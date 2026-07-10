@@ -323,7 +323,7 @@ impl AppMode for UserListMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
         self.refresh(app);
         self.row_hits.clear();
-        let theme = &app.theme;
+        let theme = &app.view.theme;
         let area = buf.rect();
         if area.w < 24 || area.h < 7 {
             return;
@@ -642,8 +642,8 @@ mod tests {
 
         mode.process_action(&mut app, BindCommand::Activate);
 
-        assert!(app.pending_transition.is_empty());
-        assert_eq!(app.status.text(), "ann is away");
+        assert!(app.view.pending_transition.is_empty());
+        assert_eq!(app.view.status.text(), "ann is away");
     }
 
     #[test]

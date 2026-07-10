@@ -37,12 +37,10 @@ use crate::{
     },
     config::{self, Config, ServerEntry, SoundboardClip, ThemeSelection, validate_server_entry},
     local_control, settings,
-    theme::Theme,
     tui::{
         Action,
-        chrome::ChromeState,
         form::rect_contains,
-        mode::{AppMode, ModeTransition, PendingTransition},
+        mode::{AppMode, ModeTransition},
         modes::{
             RoomMode, RoomSwitchMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession,
         },
@@ -55,7 +53,6 @@ use crate::{
         DeviceAction, DeviceSide, FieldId, FieldIntent, SettingsButton, SettingsOutput,
         capture_device_id, playback_device_id,
     },
-    ui::vu::MicLevelBallistics,
     ui::welcome::WelcomeDraft,
 };
 
@@ -215,7 +212,7 @@ pub(crate) struct StatusState {
 }
 
 impl StatusState {
-    fn new(text: impl Into<String>) -> Self {
+    pub(crate) fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             kind: StatusKind::Info,
@@ -333,16 +330,12 @@ impl AudioDeviceCatalog {
 
 pub(crate) struct App {
     pub config: Config,
-    pub theme: Theme,
     events: AppEvents,
     pub room: RoomSession,
     /// The primary terminal's exclusive UI state: composer, scrollback
     /// buffers, pending edit, clipboard queue. Splits off `room` so attached
     /// clients can each own one.
     pub view: ClientView,
-    pub status: StatusState,
-    pub pending_transition: PendingTransition,
-    pub chrome: ChromeState,
     pub audio_devices: AudioDeviceCatalog,
     pub network: Option<NetworkClient>,
     pub control_socket: Option<local_control::ControlSocket>,
@@ -364,9 +357,6 @@ pub(crate) struct App {
     pub playback_error: Option<String>,
     pub capture: Option<LiveCapture>,
     /// Fast-attack/slow-release smoothing for the mic VU meter and dB readout,
-    /// so noise-reduction gating faint background noise reads as a steady level
-    /// instead of flicker. Applied in `prepare_screen`; display-only.
-    pub mic_level_ballistics: MicLevelBallistics,
     pub settings_preview_capture: bool,
     pub settings_preview_refresh_id: Option<u64>,
     pub allow_settings_preview_capture: bool,
@@ -393,12 +383,7 @@ pub(crate) struct App {
     /// or cancels the pairing.
     pub join_notice: Option<String>,
     pending_after_welcome: Option<PendingJoin>,
-    quit_requested: bool,
     pub pending_audio_apply: Option<PendingAudioApply>,
-    /// When `true`, the lobby shows the detailed developer voice stats instead of
-    /// the collapsed per-participant latency estimate. Toggled by `/stats`,
-    /// session-only (defaults off each launch).
-    pub lobby_details: bool,
     /// Smoothed round-trip time to the server relay media socket, milliseconds.
     /// Used as the network leg of the latency estimate for relayed participants.
     pub server_rtt_ms: Option<u16>,
@@ -1088,7 +1073,7 @@ impl App {
         let soundboard_enabled = config.soundboard.enabled;
         let theme = config.ui.resolve_theme();
         let room = RoomSession::new(&config);
-        let view = ClientView::new(&config, &theme);
+        let view = ClientView::new(&config, theme);
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let output_volume_percent_bits =
             Arc::new(AtomicU32::new(config.audio.output_volume.to_bits()));
@@ -1110,13 +1095,9 @@ impl App {
             None
         };
         let mut app = Self {
-            theme,
             events,
             room,
             view,
-            status: StatusState::new("select a server"),
-            pending_transition: PendingTransition::default(),
-            chrome: ChromeState::default(),
             audio_devices: AudioDeviceCatalog::default(),
             network: None,
             control_socket: None,
@@ -1133,7 +1114,6 @@ impl App {
             mic_error: None,
             playback_error: None,
             capture: None,
-            mic_level_ballistics: MicLevelBallistics::default(),
             settings_preview_capture: false,
             settings_preview_refresh_id: None,
             allow_settings_preview_capture: !soundboard_enabled,
@@ -1150,9 +1130,7 @@ impl App {
             last_network_notice: None,
             join_notice: None,
             pending_after_welcome: None,
-            quit_requested: false,
             pending_audio_apply: None,
-            lobby_details: false,
             server_rtt_ms: None,
             pending_voice_teardown_at: None,
             pending_network_commands: VecDeque::new(),
@@ -1199,12 +1177,12 @@ impl App {
     }
 
     pub(crate) fn request_quit(&mut self) {
-        self.quit_requested = true;
+        self.view.quit_requested = true;
     }
 
     pub(crate) fn take_quit_requested(&mut self) -> bool {
-        let requested = self.quit_requested;
-        self.quit_requested = false;
+        let requested = self.view.quit_requested;
+        self.view.quit_requested = false;
         requested
     }
 
@@ -1214,8 +1192,7 @@ impl App {
             return false;
         }
         draft.apply_to_config(&mut self.config);
-        self.theme = self.config.ui.resolve_theme();
-        self.view.apply_theme(&self.theme);
+        self.view.apply_theme(self.config.ui.resolve_theme());
         match self.config.save_runtime() {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
@@ -1236,7 +1213,7 @@ impl App {
             return;
         };
         self.start_pending_join(pending);
-        if self.network.is_some() && self.pending_transition.is_empty() {
+        if self.network.is_some() && self.view.pending_transition.is_empty() {
             self.request_mode_transition(ModeTransition::Set(Box::new(RoomMode::default())));
         }
     }
@@ -1326,8 +1303,7 @@ impl App {
         };
         self.config.ui.theme = reloaded.ui.theme;
         self.config.ui.themes = reloaded.ui.themes;
-        self.theme = self.config.ui.resolve_theme();
-        self.view.apply_theme(&self.theme);
+        self.view.apply_theme(self.config.ui.resolve_theme());
         let _ = reply.send(Ok("theme reloaded".to_string()));
     }
 
@@ -2454,7 +2430,7 @@ impl App {
     ) {
         let Some(mut pair) = self.pending_pair.take() else {
             self.set_status("pairing succeeded");
-            if close_prompt_if_idle && self.pending_transition.is_empty() {
+            if close_prompt_if_idle && self.view.pending_transition.is_empty() {
                 self.pop_mode();
             }
             return;
@@ -2465,7 +2441,7 @@ impl App {
         pair.server.udp_probe_addr = udp_probe_addr;
         if let Err(error) = validate_server_entry(&pair.server) {
             self.set_error(error);
-            if close_prompt_if_idle && self.pending_transition.is_empty() {
+            if close_prompt_if_idle && self.view.pending_transition.is_empty() {
                 self.pop_mode();
             }
             return;
@@ -2473,7 +2449,7 @@ impl App {
         let close_after_reconnect =
             close_prompt_if_idle && matches!(pair.completion, PairCompletion::Reconnect { .. });
         self.complete_pairing(pair.server, pair.completion);
-        if close_after_reconnect && self.pending_transition.is_empty() {
+        if close_after_reconnect && self.view.pending_transition.is_empty() {
             self.pop_mode();
         }
     }
@@ -3405,30 +3381,30 @@ impl App {
     }
 
     pub(crate) fn request_mode_transition(&mut self, transition: ModeTransition) {
-        self.pending_transition.request(transition);
+        self.view.pending_transition.request(transition);
     }
 
     pub(crate) fn take_mode_transition(&mut self) -> Option<ModeTransition> {
-        self.pending_transition.take()
+        self.view.pending_transition.take()
     }
 
     pub(crate) fn process_top_bar_mouse(&mut self, mouse: MouseEvent) -> bool {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
-        if rect_contains(self.chrome.top_bar.live, mouse.column, mouse.row) {
+        if rect_contains(self.view.chrome.top_bar.live, mouse.column, mouse.row) {
             self.activate_top_bar_voice_mode(LocalVoiceMode::Live);
             return true;
         }
-        if rect_contains(self.chrome.top_bar.mute, mouse.column, mouse.row) {
+        if rect_contains(self.view.chrome.top_bar.mute, mouse.column, mouse.row) {
             self.activate_top_bar_voice_mode(LocalVoiceMode::Muted);
             return true;
         }
-        if rect_contains(self.chrome.top_bar.deafen, mouse.column, mouse.row) {
+        if rect_contains(self.view.chrome.top_bar.deafen, mouse.column, mouse.row) {
             self.activate_top_bar_voice_mode(LocalVoiceMode::Deafened);
             return true;
         }
-        if rect_contains(self.chrome.top_bar.video, mouse.column, mouse.row) {
+        if rect_contains(self.view.chrome.top_bar.video, mouse.column, mouse.row) {
             self.activate_top_bar_video();
             return true;
         }
@@ -3676,7 +3652,7 @@ impl App {
             PlaySoundboard8 => self.trigger_soundboard_slot(7),
             PlaySoundboard9 => self.trigger_soundboard_slot(8),
             ToggleKeyPreview => {
-                self.chrome.key_preview.expanded = !self.chrome.key_preview.expanded
+                self.view.chrome.key_preview.expanded = !self.view.chrome.key_preview.expanded
             }
             _ => {}
         }
@@ -3740,7 +3716,7 @@ impl App {
         let output = crate::ui::settings::settings_logic(
             &mut session.form,
             &mut session.draft,
-            &self.theme,
+            &self.view.theme,
             &self.config.bindings,
             session.dirty,
             intent,
@@ -3844,15 +3820,14 @@ impl App {
 
     /// Re-resolves the active theme and applies it to the live UI: the chat
     /// buffer restyles its syntax highlighting and the composer editor adopts
-    /// the new selection colors. Every other surface reads `self.theme` per
+    /// the new selection colors. Every other surface reads `self.view.theme` per
     /// frame, so a field swap is enough for them.
     pub(crate) fn apply_theme(&mut self, selection: ThemeSelection) {
         if self.config.ui.theme == selection {
             return;
         }
         self.config.ui.theme = selection;
-        self.theme = self.config.ui.resolve_theme();
-        self.view.apply_theme(&self.theme);
+        self.view.apply_theme(self.config.ui.resolve_theme());
     }
 
     fn apply_web_setting(&mut self, old: &config::WebConfig) {
@@ -4811,7 +4786,7 @@ impl App {
         let name = selected.display_name;
         let value_db = self.config.user_volume_db(&self.room.server_alias, user_id);
         self.room.begin_volume_preview(user_id, value_db);
-        let dialog = UserVolumeDialog::new(user_id, name.clone(), value_db, &self.theme);
+        let dialog = UserVolumeDialog::new(user_id, name.clone(), value_db, &self.view.theme);
         self.push_mode(Box::new(DialogMode::new(dialog)));
         self.set_status(format!("adjusting local volume for {name}"));
     }
@@ -5257,7 +5232,7 @@ impl App {
 
     /// Opens the filename confirmation dialog for a pasted image or file.
     pub(crate) fn open_paste_image_dialog(&mut self, image: crate::clipboard_paste::ImagePaste) {
-        let dialog = PasteImageUploadMode::new(image, &self.theme);
+        let dialog = PasteImageUploadMode::new(image, &self.view.theme);
         self.push_mode(Box::new(dialog));
     }
 
@@ -5291,8 +5266,8 @@ impl App {
     }
 
     fn toggle_lobby_details(&mut self) {
-        self.lobby_details = !self.lobby_details;
-        if self.lobby_details {
+        self.view.lobby_details = !self.view.lobby_details;
+        if self.view.lobby_details {
             self.set_status("lobby detail on (jitter buffer stats)");
         } else {
             self.set_status("lobby detail off (latency estimate)");
@@ -6331,20 +6306,21 @@ impl App {
     }
 
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
-        self.status.set(status);
+        self.view.status.set(status);
     }
 
     pub(crate) fn set_transient_status(&mut self, status: impl Into<String>) {
-        self.status
+        self.view
+            .status
             .set_transient(status, Instant::now() + TRANSIENT_STATUS_LIFETIME);
     }
 
     pub(crate) fn set_error(&mut self, status: impl Into<String>) {
-        self.status.set_error(status);
+        self.view.status.set_error(status);
     }
 
     fn expire_status(&mut self, now: Instant) {
-        self.status.expire(now);
+        self.view.status.expire(now);
     }
 }
 
@@ -6925,8 +6901,8 @@ mod tests {
 
         assert!(!app.loopback_tap.is_active());
         assert!(app.loopback_playback.is_none());
-        assert_eq!(app.status.kind(), StatusKind::Error);
-        assert!(app.status.text().contains("loopback unavailable"));
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert!(app.view.status.text().contains("loopback unavailable"));
     }
 
     #[test]
@@ -6939,7 +6915,7 @@ mod tests {
         assert!(!app.loopback_tap.is_active());
         assert!(app.loopback_playback.is_none());
         assert_eq!(
-            app.status.text(),
+            app.view.status.text(),
             "loopback unavailable: undeafen before using loopback"
         );
     }
@@ -7002,7 +6978,7 @@ mod tests {
             app.pending_network_commands.front(),
             Some(NetworkCommand::SendChat { body, .. }) if body == "hello"
         ));
-        assert_eq!(app.status.kind(), StatusKind::Error);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
     }
 
     #[test]
@@ -7099,7 +7075,7 @@ mod tests {
         app.view.composer.set_lines("/room nowhere");
         app.submit_input();
         assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(2)));
-        assert_eq!(app.status.kind(), StatusKind::Error);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
     }
 
     #[test]
@@ -7137,7 +7113,7 @@ mod tests {
             online: true,
         });
 
-        assert_eq!(app.status.text(), "steady");
+        assert_eq!(app.view.status.text(), "steady");
     }
 
     #[test]
@@ -7161,7 +7137,7 @@ mod tests {
             online: true,
         });
 
-        assert_eq!(app.status.text(), "steady");
+        assert_eq!(app.view.status.text(), "steady");
     }
 
     #[test]
@@ -7195,7 +7171,7 @@ mod tests {
 
         assert_eq!(app.pending_dm_open, None);
         assert_eq!(app.room.viewed_room, Some(dm_id));
-        assert_eq!(app.status.text(), "dm with bob");
+        assert_eq!(app.view.status.text(), "dm with bob");
     }
 
     #[test]
@@ -7245,7 +7221,7 @@ mod tests {
         });
 
         assert_eq!(app.requested_voice_room, None);
-        assert_eq!(app.status.kind(), StatusKind::Error);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
 
         app.view.composer.set_lines("/voice");
         app.submit_input();
@@ -7798,7 +7774,7 @@ mod tests {
             notice.notice_kind,
             Some(crate::chat_buffer::NoticeKind::Info)
         );
-        assert_eq!(app.status.text(), "slash commands listed");
+        assert_eq!(app.view.status.text(), "slash commands listed");
     }
 
     #[test]
@@ -7819,7 +7795,7 @@ mod tests {
             notice.notice_kind,
             Some(crate::chat_buffer::NoticeKind::Error)
         );
-        assert!(app.status.text().contains("video failed:"));
+        assert!(app.view.status.text().contains("video failed:"));
     }
 
     #[test]
@@ -7840,7 +7816,7 @@ mod tests {
                 .map(|issue| issue.reason.as_str()),
             Some("join a voice call before sharing")
         );
-        assert_eq!(app.status.kind(), StatusKind::Error);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
     }
 
     #[test]
@@ -7867,17 +7843,23 @@ mod tests {
     #[test]
     fn stats_command_toggles_lobby_details() {
         let mut app = test_app();
-        assert!(!app.lobby_details);
+        assert!(!app.view.lobby_details);
 
         app.view.composer.set_lines("/stats");
         app.submit_input();
-        assert!(app.lobby_details);
-        assert_eq!(app.status.text(), "lobby detail on (jitter buffer stats)");
+        assert!(app.view.lobby_details);
+        assert_eq!(
+            app.view.status.text(),
+            "lobby detail on (jitter buffer stats)"
+        );
 
         app.view.composer.set_lines("/stats");
         app.submit_input();
-        assert!(!app.lobby_details);
-        assert_eq!(app.status.text(), "lobby detail off (latency estimate)");
+        assert!(!app.view.lobby_details);
+        assert_eq!(
+            app.view.status.text(),
+            "lobby detail off (latency estimate)"
+        );
     }
 
     #[test]
@@ -7958,7 +7940,7 @@ mod tests {
         assert_eq!(action, Action::Continue);
         h.apply();
         assert_eq!(h.stack.len(), 1);
-        assert_eq!(h.app.status.text(), "focus lobby to adjust users");
+        assert_eq!(h.app.view.status.text(), "focus lobby to adjust users");
 
         let mut lobby_room = RoomMode::with_focus(ChatPanelFocus::Lobby);
         let action = lobby_room.process_input(
@@ -8070,7 +8052,7 @@ mod tests {
             3,
             "deletion waits for server echo"
         );
-        assert_eq!(h.app.status.text(), "deleting 2 messages");
+        assert_eq!(h.app.view.status.text(), "deleting 2 messages");
     }
 
     #[test]
@@ -8132,7 +8114,7 @@ mod tests {
             message: "message is too old".to_string(),
         });
         assert!(!app.pending_web_deletes.contains(&(RoomId(1), MessageId(7))));
-        assert_eq!(app.status.text(), "message is too old");
+        assert_eq!(app.view.status.text(), "message is too old");
     }
 
     #[test]
@@ -8204,7 +8186,7 @@ mod tests {
             room.layout().chat_rect.x,
             room.layout().chat_rect.y,
         );
-        assert_eq!(info_marker.fg(), app.theme.muted.fg());
+        assert_eq!(info_marker.fg(), app.view.theme.muted.fg());
 
         let mut app = test_app();
         let mut room = RoomMode::default();
@@ -8217,7 +8199,7 @@ mod tests {
             room.layout().chat_rect.x,
             room.layout().chat_rect.y,
         );
-        assert_eq!(error_marker.fg(), app.theme.error.fg());
+        assert_eq!(error_marker.fg(), app.view.theme.error.fg());
     }
 
     fn click_top_bar_rect(app: &mut App, room: &mut RoomMode, rect: extui::Rect) {
@@ -8240,9 +8222,9 @@ mod tests {
 
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
-        let live_rect = app.chrome.top_bar.live;
-        let mute_rect = app.chrome.top_bar.mute;
-        let deafen_rect = app.chrome.top_bar.deafen;
+        let live_rect = app.view.chrome.top_bar.live;
+        let mute_rect = app.view.chrome.top_bar.mute;
+        let deafen_rect = app.view.chrome.top_bar.deafen;
         assert!(!live_rect.is_empty());
         assert!(!mute_rect.is_empty());
         assert!(!deafen_rect.is_empty());
@@ -8299,13 +8281,13 @@ mod tests {
 
         let mut buffer = Buffer::new(100, 24);
         render_room(&mut app, &mut room, &mut buffer);
-        let video_rect = app.chrome.top_bar.video;
+        let video_rect = app.view.chrome.top_bar.video;
 
         click_top_bar_rect(&mut app, &mut room, video_rect);
 
         assert!(app.screencast.is_none());
         assert_eq!(app.screencast_status.phase, ScreencastPhase::Off);
-        assert_eq!(app.status.text(), "video off");
+        assert_eq!(app.view.status.text(), "video off");
         match rx.try_recv().expect("stop share command") {
             NetworkCommand::StopShare { stream_id: stopped } => assert_eq!(stopped, stream_id),
             other => panic!("unexpected command: {other:?}"),
@@ -8313,12 +8295,12 @@ mod tests {
 
         let mut buffer = Buffer::new(100, 24);
         render_room(&mut app, &mut room, &mut buffer);
-        let off_rect = app.chrome.top_bar.video;
+        let off_rect = app.view.chrome.top_bar.video;
         assert!(!off_rect.is_empty());
         assert_eq!(rect_text(&mut buffer, off_rect), " VIDEO OFF ");
         let style = cell_style(&mut buffer, off_rect.x, off_rect.y);
-        assert_eq!(style.bg(), app.theme.warn.fg());
-        assert_eq!(style.fg(), app.theme.mode_server_edit.fg());
+        assert_eq!(style.bg(), app.view.theme.warn.fg());
+        assert_eq!(style.fg(), app.view.theme.mode_server_edit.fg());
     }
 
     #[test]
@@ -8345,7 +8327,7 @@ mod tests {
 
         let mut buffer = Buffer::new(100, 24);
         render_room(&mut app, &mut room, &mut buffer);
-        let off_rect = app.chrome.top_bar.video;
+        let off_rect = app.view.chrome.top_bar.video;
 
         click_top_bar_rect(&mut app, &mut room, off_rect);
 
@@ -8357,7 +8339,7 @@ mod tests {
                 .is_some_and(|issue| issue.reason.contains(&missing)),
             "restart should use the cached command"
         );
-        assert_eq!(app.status.kind(), StatusKind::Error);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
     }
 
     #[test]
@@ -8370,7 +8352,7 @@ mod tests {
         let mut buffer = Buffer::new(100, 24);
         render_room(&mut app, &mut room, &mut buffer);
 
-        let video_rect = app.chrome.top_bar.video;
+        let video_rect = app.view.chrome.top_bar.video;
         assert!(!video_rect.is_empty());
         room.process_mouse(
             &mut app,
@@ -8395,7 +8377,7 @@ mod tests {
 
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
-        assert!(app.chrome.lobby_bar.audio_reset.is_empty());
+        assert!(app.view.chrome.lobby_bar.audio_reset.is_empty());
 
         app.supervisor.capture.on_rebuild_failed(
             Instant::now(),
@@ -8403,9 +8385,9 @@ mod tests {
             "device unplugged".to_string(),
         );
         render_room(&mut app, &mut room, &mut buffer);
-        let reset_rect = app.chrome.lobby_bar.audio_reset;
+        let reset_rect = app.view.chrome.lobby_bar.audio_reset;
         assert!(!reset_rect.is_empty());
-        assert!(!app.chrome.lobby_bar.audio_widget.is_empty());
+        assert!(!app.view.chrome.lobby_bar.audio_widget.is_empty());
 
         room.process_mouse(
             &mut app,
@@ -8419,7 +8401,7 @@ mod tests {
         assert!(app.supervisor.capture.is_healthy());
 
         render_room(&mut app, &mut room, &mut buffer);
-        assert!(app.chrome.lobby_bar.audio_reset.is_empty());
+        assert!(app.view.chrome.lobby_bar.audio_reset.is_empty());
     }
 
     fn app_with_servers(entries: &[(&str, &str)]) -> App {
@@ -8485,7 +8467,7 @@ mod tests {
         app.start_named_join("0.0.0.0:41000".to_string());
 
         assert!(app.pending_pair.is_none());
-        assert_eq!(app.status.kind(), StatusKind::Error);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
     }
 
     #[test]
@@ -8494,7 +8476,7 @@ mod tests {
         assert_eq!(app.resolve_join("does-not-exist"), JoinResolution::NoMatch);
         app.start_named_join("does-not-exist".to_string());
         assert!(app.pending_pair.is_none());
-        assert_eq!(app.status.kind(), StatusKind::Error);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
         assert!(matches!(
             app.take_mode_transition(),
             Some(ModeTransition::Set(_))

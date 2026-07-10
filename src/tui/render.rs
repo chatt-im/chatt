@@ -30,7 +30,7 @@ use crate::{
 };
 
 fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
-    buf.rect().with(app.theme.background).fill(buf);
+    buf.rect().with(app.view.theme.background).fill(buf);
     buf.hide_cursor();
     let capture = app
         .capture
@@ -39,22 +39,23 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
     let capture = match capture {
         Some(mut snapshot) => {
             let (rms, peak) =
-                app.mic_level_ballistics
+                app.view
+                    .mic_level_ballistics
                     .smooth(snapshot.rms, snapshot.peak, Instant::now());
             snapshot.rms = rms;
             snapshot.peak = peak;
             Some(snapshot)
         }
         None => {
-            app.mic_level_ballistics.reset();
+            app.view.mic_level_ballistics.reset();
             None
         }
     };
-    app.chrome.top_bar.live = Rect::EMPTY;
-    app.chrome.top_bar.mute = Rect::EMPTY;
-    app.chrome.top_bar.deafen = Rect::EMPTY;
-    app.chrome.top_bar.video = Rect::EMPTY;
-    app.chrome.transfer_buttons.clear();
+    app.view.chrome.top_bar.live = Rect::EMPTY;
+    app.view.chrome.top_bar.mute = Rect::EMPTY;
+    app.view.chrome.top_bar.deafen = Rect::EMPTY;
+    app.view.chrome.top_bar.video = Rect::EMPTY;
+    app.view.chrome.transfer_buttons.clear();
     capture
 }
 
@@ -69,8 +70,8 @@ fn draw_join_notice(screen: &mut Rect, app: &App, buf: &mut Buffer) {
         return;
     }
     let block = screen.take_top(height as i32);
-    let style = app.theme.status_section.patch(app.theme.warn);
-    let header_style = join_notice_header_style(&app.theme);
+    let style = app.view.theme.status_section.patch(app.view.theme.warn);
+    let header_style = join_notice_header_style(&app.view.theme);
     block.with(style).fill(buf);
     let lines = [
         " ! No saved server matched the join target",
@@ -166,8 +167,8 @@ pub(crate) fn draw_server_edit_overlay(
     let Some(panel) = form_dialog_panel(area, draft.form_height()) else {
         return;
     };
-    let body = draw_form_dialog_frame(panel, buf, &app.theme, &draft.title());
-    draft.render(body, buf, &app.theme);
+    let body = draw_form_dialog_frame(panel, buf, &app.view.theme, &draft.title());
+    draft.render(body, buf, &app.view.theme);
     draw_overlay_key_preview(app, bindings::FORM_LAYER, buf);
 }
 
@@ -191,7 +192,7 @@ pub(crate) fn draw_settings_screen(
     ui::settings::draw_settings(
         screen,
         buf,
-        &app.theme,
+        &app.view.theme,
         &app.config.bindings,
         &mut session.draft,
         &mut session.form,
@@ -285,7 +286,7 @@ fn draw_user_list(
     lobby_list_focus: LobbyListFocus,
     buf: &mut Buffer,
 ) {
-    area.with(app.theme.panel_alt).fill(buf);
+    area.with(app.view.theme.panel_alt).fill(buf);
     let mut rows = area;
     let visible = rows.h as usize;
     let start = app
@@ -323,21 +324,21 @@ fn draw_user_list(
             .map(age_label)
             .unwrap_or_else(|| "--".to_string());
         let base = if selected {
-            app.theme.room_selected
+            app.view.theme.room_selected
         } else {
-            app.theme.panel_alt
+            app.view.theme.panel_alt
         };
         let style = if selected {
-            base.patch(app.theme.good)
+            base.patch(app.view.theme.good)
         } else if participant.online {
-            app.theme.text
+            app.view.theme.text
         } else {
-            app.theme.muted
+            app.view.theme.muted
         };
         let marker = if selected { ">" } else { " " };
         let (status_marker, status_style) = room_user_status_indicator(app, participant);
         let control = room_user_control_label(app, participant);
-        let voice = room_user_voice_feedback_label(app.lobby_details, participant);
+        let voice = room_user_voice_feedback_label(app.view.lobby_details, participant);
         row.with(base).fill(buf);
         row.with(style).with(Ellipsis(true)).text(
             buf,
@@ -374,7 +375,7 @@ fn draw_workspace(
         layout.lobby_divider_rect = divider_area;
         layout.user_list_rect = users_area;
         draw_room_list(rooms_area, app, focus, lobby_list_focus, layout, buf);
-        divider_area.with(app.theme.status_fill).fill(buf);
+        divider_area.with(app.view.theme.status_fill).fill(buf);
         draw_user_list(users_area, app, focus, lobby_list_focus, buf);
     }
 
@@ -431,7 +432,7 @@ fn draw_room_list(
     if area.is_empty() {
         return;
     }
-    let theme = app.theme;
+    let theme = app.view.theme;
     area.with(theme.panel_alt).fill(buf);
 
     let items = app.room_select_items();
@@ -536,14 +537,14 @@ fn draw_room_select(
     searching: bool,
     buf: &mut Buffer,
 ) {
-    area.with(app.theme.background).fill(buf);
+    area.with(app.view.theme.background).fill(buf);
     let mut body = area;
     if body.h == 0 {
         return;
     }
     if items.is_empty() {
         body.take_top(1)
-            .with(app.theme.background.patch(app.theme.muted))
+            .with(app.view.theme.background.patch(app.view.theme.muted))
             .with(Ellipsis(true))
             .text(buf, " No rooms known yet.");
         return;
@@ -552,12 +553,12 @@ fn draw_room_select(
     if searching {
         let search = body.take_top(1);
         search
-            .with(app.theme.background.patch(app.theme.subtle))
+            .with(app.view.theme.background.patch(app.view.theme.subtle))
             .with(Ellipsis(true))
             .text(buf, &format!("/{}", select.query()));
     }
 
-    let theme = &app.theme;
+    let theme = &app.view.theme;
     select.render(body, 1, buf, |_, item_index, selected, area, buf| {
         if let Some(item) = items.get(item_index) {
             draw_room_select_item(area, buf, item, selected, theme);
@@ -615,25 +616,25 @@ fn draw_server_select(
     searching: bool,
     buf: &mut Buffer,
 ) {
-    area.with(app.theme.background).fill(buf);
+    area.with(app.view.theme.background).fill(buf);
     let mut body = area;
     if body.h == 0 {
         return;
     }
     if app.server_items().is_empty() {
-        draw_server_welcome(body, buf, &app.theme);
+        draw_server_welcome(body, buf, &app.view.theme);
         return;
     }
 
     if searching {
         let search = body.take_top(1);
         search
-            .with(app.theme.background.patch(app.theme.subtle))
+            .with(app.view.theme.background.patch(app.view.theme.subtle))
             .with(Ellipsis(true))
             .text(buf, &format!("/{}", select.query()));
     }
 
-    let theme = &app.theme;
+    let theme = &app.view.theme;
     let items = app.server_items();
     select.render(body, 3, buf, |_, item_index, selected, area, buf| {
         if let Some(item) = items.get(item_index) {
@@ -966,13 +967,13 @@ fn participant_latency_estimate_ms(
 fn room_user_status_indicator(app: &App, participant: &ParticipantState) -> (&'static str, Style) {
     let local_user = Some(participant.user_id) == app.user_id;
     if !participant.online {
-        return ("▇", app.theme.muted);
+        return ("▇", app.view.theme.muted);
     }
     if participant.voice_status.deafened || (local_user && app.deafened.load(Ordering::Relaxed)) {
-        return ("▇", app.theme.error);
+        return ("▇", app.view.theme.error);
     }
     if participant.voice_status.muted || (local_user && app.mic_muted.load(Ordering::Relaxed)) {
-        return ("▇", app.theme.warn);
+        return ("▇", app.view.theme.warn);
     }
     if participant.voice_active {
         return (
@@ -981,10 +982,10 @@ fn room_user_status_indicator(app: &App, participant: &ParticipantState) -> (&'s
             } else {
                 "░"
             },
-            app.theme.good,
+            app.view.theme.good,
         );
     }
-    ("▇", app.theme.muted)
+    ("▇", app.view.theme.muted)
 }
 
 fn room_user_control_label(app: &App, participant: &ParticipantState) -> String {
@@ -1007,7 +1008,7 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
     if area.is_empty() {
         return;
     }
-    let theme = app.theme;
+    let theme = app.view.theme;
     area.with(theme.status_fill).fill(buf);
 
     let server = if app.room.server_alias.trim().is_empty() {
@@ -1048,28 +1049,28 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
         ui::vu::draw_status_vu(meter, buf, capture, &theme);
     }
 
-    app.chrome.top_bar.video = draw_video_status_block(&mut right, app, buf);
+    app.view.chrome.top_bar.video = draw_video_status_block(&mut right, app, buf);
 }
 
 fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect {
     let (style, label) = match app.screencast_status.phase {
         ScreencastPhase::Starting => (
-            top_bar_active_button_style(app.theme, app.theme.good),
+            top_bar_active_button_style(app.view.theme, app.view.theme.good),
             " VIDEO starting ".to_string(),
         ),
         ScreencastPhase::Live => (
-            top_bar_active_button_style(app.theme, app.theme.good),
+            top_bar_active_button_style(app.view.theme, app.view.theme.good),
             format!(
                 " VIDEO {}/s ",
                 format_bytes(app.screencast_status.rolling_bytes_per_sec)
             ),
         ),
         ScreencastPhase::Off => (
-            top_bar_active_button_style(app.theme, app.theme.warn),
+            top_bar_active_button_style(app.view.theme, app.view.theme.warn),
             " VIDEO OFF ".to_string(),
         ),
         ScreencastPhase::Failed => (
-            top_bar_active_button_style(app.theme, app.theme.error),
+            top_bar_active_button_style(app.view.theme, app.view.theme.error),
             " VIDEO FAILED ".to_string(),
         ),
         ScreencastPhase::Idle => return Rect::EMPTY,
@@ -1078,19 +1079,19 @@ fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect 
 }
 
 fn draw_top_bar_voice_buttons(row: &mut Rect, app: &mut App, buf: &mut Buffer) {
-    app.chrome.top_bar.deafen = draw_status_segment_right(
+    app.view.chrome.top_bar.deafen = draw_status_segment_right(
         row,
         buf,
         top_bar_voice_button_style(app, LocalVoiceMode::Deafened),
         " DEAF ",
     );
-    app.chrome.top_bar.mute = draw_status_segment_right(
+    app.view.chrome.top_bar.mute = draw_status_segment_right(
         row,
         buf,
         top_bar_voice_button_style(app, LocalVoiceMode::Muted),
         " MUTE ",
     );
-    app.chrome.top_bar.live = draw_status_segment_right(
+    app.view.chrome.top_bar.live = draw_status_segment_right(
         row,
         buf,
         top_bar_voice_button_style(app, LocalVoiceMode::Live),
@@ -1099,7 +1100,7 @@ fn draw_top_bar_voice_buttons(row: &mut Rect, app: &mut App, buf: &mut Buffer) {
 }
 
 fn top_bar_voice_button_style(app: &App, button: LocalVoiceMode) -> Style {
-    let theme = app.theme;
+    let theme = app.view.theme;
     if app.local_voice_mode() != button {
         return top_bar_inactive_button_style(theme, button);
     }
@@ -1142,13 +1143,13 @@ fn draw_lobby_bar(
         return;
     }
     let lobby_focused = focus == ChatPanelFocus::Lobby;
-    let fill = app.theme.status_fill;
+    let fill = app.view.theme.status_fill;
     area.with(fill).fill(buf);
 
     let rooms_bar = bar_rect_for(area, room_list_rect);
     if !rooms_bar.is_empty() {
         let (_, label, detail) = section_bar_styles(
-            app.theme,
+            app.view.theme,
             ChatPanelFocus::Lobby,
             lobby_focused && lobby_list_focus == LobbyListFocus::Rooms,
         );
@@ -1167,7 +1168,7 @@ fn draw_lobby_bar(
     }
 
     let (_, label, detail) = section_bar_styles(
-        app.theme,
+        app.view.theme,
         ChatPanelFocus::Lobby,
         lobby_focused && lobby_list_focus == LobbyListFocus::Users,
     );
@@ -1212,9 +1213,9 @@ fn bar_rect_for(bar: Rect, source: Rect) -> Rect {
 /// names while healthy, recovery state plus a clickable `[reset]` button
 /// while a stream is reconnecting or waiting for a device.
 fn draw_lobby_audio_widget(remaining: Rect, app: &mut App, fill: Style, buf: &mut Buffer) {
-    app.chrome.lobby_bar.audio_widget = Rect::EMPTY;
-    app.chrome.lobby_bar.audio_reset = Rect::EMPTY;
-    let theme = app.theme;
+    app.view.chrome.lobby_bar.audio_widget = Rect::EMPTY;
+    app.view.chrome.lobby_bar.audio_reset = Rect::EMPTY;
+    let theme = app.view.theme;
     let mic = app.capture_audio_health();
     let spk = app.playback_audio_health();
     let mut right = remaining;
@@ -1227,13 +1228,13 @@ fn draw_lobby_audio_widget(remaining: Rect, app: &mut App, fill: Style, buf: &mu
         trouble.push(text);
     }
     if !trouble.is_empty() {
-        app.chrome.lobby_bar.audio_reset = draw_status_segment_right(
+        app.view.chrome.lobby_bar.audio_reset = draw_status_segment_right(
             &mut right,
             buf,
             theme.status_section.patch(theme.warn) | Modifier::BOLD,
             " [reset] ",
         );
-        app.chrome.lobby_bar.audio_widget = draw_status_segment_right(
+        app.view.chrome.lobby_bar.audio_widget = draw_status_segment_right(
             &mut right,
             buf,
             fill.patch(theme.warn),
@@ -1252,7 +1253,7 @@ fn draw_lobby_audio_widget(remaining: Rect, app: &mut App, fill: Style, buf: &mu
     if devices.is_empty() {
         return;
     }
-    app.chrome.lobby_bar.audio_widget = draw_status_segment_right(
+    app.view.chrome.lobby_bar.audio_widget = draw_status_segment_right(
         &mut right,
         buf,
         fill.patch(theme.muted),
@@ -1285,7 +1286,8 @@ fn draw_chat_log_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buf
         return;
     }
     let focused = focus == ChatPanelFocus::ChatLog;
-    let (fill, label, detail) = section_bar_styles(app.theme, ChatPanelFocus::ChatLog, focused);
+    let (fill, label, detail) =
+        section_bar_styles(app.view.theme, ChatPanelFocus::ChatLog, focused);
     area.with(fill).fill(buf);
     let mut row = area;
     draw_status_segment(&mut row, buf, label, " Chat Log ");
@@ -1313,9 +1315,10 @@ fn draw_compose_bar(
         return;
     }
     let focused = focus == ChatPanelFocus::Compose;
-    let (fill, mut label, detail) = section_bar_styles(app.theme, ChatPanelFocus::Compose, focused);
+    let (fill, mut label, detail) =
+        section_bar_styles(app.view.theme, ChatPanelFocus::Compose, focused);
     if focused {
-        label = app.theme.mode_style(mode) | Modifier::BOLD;
+        label = app.view.theme.mode_style(mode) | Modifier::BOLD;
     }
     area.with(fill).fill(buf);
     let mut row = area;
@@ -1378,7 +1381,7 @@ fn draw_chat(
     buf: &mut Buffer,
     now_ms: u64,
 ) {
-    area.with(app.theme.background).fill(buf);
+    area.with(app.view.theme.background).fill(buf);
     if area.is_empty() {
         layout.clear_chat();
         return;
@@ -1396,7 +1399,7 @@ fn draw_chat(
     layout.chat_rect = area;
     if app.view.active.chat.is_empty() {
         layout.visible_chat_lines.clear();
-        area.with(app.theme.subtle)
+        area.with(app.view.theme.subtle)
             .with(HAlign::Center)
             .text(buf, "No messages");
         return;
@@ -1430,20 +1433,20 @@ fn draw_chat(
                 let cursor_here =
                     chat_focused && app.view.active.chat.is_cursor_line(line.message, line.line);
                 let base = if visual_here {
-                    app.theme.chat_visual_line
+                    app.view.theme.chat_visual_line
                 } else if cursor_here {
-                    app.theme.chat_cursor_line
+                    app.view.theme.chat_cursor_line
                 } else if msg.local {
-                    app.theme.local_line
+                    app.view.theme.local_line
                 } else {
-                    app.theme.background
+                    app.view.theme.background
                 };
-                let accent = chat_entry_accent(app.theme, msg.local, msg.notice_kind);
+                let accent = chat_entry_accent(app.view.theme, msg.local, msg.notice_kind);
                 marker.with(base).fill(buf);
                 // The cursor row's gutter stays identifiable even inside a
                 // visual range, where the background alone cannot mark it.
                 let marker_style = if cursor_here {
-                    base.patch(app.theme.text) | extui::vt::Modifier::BOLD
+                    base.patch(app.view.theme.text) | extui::vt::Modifier::BOLD
                 } else {
                     base.patch(accent)
                 };
@@ -1460,14 +1463,14 @@ fn draw_chat(
                 } else {
                     for seg in app.view.active.chat.line(line.message, line.line) {
                         let text = app.view.active.chat.segment_text(line.message, seg);
-                        let mut style = base.patch(app.theme.text).patch(seg.style);
+                        let mut style = base.patch(app.view.theme.text).patch(seg.style);
                         if !seg.synth
                             && msg
                                 .links
                                 .iter()
                                 .any(|link| seg.start < link.end && link.start < seg.end)
                         {
-                            style = style.patch(app.theme.syntax.namespace)
+                            style = style.patch(app.view.theme.syntax.namespace)
                                 | extui::vt::Modifier::UNDERLINED;
                         }
                         let max_width = row.w.saturating_sub(seg.col) as usize;
@@ -1485,17 +1488,17 @@ fn draw_chat(
                             base,
                             *verb,
                             reason.as_deref(),
-                            &app.theme,
+                            &app.view.theme,
                             buf,
                         );
                     }
                 }
             }
             LineKind::Ellipsis => {
-                let base = app.theme.background;
+                let base = app.view.theme.background;
                 marker.with(base).fill(buf);
                 row.with(base).fill(buf);
-                row.with(app.theme.subtle)
+                row.with(app.view.theme.subtle)
                     .with(HAlign::Center)
                     .text(buf, "...");
             }
@@ -1543,7 +1546,7 @@ fn draw_transfer_progress(
         format_bytes(progress.total)
     );
     let filled = (width as f64 * ratio).round() as usize;
-    let text_style = base.patch(app.theme.text);
+    let text_style = base.patch(app.view.theme.text);
     let chars: Vec<char> = label.chars().collect();
     let mut encoded = [0u8; 4];
     for col in 0..width {
@@ -1562,12 +1565,17 @@ fn draw_transfer_progress(
         );
     }
     if let Some(button_rect) = button_rect {
-        let button_style = base.patch(app.theme.text).with_modifier(Modifier::REVERSED);
+        let button_style = base
+            .patch(app.view.theme.text)
+            .with_modifier(Modifier::REVERSED);
         button_rect
             .with(button_style)
             .with(HAlign::Center)
             .text(buf, button_text);
-        app.chrome.transfer_buttons.push((button_rect, transfer_id));
+        app.view
+            .chrome
+            .transfer_buttons
+            .push((button_rect, transfer_id));
     }
 }
 
@@ -1606,11 +1614,11 @@ fn draw_chat_heading(
 ) {
     let msg = app.view.active.chat.message(message);
     let base = if msg.local {
-        app.theme.local_line
+        app.view.theme.local_line
     } else {
-        app.theme.background
+        app.view.theme.background
     };
-    let accent = chat_entry_accent(app.theme, msg.local, msg.notice_kind);
+    let accent = chat_entry_accent(app.view.theme, msg.local, msg.notice_kind);
     marker.with(base).fill(buf);
     marker.with(base.patch(accent)).text(buf, "▟");
     row.with(base).fill(buf);
@@ -1632,7 +1640,7 @@ fn draw_chat_heading(
     let age = chat_age(msg.timestamp_ms, now_ms);
     if !age.is_empty() {
         content
-            .with(base.patch(app.theme.subtle))
+            .with(base.patch(app.view.theme.subtle))
             .with(HAlign::Right)
             .text(buf, &age);
     }
@@ -1828,7 +1836,7 @@ fn draw_status(
     if area.is_empty() {
         return;
     }
-    let theme = &app.theme;
+    let theme = &app.view.theme;
     area.with(theme.status_fill).fill(buf);
     let mut row = area;
     draw_status_segment(&mut row, buf, theme.mode_style(mode), &format!(" {label} "));
@@ -1836,19 +1844,19 @@ fn draw_status(
 }
 
 fn draw_status_text_right(area: Rect, app: &App, buf: &mut Buffer, fill: Style) {
-    let theme = &app.theme;
-    let right_style = match app.status.kind() {
+    let theme = &app.view.theme;
+    let right_style = match app.view.status.kind() {
         StatusKind::Info => fill.patch(theme.muted),
         StatusKind::Error => fill.patch(theme.error),
     };
-    let status_text = if let Some(chord) = &app.chrome.binding.pending_chord {
+    let status_text = if let Some(chord) = &app.view.chrome.binding.pending_chord {
         format!(
             "{} chord {}ms",
             chord.label.as_deref().unwrap_or("pending"),
             chord.activated_at.elapsed().as_millis()
         )
     } else {
-        app.status.text().to_string()
+        app.view.status.text().to_string()
     };
     area.with(HAlign::Right)
         .with(right_style)
@@ -1884,12 +1892,12 @@ const KEY_PREVIEW_ENTRY_GAP: &str = "  ";
 const KEY_PREVIEW_ENTRY_GAP_WIDTH: usize = 2;
 
 fn key_preview_height(app: &App, width: u16) -> u16 {
-    let entries = &app.chrome.key_preview.cache.entries;
+    let entries = &app.view.chrome.key_preview.cache.entries;
     if entries.is_empty() {
         return 0;
     }
     let rows = key_preview_rows(entries, width);
-    if app.chrome.key_preview.expanded && rows.len() > 1 {
+    if app.view.chrome.key_preview.expanded && rows.len() > 1 {
         rows.len().try_into().unwrap_or(u16::MAX)
     } else {
         1
@@ -1901,7 +1909,7 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
         return;
     }
 
-    let entries = &app.chrome.key_preview.cache.entries;
+    let entries = &app.view.chrome.key_preview.cache.entries;
     if entries.is_empty() {
         area.with(Style::default()).fill(buf);
         return;
@@ -1946,7 +1954,7 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
 
     if rows.len() > 1 {
         let hint = key_preview_toggle_hint(entries);
-        let label = if app.chrome.key_preview.expanded {
+        let label = if app.view.chrome.key_preview.expanded {
             format!("less [{hint}]")
         } else {
             format!("more [{hint}]")
@@ -1996,27 +2004,28 @@ pub(crate) fn draw_overlay_key_preview(app: &mut App, layer: LayerId, buf: &mut 
 /// [`draw_key_preview`], which read them without recomputing.
 fn refresh_key_preview_cache(app: &mut App, base: Option<LayerId>) {
     let pending = app
+        .view
         .chrome
         .binding
         .pending_chord
         .as_ref()
         .map(|chord| chord.layer);
     let key = Some((base, pending));
-    if app.chrome.key_preview.cache.key == key {
+    if app.view.chrome.key_preview.cache.key == key {
         return;
     }
-    app.chrome.key_preview.cache.key = key;
-    let mut entries = std::mem::take(&mut app.chrome.key_preview.cache.entries);
+    app.view.chrome.key_preview.cache.key = key;
+    let mut entries = std::mem::take(&mut app.view.chrome.key_preview.cache.entries);
     entries.clear();
     if let Some(layer) = base {
         build_key_preview_entries(
             &app.config.bindings,
-            &app.chrome.binding.pending_chord,
+            &app.view.chrome.binding.pending_chord,
             layer,
             &mut entries,
         );
     }
-    app.chrome.key_preview.cache.entries = entries;
+    app.view.chrome.key_preview.cache.entries = entries;
 }
 
 fn build_key_preview_entries(
@@ -2154,18 +2163,18 @@ fn draw_composer(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buf
     if area.is_empty() {
         return;
     }
-    area.with(app.theme.panel).fill(buf);
+    area.with(app.view.theme.panel).fill(buf);
     app.view.composer.resize(area.w.max(1));
     app.view
-        .refresh_command_completion(focus == ChatPanelFocus::Compose, app.theme.subtle);
+        .refresh_command_completion(focus == ChatPanelFocus::Compose, app.view.theme.subtle);
     app.view
         .composer_hl
-        .render(&mut app.view.composer, area, buf, &app.theme);
+        .render(&mut app.view.composer, area, buf, &app.view.theme);
     if focus != ChatPanelFocus::Compose {
         buf.hide_cursor();
     }
     if app.view.composer.text_len() == 0 {
-        area.with(app.theme.muted)
+        area.with(app.view.theme.muted)
             .with(Ellipsis(true))
             .text(buf, &format!(" {}", app.config.ui.placeholder));
     }
@@ -2175,7 +2184,7 @@ fn draw_composer(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buf
 /// state (where only the server name shows). Failures take priority over the
 /// transient "Connecting" phase.
 fn connection_status_label(app: &App) -> Option<(&'static str, Style)> {
-    let theme = app.theme;
+    let theme = app.view.theme;
     if app.is_offline() {
         Some(("Offline", theme.status_fill.patch(theme.error)))
     } else if app.user_id.is_none() {

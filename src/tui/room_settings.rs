@@ -40,9 +40,13 @@ impl AppMode for RoomSettingsMode {
         else {
             return;
         };
-        let body =
-            crate::tui::render::draw_form_dialog_frame(panel, buf, &app.theme, &self.draft.title());
-        self.draft.render(body, buf, &app.theme);
+        let body = crate::tui::render::draw_form_dialog_frame(
+            panel,
+            buf,
+            &app.view.theme,
+            &self.draft.title(),
+        );
+        self.draft.render(body, buf, &app.view.theme);
         crate::tui::render::draw_overlay_key_preview(app, bindings::FORM_LAYER, buf);
     }
 
@@ -50,13 +54,13 @@ impl AppMode for RoomSettingsMode {
         if is_quit_key(&key) {
             return Action::Quit;
         }
-        let event = self.draft.handle_key(key, &app.theme);
+        let event = self.draft.handle_key(key, &app.view.theme);
         self.handle_event(app, event);
         Action::Continue
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let event = self.draft.handle_mouse(mouse, &app.theme);
+        let event = self.draft.handle_mouse(mouse, &app.view.theme);
         self.handle_event(app, event);
         Action::Continue
     }

@@ -70,7 +70,7 @@ impl WelcomeMode {
         let output = welcome::welcome_logic(
             &mut self.form,
             &mut self.draft,
-            &app.theme,
+            &app.view.theme,
             &app.config.bindings,
             intent,
             commit,
@@ -124,7 +124,7 @@ impl WelcomeMode {
         welcome::draw_welcome(
             area,
             buf,
-            &app.theme,
+            &app.view.theme,
             &app.config.bindings,
             &mut self.draft,
             &mut self.form,
@@ -236,7 +236,7 @@ pub(crate) fn resolve_binding(app: &mut App, layer: LayerId, key: KeyEvent) -> B
     match bindings::resolve(
         &app.config.bindings.router,
         layer,
-        &mut app.chrome.binding.pending_chord,
+        &mut app.view.chrome.binding.pending_chord,
         input,
     ) {
         Resolved::Action(id) => {
@@ -569,13 +569,13 @@ impl AppMode for ServerEditMode {
         if is_quit_key(&key) {
             return Action::Quit;
         }
-        let event = self.draft.handle_key(key, &app.theme);
+        let event = self.draft.handle_key(key, &app.view.theme);
         self.handle_event(app, event);
         Action::Continue
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let event = self.draft.handle_mouse(mouse, &app.theme);
+        let event = self.draft.handle_mouse(mouse, &app.view.theme);
         self.handle_event(app, event);
         Action::Continue
     }
@@ -1165,6 +1165,7 @@ impl RoomMode {
                     mouse.row,
                 );
         let transfer_hit = app
+            .view
             .chrome
             .transfer_buttons
             .iter()
@@ -1184,7 +1185,7 @@ impl RoomMode {
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
                 if crate::tui::form::rect_contains(
-                    app.chrome.lobby_bar.audio_reset,
+                    app.view.chrome.lobby_bar.audio_reset,
                     mouse.column,
                     mouse.row,
                 ) =>
@@ -2090,7 +2091,7 @@ mod tests {
             "terminal label missing: {screen}"
         );
         assert!(
-            app.chrome.transfer_buttons.is_empty(),
+            app.view.chrome.transfer_buttons.is_empty(),
             "a terminal transfer must not offer a cancel/skip button"
         );
     }
@@ -2113,11 +2114,11 @@ mod tests {
 
         room.process_input(&mut app, key('x'));
         assert_eq!(app.view.composer.text(), "");
-        assert!(app.chrome.binding.pending_chord.is_some());
+        assert!(app.view.chrome.binding.pending_chord.is_some());
 
         room.process_input(&mut app, key('z'));
         assert_eq!(app.view.composer.text(), "");
-        assert!(app.chrome.binding.pending_chord.is_none());
+        assert!(app.view.chrome.binding.pending_chord.is_none());
     }
 
     #[test]
@@ -2170,7 +2171,7 @@ mod tests {
         room.process_input(&mut app, key('z'));
 
         assert_eq!(app.view.composer.text(), "");
-        assert!(app.chrome.binding.pending_chord.is_some());
+        assert!(app.view.chrome.binding.pending_chord.is_some());
     }
 
     #[test]
@@ -2513,8 +2514,8 @@ mod tests {
             app.view.take_pending_clipboard().as_deref(),
             Some("first\nsecond")
         );
-        assert_eq!(app.status.text(), "copied to clipboard");
-        assert_eq!(app.status.kind(), crate::app::StatusKind::Info);
+        assert_eq!(app.view.status.text(), "copied to clipboard");
+        assert_eq!(app.view.status.kind(), crate::app::StatusKind::Info);
         assert!(!app.view.active.chat.has_visual(), "yank exits visual mode");
     }
 
@@ -3111,7 +3112,7 @@ mod tests {
                 layout.lobby_divider_rect.x,
                 layout.lobby_divider_rect.y
             ),
-            app.theme.status_fill,
+            app.view.theme.status_fill,
         );
     }
 
@@ -3159,7 +3160,7 @@ mod tests {
         assert_eq!(room.lobby_list_focus(), LobbyListFocus::Users);
         room.process_input(&mut app, key('j'));
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
-        assert_eq!(app.status.text(), "no users in the current room yet");
+        assert_eq!(app.view.status.text(), "no users in the current room yet");
     }
 
     #[test]
@@ -3217,7 +3218,7 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
         );
 
-        assert_eq!(app.status.text(), "focus users list to adjust volume");
+        assert_eq!(app.view.status.text(), "focus users list to adjust volume");
     }
 
     #[test]
