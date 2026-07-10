@@ -36,6 +36,13 @@ export type Fragment =
 export interface WebMessage {
   id: number;
   sender: string;
+  // Original plaintext body. It is used only as textarea input for editing;
+  // rendered message content continues to come from the safe fragments below.
+  body: string;
+  // Whether the host client authored this message, and whether its displayed
+  // body is the folded result of an edit.
+  local: boolean;
+  edited: boolean;
   timestamp_ms: number;
   attachment: WebAttachment | null;
   // The file transfer id for a file message, else null. A message with both
@@ -43,8 +50,8 @@ export interface WebMessage {
   // transfer ids alone are reused after server restarts.
   file_id: number | null;
   // The chat message id (distinct from `id`, which collapses to the transfer id
-  // for file messages). With timestamp_ms it is the key `@@` references target.
-  // Zero when unknown.
+  // for file messages). This is the durable key `@@` references and mutations
+  // target. Zero when unknown.
   message_id: number;
   // Precomputed `@@` reference code (without the prefix) for copying/quoting a
   // reference to this message. Empty when the message is not referenceable.
@@ -110,7 +117,9 @@ export type ServerEnvelope =
       readonly: boolean;
       autoplay: AutoplayMode;
       viewer_in_seperate_browser_tab: boolean;
-    };
+    }
+  // A deletion request was rejected by the local client or room server.
+  | { type: "delete_error"; target: number; message: string };
 
 // A screen share this browser can watch.
 export interface ShareInfo {
@@ -131,6 +140,8 @@ export type ClientRequest =
   | { type: "play_share"; stream_id: number }
   | { type: "stop_share"; stream_id: number }
   | { type: "send_message"; body: string }
+  | { type: "edit_message"; target: number; body: string }
+  | { type: "delete_message"; target: number }
   | { type: "upload_start"; upload_id: number; name: string; size: number }
   | { type: "upload_finish"; upload_id: number }
   | { type: "abort_transfer"; transfer_id: number };

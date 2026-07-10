@@ -98,6 +98,108 @@ body {
   font-size: 14px;
 }
 
+.action-error {
+  position: absolute;
+  top: var(--space);
+  right: var(--space);
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: var(--space);
+  max-width: min(480px, calc(100% - 2 * var(--space)));
+  padding: 8px 10px 8px 14px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 14px;
+}
+
+.action-error-dismiss {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.action-error-dismiss:hover,
+.action-error-dismiss:focus-visible {
+  background: var(--accent);
+  color: var(--text);
+}
+
+.action-error-dismiss:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
+}
+
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: var(--space-lg);
+  background: rgb(0 0 0 / 60%);
+}
+
+.confirm-dialog {
+  width: min(420px, 100%);
+  padding: var(--space-lg);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: 0 12px 36px rgb(0 0 0 / 45%);
+}
+
+.confirm-dialog h2 {
+  margin: 0;
+  color: var(--text-sender);
+  font-size: 16px;
+}
+
+.confirm-dialog p {
+  margin: var(--space) 0 var(--space-lg);
+  color: var(--text-dim);
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space);
+}
+
+.confirm-button {
+  min-width: 84px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+}
+
+.confirm-button:hover,
+.confirm-button:focus-visible {
+  border-color: var(--text-dim);
+  background: var(--accent);
+}
+
+.confirm-button.is-destructive {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.confirm-button:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 2px;
+}
+
 /* Hover preview for a resolved `@@` reference pill. Fixed viewport coordinates
  * are set inline by the hover handler; max size must stay in sync with the
  * REF_HOVER_MAX_* constants in App.tsx. Pointer-inert so the card can never
@@ -252,6 +354,12 @@ body {
 .message-sender {
   color: var(--text-sender);
   font-weight: 600;
+}
+
+.message-edited {
+  color: var(--text-dim);
+  font-size: 0.9em;
+  font-weight: 400;
 }
 
 /* Every sender header has a persistent, full-size group control at the far
@@ -876,6 +984,11 @@ body {
   background: var(--accent);
 }
 
+.message-action.is-destructive:hover,
+.message-action.is-destructive:focus-visible {
+  color: var(--warn);
+}
+
 .message-action:focus-visible {
   outline: 1px solid var(--text-dim);
   outline-offset: 1px;
@@ -1427,6 +1540,39 @@ body {
   outline-offset: -4px;
 }
 
+.composer-editing {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 24px;
+  margin-left: calc(var(--gutter) - var(--space-lg));
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.composer-edit-cancel {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.composer-edit-cancel:hover,
+.composer-edit-cancel:focus-visible {
+  color: var(--text);
+  background: var(--accent);
+}
+
+.composer-edit-cancel:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
+}
+
 /* Hidden together with the chat log when a share fills the screen. */
 .app-main.is-share-fullscreen .composer {
   display: none;
@@ -1487,6 +1633,10 @@ body {
   align-items: flex-start;
   gap: var(--space);
   min-width: 0;
+}
+
+.composer.is-editing .composer-input-row {
+  padding-left: calc(var(--gutter) - var(--space-lg));
 }
 
 .composer-attach {

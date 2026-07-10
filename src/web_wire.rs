@@ -340,14 +340,17 @@ pub fn encode_single(message: &WebMessage) -> Vec<u8> {
     buf
 }
 
-/// Encodes one message: identity, optional attachment, optional file id, then
-/// its fragments.
+/// Encodes one message: identity, author/display state, optional attachment,
+/// optional file id, then its fragments.
 fn encode_message(buf: &mut Vec<u8>, message: &WebMessage) {
     put_u64(buf, message.id);
     put_u64(buf, message.timestamp_ms);
     put_u64(buf, message.message_id);
     put_str(buf, &message.ref_code);
     put_str(buf, &message.sender);
+    put_str(buf, &message.body);
+    buf.push(u8::from(message.local));
+    buf.push(u8::from(message.edited));
     match &message.attachment {
         None => buf.push(0),
         Some(attachment) => {
@@ -431,6 +434,9 @@ pub(crate) struct DecodedWindow {
 #[cfg(test)]
 pub(crate) struct DecodedMessage {
     pub sender: String,
+    pub body: String,
+    pub local: bool,
+    pub edited: bool,
     pub attachment_name: Option<String>,
     pub fragments: Vec<Fragment>,
 }
@@ -507,6 +513,9 @@ impl Reader<'_> {
         let _message_id = self.u64();
         let _ref_code = self.string();
         let sender = self.string();
+        let body = self.string();
+        let local = self.u8() == 1;
+        let edited = self.u8() == 1;
         let attachment_name = if self.u8() == 1 {
             let name = self.string();
             let _kind = self.u8();
@@ -540,6 +549,9 @@ impl Reader<'_> {
             .collect();
         DecodedMessage {
             sender,
+            body,
+            local,
+            edited,
             attachment_name,
             fragments,
         }
@@ -693,6 +705,18 @@ mod tests {
         let frame = encode_single(&WebMessage::text_for_test(9, "solo"));
         assert_eq!(&frame[0..4], &SENTINEL);
         assert_eq!(frame[4], KIND_MESSAGE);
+    }
+
+    #[test]
+    fn message_frame_carries_plaintext_author_and_edit_state() {
+        let mut message = WebMessage::text_for_test(9, "revised");
+        message.local = true;
+        message.edited = true;
+        let decoded = decode_single(&encode_single(&message));
+
+        assert_eq!(decoded.body, "revised");
+        assert!(decoded.local);
+        assert!(decoded.edited);
     }
 
     #[test]

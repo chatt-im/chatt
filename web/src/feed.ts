@@ -11,6 +11,7 @@ const KIND_SYNC = 1;
 const KIND_MESSAGE = 2;
 const KIND_OLDER = 3;
 const KIND_REF_PREVIEW = 4;
+const KIND_DELETE = 5;
 
 const FRAG_TEXT = 0;
 const FRAG_CODE = 1;
@@ -25,6 +26,7 @@ export type FeedFrame =
   | { kind: "sync"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
   | { kind: "older"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
   | { kind: "message"; message: WebMessage }
+  | { kind: "delete"; message_id: number }
   // The response to a `ref_preview` request: the echoed reference key and the
   // target message, or null when the feed history no longer holds it.
   | { kind: "ref_preview"; ts: number; mid: number; message: WebMessage | null };
@@ -44,6 +46,9 @@ export function decodeFeed(buffer: ArrayBuffer): FeedFrame | null {
     const mid = reader.u53();
     const message = reader.u8() === 1 ? reader.message() : null;
     return { kind: "ref_preview", ts, mid, message };
+  }
+  if (kind === KIND_DELETE) {
+    return { kind: "delete", message_id: reader.u53() };
   }
   // Unknown kinds (newer server) must not fall into the window parser.
   if (kind !== KIND_SYNC && kind !== KIND_OLDER) return null;
@@ -98,6 +103,9 @@ class Reader {
     const message_id = this.u53();
     const ref_code = this.string();
     const sender = this.string();
+    const body = this.string();
+    const local = this.u8() === 1;
+    const edited = this.u8() === 1;
     let attachment: WebMessage["attachment"] = null;
     if (this.u8() === 1) {
       const name = this.string();
@@ -138,6 +146,18 @@ class Reader {
           throw new Error(`unknown chat fragment kind ${kind}`);
       }
     }
-    return { id, sender, timestamp_ms, attachment, file_id, message_id, ref_code, fragments };
+    return {
+      id,
+      sender,
+      body,
+      local,
+      edited,
+      timestamp_ms,
+      attachment,
+      file_id,
+      message_id,
+      ref_code,
+      fragments,
+    };
   }
 }
