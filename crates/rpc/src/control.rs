@@ -240,6 +240,14 @@ pub enum ServerControl {
     Chat {
         message: ChatMessage,
     },
+    /// The server refused an edit/delete request before broadcasting a
+    /// mutation record.
+    ChatMutationRejected {
+        room_id: RoomId,
+        target: MessageId,
+        kind: ChatMutationKind,
+        message: String,
+    },
     /// A session began publishing voice in the room. `session_id` is how a
     /// client recognizes its own stream: the same user may hold several
     /// sessions, so matching on `user_id` would adopt another device's stream.
@@ -370,6 +378,14 @@ pub enum ServerControl {
         client_transfer_id: FileTransferId,
         reason: String,
     },
+}
+
+/// The operation named by [`ServerControl::ChatMutationRejected`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary)]
+pub enum ChatMutationKind {
+    Edit,
+    Delete,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -1277,6 +1293,20 @@ mod tests {
                 voice_status: ParticipantVoiceStatus::default(),
             }],
             default_room: RoomId(1),
+        };
+
+        let encoded = encode_server_control(&control);
+
+        assert_eq!(decode_server_control(&encoded).unwrap(), control);
+    }
+
+    #[test]
+    fn chat_mutation_rejection_round_trips_target_and_kind() {
+        let control = ServerControl::ChatMutationRejected {
+            room_id: RoomId(3),
+            target: MessageId(42),
+            kind: ChatMutationKind::Delete,
+            message: "message is too old".to_string(),
         };
 
         let encoded = encode_server_control(&control);

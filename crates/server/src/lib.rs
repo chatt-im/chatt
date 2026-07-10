@@ -24,14 +24,14 @@ use ring::rand::SecureRandom;
 use ring::signature::KeyPair;
 use rpc::{
     control::{
-        self, ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_BUG_REPORT_REJECTED,
-        ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
-        ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
-        ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata, InviteTicket,
-        MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES, MAX_FILE_CHUNK_BYTES, MessageFlags,
-        P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind, ServerControl,
-        UserSummary, decode_client_control, decode_client_hello, encode_invite_ticket,
-        encode_server_control, encode_server_hello, max_file_wire_bytes,
+        self, ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
+        ERROR_BUG_REPORT_REJECTED, ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST,
+        ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED,
+        ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata,
+        InviteTicket, MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES, MAX_FILE_CHUNK_BYTES,
+        MessageFlags, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind,
+        ServerControl, UserSummary, decode_client_control, decode_client_hello,
+        encode_invite_ticket, encode_server_control, encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims,
@@ -3082,8 +3082,7 @@ impl Server {
     /// Applies an edit or delete of a recent message. Retained targets also get
     /// ownership and operation checks; without a retained target the server
     /// broadcasts the mutation for clients to validate against their copies.
-    /// Rejections drop the request with a log line because there is no mutation
-    /// error channel back to the client.
+    /// Retained-state rejections are reported directly to the requester.
     fn mutate_chat(
         &mut self,
         session_id: SessionId,
@@ -3110,7 +3109,13 @@ impl Server {
                 room_id = room_id.0,
                 error = "room not accessible"
             );
-            return Ok(());
+            return self.reject_chat_mutation(
+                session_id,
+                room_id,
+                target,
+                kind,
+                "message is unavailable".to_string(),
+            );
         }
         if let Err(denied) = self.store.validate_mutation(room_id, target, sender, kind) {
             kvlog::warn!(
@@ -3120,7 +3125,34 @@ impl Server {
                 target = target.0,
                 error = denied.as_str()
             );
-            return Ok(());
+            let message = match (kind, denied) {
+                (_, room_store::MutationDenied::TargetMissing) => {
+                    "message is too old or no longer available"
+                }
+                (MutationKind::Edit, room_store::MutationDenied::WrongSender) => {
+                    "you can only edit your own messages"
+                }
+                (MutationKind::Delete, room_store::MutationDenied::WrongSender) => {
+                    "you can only delete your own messages"
+                }
+                (MutationKind::Edit, room_store::MutationDenied::FileMessage) => {
+                    "file messages cannot be edited"
+                }
+                (_, room_store::MutationDenied::MutationRecord) => {
+                    "message mutations cannot be changed"
+                }
+                (_, room_store::MutationDenied::Deleted) => "message was already deleted",
+                (MutationKind::Delete, room_store::MutationDenied::FileMessage) => {
+                    "message cannot be deleted"
+                }
+            };
+            return self.reject_chat_mutation(
+                session_id,
+                room_id,
+                target,
+                kind,
+                message.to_string(),
+            );
         }
         let mut flags = MessageFlags::default();
         match kind {
@@ -3150,6 +3182,32 @@ impl Server {
         );
         self.broadcast_control(room_id, &ServerControl::Chat { message });
         Ok(())
+    }
+
+    fn reject_chat_mutation(
+        &mut self,
+        session_id: SessionId,
+        room_id: RoomId,
+        target: MessageId,
+        kind: MutationKind,
+        message: String,
+    ) -> Result<(), String> {
+        let token = self
+            .live_token_for_session(session_id)
+            .ok_or_else(|| "mutation requester disconnected".to_string())?;
+        let kind = match kind {
+            MutationKind::Edit => ChatMutationKind::Edit,
+            MutationKind::Delete => ChatMutationKind::Delete,
+        };
+        self.send_control_to_token(
+            token,
+            &ServerControl::ChatMutationRejected {
+                room_id,
+                target,
+                kind,
+                message,
+            },
+        )
     }
 
     fn start_file_upload(
@@ -5731,6 +5789,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::Authenticated { .. } => "authenticated",
         ServerControl::OpenPaired { .. } => "open_paired",
         ServerControl::Chat { .. } => "chat",
+        ServerControl::ChatMutationRejected { .. } => "chat_mutation_rejected",
         ServerControl::Presence { .. } => "presence",
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
@@ -6589,6 +6648,40 @@ mod tests {
             )
             .unwrap();
         assert_no_control(&mut sender_peer);
+        let rejected = read_until(&mut reader_peer, |control| {
+            matches!(control, ServerControl::ChatMutationRejected { .. })
+        });
+        assert!(matches!(
+            rejected,
+            ServerControl::ChatMutationRejected {
+                room_id: RoomId(1),
+                target: rejected_target,
+                kind: ChatMutationKind::Edit,
+                ..
+            } if rejected_target == target
+        ));
+
+        server
+            .mutate_chat(
+                reader,
+                RoomId(1),
+                target,
+                MutationKind::Delete,
+                String::new(),
+            )
+            .unwrap();
+        let rejected = read_until(&mut reader_peer, |control| {
+            matches!(control, ServerControl::ChatMutationRejected { .. })
+        });
+        assert!(matches!(
+            rejected,
+            ServerControl::ChatMutationRejected {
+                room_id: RoomId(1),
+                target: rejected_target,
+                kind: ChatMutationKind::Delete,
+                ..
+            } if rejected_target == target
+        ));
 
         server
             .mutate_chat(

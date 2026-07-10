@@ -2494,6 +2494,24 @@ impl RoomSession {
             return Err(EditDenied::NoMessage);
         };
         let entry = self.active.chat.message(cursor.message);
+        self.validate_edit_entry(entry)?;
+        let target = MessageId(entry.id);
+        let original = entry.body.clone();
+        let parked_draft = self.composer.text();
+        self.composer.set_lines(&original);
+        if self.bindings == DefaultBindings::Standard {
+            self.composer.set_cursor_offset(self.composer.text_len());
+        }
+        self.pending_edit = Some(PendingEdit {
+            room_id,
+            target,
+            original,
+            parked_draft,
+        });
+        Ok(())
+    }
+
+    fn validate_edit_entry(&self, entry: &crate::chat_buffer::ChatEntry) -> Result<(), EditDenied> {
         if entry.id == 0 {
             return Err(EditDenied::Notice);
         }
@@ -2510,20 +2528,56 @@ impl RoomSession {
         {
             return Err(EditDenied::TooOld);
         }
-        let target = MessageId(entry.id);
-        let original = entry.body.clone();
-        let parked_draft = self.composer.text();
-        self.composer.set_lines(&original);
-        if self.bindings == DefaultBindings::Standard {
-            self.composer.set_cursor_offset(self.composer.text_len());
-        }
-        self.pending_edit = Some(PendingEdit {
-            room_id,
-            target,
-            original,
-            parked_draft,
-        });
         Ok(())
+    }
+
+    /// Validates an id-addressed edit requested by a writable browser view and
+    /// returns the room it belongs to. The browser never controls room routing.
+    pub(crate) fn validate_web_edit(&self, target: MessageId) -> Result<RoomId, EditDenied> {
+        let room_id = self.viewed_room.ok_or(EditDenied::NoMessage)?;
+        let index = self
+            .active
+            .chat
+            .find_message(target.0)
+            .ok_or(EditDenied::NoMessage)?;
+        self.validate_edit_entry(self.active.chat.message(index))?;
+        Ok(room_id)
+    }
+
+    fn delete_denied(&self, entry: &crate::chat_buffer::ChatEntry) -> Option<DeleteDenied> {
+        if entry.id == 0 {
+            return Some(DeleteDenied::Notice);
+        }
+        if !entry.local {
+            return Some(DeleteDenied::NotYours);
+        }
+        let normal_records = self
+            .active
+            .messages
+            .records_from(entry.id)
+            .unwrap_or(usize::MAX);
+        let mutation_records = self
+            .active
+            .seen_mutations
+            .iter()
+            .filter(|id| **id > entry.id)
+            .count();
+        (normal_records.saturating_add(mutation_records) > rpc::control::MUTATION_WINDOW_MESSAGES)
+            .then_some(DeleteDenied::TooOld)
+    }
+
+    /// Validates an id-addressed delete requested by a writable browser view.
+    pub(crate) fn validate_web_delete(&self, target: MessageId) -> Result<RoomId, DeleteDenied> {
+        let room_id = self.viewed_room.ok_or(DeleteDenied::NoMessage)?;
+        let index = self
+            .active
+            .chat
+            .find_message(target.0)
+            .ok_or(DeleteDenied::NoMessage)?;
+        if let Some(denied) = self.delete_denied(self.active.chat.message(index)) {
+            return Err(denied);
+        }
+        Ok(room_id)
     }
 
     /// Collects deletable messages under the cursor or visual-line selection.
@@ -2543,26 +2597,7 @@ impl RoomSession {
         let mut targets = Vec::new();
         for index in indexes.iter().copied() {
             let entry = self.active.chat.message(index);
-            let denied = if entry.id == 0 {
-                Some(DeleteDenied::Notice)
-            } else if !entry.local {
-                Some(DeleteDenied::NotYours)
-            } else {
-                let normal_records = self
-                    .active
-                    .messages
-                    .records_from(entry.id)
-                    .unwrap_or(usize::MAX);
-                let mutation_records = self
-                    .active
-                    .seen_mutations
-                    .iter()
-                    .filter(|id| **id > entry.id)
-                    .count();
-                (normal_records.saturating_add(mutation_records)
-                    > rpc::control::MUTATION_WINDOW_MESSAGES)
-                    .then_some(DeleteDenied::TooOld)
-            };
+            let denied = self.delete_denied(entry);
             if let Some(denied) = denied {
                 first_denied.get_or_insert(denied);
             } else {

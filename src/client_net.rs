@@ -28,13 +28,14 @@ use mio::{
 use ring::rand::SecureRandom;
 use rpc::{
     control::{
-        ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_PAIRING_CODE_MISMATCH,
-        ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH,
-        ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH,
-        FileContentEncoding, FileMetadata, MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate,
-        P2pCandidateKind, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, ParticipantVoiceStatus,
-        RoomInfo, ServerControl, UserSummary, decode_server_control, decode_server_hello,
-        encode_client_control, encode_client_hello, max_file_wire_bytes,
+        ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
+        ERROR_PAIRING_CODE_MISMATCH, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
+        ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
+        ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata, MAX_FILE_CHUNK_BYTES,
+        MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey, P2pNatKind, P2pPeerInfo,
+        P2pRole, ParticipantVoiceStatus, RoomInfo, ServerControl, UserSummary,
+        decode_server_control, decode_server_hello, encode_client_control, encode_client_hello,
+        max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, RecordProtection, SessionTransport,
@@ -543,6 +544,12 @@ pub enum NetworkEvent {
         complete: bool,
     },
     Chat(ChatMessage),
+    ChatMutationRejected {
+        room_id: RoomId,
+        target: MessageId,
+        kind: ChatMutationKind,
+        message: String,
+    },
     FileReceived {
         metadata: FileMetadata,
         /// The name the file is served under (`/files/<served_name>` in the web
@@ -4365,6 +4372,25 @@ impl WorkerState {
                 );
                 let _ = self.events.send(NetworkEvent::Chat(message));
             }
+            ServerControl::ChatMutationRejected {
+                room_id,
+                target,
+                kind,
+                message,
+            } => {
+                kvlog::warn!(
+                    "chat mutation rejected",
+                    room_id = room_id.0,
+                    target = target.0,
+                    error = message.as_str()
+                );
+                let _ = self.events.send(NetworkEvent::ChatMutationRejected {
+                    room_id,
+                    target,
+                    kind,
+                    message,
+                });
+            }
             ServerControl::VoiceStarted {
                 room_id,
                 session_id,
@@ -6037,6 +6063,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::Authenticated { .. } => "authenticated",
         ServerControl::OpenPaired { .. } => "open_paired",
         ServerControl::Chat { .. } => "chat",
+        ServerControl::ChatMutationRejected { .. } => "chat_mutation_rejected",
         ServerControl::Presence { .. } => "presence",
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",

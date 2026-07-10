@@ -24,7 +24,7 @@ use extui::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use rpc::{
-    control::{ERROR_TOKEN_STALE_EPOCH, InviteTicket, ParticipantVoiceStatus},
+    control::{ChatMutationKind, ERROR_TOKEN_STALE_EPOCH, InviteTicket, ParticipantVoiceStatus},
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
 };
 
@@ -413,6 +413,9 @@ pub(crate) struct App {
     audio_events: AudioEventLog,
     /// The browser chat-log feed, present only when `[web] enabled = true`.
     web_feed: Option<crate::web_server::WebFeedSender>,
+    /// Web-originated deletes awaiting either a mutation echo or an explicit
+    /// server rejection, keyed by room because ids are room-local.
+    pending_web_deletes: HashSet<(RoomId, MessageId)>,
     /// The in-memory download ring buffer, shared with the network worker and
     /// the web server. Held app-wide so it survives web-server respawns.
     download_store: crate::receive_store::DownloadStore,
@@ -870,6 +873,14 @@ fn share_error_envelope(stream_id: StreamId, message: &str) -> String {
     }
 }
 
+fn delete_error_envelope(target: MessageId, message: &str) -> String {
+    jsony::object! {
+        type: "delete_error",
+        target: target.0,
+        message: message,
+    }
+}
+
 /// Starts the web server and a relay thread that forwards browser requests into
 /// the app event channel, returning the feed handle. The relay bridges the
 /// otherwise one-directional web feed so a browser play click reaches the app.
@@ -878,6 +889,7 @@ fn share_error_envelope(stream_id: StreamId, message: &str) -> String {
 fn web_room_messages(
     view: &crate::room_history::LoadedHistory,
     room: &RoomSession,
+    local_user: Option<UserId>,
 ) -> Vec<crate::web_server::WebMessage> {
     let resolver = |target| room.web_ref_for(target);
     let mut messages = Vec::with_capacity(view.messages.len());
@@ -892,10 +904,11 @@ fn web_room_messages(
                     &detail.file_name,
                     detail.length,
                     detail.dimensions(),
+                    local_user,
                 ),
-                None => crate::web_server::WebMessage::from_chat(message, &resolver),
+                None => crate::web_server::WebMessage::from_chat(message, &resolver, local_user),
             },
-            None => crate::web_server::WebMessage::from_chat(message, &resolver),
+            None => crate::web_server::WebMessage::from_chat(message, &resolver, local_user),
         };
         messages.push(web_message);
     }
@@ -1107,6 +1120,7 @@ impl App {
             supervisor: SupervisorState::default(),
             audio_events: AudioEventLog::default(),
             web_feed,
+            pending_web_deletes: HashSet::new(),
             download_store,
             screencast: None,
             cached_screencast_start: None,
@@ -1494,6 +1508,43 @@ impl App {
             crate::web_server::WebRequest::SendChat { body } => {
                 self.send_chat_to_viewed(body);
             }
+            crate::web_server::WebRequest::EditChat { target, body } => {
+                let target = MessageId(target);
+                match self.room.validate_web_edit(target) {
+                    Ok(room_id) if !body.trim().is_empty() => {
+                        self.send_network_command(
+                            NetworkCommand::EditChat {
+                                room_id,
+                                target,
+                                body,
+                            },
+                            true,
+                        );
+                    }
+                    Ok(_) => self.set_error("chat message is empty"),
+                    Err(denied) => self.set_error(denied.status()),
+                }
+            }
+            crate::web_server::WebRequest::DeleteChat { target } => {
+                let target = MessageId(target);
+                match self.room.validate_web_delete(target) {
+                    Ok(room_id) => {
+                        if self.network.is_none() {
+                            let message = "select a server before deleting messages";
+                            self.set_error(message);
+                            self.report_web_delete_error(target, message);
+                        } else {
+                            self.pending_web_deletes.insert((room_id, target));
+                            self.delete_chat_messages(room_id, vec![target]);
+                        }
+                    }
+                    Err(denied) => {
+                        let message = denied.status();
+                        self.set_error(message);
+                        self.report_web_delete_error(target, message);
+                    }
+                }
+            }
             crate::web_server::WebRequest::UploadFile { path, name } => {
                 self.send_network_command(
                     NetworkCommand::UploadFile(UploadFileRequest {
@@ -1507,6 +1558,12 @@ impl App {
             crate::web_server::WebRequest::CancelTransfer { transfer_id } => {
                 self.cancel_transfer(FileTransferId(transfer_id));
             }
+        }
+    }
+
+    fn report_web_delete_error(&self, target: MessageId, message: &str) {
+        if let Some(feed) = &self.web_feed {
+            feed.send_delete_error(delete_error_envelope(target, message));
         }
     }
 
@@ -1692,7 +1749,7 @@ impl App {
         }
         if let Some(feed) = &self.web_feed {
             let view = self.room.viewed_history();
-            feed.set_room(web_room_messages(&view, &self.room));
+            feed.set_room(web_room_messages(&view, &self.room, self.user_id));
         }
         self.active_tcp_addr = Some(
             server
@@ -1765,7 +1822,7 @@ impl App {
     fn sync_viewed_room_to_feeds(&mut self) {
         if let Some(feed) = &self.web_feed {
             let view = self.room.viewed_history();
-            feed.set_room(web_room_messages(&view, &self.room));
+            feed.set_room(web_room_messages(&view, &self.room, self.user_id));
         }
         if let Some(room_id) = self.room.viewed_room {
             self.send_network_command(NetworkCommand::SetActiveRoom(room_id), false);
@@ -2484,6 +2541,25 @@ impl App {
                     self.room.abort_history_fetch(room_id, before);
                 }
             }
+            NetworkEvent::ChatMutationRejected {
+                room_id,
+                target,
+                kind,
+                message,
+            } => {
+                kvlog::warn!(
+                    "chat mutation rejected",
+                    room_id = room_id.0,
+                    target = target.0,
+                    error = message.as_str()
+                );
+                self.set_error(&message);
+                if kind == ChatMutationKind::Delete
+                    && self.pending_web_deletes.remove(&(room_id, target))
+                {
+                    self.report_web_delete_error(target, &message);
+                }
+            }
             NetworkEvent::Chat(message) => {
                 let viewed = self.room.viewed_room == Some(message.room_id);
                 if message.target.is_some() {
@@ -2494,12 +2570,17 @@ impl App {
                     if update.read_advanced {
                         self.mark_room_catalog_dirty();
                     }
+                    if matches!(&update.outcome, MutationOutcome::AppliedDelete) {
+                        let target = message.target.expect("mutation record");
+                        self.pending_web_deletes.remove(&(message.room_id, target));
+                    }
                     if viewed && let Some(feed) = &self.web_feed {
                         match update.outcome {
                             MutationOutcome::AppliedEdit(folded) => {
                                 feed.send(crate::web_server::WebMessage::from_chat(
                                     &folded,
                                     &|target| self.room.web_ref_for(target),
+                                    self.user_id,
                                 ));
                             }
                             MutationOutcome::AppliedDelete => {
@@ -2528,6 +2609,7 @@ impl App {
                     feed.send(crate::web_server::WebMessage::from_chat(
                         &message,
                         &|target| self.room.web_ref_for(target),
+                        self.user_id,
                     ));
                 }
                 if !update.local {
@@ -2546,6 +2628,7 @@ impl App {
                         &metadata,
                         &served_name,
                         dimensions,
+                        self.user_id,
                     ));
                 }
                 self.room
@@ -6108,6 +6191,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::DmOpened { .. } => "dm_opened",
         NetworkEvent::HistoryChunk { .. } => "history_chunk",
         NetworkEvent::Chat(_) => "chat",
+        NetworkEvent::ChatMutationRejected { .. } => "chat_mutation_rejected",
         NetworkEvent::FileReceived { .. } => "file_received",
         NetworkEvent::TransferProgress { .. } => "transfer_progress",
         NetworkEvent::TransferEnded { .. } => "transfer_ended",
@@ -7733,6 +7817,61 @@ mod tests {
             "deletion waits for server echo"
         );
         assert_eq!(h.app.status.text(), "deleting 2 messages");
+    }
+
+    #[test]
+    fn writable_web_mutations_route_through_current_room_validation() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+        app.room.chat_received(
+            rpc::control::ChatMessage {
+                message_id: MessageId(7),
+                room_id: RoomId(1),
+                sender: UserId(1),
+                sender_name: "alice".to_string(),
+                timestamp_ms: 7_000,
+                body: "original".to_string(),
+                file_transfer_id: None,
+                flags: rpc::control::MessageFlags::default(),
+                target: None,
+            },
+            app.user_id,
+        );
+
+        app.handle_web_request(crate::web_server::WebRequest::EditChat {
+            target: 7,
+            body: "revised".to_string(),
+        });
+        match rx.try_recv().unwrap() {
+            NetworkCommand::EditChat {
+                room_id: RoomId(1),
+                target: MessageId(7),
+                body,
+            } => assert_eq!(body, "revised"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        app.handle_web_request(crate::web_server::WebRequest::DeleteChat { target: 7 });
+        match rx.try_recv().unwrap() {
+            NetworkCommand::DeleteChat {
+                room_id: RoomId(1),
+                target: MessageId(7),
+            } => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        app.pending_web_deletes.insert((RoomId(1), MessageId(7)));
+        app.handle_network_event(NetworkEvent::ChatMutationRejected {
+            room_id: RoomId(1),
+            target: MessageId(7),
+            kind: ChatMutationKind::Delete,
+            message: "message is too old".to_string(),
+        });
+        assert!(!app.pending_web_deletes.contains(&(RoomId(1), MessageId(7))));
+        assert_eq!(app.status.text(), "message is too old");
     }
 
     #[test]

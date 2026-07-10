@@ -68,16 +68,31 @@ const PREVIEW_HISTORY_LIMIT = 16;
 // only the first carries the sender/time header (Discord-style).
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
+// Mirror the client's conservative edit window and the protocol's hard
+// mutation window. The browser does not receive folded mutation records, so
+// these counts hide only messages that are unambiguously too old; Rust still
+// performs the authoritative preflight.
+const EDIT_ACTION_WINDOW = 200;
+const DELETE_ACTION_WINDOW = 256;
+
 type MessageGroupInfo = {
   key: string;
   continuation: boolean;
   messageCount: number;
   collapsed: boolean;
+  newestOffset: number;
 };
 
 type MessageList = {
   visible: WebMessage[];
   groups: Map<WebMessage, MessageGroupInfo>;
+};
+
+type PendingWebEdit = {
+  target: number;
+  original: string;
+  parkedDraft: string;
+  parkedFiles: File[];
 };
 
 function isMessageContinuation(
@@ -86,6 +101,8 @@ function isMessageContinuation(
 ): boolean {
   return (
     !!previous &&
+    !message.edited &&
+    !previous.edited &&
     previous.sender === message.sender &&
     message.timestamp_ms - previous.timestamp_ms < GROUP_WINDOW_MS
   );
@@ -128,6 +145,7 @@ function buildMessageList(
       continuation: false,
       messageCount,
       collapsed,
+      newestOffset: messages.length - start,
     });
 
     for (let index = start + 1; index < end; index++) {
@@ -137,6 +155,7 @@ function buildMessageList(
         continuation: true,
         messageCount,
         collapsed,
+        newestOffset: messages.length - index,
       });
       if (!collapsed) visible.push(child);
     }
@@ -950,6 +969,9 @@ function RefHoverCard(props: { hover: RefHoverState }) {
     <div class="ref-hover-card" style={style()} role="tooltip">
       <div class="ref-hover-meta">
         <span class="ref-hover-sender">{props.hover.message.sender}</span>
+        <Show when={props.hover.message.edited}>
+          <span class="message-edited">(edited)</span>
+        </Show>
         <span class="ref-hover-time">
           {formatTime(props.hover.message.timestamp_ms)}
         </span>
@@ -1000,12 +1022,25 @@ function MessageRow(props: {
   onOpenPreview: (item: PreviewItem, opener: HTMLElement) => void;
   onQuoteRef?: (refCode: string) => void;
   onAbortTransfer?: (transferId: number) => void;
+  onEdit?: (message: WebMessage) => void;
+  onDelete?: (message: WebMessage, opener: HTMLButtonElement) => void;
   autoplay: AutoplayMode;
 }) {
   // A continuation hides the header and shows its time only on hover, in the
   // reserved left gutter. Group metadata is projected reactively from the full
   // feed so prepended history can still change the boundary row's grouping.
   const continuation = () => props.group.continuation;
+  const canEdit = () =>
+    props.message.local &&
+    props.message.message_id !== 0 &&
+    props.message.file_id === null &&
+    props.group.newestOffset <= EDIT_ACTION_WINDOW &&
+    !!props.onEdit;
+  const canDelete = () =>
+    props.message.local &&
+    props.message.message_id !== 0 &&
+    props.group.newestOffset <= DELETE_ACTION_WINDOW &&
+    !!props.onDelete;
   const groupLabel = () => {
     const action = props.group.collapsed ? "Expand" : "Collapse";
     const noun = props.group.messageCount === 1 ? "message" : "messages";
@@ -1050,6 +1085,9 @@ function MessageRow(props: {
       <Show when={!continuation()}>
         <div class="message-meta">
           <span class="message-sender">{props.message.sender}</span>
+          <Show when={props.message.edited}>
+            <span class="message-edited">(edited)</span>
+          </Show>
           <Show when={props.group.collapsed}>
             <span class="message-group-summary">
               {props.group.messageCount}{" "}
@@ -1107,8 +1145,38 @@ function MessageRow(props: {
               : props.message.terminal!.verb}
           </div>
         </Show>
-        <Show when={props.message.ref_code}>
+        <Show
+          when={
+            props.message.ref_code ||
+            canEdit() ||
+            canDelete()
+          }
+        >
           <div class="message-actions">
+            <Show when={canEdit()}>
+              <button
+                class="message-action"
+                type="button"
+                aria-label="Edit message"
+                title="Edit"
+                onClick={() => props.onEdit!(props.message)}
+              >
+                <Icon name="pencil" />
+              </button>
+            </Show>
+            <Show when={canDelete()}>
+              <button
+                class="message-action is-destructive"
+                type="button"
+                aria-label="Delete message"
+                title="Delete"
+                onClick={(event) =>
+                  props.onDelete!(props.message, event.currentTarget)
+                }
+              >
+                <Icon name="trash-2" />
+              </button>
+            </Show>
             <Show when={props.onQuoteRef}>
               <button
                 class="message-action"
@@ -1120,18 +1188,91 @@ function MessageRow(props: {
                 <Icon name="corner-up-left" />
               </button>
             </Show>
-            <button
-              class="message-action"
-              type="button"
-              aria-label={refCopied() ? "Copied reference" : "Copy reference"}
-              title={refCopied() ? "Copied" : "Copy reference"}
-              onClick={copyRef}
-            >
-              <Icon name={refCopied() ? "check" : "at-sign"} />
-            </button>
+            <Show when={props.message.ref_code}>
+              <button
+                class="message-action"
+                type="button"
+                aria-label={refCopied() ? "Copied reference" : "Copy reference"}
+                title={refCopied() ? "Copied" : "Copy reference"}
+                onClick={copyRef}
+              >
+                <Icon name={refCopied() ? "check" : "at-sign"} />
+              </button>
+            </Show>
           </div>
         </Show>
       </Show>
+    </div>
+  );
+}
+
+function DeleteConfirmation(props: {
+  message: WebMessage;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  let cancelButton: HTMLButtonElement | undefined;
+  let deleteButton: HTMLButtonElement | undefined;
+
+  onMount(() => {
+    cancelButton?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        props.onCancel();
+        return;
+      }
+      if (event.key !== "Tab" || !cancelButton || !deleteButton) return;
+      if (event.shiftKey && document.activeElement === cancelButton) {
+        event.preventDefault();
+        deleteButton.focus();
+      } else if (!event.shiftKey && document.activeElement === deleteButton) {
+        event.preventDefault();
+        cancelButton.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    onCleanup(() => document.removeEventListener("keydown", onKeyDown));
+  });
+
+  return (
+    <div
+      class="confirm-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) props.onCancel();
+      }}
+    >
+      <section
+        class="confirm-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="delete-confirm-title"
+        aria-describedby="delete-confirm-description"
+      >
+        <h2 id="delete-confirm-title">Delete message?</h2>
+        <p id="delete-confirm-description">
+          This will permanently delete {props.message.sender}'s message from
+          the room.
+        </p>
+        <div class="confirm-actions">
+          <button
+            class="confirm-button"
+            type="button"
+            ref={cancelButton}
+            onClick={props.onCancel}
+          >
+            Cancel
+          </button>
+          <button
+            class="confirm-button is-destructive"
+            type="button"
+            ref={deleteButton}
+            onClick={props.onConfirm}
+          >
+            Delete
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
@@ -1167,6 +1308,7 @@ export default function App() {
     buildMessageList(messages(), collapsedGroups())
   );
   const [refToast, setRefToast] = createSignal<string | null>(null);
+  const [deleteError, setDeleteError] = createSignal<string | null>(null);
   const [refHover, setRefHover] = createSignal<RefHoverState | null>(null);
   const [connected, setConnected] = createSignal(false);
   const [connectionErrorVisible, setConnectionErrorVisible] =
@@ -1203,6 +1345,8 @@ export default function App() {
   const [viewerInSeparateBrowserTab, setViewerInSeparateBrowserTab] =
     createSignal(false);
   let previewOpener: HTMLElement | undefined;
+  let deleteOpener: HTMLButtonElement | undefined;
+  let deleteErrorTimer: number | undefined;
 
   const activePreview = () => {
     const key = activePreviewKey();
@@ -1265,6 +1409,8 @@ export default function App() {
   const [draft, setDraft] = createSignal("");
   // Files dragged onto the composer, held until the message is submitted.
   const [queued, setQueued] = createSignal<File[]>([]);
+  const [editing, setEditing] = createSignal<PendingWebEdit | null>(null);
+  const [pendingDelete, setPendingDelete] = createSignal<WebMessage | null>(null);
   const [dragActive, setDragActive] = createSignal(false);
   // A per-connection counter naming each upload so its chunk frames route to the
   // right server-side file.
@@ -1802,6 +1948,11 @@ export default function App() {
   let refHoverPendingKey: string | undefined;
   const refPreviewCache = new Map<string, WebMessage | null>();
 
+  function invalidateMessageReference(messageId: number) {
+    refPreviewCache.delete(refPreviewKey(0, messageId));
+    if (refHover()?.message.message_id === messageId) hideRefHover();
+  }
+
   function refPreviewKey(_ts: number, mid: number): string {
     return `${mid}`;
   }
@@ -1974,6 +2125,75 @@ export default function App() {
     sendJson({ type: "abort_transfer", transfer_id: transferId });
   }
 
+  function restoreParkedComposer(edit: PendingWebEdit) {
+    batch(() => {
+      setEditing(null);
+      setDraft(edit.parkedDraft);
+      setQueued(edit.parkedFiles);
+      setDragActive(false);
+    });
+    queueMicrotask(resizeComposer);
+  }
+
+  function cancelEdit() {
+    const edit = editing();
+    if (!edit) return;
+    restoreParkedComposer(edit);
+  }
+
+  function beginEdit(message: WebMessage) {
+    const current = editing();
+    const parkedDraft = current?.parkedDraft ?? draft();
+    const parkedFiles = current?.parkedFiles ?? queued();
+    batch(() => {
+      setEditing({
+        target: message.message_id,
+        original: message.body,
+        parkedDraft,
+        parkedFiles,
+      });
+      setDraft(message.body);
+      setQueued([]);
+      setDragActive(false);
+    });
+    queueMicrotask(() => {
+      resizeComposer();
+      composerTextEl?.focus();
+      composerTextEl?.setSelectionRange(message.body.length, message.body.length);
+    });
+  }
+
+  function deleteMessage(message: WebMessage, opener: HTMLButtonElement) {
+    deleteOpener = opener;
+    setPendingDelete(message);
+  }
+
+  function closeDeleteConfirmation(restoreFocus = true) {
+    setPendingDelete(null);
+    const opener = deleteOpener;
+    deleteOpener = undefined;
+    if (restoreFocus) {
+      queueMicrotask(() => opener?.isConnected && opener.focus());
+    }
+  }
+
+  function confirmDelete() {
+    const message = pendingDelete();
+    if (!message) return;
+    closeDeleteConfirmation(false);
+    if (editing()?.target === message.message_id) cancelEdit();
+    sendJson({ type: "delete_message", target: message.message_id });
+  }
+
+  function showDeleteError(message: string) {
+    setDeleteError(message);
+    if (deleteErrorTimer !== undefined) clearTimeout(deleteErrorTimer);
+    deleteErrorTimer = window.setTimeout(() => {
+      deleteErrorTimer = undefined;
+      setDeleteError(null);
+    }, 5000);
+  }
+
   function openSocketOrThrow(): WebSocket {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error("websocket is not open");
@@ -2110,6 +2330,17 @@ export default function App() {
   }
 
   function submitCompose() {
+    const edit = editing();
+    if (edit) {
+      const body = draft();
+      if (!body.trim()) return;
+      if (body !== edit.original) {
+        sendJson({ type: "edit_message", target: edit.target, body });
+      }
+      restoreParkedComposer(edit);
+      return;
+    }
+
     const body = draft().trim();
     const files = queued();
     if (!body && files.length === 0) return;
@@ -2121,6 +2352,11 @@ export default function App() {
   }
 
   function onComposeKeyDown(event: KeyboardEvent) {
+    if (event.key === "Escape" && editing()) {
+      event.preventDefault();
+      cancelEdit();
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       submitCompose();
@@ -2128,6 +2364,7 @@ export default function App() {
   }
 
   function onComposeDragOver(event: DragEvent) {
+    if (editing()) return;
     event.preventDefault();
     setDragActive(true);
   }
@@ -2138,6 +2375,7 @@ export default function App() {
   }
 
   function onComposeDrop(event: DragEvent) {
+    if (editing()) return;
     event.preventDefault();
     setDragActive(false);
     const files = event.dataTransfer
@@ -2147,12 +2385,14 @@ export default function App() {
   }
 
   function openComposeFileDialog() {
+    if (editing()) return;
     composerFileInputEl?.click();
   }
 
   function onComposeFileInput(
     event: Event & { currentTarget: HTMLInputElement }
   ) {
+    if (editing()) return;
     const files = Array.from(event.currentTarget.files ?? []);
     if (files.length > 0) setQueued((prev) => [...prev, ...files]);
     event.currentTarget.value = "";
@@ -2181,6 +2421,7 @@ export default function App() {
   }
 
   function onComposePaste(event: ClipboardEvent) {
+    if (editing()) return;
     const files = pastedImageFiles(event.clipboardData);
     if (files.length === 0) return;
     event.preventDefault();
@@ -2489,6 +2730,8 @@ export default function App() {
             frameHasMore: feed.has_more,
           });
           preloadRecentImages(feed.messages);
+          cancelEdit();
+          closeDeleteConfirmation(false);
           refPreviewCache.clear();
           setMessages(feed.messages);
           oldestSeq = feed.oldest_seq;
@@ -2529,11 +2772,25 @@ export default function App() {
           scheduleResumePendingJump();
         } else if (feed.kind === "ref_preview") {
           onRefPreview(feed.ts, feed.mid, feed.message);
+        } else if (feed.kind === "delete") {
+          invalidateMessageReference(feed.message_id);
+          if (editing()?.target === feed.message_id) cancelEdit();
+          if (pendingDelete()?.message_id === feed.message_id) {
+            closeDeleteConfirmation(false);
+          }
+          setMessages((prev) =>
+            prev.filter((message) => message.message_id !== feed.message_id)
+          );
+          pin();
         } else {
           // A live message. Upsert by the announcement timestamp and file id;
           // transfer ids are reused after server restarts, while the pair
           // identifies one file.
           const msg = feed.message;
+          if (msg.edited) {
+            invalidateMessageReference(msg.message_id);
+            if (editing()?.target === msg.message_id) cancelEdit();
+          }
           preloadImage(msg);
           if (msg.attachment?.kind === "video" && autoplay() !== "disabled") {
             msg.autoplay = autoplay();
@@ -2559,6 +2816,9 @@ export default function App() {
                 next[i] = msg;
                 return next;
               }
+              // An edit of a target outside this tab's loaded window updates
+              // the server-side backlog but must not appear as a new tail row.
+              if (msg.edited) return prev;
             }
             return [...prev, msg];
           });
@@ -2645,6 +2905,10 @@ export default function App() {
           return next;
         });
       } else if (env.type === "config") {
+        if (env.readonly) {
+          cancelEdit();
+          closeDeleteConfirmation(false);
+        }
         setReadonly(env.readonly);
         setAutoplay(env.autoplay);
         setViewerInSeparateBrowserTab(
@@ -2652,6 +2916,11 @@ export default function App() {
         );
       } else if (env.type === "share_error") {
         setShareError(env.stream_id, env.message);
+      } else if (env.type === "delete_error") {
+        if (pendingDelete()?.message_id === env.target) {
+          closeDeleteConfirmation(false);
+        }
+        showDeleteError(env.message);
       } else if (env.type === "share_ended") {
         setShares((prev) => prev.filter((s) => s.stream_id !== env.stream_id));
         clearShareError(env.stream_id);
@@ -2673,6 +2942,8 @@ export default function App() {
         was_clean: event.wasClean,
       });
       setConnected(false);
+      cancelEdit();
+      closeDeleteConfirmation(false);
       scheduleConnectionError();
       reconnectTimer = window.setTimeout(connect, 1000);
     };
@@ -2756,6 +3027,7 @@ export default function App() {
     if (pendingJumpFrame) cancelAnimationFrame(pendingJumpFrame);
     clearPrependSettleFrame();
     if (refToastTimer) clearTimeout(refToastTimer);
+    if (deleteErrorTimer !== undefined) clearTimeout(deleteErrorTimer);
     if (refHoverTimer !== undefined) clearTimeout(refHoverTimer);
     for (const decoder of decoders.values()) decoder.close();
     decoders.clear();
@@ -2775,6 +3047,28 @@ export default function App() {
         <div class="ref-toast" role="status" aria-live="polite">
           {refToast()}
         </div>
+      </Show>
+      <Show when={deleteError()}>
+        <div class="action-error" role="alert">
+          <span>Delete failed: {deleteError()}</span>
+          <button
+            class="action-error-dismiss"
+            type="button"
+            aria-label="Dismiss deletion error"
+            onClick={() => setDeleteError(null)}
+          >
+            <Icon name="x" />
+          </button>
+        </div>
+      </Show>
+      <Show when={pendingDelete()}>
+        {(message) => (
+          <DeleteConfirmation
+            message={message()}
+            onCancel={closeDeleteConfirmation}
+            onConfirm={confirmDelete}
+          />
+        )}
       </Show>
       <Show when={refHover()}>
         {(hover) => <RefHoverCard hover={hover()} />}
@@ -2863,6 +3157,8 @@ export default function App() {
                     onOpenPreview={openPreview}
                     onQuoteRef={readonly() ? undefined : quoteRef}
                     onAbortTransfer={readonly() ? undefined : abortTransfer}
+                    onEdit={readonly() ? undefined : beginEdit}
+                    onDelete={readonly() ? undefined : deleteMessage}
                     autoplay={message.autoplay ?? "disabled"}
                   />
                 )}
@@ -2872,11 +3168,28 @@ export default function App() {
           <Show when={!readonly()}>
             <section
               class="composer"
-              classList={{ "is-drag-active": dragActive() }}
+              classList={{
+                "is-drag-active": dragActive(),
+                "is-editing": !!editing(),
+              }}
               onDragOver={onComposeDragOver}
               onDragLeave={onComposeDragLeave}
               onDrop={onComposeDrop}
             >
+              <Show when={editing()}>
+                <div class="composer-editing" role="status">
+                  <span>Editing message</span>
+                  <button
+                    class="composer-edit-cancel"
+                    type="button"
+                    aria-label="Cancel message edit"
+                    title="Cancel edit"
+                    onClick={cancelEdit}
+                  >
+                    <Icon name="x" />
+                  </button>
+                </div>
+              </Show>
               <Show when={queued().length > 0}>
                 <div class="composer-files">
                   <For each={queued()}>
@@ -2898,20 +3211,22 @@ export default function App() {
                 </div>
               </Show>
               <div class="composer-input-row">
-                <button
-                  class="composer-attach"
-                  type="button"
-                  aria-label="Attach files"
-                  title="Attach files"
-                  onClick={openComposeFileDialog}
-                >
-                  <Icon name="plus" />
-                </button>
+                <Show when={!editing()}>
+                  <button
+                    class="composer-attach"
+                    type="button"
+                    aria-label="Attach files"
+                    title="Attach files"
+                    onClick={openComposeFileDialog}
+                  >
+                    <Icon name="plus" />
+                  </button>
+                </Show>
                 <textarea
                   class="composer-text"
                   ref={composerTextEl}
                   rows={1}
-                  placeholder="Write a message…"
+                  placeholder={editing() ? "Edit message…" : "Write a message…"}
                   value={draft()}
                   onInput={(event) => {
                     setDraft(event.currentTarget.value);

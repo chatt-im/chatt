@@ -26,6 +26,7 @@ use darkhttp::{
 use jsony::Jsony;
 use rpc::{
     control::{ChatMessage, FileMetadata},
+    ids::UserId,
     video::{self, SharedVideoFrame},
 };
 
@@ -148,6 +149,13 @@ fn video_frame_meta(frame: &[u8]) -> Option<(u32, bool)> {
 pub struct WebMessage {
     pub id: u64,
     pub sender: String,
+    /// The original plaintext body, used to populate the browser composer when
+    /// the local author edits a text message. It is never inserted as HTML.
+    pub body: String,
+    /// Whether this message was authored by the client hosting the web view.
+    pub local: bool,
+    /// Whether the displayed body is the folded result of an edit mutation.
+    pub edited: bool,
     pub timestamp_ms: u64,
     pub attachment: Option<WebAttachment>,
     /// `Some` for a file message. The feed upserts by this id together with
@@ -210,13 +218,20 @@ fn chat_ref_code(message: &ChatMessage) -> String {
 impl WebMessage {
     /// Builds a message from a relayed chat message, resolving any `@@`
     /// references in its body through `resolver`.
-    pub fn from_chat(message: &ChatMessage, resolver: web_wire::RefResolver) -> Self {
+    pub fn from_chat(
+        message: &ChatMessage,
+        resolver: web_wire::RefResolver,
+        local_user: Option<UserId>,
+    ) -> Self {
         let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
         WebMessage {
             // A file announcement keys on the transfer id so it shares an id with
             // the inline file message that later enriches it.
             id: file_id.unwrap_or(message.message_id.0),
             sender: message.sender_name.clone(),
+            body: message.body.clone(),
+            local: Some(message.sender) == local_user,
+            edited: message.flags.edited(),
             fragments: split_fragments(&message.body, resolver),
             timestamp_ms: message.timestamp_ms,
             attachment: None,
@@ -240,6 +255,7 @@ impl WebMessage {
         metadata: &FileMetadata,
         served_name: &str,
         dimensions: Option<(u32, u32)>,
+        local_user: Option<UserId>,
     ) -> Self {
         // Name the body after the served file, not the sender's original name, so
         // the recipient sees where the file actually landed after any save-time
@@ -249,6 +265,9 @@ impl WebMessage {
         WebMessage {
             id: metadata.transfer_id.0,
             sender: metadata.sender_name.clone(),
+            body: body.clone(),
+            local: Some(metadata.sender) == local_user,
+            edited: false,
             fragments: split_fragments(&body, &|_| None),
             timestamp_ms: metadata.timestamp_ms,
             attachment: Some(WebAttachment::from_served_file(served_name, dimensions)),
@@ -269,6 +288,7 @@ impl WebMessage {
         served_name: &str,
         size: u64,
         dimensions: Option<(u32, u32)>,
+        local_user: Option<UserId>,
     ) -> Self {
         let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
         // Rebuild the body from the served name rather than reusing the stored
@@ -278,6 +298,9 @@ impl WebMessage {
         WebMessage {
             id: file_id.unwrap_or(message.message_id.0),
             sender: message.sender_name.clone(),
+            body: body.clone(),
+            local: Some(message.sender) == local_user,
+            edited: message.flags.edited(),
             fragments: split_fragments(&body, &|_| None),
             timestamp_ms: message.timestamp_ms,
             attachment: Some(WebAttachment::from_served_file(served_name, dimensions)),
@@ -322,6 +345,9 @@ impl WebMessage {
         WebMessage {
             id,
             sender: "Alice".to_string(),
+            body: body.to_string(),
+            local: false,
+            edited: false,
             fragments: split_fragments(body, &|_| None),
             timestamp_ms: 100,
             attachment: None,
@@ -388,6 +414,9 @@ enum WebFeed {
     Delete {
         message_id: u64,
     },
+    /// A transient `delete_error` envelope for a locally/server-rejected web
+    /// deletion request.
+    DeleteError(String),
     /// Replaces the backlog with the current room's messages (empty when there
     /// is no current room) and re-syncs every connected browser. The web view
     /// mirrors the room the client is in, nothing more.
@@ -445,6 +474,15 @@ pub enum WebRequest {
     SendChat {
         body: String,
     },
+    /// Replaces a locally-authored text message in the current room.
+    EditChat {
+        target: u64,
+        body: String,
+    },
+    /// Deletes a locally-authored message in the current room.
+    DeleteChat {
+        target: u64,
+    },
     /// A file the browser uploaded, reassembled to `path` on disk.
     UploadFile {
         path: PathBuf,
@@ -478,6 +516,12 @@ enum ClientRequest {
     /// A composed chat line to send to the current room. Ignored when read-only.
     #[jsony(rename = "send_message")]
     SendMessage { body: String },
+    /// Replaces a locally-authored text message. Ignored when read-only.
+    #[jsony(rename = "edit_message")]
+    EditMessage { target: u64, body: String },
+    /// Deletes a locally-authored message. Ignored when read-only.
+    #[jsony(rename = "delete_message")]
+    DeleteMessage { target: u64 },
     /// Opens a file upload. The binary chunk frames that follow carry its bytes,
     /// keyed by `upload_id`, and `upload_finish` closes it. Ignored when
     /// read-only.
@@ -570,6 +614,12 @@ impl WebFeedSender {
     /// Tells every browser to drop a deleted chat message.
     pub fn send_delete(&self, message_id: u64) {
         let _ = self.tx.send(WebFeed::Delete { message_id });
+        self.wake.wake();
+    }
+
+    /// Reports a rejected browser deletion request. Not retained.
+    pub fn send_delete_error(&self, payload: String) {
+        let _ = self.tx.send(WebFeed::DeleteError(payload));
         self.wake.wake();
     }
 
@@ -880,6 +930,25 @@ fn run(
                         );
                         let _ = web_requests.send(WebRequest::SendChat { body });
                     }
+                    Ok(ClientRequest::EditMessage { target, body }) if !readonly => {
+                        kvlog::info!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "edit_message",
+                            target,
+                            body_len = body.len()
+                        );
+                        let _ = web_requests.send(WebRequest::EditChat { target, body });
+                    }
+                    Ok(ClientRequest::DeleteMessage { target }) if !readonly => {
+                        kvlog::info!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "delete_message",
+                            target
+                        );
+                        let _ = web_requests.send(WebRequest::DeleteChat { target });
+                    }
                     Ok(ClientRequest::UploadStart {
                         upload_id,
                         name,
@@ -1147,6 +1216,7 @@ fn run(
                     }
                 }
                 Ok(WebFeed::ShareError(payload))
+                | Ok(WebFeed::DeleteError(payload))
                 | Ok(WebFeed::FileProgress(payload))
                 | Ok(WebFeed::FileTerminal(payload)) => {
                     for id in &clients {
@@ -1253,6 +1323,8 @@ fn client_request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::PlayShare { .. } => "play_share",
         ClientRequest::StopShare { .. } => "stop_share",
         ClientRequest::SendMessage { .. } => "send_message",
+        ClientRequest::EditMessage { .. } => "edit_message",
+        ClientRequest::DeleteMessage { .. } => "delete_message",
         ClientRequest::UploadStart { .. } => "upload_start",
         ClientRequest::UploadFinish { .. } => "upload_finish",
         ClientRequest::AbortTransfer { .. } => "abort_transfer",
@@ -1592,7 +1664,7 @@ mod tests {
             timestamp_ms: 5,
         };
         // A save-time collision renamed the file on disk.
-        let message = WebMessage::from_file(&metadata, "wide-1.png", Some((640, 480)));
+        let message = WebMessage::from_file(&metadata, "wide-1.png", Some((640, 480)), None);
         let attachment = message.attachment.as_ref().expect("attachment present");
         assert_eq!(attachment.name, "wide-1.png");
         assert_eq!(attachment.kind, "image");
@@ -1649,7 +1721,7 @@ mod tests {
             flags: rpc::control::MessageFlags::default(),
             target: None,
         };
-        let message = WebMessage::from_chat(&announcement, &|_| None);
+        let message = WebMessage::from_chat(&announcement, &|_| None, None);
         // The file id keys the upsert, and the message id matches it so the
         // placeholder shares an id with the inline version that enriches it.
         assert_eq!(message.file_id, Some(7));
@@ -1658,9 +1730,33 @@ mod tests {
     }
 
     #[test]
+    fn chat_message_exposes_local_editing_state_and_plaintext() {
+        use rpc::control::ChatMessage;
+        use rpc::ids::MessageId;
+
+        let mut chat = ChatMessage {
+            message_id: MessageId(9),
+            room_id: RoomId(1),
+            sender: UserId(2),
+            sender_name: "Alice".to_string(),
+            timestamp_ms: 5,
+            body: "revised **text**".to_string(),
+            file_transfer_id: None,
+            flags: rpc::control::MessageFlags::default(),
+            target: None,
+        };
+        chat.flags.set_edited();
+
+        let message = WebMessage::from_chat(&chat, &|_| None, Some(UserId(2)));
+        assert_eq!(message.body, "revised **text**");
+        assert!(message.local);
+        assert!(message.edited);
+    }
+
+    #[test]
     fn merge_enriches_placeholder_in_place() {
         let mut placeholder = file_placeholder(7, "sent file `wide.png` (2.0 KiB)");
-        let inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
+        let inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)), None);
         placeholder.merge_from(inline);
         let attachment = placeholder.attachment.as_ref().expect("attachment kept");
         assert_eq!(attachment.width, Some(4));
@@ -1670,7 +1766,7 @@ mod tests {
     #[test]
     fn merge_keeps_attachment_when_placeholder_arrives_last() {
         // Reverse order: the inline file arrived first, then the announcement.
-        let mut inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
+        let mut inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)), None);
         let placeholder = file_placeholder(7, "sent file `wide.png` (2.0 KiB)");
         inline.merge_from(placeholder);
         assert!(
@@ -1684,13 +1780,13 @@ mod tests {
         // Inline file enriches the announcement: the announcement's message
         // identity must survive, since the inline side has none.
         let mut placeholder = file_placeholder(7, "sent file `wide.png` (2.0 KiB)");
-        let inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
+        let inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)), None);
         placeholder.merge_from(inline);
         assert_eq!(placeholder.message_id, 99);
         assert_eq!(placeholder.ref_code, "testref");
 
         // Reverse order: the announcement arrives last and its identity wins.
-        let mut inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
+        let mut inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)), None);
         assert_eq!(inline.message_id, 0);
         inline.merge_from(file_placeholder(7, "sent file `wide.png` (2.0 KiB)"));
         assert_eq!(inline.message_id, 99);
@@ -1699,10 +1795,10 @@ mod tests {
 
     #[test]
     fn file_identity_includes_announcement_timestamp() {
-        let first = WebMessage::from_file(&file_metadata(7), "first.png", None);
+        let first = WebMessage::from_file(&file_metadata(7), "first.png", None, None);
         let mut second_metadata = file_metadata(7);
         second_metadata.timestamp_ms += 1;
-        let second = WebMessage::from_file(&second_metadata, "second.png", None);
+        let second = WebMessage::from_file(&second_metadata, "second.png", None, None);
 
         assert!(same_file(&first, &first));
         assert!(!same_file(&first, &second));
@@ -1738,7 +1834,7 @@ mod tests {
             encoding: FileContentEncoding::Identity,
             timestamp_ms: 5,
         };
-        let message = WebMessage::from_file(&metadata, "clip.mp4", Some((1920, 1080)));
+        let message = WebMessage::from_file(&metadata, "clip.mp4", Some((1920, 1080)), None);
         let attachment = message.attachment.as_ref().expect("attachment present");
         assert_eq!(attachment.kind, "video");
         assert_eq!(attachment.width, None);
@@ -1750,6 +1846,9 @@ mod tests {
         WebMessage {
             id,
             sender: "Alice".to_string(),
+            body: body.to_string(),
+            local: false,
+            edited: false,
             fragments: split_fragments(body, &|_| None),
             timestamp_ms: 5,
             attachment: None,
@@ -2251,6 +2350,37 @@ Sec-WebSocket-Version: 13\r\n\
     }
 
     #[test]
+    fn delete_error_is_broadcast_as_text_envelope() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: false,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            100,
+            web_tx,
+            false,
+        )
+        .unwrap();
+        let mut stream = open_ready_ws(sender.local_addr());
+
+        sender.send_delete_error(
+            r#"{"type":"delete_error","target":7,"message":"too old"}"#.to_string(),
+        );
+
+        let (opcode, payload) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            r#"{"type":"delete_error","target":7,"message":"too old"}"#
+        );
+    }
+
+    #[test]
     fn load_older_request_returns_older_frame() {
         let cfg = WebConfig {
             enabled: true,
@@ -2470,6 +2600,71 @@ Sec-WebSocket-Version: 13\r\n\
                 body: "hi there".to_string()
             }
         );
+    }
+
+    #[test]
+    fn message_mutations_forward_when_writable() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: false,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            100,
+            web_tx,
+            false,
+        )
+        .unwrap();
+
+        let mut stream = open_ready_ws(sender.local_addr());
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"edit_message","target":7,"body":"revised"}"#,
+        );
+        assert_eq!(
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WebRequest::EditChat {
+                target: 7,
+                body: "revised".to_string(),
+            }
+        );
+
+        write_ws_text(&mut stream, r#"{"type":"delete_message","target":7}"#);
+        assert_eq!(
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WebRequest::DeleteChat { target: 7 }
+        );
+    }
+
+    #[test]
+    fn message_mutations_are_ignored_when_readonly() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
+
+        let mut stream = open_ready_ws(sender.local_addr());
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"edit_message","target":7,"body":"revised"}"#,
+        );
+        write_ws_text(&mut stream, r#"{"type":"delete_message","target":7}"#);
+        assert!(web_rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
     #[test]
