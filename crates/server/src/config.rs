@@ -1090,31 +1090,6 @@ mod tests {
     }
 
     #[test]
-    fn dev_server_rooms_retain_history_for_chat_mutations() {
-        for (name, content) in [
-            ("private", include_str!("../../../dev/private-server.toml")),
-            (
-                "plaintext",
-                include_str!("../../../dev/plaintext-server.toml"),
-            ),
-            ("public", include_str!("../../../dev/public-server.toml")),
-        ] {
-            assert!(
-                content.contains("persistence = \"memory\""),
-                "{name} dev rooms must retain the mutation window"
-            );
-        }
-
-        let config = parse(include_str!("../../../dev/private-server.toml")).unwrap();
-        assert!(
-            config
-                .rooms
-                .iter()
-                .all(|room| room.persistence == RoomPersistenceConfig::Memory)
-        );
-    }
-
-    #[test]
     fn config_rejects_duplicate_room_names() {
         let error = parse(&config_content(
             "[[rooms]]\nid = 1\nname = \"lobby\"\n\n[[rooms]]\nid = 2\nname = \"lobby\"\n",

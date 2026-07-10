@@ -122,18 +122,8 @@ impl ConfirmMode {
         } else {
             (selected, idle)
         };
-        draw_button(
-            self.cancel_button,
-            buf,
-            cancel_style,
-            &self.cancel_label,
-        );
-        draw_button(
-            self.confirm_button,
-            buf,
-            confirm_style,
-            &self.confirm_label,
-        );
+        draw_button(self.cancel_button, buf, cancel_style, &self.cancel_label);
+        draw_button(self.confirm_button, buf, confirm_style, &self.confirm_label);
     }
 }
 

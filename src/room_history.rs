@@ -850,16 +850,32 @@ fn fold_records(records: &[ValidatedRecord]) -> LoadedHistory {
     }
 }
 
-/// Folds one mutation record into its target's display state: a delete leaves
-/// a body-less tombstone that no later edit revives, an edit replaces the body
-/// and marks it.
-pub(crate) fn apply_mutation(message: &mut ChatMessage, mutation: &ChatMessage) {
+/// Folds a mutation into its target only when the room, id, and sender match.
+/// A delete leaves a body-less tombstone that no later edit revives; edits of
+/// file announcements are invalid.
+pub(crate) fn apply_mutation(message: &mut ChatMessage, mutation: &ChatMessage) -> bool {
+    if mutation.room_id != message.room_id
+        || mutation.target != Some(message.message_id)
+        || mutation.sender != message.sender
+    {
+        return false;
+    }
     if mutation.flags.deleted() {
+        if message.flags.deleted() {
+            return false;
+        }
         message.flags = MessageFlags(MessageFlags::DELETED);
         message.body.clear();
-    } else if mutation.flags.edited() && !message.flags.deleted() {
+        true
+    } else if mutation.flags.edited()
+        && !message.flags.deleted()
+        && message.file_transfer_id.is_none()
+    {
         message.body = mutation.body.clone();
         message.flags.set_edited();
+        true
+    } else {
+        false
     }
 }
 
@@ -1519,10 +1535,22 @@ mod tests {
         record
     }
 
+    fn edit_record_from(id: u64, target: u64, sender: UserId, body: &str) -> ChatMessage {
+        let mut record = edit_record(id, target, body);
+        record.sender = sender;
+        record
+    }
+
     fn delete_record(id: u64, target: u64) -> ChatMessage {
         let mut record = text_message(id, id * 1_000, "");
         record.flags = MessageFlags(MessageFlags::DELETED);
         record.target = Some(MessageId(target));
+        record
+    }
+
+    fn delete_record_from(id: u64, target: u64, sender: UserId) -> ChatMessage {
+        let mut record = delete_record(id, target);
+        record.sender = sender;
         record
     }
 
@@ -1557,6 +1585,44 @@ mod tests {
         assert_eq!(loaded.messages[0].body, "second thought");
         assert!(loaded.messages[0].flags.edited());
         assert_eq!(loaded.mutations.len(), 2);
+    }
+
+    #[test]
+    fn fold_ignores_foreign_edits_and_deletes() {
+        let path = scratch("fold-foreign-mutations");
+        let mut store = fresh_store(&path);
+        store.append_message(&text_message(1, 1_000, "original"));
+        store.append_message(&edit_record_from(2, 1, UserId(4), "hijacked"));
+        store.append_message(&delete_record_from(3, 1, UserId(4)));
+        drop(store);
+
+        let loaded = open_path(&path, 7).loaded;
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].body, "original");
+        assert_eq!(loaded.messages[0].flags, MessageFlags::default());
+        assert_eq!(loaded.mutations.len(), 2);
+    }
+
+    #[test]
+    fn fold_ignores_file_edits_but_accepts_author_deletes() {
+        let path = scratch("fold-file-mutations");
+        let mut store = fresh_store(&path);
+        let mut file = text_message(1, 1_000, "sent file `notes.txt` (10 B)");
+        file.file_transfer_id = Some(FileTransferId(9));
+        store.append_message(&file);
+        store.append_message(&edit_record(2, 1, "not a file"));
+        drop(store);
+
+        let loaded = open_path(&path, 7).loaded;
+        assert_eq!(loaded.messages[0].body, "sent file `notes.txt` (10 B)");
+        assert_eq!(loaded.messages[0].flags, MessageFlags::default());
+
+        let mut store = open_path(&path, 7).store.expect("reopen");
+        store.append_message(&delete_record(3, 1));
+        drop(store);
+        let loaded = open_path(&path, 7).loaded;
+        assert!(loaded.messages[0].flags.deleted());
+        assert!(loaded.messages[0].body.is_empty());
     }
 
     #[test]

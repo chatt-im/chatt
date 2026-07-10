@@ -30,9 +30,8 @@ use rpc::{
         ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata, InviteTicket,
         MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES, MAX_FILE_CHUNK_BYTES, MessageFlags,
         P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind, ServerControl,
-        UserSummary,
-        decode_client_control, decode_client_hello, encode_invite_ticket, encode_server_control,
-        encode_server_hello, max_file_wire_bytes,
+        UserSummary, decode_client_control, decode_client_hello, encode_invite_ticket,
+        encode_server_control, encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims,
@@ -3080,10 +3079,11 @@ impl Server {
         Ok(())
     }
 
-    /// Validates and applies an edit or delete of a recent message: appends a
-    /// mutation record targeting it and broadcasts the record as an ordinary
-    /// chat. Rejections drop the request with a log line; there is no error
-    /// channel back to the client, whose own tighter window makes them rare.
+    /// Applies an edit or delete of a recent message. Retained targets also get
+    /// ownership and operation checks; without a retained target the server
+    /// broadcasts the mutation for clients to validate against their copies.
+    /// Rejections drop the request with a log line because there is no mutation
+    /// error channel back to the client.
     fn mutate_chat(
         &mut self,
         session_id: SessionId,
@@ -6566,9 +6566,10 @@ mod tests {
             )
             .unwrap();
         for peer in [&mut sender_peer, &mut reader_peer] {
-            let control = read_until(peer, |control| {
-                matches!(control, ServerControl::Chat { message } if message.target.is_some())
-            });
+            let control = read_until(
+                peer,
+                |control| matches!(control, ServerControl::Chat { message } if message.target.is_some()),
+            );
             let ServerControl::Chat { message } = control else {
                 unreachable!();
             };
@@ -6598,14 +6599,51 @@ mod tests {
                 String::new(),
             )
             .unwrap();
-        let control = read_until(&mut reader_peer, |control| {
-            matches!(control, ServerControl::Chat { message } if message.flags.deleted())
-        });
+        let control = read_until(
+            &mut reader_peer,
+            |control| matches!(control, ServerControl::Chat { message } if message.flags.deleted()),
+        );
         let ServerControl::Chat { message } = control else {
             unreachable!();
         };
         assert_eq!(message.target, Some(target));
         assert!(message.body.is_empty());
+    }
+
+    #[test]
+    fn stateless_chat_mutations_fan_out_for_client_validation() {
+        let mut server = test_server();
+        let sender = SessionId(1);
+        let reader = SessionId(2);
+        let mut sender_peer = live_user(&mut server, Token(11), sender, UserId(1));
+        let mut reader_peer = live_user(&mut server, Token(22), reader, UserId(2));
+
+        server
+            .send_chat(sender, RoomId(1), "original".to_string())
+            .unwrap();
+        let target = server.store.head(RoomId(1)).expect("recent chat message");
+        server
+            .mutate_chat(
+                reader,
+                RoomId(1),
+                target,
+                MutationKind::Edit,
+                "foreign edit".to_string(),
+            )
+            .unwrap();
+
+        for peer in [&mut sender_peer, &mut reader_peer] {
+            let control = read_until(
+                peer,
+                |control| matches!(control, ServerControl::Chat { message } if message.target.is_some()),
+            );
+            let ServerControl::Chat { message } = control else {
+                unreachable!();
+            };
+            assert_eq!(message.target, Some(target));
+            assert_eq!(message.sender, UserId(2));
+            assert_eq!(message.body, "foreign edit");
+        }
     }
 
     #[test]
