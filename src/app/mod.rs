@@ -341,9 +341,6 @@ pub(crate) struct App {
     pub control_socket: Option<local_control::ControlSocket>,
     pub session_id: Option<SessionId>,
     pub user_id: Option<UserId>,
-    /// The room whose voice call this client is in, independent of the viewed
-    /// room. Mirrors the worker's view; confirmed by our own `VoiceStarted`.
-    pub voice_room: Option<RoomId>,
     requested_voice_room: Option<RoomId>,
     /// The user explicitly left voice this session; suppresses the voice
     /// auto-join on (re-)authentication until the next explicit join.
@@ -378,24 +375,13 @@ pub(crate) struct App {
     pub voice_bytes_received: u64,
     pub encoder_profile: LiveEncoderProfile,
     pub last_network_notice: Option<String>,
-    /// A warn banner shown while a `chatt join` falls back to pairing because no
-    /// configured server matched. Cleared once the client connects, disconnects,
-    /// or cancels the pairing.
-    pub join_notice: Option<String>,
     pending_after_welcome: Option<PendingJoin>,
     pub pending_audio_apply: Option<PendingAudioApply>,
-    /// Smoothed round-trip time to the server relay media socket, milliseconds.
-    /// Used as the network leg of the latency estimate for relayed participants.
-    pub server_rtt_ms: Option<u16>,
     /// When set, the deadline at which outbound voice should be hard-disabled
     /// after a deafen. The teardown is deferred so active senders can transmit
     /// their mute fade-out tail before transport closes.
     pending_voice_teardown_at: Option<Instant>,
     pending_network_commands: VecDeque<NetworkCommand>,
-    network_disconnected: bool,
-    /// UDP media path to the server never bound after repeated retries while the
-    /// TCP session is otherwise up. Surfaced as "UDP Connection Failure".
-    udp_unreachable: bool,
     pending_dm_open: Option<(RoomId, UserId)>,
     pending_room_catalog_save: Option<PendingRoomCatalogSave>,
     supervisor: SupervisorState,
@@ -418,10 +404,6 @@ pub(crate) struct App {
     cached_screencast_start: Option<CachedScreencastStart>,
     /// The stream id of our active outbound share, set on `ShareStarted`.
     screencast_stream_id: Option<StreamId>,
-    pub(crate) screencast_status: ScreencastStatus,
-    /// Shares this client can view, keyed by stream id, learned from
-    /// `ShareAvailable`. Holds the per-stream view secret and codec metadata.
-    available_shares: HashMap<StreamId, AvailableShare>,
     /// Active inbound viewer connections, keyed by stream id.
     subscribers: HashMap<StreamId, crate::video::SubscriberHandle>,
     /// Video connection authentication/protection selected by the current
@@ -430,7 +412,6 @@ pub(crate) struct App {
     /// TCP address of the connected server, reused by dedicated video
     /// connections. Set on connect, cleared on disconnect.
     active_tcp_addr: Option<String>,
-    active_server_label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1103,7 +1084,6 @@ impl App {
             control_socket: None,
             session_id: None,
             user_id: None,
-            voice_room: None,
             requested_voice_room: None,
             voice_left: false,
             server_catalog: ServerCatalog::default(),
@@ -1128,14 +1108,10 @@ impl App {
             voice_bytes_received: 0,
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
-            join_notice: None,
             pending_after_welcome: None,
             pending_audio_apply: None,
-            server_rtt_ms: None,
             pending_voice_teardown_at: None,
             pending_network_commands: VecDeque::new(),
-            network_disconnected: false,
-            udp_unreachable: false,
             pending_dm_open: None,
             pending_room_catalog_save: None,
             supervisor: SupervisorState::default(),
@@ -1146,12 +1122,9 @@ impl App {
             screencast: None,
             cached_screencast_start: None,
             screencast_stream_id: None,
-            screencast_status: ScreencastStatus::default(),
-            available_shares: HashMap::new(),
             subscribers: HashMap::new(),
             video_transport: None,
             active_tcp_addr: None,
-            active_server_label: None,
             config,
         };
         app.rebuild_server_items();
@@ -1335,7 +1308,7 @@ impl App {
                     self.set_error("a screen share is already active");
                     return;
                 }
-                if self.voice_room.is_none() {
+                if self.room.voice_room.is_none() {
                     self.fail_screencast_start("join a voice call before sharing");
                     return;
                 }
@@ -1381,7 +1354,7 @@ impl App {
                     events,
                 ) {
                     Ok(handle) => {
-                        self.screencast_status.start();
+                        self.room.screencast_status.start();
                         self.screencast = Some(handle);
                         self.cached_screencast_start = Some(cached_start);
                         self.set_status("starting screen share");
@@ -1400,23 +1373,23 @@ impl App {
     fn stop_screencast_to_off(&mut self) {
         let had_restartable_video = self.screencast.is_some()
             || matches!(
-                self.screencast_status.phase,
+                self.room.screencast_status.phase,
                 ScreencastPhase::Starting | ScreencastPhase::Live | ScreencastPhase::Off
             )
             || self.cached_screencast_start.is_some();
         self.teardown_own_share(true);
         if had_restartable_video {
-            self.screencast_status.turn_off();
+            self.room.screencast_status.turn_off();
             self.set_status("video off");
         } else {
-            self.screencast_status.clear_active();
+            self.room.screencast_status.clear_active();
             self.set_status("screen share stopped");
         }
     }
 
     fn fail_screencast_start(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
-        self.screencast_status.fail(reason.clone());
+        self.room.screencast_status.fail(reason.clone());
         self.set_error(reason);
     }
 
@@ -1426,13 +1399,13 @@ impl App {
     fn handle_screencast_failed(&mut self, reason: String) {
         if self.screencast.is_none()
             && !matches!(
-                self.screencast_status.phase,
+                self.room.screencast_status.phase,
                 ScreencastPhase::Starting | ScreencastPhase::Live
             )
         {
             return;
         }
-        self.screencast_status.fail(reason.clone());
+        self.room.screencast_status.fail(reason.clone());
         self.teardown_own_share(true);
         self.set_error(reason);
     }
@@ -1440,18 +1413,18 @@ impl App {
     fn fail_screencast_if_running(&mut self, reason: impl Into<String>, notify_server: bool) {
         if self.screencast.is_none()
             && !matches!(
-                self.screencast_status.phase,
+                self.room.screencast_status.phase,
                 ScreencastPhase::Starting | ScreencastPhase::Live
             )
         {
             return;
         }
-        self.screencast_status.fail(reason.into());
+        self.room.screencast_status.fail(reason.into());
         self.teardown_own_share(notify_server);
     }
 
     fn handle_screencast_progress(&mut self, progress: ScreencastProgress) {
-        self.screencast_status.progress(
+        self.room.screencast_status.progress(
             progress.stream_id,
             progress.total_bytes,
             progress.total_frames,
@@ -1468,7 +1441,7 @@ impl App {
                     .sender()
                     .send(NetworkCommand::StopShare { stream_id });
             }
-            self.available_shares.remove(&stream_id);
+            self.room.available_shares.remove(&stream_id);
             if let Some(feed) = &self.web_feed {
                 feed.send_share_ended(stream_id.0, share_ended_envelope(stream_id));
             }
@@ -1481,11 +1454,11 @@ impl App {
     /// Stops the outbound share and every inbound viewer connection.
     fn stop_all_shares(&mut self) {
         self.teardown_own_share(true);
-        if self.screencast_status.phase != ScreencastPhase::Failed {
-            self.screencast_status.clear_active();
+        if self.room.screencast_status.phase != ScreencastPhase::Failed {
+            self.room.screencast_status.clear_active();
         }
         self.screencast_stream_id = None;
-        self.available_shares.clear();
+        self.room.available_shares.clear();
         for (_, mut subscriber) in self.subscribers.drain() {
             subscriber.stop();
         }
@@ -1493,12 +1466,13 @@ impl App {
 
     fn clear_shares_for_voice_room(&mut self, room_id: RoomId) {
         let stream_ids = self
+            .room
             .available_shares
             .iter()
             .filter_map(|(stream_id, share)| (share.room_id == room_id).then_some(*stream_id))
             .collect::<Vec<_>>();
         for stream_id in stream_ids {
-            self.available_shares.remove(&stream_id);
+            self.room.available_shares.remove(&stream_id);
             if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
                 subscriber.stop();
             }
@@ -1506,7 +1480,8 @@ impl App {
                 feed.send_share_ended(stream_id.0, share_ended_envelope(stream_id));
             }
             if self.screencast_stream_id == Some(stream_id) {
-                self.screencast_status
+                self.room
+                    .screencast_status
                     .fail("voice call ended during screen share".to_string());
                 self.screencast_stream_id = None;
                 if let Some(mut handle) = self.screencast.take() {
@@ -1549,7 +1524,7 @@ impl App {
                         Some("no room selected"),
                     );
                     false
-                } else if self.network.is_none() && !self.network_disconnected {
+                } else if self.network.is_none() && !self.room.network_disconnected {
                     self.set_error("select a server before sending messages");
                     self.report_web_request_result(
                         client,
@@ -1576,7 +1551,7 @@ impl App {
                 let target = MessageId(target);
                 match self.view.validate_web_edit(&self.room, target) {
                     Ok(room_id) if !body.trim().is_empty() => {
-                        if self.network.is_none() && !self.network_disconnected {
+                        if self.network.is_none() && !self.room.network_disconnected {
                             let message = "select a server before editing messages";
                             self.set_error(message);
                             self.report_web_request_result(
@@ -1687,7 +1662,7 @@ impl App {
                         false,
                         Some("no room selected"),
                     );
-                } else if self.network.is_none() && !self.network_disconnected {
+                } else if self.network.is_none() && !self.room.network_disconnected {
                     let _ = std::fs::remove_file(&path);
                     self.report_web_request_result(
                         client,
@@ -1763,14 +1738,14 @@ impl App {
         let Some(feed) = self.web_feed.clone() else {
             return;
         };
-        let Some(share) = self.available_shares.get(&stream_id) else {
+        let Some(share) = self.room.available_shares.get(&stream_id) else {
             feed.send_share_error(
                 client,
                 share_error_envelope(stream_id, "that screen share is no longer available"),
             );
             return;
         };
-        if self.voice_room != Some(share.room_id) {
+        if self.room.voice_room != Some(share.room_id) {
             feed.send_share_error(
                 client,
                 share_error_envelope(stream_id, "join the share's voice room before viewing"),
@@ -1936,11 +1911,11 @@ impl App {
                 .client_config(&self.config, self.download_store.clone())
                 .tcp_addr,
         );
-        self.active_server_label = Some(server.label.clone());
+        self.room.active_server_label = Some(server.label.clone());
         self.network = Some(network);
-        self.network_disconnected = false;
+        self.room.network_disconnected = false;
         self.supervisor.network.reset();
-        self.join_notice = None;
+        self.room.join_notice = None;
         self.set_status("connecting");
         true
     }
@@ -1948,19 +1923,19 @@ impl App {
     /// Whether the client has no live session: either the worker is gone or a
     /// reconnect is in flight. Drives the "Offline" top-bar label.
     pub(crate) fn is_offline(&self) -> bool {
-        self.network.is_none() || self.network_disconnected
+        self.network.is_none() || self.room.network_disconnected
     }
 
     /// Whether the TCP session is up but the UDP media path never bound.
     pub(crate) fn is_udp_unreachable(&self) -> bool {
-        self.udp_unreachable
+        self.room.udp_unreachable
     }
 
     fn disconnect_network(&mut self) {
         self.stop_audio();
         self.stop_all_shares();
         self.active_tcp_addr = None;
-        self.active_server_label = None;
+        self.room.active_server_label = None;
         self.video_transport = None;
         self.control_socket.take();
         if let Some(network) = self.network.take() {
@@ -1969,14 +1944,14 @@ impl App {
         self.session_id = None;
         self.user_id = None;
         self.reset_room_for_disconnect();
-        self.server_rtt_ms = None;
+        self.room.server_rtt_ms = None;
         self.last_network_notice = None;
-        self.join_notice = None;
+        self.room.join_notice = None;
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.pending_voice_teardown_at = None;
         self.pending_network_commands.clear();
-        self.network_disconnected = true;
-        self.udp_unreachable = false;
+        self.room.network_disconnected = true;
+        self.room.udp_unreachable = false;
         self.pending_dm_open = None;
         self.supervisor.network.reset();
         self.supervisor.control_socket.reset();
@@ -1991,7 +1966,7 @@ impl App {
     /// and worker-failure recovery.
     fn reset_room_for_disconnect(&mut self) {
         self.save_room_catalog();
-        self.voice_room = None;
+        self.room.voice_room = None;
         self.requested_voice_room = None;
         self.pending_dm_open = None;
         self.view.cancel_pending_edit();
@@ -2049,7 +2024,7 @@ impl App {
     /// The switcher and lobby room-list rows for the current catalog, voice,
     /// and view state.
     pub(crate) fn room_select_items(&self) -> Vec<room::RoomSelectItem> {
-        self.room.room_select_items(self.voice_room)
+        self.room.room_select_items(self.room.voice_room)
     }
 
     pub(crate) fn open_room_switcher(&mut self) {
@@ -2061,7 +2036,7 @@ impl App {
     }
 
     pub(crate) fn open_room_settings(&mut self) {
-        let Some(alias) = self.active_server_label.clone() else {
+        let Some(alias) = self.room.active_server_label.clone() else {
             self.set_error("connect to a server first");
             return;
         };
@@ -2226,7 +2201,7 @@ impl App {
         if catalog_dir.is_none() {
             return;
         }
-        crate::room_catalog::save(catalog_dir, &self.room.catalog(self.voice_room));
+        crate::room_catalog::save(catalog_dir, &self.room.catalog(self.room.voice_room));
     }
 
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
@@ -2304,7 +2279,7 @@ impl App {
                 self.set_status(format!("servers matching '{specifier}'"));
             }
             JoinResolution::Pair(addr) => {
-                self.join_notice = Some(format!(
+                self.room.join_notice = Some(format!(
                     "   No saved server matches '{specifier}'; pairing with {addr} instead"
                 ));
                 self.start_open_pairing(addr);
@@ -2459,12 +2434,12 @@ impl App {
     pub(crate) fn cancel_open_pairing(&mut self) {
         self.pop_mode();
         self.pending_pair.take();
-        self.join_notice = None;
+        self.room.join_notice = None;
         self.set_status("pairing canceled");
     }
 
     fn start_stale_token_repair(&mut self, reason: &str) -> bool {
-        let Some(label) = self.active_server_label.clone() else {
+        let Some(label) = self.room.active_server_label.clone() else {
             return false;
         };
         let server = match self.config.server(&label).cloned() {
@@ -2634,8 +2609,8 @@ impl App {
                     video_transport_mode,
                     video_auth_key,
                 ));
-                self.network_disconnected = false;
-                self.udp_unreachable = false;
+                self.room.network_disconnected = false;
+                self.room.udp_unreachable = false;
                 self.last_network_notice = None;
                 let catalog = crate::room_catalog::load(self.room.history_storage().catalog_dir());
                 let known = self.room.authenticated(
@@ -2907,7 +2882,7 @@ impl App {
                 stream_id,
             } => {
                 if Some(session_id) == self.session_id {
-                    self.voice_room = Some(room_id);
+                    self.room.voice_room = Some(room_id);
                     self.requested_voice_room = None;
                 }
                 let notice = self.room.voice_started(
@@ -2916,9 +2891,9 @@ impl App {
                     user_id,
                     stream_id,
                     self.session_id,
-                    self.voice_room,
+                    self.room.voice_room,
                 );
-                if self.voice_room == Some(room_id) {
+                if self.room.voice_room == Some(room_id) {
                     if let Some(playback) = &self.playback {
                         playback.start_stream(stream_id.0);
                     }
@@ -2933,7 +2908,7 @@ impl App {
                         self.set_status("voice stream ready");
                     }
                     self.mark_room_catalog_dirty();
-                } else if self.voice_room == Some(room_id) {
+                } else if self.room.voice_room == Some(room_id) {
                     self.set_status(format!("{} voice ready", notice.display_name));
                 }
             }
@@ -2951,9 +2926,9 @@ impl App {
                     self.session_id,
                 );
                 if notice.local {
-                    if self.voice_room == Some(room_id) {
+                    if self.room.voice_room == Some(room_id) {
                         self.clear_shares_for_voice_room(room_id);
-                        self.voice_room = None;
+                        self.room.voice_room = None;
                         self.stop_audio();
                         self.set_status("voice stopped");
                     }
@@ -2961,7 +2936,7 @@ impl App {
                     if let Some(playback) = &self.playback {
                         playback.stop_stream(stream_id.0);
                     }
-                    if self.voice_room == Some(room_id) {
+                    if self.room.voice_room == Some(room_id) {
                         self.set_status(format!("{} left voice", notice.display_name));
                     }
                 }
@@ -2982,7 +2957,7 @@ impl App {
                 self.room.outbound_feedback(reporter, feedback);
             }
             NetworkEvent::ServerRtt { rtt_ms } => {
-                self.server_rtt_ms = rtt_ms;
+                self.room.server_rtt_ms = rtt_ms;
             }
             NetworkEvent::PeerRtt { user_id, rtt_ms } => {
                 self.room.peer_rtt(user_id, rtt_ms);
@@ -3013,8 +2988,12 @@ impl App {
                 extradata,
             } => {
                 self.screencast_stream_id = Some(stream_id);
-                self.screencast_status
-                    .live(stream_id, codec.clone(), coded_width, coded_height);
+                self.room.screencast_status.live(
+                    stream_id,
+                    codec.clone(),
+                    coded_width,
+                    coded_height,
+                );
                 if let (Some(handle), Some(session_id)) = (&self.screencast, self.session_id) {
                     handle.deliver_secret(session_id, stream_id, publish_secret);
                 } else {
@@ -3030,7 +3009,7 @@ impl App {
                     .user_id
                     .map(|user_id| self.room.participants.display_name_for(user_id).to_string())
                     .unwrap_or_else(|| "you".to_string());
-                self.available_shares.insert(
+                self.room.available_shares.insert(
                     stream_id,
                     AvailableShare {
                         room_id,
@@ -3064,10 +3043,10 @@ impl App {
                 extradata,
                 view_secret,
             } => {
-                if self.voice_room != Some(room_id) {
+                if self.room.voice_room != Some(room_id) {
                     return;
                 }
-                self.available_shares.insert(
+                self.room.available_shares.insert(
                     stream_id,
                     AvailableShare {
                         room_id,
@@ -3093,11 +3072,12 @@ impl App {
             }
             NetworkEvent::ShareEnded { stream_id } => {
                 if self.screencast_stream_id == Some(stream_id) {
-                    self.screencast_status
+                    self.room
+                        .screencast_status
                         .fail("screen share ended by server".to_string());
                     self.teardown_own_share(false);
                 } else {
-                    self.available_shares.remove(&stream_id);
+                    self.room.available_shares.remove(&stream_id);
                     if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
                         subscriber.stop();
                     }
@@ -3109,7 +3089,7 @@ impl App {
             NetworkEvent::ShareStartRejected { message } => {
                 self.handle_screencast_failed(message);
             }
-            NetworkEvent::MediaConnectivity { udp_ok } => self.udp_unreachable = !udp_ok,
+            NetworkEvent::MediaConnectivity { udp_ok } => self.room.udp_unreachable = !udp_ok,
             NetworkEvent::Status(status) => self.set_status(status),
             NetworkEvent::Error(error) => {
                 kvlog::warn!("app network error", error = error.as_str());
@@ -3130,7 +3110,7 @@ impl App {
                 self.set_error(auth_failure_status(&message));
             }
             NetworkEvent::NativeEncryptionRequired => {
-                let Some(label) = self.active_server_label.clone() else {
+                let Some(label) = self.room.active_server_label.clone() else {
                     self.disconnect_network();
                     self.open_server_select();
                     self.set_error("server is not using native encryption");
@@ -3168,8 +3148,8 @@ impl App {
                 self.set_error(error);
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
-                self.network_disconnected = true;
-                self.udp_unreachable = false;
+                self.room.network_disconnected = true;
+                self.room.udp_unreachable = false;
                 self.stop_audio();
                 self.fail_screencast_if_running(
                     format!("screen share stopped: connection failed: {reason}"),
@@ -3217,7 +3197,7 @@ impl App {
     }
 
     fn send_network_command(&mut self, command: NetworkCommand, queue_on_failure: bool) -> bool {
-        if self.network_disconnected {
+        if self.room.network_disconnected {
             let kind = app_network_command_kind(&command);
             kvlog::info!("network command queued while disconnected", kind);
             if queue_on_failure {
@@ -3297,7 +3277,7 @@ impl App {
     fn flush_pending_network_commands(&mut self) {
         if self.pending_network_commands.is_empty()
             || self.network.is_none()
-            || self.network_disconnected
+            || self.room.network_disconnected
         {
             return;
         }
@@ -3533,7 +3513,7 @@ impl App {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 self.rebuild_server_items();
-                if self.active_server_label.as_deref() == Some(label.as_str()) {
+                if self.room.active_server_label.as_deref() == Some(label.as_str()) {
                     self.push_file_policy();
                 }
                 if join_after_save {
@@ -3544,7 +3524,7 @@ impl App {
                     self.pop_mode();
                     if history_changed
                         && self.network.is_some()
-                        && self.active_server_label.as_deref() == Some(label.as_str())
+                        && self.room.active_server_label.as_deref() == Some(label.as_str())
                     {
                         self.set_status("server saved; persistence changes apply on reconnect");
                     } else {
@@ -4952,7 +4932,7 @@ impl App {
         if self.network.is_none() {
             return;
         }
-        let Some(alias) = self.active_server_label.clone() else {
+        let Some(alias) = self.room.active_server_label.clone() else {
             return;
         };
         let Ok(server) = self.config.server(&alias) else {
@@ -5175,7 +5155,7 @@ impl App {
             self.set_error("select a server before joining voice");
             return;
         }
-        if self.voice_room == Some(target) || self.requested_voice_room == Some(target) {
+        if self.room.voice_room == Some(target) || self.requested_voice_room == Some(target) {
             self.set_status("already in this room's voice call");
             return;
         }
@@ -5186,7 +5166,7 @@ impl App {
     }
 
     fn leave_voice_command(&mut self) {
-        if self.voice_room.is_none() && self.requested_voice_room.is_none() {
+        if self.room.voice_room.is_none() && self.requested_voice_room.is_none() {
             self.set_status("not in a voice call");
             return;
         }
@@ -5389,7 +5369,7 @@ impl App {
     }
 
     fn activate_top_bar_video(&mut self) {
-        match self.screencast_status.phase {
+        match self.room.screencast_status.phase {
             ScreencastPhase::Failed => self.show_video_status(),
             ScreencastPhase::Off => self.restart_cached_screencast(),
             ScreencastPhase::Starting | ScreencastPhase::Live => self.stop_screencast_to_off(),
@@ -5425,7 +5405,7 @@ impl App {
 
     fn show_video_status(&mut self) {
         let notice = self.video_diagnostics_notice();
-        if self.screencast_status.phase == ScreencastPhase::Failed {
+        if self.room.screencast_status.phase == ScreencastPhase::Failed {
             self.push_error_notice("video", notice);
         } else {
             self.push_notice("video", notice);
@@ -5434,8 +5414,8 @@ impl App {
     }
 
     fn video_status_summary(&self) -> String {
-        match self.screencast_status.phase {
-            ScreencastPhase::Idle => match &self.screencast_status.last_issue {
+        match self.room.screencast_status.phase {
+            ScreencastPhase::Idle => match &self.room.screencast_status.last_issue {
                 Some(issue) => format!("video idle; last issue: {}", issue.reason),
                 None => "video idle".to_string(),
             },
@@ -5443,9 +5423,10 @@ impl App {
             ScreencastPhase::Starting => "video starting".to_string(),
             ScreencastPhase::Live => format!(
                 "video live: {}",
-                video_rate_label(self.screencast_status.rolling_bytes_per_sec)
+                video_rate_label(self.room.screencast_status.rolling_bytes_per_sec)
             ),
             ScreencastPhase::Failed => self
+                .room
                 .screencast_status
                 .last_issue
                 .as_ref()
@@ -5455,7 +5436,7 @@ impl App {
     }
 
     fn video_diagnostics_notice(&self) -> String {
-        let status = &self.screencast_status;
+        let status = &self.room.screencast_status;
         let mut lines = Vec::new();
         lines.push(format!("state: {}", screencast_phase_label(status.phase)));
         if let Some(stream_id) = status.stream_id {
@@ -6655,7 +6636,7 @@ mod tests {
                 .to_string(),
             ..ServerEntry::default()
         });
-        app.active_server_label = Some("public".to_string());
+        app.room.active_server_label = Some("public".to_string());
 
         app.handle_app_event(
             NetworkEvent::AuthFailed {
@@ -7020,7 +7001,7 @@ mod tests {
         }
         assert!(flushed);
         assert!(app.pending_network_commands.is_empty());
-        assert!(!app.network_disconnected);
+        assert!(!app.room.network_disconnected);
     }
 
     #[test]
@@ -7028,7 +7009,7 @@ mod tests {
         let mut app = test_app();
         let (tx, _rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
-        app.network_disconnected = true;
+        app.room.network_disconnected = true;
         app.user_id = Some(UserId(1));
         enter_test_room(&mut app);
 
@@ -7188,7 +7169,7 @@ mod tests {
         app.view.composer.set_lines("/voice");
         app.submit_input();
 
-        assert_eq!(app.voice_room, None);
+        assert_eq!(app.room.voice_room, None);
         assert_eq!(app.requested_voice_room, Some(rpc::ids::RoomId(1)));
         let mut commands = Vec::new();
         while let Ok(command) = rx.try_recv() {
@@ -7244,7 +7225,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         enter_test_room(&mut app);
-        app.voice_room = Some(rpc::ids::RoomId(1));
+        app.room.voice_room = Some(rpc::ids::RoomId(1));
 
         app.view.composer.set_lines("/voice-leave");
         app.submit_input();
@@ -7262,7 +7243,7 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.deafened.store(true, Ordering::Relaxed);
         enter_test_room(&mut app);
-        app.voice_room = Some(rpc::ids::RoomId(1));
+        app.room.voice_room = Some(rpc::ids::RoomId(1));
 
         app.view.composer.set_lines("/voice-leave");
         app.submit_input();
@@ -7289,7 +7270,7 @@ mod tests {
             "auto-join must stay suppressed after /voice-leave, got {commands:?}"
         );
 
-        app.voice_room = None;
+        app.room.voice_room = None;
         app.view.composer.set_lines("/voice");
         app.submit_input();
         assert!(!app.voice_left);
@@ -7323,7 +7304,7 @@ mod tests {
             app.user_id,
         );
         app.session_id = Some(SessionId(1));
-        app.voice_room = Some(RoomId(1));
+        app.room.voice_room = Some(RoomId(1));
         app.voice_tx_enabled.store(true, Ordering::Relaxed);
 
         app.handle_network_event(NetworkEvent::VoiceStopped {
@@ -7339,7 +7320,7 @@ mod tests {
             stream_id: StreamId(11),
         });
 
-        assert_eq!(app.voice_room, Some(RoomId(2)));
+        assert_eq!(app.room.voice_room, Some(RoomId(2)));
         assert!(app.voice_tx_enabled.load(Ordering::Relaxed));
     }
 
@@ -7358,7 +7339,7 @@ mod tests {
             app.user_id,
         );
         app.session_id = Some(SessionId(1));
-        app.voice_room = Some(RoomId(1));
+        app.room.voice_room = Some(RoomId(1));
         let available = |room_id, stream_id| NetworkEvent::ShareAvailable {
             room_id,
             stream_id,
@@ -7371,10 +7352,10 @@ mod tests {
         };
 
         app.handle_network_event(available(RoomId(2), StreamId(20)));
-        assert!(app.available_shares.is_empty());
+        assert!(app.room.available_shares.is_empty());
 
         app.handle_network_event(available(RoomId(1), StreamId(10)));
-        assert!(app.available_shares.contains_key(&StreamId(10)));
+        assert!(app.room.available_shares.contains_key(&StreamId(10)));
 
         app.handle_network_event(NetworkEvent::VoiceStopped {
             room_id: RoomId(1),
@@ -7382,7 +7363,7 @@ mod tests {
             user_id: UserId(1),
             stream_id: StreamId(1),
         });
-        assert!(app.available_shares.is_empty());
+        assert!(app.room.available_shares.is_empty());
     }
 
     #[test]
@@ -7400,7 +7381,7 @@ mod tests {
             None,
             app.user_id,
         );
-        app.voice_room = Some(RoomId(1));
+        app.room.voice_room = Some(RoomId(1));
         app.handle_network_event(NetworkEvent::ShareAvailable {
             room_id: RoomId(1),
             stream_id: StreamId(10),
@@ -7411,14 +7392,14 @@ mod tests {
             extradata: Vec::new(),
             view_secret: vec![7; 32],
         });
-        assert!(app.available_shares.contains_key(&StreamId(10)));
+        assert!(app.room.available_shares.contains_key(&StreamId(10)));
 
         app.handle_network_event(NetworkEvent::ReconnectScheduled {
             retry_in: Duration::from_secs(2),
             reason: "connection reset".to_string(),
         });
 
-        assert!(app.available_shares.is_empty());
+        assert!(app.room.available_shares.is_empty());
         assert_eq!(app.screencast_stream_id, None);
     }
 
@@ -7780,7 +7761,8 @@ mod tests {
     #[test]
     fn video_command_pushes_diagnostics_notice() {
         let mut app = test_app();
-        app.screencast_status
+        app.room
+            .screencast_status
             .fail("screen capture output is not Annex-B video".to_string());
         app.view.composer.set_lines("/video");
 
@@ -7808,9 +7790,10 @@ mod tests {
         });
 
         assert!(app.screencast.is_none());
-        assert_eq!(app.screencast_status.phase, ScreencastPhase::Failed);
+        assert_eq!(app.room.screencast_status.phase, ScreencastPhase::Failed);
         assert_eq!(
-            app.screencast_status
+            app.room
+                .screencast_status
                 .last_issue
                 .as_ref()
                 .map(|issue| issue.reason.as_str()),
@@ -7823,16 +7806,17 @@ mod tests {
     fn share_start_rejection_tears_down_local_screencast() {
         let mut app = test_app();
         app.screencast = Some(crate::video::ScreencastHandle::for_test());
-        app.screencast_status.start();
+        app.room.screencast_status.start();
 
         app.handle_network_event(NetworkEvent::ShareStartRejected {
             message: "join the room's voice call before sharing".to_string(),
         });
 
         assert!(app.screencast.is_none());
-        assert_eq!(app.screencast_status.phase, ScreencastPhase::Failed);
+        assert_eq!(app.room.screencast_status.phase, ScreencastPhase::Failed);
         assert_eq!(
-            app.screencast_status
+            app.room
+                .screencast_status
                 .last_issue
                 .as_ref()
                 .map(|issue| issue.reason.as_str()),
@@ -8276,7 +8260,8 @@ mod tests {
         });
         let stream_id = StreamId(7);
         app.screencast_stream_id = Some(stream_id);
-        app.screencast_status
+        app.room
+            .screencast_status
             .live(stream_id, "h264".to_string(), 1280, 720);
 
         let mut buffer = Buffer::new(100, 24);
@@ -8286,7 +8271,7 @@ mod tests {
         click_top_bar_rect(&mut app, &mut room, video_rect);
 
         assert!(app.screencast.is_none());
-        assert_eq!(app.screencast_status.phase, ScreencastPhase::Off);
+        assert_eq!(app.room.screencast_status.phase, ScreencastPhase::Off);
         assert_eq!(app.view.status.text(), "video off");
         match rx.try_recv().expect("stop share command") {
             NetworkCommand::StopShare { stream_id: stopped } => assert_eq!(stopped, stream_id),
@@ -8310,7 +8295,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.active_tcp_addr = Some("127.0.0.1:1".to_string());
-        app.voice_room = Some(RoomId(1));
+        app.room.voice_room = Some(RoomId(1));
         app.video_transport = Some(crate::video::VideoTransport::new(
             rpc::crypto::TransportMode::NativeEncrypted,
             [0u8; rpc::crypto::KEY_LEN],
@@ -8323,7 +8308,7 @@ mod tests {
             argv: vec![missing.clone()],
             hevc: false,
         });
-        app.screencast_status.turn_off();
+        app.room.screencast_status.turn_off();
 
         let mut buffer = Buffer::new(100, 24);
         render_room(&mut app, &mut room, &mut buffer);
@@ -8331,9 +8316,10 @@ mod tests {
 
         click_top_bar_rect(&mut app, &mut room, off_rect);
 
-        assert_eq!(app.screencast_status.phase, ScreencastPhase::Failed);
+        assert_eq!(app.room.screencast_status.phase, ScreencastPhase::Failed);
         assert!(
-            app.screencast_status
+            app.room
+                .screencast_status
                 .last_issue
                 .as_ref()
                 .is_some_and(|issue| issue.reason.contains(&missing)),
@@ -8346,7 +8332,8 @@ mod tests {
     fn failed_video_badge_opens_video_diagnostics_on_click() {
         let mut app = test_app();
         let mut room = RoomMode::default();
-        app.screencast_status
+        app.room
+            .screencast_status
             .fail("screen publish failed: connection reset".to_string());
 
         let mut buffer = Buffer::new(100, 24);
@@ -8456,7 +8443,7 @@ mod tests {
         );
         app.start_named_join("192.168.0.1:4000".to_string());
         assert!(app.pending_pair.is_some());
-        assert!(app.join_notice.is_some());
+        assert!(app.room.join_notice.is_some());
     }
 
     #[test]

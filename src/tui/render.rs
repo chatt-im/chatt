@@ -62,7 +62,7 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
 /// Draws the `chatt join` fallback warning as a warm header block when set,
 /// consuming the top three rows of `screen` when there is enough space.
 fn draw_join_notice(screen: &mut Rect, app: &App, buf: &mut Buffer) {
-    let Some(notice) = app.join_notice.as_deref() else {
+    let Some(notice) = app.room.join_notice.as_deref() else {
         return;
     };
     let height = screen.h.min(3);
@@ -1053,7 +1053,7 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
 }
 
 fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect {
-    let (style, label) = match app.screencast_status.phase {
+    let (style, label) = match app.room.screencast_status.phase {
         ScreencastPhase::Starting => (
             top_bar_active_button_style(app.view.theme, app.view.theme.good),
             " VIDEO starting ".to_string(),
@@ -1062,7 +1062,7 @@ fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect 
             top_bar_active_button_style(app.view.theme, app.view.theme.good),
             format!(
                 " VIDEO {}/s ",
-                format_bytes(app.screencast_status.rolling_bytes_per_sec)
+                format_bytes(app.room.screencast_status.rolling_bytes_per_sec)
             ),
         ),
         ScreencastPhase::Off => (
@@ -1173,6 +1173,7 @@ fn draw_lobby_bar(
         lobby_focused && lobby_list_focus == LobbyListFocus::Users,
     );
     let voice_label = match app
+        .room
         .voice_room
         .and_then(|room_id| app.room.room_meta(room_id))
     {

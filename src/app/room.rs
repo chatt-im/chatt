@@ -698,6 +698,27 @@ pub(crate) struct RoomSession {
     pub local_user_name: String,
     pub room_name: String,
     pub participants: Participants,
+    /// The room whose voice call this client is in, independent of any viewed
+    /// room. Mirrors the worker's view; confirmed by our own `VoiceStarted`.
+    pub voice_room: Option<RoomId>,
+    /// A warn banner shown while a `chatt join` falls back to pairing because
+    /// no configured server matched. Cleared once the client connects,
+    /// disconnects, or cancels the pairing.
+    pub join_notice: Option<String>,
+    /// Smoothed round-trip time to the server relay media socket,
+    /// milliseconds. The network leg of the latency estimate for relayed
+    /// participants.
+    pub server_rtt_ms: Option<u16>,
+    /// A reconnect is in flight for the current server.
+    pub network_disconnected: bool,
+    /// UDP media path to the server never bound after repeated retries while
+    /// the TCP session is otherwise up. Surfaced as "UDP Connection Failure".
+    pub udp_unreachable: bool,
+    pub screencast_status: super::ScreencastStatus,
+    /// Shares this client can view, keyed by stream id, learned from
+    /// `ShareAvailable`. Holds the per-stream view secret and codec metadata.
+    pub(super) available_shares: HashMap<StreamId, super::AvailableShare>,
+    pub active_server_label: Option<String>,
     muted_users: HashSet<UserId>,
     stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
@@ -1194,6 +1215,14 @@ impl RoomSession {
             local_user_name: String::new(),
             room_name: "servers".to_string(),
             participants: Participants::default(),
+            voice_room: None,
+            join_notice: None,
+            server_rtt_ms: None,
+            network_disconnected: false,
+            udp_unreachable: false,
+            screencast_status: super::ScreencastStatus::default(),
+            available_shares: HashMap::new(),
+            active_server_label: None,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
