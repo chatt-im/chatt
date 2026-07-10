@@ -24,6 +24,7 @@ const SENTINEL: [u8; 4] = [0, 0, 0, 0];
 pub const KIND_SYNC: u8 = 1;
 pub const KIND_MESSAGE: u8 = 2;
 pub const KIND_OLDER: u8 = 3;
+pub const KIND_REF_PREVIEW: u8 = 4;
 
 /// Fragment kind bytes.
 const FRAG_TEXT: u8 = 0;
@@ -292,6 +293,30 @@ pub fn encode_window(
     put_u32(&mut buf, messages.len() as u32);
     for message in messages {
         encode_message(&mut buf, message);
+    }
+    buf
+}
+
+/// Encodes a `ref_preview` response: the echoed `(timestamp, message id)`
+/// request key, a found flag, and the target message when the feed history
+/// holds it. The browser shows it as the hover card for a `@@` reference
+/// whose target is not in its loaded window.
+pub fn encode_ref_preview(
+    timestamp_ms: u64,
+    message_id: u64,
+    message: Option<&WebMessage>,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&SENTINEL);
+    buf.push(KIND_REF_PREVIEW);
+    put_u64(&mut buf, timestamp_ms);
+    put_u64(&mut buf, message_id);
+    match message {
+        None => buf.push(0),
+        Some(message) => {
+            buf.push(1);
+            encode_message(&mut buf, message);
+        }
     }
     buf
 }
@@ -652,6 +677,20 @@ mod tests {
         let frame = encode_single(&WebMessage::text_for_test(9, "solo"));
         assert_eq!(&frame[0..4], &SENTINEL);
         assert_eq!(frame[4], KIND_MESSAGE);
+    }
+
+    #[test]
+    fn ref_preview_frame_echoes_key_and_flags_found() {
+        let frame = encode_ref_preview(100, 9, Some(&WebMessage::text_for_test(9, "target")));
+        assert_eq!(&frame[0..4], &SENTINEL);
+        assert_eq!(frame[4], KIND_REF_PREVIEW);
+        assert_eq!(u64::from_le_bytes(frame[5..13].try_into().unwrap()), 100);
+        assert_eq!(u64::from_le_bytes(frame[13..21].try_into().unwrap()), 9);
+        assert_eq!(frame[21], 1);
+
+        let missing = encode_ref_preview(100, 9, None);
+        assert_eq!(missing[21], 0);
+        assert_eq!(missing.len(), 22);
     }
 
     #[test]

@@ -9,6 +9,7 @@ import type { WebMessage, Fragment, MediaKind } from "./types";
 
 const KIND_SYNC = 1;
 const KIND_MESSAGE = 2;
+const KIND_REF_PREVIEW = 4;
 
 const FRAG_TEXT = 0;
 const FRAG_CODE = 1;
@@ -22,7 +23,10 @@ const decoder = new TextDecoder();
 export type FeedFrame =
   | { kind: "sync"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
   | { kind: "older"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
-  | { kind: "message"; message: WebMessage };
+  | { kind: "message"; message: WebMessage }
+  // The response to a `ref_preview` request: the echoed reference key and the
+  // target message, or null when the feed history no longer holds it.
+  | { kind: "ref_preview"; ts: number; mid: number; message: WebMessage | null };
 
 // Decodes a feed frame, or returns null when the buffer is not one (a video
 // frame), so the caller falls back to the video path.
@@ -33,6 +37,12 @@ export function decodeFeed(buffer: ArrayBuffer): FeedFrame | null {
   const kind = view.getUint8(4);
   if (kind === KIND_MESSAGE) {
     return { kind: "message", message: reader.message() };
+  }
+  if (kind === KIND_REF_PREVIEW) {
+    const ts = reader.u53();
+    const mid = reader.u53();
+    const message = reader.u8() === 1 ? reader.message() : null;
+    return { kind: "ref_preview", ts, mid, message };
   }
   const oldest_seq = reader.u53();
   const has_more = reader.u8() === 1;

@@ -919,6 +919,80 @@ function Attachment(props: {
   );
 }
 
+const REF_HOVER_DELAY_MS = 200;
+// Mirror the .ref-hover-card max-width/max-height in styles.css; used to clamp
+// and flip the fixed-position card before it has rendered.
+const REF_HOVER_MAX_WIDTH = 360;
+const REF_HOVER_MAX_HEIGHT = 240;
+const REF_HOVER_GAP = 4;
+const REF_HOVER_MARGIN = 8;
+
+// Exactly one of top/bottom is set: `bottom` anchors the card above the pill
+// (growing upward, so its unknown height needs no measurement), `top` below.
+interface RefHoverState {
+  message: WebMessage;
+  left: number;
+  top: number | null;
+  bottom: number | null;
+}
+
+// Floating preview of a referenced message, shown while hovering a resolved
+// `@@` pill. Inert to the pointer; positioning is fixed viewport coordinates
+// computed by the hover handlers in App.
+function RefHoverCard(props: { hover: RefHoverState }) {
+  const style = () => ({
+    left: `${props.hover.left}px`,
+    top: props.hover.top !== null ? `${props.hover.top}px` : undefined,
+    bottom:
+      props.hover.bottom !== null ? `${props.hover.bottom}px` : undefined,
+  });
+  return (
+    <div class="ref-hover-card" style={style()} role="tooltip">
+      <div class="ref-hover-meta">
+        <span class="ref-hover-sender">{props.hover.message.sender}</span>
+        <span class="ref-hover-time">
+          {formatTime(props.hover.message.timestamp_ms)}
+        </span>
+      </div>
+      <MessageBody fragments={props.hover.message.fragments} />
+      <Show when={props.hover.message.attachment}>
+        {(att) => {
+          // Reserve the image box from its intrinsic size so the card does not
+          // resize when the image decodes; bottom-anchored cards grow upward.
+          const box = () => {
+            const width = att().width ?? 0;
+            const height = att().height ?? 0;
+            if (width > 0 && height > 0) {
+              return {
+                width: `min(100%, ${width}px)`,
+                "aspect-ratio": `${width} / ${height}`,
+              };
+            }
+            return undefined;
+          };
+          return (
+            <Show
+              when={att().kind === "image"}
+              fallback={
+                <div class="ref-hover-attachment">
+                  {att().kind}: {att().name}
+                </div>
+              }
+            >
+              <img
+                class="ref-hover-image"
+                src={fileUrl(att().name)}
+                alt={att().name}
+                style={box()}
+              />
+            </Show>
+          );
+        }}
+      </Show>
+    </div>
+  );
+}
+
 function MessageRow(props: {
   message: WebMessage;
   group: MessageGroupInfo;
@@ -1093,6 +1167,7 @@ export default function App() {
     buildMessageList(messages(), collapsedGroups())
   );
   const [refToast, setRefToast] = createSignal<string | null>(null);
+  const [refHover, setRefHover] = createSignal<RefHoverState | null>(null);
   const [connected, setConnected] = createSignal(false);
   const [connectionErrorVisible, setConnectionErrorVisible] =
     createSignal(false);
@@ -1719,9 +1794,115 @@ export default function App() {
     resizeComposer();
   }
 
+  // Hover preview for `@@` reference pills. Delegated mouseover/mouseout on the
+  // log container, mirroring onLogClick, because the anchors live inside
+  // Rust-rendered fragment HTML. The card is pointer-inert, so only the pill
+  // itself keeps the hover alive. A target outside the loaded window is fetched
+  // from the web server's retained history with a `ref_preview` request; the
+  // responses are cached (hits and misses) until the next room sync.
+  let refHoverTimer: number | undefined;
+  let refHoverAnchor: HTMLElement | undefined;
+  let refHoverPendingKey: string | undefined;
+  const refPreviewCache = new Map<string, WebMessage | null>();
+
+  function refPreviewKey(ts: number, mid: number): string {
+    return `${ts}:${mid}`;
+  }
+
+  function hideRefHover() {
+    if (refHoverTimer !== undefined) {
+      clearTimeout(refHoverTimer);
+      refHoverTimer = undefined;
+    }
+    refHoverAnchor = undefined;
+    refHoverPendingKey = undefined;
+    if (refHover()) setRefHover(null);
+  }
+
+  function showRefHover(anchor: HTMLElement) {
+    const ts = Number(anchor.dataset.ts);
+    const mid = Number(anchor.dataset.mid);
+    if (!Number.isFinite(ts) || !Number.isFinite(mid)) return;
+    const index = findMessageIndex(ts, mid);
+    if (index >= 0) {
+      displayRefHover(anchor, messages()[index]!);
+      return;
+    }
+    const key = refPreviewKey(ts, mid);
+    if (refPreviewCache.has(key)) {
+      const cached = refPreviewCache.get(key);
+      if (cached) displayRefHover(anchor, cached);
+      return;
+    }
+    refHoverPendingKey = key;
+    sendJson({ type: "ref_preview", ts, mid });
+  }
+
+  function onRefPreview(ts: number, mid: number, message: WebMessage | null) {
+    const key = refPreviewKey(ts, mid);
+    refPreviewCache.set(key, message);
+    if (key !== refHoverPendingKey) return;
+    refHoverPendingKey = undefined;
+    const anchor = refHoverAnchor;
+    if (!anchor || !anchor.isConnected || !message) return;
+    displayRefHover(anchor, message);
+  }
+
+  function displayRefHover(anchor: HTMLElement, message: WebMessage) {
+    const rect = anchor.getBoundingClientRect();
+    const left = clamp(
+      rect.left,
+      REF_HOVER_MARGIN,
+      Math.max(
+        REF_HOVER_MARGIN,
+        window.innerWidth - REF_HOVER_MAX_WIDTH - REF_HOVER_MARGIN
+      )
+    );
+    const fitsAbove =
+      rect.top >= REF_HOVER_MAX_HEIGHT + REF_HOVER_GAP + REF_HOVER_MARGIN;
+    setRefHover(
+      fitsAbove
+        ? {
+            message,
+            left,
+            top: null,
+            bottom: window.innerHeight - rect.top + REF_HOVER_GAP,
+          }
+        : { message, left, top: rect.bottom + REF_HOVER_GAP, bottom: null }
+    );
+  }
+
+  function onLogMouseOver(event: MouseEvent) {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const anchor = target.closest("a.msg-ref");
+    if (!(anchor instanceof HTMLElement)) return;
+    // mouseover re-fires when crossing descendant nodes; ignore repeats on the
+    // pill already tracked so the show timer is not restarted.
+    if (anchor === refHoverAnchor) return;
+    hideRefHover();
+    refHoverAnchor = anchor;
+    refHoverTimer = window.setTimeout(() => {
+      refHoverTimer = undefined;
+      showRefHover(anchor);
+    }, REF_HOVER_DELAY_MS);
+  }
+
+  function onLogMouseOut(event: MouseEvent) {
+    if (!refHoverAnchor) return;
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    if (target.closest("a.msg-ref") !== refHoverAnchor) return;
+    // Still inside the same pill (moved onto a descendant node): not a leave.
+    const related = event.relatedTarget;
+    if (related instanceof Node && refHoverAnchor.contains(related)) return;
+    hideRefHover();
+  }
+
   // Reference anchors live inside Rust-rendered fragment HTML. Media references
   // include backend-filled preview metadata; shift-click keeps the jump action.
   function onLogClick(event: MouseEvent) {
+    hideRefHover();
     const target = event.target as HTMLElement;
     const anchor = target.closest?.("a.msg-ref");
     if (!(anchor instanceof HTMLElement)) return;
@@ -2197,6 +2378,7 @@ export default function App() {
   }
 
   function onScroll(offset: number) {
+    hideRefHover();
     const now = debugNow();
     const requestThreshold = topRequestThreshold();
     const rearmThreshold = topRearmThreshold();
@@ -2309,6 +2491,7 @@ export default function App() {
             frameHasMore: feed.has_more,
           });
           preloadRecentImages(feed.messages);
+          refPreviewCache.clear();
           setMessages(feed.messages);
           oldestSeq = feed.oldest_seq;
           hasMore = feed.has_more;
@@ -2346,6 +2529,8 @@ export default function App() {
             frameHasMore: feed.has_more,
           });
           scheduleResumePendingJump();
+        } else if (feed.kind === "ref_preview") {
+          onRefPreview(feed.ts, feed.mid, feed.message);
         } else {
           // A live message. Upsert by the announcement timestamp and file id;
           // transfer ids are reused after server restarts, while the pair
@@ -2564,6 +2749,7 @@ export default function App() {
     if (pendingJumpFrame) cancelAnimationFrame(pendingJumpFrame);
     clearPrependSettleFrame();
     if (refToastTimer) clearTimeout(refToastTimer);
+    if (refHoverTimer !== undefined) clearTimeout(refHoverTimer);
     for (const decoder of decoders.values()) decoder.close();
     decoders.clear();
     imagePreloads.clear();
@@ -2582,6 +2768,9 @@ export default function App() {
         <div class="ref-toast" role="status" aria-live="polite">
           {refToast()}
         </div>
+      </Show>
+      <Show when={refHover()}>
+        {(hover) => <RefHoverCard hover={hover()} />}
       </Show>
       <div
         class="app-body"
@@ -2638,6 +2827,8 @@ export default function App() {
             onPointerDown={onLogPointerDown}
             onKeyDown={onKeyDown}
             onClick={onLogClick}
+            onMouseOver={onLogMouseOver}
+            onMouseOut={onLogMouseOut}
           >
             <div class="chat-log-content" ref={contentEl}>
               <Virtualizer
