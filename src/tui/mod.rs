@@ -1,4 +1,5 @@
 pub(crate) mod chrome;
+pub(crate) mod client_thread;
 pub(crate) mod editor;
 pub(crate) mod form;
 pub(crate) mod mode;
@@ -10,6 +11,7 @@ pub(crate) mod overlay;
 pub(crate) mod render;
 pub(crate) mod room_settings;
 pub(crate) mod user_list;
+pub(crate) mod view;
 pub(crate) mod widgets;
 
 pub(crate) use modes::Action;

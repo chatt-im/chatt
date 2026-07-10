@@ -1,5 +1,6 @@
 pub(crate) mod audio_diagnostics;
 pub(crate) mod audio_supervisor;
+pub(crate) mod command;
 pub(crate) mod commands;
 pub(crate) mod dialogs;
 pub(crate) mod participants;
