@@ -49,6 +49,7 @@ use crate::{
         overlay::{
             DialogMode, NativeEncryptionWarningMode, PasswordPromptMode, PasteImageUploadMode,
         },
+        view::ClientView,
     },
     ui::settings::{
         DeviceAction, DeviceSide, FieldId, FieldIntent, SettingsButton, SettingsOutput,
@@ -335,6 +336,10 @@ pub(crate) struct App {
     pub theme: Theme,
     events: AppEvents,
     pub room: RoomSession,
+    /// The primary terminal's exclusive UI state: composer, scrollback
+    /// buffers, pending edit, clipboard queue. Splits off `room` so attached
+    /// clients can each own one.
+    pub view: ClientView,
     pub status: StatusState,
     pub pending_transition: PendingTransition,
     pub chrome: ChromeState,
@@ -913,9 +918,10 @@ fn web_action_error_envelope(operation: &str, message: &str) -> String {
 fn web_room_messages(
     view: &crate::room_history::LoadedHistory,
     room: &RoomSession,
+    client_view: &ClientView,
     local_user: Option<UserId>,
 ) -> Vec<crate::web_server::WebMessage> {
-    let resolver = |target| room.web_ref_for(target);
+    let resolver = |target| client_view.web_ref_for(room, target);
     let mut messages = Vec::with_capacity(view.messages.len());
     for message in &view.messages {
         let web_message = match message.file_transfer_id {
@@ -1081,7 +1087,8 @@ impl App {
         let events = AppEvents::new();
         let soundboard_enabled = config.soundboard.enabled;
         let theme = config.ui.resolve_theme();
-        let room = RoomSession::new(&config, &theme);
+        let room = RoomSession::new(&config);
+        let view = ClientView::new(&config, &theme);
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let output_volume_percent_bits =
             Arc::new(AtomicU32::new(config.audio.output_volume.to_bits()));
@@ -1106,6 +1113,7 @@ impl App {
             theme,
             events,
             room,
+            view,
             status: StatusState::new("select a server"),
             pending_transition: PendingTransition::default(),
             chrome: ChromeState::default(),
@@ -1207,11 +1215,12 @@ impl App {
         }
         draft.apply_to_config(&mut self.config);
         self.theme = self.config.ui.resolve_theme();
-        self.room.apply_theme(&self.theme);
+        self.view.apply_theme(&self.theme);
         match self.config.save_runtime() {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 self.room.set_max_messages(self.config.ui.max_messages);
+                self.view.set_max_messages(self.config.ui.max_messages);
                 self.set_status(format!("setup saved to {}", path.display()));
                 true
             }
@@ -1318,7 +1327,7 @@ impl App {
         self.config.ui.theme = reloaded.ui.theme;
         self.config.ui.themes = reloaded.ui.themes;
         self.theme = self.config.ui.resolve_theme();
-        self.room.apply_theme(&self.theme);
+        self.view.apply_theme(&self.theme);
         let _ = reply.send(Ok("theme reloaded".to_string()));
     }
 
@@ -1589,7 +1598,7 @@ impl App {
                 body,
             } => {
                 let target = MessageId(target);
-                match self.room.validate_web_edit(target) {
+                match self.view.validate_web_edit(&self.room, target) {
                     Ok(room_id) if !body.trim().is_empty() => {
                         if self.network.is_none() && !self.network_disconnected {
                             let message = "select a server before editing messages";
@@ -1648,7 +1657,7 @@ impl App {
                 target,
             } => {
                 let target = MessageId(target);
-                match self.room.validate_web_delete(target) {
+                match self.view.validate_web_delete(&self.room, target) {
                     Ok(room_id) => {
                         if self.network.is_none() {
                             let message = "select a server before deleting messages";
@@ -1932,6 +1941,7 @@ impl App {
             server.effective_display_name(),
         );
         if continuity == room::ServerContinuity::NewServer {
+            self.view.reset_rooms();
             let catalog_dir = self.room.history_storage().catalog_dir();
             if catalog_dir.is_some() {
                 let catalog = crate::room_catalog::load(catalog_dir);
@@ -1942,7 +1952,7 @@ impl App {
             let view = self.room.viewed_history();
             feed.set_room(
                 self.room.room_name.clone(),
-                web_room_messages(&view, &self.room, self.user_id),
+                web_room_messages(&view, &self.room, &self.view, self.user_id),
             );
         }
         self.active_tcp_addr = Some(
@@ -2008,17 +2018,21 @@ impl App {
         self.voice_room = None;
         self.requested_voice_room = None;
         self.pending_dm_open = None;
+        self.view.cancel_pending_edit();
         self.room.reset_for_disconnect();
     }
 
     /// Mirrors the viewed room into the web feed and tells the worker which
     /// room externally injected uploads target.
     fn sync_viewed_room_to_feeds(&mut self) {
+        // The web feed mirrors the primary view's buffer, so catch it up
+        // before exporting.
+        self.view.sync_active(&self.room);
         if let Some(feed) = &self.web_feed {
             let view = self.room.viewed_history();
             feed.set_room(
                 self.room.room_name.clone(),
-                web_room_messages(&view, &self.room, self.user_id),
+                web_room_messages(&view, &self.room, &self.view, self.user_id),
             );
         }
         if let Some(room_id) = self.room.viewed_room {
@@ -2029,15 +2043,16 @@ impl App {
     /// Switches the viewed room, updating the web feed, upload target, and the
     /// persisted catalog. Returns false when the room is unknown.
     pub(crate) fn set_viewed_room(&mut self, room_id: RoomId) -> bool {
-        if !self.room.set_viewed_room(room_id, self.user_id) {
+        if !self.room.set_viewed_room(room_id) {
             return false;
         }
+        self.view.switch_room(room_id, &self.room);
         self.after_view_switch();
         true
     }
 
     pub(crate) fn request_older_history_if_at_top(&mut self, width: u16, height: u16) {
-        if !self.room.active.chat.is_at_top(width, height) {
+        if !self.view.active.chat.is_at_top(width, height) {
             return;
         }
         let Some((room_id, before, limit)) = self.room.older_history_request() else {
@@ -2690,17 +2705,15 @@ impl App {
                 }
                 if let Some((pending_room, peer)) = self.pending_dm_open
                     && pending_room == room_id
-                    && self.room.set_viewed_room(room_id, self.user_id)
+                    && self.set_viewed_room(room_id)
                 {
                     self.pending_dm_open = None;
-                    self.after_view_switch();
                     self.set_status(format!("dm with {}", self.room.display_name_of(peer)));
                 }
                 self.mark_room_catalog_dirty();
             }
             NetworkEvent::DmOpened { room_id, peer } => {
-                if self.room.set_viewed_room(room_id, self.user_id) {
-                    self.after_view_switch();
+                if self.set_viewed_room(room_id) {
                     self.set_status(format!("dm with {}", self.room.display_name_of(peer)));
                 } else {
                     self.pending_dm_open = Some((room_id, peer));
@@ -2783,7 +2796,7 @@ impl App {
                             MutationOutcome::AppliedEdit(folded) => {
                                 feed.send(crate::web_server::WebMessage::from_chat(
                                     &folded,
-                                    &|target| self.room.web_ref_for(target),
+                                    &|target| self.view.web_ref_for(&self.room, target),
                                     self.user_id,
                                 ));
                             }
@@ -2810,9 +2823,12 @@ impl App {
                 if let Some(message) = feed_message
                     && let Some(feed) = &self.web_feed
                 {
+                    // Web refs resolve against the primary view's buffer;
+                    // catch it up to include the message just received.
+                    self.view.sync_active(&self.room);
                     feed.send(crate::web_server::WebMessage::from_chat(
                         &message,
-                        &|target| self.room.web_ref_for(target),
+                        &|target| self.view.web_ref_for(&self.room, target),
                         self.user_id,
                     ));
                 }
@@ -3342,7 +3358,27 @@ impl App {
             return;
         }
         self.last_network_notice = Some(body.to_string());
-        self.room.push_error_notice(sender, body);
+        self.push_error_notice(sender, body);
+    }
+
+    /// Journals a system line into the viewed room; before any room is
+    /// viewed it lands in the primary view's pre-connect buffer instead.
+    pub(crate) fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
+        let sender = sender.into();
+        let body = body.into();
+        if !self.room.push_notice(sender.clone(), body.clone()) {
+            self.view
+                .push_local_notice(sender, body, crate::chat_buffer::NoticeKind::Info);
+        }
+    }
+
+    pub(crate) fn push_error_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
+        let sender = sender.into();
+        let body = body.into();
+        if !self.room.push_error_notice(sender.clone(), body.clone()) {
+            self.view
+                .push_local_notice(sender, body, crate::chat_buffer::NoticeKind::Error);
+        }
     }
 
     /// Builds the fallback base mode used if the stack is ever popped empty.
@@ -3407,6 +3443,7 @@ impl App {
         if self.room.server_alias == label {
             self.disconnect_network();
             self.room.reset_for_server_list();
+            self.view.reset_rooms();
         }
         match self.config.save_runtime() {
             Ok(path) => {
@@ -3430,6 +3467,7 @@ impl App {
         else {
             self.set_error(format!("server {label} is not configured"));
             self.room.reset_for_server_list();
+            self.view.reset_rooms();
             self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
             return;
         };
@@ -3449,6 +3487,7 @@ impl App {
                     ));
                 } else {
                     self.room.reset_for_server_list();
+                    self.view.reset_rooms();
                     self.request_mode_transition(ModeTransition::Set(Box::new(
                         ServerListMode::new(),
                     )));
@@ -3461,6 +3500,7 @@ impl App {
     pub(crate) fn cancel_native_encryption_warning(&mut self) {
         self.disconnect_network();
         self.room.reset_for_server_list();
+        self.view.reset_rooms();
         self.rebuild_server_items();
         self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
         self.set_status("connection canceled");
@@ -3812,7 +3852,7 @@ impl App {
         }
         self.config.ui.theme = selection;
         self.theme = self.config.ui.resolve_theme();
-        self.room.apply_theme(&self.theme);
+        self.view.apply_theme(&self.theme);
     }
 
     fn apply_web_setting(&mut self, old: &config::WebConfig) {
@@ -4918,6 +4958,7 @@ impl App {
                 self.config.config_path = Some(path.clone());
                 session.dirty = false;
                 self.room.set_max_messages(self.config.ui.max_messages);
+                self.view.set_max_messages(self.config.ui.max_messages);
                 // Commit the download runtime effects together: the memory ring
                 // cap and the network worker's file policy flip on Save, so the
                 // UI, the ring, and the worker stay consistent.
@@ -5009,7 +5050,7 @@ impl App {
     }
 
     pub(crate) fn submit_input(&mut self) {
-        let Some(submission) = self.room.submit_composer() else {
+        let Some(submission) = self.view.submit_composer() else {
             return;
         };
         let input = match submission {
@@ -5053,7 +5094,7 @@ impl App {
             "/audio" => self.show_audio_status(),
             "/audio-reset" => self.audio_manual_reset(),
             "/stats" => self.toggle_lobby_details(),
-            "/clear" => self.room.clear_chat(),
+            "/clear" => self.view.clear_chat(),
             "/help" => self.show_command_help(),
             "/config" | "/settings" => self.open_settings(),
             "/servers" if self.network.is_some() => self.pop_mode(),
@@ -5245,7 +5286,7 @@ impl App {
     }
 
     fn show_command_help(&mut self) {
-        self.room.push_notice("help", slash_command_help());
+        self.push_notice("help", slash_command_help());
         self.set_status("slash commands listed");
     }
 
@@ -5410,9 +5451,9 @@ impl App {
     fn show_video_status(&mut self) {
         let notice = self.video_diagnostics_notice();
         if self.screencast_status.phase == ScreencastPhase::Failed {
-            self.room.push_error_notice("video", notice);
+            self.push_error_notice("video", notice);
         } else {
-            self.room.push_notice("video", notice);
+            self.push_notice("video", notice);
         }
         self.set_status(self.video_status_summary());
     }
@@ -5526,7 +5567,7 @@ impl App {
             health_lines,
             recent_events,
         );
-        self.room.push_notice("audio", diagnostics.notice_body());
+        self.push_notice("audio", diagnostics.notice_body());
         self.set_status(diagnostics.status_summary());
     }
 
@@ -5649,7 +5690,7 @@ impl App {
             .map(|(index, clip)| format!("{}:{}", index + 1, clip.name))
             .collect::<Vec<_>>()
             .join(" ");
-        self.room.push_notice(
+        self.push_notice(
             "soundboard",
             &format!(
                 "clips {clips}; loss {}; trigger with /sound N or bound keys",
@@ -6733,6 +6774,7 @@ mod tests {
             None,
             app.user_id,
         );
+        app.view.switch_room(rpc::ids::RoomId(1), &app.room);
     }
 
     fn observe_room_voice(app: &mut App, user_id: UserId, stream_id: u32) {
@@ -7026,7 +7068,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         enter_test_room(&mut app);
-        app.room.composer.set_lines(" /help");
+        app.view.composer.set_lines(" /help");
 
         app.submit_input();
 
@@ -7050,11 +7092,11 @@ mod tests {
             app.user_id,
         );
 
-        app.room.composer.set_lines("/room room-2");
+        app.view.composer.set_lines("/room room-2");
         app.submit_input();
         assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(2)));
 
-        app.room.composer.set_lines("/room nowhere");
+        app.view.composer.set_lines("/room nowhere");
         app.submit_input();
         assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(2)));
         assert_eq!(app.status.kind(), StatusKind::Error);
@@ -7074,7 +7116,7 @@ mod tests {
             ],
         );
 
-        app.room.composer.set_lines("/dm bob");
+        app.view.composer.set_lines("/dm bob");
         app.submit_input();
 
         match rx.try_recv().unwrap() {
@@ -7167,7 +7209,7 @@ mod tests {
         // hermetic; the join command must still go out.
         app.deafened.store(true, Ordering::Relaxed);
 
-        app.room.composer.set_lines("/voice");
+        app.view.composer.set_lines("/voice");
         app.submit_input();
 
         assert_eq!(app.voice_room, None);
@@ -7193,7 +7235,7 @@ mod tests {
         enter_test_room(&mut app);
         app.deafened.store(true, Ordering::Relaxed);
 
-        app.room.composer.set_lines("/voice");
+        app.view.composer.set_lines("/voice");
         app.submit_input();
         assert_eq!(app.requested_voice_room, Some(rpc::ids::RoomId(1)));
 
@@ -7205,7 +7247,7 @@ mod tests {
         assert_eq!(app.requested_voice_room, None);
         assert_eq!(app.status.kind(), StatusKind::Error);
 
-        app.room.composer.set_lines("/voice");
+        app.view.composer.set_lines("/voice");
         app.submit_input();
         assert_eq!(app.requested_voice_room, Some(rpc::ids::RoomId(1)));
         let mut join_count = 0;
@@ -7228,7 +7270,7 @@ mod tests {
         enter_test_room(&mut app);
         app.voice_room = Some(rpc::ids::RoomId(1));
 
-        app.room.composer.set_lines("/voice-leave");
+        app.view.composer.set_lines("/voice-leave");
         app.submit_input();
 
         match rx.try_recv().unwrap() {
@@ -7246,7 +7288,7 @@ mod tests {
         enter_test_room(&mut app);
         app.voice_room = Some(rpc::ids::RoomId(1));
 
-        app.room.composer.set_lines("/voice-leave");
+        app.view.composer.set_lines("/voice-leave");
         app.submit_input();
         while rx.try_recv().is_ok() {}
 
@@ -7272,7 +7314,7 @@ mod tests {
         );
 
         app.voice_room = None;
-        app.room.composer.set_lines("/voice");
+        app.view.composer.set_lines("/voice");
         app.submit_input();
         assert!(!app.voice_left);
         while rx.try_recv().is_ok() {}
@@ -7501,12 +7543,13 @@ mod tests {
             .collect::<Vec<_>>();
         app.room
             .complete_history_fetch(RoomId(1), None, &messages, false);
-        app.room.merge_history(RoomId(1), messages, app.user_id);
+        app.room.merge_history(RoomId(1), messages);
+        app.view.sync_active(&app.room);
 
         app.request_older_history_if_at_top(40, 5);
         assert!(rx.try_recv().is_err());
 
-        app.room.active.chat.top(40, 5);
+        app.view.active.chat.top(40, 5);
         app.request_older_history_if_at_top(40, 5);
         match rx.try_recv().unwrap() {
             NetworkCommand::FetchHistory {
@@ -7727,7 +7770,7 @@ mod tests {
     fn settings_detour_preserves_composer_draft() {
         let mut app = test_app();
         app.room.server_alias = "local".to_string();
-        app.room.composer.set_lines("unsent draft");
+        app.view.composer.set_lines("unsent draft");
         let mut h = Harness::new(app);
 
         h.app.open_settings();
@@ -7736,18 +7779,18 @@ mod tests {
 
         assert_eq!(h.stack.len(), 1);
         assert_eq!(h.top_theme_mode(), crate::theme::UiMode::Compose);
-        assert_eq!(h.app.room.composer.text(), "unsent draft");
+        assert_eq!(h.app.view.composer.text(), "unsent draft");
     }
 
     #[test]
     fn slash_help_pushes_command_notice() {
         let mut app = test_app();
-        app.room.composer.set_lines("/help");
+        app.view.composer.set_lines("/help");
 
         app.submit_input();
 
-        assert_eq!(app.room.active.chat.len(), 1);
-        let notice = app.room.active.chat.message(0);
+        assert_eq!(app.view.active.chat.len(), 1);
+        let notice = app.view.active.chat.message(0);
         assert_eq!(notice.sender, "help");
         assert!(notice.body.contains("/report-bug what went wrong"));
         assert!(notice.body.contains("Press Tab again to cycle matches"));
@@ -7763,12 +7806,12 @@ mod tests {
         let mut app = test_app();
         app.screencast_status
             .fail("screen capture output is not Annex-B video".to_string());
-        app.room.composer.set_lines("/video");
+        app.view.composer.set_lines("/video");
 
         app.submit_input();
 
-        assert_eq!(app.room.active.chat.len(), 1);
-        let notice = app.room.active.chat.message(0);
+        assert_eq!(app.view.active.chat.len(), 1);
+        let notice = app.view.active.chat.message(0);
         assert_eq!(notice.sender, "video");
         assert!(notice.body.contains("state: failed"));
         assert!(notice.body.contains("last issue:"));
@@ -7826,12 +7869,12 @@ mod tests {
         let mut app = test_app();
         assert!(!app.lobby_details);
 
-        app.room.composer.set_lines("/stats");
+        app.view.composer.set_lines("/stats");
         app.submit_input();
         assert!(app.lobby_details);
         assert_eq!(app.status.text(), "lobby detail on (jitter buffer stats)");
 
-        app.room.composer.set_lines("/stats");
+        app.view.composer.set_lines("/stats");
         app.submit_input();
         assert!(!app.lobby_details);
         assert_eq!(app.status.text(), "lobby detail off (latency estimate)");
@@ -7878,7 +7921,7 @@ mod tests {
         let mut app = App::new(config, None).expect("test app");
         let mut room = RoomMode::default();
         room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert_eq!(app.room.composer.mode(), EditorMode::Normal);
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
 
         room.process_input(
             &mut app,
@@ -7887,7 +7930,7 @@ mod tests {
 
         assert!(app.mic_muted.load(Ordering::Relaxed));
         assert_eq!(room.focus(), ChatPanelFocus::Compose);
-        assert_eq!(app.room.composer.mode(), EditorMode::Normal);
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
     }
 
     #[test]
@@ -7993,11 +8036,12 @@ mod tests {
             );
         }
 
+        app.view.sync_active(&app.room);
         let mut mode = RoomMode::with_focus(ChatPanelFocus::ChatLog);
         mode.render(&mut app, &mut Buffer::new(80, 24), 0);
-        app.room.active.chat.set_cursor_to_message(0);
-        assert!(app.room.active.chat.toggle_visual_anchor(80));
-        app.room.active.chat.move_cursor_line(2, 80);
+        app.view.active.chat.set_cursor_to_message(0);
+        assert!(app.view.active.chat.toggle_visual_anchor(80));
+        app.view.active.chat.move_cursor_line(2, 80);
         let stack = crate::tui::mode_stack::ModeStack::new(Box::new(mode), &mut app);
         let mut h = Harness { app, stack };
 
@@ -8005,7 +8049,7 @@ mod tests {
         assert!(h.overlay_active());
         assert!(rx.try_recv().is_err(), "opening the modal must not delete");
         h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(h.app.room.active.chat.has_visual());
+        assert!(h.app.view.active.chat.has_visual());
         assert!(rx.try_recv().is_err(), "canceling must not delete");
 
         h.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
@@ -8020,9 +8064,9 @@ mod tests {
             }
         }
         assert!(rx.try_recv().is_err());
-        assert!(!h.app.room.active.chat.has_visual());
+        assert!(!h.app.view.active.chat.has_visual());
         assert_eq!(
-            h.app.room.active.chat.len(),
+            h.app.view.active.chat.len(),
             3,
             "deletion waits for server echo"
         );
@@ -8050,6 +8094,7 @@ mod tests {
             },
             app.user_id,
         );
+        app.view.sync_active(&app.room);
 
         app.handle_web_request(crate::web_server::WebRequest::EditChat {
             client: 1,
@@ -8150,7 +8195,8 @@ mod tests {
     fn chat_notice_markers_use_notice_kind_accent() {
         let mut app = test_app();
         let mut room = RoomMode::default();
-        app.room.push_notice("system", "joined");
+        app.view
+            .push_local_notice("system", "joined", crate::chat_buffer::NoticeKind::Info);
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
         let info_marker = cell_style(
@@ -8162,7 +8208,8 @@ mod tests {
 
         let mut app = test_app();
         let mut room = RoomMode::default();
-        app.room.push_error_notice("video", "failed");
+        app.view
+            .push_local_notice("video", "failed", crate::chat_buffer::NoticeKind::Error);
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
         let error_marker = cell_style(
@@ -8335,8 +8382,8 @@ mod tests {
             },
         );
 
-        assert_eq!(app.room.active.chat.len(), 1);
-        let notice = app.room.active.chat.message(0);
+        assert_eq!(app.view.active.chat.len(), 1);
+        let notice = app.view.active.chat.message(0);
         assert_eq!(notice.sender, "video");
         assert!(notice.body.contains("connection reset"));
     }

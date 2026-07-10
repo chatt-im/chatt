@@ -87,6 +87,9 @@ fn run_app_inner(
         }
         app.tick();
         mode_stack.apply_pending(&mut app);
+        // Catch the primary view's buffer up to the shared session before
+        // painting; every session mutation above lands here.
+        app.view.sync_active(&app.room);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
@@ -128,10 +131,10 @@ fn run_app_inner(
             }
         }
 
-        if let Some(text) = app.room.take_pending_clipboard() {
+        if let Some(text) = app.view.take_pending_clipboard() {
             clipboard.copy(&mut terminal, &text);
         }
-        if let Some(url) = app.room.take_pending_url_open() {
+        if let Some(url) = app.view.take_pending_url_open() {
             url_opener.open(&url);
         }
     }

@@ -971,7 +971,7 @@ impl RoomMode {
 
     pub(crate) fn set_focus(&mut self, app: &mut App, focus: ChatPanelFocus) {
         if self.focus == ChatPanelFocus::Compose && focus != ChatPanelFocus::Compose {
-            app.room.cancel_pending_edit();
+            app.view.cancel_pending_edit();
         }
         self.focus = focus;
         match focus {
@@ -980,14 +980,14 @@ impl RoomMode {
             }
             ChatPanelFocus::Lobby => {}
             ChatPanelFocus::ChatLog => {
-                app.room.active.chat.ensure_cursor(self.layout.chat_width);
+                app.view.active.chat.ensure_cursor(self.layout.chat_width);
             }
             ChatPanelFocus::Compose => {}
         }
     }
 
     fn enter_compose_insert_mode(&mut self, app: &mut App) {
-        app.room.composer.enter_insert_mode();
+        app.view.composer.enter_insert_mode();
         self.set_focus(app, ChatPanelFocus::Compose);
     }
 
@@ -998,7 +998,7 @@ impl RoomMode {
     /// The binding layer for non-compose focus: the chat-visual overlay while
     /// the chat log holds a visual-line selection, the workspace otherwise.
     fn workspace_layer(&self, app: &App) -> LayerId {
-        if self.focus == ChatPanelFocus::ChatLog && app.room.active.chat.has_visual() {
+        if self.focus == ChatPanelFocus::ChatLog && app.view.active.chat.has_visual() {
             bindings::CHAT_VISUAL_LAYER
         } else {
             bindings::WORKSPACE_LAYER
@@ -1017,8 +1017,8 @@ impl RoomMode {
             EnterLog => self.set_focus(app, ChatPanelFocus::ChatLog),
             SubmitMessage => app.submit_input(),
             Cancel => {
-                if self.focus == ChatPanelFocus::Compose && !app.room.cancel_pending_edit() {
-                    app.room.composer.clear();
+                if self.focus == ChatPanelFocus::Compose && !app.view.cancel_pending_edit() {
+                    app.view.composer.clear();
                 }
                 self.enter_compose_insert_mode(app);
             }
@@ -1057,7 +1057,7 @@ impl RoomMode {
             ToggleVisual => self.toggle_chat_visual_if_focused(app),
             ClearSelection => {
                 if self.focus == ChatPanelFocus::ChatLog {
-                    app.room.active.chat.clear_visual_anchor();
+                    app.view.active.chat.clear_visual_anchor();
                 }
             }
             CopySelection => self.copy_chat_selection_if_focused(app),
@@ -1079,7 +1079,7 @@ impl RoomMode {
             AdjustRight if self.focus == ChatPanelFocus::Lobby => {
                 self.set_lobby_list_focus(app, LobbyListFocus::Users);
             }
-            ClearChat if self.focus == ChatPanelFocus::ChatLog => app.room.clear_chat(),
+            ClearChat if self.focus == ChatPanelFocus::ChatLog => app.view.clear_chat(),
             PasteClipboard => {
                 self.paste_from_clipboard(app, &crate::clipboard_paste::HelperClipboard)
             }
@@ -1094,10 +1094,10 @@ impl RoomMode {
     }
 
     fn process_compose_key(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if app.room.composer.mode() == EditorMode::Insert {
+        if app.view.composer.mode() == EditorMode::Insert {
             if key.code == extui::event::KeyCode::Tab
                 && key.modifiers.is_empty()
-                && app.room.complete_command()
+                && app.view.complete_command()
             {
                 return Action::Continue;
             }
@@ -1110,8 +1110,8 @@ impl RoomMode {
                     BindingResolution::Unmatched => {}
                 }
             }
-            if app.room.composer.send_key(&key) {
-                maybe_auto_close_markdown_code_fence(&mut app.room.composer, key);
+            if app.view.composer.send_key(&key) {
+                maybe_auto_close_markdown_code_fence(&mut app.view.composer, key);
             }
             return Action::Continue;
         }
@@ -1121,7 +1121,7 @@ impl RoomMode {
             BindingResolution::Consumed => return Action::Continue,
             BindingResolution::Unmatched => {}
         }
-        let _ = app.room.composer.send_key(&key);
+        let _ = app.view.composer.send_key(&key);
         Action::Continue
     }
 
@@ -1137,7 +1137,7 @@ impl RoomMode {
         match provider.read_paste() {
             Ok(PastePayload::Text(text)) => {
                 self.enter_compose_insert_mode(app);
-                app.room.insert_paste(text);
+                app.view.insert_paste(text);
             }
             Ok(PastePayload::Image(image)) => app.open_paste_image_dialog(image),
             Ok(PastePayload::Empty) => app.set_status("clipboard is empty"),
@@ -1238,31 +1238,31 @@ impl RoomMode {
             }
             extui::event::MouseEventKind::ScrollDown if in_chat => {
                 self.set_focus(app, ChatPanelFocus::ChatLog);
-                app.room.active.chat.scroll_down(5);
+                app.view.active.chat.scroll_down(5);
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_chat => {
                 self.set_focus(app, ChatPanelFocus::ChatLog);
                 match self.layout.chat_line_at(mouse.row) {
                     Some(line) => match line.kind {
                         LineKind::Heading | LineKind::Ellipsis => {
-                            app.room
+                            app.view
                                 .active
                                 .chat
                                 .toggle_expand(line.message, self.layout.chat_width);
-                            app.room
+                            app.view
                                 .active
                                 .chat
                                 .clamp_scroll(self.layout.chat_width, self.layout.chat_height);
                         }
                         LineKind::Body => {
-                            app.room.active.chat.begin_drag(ChatCursor {
+                            app.view.active.chat.begin_drag(ChatCursor {
                                 message: line.message,
                                 line: line.line,
                             });
                         }
                     },
                     _ => {
-                        app.room.active.chat.clear_visual_anchor();
+                        app.view.active.chat.clear_visual_anchor();
                     }
                 }
             }
@@ -1277,7 +1277,7 @@ impl RoomMode {
                 self.divider_drag = None;
             }
             extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
-                if app.room.active.chat.is_dragging() =>
+                if app.view.active.chat.is_dragging() =>
             {
                 self.set_focus(app, ChatPanelFocus::ChatLog);
                 self.drag_chat_selection(app, mouse.row);
@@ -1286,17 +1286,17 @@ impl RoomMode {
                 // A click (press and release without a drag) over a message
                 // reference jumps to it and over a URL opens it; a drag remains
                 // a visual selection.
-                if app.room.active.chat.drag_is_click() {
+                if app.view.active.chat.drag_is_click() {
                     if let Some(target) = self.chat_ref_at(app, mouse.column, mouse.row) {
                         self.jump_to_ref(app, target);
                     } else if let Some(url) = self.chat_link_at(app, mouse.column, mouse.row) {
-                        app.room.request_open_url(url);
+                        app.view.request_open_url(url);
                     }
                 }
-                app.room.active.chat.end_drag();
+                app.view.active.chat.end_drag();
             }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left) => {
-                app.room.active.chat.end_drag();
+                app.view.active.chat.end_drag();
             }
             _ => {}
         }
@@ -1316,7 +1316,7 @@ impl RoomMode {
             return None;
         }
         let col_in_line = column - content_x;
-        app.room
+        app.view
             .active
             .chat
             .link_at(line.message, line.line, col_in_line)
@@ -1334,7 +1334,7 @@ impl RoomMode {
             return None;
         }
         let col_in_line = column - content_x;
-        app.room
+        app.view
             .active
             .chat
             .ref_at(line.message, line.line, col_in_line)
@@ -1344,7 +1344,7 @@ impl RoomMode {
     /// present in the buffer, otherwise reports why not.
     fn jump_to_ref(&mut self, app: &mut App, target: rpc::msgref::MessageRef) {
         match app
-            .room
+            .view
             .jump_to_ref(target, self.layout.chat_width, self.layout.chat_height)
         {
             crate::app::room::RefJump::Jumped => self.set_focus(app, ChatPanelFocus::ChatLog),
@@ -1353,7 +1353,7 @@ impl RoomMode {
             }
             crate::app::room::RefJump::OtherRoom => {
                 if app.set_viewed_room(target.room_id) {
-                    match app.room.jump_to_ref(
+                    match app.view.jump_to_ref(
                         target,
                         self.layout.chat_width,
                         self.layout.chat_height,
@@ -1377,7 +1377,7 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        match app.room.copy_message_ref(self.layout.chat_width) {
+        match app.view.copy_message_ref(self.layout.chat_width) {
             Some(code) => app.set_status(format!("copied {code}")),
             None => app.set_status("select a message to reference"),
         }
@@ -1388,7 +1388,7 @@ impl RoomMode {
             return;
         }
         if app
-            .room
+            .view
             .insert_message_ref(self.layout.chat_width)
             .is_some()
         {
@@ -1402,8 +1402,8 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        app.room.active.chat.ensure_cursor(self.layout.chat_width);
-        let Some(target) = app.room.active.chat.cursor_ref() else {
+        app.view.active.chat.ensure_cursor(self.layout.chat_width);
+        let Some(target) = app.view.active.chat.cursor_ref() else {
             app.set_status("selected message contains no reference");
             return;
         };
@@ -1415,13 +1415,13 @@ impl RoomMode {
         if row < rect.y {
             self.scroll_chat_up(app, 1);
         } else if row >= rect.y.saturating_add(rect.h) {
-            app.room.active.chat.scroll_down(1);
+            app.view.active.chat.scroll_down(1);
         }
         let clamped = row.clamp(rect.y, rect.y.saturating_add(rect.h).saturating_sub(1));
         if let Some(line) = self.layout.chat_line_at(clamped)
             && line.kind == LineKind::Body
         {
-            app.room.active.chat.drag_to(ChatCursor {
+            app.view.active.chat.drag_to(ChatCursor {
                 message: line.message,
                 line: line.line,
             });
@@ -1455,7 +1455,7 @@ impl RoomMode {
                 let delta = i32::from(anchor_row) - i32::from(row);
                 let budget = i32::from(start_rows) + i32::from(self.layout.chat_rect.h);
                 let rows = (i32::from(start_rows) + delta).clamp(1, (budget - 1).max(1)) as u16;
-                app.room.composer_min_rows = Some(rows);
+                app.view.composer_min_rows = Some(rows);
             }
             None => {}
         }
@@ -1463,7 +1463,7 @@ impl RoomMode {
 
     fn toggle_selected_log_collapse(&mut self, app: &mut App) {
         let width = self.layout.chat_width;
-        match app.room.toggle_cursor_message_expand(width) {
+        match app.view.toggle_cursor_message_expand(width) {
             ToggleExpandResult::Toggled => {}
             ToggleExpandResult::NoMessages => {
                 app.set_status("no messages");
@@ -1473,7 +1473,7 @@ impl RoomMode {
                 app.set_status("selected log is not collapsible");
             }
         }
-        app.room
+        app.view
             .active
             .chat
             .clamp_scroll(width, self.layout.chat_height);
@@ -1481,7 +1481,7 @@ impl RoomMode {
     }
 
     fn scroll_chat_up(&mut self, app: &mut App, rows: usize) {
-        app.room
+        app.view
             .active
             .chat
             .scroll_up(rows, self.layout.chat_width, self.layout.chat_height);
@@ -1490,7 +1490,7 @@ impl RoomMode {
 
     fn copy_chat_selection(&mut self, app: &mut App) {
         if app
-            .room
+            .view
             .copy_chat_selection(self.layout.chat_width)
             .is_some()
         {
@@ -1500,11 +1500,11 @@ impl RoomMode {
 
     fn select_chat_top(&mut self, app: &mut App) {
         if self.focus == ChatPanelFocus::ChatLog {
-            app.room
+            app.view
                 .active
                 .chat
                 .top(self.layout.chat_width, self.layout.chat_height);
-            app.room.active.chat.cursor_to_first();
+            app.view.active.chat.cursor_to_first();
             self.keep_chat_cursor_visible(app);
             app.request_older_history_if_at_top(self.layout.chat_width, self.layout.chat_height);
         }
@@ -1512,8 +1512,8 @@ impl RoomMode {
 
     fn select_chat_bottom(&mut self, app: &mut App) {
         if self.focus == ChatPanelFocus::ChatLog {
-            app.room.active.chat.bottom();
-            app.room.active.chat.cursor_to_last(self.layout.chat_width);
+            app.view.active.chat.bottom();
+            app.view.active.chat.cursor_to_last(self.layout.chat_width);
             self.keep_chat_cursor_visible(app);
         }
     }
@@ -1528,7 +1528,7 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        if app.room.copy_cursor_line(self.layout.chat_width).is_some() {
+        if app.view.copy_cursor_line(self.layout.chat_width).is_some() {
             app.set_transient_status("copied line to clipboard");
         }
     }
@@ -1538,7 +1538,7 @@ impl RoomMode {
             return;
         }
         if app
-            .room
+            .view
             .copy_cursor_message(self.layout.chat_width)
             .is_some()
         {
@@ -1551,7 +1551,7 @@ impl RoomMode {
             return;
         }
         if app
-            .room
+            .view
             .active
             .chat
             .move_cursor_paragraph(delta, self.layout.chat_width)
@@ -1567,7 +1567,7 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        app.room
+        app.view
             .active
             .chat
             .toggle_visual_anchor(self.layout.chat_width);
@@ -1586,7 +1586,10 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        match app.room.begin_edit_cursor_message(self.layout.chat_width) {
+        match app
+            .view
+            .begin_edit_cursor_message(&app.room, self.layout.chat_width)
+        {
             Ok(()) => {
                 self.set_focus(app, ChatPanelFocus::Compose);
                 app.set_status("editing message; submit to save");
@@ -1599,7 +1602,7 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        let selection = match app.room.delete_selection(self.layout.chat_width) {
+        let selection = match app.view.delete_selection(&app.room, self.layout.chat_width) {
             Ok(selection) => selection,
             Err(denied) => {
                 app.set_status(denied.status());
@@ -1631,7 +1634,7 @@ impl RoomMode {
                 if app.delete_chat_messages(room_id, targets)
                     && app.room.viewed_room == Some(room_id)
                 {
-                    app.room.active.chat.clear_visual_anchor();
+                    app.view.active.chat.clear_visual_anchor();
                 }
                 ConfirmDisposition::Close
             },
@@ -1656,7 +1659,7 @@ impl RoomMode {
         if rows < 0 {
             self.scroll_chat_up(app, rows.unsigned_abs());
         } else {
-            app.room.active.chat.scroll_down(rows as usize);
+            app.view.active.chat.scroll_down(rows as usize);
         }
     }
 
@@ -1666,7 +1669,7 @@ impl RoomMode {
 
     fn move_chat_cursor(&mut self, app: &mut App, delta: isize) {
         self.set_focus(app, ChatPanelFocus::ChatLog);
-        if !app.room.move_chat_cursor(delta, self.layout.chat_width) {
+        if !app.view.move_chat_cursor(delta, self.layout.chat_width) {
             app.set_status("no messages");
             return;
         }
@@ -1674,7 +1677,7 @@ impl RoomMode {
     }
 
     fn keep_chat_cursor_visible(&mut self, app: &mut App) {
-        app.room
+        app.view
             .active
             .chat
             .keep_cursor_visible(self.layout.chat_width, self.layout.chat_height);
@@ -1750,7 +1753,7 @@ impl AppMode for RoomMode {
 
     fn process_paste(&mut self, app: &mut App, text: String) {
         self.enter_compose_insert_mode(app);
-        app.room.insert_paste(text);
+        app.view.insert_paste(text);
     }
 
     fn presentation(&self, app: &App) -> ModePresentation {
@@ -1761,7 +1764,7 @@ impl AppMode for RoomMode {
         };
         let layer = if self.focus != ChatPanelFocus::Compose {
             self.workspace_layer(app)
-        } else if app.room.composer.mode() == EditorMode::Insert {
+        } else if app.view.composer.mode() == EditorMode::Insert {
             bindings::INSERT_LAYER
         } else {
             bindings::COMPOSE_NORMAL_LAYER
@@ -1841,7 +1844,7 @@ mod tests {
             let mut room = RoomMode::with_focus(focus);
             room.process_paste(&mut app, "pasted".to_string());
             assert!(
-                app.room.composer.text().contains("pasted"),
+                app.view.composer.text().contains("pasted"),
                 "focus {focus:?} did not receive paste"
             );
         }
@@ -1854,8 +1857,8 @@ mod tests {
 
         type_text(&mut room, &mut app, "```");
 
-        assert_eq!(app.room.composer.text(), "```\n```");
-        assert_eq!(app.room.composer.cursor_offset(), 3);
+        assert_eq!(app.view.composer.text(), "```\n```");
+        assert_eq!(app.view.composer.cursor_offset(), 3);
     }
 
     #[test]
@@ -1865,22 +1868,22 @@ mod tests {
 
         type_text(&mut room, &mut app, "```rust");
 
-        assert_eq!(app.room.composer.text(), "```rust\n```");
-        assert_eq!(app.room.composer.cursor_offset(), "```rust".len() as u32);
+        assert_eq!(app.view.composer.text(), "```rust\n```");
+        assert_eq!(app.view.composer.cursor_offset(), "```rust".len() as u32);
     }
 
     #[test]
     fn typed_markdown_code_fence_inside_line_does_not_auto_close() {
         let mut app = test_app();
         let mut room = RoomMode::default();
-        app.room.composer.set_lines("``x");
-        app.room.composer.set_cursor_offset(2);
-        app.room.composer.enter_insert_mode();
+        app.view.composer.set_lines("``x");
+        app.view.composer.set_cursor_offset(2);
+        app.view.composer.enter_insert_mode();
 
         room.process_input(&mut app, key('`'));
 
-        assert_eq!(app.room.composer.text(), "```x");
-        assert_eq!(app.room.composer.cursor_offset(), 3);
+        assert_eq!(app.view.composer.text(), "```x");
+        assert_eq!(app.view.composer.cursor_offset(), 3);
     }
 
     #[test]
@@ -1890,18 +1893,18 @@ mod tests {
 
         room.process_paste(&mut app, "```".to_string());
 
-        assert_eq!(app.room.composer.text(), "```");
-        assert_eq!(app.room.composer.cursor_offset(), 3);
+        assert_eq!(app.view.composer.text(), "```");
+        assert_eq!(app.view.composer.cursor_offset(), 3);
     }
 
     #[test]
     fn direct_insert_paste_markdown_code_fence_does_not_auto_close() {
         let mut app = test_app();
 
-        app.room.insert_paste("```".to_string());
+        app.view.insert_paste("```".to_string());
 
-        assert_eq!(app.room.composer.text(), "```");
-        assert_eq!(app.room.composer.cursor_offset(), 3);
+        assert_eq!(app.view.composer.text(), "```");
+        assert_eq!(app.view.composer.cursor_offset(), 3);
     }
 
     #[test]
@@ -1938,6 +1941,8 @@ mod tests {
     }
 
     fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
+        // The runtime loop catches the view up to the session before painting.
+        app.view.sync_active(&app.room);
         room.render(app, buffer, 0);
     }
 
@@ -1990,6 +1995,7 @@ mod tests {
             .collect();
         app.room
             .authenticated(&rooms, Vec::new(), RoomId(ids[0]), None, None);
+        app.view.switch_room(RoomId(ids[0]), &app.room);
     }
 
     #[test]
@@ -2040,6 +2046,7 @@ mod tests {
             },
             None,
         );
+        app.view.sync_active(&app.room);
     }
 
     fn push_file_message(app: &mut App, message_id: u64, transfer_id: FileTransferId) {
@@ -2058,6 +2065,7 @@ mod tests {
             },
             None,
         );
+        app.view.sync_active(&app.room);
     }
 
     #[test]
@@ -2104,11 +2112,11 @@ mod tests {
         let mut room = RoomMode::default();
 
         room.process_input(&mut app, key('x'));
-        assert_eq!(app.room.composer.text(), "");
+        assert_eq!(app.view.composer.text(), "");
         assert!(app.chrome.binding.pending_chord.is_some());
 
         room.process_input(&mut app, key('z'));
-        assert_eq!(app.room.composer.text(), "");
+        assert_eq!(app.view.composer.text(), "");
         assert!(app.chrome.binding.pending_chord.is_none());
     }
 
@@ -2119,7 +2127,7 @@ mod tests {
 
         room.process_input(&mut app, key('q'));
 
-        assert_eq!(app.room.composer.text(), "q");
+        assert_eq!(app.view.composer.text(), "q");
     }
 
     #[test]
@@ -2130,8 +2138,8 @@ mod tests {
         type_text(&mut room, &mut app, "/rep");
         room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
 
-        assert_eq!(app.room.composer.text(), "/report-bug");
-        assert_eq!(app.room.composer.mode(), EditorMode::Insert);
+        assert_eq!(app.view.composer.text(), "/report-bug");
+        assert_eq!(app.view.composer.mode(), EditorMode::Insert);
     }
 
     #[test]
@@ -2141,13 +2149,13 @@ mod tests {
 
         type_text(&mut room, &mut app, "/s");
         room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-        assert_eq!(app.room.composer.text(), "/servers");
+        assert_eq!(app.view.composer.text(), "/servers");
 
         room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-        assert_eq!(app.room.composer.text(), "/settings");
+        assert_eq!(app.view.composer.text(), "/settings");
 
         room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-        assert_eq!(app.room.composer.text(), "/sound");
+        assert_eq!(app.view.composer.text(), "/sound");
     }
 
     #[test]
@@ -2157,11 +2165,11 @@ mod tests {
         );
         let mut room = RoomMode::default();
         room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert_eq!(app.room.composer.mode(), EditorMode::Normal);
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
 
         room.process_input(&mut app, key('z'));
 
-        assert_eq!(app.room.composer.text(), "");
+        assert_eq!(app.view.composer.text(), "");
         assert!(app.chrome.binding.pending_chord.is_some());
     }
 
@@ -2180,25 +2188,25 @@ mod tests {
         ));
 
         assert_eq!(room.focus(), ChatPanelFocus::Compose);
-        assert_eq!(app.room.composer.mode(), EditorMode::Normal);
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
 
         assert!(matches!(
             room.process_input(&mut app, key('i')),
             Action::Continue
         ));
         assert_eq!(room.focus(), ChatPanelFocus::Compose);
-        assert_eq!(app.room.composer.mode(), EditorMode::Insert);
+        assert_eq!(app.view.composer.mode(), EditorMode::Insert);
     }
 
     #[test]
     fn compose_vim_text_object_commands_receive_i_key() {
         let mut app = test_app_vim();
         let mut room = RoomMode::default();
-        app.room.composer.set_lines("alpha beta");
-        app.room.composer.set_cursor_offset(2);
+        app.view.composer.set_lines("alpha beta");
+        app.view.composer.set_cursor_offset(2);
 
         room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert_eq!(app.room.composer.mode(), EditorMode::Normal);
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
 
         for key in ['c', 'i', 'w'] {
             room.process_input(
@@ -2208,8 +2216,8 @@ mod tests {
         }
 
         assert_eq!(room.focus(), ChatPanelFocus::Compose);
-        assert_eq!(app.room.composer.mode(), EditorMode::Insert);
-        assert_eq!(app.room.composer.text(), " beta");
+        assert_eq!(app.view.composer.mode(), EditorMode::Insert);
+        assert_eq!(app.view.composer.text(), " beta");
     }
 
     #[test]
@@ -2235,7 +2243,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()),
         );
         assert_eq!(room.focus(), ChatPanelFocus::Compose);
-        assert_eq!(app.room.composer.mode(), EditorMode::Normal);
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
 
         room.process_input(
             &mut app,
@@ -2248,7 +2256,7 @@ mod tests {
     fn super_jk_move_chat_panel_focus_from_compose_insert_mode() {
         let mut app = test_app();
         let mut room = RoomMode::default();
-        assert_eq!(app.room.composer.mode(), EditorMode::Insert);
+        assert_eq!(app.view.composer.mode(), EditorMode::Insert);
 
         room.process_input(
             &mut app,
@@ -2257,7 +2265,7 @@ mod tests {
         assert_eq!(room.focus(), ChatPanelFocus::ChatLog);
 
         room.set_focus(&mut app, ChatPanelFocus::Compose);
-        assert_eq!(app.room.composer.mode(), EditorMode::Insert);
+        assert_eq!(app.view.composer.mode(), EditorMode::Insert);
 
         room.process_input(
             &mut app,
@@ -2282,7 +2290,7 @@ mod tests {
 
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
         let cursor_message =
-            |app: &crate::app::App| app.room.active.chat.cursor().map(|c| c.message);
+            |app: &crate::app::App| app.view.active.chat.cursor().map(|c| c.message);
         assert_eq!(cursor_message(&app), Some(2));
 
         room.process_input(&mut app, key('k'));
@@ -2313,23 +2321,23 @@ mod tests {
         room.process_input(&mut app, key('g'));
         room.process_input(&mut app, key('g'));
         assert_eq!(
-            app.room.active.chat.cursor(),
+            app.view.active.chat.cursor(),
             Some(ChatCursor {
                 message: 0,
                 line: 0
             })
         );
-        assert!(app.room.active.chat.scroll_offset() > 0);
+        assert!(app.view.active.chat.scroll_offset() > 0);
 
         room.process_input(&mut app, key('G'));
         assert_eq!(
-            app.room.active.chat.cursor(),
+            app.view.active.chat.cursor(),
             Some(ChatCursor {
                 message: 19,
                 line: 0,
             })
         );
-        assert_eq!(app.room.active.chat.scroll_offset(), 0);
+        assert_eq!(app.view.active.chat.scroll_offset(), 0);
     }
 
     #[test]
@@ -2350,14 +2358,14 @@ mod tests {
         render_room(&mut app, &mut room, &mut buffer);
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
         // Scroll the viewport away, leaving the cursor on the newest message.
-        app.room
+        app.view
             .active
             .chat
             .top(room.layout().chat_width, room.layout().chat_height);
         room.process_input(&mut app, key('k'));
         render_room(&mut app, &mut room, &mut buffer);
 
-        let cursor = app.room.active.chat.cursor().expect("cursor present");
+        let cursor = app.view.active.chat.cursor().expect("cursor present");
         assert_eq!(cursor.message, 28);
         assert!(
             room.layout()
@@ -2385,10 +2393,10 @@ mod tests {
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
-        assert!(app.room.active.chat.is_collapsed(0));
+        assert!(app.view.active.chat.is_collapsed(0));
 
         room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-        assert!(app.room.active.chat.is_expanded(0));
+        assert!(app.view.active.chat.is_expanded(0));
     }
 
     #[test]
@@ -2428,7 +2436,7 @@ mod tests {
         let width = room.layout().chat_width;
         let height = room.layout().chat_height;
         assert!(
-            app.room.active.chat.is_collapsed(0),
+            app.view.active.chat.is_collapsed(0),
             "long message starts collapsed"
         );
 
@@ -2436,9 +2444,9 @@ mod tests {
         // at the top of the viewport. Collapsing now removes fewer rows than the
         // viewport height, which lands the scroll offset in the window where
         // `visible_lines` does not self-correct.
-        app.room.active.chat.toggle_expand(0, width);
-        assert!(app.room.active.chat.is_expanded(0));
-        app.room.active.chat.top(width, height);
+        app.view.active.chat.toggle_expand(0, width);
+        assert!(app.view.active.chat.is_expanded(0));
+        app.view.active.chat.top(width, height);
         render_room(&mut app, &mut room, &mut buffer);
 
         let heading_row = room
@@ -2460,7 +2468,7 @@ mod tests {
             },
         );
         assert!(
-            app.room.active.chat.is_collapsed(0),
+            app.view.active.chat.is_collapsed(0),
             "clicking the heading collapses it"
         );
 
@@ -2490,24 +2498,24 @@ mod tests {
         render_room(&mut app, &mut room, &mut buffer);
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
         // A mouse-style drag over both messages produces the visual range.
-        app.room.active.chat.begin_drag(ChatCursor {
+        app.view.active.chat.begin_drag(ChatCursor {
             message: 0,
             line: 0,
         });
-        app.room.active.chat.drag_to(ChatCursor {
+        app.view.active.chat.drag_to(ChatCursor {
             message: 1,
             line: 0,
         });
-        app.room.active.chat.end_drag();
+        app.view.active.chat.end_drag();
         room.process_input(&mut app, key('y'));
 
         assert_eq!(
-            app.room.take_pending_clipboard().as_deref(),
+            app.view.take_pending_clipboard().as_deref(),
             Some("first\nsecond")
         );
         assert_eq!(app.status.text(), "copied to clipboard");
         assert_eq!(app.status.kind(), crate::app::StatusKind::Info);
-        assert!(!app.room.active.chat.has_visual(), "yank exits visual mode");
+        assert!(!app.view.active.chat.has_visual(), "yank exits visual mode");
     }
 
     #[test]
@@ -2521,7 +2529,7 @@ mod tests {
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
         room.process_input(&mut app, key('y'));
 
-        assert_eq!(app.room.take_pending_clipboard(), None);
+        assert_eq!(app.view.take_pending_clipboard(), None);
     }
 
     #[test]
@@ -2543,16 +2551,16 @@ mod tests {
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
 
         room.process_input(&mut app, key('v'));
-        assert!(app.room.active.chat.has_visual());
+        assert!(app.view.active.chat.has_visual());
         room.process_input(&mut app, key('k'));
         room.process_input(&mut app, key('k'));
         room.process_input(&mut app, key('y'));
 
         assert_eq!(
-            app.room.take_pending_clipboard().as_deref(),
+            app.view.take_pending_clipboard().as_deref(),
             Some("first\nsecond\nthird")
         );
-        assert!(!app.room.active.chat.has_visual(), "yank exits visual");
+        assert!(!app.view.active.chat.has_visual(), "yank exits visual");
     }
 
     #[test]
@@ -2566,9 +2574,9 @@ mod tests {
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
 
         room.process_input(&mut app, key('v'));
-        assert!(app.room.active.chat.has_visual());
+        assert!(app.view.active.chat.has_visual());
         room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(!app.room.active.chat.has_visual());
+        assert!(!app.view.active.chat.has_visual());
     }
 
     #[test]
@@ -2585,7 +2593,7 @@ mod tests {
 
         room.process_input(&mut app, key('{'));
         assert_eq!(
-            app.room.active.chat.cursor(),
+            app.view.active.chat.cursor(),
             Some(ChatCursor {
                 message: 0,
                 line: 0
@@ -2594,7 +2602,7 @@ mod tests {
         );
         room.process_input(&mut app, key('}'));
         assert_eq!(
-            app.room.active.chat.cursor(),
+            app.view.active.chat.cursor(),
             Some(ChatCursor {
                 message: 2,
                 line: 0
@@ -2616,7 +2624,7 @@ mod tests {
         room.process_input(&mut app, key('y'));
         room.process_input(&mut app, key('y'));
 
-        assert_eq!(app.room.take_pending_clipboard().as_deref(), Some("beta"));
+        assert_eq!(app.view.take_pending_clipboard().as_deref(), Some("beta"));
     }
 
     #[test]
@@ -2633,7 +2641,7 @@ mod tests {
         room.process_input(&mut app, key('m'));
 
         assert_eq!(
-            app.room.take_pending_clipboard().as_deref(),
+            app.view.take_pending_clipboard().as_deref(),
             Some("alpha\nbeta")
         );
     }
@@ -2657,7 +2665,7 @@ mod tests {
         }
         .encode();
         assert_eq!(
-            app.room.take_pending_clipboard(),
+            app.view.take_pending_clipboard(),
             Some(format!("@@{expected}"))
         );
     }
@@ -2669,10 +2677,10 @@ mod tests {
         push_room_message(&mut app, 1, UserId(2), 1_000, "first");
 
         assert_eq!(room.workspace_layer(&app), bindings::WORKSPACE_LAYER);
-        app.room.active.chat.ensure_cursor(40);
-        app.room.active.chat.toggle_visual_anchor(40);
+        app.view.active.chat.ensure_cursor(40);
+        app.view.active.chat.toggle_visual_anchor(40);
         assert_eq!(room.workspace_layer(&app), bindings::CHAT_VISUAL_LAYER);
-        app.room.active.chat.clear_visual_anchor();
+        app.view.active.chat.clear_visual_anchor();
         assert_eq!(room.workspace_layer(&app), bindings::WORKSPACE_LAYER);
     }
 
@@ -2742,13 +2750,13 @@ mod tests {
 
         assert_eq!(room.focus(), ChatPanelFocus::ChatLog);
         assert_eq!(
-            app.room.active.chat.cursor(),
+            app.view.active.chat.cursor(),
             Some(ChatCursor {
                 message: line.message,
                 line: line.line,
             })
         );
-        assert!(app.room.active.chat.is_dragging());
+        assert!(app.view.active.chat.is_dragging());
 
         room.process_mouse(
             &mut app,
@@ -2760,7 +2768,7 @@ mod tests {
             },
         );
         assert!(
-            !app.room.active.chat.has_visual(),
+            !app.view.active.chat.has_visual(),
             "a click is a cursor move, not a selection"
         );
     }
@@ -2926,15 +2934,15 @@ mod tests {
             ),
         );
 
-        assert_eq!(app.room.composer_min_rows, Some(target));
+        assert_eq!(app.view.composer_min_rows, Some(target));
         render_room(&mut app, &mut room, &mut buffer);
         assert_eq!(room.layout().composer_rect.h, target);
 
         // The floor persists once the message clears on send.
         type_text(&mut room, &mut app, "hello");
-        app.room.submit_composer();
-        assert!(app.room.composer.text().is_empty());
-        assert_eq!(app.room.composer_min_rows, Some(target));
+        app.view.submit_composer();
+        assert!(app.view.composer.text().is_empty());
+        assert_eq!(app.view.composer_min_rows, Some(target));
         render_room(&mut app, &mut room, &mut buffer);
         assert_eq!(room.layout().composer_rect.h, target);
     }
@@ -2969,7 +2977,7 @@ mod tests {
                 bar_row - (target - 1),
             ),
         );
-        assert_eq!(app.room.composer_min_rows, Some(target));
+        assert_eq!(app.view.composer_min_rows, Some(target));
 
         let mut short = Buffer::new(80, 12);
         render_room(&mut app, &mut room, &mut short);
@@ -2985,7 +2993,7 @@ mod tests {
     fn overlarge_resize_preserves_lobby_row_bar_and_chat_row() {
         let mut app = test_app();
         app.config.ui.room_height = 100;
-        app.room.composer_min_rows = Some(100);
+        app.view.composer_min_rows = Some(100);
         let mut room = RoomMode::default();
         let mut buffer = Buffer::new(80, 12);
 
@@ -3001,8 +3009,8 @@ mod tests {
     fn manual_composer_floor_does_not_cap_taller_content() {
         let mut app = test_app();
         app.config.ui.max_composer_height = 2;
-        app.room.composer_min_rows = Some(3);
-        app.room.composer.set_lines("a\nb\nc\nd\ne");
+        app.view.composer_min_rows = Some(3);
+        app.view.composer.set_lines("a\nb\nc\nd\ne");
         let mut room = RoomMode::default();
         let mut buffer = Buffer::new(80, 24);
 
@@ -3279,6 +3287,6 @@ mod tests {
             Action::Continue
         ));
 
-        assert_eq!(app.room.composer.text(), "a\nb");
+        assert_eq!(app.view.composer.text(), "a\nb");
     }
 }
