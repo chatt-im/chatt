@@ -40,7 +40,7 @@ use crate::{
     tui::{
         Action,
         form::rect_contains,
-        mode::{AppMode, ModeTransition},
+        mode::{AppMode, ModeTransition, ViewCx},
         modes::{
             RoomMode, RoomSwitchMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession,
         },
@@ -331,6 +331,8 @@ impl AudioDeviceCatalog {
 pub(crate) struct App {
     pub config: Config,
     events: AppEvents,
+    #[allow(dead_code)] // Used as modes move to ViewCx incrementally.
+    command_queue: Vec<command::CoreCommand>,
     pub room: RoomSession,
     /// The primary terminal's exclusive UI state: composer, scrollback
     /// buffers, pending edit, clipboard queue. Splits off `room` so attached
@@ -1077,6 +1079,7 @@ impl App {
         };
         let mut app = Self {
             events,
+            command_queue: Vec::new(),
             room,
             view,
             network: None,
@@ -1152,6 +1155,91 @@ impl App {
 
     pub(crate) fn request_quit(&mut self) {
         self.view.quit_requested = true;
+    }
+
+    /// Builds the phase-1 in-process view context from disjoint App fields.
+    /// Render threads will receive the same shape with a shared session guard
+    /// and an mpsc-backed command sink in phase 3.
+    #[allow(dead_code)]
+    pub(crate) fn view_cx(&mut self) -> ViewCx<'_> {
+        ViewCx {
+            view: &mut self.view,
+            session: &self.room,
+            config: &self.config,
+            commands: &mut self.command_queue,
+        }
+    }
+
+    /// Runs every command produced by one UI dispatch. A handler may enqueue
+    /// follow-up work, so keep draining until the queue is empty.
+    #[allow(dead_code)]
+    pub(crate) fn drain_core_commands(&mut self) {
+        while !self.command_queue.is_empty() {
+            let commands = std::mem::take(&mut self.command_queue);
+            for command in commands {
+                self.handle_core_command(command);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn handle_core_command(&mut self, command: command::CoreCommand) {
+        use command::CoreCommand;
+
+        match command {
+            CoreCommand::SendChat { room_id, body } => self.send_chat(room_id, body),
+            CoreCommand::SubmitEdit {
+                room_id,
+                target,
+                body,
+            } => self.submit_edit(room_id, target, body),
+            CoreCommand::RunSlash { input } => self.run_slash_command(input),
+            CoreCommand::DeleteMessages {
+                room_id,
+                targets,
+                skipped,
+            } => {
+                let _ = skipped;
+                self.delete_chat_messages(room_id, targets);
+            }
+            CoreCommand::SetViewedRoom(room_id) => {
+                self.set_viewed_room(room_id);
+            }
+            CoreCommand::RequestOlderHistory { room_id } => {
+                self.request_older_history(room_id);
+            }
+            CoreCommand::OpenDm(user_id) => self.open_dm_with(user_id),
+            CoreCommand::JoinVoice(room_id) => self.join_voice_room(room_id),
+            CoreCommand::LeaveVoice => self.leave_voice_command(),
+            CoreCommand::ToggleMute => self.toggle_mute(),
+            CoreCommand::ToggleDeafen => {
+                self.set_deafen(!self.deafened.load(Ordering::Relaxed));
+            }
+            CoreCommand::SetVoiceMode(mode) => self.set_local_voice_mode(mode),
+            CoreCommand::ToggleSelectedUserMute => self.toggle_selected_user_mute(),
+            CoreCommand::CancelTransfer(transfer_id) => self.cancel_transfer(transfer_id),
+            CoreCommand::Connect { alias } => {
+                self.start_network(&alias);
+            }
+            CoreCommand::DeleteServer { label } => self.delete_server(&label),
+            CoreCommand::SaveServerEdit {
+                draft,
+                join_after_save,
+            } => self.save_server_edit_with(&draft, join_after_save),
+            CoreCommand::SaveRoomSettings(draft) => self.save_room_settings(&draft),
+            CoreCommand::UploadPastedImage { source, raw_name } => {
+                if let Err(error) = self.confirm_paste_image_upload(&source, raw_name) {
+                    self.set_error(error);
+                }
+            }
+            CoreCommand::SubmitPairPassword(password) => {
+                self.submit_open_pair_password(password);
+            }
+            CoreCommand::CancelPairing => self.cancel_open_pairing(),
+            CoreCommand::AudioManualReset => self.audio_manual_reset(),
+            CoreCommand::ReportBug(description) => self.start_bug_report(description),
+            CoreCommand::Quit => self.request_quit(),
+        }
     }
 
     pub(crate) fn take_quit_requested(&mut self) -> bool {
@@ -2007,7 +2095,14 @@ impl App {
         if !self.view.active.chat.is_at_top(width, height) {
             return;
         }
-        let Some((room_id, before, limit)) = self.room.older_history_request() else {
+        let Some(room_id) = self.view.viewed_room else {
+            return;
+        };
+        self.request_older_history(room_id);
+    }
+
+    fn request_older_history(&mut self, room_id: RoomId) {
+        let Some((room_id, before, limit)) = self.room.older_history_request(room_id) else {
             return;
         };
         if !self.send_network_command(
@@ -2172,13 +2267,36 @@ impl App {
         }
     }
 
-    /// Sends a chat message to the currently viewed room.
-    fn send_chat_to_viewed(&mut self, body: String) {
-        let Some(room_id) = self.room.viewed_room else {
+    fn send_chat(&mut self, room_id: Option<RoomId>, body: String) {
+        if self.network.is_none() {
+            self.set_error("select a server before sending messages");
+            return;
+        }
+        let Some(room_id) = room_id else {
             self.set_error("no room selected");
             return;
         };
         self.send_network_command(NetworkCommand::SendChat { room_id, body }, true);
+    }
+
+    fn submit_edit(&mut self, room_id: RoomId, target: MessageId, body: String) {
+        if self.network.is_none() {
+            self.set_error("select a server before editing messages");
+            return;
+        }
+        self.send_network_command(
+            NetworkCommand::EditChat {
+                room_id,
+                target,
+                body,
+            },
+            true,
+        );
+    }
+
+    /// Sends a chat message to the currently viewed room.
+    fn send_chat_to_viewed(&mut self, body: String) {
+        self.send_chat(self.room.viewed_room, body);
     }
 
     fn mark_room_catalog_dirty(&mut self) {
@@ -5022,11 +5140,7 @@ impl App {
         let input = match submission {
             ComposerSubmission::Command(input) => input,
             ComposerSubmission::Message(body) => {
-                if self.network.is_some() {
-                    self.send_chat_to_viewed(body);
-                } else {
-                    self.set_error("select a server before sending messages");
-                }
+                self.send_chat_to_viewed(body);
                 return;
             }
             ComposerSubmission::Edit {
@@ -5034,21 +5148,14 @@ impl App {
                 target,
                 body,
             } => {
-                if self.network.is_some() {
-                    self.send_network_command(
-                        NetworkCommand::EditChat {
-                            room_id,
-                            target,
-                            body,
-                        },
-                        true,
-                    );
-                } else {
-                    self.set_error("select a server before editing messages");
-                }
+                self.submit_edit(room_id, target, body);
                 return;
             }
         };
+        self.run_slash_command(input);
+    }
+
+    fn run_slash_command(&mut self, input: String) {
         match input.as_str() {
             "/quit" => self.set_status("use Ctrl-C to quit"),
             "/mute" => self.set_mute(true),
