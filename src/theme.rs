@@ -51,6 +51,10 @@ pub struct Theme {
     // Chat lines.
     pub local_line: Style,
     pub selected_line: Style,
+    /// Rows inside the chat visual-line selection (mouse drag or `v` range).
+    pub chat_visual_line: Style,
+    /// The chat cursor's row, dimmer than [`Theme::chat_visual_line`].
+    pub chat_cursor_line: Style,
     pub room_selected: Style,
     // Status bar.
     pub status_fill: Style,
@@ -132,6 +136,8 @@ impl Theme {
             error: d.with_fg_rgb(0xff, 0x66, 0x6f),
             local_line: d,
             selected_line: d.with_bg_rgb(0x3a, 0x3a, 0x3a),
+            chat_visual_line: d.with_bg_rgb(0x2c, 0x44, 0x58),
+            chat_cursor_line: d.with_bg_rgb(0x2c, 0x2c, 0x2c),
             room_selected: d
                 .with_bg_rgb(0x29, 0x29, 0x29)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
@@ -239,6 +245,8 @@ impl Theme {
             error: d.with_fg_ansi(red),
             local_line: d,
             selected_line: d.with_bg_ansi(AnsiColor::Grey[4]),
+            chat_visual_line: d.with_bg_ansi(AnsiColor(4)),
+            chat_cursor_line: d.with_bg_ansi(AnsiColor::Grey[3]),
             room_selected: d
                 .with_bg_ansi(AnsiColor::Grey[5])
                 .with_fg_ansi(bright_white),
@@ -316,6 +324,8 @@ impl Theme {
             error: d.with_fg_ansi(red),
             local_line: d,
             selected_line: d.with_bg_ansi(AnsiColor::Grey[27]),
+            chat_visual_line: d.with_bg_ansi(AnsiColor::Grey[21]),
+            chat_cursor_line: d.with_bg_ansi(AnsiColor::Grey[26]),
             room_selected: d.with_bg_ansi(AnsiColor::Grey[25]).with_fg_ansi(black),
             status_fill: d.with_bg_ansi(AnsiColor::Grey[27]).with_fg_ansi(black),
             status_section: d.with_bg_ansi(AnsiColor::Grey[23]).with_fg_ansi(black),
@@ -369,6 +379,8 @@ impl Theme {
             ThemeSlot::Error => &mut self.error,
             ThemeSlot::LocalLine => &mut self.local_line,
             ThemeSlot::SelectedLine => &mut self.selected_line,
+            ThemeSlot::ChatVisualLine => &mut self.chat_visual_line,
+            ThemeSlot::ChatCursorLine => &mut self.chat_cursor_line,
             ThemeSlot::RoomSelected => &mut self.room_selected,
             ThemeSlot::StatusFill => &mut self.status_fill,
             ThemeSlot::StatusSection => &mut self.status_section,
@@ -575,6 +587,8 @@ mod tests {
                 (ThemeSlot::LocalLine, pair(11)),
                 (ThemeSlot::SelectedLine, pair(12)),
                 (ThemeSlot::RoomSelected, pair(13)),
+                (ThemeSlot::ChatVisualLine, pair(37)),
+                (ThemeSlot::ChatCursorLine, pair(38)),
                 (ThemeSlot::StatusFill, pair(14)),
                 (ThemeSlot::StatusSection, pair(15)),
                 (ThemeSlot::JoinInputActive, pair(16)),
@@ -639,5 +653,7 @@ mod tests {
         assert_eq!(theme.vu_good, style(34));
         assert_eq!(theme.vu_warn, style(35));
         assert_eq!(theme.vu_peak, style(36));
+        assert_eq!(theme.chat_visual_line, style(37));
+        assert_eq!(theme.chat_cursor_line, style(38));
     }
 }

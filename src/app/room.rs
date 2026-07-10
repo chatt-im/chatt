@@ -2171,22 +2171,37 @@ impl RoomSession {
         self.participants.keep_selected_visible(visible_rows);
     }
 
-    pub(crate) fn copy_chat_selection(&mut self, width: u16) -> Option<String> {
-        let text = self
-            .active
-            .chat
-            .selected_text()
-            .or_else(|| self.active.chat.selected_header_text(width))?;
+    /// Copies the visual selection's text, clearing the selection on success
+    /// so a yank exits visual mode.
+    pub(crate) fn copy_chat_selection(&mut self) -> Option<String> {
+        let text = self.active.chat.visual_text()?;
+        self.active.chat.clear_visual_anchor();
         self.pending_clipboard = Some(text.clone());
         Some(text)
     }
 
-    /// The reference identifying the keyboard-selected message, when one is
-    /// selected and referenceable (notices have no durable key).
-    fn selected_message_ref(&mut self, width: u16) -> Option<rpc::msgref::MessageRef> {
+    /// Copies the original body text of the cursor's wrapped row.
+    pub(crate) fn copy_cursor_line(&mut self, width: u16) -> Option<String> {
+        self.active.chat.ensure_cursor(width)?;
+        let text = self.active.chat.cursor_line_text()?;
+        self.pending_clipboard = Some(text.clone());
+        Some(text)
+    }
+
+    /// Copies the full body of the message under the cursor.
+    pub(crate) fn copy_cursor_message(&mut self, width: u16) -> Option<String> {
+        self.active.chat.ensure_cursor(width)?;
+        let text = self.active.chat.cursor_message_body()?.to_string();
+        self.pending_clipboard = Some(text.clone());
+        Some(text)
+    }
+
+    /// The reference identifying the message under the cursor, when it is
+    /// referenceable (notices have no durable key).
+    fn cursor_message_ref(&mut self, width: u16) -> Option<rpc::msgref::MessageRef> {
         let room_id = self.active.chat.room_id()?;
-        let selected = self.active.chat.ensure_selected_header(width)?;
-        let entry = self.active.chat.message(selected);
+        let cursor = self.active.chat.ensure_cursor(width)?;
+        let entry = self.active.chat.message(cursor.message);
         if entry.timestamp_ms == 0 {
             return None;
         }
@@ -2197,17 +2212,17 @@ impl RoomSession {
         })
     }
 
-    /// Copies the selected message's `@@code` to the clipboard, returning it.
+    /// Copies the cursor message's `@@code` to the clipboard, returning it.
     pub(crate) fn copy_message_ref(&mut self, width: u16) -> Option<String> {
-        let code = self.selected_message_ref(width)?.encode();
+        let code = self.cursor_message_ref(width)?.encode();
         let code = format!("{}{code}", rpc::msgref::REF_PREFIX);
         self.pending_clipboard = Some(code.clone());
         Some(code)
     }
 
-    /// Inserts the selected message's `@@code ` into the composer, returning it.
+    /// Inserts the cursor message's `@@code ` into the composer, returning it.
     pub(crate) fn insert_message_ref(&mut self, width: u16) -> Option<String> {
-        let code = self.selected_message_ref(width)?.encode();
+        let code = self.cursor_message_ref(width)?.encode();
         let code = format!("{}{code} ", rpc::msgref::REF_PREFIX);
         self.insert_paste(code.clone());
         Some(code)
@@ -2229,8 +2244,8 @@ impl RoomSession {
         ))
     }
 
-    /// Selects and scrolls to the message a reference targets. Never touches
-    /// the view unless the target is present in the buffer.
+    /// Moves the cursor onto and scrolls to the message a reference targets.
+    /// Never touches the view unless the target is present in the buffer.
     pub(crate) fn jump_to_ref(
         &mut self,
         target: rpc::msgref::MessageRef,
@@ -2247,32 +2262,26 @@ impl RoomSession {
         else {
             return RefJump::NotFound;
         };
-        self.active.chat.clear_selection();
-        self.active.chat.select_header_containing(index, width);
+        self.active.chat.set_cursor_to_message(index);
         self.active
             .chat
             .scroll_message_into_view(index, width, height);
         RefJump::Jumped
     }
 
-    pub(crate) fn toggle_selected_message_expand(&mut self, width: u16) -> ToggleExpandResult {
-        if self.active.chat.ensure_selected_header(width).is_none() {
+    pub(crate) fn toggle_cursor_message_expand(&mut self, width: u16) -> ToggleExpandResult {
+        let Some(cursor) = self.active.chat.ensure_cursor(width) else {
             return ToggleExpandResult::NoMessages;
-        }
-        self.active.chat.clear_selection();
-        if self.active.chat.toggle_selected_expand(width) {
+        };
+        if self.active.chat.toggle_expand(cursor.message, width) {
             ToggleExpandResult::Toggled
         } else {
             ToggleExpandResult::NotCollapsible
         }
     }
 
-    pub(crate) fn move_selected_message(&mut self, delta: isize, width: u16) -> bool {
-        self.active.chat.clear_selection();
-        self.active
-            .chat
-            .move_selected_header(delta, width)
-            .is_some()
+    pub(crate) fn move_chat_cursor(&mut self, delta: isize, width: u16) -> bool {
+        self.active.chat.move_cursor_line(delta, width).is_some()
     }
 
     pub(super) fn begin_volume_preview(&mut self, user_id: UserId, value_db: f32) {

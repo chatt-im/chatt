@@ -296,6 +296,12 @@ layer (like the default `list`) is a reusable template: it only takes effect
 where it is inherited, and a table that is neither a layer nor inherited
 anywhere is reported as an unknown-key warning.
 
+In the chat log, `j`/`k` move a line cursor, `{`/`}` jump between sender
+blocks, and `v` (or a mouse drag) starts a visual-line selection. While a
+selection is active the `chat-visual` layer overlays `workspace`: `y` yanks
+the selection and `Esc` clears it. Without a selection `y` opens a yank
+chord — `y y` copies the cursor's line, `y m` the whole message.
+
 ### Pasting from the clipboard
 
 In a room, `Ctrl+V` or `Ctrl+Alt+V` pastes from the system clipboard, from any
@@ -387,7 +393,8 @@ names, except names that look like color literals (`12`, `ansi:12`, `#fff`) are
 reserved. The overridable slot names match the theme's roles — surfaces
 (`background`, `panel`, `panel-alt`, `detail-panel`, `dialog-panel`, `dialog-header`),
 foreground roles (`text`, `muted`, `subtle`, `accent`, `good`, `warn`, `error`),
-chat lines (`local-line`, `selected-line`, `room-selected`), the status bar
+chat lines (`local-line`, `selected-line`, `chat-visual-line`,
+`chat-cursor-line`, `room-selected`), the status bar
 (`status-fill`, `status-section`), inputs (`join-input-active`,
 `join-input-inactive`, `join-input-boundary-active`), form rows (`row-focused`,
 `selected-focused`), mode badges (`mode-server-select`, `mode-server-edit`,
