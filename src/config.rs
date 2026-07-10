@@ -608,6 +608,10 @@ pub struct WebConfig {
     /// The loopback address the web server binds.
     #[toml(default = "127.0.0.1:8080".to_string())]
     pub bind: String,
+    /// Browser origins allowed to open the control WebSocket. An empty list
+    /// derives origins from `bind` at server startup.
+    #[toml(default, ToToml skip_if = Vec::is_empty)]
+    pub allowed_origins: Vec<String>,
     /// Whether the browser view is view-only. When `true` (the default) the page
     /// cannot send chat messages or files. Set `false` to enable the compose box.
     #[toml(default = true)]
@@ -628,6 +632,7 @@ impl Default for WebConfig {
         Self {
             enabled: false,
             bind: "127.0.0.1:8080".to_string(),
+            allowed_origins: Vec::new(),
             readonly: true,
             autoplay: WebAutoplay::Disabled,
             viewer_in_seperate_browser_tab: false,
@@ -639,6 +644,47 @@ impl WebConfig {
     pub fn is_default(&self) -> bool {
         *self == WebConfig::default()
     }
+}
+
+fn valid_web_origin(value: &str) -> bool {
+    let Some((scheme, authority)) = value.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    if authority.is_empty()
+        || authority
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | b' ' | b'\t'))
+    {
+        return false;
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((address, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.parse::<u16>().is_ok());
+    }
+
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    !host.is_empty()
+        && !host.contains(':')
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        && port.is_none_or(|port| !port.is_empty() && port.parse::<u16>().is_ok())
 }
 
 #[derive(Clone, Debug, PartialEq, Toml)]
@@ -1520,6 +1566,9 @@ impl Config {
             .retain(|preference| preference.volume_db != 0.0);
         self.sort_user_audio();
         self.web.bind = self.web.bind.trim().to_string();
+        for origin in &mut self.web.allowed_origins {
+            *origin = origin.trim().to_string();
+        }
         self.notifications.message_volume_db =
             snap_notification_volume_db(self.notifications.message_volume_db);
         self.notifications.peer_join_volume_db =
@@ -1561,6 +1610,13 @@ impl Config {
             out.push(Diag::error(format!(
                 "web bind must be a socket address: {error}"
             )));
+        }
+        for origin in &self.web.allowed_origins {
+            if !valid_web_origin(origin) {
+                out.push(Diag::error(format!(
+                    "web allowed-origin must be an http(s) origin without a path: {origin}"
+                )));
+            }
         }
         for (name, volume_db) in [
             ("message-volume-db", self.notifications.message_volume_db),
@@ -2137,6 +2193,55 @@ mod tests {
             .map(|diag| diag.message)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn web_origins_require_serialized_http_origins() {
+        for origin in [
+            "http://localhost:8080",
+            "https://chat.example.test",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(valid_web_origin(origin), "{origin}");
+        }
+        for origin in [
+            "",
+            "null",
+            "ws://localhost:8080",
+            "http://localhost:8080/",
+            "http://user@localhost:8080",
+            "http://localhost:not-a-port",
+        ] {
+            assert!(!valid_web_origin(origin), "{origin}");
+        }
+    }
+
+    #[test]
+    fn web_origin_validation_reports_invalid_configured_entry() {
+        let mut config = Config::default();
+        config.web.allowed_origins = vec!["http://localhost:8080/path".to_string()];
+        assert!(validation_errors(&config).contains("web allowed-origin"));
+    }
+
+    #[test]
+    fn web_allowed_origins_parse_from_config() {
+        let arena = Arena::new();
+        let mut doc = toml_spanner::parse(
+            r#"
+[web]
+allowed-origins = ["https://chat.example.test", "http://localhost:5173"]
+"#,
+            &arena,
+        )
+        .unwrap();
+        let mut config: Config = doc.to().unwrap();
+        config.normalize();
+        assert!(validation_errors(&config).is_empty());
+        assert_eq!(
+            config.web.allowed_origins,
+            ["https://chat.example.test", "http://localhost:5173"]
+        );
     }
 
     #[test]

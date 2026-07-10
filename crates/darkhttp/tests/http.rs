@@ -694,6 +694,83 @@ Sec-WebSocket-Version: 13\r\n\
 }
 
 #[test]
+fn websocket_origin_allowlist_accepts_browser_and_native_clients() {
+    let config =
+        ServerConfig::default().websocket_origins(vec!["http://localhost:5173".to_string()]);
+    let server = EmbeddedServer::start_with_config_and_events(
+        config,
+        Router::new().websocket("/chat"),
+        |_, _| {},
+    );
+
+    for origin in [Some("http://localhost:5173"), None] {
+        let mut stream = TcpStream::connect(server.addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let origin = origin.map_or_else(String::new, |origin| format!("Origin: {origin}\r\n"));
+        stream
+            .write_all(
+                format!(
+                    "GET /chat HTTP/1.1\r\n\
+Host: localhost\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+{origin}\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        assert!(headers.starts_with("HTTP/1.1 101 Switching Protocols"));
+    }
+}
+
+#[test]
+fn websocket_origin_allowlist_rejects_untrusted_and_invalid_origins() {
+    let config =
+        ServerConfig::default().websocket_origins(vec!["http://localhost:5173".to_string()]);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let event_opens = Arc::clone(&opens);
+    let server = EmbeddedServer::start_with_config_and_events(
+        config,
+        Router::new().websocket("/chat"),
+        move |event, _| {
+            if matches!(event, ServerEvent::WebSocketOpen { .. }) {
+                event_opens.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+    );
+    let too_long = format!("http://{}.test", "a".repeat(512));
+    let origins = [
+        "Origin: http://attacker.test\r\n".to_string(),
+        "Origin: null\r\n".to_string(),
+        "Origin: http://localhost:5173/path\r\n".to_string(),
+        "Origin: http://localhost:5173\r\nOrigin: http://localhost:5173\r\n".to_string(),
+        format!("Origin: {too_long}\r\n"),
+    ];
+
+    for origin in origins {
+        let response = raw_request(
+            server.addr,
+            &format!(
+                "GET /chat HTTP/1.1\r\n\
+Host: localhost\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+{origin}\r\n"
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+    }
+    assert_eq!(opens.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn fragmented_websocket_text_reassembles() {
     let router = Router::new().websocket("/chat");
     let server = EmbeddedServer::start_with_events(router, |event, server| match event {

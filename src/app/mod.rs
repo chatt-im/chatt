@@ -3620,7 +3620,11 @@ impl App {
             return;
         }
 
-        if old.enabled && self.config.web.enabled && old.bind != self.config.web.bind {
+        if old.enabled
+            && self.config.web.enabled
+            && (old.bind != self.config.web.bind
+                || old.allowed_origins != self.config.web.allowed_origins)
+        {
             if let Some(feed) = self.web_feed.take() {
                 feed.stop();
             }

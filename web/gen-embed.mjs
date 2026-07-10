@@ -1,9 +1,16 @@
-// Postbuild generator for the Rust `embed-web` feature. After `vite build`, gzip
-// every file in dist/ and write dist/embed.rs: a single `match`-based `asset()`
-// the Rust client includes to serve the frontend from the binary. Rust cannot
-// see Vite's content-hashed filenames otherwise, and this avoids a build.rs.
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, posix, relative, sep } from "node:path";
+// Postbuild generator for the Rust `embed-web` feature. Vite owns the ignored,
+// disposable dist/ directory; this script writes the committed embedded/
+// bundle consumed by Rust. Keeping them separate prevents a normal Vite build
+// from deleting tracked assets while retaining a build.rs-free Rust checkout.
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, posix, relative, sep } from "node:path";
 import { gzipSync } from "node:zlib";
 
 // Content types by extension, mirroring crates/darkhttp/src/http/mime.rs.
@@ -41,7 +48,7 @@ function contentType(file) {
 
 function walk(dir) {
   const out = [];
-  for (const entry of readdirSync(dir)) {
+  for (const entry of readdirSync(dir).sort()) {
     const full = join(dir, entry);
     if (statSync(full).isDirectory()) out.push(...walk(full));
     else out.push(full);
@@ -50,11 +57,15 @@ function walk(dir) {
 }
 
 const dist = join(import.meta.dirname, "dist");
+const embedded = join(import.meta.dirname, "embedded");
+rmSync(embedded, { recursive: true, force: true });
+mkdirSync(embedded, { recursive: true });
 const arms = [];
 for (const full of walk(dist)) {
-  if (full.endsWith(".gz") || full.endsWith("embed.rs")) continue;
   const rel = relative(dist, full).split(sep).join(posix.sep);
-  writeFileSync(`${full}.gz`, gzipSync(readFileSync(full), { level: 9 }));
+  const compressed = join(embedded, `${rel}.gz`);
+  mkdirSync(dirname(compressed), { recursive: true });
+  writeFileSync(compressed, gzipSync(readFileSync(full), { level: 9 }));
   const route = `/${rel}`;
   // The root request resolves to index.html without a filesystem index fallback.
   const arm = rel === "index.html" ? `"/" | ${JSON.stringify(route)}` : JSON.stringify(route);
@@ -72,5 +83,5 @@ const body =
   "        _ => return None,\n" +
   "    })\n" +
   "}\n";
-writeFileSync(join(dist, "embed.rs"), body);
+writeFileSync(join(embedded, "embed.rs"), body);
 console.log(`embed.rs: ${arms.length} assets`);
