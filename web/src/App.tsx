@@ -55,6 +55,8 @@ const PAGE = 100;
 const UPLOAD_CHUNK_BYTES = 256 * 1024;
 const UPLOAD_MAX_BUFFERED_BYTES = 1024 * 1024;
 const UPLOAD_DRAIN_POLL_MS = 10;
+const DRAFT_STORAGE_KEY = "chatt.web.compose-draft";
+const REQUEST_TIMEOUT_MS = 15_000;
 
 // Warm a small number of image attachments from the edge of each message batch.
 // This keeps near-viewport images responsive without fetching the whole sync or
@@ -379,6 +381,16 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function loadSessionDraft(): string {
+  try {
+    return typeof sessionStorage === "undefined"
+      ? ""
+      : sessionStorage.getItem(DRAFT_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -387,6 +399,25 @@ function formatTime(ms: number): string {
   if (!ms) return "";
   const d = new Date(ms);
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatExactTime(ms: number): string {
+  return ms ? new Date(ms).toLocaleString([], { dateStyle: "full", timeStyle: "medium" }) : "";
+}
+
+function dateKey(ms: number): string {
+  const date = new Date(ms);
+  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+}
+
+function formatDateLabel(ms: number): string {
+  const date = new Date(ms);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (dateKey(ms) === dateKey(today.getTime())) return "Today";
+  if (dateKey(ms) === dateKey(yesterday.getTime())) return "Yesterday";
+  return date.toLocaleDateString([], { dateStyle: "long" });
 }
 
 function formatBytes(bytes: number): string {
@@ -1014,7 +1045,7 @@ function RefHoverCard(props: { hover: RefHoverState }) {
         <Show when={props.hover.message.edited}>
           <span class="message-edited">(edited)</span>
         </Show>
-        <span class="ref-hover-time">
+        <span class="ref-hover-time" title={formatExactTime(props.hover.message.timestamp_ms)}>
           {formatTime(props.hover.message.timestamp_ms)}
         </span>
       </div>
@@ -1130,7 +1161,12 @@ function MessageRow(props: {
     >
       {/* The time always lives in the left gutter so it sits in one consistent
        * column: shown on a group's first row, revealed on hover for the rest. */}
-      <span class="message-time-gutter">
+      <span
+        class="message-time-gutter"
+        title={formatExactTime(props.message.timestamp_ms)}
+        aria-label={formatExactTime(props.message.timestamp_ms)}
+        tabIndex={0}
+      >
         {formatTime(props.message.timestamp_ms)}
       </span>
       <Show when={!continuation()}>
@@ -1334,7 +1370,7 @@ export default function App() {
   const scrollDebugActive = scrollDebugEnabled();
   if (standalone) {
     const key = previewKey(standalone.item);
-    document.title = `${standalone.item.name} — chatt`;
+    document.title = standalone.item.name;
     return (
       <div class="app">
         <IconSprite />
@@ -1367,10 +1403,12 @@ export default function App() {
   // Drives virtua's `shift`: while true a data change is treated as a prepend so
   // scroll position is anchored from the end (reverse infinite scroll).
   const [prepend, setPrepend] = createSignal(false);
+  const [newMessageCount, setNewMessageCount] = createSignal(0);
 
   // Screen shares this browser can watch, and the stream ids currently playing.
   const [shares, setShares] = createSignal<ShareInfo[]>([]);
   const [playing, setPlaying] = createSignal<number[]>([]);
+  const [shareStates, setShareStates] = createSignal<Record<number, string>>({});
   // Per-stream play-failure messages reported by the client, shown on the row.
   const [shareErrors, setShareErrors] = createSignal<Record<number, string>>(
     {}
@@ -1391,6 +1429,7 @@ export default function App() {
     DEFAULT_PREVIEW_PANEL_WIDTH
   );
   const [previewPanelResizing, setPreviewPanelResizing] = createSignal(false);
+  const [compactPreview, setCompactPreview] = createSignal(false);
   const [autoplay, setAutoplay] =
     createSignal<AutoplayMode>("disabled");
   const [viewerInSeparateBrowserTab, setViewerInSeparateBrowserTab] =
@@ -1398,6 +1437,7 @@ export default function App() {
   let previewOpener: HTMLElement | undefined;
   let deleteOpener: HTMLButtonElement | undefined;
   let deleteErrorTimer: number | undefined;
+  let previewMedia: MediaQueryList | undefined;
 
   const activePreview = () => {
     const key = activePreviewKey();
@@ -1457,15 +1497,39 @@ export default function App() {
   // The compose box is hidden until the client reports a writable feed in its
   // `config` envelope, so a read-only view never shows controls it cannot use.
   const [readonly, setReadonly] = createSignal(true);
-  const [draft, setDraft] = createSignal("");
+  const [draft, setDraft] = createSignal(loadSessionDraft());
   // Files dragged onto the composer, held until the message is submitted.
   const [queued, setQueued] = createSignal<File[]>([]);
   const [editing, setEditing] = createSignal<PendingWebEdit | null>(null);
   const [pendingDelete, setPendingDelete] = createSignal<WebMessage | null>(null);
   const [dragActive, setDragActive] = createSignal(false);
+  const [submitting, setSubmitting] = createSignal(false);
+  const [composeError, setComposeError] = createSignal<string | null>(null);
+  const [maxUploadBytes, setMaxUploadBytes] = createSignal(Number.MAX_SAFE_INTEGER);
+  const [staging, setStaging] = createSignal<{
+    uploadId: number;
+    file: File;
+    sent: number;
+    cancelled: boolean;
+  } | null>(null);
   // A per-connection counter naming each upload so its chunk frames route to the
   // right server-side file.
   let nextUploadId = 1;
+  let nextRequestId = 1;
+  const pendingRequests = new Map<
+    number,
+    { resolve: () => void; reject: (error: Error) => void; timer: number }
+  >();
+
+  createEffect(() => {
+    const value = draft();
+    try {
+      if (value) sessionStorage.setItem(DRAFT_STORAGE_KEY, value);
+      else sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+    } catch {
+      // Storage can be disabled; the in-memory draft remains authoritative.
+    }
+  });
 
   function setShareError(streamId: number, message: string) {
     setShareErrors((prev) => ({ ...prev, [streamId]: message }));
@@ -1491,6 +1555,7 @@ export default function App() {
     decoders.get(streamId)?.close();
     decoders.delete(streamId);
     setPlaying((prev) => prev.filter((id) => id !== streamId));
+    setShareStates((prev) => ({ ...prev, [streamId]: "stopped" }));
   }
 
   let mainEl: HTMLElement | undefined;
@@ -1778,6 +1843,14 @@ export default function App() {
     // Always clear on a timer that outlives the measurement window.
   }
 
+  function jumpToLatest() {
+    following = true;
+    pin();
+    window.setTimeout(() => {
+      if (atBottom()) setNewMessageCount(0);
+    }, 300);
+  }
+
   function preloadImage(message: WebMessage): boolean {
     const att = message.attachment;
     if (!att || att.kind !== "image") return false;
@@ -1910,6 +1983,15 @@ export default function App() {
       next.set(key, nextSection);
       return next;
     });
+  }
+
+  function showsDateSeparator(message: WebMessage): boolean {
+    const visible = messageList().visible;
+    const index = visible.indexOf(message);
+    return (
+      index === 0 ||
+      dateKey(visible[index - 1]!.timestamp_ms) !== dateKey(message.timestamp_ms)
+    );
   }
 
   function flashMessage(_ts: number, mid: number) {
@@ -2086,6 +2168,14 @@ export default function App() {
     );
     const fitsAbove =
       rect.top >= REF_HOVER_MAX_HEIGHT + REF_HOVER_GAP + REF_HOVER_MARGIN;
+    const belowTop = clamp(
+      rect.bottom + REF_HOVER_GAP,
+      REF_HOVER_MARGIN,
+      Math.max(
+        REF_HOVER_MARGIN,
+        window.innerHeight - REF_HOVER_MAX_HEIGHT - REF_HOVER_MARGIN
+      )
+    );
     setRefHover(
       fitsAbove
         ? {
@@ -2094,7 +2184,7 @@ export default function App() {
             top: null,
             bottom: window.innerHeight - rect.top + REF_HOVER_GAP,
           }
-        : { message, left, top: rect.bottom + REF_HOVER_GAP, bottom: null }
+        : { message, left, top: belowTop, bottom: null }
     );
   }
 
@@ -2120,6 +2210,23 @@ export default function App() {
     if (!(target instanceof Element)) return;
     if (target.closest("a.msg-ref") !== refHoverAnchor) return;
     // Still inside the same pill (moved onto a descendant node): not a leave.
+    const related = event.relatedTarget;
+    if (related instanceof Node && refHoverAnchor.contains(related)) return;
+    hideRefHover();
+  }
+
+  function onLogFocusIn(event: FocusEvent) {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const anchor = target.closest("a.msg-ref");
+    if (!(anchor instanceof HTMLElement)) return;
+    hideRefHover();
+    refHoverAnchor = anchor;
+    showRefHover(anchor);
+  }
+
+  function onLogFocusOut(event: FocusEvent) {
+    if (!refHoverAnchor) return;
     const related = event.relatedTarget;
     if (related instanceof Node && refHoverAnchor.contains(related)) return;
     hideRefHover();
@@ -2160,8 +2267,15 @@ export default function App() {
   }
 
   function playShare(streamId: number) {
+    if (!ScreenShareDecoder.supported()) {
+      setShareError(streamId, "This browser does not support WebCodecs screen-share playback");
+      setShareStates((prev) => ({ ...prev, [streamId]: "failed" }));
+      return;
+    }
     if (socket && socket.readyState === WebSocket.OPEN) {
       clearShareError(streamId);
+      setShareStates((prev) => ({ ...prev, [streamId]: "connecting" }));
+      setPlaying((prev) => (prev.includes(streamId) ? prev : [...prev, streamId]));
       socket.send(
         JSON.stringify({
           type: "play_share",
@@ -2190,16 +2304,45 @@ export default function App() {
     closeDecoder(streamId);
   }
 
-  function sendJson(req: ClientRequest) {
+  function sendJson(req: ClientRequest): boolean {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(req));
+      return true;
     }
+    return false;
+  }
+
+  function sendRequest(
+    build: (requestId: number) => ClientRequest
+  ): Promise<void> {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("Not connected to the local Chatt client"));
+    }
+    const requestId = nextRequestId++;
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        pendingRequests.delete(requestId);
+        reject(new Error("Chatt did not acknowledge the request; input was retained"));
+      }, REQUEST_TIMEOUT_MS);
+      pendingRequests.set(requestId, { resolve, reject, timer });
+      try {
+        socket!.send(JSON.stringify(build(requestId)));
+      } catch (error) {
+        clearTimeout(timer);
+        pendingRequests.delete(requestId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
   }
 
   // Cancel an outgoing upload or skip an incoming download, by the transfer id
   // the placeholder message carries as its `file_id`.
   function abortTransfer(transferId: number) {
-    sendJson({ type: "abort_transfer", transfer_id: transferId });
+    void sendRequest((requestId) => ({
+      type: "abort_transfer",
+      request_id: requestId,
+      transfer_id: transferId,
+    })).catch((error) => setComposeError(error.message));
   }
 
   function restoreParkedComposer(edit: PendingWebEdit) {
@@ -2254,12 +2397,20 @@ export default function App() {
     }
   }
 
-  function confirmDelete() {
+  async function confirmDelete() {
     const message = pendingDelete();
     if (!message) return;
-    closeDeleteConfirmation(false);
-    if (editing()?.target === message.message_id) cancelEdit();
-    sendJson({ type: "delete_message", target: message.message_id });
+    try {
+      await sendRequest((requestId) => ({
+        type: "delete_message",
+        request_id: requestId,
+        target: message.message_id,
+      }));
+      closeDeleteConfirmation(false);
+      if (editing()?.target === message.message_id) cancelEdit();
+    } catch (error) {
+      showDeleteError(error instanceof Error ? error.message : String(error));
+    }
   }
 
   function showDeleteError(message: string) {
@@ -2339,23 +2490,42 @@ export default function App() {
   // each prefixed with the little-endian upload id, then `upload_finish`. The
   // server reassembles them into a temp file and relays it as a normal upload.
   async function sendFile(file: File) {
-    const ws = openSocketOrThrow();
     const uploadId = nextUploadId++;
+    if (file.size > maxUploadBytes()) {
+      throw new Error(
+        `${file.name} is ${formatBytes(file.size)}; the upload limit is ${formatBytes(maxUploadBytes())}`
+      );
+    }
+    const ws = openSocketOrThrow();
     debugUpload("start", {
       upload_id: uploadId,
       name: file.name,
       size: file.size,
       buffered_amount: ws.bufferedAmount,
     });
-    ws.send(
-      JSON.stringify({
+    try {
+      await sendRequest((requestId) => ({
         type: "upload_start",
+        request_id: requestId,
         upload_id: uploadId,
         name: file.name,
         size: file.size,
-      })
-    );
+      }));
+    } catch (error) {
+      if (socket?.readyState === WebSocket.OPEN) {
+        void sendRequest((requestId) => ({
+          type: "upload_cancel",
+          request_id: requestId,
+          upload_id: uploadId,
+        })).catch(() => {});
+      }
+      throw error;
+    }
+    setStaging({ uploadId, file, sent: 0, cancelled: false });
     for (let offset = 0; offset < file.size; offset += UPLOAD_CHUNK_BYTES) {
+      if (staging()?.cancelled) {
+        throw new Error(`Staging ${file.name} was cancelled`);
+      }
       const end = Math.min(file.size, offset + UPLOAD_CHUNK_BYTES);
       const chunk = new Uint8Array(await file.slice(offset, end).arrayBuffer());
       const frame = new Uint8Array(4 + chunk.length);
@@ -2363,6 +2533,9 @@ export default function App() {
       frame.set(chunk, 4);
       const current = openSocketOrThrow();
       current.send(frame);
+      setStaging((active) =>
+        active?.uploadId === uploadId ? { ...active, sent: end } : active
+      );
       debugUpload("chunk", {
         upload_id: uploadId,
         name: file.name,
@@ -2375,57 +2548,94 @@ export default function App() {
       await waitForUploadDrain(uploadId);
     }
     const current = openSocketOrThrow();
-    current.send(
-      JSON.stringify({ type: "upload_finish", upload_id: uploadId })
-    );
+    await sendRequest((requestId) => ({
+      type: "upload_finish",
+      request_id: requestId,
+      upload_id: uploadId,
+    }));
     debugUpload("finish", {
       upload_id: uploadId,
       name: file.name,
       size: file.size,
       buffered_amount: current.bufferedAmount,
     });
+    setStaging(null);
   }
 
   async function sendQueuedFiles(files: File[]) {
     for (const file of files) {
-      try {
-        await sendFile(file);
-      } catch (error) {
-        console.warn("[chatt:upload] failed", {
-          name: file.name,
-          size: file.size,
-          error,
-        });
-        debugUpload("error", {
-          name: file.name,
-          size: file.size,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return;
-      }
+      await sendFile(file);
+      setQueued((current) => current.filter((candidate) => candidate !== file));
     }
   }
 
-  function submitCompose() {
+  async function cancelStaging() {
+    const active = staging();
+    if (!active || active.cancelled) return;
+    setStaging({ ...active, cancelled: true });
+    try {
+      await sendRequest((requestId) => ({
+        type: "upload_cancel",
+        request_id: requestId,
+        upload_id: active.uploadId,
+      }));
+      setQueued((current) => current.filter((file) => file !== active.file));
+    } catch (error) {
+      setComposeError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function submitCompose() {
+    if (!connected() || submitting()) return;
+    setComposeError(null);
     const edit = editing();
     if (edit) {
       const body = draft();
       if (!body.trim()) return;
-      if (body !== edit.original) {
-        sendJson({ type: "edit_message", target: edit.target, body });
+      if (body === edit.original) {
+        restoreParkedComposer(edit);
+        return;
       }
-      restoreParkedComposer(edit);
+      setSubmitting(true);
+      try {
+        await sendRequest((requestId) => ({
+          type: "edit_message",
+          request_id: requestId,
+          target: edit.target,
+          body,
+        }));
+        restoreParkedComposer(edit);
+      } catch (error) {
+        setComposeError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setSubmitting(false);
+      }
       return;
     }
 
     const body = draft().trim();
     const files = queued();
     if (!body && files.length === 0) return;
-    if (body) sendJson({ type: "send_message", body });
-    if (files.length > 0) void sendQueuedFiles(files);
-    setDraft("");
-    setQueued([]);
-    queueMicrotask(resizeComposer);
+    setSubmitting(true);
+    try {
+      if (body) {
+        await sendRequest((requestId) => ({
+          type: "send_message",
+          request_id: requestId,
+          body,
+        }));
+        setDraft("");
+        queueMicrotask(resizeComposer);
+      }
+      if (files.length > 0) await sendQueuedFiles(files);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setComposeError(message);
+      setStaging(null);
+      debugUpload("error", { error: message });
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   function onComposeKeyDown(event: KeyboardEvent) {
@@ -2434,7 +2644,12 @@ export default function App() {
       cancelEdit();
       return;
     }
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.isComposing &&
+      event.keyCode !== 229
+    ) {
       event.preventDefault();
       submitCompose();
     }
@@ -2451,6 +2666,17 @@ export default function App() {
     setDragActive(false);
   }
 
+  function queueFiles(files: File[]) {
+    const accepted = files.filter((file) => file.size <= maxUploadBytes());
+    const rejected = files.find((file) => file.size > maxUploadBytes());
+    if (rejected) {
+      setComposeError(
+        `${rejected.name} is ${formatBytes(rejected.size)}; the upload limit is ${formatBytes(maxUploadBytes())}`
+      );
+    }
+    if (accepted.length > 0) setQueued((prev) => [...prev, ...accepted]);
+  }
+
   function onComposeDrop(event: DragEvent) {
     if (editing()) return;
     event.preventDefault();
@@ -2458,7 +2684,7 @@ export default function App() {
     const files = event.dataTransfer
       ? Array.from(event.dataTransfer.files)
       : [];
-    if (files.length > 0) setQueued((prev) => [...prev, ...files]);
+    if (files.length > 0) queueFiles(files);
   }
 
   function openComposeFileDialog() {
@@ -2471,7 +2697,7 @@ export default function App() {
   ) {
     if (editing()) return;
     const files = Array.from(event.currentTarget.files ?? []);
-    if (files.length > 0) setQueued((prev) => [...prev, ...files]);
+    if (files.length > 0) queueFiles(files);
     event.currentTarget.value = "";
   }
 
@@ -2502,7 +2728,7 @@ export default function App() {
     const files = pastedImageFiles(event.clipboardData);
     if (files.length === 0) return;
     event.preventDefault();
-    setQueued((prev) => [...prev, ...files]);
+    queueFiles(files);
   }
 
   function removeQueued(index: number) {
@@ -2756,6 +2982,7 @@ export default function App() {
     if (suppress) return;
     if (!userDriving) return;
     following = atBottom();
+    if (following) setNewMessageCount(0);
   }
 
   // virtua's onScrollEnd fires ~150ms after scrolling stops. Release user
@@ -2785,11 +3012,13 @@ export default function App() {
     // Video frames arrive as binary messages; everything else is JSON text.
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
+      if (socket !== ws) return;
       debugSocket("open", { url });
       setConnected(true);
       hideConnectionError();
     };
     ws.onmessage = (ev) => {
+      if (socket !== ws) return;
       if (typeof ev.data !== "string") {
         // A binary message is either a chat feed frame (zero sentinel) or a
         // video frame. decodeFeed returns null for the latter.
@@ -2807,16 +3036,17 @@ export default function App() {
             frameHasMore: feed.has_more,
           });
           preloadRecentImages(feed.messages);
-          cancelEdit();
           closeDeleteConfirmation(false);
           refPreviewCache.clear();
           setMessages(feed.messages);
           oldestSeq = feed.oldest_seq;
           hasMore = feed.has_more;
+          loadingOlder = false;
           prependSettling = false;
           clearPrependSettleFrame();
           topPagingArmed = true;
           following = true;
+          setNewMessageCount(0);
           pin();
         } else if (feed.kind === "older") {
           debugScrollState("older-received", {
@@ -2872,6 +3102,7 @@ export default function App() {
           if (msg.attachment?.kind === "video" && autoplay() !== "disabled") {
             msg.autoplay = autoplay();
           }
+          let appended = false;
           setMessages((prev) => {
             if (msg.file_id !== null) {
               const i = prev.findIndex(
@@ -2897,14 +3128,21 @@ export default function App() {
               // the server-side backlog but must not appear as a new tail row.
               if (msg.edited) return prev;
             }
+            appended = true;
             return [...prev, msg];
           });
+          if (appended && !following) {
+            setNewMessageCount((count) => count + 1);
+          }
           pin();
         }
         return;
       }
       const env: ServerEnvelope = JSON.parse(ev.data);
       if (env.type === "share_available") {
+        setShareStates((prev) =>
+          env.stream_id in prev ? prev : { ...prev, [env.stream_id]: "available" }
+        );
         setShares((prev) => {
           const share = {
             stream_id: env.stream_id,
@@ -2923,8 +3161,8 @@ export default function App() {
         // Configure this stream's decoder from the codec and descriptor the
         // client supplies, then mark the share as playing. The canvas was
         // mounted with the share's row, so it is already registered. The client
-        // broadcasts share_config on every play request so a tab that joined
-        // after the share started can bootstrap its decoder. Treat the config as
+        // targets share_config to every requesting tab so one that joined after
+        // the share started can bootstrap its decoder. Treat the config as
         // a fresh bootstrap point even if a decoder already exists: the server is
         // about to fast-start from a keyframe, and any stale decode queue would
         // otherwise keep the canvas pinned on old frames.
@@ -2932,9 +3170,19 @@ export default function App() {
         if (canvas) {
           clearShareError(env.stream_id);
           decoders.get(env.stream_id)?.close();
-          const decoder = new ScreenShareDecoder(canvas);
+          const decoder = new ScreenShareDecoder(canvas, {
+            waiting: () =>
+              setShareStates((prev) => ({ ...prev, [env.stream_id]: "waiting-for-keyframe" })),
+            playing: () =>
+              setShareStates((prev) => ({ ...prev, [env.stream_id]: "playing" })),
+            failed: (message) => {
+              setShareError(env.stream_id, message);
+              setShareStates((prev) => ({ ...prev, [env.stream_id]: "failed" }));
+              setPlaying((prev) => prev.filter((id) => id !== env.stream_id));
+            },
+          });
           decoders.set(env.stream_id, decoder);
-          decoder.configure(env.codec, new Uint8Array(env.extradata));
+          void decoder.configure(env.codec, new Uint8Array(env.extradata));
           setPlaying((prev) =>
             prev.includes(env.stream_id) ? prev : [...prev, env.stream_id]
           );
@@ -2991,8 +3239,24 @@ export default function App() {
         setViewerInSeparateBrowserTab(
           env.viewer_in_seperate_browser_tab
         );
+        setMaxUploadBytes(env.max_upload_bytes);
+        document.title = `Chatt | ${env.room_name}`;
+      } else if (env.type === "room") {
+        document.title = `Chatt | ${env.name}`;
+      } else if (env.type === "request_result") {
+        const pending = pendingRequests.get(env.request_id);
+        if (pending) {
+          pendingRequests.delete(env.request_id);
+          clearTimeout(pending.timer);
+          if (env.accepted) pending.resolve();
+          else pending.reject(new Error(env.message ?? `${env.operation} was rejected`));
+        }
+      } else if (env.type === "action_error") {
+        setComposeError(`${env.operation.replace(/_/g, " ")} failed: ${env.message}`);
       } else if (env.type === "share_error") {
         setShareError(env.stream_id, env.message);
+        setShareStates((prev) => ({ ...prev, [env.stream_id]: "failed" }));
+        setPlaying((prev) => prev.filter((id) => id !== env.stream_id));
       } else if (env.type === "delete_error") {
         if (pendingDelete()?.message_id === env.target) {
           closeDeleteConfirmation(false);
@@ -3008,6 +3272,7 @@ export default function App() {
       }
     };
     ws.onclose = (event) => {
+      if (socket !== ws) return;
       console.warn("[chatt:ws] closed", {
         code: event.code,
         reason: event.reason,
@@ -3019,12 +3284,23 @@ export default function App() {
         was_clean: event.wasClean,
       });
       setConnected(false);
-      cancelEdit();
       closeDeleteConfirmation(false);
+      loadingOlder = false;
+      topPagingArmed = true;
+      setStaging(null);
+      for (const pending of pendingRequests.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("Connection lost before Chatt accepted the request"));
+      }
+      pendingRequests.clear();
+      for (const decoder of decoders.values()) decoder.close();
+      decoders.clear();
+      setPlaying([]);
       scheduleConnectionError();
       reconnectTimer = window.setTimeout(connect, 1000);
     };
     ws.onerror = (event) => {
+      if (socket !== ws) return;
       console.warn("[chatt:ws] error", event);
       debugSocket("error");
       ws.close();
@@ -3033,6 +3309,10 @@ export default function App() {
   }
 
   onMount(() => {
+    previewMedia = window.matchMedia("(max-width: 820px)");
+    const updateCompactPreview = () => setCompactPreview(previewMedia!.matches);
+    updateCompactPreview();
+    previewMedia.onchange = updateCompactPreview;
     if (contentEl) {
       // Fires on any content-size change: new message, image/video decode, font
       // load, reflow. The wrapper grows with virtua's container, so media that
@@ -3085,6 +3365,9 @@ export default function App() {
     connect();
   });
   onCleanup(() => {
+    if (previewMedia) {
+      previewMedia.onchange = null;
+    }
     resizeObserver?.disconnect();
     chatViewportResizeObserver?.disconnect();
     splitResizeObserver?.disconnect();
@@ -3107,6 +3390,8 @@ export default function App() {
     if (deleteErrorTimer !== undefined) clearTimeout(deleteErrorTimer);
     if (refHoverTimer !== undefined) clearTimeout(refHoverTimer);
     for (const decoder of decoders.values()) decoder.close();
+    for (const pending of pendingRequests.values()) clearTimeout(pending.timer);
+    pendingRequests.clear();
     decoders.clear();
     imagePreloads.clear();
     socket?.close();
@@ -3162,6 +3447,7 @@ export default function App() {
             "is-share-fullscreen": fullscreenStream() !== null,
           }}
           ref={mainEl}
+          inert={compactPreview() && !!activePreview()}
           style={
             hasVideoPane()
               ? `--share-pane-height: ${sharePaneHeight()}px`
@@ -3173,6 +3459,7 @@ export default function App() {
               <ScreenShare
                 shares={shares()}
                 playing={playing()}
+                states={shareStates()}
                 errors={shareErrors()}
                 fullscreenStream={fullscreenStream()}
                 onPlay={playShare}
@@ -3207,6 +3494,8 @@ export default function App() {
             onClick={onLogClick}
             onMouseOver={onLogMouseOver}
             onMouseOut={onLogMouseOut}
+            onFocusIn={onLogFocusIn}
+            onFocusOut={onLogFocusOut}
           >
             <div class="chat-log-content" ref={contentEl}>
               <Virtualizer
@@ -3227,20 +3516,32 @@ export default function App() {
                 onScrollEnd={onScrollEnd}
               >
                 {(message) => (
-                  <MessageRow
-                    message={message}
-                    group={messageList().groups.get(message)!}
-                    onToggleGroup={toggleMessageGroup}
-                    onOpenPreview={openPreview}
-                    onQuoteRef={readonly() ? undefined : quoteRef}
-                    onAbortTransfer={readonly() ? undefined : abortTransfer}
-                    onEdit={readonly() ? undefined : beginEdit}
-                    onDelete={readonly() ? undefined : deleteMessage}
-                    autoplay={message.autoplay ?? "disabled"}
-                  />
+                  <div class="message-item">
+                    <Show when={showsDateSeparator(message)}>
+                      <div class="date-separator" role="separator" aria-label={formatDateLabel(message.timestamp_ms)}>
+                        <span>{formatDateLabel(message.timestamp_ms)}</span>
+                      </div>
+                    </Show>
+                    <MessageRow
+                      message={message}
+                      group={messageList().groups.get(message)!}
+                      onToggleGroup={toggleMessageGroup}
+                      onOpenPreview={openPreview}
+                      onQuoteRef={readonly() ? undefined : quoteRef}
+                      onAbortTransfer={readonly() ? undefined : abortTransfer}
+                      onEdit={readonly() ? undefined : beginEdit}
+                      onDelete={readonly() ? undefined : deleteMessage}
+                      autoplay={message.autoplay ?? "disabled"}
+                    />
+                  </div>
                 )}
               </Virtualizer>
             </div>
+            <Show when={newMessageCount() > 0}>
+              <button class="new-messages" type="button" onClick={jumpToLatest}>
+                {newMessageCount()} new {newMessageCount() === 1 ? "message" : "messages"}
+              </button>
+            </Show>
           </div>
           <Show when={!readonly()}>
             <section
@@ -3287,6 +3588,27 @@ export default function App() {
                   </For>
                 </div>
               </Show>
+              <Show when={staging()}>
+                {(active) => (
+                  <div class="composer-staging" role="status" aria-live="polite">
+                    <span>
+                      Staging {active().file.name}: {formatBytes(active().sent)} / {formatBytes(active().file.size)}
+                    </span>
+                    <progress value={active().sent} max={Math.max(1, active().file.size)} />
+                    <button type="button" onClick={cancelStaging} disabled={active().cancelled}>
+                      {active().cancelled ? "Cancelling…" : "Cancel"}
+                    </button>
+                  </div>
+                )}
+              </Show>
+              <Show when={composeError()}>
+                <div class="composer-error" role="alert">
+                  {composeError()} Input and unaccepted files were retained.
+                </div>
+              </Show>
+              <Show when={!connected()}>
+                <div class="composer-offline" role="status">Offline — your draft is retained; sending is disabled.</div>
+              </Show>
               <div class="composer-input-row">
                 <Show when={!editing()}>
                   <button
@@ -3295,11 +3617,14 @@ export default function App() {
                     aria-label="Attach files"
                     title="Attach files"
                     onClick={openComposeFileDialog}
+                    disabled={submitting()}
                   >
                     <Icon name="plus" />
                   </button>
                 </Show>
+                <label class="visually-hidden" for="composer-message">Message</label>
                 <textarea
+                  id="composer-message"
                   class="composer-text"
                   ref={composerTextEl}
                   rows={1}
@@ -3350,6 +3675,7 @@ export default function App() {
                   onClose={closePreview}
                   onCloseTab={closePreviewTab}
                   autoplay={autoplay()}
+                  modal={compactPreview()}
                 />
               </aside>
             </>

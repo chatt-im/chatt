@@ -881,6 +881,29 @@ fn delete_error_envelope(target: MessageId, message: &str) -> String {
     }
 }
 
+fn web_request_result_envelope(
+    request_id: u64,
+    operation: &str,
+    accepted: bool,
+    message: Option<&str>,
+) -> String {
+    jsony::object! {
+        type: "request_result",
+        request_id: request_id,
+        operation: operation,
+        accepted: accepted,
+        message: message,
+    }
+}
+
+fn web_action_error_envelope(operation: &str, message: &str) -> String {
+    jsony::object! {
+        type: "action_error",
+        operation: operation,
+        message: message,
+    }
+}
+
 /// Starts the web server and a relay thread that forwards browser requests into
 /// the app event channel, returning the feed handle. The relay bridges the
 /// otherwise one-directional web feed so a browser play click reaches the app.
@@ -950,17 +973,26 @@ fn spawn_web_feed(
     web: &config::WebConfig,
     download_store: crate::receive_store::DownloadStore,
     max_messages: usize,
+    max_upload_bytes: u64,
+    room_name: String,
     events: &EventSender,
 ) -> Option<crate::web_server::WebFeedSender> {
     let (web_tx, web_rx) = mpsc::channel();
-    let feed =
-        match crate::web_server::spawn(web, download_store, max_messages, web_tx, web.readonly) {
-            Ok(feed) => feed,
-            Err(error) => {
-                kvlog::error!("web server failed to start", error = %error);
-                return None;
-            }
-        };
+    let feed = match crate::web_server::spawn_with_upload_limit(
+        web,
+        download_store,
+        max_messages,
+        web_tx,
+        web.readonly,
+        max_upload_bytes,
+        room_name,
+    ) {
+        Ok(feed) => feed,
+        Err(error) => {
+            kvlog::error!("web server failed to start", error = %error);
+            return None;
+        }
+    };
     let relay = events.clone();
     if let Err(error) = thread::Builder::new()
         .name("chatt-web-relay".to_string())
@@ -1062,6 +1094,8 @@ impl App {
                 &config.web,
                 download_store.clone(),
                 config.ui.max_messages as usize,
+                config.files.max_upload_bytes(),
+                room.room_name.clone(),
                 &events.tx,
             )
         } else {
@@ -1499,33 +1533,119 @@ impl App {
     /// Handles a browser request relayed from the web view.
     fn handle_web_request(&mut self, request: crate::web_server::WebRequest) {
         match request {
-            crate::web_server::WebRequest::PlayShare { stream_id } => {
-                self.start_view(StreamId(stream_id))
+            crate::web_server::WebRequest::PlayShare { client, stream_id } => {
+                self.start_view(client, StreamId(stream_id))
             }
             crate::web_server::WebRequest::StopShare { stream_id } => {
                 self.stop_view(StreamId(stream_id))
             }
-            crate::web_server::WebRequest::SendChat { body } => {
-                self.send_chat_to_viewed(body);
+            crate::web_server::WebRequest::SendChat {
+                client,
+                request_id,
+                body,
+            } => {
+                let accepted = if body.trim().is_empty() {
+                    self.report_web_request_result(
+                        client,
+                        request_id,
+                        "send_message",
+                        false,
+                        Some("chat message is empty"),
+                    );
+                    false
+                } else if self.room.viewed_room.is_none() {
+                    self.set_error("no room selected");
+                    self.report_web_request_result(
+                        client,
+                        request_id,
+                        "send_message",
+                        false,
+                        Some("no room selected"),
+                    );
+                    false
+                } else if self.network.is_none() && !self.network_disconnected {
+                    self.set_error("select a server before sending messages");
+                    self.report_web_request_result(
+                        client,
+                        request_id,
+                        "send_message",
+                        false,
+                        Some("select a server before sending messages"),
+                    );
+                    false
+                } else {
+                    self.send_chat_to_viewed(body);
+                    true
+                };
+                if accepted {
+                    self.report_web_request_result(client, request_id, "send_message", true, None);
+                }
             }
-            crate::web_server::WebRequest::EditChat { target, body } => {
+            crate::web_server::WebRequest::EditChat {
+                client,
+                request_id,
+                target,
+                body,
+            } => {
                 let target = MessageId(target);
                 match self.room.validate_web_edit(target) {
                     Ok(room_id) if !body.trim().is_empty() => {
-                        self.send_network_command(
-                            NetworkCommand::EditChat {
-                                room_id,
-                                target,
-                                body,
-                            },
-                            true,
+                        if self.network.is_none() && !self.network_disconnected {
+                            let message = "select a server before editing messages";
+                            self.set_error(message);
+                            self.report_web_request_result(
+                                client,
+                                request_id,
+                                "edit_message",
+                                false,
+                                Some(message),
+                            );
+                        } else {
+                            self.send_network_command(
+                                NetworkCommand::EditChat {
+                                    room_id,
+                                    target,
+                                    body,
+                                },
+                                true,
+                            );
+                            self.report_web_request_result(
+                                client,
+                                request_id,
+                                "edit_message",
+                                true,
+                                None,
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        self.set_error("chat message is empty");
+                        self.report_web_request_result(
+                            client,
+                            request_id,
+                            "edit_message",
+                            false,
+                            Some("chat message is empty"),
                         );
                     }
-                    Ok(_) => self.set_error("chat message is empty"),
-                    Err(denied) => self.set_error(denied.status()),
+                    Err(denied) => {
+                        let message = denied.status();
+                        self.set_error(message);
+                        self.report_web_request_result(
+                            client,
+                            request_id,
+                            "edit_message",
+                            false,
+                            Some(message),
+                        );
+                    }
                 }
             }
-            crate::web_server::WebRequest::DeleteChat { target } => {
+            crate::web_server::WebRequest::DeleteChat {
+                client,
+                request_id,
+                target,
+            } => {
                 let target = MessageId(target);
                 match self.room.validate_web_delete(target) {
                     Ok(room_id) => {
@@ -1533,30 +1653,82 @@ impl App {
                             let message = "select a server before deleting messages";
                             self.set_error(message);
                             self.report_web_delete_error(target, message);
+                            self.report_web_request_result(
+                                client,
+                                request_id,
+                                "delete_message",
+                                false,
+                                Some(message),
+                            );
                         } else {
                             self.pending_web_deletes.insert((room_id, target));
                             self.delete_chat_messages(room_id, vec![target]);
+                            self.report_web_request_result(
+                                client,
+                                request_id,
+                                "delete_message",
+                                true,
+                                None,
+                            );
                         }
                     }
                     Err(denied) => {
                         let message = denied.status();
                         self.set_error(message);
                         self.report_web_delete_error(target, message);
+                        self.report_web_request_result(
+                            client,
+                            request_id,
+                            "delete_message",
+                            false,
+                            Some(message),
+                        );
                     }
                 }
             }
-            crate::web_server::WebRequest::UploadFile { path, name } => {
-                self.send_network_command(
-                    NetworkCommand::UploadFile(UploadFileRequest {
-                        path,
-                        name_override: Some(name),
-                        delete_after_open: true,
-                    }),
-                    true,
-                );
+            crate::web_server::WebRequest::UploadFile {
+                client,
+                request_id,
+                path,
+                name,
+            } => {
+                if self.room.viewed_room.is_none() {
+                    let _ = std::fs::remove_file(&path);
+                    self.report_web_request_result(
+                        client,
+                        request_id,
+                        "upload_finish",
+                        false,
+                        Some("no room selected"),
+                    );
+                } else if self.network.is_none() && !self.network_disconnected {
+                    let _ = std::fs::remove_file(&path);
+                    self.report_web_request_result(
+                        client,
+                        request_id,
+                        "upload_finish",
+                        false,
+                        Some("select a server before uploading files"),
+                    );
+                } else {
+                    self.send_network_command(
+                        NetworkCommand::UploadFile(UploadFileRequest {
+                            path,
+                            name_override: Some(name),
+                            delete_after_open: true,
+                        }),
+                        true,
+                    );
+                    self.report_web_request_result(client, request_id, "upload_finish", true, None);
+                }
             }
-            crate::web_server::WebRequest::CancelTransfer { transfer_id } => {
+            crate::web_server::WebRequest::CancelTransfer {
+                client,
+                request_id,
+                transfer_id,
+            } => {
                 self.cancel_transfer(FileTransferId(transfer_id));
+                self.report_web_request_result(client, request_id, "abort_transfer", true, None);
             }
         }
     }
@@ -1564,6 +1736,22 @@ impl App {
     fn report_web_delete_error(&self, target: MessageId, message: &str) {
         if let Some(feed) = &self.web_feed {
             feed.send_delete_error(delete_error_envelope(target, message));
+        }
+    }
+
+    fn report_web_request_result(
+        &self,
+        client: u64,
+        request_id: u64,
+        operation: &str,
+        accepted: bool,
+        message: Option<&str>,
+    ) {
+        if let Some(feed) = &self.web_feed {
+            feed.send_request_result(
+                client,
+                web_request_result_envelope(request_id, operation, accepted, message),
+            );
         }
     }
 
@@ -1577,36 +1765,35 @@ impl App {
     /// Tells the browser to configure its decoder for `stream_id` and ensures a
     /// viewer connection is feeding it frames.
     ///
-    /// The decoder config is broadcast on every play request, not just the
-    /// first. A browser tab that connects after a share started receives the
-    /// retained `share_available` button but missed the transient
-    /// `share_config`, so its play click must re-broadcast the config to
-    /// bootstrap its decoder. Frames are broadcast to every web client, so a
-    /// single subscriber connection serves all tabs and a play request for an
-    /// already-viewed stream reuses it instead of opening a second connection.
-    fn start_view(&mut self, stream_id: StreamId) {
+    /// The decoder config is targeted to every tab that asks to play. A tab
+    /// that connects after a share started receives the retained
+    /// `share_available` button but missed earlier transient config, so its play
+    /// click must bootstrap its own decoder. The web server scopes frames to
+    /// subscribed sockets while one app-level subscriber connection serves all
+    /// tabs viewing the same remote stream.
+    fn start_view(&mut self, client: u64, stream_id: StreamId) {
         // The play click came from the browser, so failures are reported back to
         // the web view rather than the TUI, which that user is not watching.
         let Some(feed) = self.web_feed.clone() else {
             return;
         };
         let Some(share) = self.available_shares.get(&stream_id) else {
-            feed.send_share_error(share_error_envelope(
-                stream_id,
-                "that screen share is no longer available",
-            ));
+            feed.send_share_error(
+                client,
+                share_error_envelope(stream_id, "that screen share is no longer available"),
+            );
             return;
         };
         if self.voice_room != Some(share.room_id) {
-            feed.send_share_error(share_error_envelope(
-                stream_id,
-                "join the share's voice room before viewing",
-            ));
+            feed.send_share_error(
+                client,
+                share_error_envelope(stream_id, "join the share's voice room before viewing"),
+            );
             return;
         }
         let config = share_config_envelope(stream_id, &share.codec, &share.extradata);
         let view_secret = share.view_secret.clone();
-        feed.send_share_config(stream_id.0, config);
+        feed.send_share_config(client, stream_id.0, config);
 
         // The user's own share is teed to the browser by the publisher, and an
         // already-subscribed remote share is teed by its existing subscriber, so
@@ -1621,21 +1808,24 @@ impl App {
         }
 
         let Some(tcp_addr) = self.active_tcp_addr.clone() else {
-            feed.send_share_error(share_error_envelope(stream_id, "not connected to a server"));
+            feed.send_share_error(
+                client,
+                share_error_envelope(stream_id, "not connected to a server"),
+            );
             return;
         };
         let Some(session_id) = self.session_id else {
-            feed.send_share_error(share_error_envelope(
-                stream_id,
-                "the voice session is no longer active",
-            ));
+            feed.send_share_error(
+                client,
+                share_error_envelope(stream_id, "the voice session is no longer active"),
+            );
             return;
         };
         let Some(video_transport) = self.video_transport else {
-            feed.send_share_error(share_error_envelope(
-                stream_id,
-                "video transport is not ready",
-            ));
+            feed.send_share_error(
+                client,
+                share_error_envelope(stream_id, "video transport is not ready"),
+            );
             return;
         };
         let handle = crate::video::start_subscriber(
@@ -1749,7 +1939,10 @@ impl App {
         }
         if let Some(feed) = &self.web_feed {
             let view = self.room.viewed_history();
-            feed.set_room(web_room_messages(&view, &self.room, self.user_id));
+            feed.set_room(
+                self.room.room_name.clone(),
+                web_room_messages(&view, &self.room, self.user_id),
+            );
         }
         self.active_tcp_addr = Some(
             server
@@ -1822,7 +2015,10 @@ impl App {
     fn sync_viewed_room_to_feeds(&mut self) {
         if let Some(feed) = &self.web_feed {
             let view = self.room.viewed_history();
-            feed.set_room(web_room_messages(&view, &self.room, self.user_id));
+            feed.set_room(
+                self.room.room_name.clone(),
+                web_room_messages(&view, &self.room, self.user_id),
+            );
         }
         if let Some(room_id) = self.room.viewed_room {
             self.send_network_command(NetworkCommand::SetActiveRoom(room_id), false);
@@ -2554,6 +2750,13 @@ impl App {
                     error = message.as_str()
                 );
                 self.set_error(&message);
+                if let Some(feed) = &self.web_feed {
+                    let operation = match kind {
+                        ChatMutationKind::Edit => "edit_message",
+                        ChatMutationKind::Delete => "delete_message",
+                    };
+                    feed.send_action_error(web_action_error_envelope(operation, &message));
+                }
                 if kind == ChatMutationKind::Delete
                     && self.pending_web_deletes.remove(&(room_id, target))
                 {
@@ -3635,6 +3838,8 @@ impl App {
                 &self.config.web,
                 self.download_store.clone(),
                 self.config.ui.max_messages as usize,
+                self.config.files.max_upload_bytes(),
+                self.room.room_name.clone(),
                 &self.events.tx,
             );
             match feed {
@@ -7846,6 +8051,8 @@ mod tests {
         );
 
         app.handle_web_request(crate::web_server::WebRequest::EditChat {
+            client: 1,
+            request_id: 1,
             target: 7,
             body: "revised".to_string(),
         });
@@ -7858,7 +8065,11 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
 
-        app.handle_web_request(crate::web_server::WebRequest::DeleteChat { target: 7 });
+        app.handle_web_request(crate::web_server::WebRequest::DeleteChat {
+            client: 1,
+            request_id: 2,
+            target: 7,
+        });
         match rx.try_recv().unwrap() {
             NetworkCommand::DeleteChat {
                 room_id: RoomId(1),

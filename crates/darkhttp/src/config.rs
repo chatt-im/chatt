@@ -18,6 +18,10 @@ pub struct ServerConfig {
     pub websocket_origins: Option<Vec<String>>,
     pub max_request_length: usize,
     pub max_websocket_payload: usize,
+    /// Maximum encoded WebSocket bytes queued for one connection. Exceeding
+    /// the cap closes that connection instead of allowing an unread socket to
+    /// grow the process without bound.
+    pub max_websocket_queue_bytes: usize,
     pub io_threads: usize,
 }
 
@@ -31,6 +35,7 @@ impl Default for ServerConfig {
             websocket_origins: None,
             max_request_length: 8192,
             max_websocket_payload: 16 * 1024 * 1024,
+            max_websocket_queue_bytes: 8 * 1024 * 1024,
             io_threads: 2,
         }
     }
@@ -74,6 +79,11 @@ impl ServerConfig {
 
     pub fn max_websocket_payload(mut self, max_websocket_payload: usize) -> Self {
         self.max_websocket_payload = max_websocket_payload;
+        self
+    }
+
+    pub fn max_websocket_queue_bytes(mut self, max_websocket_queue_bytes: usize) -> Self {
+        self.max_websocket_queue_bytes = max_websocket_queue_bytes.max(1);
         self
     }
 

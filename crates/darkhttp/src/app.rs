@@ -205,12 +205,26 @@ impl App {
         opcode: u8,
         payload: &[u8],
     ) -> io::Result<()> {
-        let conn = self
+        let idx = self
             .conns
-            .iter_mut()
-            .find(|conn| conn.websocket_id == Some(id))
+            .iter()
+            .position(|conn| conn.websocket_id == Some(id))
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "websocket not found"))?;
-        conn.websocket_out.push_back(frame::encode(opcode, payload));
+        let encoded = frame::encode(opcode, payload);
+        let queued = self.conns[idx]
+            .websocket_out
+            .iter()
+            .fold(0usize, |total, frame| total.saturating_add(frame.len()));
+        if queued.saturating_add(encoded.len()) > self.config.max_websocket_queue_bytes {
+            self.emit_websocket_close(idx, WebSocketCloseReason::WriteError);
+            self.conns[idx].state = ConnState::Done;
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "websocket outgoing queue limit exceeded",
+            ));
+        }
+        let conn = &mut self.conns[idx];
+        conn.websocket_out.push_back(encoded);
         if opcode == 0x8 {
             conn.websocket_close_sent = true;
         }
@@ -850,10 +864,7 @@ impl App {
             0x1 | 0x2 => self.handle_websocket_data(idx, id, frame),
             0x8 => {
                 if !self.conns[idx].websocket_close_sent {
-                    self.conns[idx]
-                        .websocket_out
-                        .push_back(frame::encode(0x8, &frame.payload));
-                    self.conns[idx].websocket_close_sent = true;
+                    let _ = self.queue_websocket_frame(id, 0x8, &frame.payload);
                 }
                 self.emit_websocket_close(
                     idx,
@@ -862,9 +873,9 @@ impl App {
                     },
                 );
             }
-            0x9 => self.conns[idx]
-                .websocket_out
-                .push_back(frame::encode(0xA, &frame.payload)),
+            0x9 => {
+                let _ = self.queue_websocket_frame(id, 0xA, &frame.payload);
+            }
             0xA => {}
             _ => {
                 self.queue_close(idx, 1002);
@@ -997,10 +1008,9 @@ impl App {
         if self.conns[idx].websocket_close_sent {
             return;
         }
-        self.conns[idx]
-            .websocket_out
-            .push_back(frame::encode(0x8, &code.to_be_bytes()));
-        self.conns[idx].websocket_close_sent = true;
+        if let Some(id) = self.conns[idx].websocket_id {
+            let _ = self.queue_websocket_frame(id, 0x8, &code.to_be_bytes());
+        }
     }
 
     fn protocol_close(&mut self, idx: usize, code: u16, detail: &'static str) {

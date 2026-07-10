@@ -53,12 +53,18 @@ export default function PreviewPanel(props: {
   onCloseTab: (key: string) => void;
   autoplay: AutoplayMode;
   standalone?: boolean;
+  modal?: boolean;
 }) {
+  let panelEl: HTMLDivElement | undefined;
   let tabsEl: HTMLDivElement | undefined;
   let tabsResizeObserver: ResizeObserver | undefined;
   const tabButtons = new Map<string, HTMLButtonElement>();
   const [hasOverflowBefore, setHasOverflowBefore] = createSignal(false);
   const [hasOverflowAfter, setHasOverflowAfter] = createSignal(false);
+  const [searchOpen, setSearchOpen] = createSignal(false);
+  const [copied, setCopied] = createSignal(false);
+  const [activeFileText, setActiveFileText] = createSignal<string | null>(null);
+  let copiedReset: number | undefined;
 
   function updateOverflowEdges() {
     if (!tabsEl) return;
@@ -119,7 +125,32 @@ export default function PreviewPanel(props: {
     updateOverflowEdges();
   }
 
+  function onPanelKeyDown(event: KeyboardEvent) {
+    if (event.key === "Escape" && !props.standalone) {
+      event.preventDefault();
+      props.onClose();
+      return;
+    }
+    if (event.key !== "Tab" || !props.modal || !panelEl) return;
+    const focusable = Array.from(
+      panelEl.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), a[href], input:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )
+    );
+    if (focusable.length === 0) return;
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   onMount(() => {
+    if (props.modal) queueMicrotask(() => panelEl?.focus());
     if (!tabsEl) return;
     tabsResizeObserver = new ResizeObserver(updateOverflowEdges);
     tabsResizeObserver.observe(tabsEl);
@@ -147,8 +178,29 @@ export default function PreviewPanel(props: {
     });
   });
 
+  createEffect(() => {
+    props.activeKey;
+    setSearchOpen(false);
+    setCopied(false);
+    setActiveFileText(null);
+  });
+
+  async function copyActiveFile() {
+    const text = activeFileText();
+    if (text === null) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      if (copiedReset !== undefined) window.clearTimeout(copiedReset);
+      copiedReset = window.setTimeout(() => setCopied(false), 1500);
+    } catch (error) {
+      console.warn("[chatt:clipboard] file copy failed", error);
+    }
+  }
+
   onCleanup(() => {
     tabsResizeObserver?.disconnect();
+    if (copiedReset !== undefined) window.clearTimeout(copiedReset);
     tabButtons.clear();
   });
 
@@ -159,9 +211,29 @@ export default function PreviewPanel(props: {
     <div
       class="preview-panel"
       classList={{ "is-standalone": props.standalone }}
+      ref={panelEl}
+      role={props.modal ? "dialog" : undefined}
+      aria-modal={props.modal ? "true" : undefined}
+      aria-label={props.modal ? `Preview ${props.active.name}` : undefined}
+      tabIndex={props.modal ? -1 : undefined}
+      onKeyDown={onPanelKeyDown}
     >
       <Show when={!imageUsesStandaloneToolbar()}>
         <div class="preview-panel-head">
+          <Show
+            when={props.active.kind === "file" && activeFileText() !== null}
+          >
+            <button
+              class="preview-panel-action preview-panel-search"
+              type="button"
+              aria-label="Search file"
+              aria-pressed={searchOpen()}
+              title="Search file"
+              onClick={() => setSearchOpen((open) => !open)}
+            >
+              <Icon name="search" />
+            </button>
+          </Show>
           <Show when={!props.standalone}>
             <div
               class="preview-tabs-frame"
@@ -222,8 +294,21 @@ export default function PreviewPanel(props: {
             </div>
           </Show>
           <div class="preview-panel-actions">
+            <Show
+              when={props.active.kind === "file" && activeFileText() !== null}
+            >
+              <button
+                class="preview-panel-action"
+                type="button"
+                aria-label={`Copy ${props.active.name}`}
+                title={copied() ? "Copied" : "Copy file"}
+                onClick={copyActiveFile}
+              >
+                <Icon name={copied() ? "check" : "copy"} />
+              </button>
+            </Show>
             <a
-              class="preview-panel-download"
+              class="preview-panel-action"
               href={`/files/${encodeURIComponent(props.active.name)}`}
               download={props.active.name}
               aria-label={`Download ${props.active.name}`}
@@ -232,7 +317,7 @@ export default function PreviewPanel(props: {
               <Icon name="download" />
             </a>
             <button
-              class="preview-panel-close"
+              class="preview-panel-action"
               type="button"
               aria-label="Close preview"
               title="Close"
@@ -282,7 +367,12 @@ export default function PreviewPanel(props: {
                 />
               </div>
             ) : (
-              <FileViewer name={item.name} />
+              <FileViewer
+                name={item.name}
+                searchOpen={searchOpen()}
+                onCloseSearch={() => setSearchOpen(false)}
+                onTextLoaded={setActiveFileText}
+              />
             )
           }
         </Show>

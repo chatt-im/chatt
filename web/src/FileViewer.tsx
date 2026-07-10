@@ -1,4 +1,4 @@
-import { createResource, Show, Suspense } from "solid-js";
+import { createEffect, createResource, Show, Suspense } from "solid-js";
 import CodeList from "./CodeList";
 import { decodeFileBuffer, type FileHighlight } from "./highlight";
 
@@ -28,8 +28,19 @@ async function loadFile(name: string): Promise<FileLoadResult> {
 // The expanded, line-numbered, syntax-highlighted view of a text file. Panel
 // chrome is owned by PreviewPanel so code and image previews share one history.
 // Only visible lines build HTML, keeping very large files responsive.
-export default function FileViewer(props: { name: string }) {
+export default function FileViewer(props: {
+  name: string;
+  searchOpen: boolean;
+  onCloseSearch: () => void;
+  onTextLoaded: (text: string | null) => void;
+}) {
   const [state] = createResource(() => props.name, loadFile);
+  createEffect(() => {
+    const result = state();
+    props.onTextLoaded(
+      result && "highlight" in result ? result.highlight.text : null,
+    );
+  });
   const error = () => {
     const result = state();
     return result && "error" in result ? result.error : undefined;
@@ -46,7 +57,13 @@ export default function FileViewer(props: { name: string }) {
           when={error()}
           fallback={
             <Show when={highlight()} keyed>
-              {(loadedHighlight) => <CodeList highlight={loadedHighlight} />}
+              {(loadedHighlight) => (
+                <CodeList
+                  highlight={loadedHighlight}
+                  searchOpen={props.searchOpen}
+                  onCloseSearch={props.onCloseSearch}
+                />
+              )}
             </Show>
           }
         >

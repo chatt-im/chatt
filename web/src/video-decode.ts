@@ -22,6 +22,12 @@ export interface VideoFrame {
   data: Uint8Array;
 }
 
+export interface DecoderEvents {
+  waiting?: () => void;
+  playing?: () => void;
+  failed?: (message: string) => void;
+}
+
 /// Parses one binary frame message: its 17-byte header then the bitstream body.
 /// Returns `null` when the buffer is too short or its size field is malformed.
 export function parseFrame(buffer: ArrayBuffer): VideoFrame | null {
@@ -68,7 +74,10 @@ export class ScreenShareDecoder {
   // output callback can tell an intermediate catch-up frame from the newest.
   private newestSubmittedUs = Number.NEGATIVE_INFINITY;
 
-  constructor(private canvas: HTMLCanvasElement) {}
+  private terminal = false;
+  private generation = 0;
+
+  constructor(private canvas: HTMLCanvasElement, private events: DecoderEvents = {}) {}
 
   /// True when WebCodecs is available in this browser.
   static supported(): boolean {
@@ -77,12 +86,33 @@ export class ScreenShareDecoder {
 
   /// Configures the decoder for `codec`, with `description` the `extra_data`
   /// descriptor (empty when the stream needs none). Any prior decoder is closed.
-  configure(codec: string, description: Uint8Array) {
+  async configure(codec: string, description: Uint8Array): Promise<void> {
     this.close();
+    const generation = this.generation;
+    if (!ScreenShareDecoder.supported()) {
+      this.fail("This browser does not support WebCodecs screen-share playback");
+      return;
+    }
     this.codec = codec;
     this.description = description;
     this.preferSoftware = false;
     console.info("[screenshare] configure", { codec, descriptorBytes: description.length });
+    const config: VideoDecoderConfig = { codec, optimizeForLatency: true };
+    if (description.length > 0) config.description = description;
+    try {
+      const support = await VideoDecoder.isConfigSupported(config);
+      if (generation !== this.generation) return;
+      if (!support.supported) {
+        this.fail(`The browser cannot decode ${codec}`);
+        return;
+      }
+    } catch (error) {
+      if (generation !== this.generation) return;
+      this.fail(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    this.terminal = false;
+    this.events.waiting?.();
     this.start();
   }
 
@@ -100,6 +130,7 @@ export class ScreenShareDecoder {
           });
         }
         this.decoded = true;
+        this.events.playing?.();
         this.replay.length = 0;
         // While catching up (fast-start burst, or decode falling behind), more
         // frames are already queued behind this one. Drawing each of them would
@@ -132,6 +163,7 @@ export class ScreenShareDecoder {
       this.decoder.configure(config);
     } catch (error) {
       console.error("[screenshare] configure threw", error);
+      this.fail(error instanceof Error ? error.message : String(error));
     }
     this.sawKey = false;
     this.decoded = false;
@@ -156,6 +188,7 @@ export class ScreenShareDecoder {
     });
     if (this.decoded || this.preferSoftware) {
       console.error("[screenshare] decode failed (terminal)", error);
+      this.fail(error.message || "Screen-share decoding failed");
       return;
     }
     console.warn("[screenshare] hardware decode failed, falling back to software");
@@ -187,6 +220,7 @@ export class ScreenShareDecoder {
   }
 
   decode(frame: VideoFrame) {
+    if (this.terminal) return;
     if (!this.decoder || this.decoder.state === "closed") {
       console.warn("[screenshare] decode skipped, decoder not ready", {
         hasDecoder: !!this.decoder,
@@ -194,10 +228,22 @@ export class ScreenShareDecoder {
       });
       return;
     }
+    if (this.pending.length >= MAX_PENDING_FRAMES) {
+      console.warn("[screenshare] pending frame limit reached; waiting for a fresh keyframe", {
+        pending: this.pending.length,
+        streamId: frame.streamId,
+      });
+      this.closeDecoderOnly();
+      this.start();
+      this.events.waiting?.();
+      if (!frame.isKey) return;
+      this.sawKey = true;
+    }
     if (!this.sawKey) {
       if (!frame.isKey) {
         this.skippedBeforeKey += 1;
         if (this.skippedBeforeKey === 1 || this.skippedBeforeKey % 120 === 0) {
+          this.events.waiting?.();
           console.warn("[screenshare] waiting for keyframe", {
             skipped: this.skippedBeforeKey,
             streamId: frame.streamId,
@@ -290,10 +336,12 @@ export class ScreenShareDecoder {
       this.decoder.decode(chunk);
     } catch (error) {
       console.error("[screenshare] decode threw", { type: chunk.type, error });
+      this.fail(error instanceof Error ? error.message : String(error));
     }
   }
 
   close() {
+    this.generation += 1;
     this.closeDecoderOnly();
     this.sawKey = false;
     this.decoded = false;
@@ -301,6 +349,14 @@ export class ScreenShareDecoder {
     this.pending.length = 0;
     this.skippedBeforeKey = 0;
     this.warnedWaitingForKey = false;
+  }
+
+  private fail(message: string) {
+    this.terminal = true;
+    this.closeDecoderOnly();
+    this.replay.length = 0;
+    this.pending.length = 0;
+    this.events.failed?.(message);
   }
 
   private closeDecoderOnly() {

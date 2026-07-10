@@ -8,7 +8,7 @@
 //! demand by sending a `load_older` request as it scrolls up, addressed by a
 //! server-assigned monotonic sequence number.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -67,6 +67,9 @@ const MAX_HIGHLIGHT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// exceeds this bound, caching pauses until the next keyframe rather than
 /// retaining an undecodable delta suffix.
 const VIDEO_FAST_START_MAX_BYTES: usize = video::MAX_VIDEO_FRAME_LEN;
+const MAX_WEBSOCKET_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACTIVE_UPLOADS_PER_SOCKET: usize = 4;
+const MAX_ACTIVE_UPLOADS_GLOBAL: usize = 32;
 
 static NEXT_UPLOAD_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -423,10 +426,16 @@ enum WebFeed {
     /// A transient `delete_error` envelope for a locally/server-rejected web
     /// deletion request.
     DeleteError(String),
+    /// A browser-visible rejection that cannot be tied to one still-pending
+    /// local request (for example, a later room-server mutation rejection).
+    ActionError(String),
     /// Replaces the backlog with the current room's messages (empty when there
     /// is no current room) and re-syncs every connected browser. The web view
     /// mirrors the room the client is in, nothing more.
-    SetRoom(Vec<WebMessage>),
+    SetRoom {
+        name: String,
+        messages: Vec<WebMessage>,
+    },
     /// A `share_available` envelope. The web thread retains it by `stream_id` and
     /// replays it to a browser that connects after the share started.
     ShareAvailable {
@@ -434,16 +443,25 @@ enum WebFeed {
         payload: String,
     },
     /// A `share_config` envelope sent when playback starts. Transient: it targets
-    /// a browser that already asked to play, so it is broadcast but not retained.
+    /// the browser that asked to play, so it is targeted and not retained.
     /// The stream id selects the cached keyframe-led burst sent immediately
     /// after the config.
     ShareConfig {
+        client: u64,
         stream_id: u32,
         payload: String,
     },
     /// A `share_error` envelope reporting a failed play request. Transient and
-    /// broadcast like [`ShareConfig`](WebFeed::ShareConfig), not retained.
-    ShareError(String),
+    /// targeted like [`ShareConfig`](WebFeed::ShareConfig), not retained.
+    ShareError {
+        client: u64,
+        payload: String,
+    },
+    /// A mutation/upload acknowledgement routed only to its originating tab.
+    RequestResult {
+        client: u64,
+        payload: String,
+    },
     /// A `file_progress` envelope for an in-flight transfer. Transient: browsers
     /// merge it into the matching placeholder message and it is not retained, so a
     /// browser that connects mid-transfer simply sees the file once it lands.
@@ -471,6 +489,7 @@ enum WebFeed {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WebRequest {
     PlayShare {
+        client: u64,
         stream_id: u32,
     },
     StopShare {
@@ -478,25 +497,35 @@ pub enum WebRequest {
     },
     /// A chat line the browser composed, sent to the current room.
     SendChat {
+        client: u64,
+        request_id: u64,
         body: String,
     },
     /// Replaces a locally-authored text message in the current room.
     EditChat {
+        client: u64,
+        request_id: u64,
         target: u64,
         body: String,
     },
     /// Deletes a locally-authored message in the current room.
     DeleteChat {
+        client: u64,
+        request_id: u64,
         target: u64,
     },
     /// A file the browser uploaded, reassembled to `path` on disk.
     UploadFile {
+        client: u64,
+        request_id: u64,
         path: PathBuf,
         name: String,
     },
     /// Aborts the in-flight transfer with the given server transfer id: the app
     /// cancels it if it is an outgoing upload, or skips it if incoming.
     CancelTransfer {
+        client: u64,
+        request_id: u64,
         transfer_id: u64,
     },
 }
@@ -521,31 +550,39 @@ enum ClientRequest {
     StopShare { stream_id: u32 },
     /// A composed chat line to send to the current room. Ignored when read-only.
     #[jsony(rename = "send_message")]
-    SendMessage { body: String },
+    SendMessage { request_id: u64, body: String },
     /// Replaces a locally-authored text message. Ignored when read-only.
     #[jsony(rename = "edit_message")]
-    EditMessage { target: u64, body: String },
+    EditMessage {
+        request_id: u64,
+        target: u64,
+        body: String,
+    },
     /// Deletes a locally-authored message. Ignored when read-only.
     #[jsony(rename = "delete_message")]
-    DeleteMessage { target: u64 },
+    DeleteMessage { request_id: u64, target: u64 },
     /// Opens a file upload. The binary chunk frames that follow carry its bytes,
     /// keyed by `upload_id`, and `upload_finish` closes it. Ignored when
     /// read-only.
     #[jsony(rename = "upload_start")]
     UploadStart {
         upload_id: u32,
+        request_id: u64,
         name: String,
         size: u64,
     },
     /// Closes the upload opened with the matching `upload_id`, queuing the
     /// reassembled file for sending.
     #[jsony(rename = "upload_finish")]
-    UploadFinish { upload_id: u32 },
+    UploadFinish { upload_id: u32, request_id: u64 },
+    /// Cancels browser-to-client staging before the normal room transfer starts.
+    #[jsony(rename = "upload_cancel")]
+    UploadCancel { upload_id: u32, request_id: u64 },
     /// Cancels an in-flight upload or skips an in-flight download, by the server
     /// transfer id the placeholder message carries as its `file_id`. Ignored
     /// when read-only.
     #[jsony(rename = "abort_transfer")]
-    AbortTransfer { transfer_id: u64 },
+    AbortTransfer { request_id: u64, transfer_id: u64 },
 }
 
 /// A cloneable handle the app uses to push messages to the web view.
@@ -573,13 +610,13 @@ impl WebFeedSender {
         self.wake.wake();
     }
 
-    /// Replaces the feed's backlog with `messages` and re-syncs every browser.
+    /// Replaces the feed's room name and backlog, then re-syncs every browser.
     ///
     /// Call this on entering a room (with that room's history) and on leaving
     /// one (with an empty vector) so the web view always shows exactly the
     /// current room's content.
-    pub fn set_room(&self, messages: Vec<WebMessage>) {
-        let _ = self.tx.send(WebFeed::SetRoom(messages));
+    pub fn set_room(&self, name: String, messages: Vec<WebMessage>) {
+        let _ = self.tx.send(WebFeed::SetRoom { name, messages });
         self.wake.wake();
     }
 
@@ -591,14 +628,23 @@ impl WebFeedSender {
     }
 
     /// Sends a decoder-config envelope when playback starts. Not retained.
-    pub fn send_share_config(&self, stream_id: u32, payload: String) {
-        let _ = self.tx.send(WebFeed::ShareConfig { stream_id, payload });
+    pub fn send_share_config(&self, client: u64, stream_id: u32, payload: String) {
+        let _ = self.tx.send(WebFeed::ShareConfig {
+            client,
+            stream_id,
+            payload,
+        });
         self.wake.wake();
     }
 
     /// Sends a play-failure envelope to the browser. Not retained.
-    pub fn send_share_error(&self, payload: String) {
-        let _ = self.tx.send(WebFeed::ShareError(payload));
+    pub fn send_share_error(&self, client: u64, payload: String) {
+        let _ = self.tx.send(WebFeed::ShareError { client, payload });
+        self.wake.wake();
+    }
+
+    pub fn send_request_result(&self, client: u64, payload: String) {
+        let _ = self.tx.send(WebFeed::RequestResult { client, payload });
         self.wake.wake();
     }
 
@@ -626,6 +672,11 @@ impl WebFeedSender {
     /// Reports a rejected browser deletion request. Not retained.
     pub fn send_delete_error(&self, payload: String) {
         let _ = self.tx.send(WebFeed::DeleteError(payload));
+        self.wake.wake();
+    }
+
+    pub fn send_action_error(&self, payload: String) {
+        let _ = self.tx.send(WebFeed::ActionError(payload));
         self.wake.wake();
     }
 
@@ -763,12 +814,33 @@ fn websocket_origins(cfg: &WebConfig, addr: SocketAddr) -> Vec<String> {
 ///
 /// Returns an error if `cfg.bind` is not a valid socket address or the listener
 /// cannot bind.
+#[cfg(test)]
 pub fn spawn(
     cfg: &WebConfig,
     download_store: DownloadStore,
     max_messages: usize,
     web_requests: Sender<WebRequest>,
     readonly: bool,
+) -> io::Result<WebFeedSender> {
+    spawn_with_upload_limit(
+        cfg,
+        download_store,
+        max_messages,
+        web_requests,
+        readonly,
+        rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
+        String::new(),
+    )
+}
+
+pub fn spawn_with_upload_limit(
+    cfg: &WebConfig,
+    download_store: DownloadStore,
+    max_messages: usize,
+    web_requests: Sender<WebRequest>,
+    readonly: bool,
+    max_upload_bytes: u64,
+    room_name: String,
 ) -> io::Result<WebFeedSender> {
     let addr: SocketAddr = cfg.bind.parse().map_err(|error| {
         io::Error::new(
@@ -802,6 +874,7 @@ pub fn spawn(
         .bind(addr)
         .http_timeout(HTTP_PROGRESS_TIMEOUT)
         .websocket_timeout(Duration::ZERO)
+        .max_websocket_queue_bytes(MAX_WEBSOCKET_QUEUE_BYTES)
         .websocket_origins(websocket_origins(cfg, addr));
     let server = Server::bind(config, router)?;
     let wake = server.wake_handle()?;
@@ -821,6 +894,8 @@ pub fn spawn(
                 readonly,
                 autoplay,
                 viewer_in_seperate_browser_tab,
+                max_upload_bytes,
+                room_name,
             )
         })?;
 
@@ -842,6 +917,8 @@ fn run(
     readonly: bool,
     autoplay: WebAutoplay,
     viewer_in_seperate_browser_tab: bool,
+    max_upload_bytes: u64,
+    mut room_name: String,
 ) {
     // Open uploads keyed by connection and browser-assigned id, each an
     // append-mode file the binary chunk frames stream into until `upload_finish`.
@@ -855,6 +932,13 @@ fn run(
     // history independent of the message ids (which span two id namespaces).
     let mut base_seq: u64 = 0;
     let mut clients: Vec<WebSocketId> = Vec::new();
+    // Browser playback subscriptions are scoped to the originating socket.
+    // The app-level subscriber is started on the first subscription and stopped
+    // only after the last socket leaves the stream.
+    let mut share_subscriptions: HashSet<(WebSocketId, u32)> = HashSet::new();
+    // A requested subscription becomes ready only after its targeted decoder
+    // config and keyframe-led replay have been queued, preserving decode order.
+    let mut ready_share_subscriptions: HashSet<(WebSocketId, u32)> = HashSet::new();
     // Active screen shares by stream id, replayed to a browser that connects
     // after a share started so it still shows the play button.
     let mut active_shares: HashMap<u32, String> = HashMap::new();
@@ -911,7 +995,13 @@ fn run(
                         let _ = server.send_websocket_binary(id, &sync_frame(&history, base_seq));
                         let _ = server.send_websocket_text(
                             id,
-                            &config_envelope(readonly, autoplay, viewer_in_seperate_browser_tab),
+                            &config_envelope(
+                                readonly,
+                                autoplay,
+                                viewer_in_seperate_browser_tab,
+                                max_upload_bytes,
+                                &room_name,
+                            ),
                         );
                         for payload in active_shares.values() {
                             let _ = server.send_websocket_text(id, payload);
@@ -920,6 +1010,20 @@ fn run(
                 }
                 ServerEvent::WebSocketClose { id, reason } => {
                     clients.retain(|client| *client != id);
+                    let subscribed_streams: Vec<u32> = share_subscriptions
+                        .iter()
+                        .filter_map(|(client, stream_id)| (*client == id).then_some(*stream_id))
+                        .collect();
+                    share_subscriptions.retain(|(client, _)| *client != id);
+                    ready_share_subscriptions.retain(|(client, _)| *client != id);
+                    for stream_id in subscribed_streams {
+                        if !share_subscriptions
+                            .iter()
+                            .any(|(_, subscribed)| *subscribed == stream_id)
+                        {
+                            let _ = web_requests.send(WebRequest::StopShare { stream_id });
+                        }
+                    }
                     // Drop and delete any uploads this client left unfinished.
                     let mut abandoned_uploads = 0u32;
                     uploads.retain(|(client, _), sink| {
@@ -934,7 +1038,6 @@ fn run(
                                 expected_bytes = sink.expected_size,
                                 path = %sink.path.display()
                             );
-                            let _ = fs::remove_file(&sink.path);
                             false
                         } else {
                             true
@@ -975,7 +1078,11 @@ fn run(
                             kind = "play_share",
                             stream_id
                         );
-                        let _ = web_requests.send(WebRequest::PlayShare { stream_id });
+                        share_subscriptions.insert((id, stream_id));
+                        let _ = web_requests.send(WebRequest::PlayShare {
+                            client: id.get(),
+                            stream_id,
+                        });
                     }
                     Ok(ClientRequest::StopShare { stream_id }) => {
                         kvlog::debug!(
@@ -984,20 +1091,46 @@ fn run(
                             kind = "stop_share",
                             stream_id
                         );
-                        let _ = web_requests.send(WebRequest::StopShare { stream_id });
+                        share_subscriptions.remove(&(id, stream_id));
+                        ready_share_subscriptions.remove(&(id, stream_id));
+                        if !share_subscriptions
+                            .iter()
+                            .any(|(_, subscribed)| *subscribed == stream_id)
+                        {
+                            let _ = web_requests.send(WebRequest::StopShare { stream_id });
+                        }
                     }
                     // Writes are refused wholesale in read-only mode, matching a
                     // browser that never shows the compose box.
-                    Ok(ClientRequest::SendMessage { body }) if !readonly => {
+                    Ok(ClientRequest::SendMessage { request_id, body }) if !readonly => {
                         kvlog::info!(
                             "websocket request",
                             ws_id = id.get(),
                             kind = "send_message",
                             body_len = body.len()
                         );
-                        let _ = web_requests.send(WebRequest::SendChat { body });
+                        if web_requests
+                            .send(WebRequest::SendChat {
+                                client: id.get(),
+                                request_id,
+                                body,
+                            })
+                            .is_err()
+                        {
+                            let payload = request_result_envelope(
+                                request_id,
+                                "send_message",
+                                false,
+                                Some("the local client is unavailable"),
+                            );
+                            let _ = server.send_websocket_text(id, payload);
+                        }
                     }
-                    Ok(ClientRequest::EditMessage { target, body }) if !readonly => {
+                    Ok(ClientRequest::EditMessage {
+                        request_id,
+                        target,
+                        body,
+                    }) if !readonly => {
                         kvlog::info!(
                             "websocket request",
                             ws_id = id.get(),
@@ -1005,45 +1138,129 @@ fn run(
                             target,
                             body_len = body.len()
                         );
-                        let _ = web_requests.send(WebRequest::EditChat { target, body });
+                        if web_requests
+                            .send(WebRequest::EditChat {
+                                client: id.get(),
+                                request_id,
+                                target,
+                                body,
+                            })
+                            .is_err()
+                        {
+                            let payload = request_result_envelope(
+                                request_id,
+                                "edit_message",
+                                false,
+                                Some("the local client is unavailable"),
+                            );
+                            let _ = server.send_websocket_text(id, payload);
+                        }
                     }
-                    Ok(ClientRequest::DeleteMessage { target }) if !readonly => {
+                    Ok(ClientRequest::DeleteMessage { request_id, target }) if !readonly => {
                         kvlog::info!(
                             "websocket request",
                             ws_id = id.get(),
                             kind = "delete_message",
                             target
                         );
-                        let _ = web_requests.send(WebRequest::DeleteChat { target });
+                        if web_requests
+                            .send(WebRequest::DeleteChat {
+                                client: id.get(),
+                                request_id,
+                                target,
+                            })
+                            .is_err()
+                        {
+                            let payload = request_result_envelope(
+                                request_id,
+                                "delete_message",
+                                false,
+                                Some("the local client is unavailable"),
+                            );
+                            let _ = server.send_websocket_text(id, payload);
+                        }
                     }
                     Ok(ClientRequest::UploadStart {
                         upload_id,
+                        request_id,
                         name,
                         size,
-                    }) if !readonly => match UploadSink::create(id, upload_id, &name, size) {
-                        Ok(sink) => {
-                            kvlog::info!(
-                                "web upload started",
-                                ws_id = id.get(),
-                                upload_id,
-                                name = sink.name.as_str(),
-                                expected_bytes = sink.expected_size,
-                                path = %sink.path.display()
+                    }) if !readonly => {
+                        let socket_count =
+                            uploads.keys().filter(|(client, _)| *client == id).count();
+                        let socket_bytes = uploads
+                            .iter()
+                            .filter(|((client, _), _)| *client == id)
+                            .fold(0u64, |total, (_, sink)| {
+                                total.saturating_add(sink.expected_size)
+                            });
+                        let global_bytes = uploads
+                            .values()
+                            .fold(0u64, |total, sink| total.saturating_add(sink.expected_size));
+                        let global_limit = max_upload_bytes.saturating_mul(4);
+                        let rejection = if uploads.contains_key(&(id, upload_id)) {
+                            Some("that upload id is already active")
+                        } else if size > max_upload_bytes {
+                            Some("file exceeds the configured upload-size limit")
+                        } else if socket_count >= MAX_ACTIVE_UPLOADS_PER_SOCKET {
+                            Some("too many uploads are active in this tab")
+                        } else if uploads.len() >= MAX_ACTIVE_UPLOADS_GLOBAL {
+                            Some("too many web uploads are active")
+                        } else if socket_bytes.saturating_add(size) > max_upload_bytes {
+                            Some("this tab's staged upload-byte limit would be exceeded")
+                        } else if global_bytes.saturating_add(size) > global_limit {
+                            Some("the global staged upload-byte limit would be exceeded")
+                        } else {
+                            None
+                        };
+                        if let Some(message) = rejection {
+                            let payload = request_result_envelope(
+                                request_id,
+                                "upload_start",
+                                false,
+                                Some(message),
                             );
-                            uploads.insert((id, upload_id), sink);
+                            let _ = server.send_websocket_text(id, payload);
+                            continue;
                         }
-                        Err(error) => {
-                            kvlog::warn!(
-                                "web upload could not be opened",
-                                ws_id = id.get(),
-                                upload_id,
-                                name = name.as_str(),
-                                expected_bytes = size,
-                                error = %error
-                            );
+                        match UploadSink::create(id.get(), upload_id, &name, size) {
+                            Ok(sink) => {
+                                kvlog::info!(
+                                    "web upload started",
+                                    ws_id = id.get(),
+                                    upload_id,
+                                    name = sink.name.as_str(),
+                                    expected_bytes = sink.expected_size,
+                                    path = %sink.path.display()
+                                );
+                                uploads.insert((id, upload_id), sink);
+                                let payload =
+                                    request_result_envelope(request_id, "upload_start", true, None);
+                                let _ = server.send_websocket_text(id, payload);
+                            }
+                            Err(error) => {
+                                kvlog::warn!(
+                                    "web upload could not be opened",
+                                    ws_id = id.get(),
+                                    upload_id,
+                                    name = name.as_str(),
+                                    expected_bytes = size,
+                                    error = %error
+                                );
+                                let payload = request_result_envelope(
+                                    request_id,
+                                    "upload_start",
+                                    false,
+                                    Some("the staging file could not be created"),
+                                );
+                                let _ = server.send_websocket_text(id, payload);
+                            }
                         }
-                    },
-                    Ok(ClientRequest::UploadFinish { upload_id }) if !readonly => {
+                    }
+                    Ok(ClientRequest::UploadFinish {
+                        upload_id,
+                        request_id,
+                    }) if !readonly => {
                         if let Some(sink) = uploads.remove(&(id, upload_id)) {
                             let name = sink.name.clone();
                             let received = sink.received;
@@ -1061,6 +1278,8 @@ fn run(
                                         path = %path.display()
                                     );
                                     if let Err(error) = web_requests.send(WebRequest::UploadFile {
+                                        client: id.get(),
+                                        request_id,
                                         path: path.clone(),
                                         name,
                                     }) {
@@ -1071,6 +1290,13 @@ fn run(
                                             error = %error
                                         );
                                         let _ = fs::remove_file(path);
+                                        let payload = request_result_envelope(
+                                            request_id,
+                                            "upload_finish",
+                                            false,
+                                            Some("the local client is unavailable"),
+                                        );
+                                        let _ = server.send_websocket_text(id, payload);
                                     }
                                 }
                                 Ok(path) => {
@@ -1084,6 +1310,15 @@ fn run(
                                         path = %path.display()
                                     );
                                     let _ = fs::remove_file(path);
+                                    let payload = request_result_envelope(
+                                        request_id,
+                                        "upload_finish",
+                                        false,
+                                        Some(
+                                            "the staged upload size did not match the selected file",
+                                        ),
+                                    );
+                                    let _ = server.send_websocket_text(id, payload);
                                 }
                                 Err(error) => {
                                     kvlog::warn!(
@@ -1097,6 +1332,13 @@ fn run(
                                         error = %error
                                     );
                                     let _ = fs::remove_file(path_for_cleanup);
+                                    let payload = request_result_envelope(
+                                        request_id,
+                                        "upload_finish",
+                                        false,
+                                        Some("the staged upload could not be finalized"),
+                                    );
+                                    let _ = server.send_websocket_text(id, payload);
                                 }
                             }
                         } else {
@@ -1105,16 +1347,54 @@ fn run(
                                 ws_id = id.get(),
                                 upload_id
                             );
+                            let payload = request_result_envelope(
+                                request_id,
+                                "upload_finish",
+                                false,
+                                Some("the staged upload no longer exists"),
+                            );
+                            let _ = server.send_websocket_text(id, payload);
                         }
                     }
-                    Ok(ClientRequest::AbortTransfer { transfer_id }) if !readonly => {
+                    Ok(ClientRequest::UploadCancel {
+                        upload_id,
+                        request_id,
+                    }) if !readonly => {
+                        let accepted = uploads.remove(&(id, upload_id)).is_some();
+                        let payload = request_result_envelope(
+                            request_id,
+                            "upload_cancel",
+                            accepted,
+                            (!accepted).then_some("the staged upload no longer exists"),
+                        );
+                        let _ = server.send_websocket_text(id, payload);
+                    }
+                    Ok(ClientRequest::AbortTransfer {
+                        request_id,
+                        transfer_id,
+                    }) if !readonly => {
                         kvlog::info!(
                             "websocket request",
                             ws_id = id.get(),
                             kind = "abort_transfer",
                             transfer_id
                         );
-                        let _ = web_requests.send(WebRequest::CancelTransfer { transfer_id });
+                        if web_requests
+                            .send(WebRequest::CancelTransfer {
+                                client: id.get(),
+                                request_id,
+                                transfer_id,
+                            })
+                            .is_err()
+                        {
+                            let payload = request_result_envelope(
+                                request_id,
+                                "abort_transfer",
+                                false,
+                                Some("the local client is unavailable"),
+                            );
+                            let _ = server.send_websocket_text(id, payload);
+                        }
                     }
                     Ok(request) => {
                         let kind = client_request_kind(&request);
@@ -1237,7 +1517,7 @@ fn run(
                         let _ = server.send_websocket_binary(*id, &frame);
                     }
                 }
-                Ok(WebFeed::SetRoom(messages)) => {
+                Ok(WebFeed::SetRoom { name, messages }) => {
                     // Advance the sequence past the dropped backlog so a browser
                     // never confuses the new room's messages with the old ones,
                     // then bound the replacement to the same window as live sends.
@@ -1252,6 +1532,11 @@ fn run(
                     for id in &clients {
                         let _ = server.send_websocket_binary(*id, &frame);
                     }
+                    room_name = name;
+                    let payload = room_envelope(&room_name);
+                    for id in &clients {
+                        let _ = server.send_websocket_text(*id, &payload);
+                    }
                 }
                 Ok(WebFeed::ShareAvailable { stream_id, payload }) => {
                     active_shares.insert(stream_id, payload.clone());
@@ -1259,7 +1544,11 @@ fn run(
                         let _ = server.send_websocket_text(*id, &payload);
                     }
                 }
-                Ok(WebFeed::ShareConfig { stream_id, payload }) => {
+                Ok(WebFeed::ShareConfig {
+                    client,
+                    stream_id,
+                    payload,
+                }) => {
                     let cached = video_fast_start.get(&stream_id);
                     let leads_with_key = cached
                         .and_then(|cache| cache.frames.front())
@@ -1271,19 +1560,28 @@ fn run(
                         frames = cached.map(|cache| cache.frames.len()).unwrap_or(0),
                         bytes = cached.map(|cache| cache.bytes).unwrap_or(0),
                         leads_with_key,
-                        clients = clients.len()
+                        clients = 1
                     );
-                    for id in &clients {
-                        let _ = server.send_websocket_text(*id, &payload);
+                    if let Some(client_id) = clients.iter().copied().find(|id| id.get() == client)
+                        && share_subscriptions.contains(&(client_id, stream_id))
+                    {
+                        let _ = server.send_websocket_text(client_id, &payload);
                         if let Some(cached) = video_fast_start.get(&stream_id) {
                             for frame in &cached.frames {
-                                let _ = server.send_websocket_binary(*id, frame.as_slice());
+                                let _ = server.send_websocket_binary(client_id, frame.as_slice());
                             }
                         }
+                        ready_share_subscriptions.insert((client_id, stream_id));
                     }
                 }
-                Ok(WebFeed::ShareError(payload))
-                | Ok(WebFeed::DeleteError(payload))
+                Ok(WebFeed::ShareError { client, payload })
+                | Ok(WebFeed::RequestResult { client, payload }) => {
+                    if let Some(client) = clients.iter().copied().find(|id| id.get() == client) {
+                        let _ = server.send_websocket_text(client, &payload);
+                    }
+                }
+                Ok(WebFeed::DeleteError(payload))
+                | Ok(WebFeed::ActionError(payload))
                 | Ok(WebFeed::FileProgress(payload))
                 | Ok(WebFeed::FileTerminal(payload)) => {
                     for id in &clients {
@@ -1293,6 +1591,8 @@ fn run(
                 Ok(WebFeed::ShareEnded { stream_id, payload }) => {
                     active_shares.remove(&stream_id);
                     video_fast_start.remove(&stream_id);
+                    share_subscriptions.retain(|(_, subscribed)| *subscribed != stream_id);
+                    ready_share_subscriptions.retain(|(_, subscribed)| *subscribed != stream_id);
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }
@@ -1305,17 +1605,47 @@ fn run(
                         );
                         continue;
                     };
-                    for id in &clients {
-                        let _ = server.send_websocket_binary(*id, frame.as_slice());
+                    for (id, subscribed) in &ready_share_subscriptions {
+                        if *subscribed == stream_id {
+                            if let Err(error) = server.send_websocket_binary(*id, frame.as_slice())
+                            {
+                                kvlog::warn!(
+                                    "browser video frame dropped and socket closed",
+                                    ws_id = id.get(),
+                                    stream_id,
+                                    frame_bytes = frame.len(),
+                                    dropped_frames = 1,
+                                    error = %error
+                                );
+                            }
+                        }
                     }
                     video_fast_start
                         .entry(stream_id)
                         .or_default()
                         .push(stream_id, frame, is_key);
                 }
-                Ok(WebFeed::Stop) => return,
+                Ok(WebFeed::Stop) => {
+                    for stream_id in share_subscriptions
+                        .iter()
+                        .map(|(_, stream_id)| *stream_id)
+                        .collect::<HashSet<_>>()
+                    {
+                        let _ = web_requests.send(WebRequest::StopShare { stream_id });
+                    }
+                    return;
+                }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    for stream_id in share_subscriptions
+                        .iter()
+                        .map(|(_, stream_id)| *stream_id)
+                        .collect::<HashSet<_>>()
+                    {
+                        let _ = web_requests.send(WebRequest::StopShare { stream_id });
+                    }
+                    return;
+                }
             }
         }
     }
@@ -1369,17 +1699,43 @@ fn ref_preview_frame(ts: u64, mid: u64, history: &[WebMessage]) -> Vec<u8> {
     web_wire::encode_ref_preview(ts, mid, found)
 }
 
-/// The JSON envelope sent on connect with browser-only behavior settings.
+/// The JSON envelope sent on connect with browser behavior settings and room name.
 fn config_envelope(
     readonly: bool,
     autoplay: WebAutoplay,
     viewer_in_seperate_browser_tab: bool,
+    max_upload_bytes: u64,
+    room_name: &str,
 ) -> String {
     jsony::object! {
         type: "config",
         readonly: readonly,
         autoplay: autoplay.wire_name(),
         viewer_in_seperate_browser_tab: viewer_in_seperate_browser_tab,
+        max_upload_bytes: max_upload_bytes,
+        room_name: room_name,
+    }
+}
+
+fn room_envelope(name: &str) -> String {
+    jsony::object! {
+        type: "room",
+        name: name,
+    }
+}
+
+fn request_result_envelope(
+    request_id: u64,
+    operation: &str,
+    accepted: bool,
+    message: Option<&str>,
+) -> String {
+    jsony::object! {
+        type: "request_result",
+        request_id: request_id,
+        operation: operation,
+        accepted: accepted,
+        message: message,
     }
 }
 
@@ -1394,6 +1750,7 @@ fn client_request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::DeleteMessage { .. } => "delete_message",
         ClientRequest::UploadStart { .. } => "upload_start",
         ClientRequest::UploadFinish { .. } => "upload_finish",
+        ClientRequest::UploadCancel { .. } => "upload_cancel",
         ClientRequest::AbortTransfer { .. } => "abort_transfer",
     }
 }
@@ -1573,13 +1930,14 @@ struct UploadSink {
     received: u64,
     path: PathBuf,
     file: fs::File,
+    remove_on_drop: bool,
 }
 
 impl UploadSink {
     /// Creates the temp file for `upload_id` under a dedicated web-uploads
     /// directory, named from a sanitized `name` so the served file keeps a
     /// recognizable extension.
-    fn create(id: WebSocketId, upload_id: u32, name: &str, expected_size: u64) -> io::Result<Self> {
+    fn create(client: u64, upload_id: u32, name: &str, expected_size: u64) -> io::Result<Self> {
         let dir = std::env::temp_dir().join("chatt-web-uploads");
         fs::create_dir_all(&dir)?;
         let name = sanitize_upload_name(name);
@@ -1587,7 +1945,7 @@ impl UploadSink {
         let path = dir.join(format!(
             "{}-{temp_id}-{}-{upload_id}-{name}",
             std::process::id(),
-            id.get()
+            client
         ));
         let file = fs::File::create(&path)?;
         Ok(Self {
@@ -1597,6 +1955,7 @@ impl UploadSink {
             received: 0,
             path,
             file,
+            remove_on_drop: true,
         })
     }
 
@@ -1621,8 +1980,16 @@ impl UploadSink {
     fn finish(mut self) -> io::Result<PathBuf> {
         use std::io::Write;
         self.file.flush()?;
-        drop(self.file);
-        Ok(self.path)
+        self.remove_on_drop = false;
+        Ok(self.path.clone())
+    }
+}
+
+impl Drop for UploadSink {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1689,6 +2056,15 @@ mod tests {
             websocket_origins(&cfg, "127.0.0.1:8080".parse().unwrap()),
             vec!["https://chat.example.test".to_string()]
         );
+    }
+
+    #[test]
+    fn unfinished_upload_sink_removes_its_temp_file_on_drop() {
+        let sink = UploadSink::create(99, u32::MAX, "drop-cleanup.bin", 4).unwrap();
+        let path = sink.path.clone();
+        assert!(path.exists());
+        drop(sink);
+        assert!(!path.exists());
     }
 
     #[test]
@@ -2595,7 +2971,10 @@ Sec-WebSocket-Version: 13\r\n\
         drain_config(&mut stream);
 
         // Entering a room re-syncs the connected browser with that room's history.
-        sender.set_room(vec![WebMessage::text_for_test(1, "room one")]);
+        sender.set_room(
+            "lobby".to_string(),
+            vec![WebMessage::text_for_test(1, "room one")],
+        );
         let (opcode, payload) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x2);
         let window = web_wire::decode_window(&payload);
@@ -2604,13 +2983,22 @@ Sec-WebSocket-Version: 13\r\n\
             window.messages[0].fragments,
             vec![Fragment::text("<p>room one</p>")]
         );
+        let (opcode, payload) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        assert_eq!(String::from_utf8(payload).unwrap(), room_envelope("lobby"));
 
         // Leaving the room clears the view to nothing.
-        sender.set_room(Vec::new());
+        sender.set_room("servers".to_string(), Vec::new());
         let (_, cleared) = read_ws_frame(&mut stream);
         let window = web_wire::decode_window(&cleared);
         assert_eq!(window.kind, web_wire::KIND_SYNC);
         assert!(window.messages.is_empty());
+        let (opcode, payload) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            room_envelope("servers")
+        );
     }
 
     #[test]
@@ -2764,7 +3152,7 @@ Sec-WebSocket-Version: 13\r\n\
             bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
-        let (web_tx, _web_rx) = mpsc::channel();
+        let (web_tx, web_rx) = mpsc::channel();
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
@@ -2781,13 +3169,18 @@ Sec-WebSocket-Version: 13\r\n\
         let delta = video::encode_video_frame(4, false, 15, &[4]);
         for frame in [&old_key, &old_delta, &key, &delta] {
             sender.send_video_frame(SharedVideoFrame::copy_from_slice(frame));
-            let (opcode, live) = read_ws_frame(&mut stream);
-            assert_eq!(opcode, 0x2);
-            assert_eq!(live, *frame);
         }
 
+        write_ws_text(&mut stream, r#"{"type":"play_share","stream_id":15}"#);
+        let WebRequest::PlayShare { client, stream_id } =
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected play request");
+        };
+        assert_eq!(stream_id, 15);
+
         let config = "{\"type\":\"share_config\",\"stream_id\":15}".to_string();
-        sender.send_share_config(15, config.clone());
+        sender.send_share_config(client, 15, config.clone());
 
         let (opcode, payload) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x1);
@@ -2811,12 +3204,14 @@ Sec-WebSocket-Version: 13\r\n\
             viewer_in_seperate_browser_tab: true,
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(
+        let sender = spawn_with_upload_limit(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
             100,
             web_tx,
             true,
+            rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            "lobby".to_string(),
         )
         .unwrap();
 
@@ -2831,6 +3226,7 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(text.contains("\"config\""), "{text}");
         assert!(text.contains("\"readonly\":true"), "{text}");
         assert!(text.contains("\"autoplay\":\"with-audio\""), "{text}");
+        assert!(text.contains("\"room_name\":\"lobby\""), "{text}");
         assert!(
             text.contains("\"viewer_in_seperate_browser_tab\":true"),
             "{text}"
@@ -2856,12 +3252,17 @@ Sec-WebSocket-Version: 13\r\n\
         .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
-        write_ws_text(&mut stream, r#"{"type":"send_message","body":"hi there"}"#);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"send_message","request_id":11,"body":"hi there"}"#,
+        );
 
         let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(
             request,
             WebRequest::SendChat {
+                client: 1,
+                request_id: 11,
                 body: "hi there".to_string()
             }
         );
@@ -2888,20 +3289,29 @@ Sec-WebSocket-Version: 13\r\n\
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(
             &mut stream,
-            r#"{"type":"edit_message","target":7,"body":"revised"}"#,
+            r#"{"type":"edit_message","request_id":12,"target":7,"body":"revised"}"#,
         );
         assert_eq!(
             web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             WebRequest::EditChat {
+                client: 1,
+                request_id: 12,
                 target: 7,
                 body: "revised".to_string(),
             }
         );
 
-        write_ws_text(&mut stream, r#"{"type":"delete_message","target":7}"#);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"delete_message","request_id":13,"target":7}"#,
+        );
         assert_eq!(
             web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            WebRequest::DeleteChat { target: 7 }
+            WebRequest::DeleteChat {
+                client: 1,
+                request_id: 13,
+                target: 7
+            }
         );
     }
 
@@ -2926,9 +3336,12 @@ Sec-WebSocket-Version: 13\r\n\
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(
             &mut stream,
-            r#"{"type":"edit_message","target":7,"body":"revised"}"#,
+            r#"{"type":"edit_message","request_id":12,"target":7,"body":"revised"}"#,
         );
-        write_ws_text(&mut stream, r#"{"type":"delete_message","target":7}"#);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"delete_message","request_id":13,"target":7}"#,
+        );
         assert!(web_rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
@@ -2951,10 +3364,20 @@ Sec-WebSocket-Version: 13\r\n\
         .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
-        write_ws_text(&mut stream, r#"{"type":"abort_transfer","transfer_id":7}"#);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"abort_transfer","request_id":14,"transfer_id":7}"#,
+        );
 
         let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(request, WebRequest::CancelTransfer { transfer_id: 7 });
+        assert_eq!(
+            request,
+            WebRequest::CancelTransfer {
+                client: 1,
+                request_id: 14,
+                transfer_id: 7
+            }
+        );
     }
 
     #[test]
@@ -2976,7 +3399,10 @@ Sec-WebSocket-Version: 13\r\n\
         .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
-        write_ws_text(&mut stream, r#"{"type":"abort_transfer","transfer_id":7}"#);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"abort_transfer","request_id":14,"transfer_id":7}"#,
+        );
 
         // A read-only viewer cannot abort the host's transfers.
         assert!(web_rx.recv_timeout(Duration::from_millis(300)).is_err());
@@ -3001,7 +3427,10 @@ Sec-WebSocket-Version: 13\r\n\
         .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
-        write_ws_text(&mut stream, r#"{"type":"send_message","body":"hi there"}"#);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"send_message","request_id":11,"body":"hi there"}"#,
+        );
 
         // A read-only feed drops the write, so nothing reaches the app.
         assert!(web_rx.recv_timeout(Duration::from_millis(300)).is_err());
@@ -3028,16 +3457,19 @@ Sec-WebSocket-Version: 13\r\n\
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(
             &mut stream,
-            r#"{"type":"upload_start","upload_id":42,"name":"note.txt","size":11}"#,
+            r#"{"type":"upload_start","request_id":20,"upload_id":42,"name":"note.txt","size":11}"#,
         );
         // A chunk frame is the little-endian upload id followed by the bytes.
         let mut chunk = 42u32.to_le_bytes().to_vec();
         chunk.extend_from_slice(b"hello world");
         write_ws_binary(&mut stream, &chunk);
-        write_ws_text(&mut stream, r#"{"type":"upload_finish","upload_id":42}"#);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"upload_finish","request_id":21,"upload_id":42}"#,
+        );
 
         let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let WebRequest::UploadFile { path, name } = request else {
+        let WebRequest::UploadFile { path, name, .. } = request else {
             panic!("expected an upload request, got {request:?}");
         };
         assert_eq!(fs::read(&path).unwrap(), b"hello world");
@@ -3073,7 +3505,7 @@ Sec-WebSocket-Version: 13\r\n\
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(
             &mut stream,
-            r#"{"type":"upload_start","upload_id":42,"name":"note.txt","size":11}"#,
+            r#"{"type":"upload_start","request_id":20,"upload_id":42,"name":"note.txt","size":11}"#,
         );
         // Some webviews fragment larger WebSocket messages. The app-level
         // binary payload is still one upload chunk once the continuation frames
@@ -3081,14 +3513,122 @@ Sec-WebSocket-Version: 13\r\n\
         write_ws_frame(&mut stream, false, 0x2, &42u32.to_le_bytes());
         write_ws_frame(&mut stream, false, 0x0, b"hello ");
         write_ws_frame(&mut stream, true, 0x0, b"world");
-        write_ws_text(&mut stream, r#"{"type":"upload_finish","upload_id":42}"#);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"upload_finish","request_id":21,"upload_id":42}"#,
+        );
 
         let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let WebRequest::UploadFile { path, name } = request else {
+        let WebRequest::UploadFile { path, name, .. } = request else {
             panic!("expected an upload request, got {request:?}");
         };
         assert_eq!(fs::read(&path).unwrap(), b"hello world");
         assert_eq!(name, "note.txt");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upload_start_rejects_oversize_and_duplicate_ids() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: false,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn_with_upload_limit(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            100,
+            web_tx,
+            false,
+            10,
+            String::new(),
+        )
+        .unwrap();
+        let mut stream = open_ready_ws(sender.local_addr());
+
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"upload_start","request_id":1,"upload_id":1,"name":"large.bin","size":11}"#,
+        );
+        let (opcode, rejected) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        let rejected = String::from_utf8(rejected).unwrap();
+        assert!(rejected.contains("\"request_id\":1"), "{rejected}");
+        assert!(rejected.contains("\"accepted\":false"), "{rejected}");
+
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"upload_start","request_id":2,"upload_id":2,"name":"ok.bin","size":5}"#,
+        );
+        let (_, accepted) = read_ws_frame(&mut stream);
+        assert!(
+            String::from_utf8(accepted)
+                .unwrap()
+                .contains("\"accepted\":true")
+        );
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"upload_start","request_id":3,"upload_id":2,"name":"duplicate.bin","size":5}"#,
+        );
+        let (_, duplicate) = read_ws_frame(&mut stream);
+        let duplicate = String::from_utf8(duplicate).unwrap();
+        assert!(duplicate.contains("\"request_id\":3"), "{duplicate}");
+        assert!(duplicate.contains("already active"), "{duplicate}");
+        assert!(web_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"upload_cancel","request_id":4,"upload_id":2}"#,
+        );
+        let (_, cancelled) = read_ws_frame(&mut stream);
+        assert!(
+            String::from_utf8(cancelled)
+                .unwrap()
+                .contains("\"accepted\":true")
+        );
+    }
+
+    #[test]
+    fn share_stop_is_reference_counted_across_sockets() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
+        let mut first = open_ready_ws(sender.local_addr());
+        let mut second = open_ready_ws(sender.local_addr());
+
+        write_ws_text(&mut first, r#"{"type":"play_share","stream_id":9}"#);
+        write_ws_text(&mut second, r#"{"type":"play_share","stream_id":9}"#);
+        let first_play = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second_play = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            first_play,
+            WebRequest::PlayShare { stream_id: 9, .. }
+        ));
+        assert!(matches!(
+            second_play,
+            WebRequest::PlayShare { stream_id: 9, .. }
+        ));
+
+        write_ws_text(&mut first, r#"{"type":"stop_share","stream_id":9}"#);
+        assert!(web_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        write_ws_text(&mut second, r#"{"type":"stop_share","stream_id":9}"#);
+        assert_eq!(
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WebRequest::StopShare { stream_id: 9 }
+        );
     }
 }
