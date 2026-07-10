@@ -719,6 +719,14 @@ pub(crate) struct RoomSession {
     /// `ShareAvailable`. Holds the per-stream view secret and codec metadata.
     pub(super) available_shares: HashMap<StreamId, super::AvailableShare>,
     pub active_server_label: Option<String>,
+    /// Health of each audio side plus its opened device name, projected by
+    /// the core tick for the lobby-bar widget and top-bar indicators.
+    pub capture_health: super::AudioSideHealth,
+    pub playback_health: super::AudioSideHealth,
+    /// Live mic level handle while capture runs; the meter snapshots it.
+    pub capture_stats: Option<crate::audio::AudioStats>,
+    /// Input/output device catalog, refreshed by the core's device probes.
+    pub audio_devices: super::AudioDeviceCatalog,
     muted_users: HashSet<UserId>,
     stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
@@ -1223,6 +1231,10 @@ impl RoomSession {
             screencast_status: super::ScreencastStatus::default(),
             available_shares: HashMap::new(),
             active_server_label: None,
+            capture_health: super::AudioSideHealth::default(),
+            playback_health: super::AudioSideHealth::default(),
+            capture_stats: None,
+            audio_devices: super::AudioDeviceCatalog::default(),
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,

@@ -33,9 +33,10 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
     buf.rect().with(app.view.theme.background).fill(buf);
     buf.hide_cursor();
     let capture = app
-        .capture
+        .room
+        .capture_stats
         .as_ref()
-        .map(|capture| capture.stats().snapshot());
+        .map(|stats| stats.snapshot());
     let capture = match capture {
         Some(mut snapshot) => {
             let (rms, peak) =
@@ -307,18 +308,19 @@ fn draw_user_list(
         let selected = lobby_focused
             && lobby_list_focus == LobbyListFocus::Users
             && Some(participant.user_id) == app.room.participants.selected_user;
-        let state =
-            if Some(participant.user_id) == app.user_id && app.deafened.load(Ordering::Relaxed) {
-                "deaf"
-            } else if participant.online && Some(participant.user_id) == app.user_id {
-                "voice"
-            } else if participant.online && participant.p2p_direct {
-                "p2p"
-            } else if participant.online {
-                "relay"
-            } else {
-                "away"
-            };
+        let state = if Some(participant.user_id) == app.room.local_user
+            && app.view.deafened.load(Ordering::Relaxed)
+        {
+            "deaf"
+        } else if participant.online && Some(participant.user_id) == app.room.local_user {
+            "voice"
+        } else if participant.online && participant.p2p_direct {
+            "p2p"
+        } else if participant.online {
+            "relay"
+        } else {
+            "away"
+        };
         let uptime = participant
             .presence_since
             .map(age_label)
@@ -965,14 +967,17 @@ fn participant_latency_estimate_ms(
 }
 
 fn room_user_status_indicator(app: &App, participant: &ParticipantState) -> (&'static str, Style) {
-    let local_user = Some(participant.user_id) == app.user_id;
+    let local_user = Some(participant.user_id) == app.room.local_user;
     if !participant.online {
         return ("▇", app.view.theme.muted);
     }
-    if participant.voice_status.deafened || (local_user && app.deafened.load(Ordering::Relaxed)) {
+    if participant.voice_status.deafened
+        || (local_user && app.view.deafened.load(Ordering::Relaxed))
+    {
         return ("▇", app.view.theme.error);
     }
-    if participant.voice_status.muted || (local_user && app.mic_muted.load(Ordering::Relaxed)) {
+    if participant.voice_status.muted || (local_user && app.view.mic_muted.load(Ordering::Relaxed))
+    {
         return ("▇", app.view.theme.warn);
     }
     if participant.voice_active {
@@ -989,7 +994,7 @@ fn room_user_status_indicator(app: &App, participant: &ParticipantState) -> (&'s
 }
 
 fn room_user_control_label(app: &App, participant: &ParticipantState) -> String {
-    if Some(participant.user_id) == app.user_id {
+    if Some(participant.user_id) == app.room.local_user {
         return String::new();
     }
     let muted = app.room.muted_user(participant.user_id);
@@ -1101,7 +1106,7 @@ fn draw_top_bar_voice_buttons(row: &mut Rect, app: &mut App, buf: &mut Buffer) {
 
 fn top_bar_voice_button_style(app: &App, button: LocalVoiceMode) -> Style {
     let theme = app.view.theme;
-    if app.local_voice_mode() != button {
+    if app.view.local_voice_mode() != button {
         return top_bar_inactive_button_style(theme, button);
     }
 
@@ -1217,8 +1222,8 @@ fn draw_lobby_audio_widget(remaining: Rect, app: &mut App, fill: Style, buf: &mu
     app.view.chrome.lobby_bar.audio_widget = Rect::EMPTY;
     app.view.chrome.lobby_bar.audio_reset = Rect::EMPTY;
     let theme = app.view.theme;
-    let mic = app.capture_audio_health();
-    let spk = app.playback_audio_health();
+    let mic = app.room.capture_health.clone();
+    let spk = app.room.playback_health.clone();
     let mut right = remaining;
 
     let mut trouble = Vec::new();
@@ -2188,7 +2193,7 @@ fn connection_status_label(app: &App) -> Option<(&'static str, Style)> {
     let theme = app.view.theme;
     if app.is_offline() {
         Some(("Offline", theme.status_fill.patch(theme.error)))
-    } else if app.user_id.is_none() {
+    } else if app.room.local_user.is_none() {
         Some(("Connecting", theme.status_fill.patch(theme.muted)))
     } else if app.is_udp_unreachable() {
         Some((

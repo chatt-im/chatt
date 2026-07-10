@@ -29,6 +29,12 @@ pub(crate) struct ClientView {
     pub status: StatusState,
     pub pending_transition: PendingTransition,
     pub chrome: ChromeState,
+    /// Rows for the server picker, rebuilt from config whenever it changes.
+    pub server_catalog: crate::app::ServerCatalog,
+    /// Shared mute/deafen switches, cloned from the core's handles so the
+    /// top bar reads them without core access.
+    pub mic_muted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub deafened: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Fast-attack/slow-release smoothing for the mic VU meter and dB readout,
     /// so noise-reduction gating faint background noise reads as a steady level
     /// instead of flicker. Applied in `prepare_screen`; display-only.
@@ -86,6 +92,9 @@ impl ClientView {
             status: StatusState::new("select a server"),
             pending_transition: PendingTransition::default(),
             chrome: ChromeState::default(),
+            server_catalog: crate::app::ServerCatalog::default(),
+            mic_muted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deafened: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mic_level_ballistics: MicLevelBallistics::default(),
             quit_requested: false,
             lobby_details: false,
@@ -183,6 +192,18 @@ impl ClientView {
     ) {
         self.active.chat.push_notice_with_kind(sender, body, kind);
         self.active.chat.bottom();
+    }
+
+    /// The local mute/deafen display mode, read from the shared switches.
+    pub(crate) fn local_voice_mode(&self) -> crate::app::LocalVoiceMode {
+        use std::sync::atomic::Ordering;
+        if self.deafened.load(Ordering::Relaxed) {
+            crate::app::LocalVoiceMode::Deafened
+        } else if self.mic_muted.load(Ordering::Relaxed) {
+            crate::app::LocalVoiceMode::Muted
+        } else {
+            crate::app::LocalVoiceMode::Live
+        }
     }
 
     pub(crate) fn take_pending_clipboard(&mut self) -> Option<String> {

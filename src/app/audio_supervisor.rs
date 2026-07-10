@@ -82,8 +82,9 @@ pub(crate) enum RecoveryPhase {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum AudioHealthState {
+    #[default]
     Healthy,
     /// A debounced rebuild is pending (device transition settling).
     Settling,
