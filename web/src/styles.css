@@ -362,9 +362,9 @@ body {
   font-weight: 400;
 }
 
-/* Every sender header has a persistent, full-size group control at the far
- * right. Inward/outward list icons describe the action without relying on a
- * small rotating disclosure arrow. */
+/* Every message has a persistent, full-size group control at the far right.
+ * Inward/outward list icons describe the action without relying on a small
+ * rotating disclosure arrow. */
 .message-group-toggle {
   position: absolute;
   top: calc(var(--space) - 3px);
@@ -376,11 +376,15 @@ body {
   height: 28px;
   padding: 0;
   color: var(--text-dim);
-  background: transparent;
+  background: var(--bg-elevated);
   border: 0;
   cursor: pointer;
   opacity: 0;
   pointer-events: none;
+}
+
+.message.is-continuation .message-group-toggle {
+  top: 2px;
 }
 
 .message-group-toggle .icon {
@@ -425,18 +429,18 @@ body {
 /* A collapsed group is one deliberately compact state row: identity and time
  * remain, while every potentially large body or attachment is removed. */
 .message.is-group-collapsed {
-  padding-top: 6px;
-  padding-bottom: 6px;
+  padding-top: var(--space);
+  padding-bottom: var(--space);
   background: var(--bg-elevated);
   cursor: pointer;
 }
 
 .message.is-group-collapsed .message-time-gutter {
-  top: 6px;
+  top: var(--space);
 }
 
 .message.is-group-collapsed .message-group-toggle {
-  top: 3px;
+  top: calc(var(--space) - 3px);
 }
 
 /* The timestamp always occupies the reserved gutter as a single right-aligned
@@ -601,13 +605,16 @@ body {
 .media-image-missing {
   display: flex;
   width: min(320px, 100%);
-  min-height: 72px;
   align-items: center;
   justify-content: center;
   padding: var(--space);
   color: var(--text-dim);
   font-size: 12px;
   background: var(--bg-code);
+}
+
+.media-image-missing:not(.has-intrinsic-size) {
+  min-height: 72px;
 }
 
 /* Revealed on decode (or error) so the image fades in rather than snapping. */
@@ -945,7 +952,7 @@ body {
 .message-actions {
   position: absolute;
   top: 2px;
-  right: var(--space-lg);
+  right: calc(var(--space-lg) + 34px);
   z-index: 1;
   display: flex;
   gap: 2px;
@@ -953,7 +960,6 @@ body {
 
 .message:not(.is-continuation) .message-actions {
   top: calc(var(--space) - 3px);
-  right: calc(var(--space-lg) + 34px);
 }
 
 .message-action {
