@@ -13,4 +13,7 @@ pub use config::ServerConfig;
 pub use http::content_type;
 pub use net::waker::WakeHandle;
 pub use router::{GeneratedHandler, GeneratedRequest, GeneratedResponse, Router};
-pub use server::{Server, ServerEvent, WebSocketCloseReason, WebSocketId, WebSocketMessage};
+pub use server::{
+    HttpMethod, HttpRequestEnd, HttpRequestId, HttpRequestPhase, Server, ServerEvent,
+    WebSocketCloseReason, WebSocketId, WebSocketMessage,
+};

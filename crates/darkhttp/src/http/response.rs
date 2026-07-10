@@ -8,6 +8,7 @@ const SERVER_HEADER: &[u8] = b"darkhttp";
 const HEADER_CAP: usize = 2048;
 
 pub(crate) struct PreparedResponse {
+    pub(crate) status: u16,
     pub(crate) header: HeaderBuf,
     pub(crate) body: Body,
     pub(crate) keep_alive: bool,
@@ -102,6 +103,7 @@ pub(crate) fn error(
     header.line(b"Content-Type: text/plain; charset=UTF-8");
     finish_header(&mut header, 0);
     PreparedResponse {
+        status,
         header,
         body: Body::Empty,
         keep_alive,
@@ -127,6 +129,7 @@ pub(crate) fn bytes(
     }
     finish_header(&mut header, body.len() as u64);
     PreparedResponse {
+        status: 200,
         header,
         body: if header_only {
             Body::Empty
@@ -178,6 +181,7 @@ pub(crate) fn memory(options: MemoryResponse) -> PreparedResponse {
         }
     };
     PreparedResponse {
+        status: options.status,
         header,
         body,
         keep_alive: options.keep_alive,
@@ -235,6 +239,7 @@ pub(crate) fn file(options: FileResponse) -> PreparedResponse {
         Body::Empty
     };
     PreparedResponse {
+        status: options.status,
         header,
         body,
         keep_alive: options.keep_alive,
@@ -255,6 +260,7 @@ pub(crate) fn not_modified(
     }
     finish_header(&mut header, 0);
     PreparedResponse {
+        status: 304,
         header,
         body: Body::Empty,
         keep_alive,
@@ -273,6 +279,7 @@ pub(crate) fn switching_protocols(accept_key: &[u8; 28]) -> PreparedResponse {
     header.crlf();
     header.crlf();
     PreparedResponse {
+        status: 101,
         header,
         body: Body::Empty,
         keep_alive: false,

@@ -5,7 +5,13 @@ use std::time::Duration;
 pub struct ServerConfig {
     pub addr: SocketAddr,
     pub keepalive: bool,
-    pub timeout: Duration,
+    /// Maximum time an HTTP connection may make no read or write progress.
+    /// A zero duration disables HTTP connection timeouts.
+    pub http_timeout: Duration,
+    /// Maximum time a WebSocket may make no read or write progress. This is
+    /// independent from [`Self::http_timeout`] so long-lived, quiet sockets do
+    /// not require leaving ordinary HTTP requests open forever.
+    pub websocket_timeout: Duration,
     pub max_request_length: usize,
     pub max_websocket_payload: usize,
     pub io_threads: usize,
@@ -16,7 +22,8 @@ impl Default for ServerConfig {
         Self {
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             keepalive: true,
-            timeout: Duration::from_secs(30),
+            http_timeout: Duration::from_secs(30),
+            websocket_timeout: Duration::from_secs(30),
             max_request_length: 8192,
             max_websocket_payload: 16 * 1024 * 1024,
             io_threads: 2,
@@ -40,8 +47,13 @@ impl ServerConfig {
         self
     }
 
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    pub fn http_timeout(mut self, timeout: Duration) -> Self {
+        self.http_timeout = timeout;
+        self
+    }
+
+    pub fn websocket_timeout(mut self, timeout: Duration) -> Self {
+        self.websocket_timeout = timeout;
         self
     }
 

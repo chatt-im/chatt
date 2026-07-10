@@ -1,7 +1,7 @@
 use crate::http::path;
 use crate::router::RoutePath;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Method {
     Get,
     Head,

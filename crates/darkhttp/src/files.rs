@@ -42,7 +42,7 @@ impl FileTask {
                 "Not Found",
                 "The URL you requested was not found.",
                 self.request.keep_alive,
-                self.config.timeout,
+                self.config.http_timeout,
                 self.request.is_head(),
             ),
             ResolveResult::Forbidden => response::error(
@@ -50,7 +50,7 @@ impl FileTask {
                 "Forbidden",
                 "You do not have permission to access this file.",
                 self.request.keep_alive,
-                self.config.timeout,
+                self.config.http_timeout,
                 self.request.is_head(),
             ),
         }
@@ -116,7 +116,11 @@ fn serve_path(path: PathBuf, request: &Request, config: &ServerConfig) -> Prepar
         (request.if_modified_since(), last_modified)
         && if_modified_since == last_modified.as_bytes()
     {
-        return response::not_modified(request.keep_alive, config.timeout, Some(last_modified));
+        return response::not_modified(
+            request.keep_alive,
+            config.http_timeout,
+            Some(last_modified),
+        );
     }
 
     let size = metadata.len();
@@ -136,7 +140,7 @@ fn serve_path(path: PathBuf, request: &Request, config: &ServerConfig) -> Prepar
                     last_modified,
                     content_range: Some(ContentRange::Satisfied { from, to, size }),
                     keep_alive: request.keep_alive,
-                    timeout: config.timeout,
+                    timeout: config.http_timeout,
                     header_only: request.is_head(),
                 })
             }
@@ -150,7 +154,7 @@ fn serve_path(path: PathBuf, request: &Request, config: &ServerConfig) -> Prepar
                 last_modified,
                 content_range: Some(ContentRange::Unsatisfied { size }),
                 keep_alive: request.keep_alive,
-                timeout: config.timeout,
+                timeout: config.http_timeout,
                 header_only: true,
             }),
         }
@@ -165,7 +169,7 @@ fn serve_path(path: PathBuf, request: &Request, config: &ServerConfig) -> Prepar
             last_modified,
             content_range: None,
             keep_alive: request.keep_alive,
-            timeout: config.timeout,
+            timeout: config.http_timeout,
             header_only: request.is_head(),
         })
     }
@@ -200,7 +204,7 @@ fn file_error(error: io::Error, request: &Request, config: &ServerConfig) -> Pre
             "Not Found",
             "The URL you requested was not found.",
             request.keep_alive,
-            config.timeout,
+            config.http_timeout,
             request.is_head(),
         ),
         io::ErrorKind::PermissionDenied => response::error(
@@ -208,7 +212,7 @@ fn file_error(error: io::Error, request: &Request, config: &ServerConfig) -> Pre
             "Forbidden",
             "You do not have permission to access this file.",
             request.keep_alive,
-            config.timeout,
+            config.http_timeout,
             request.is_head(),
         ),
         _ => response::error(
@@ -216,7 +220,7 @@ fn file_error(error: io::Error, request: &Request, config: &ServerConfig) -> Pre
             "Internal Server Error",
             "The URL you requested cannot be returned.",
             false,
-            config.timeout,
+            config.http_timeout,
             request.is_head(),
         ),
     }
@@ -228,7 +232,7 @@ fn not_found(request: &Request, config: &ServerConfig) -> PreparedResponse {
         "Not Found",
         "The URL you requested was not found.",
         request.keep_alive,
-        config.timeout,
+        config.http_timeout,
         request.is_head(),
     )
 }

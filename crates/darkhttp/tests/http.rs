@@ -66,7 +66,20 @@ impl EmbeddedServer {
     where
         F: FnMut(ServerEvent, &mut Server) + Send + 'static,
     {
-        let mut server = Server::bind(ServerConfig::default(), router).unwrap();
+        Self::start_with_config_and_events(ServerConfig::default(), router, move |event, server| {
+            on_event(event, server);
+        })
+    }
+
+    fn start_with_config_and_events<F>(
+        config: ServerConfig,
+        router: Router,
+        mut on_event: F,
+    ) -> Self
+    where
+        F: FnMut(ServerEvent, &mut Server) + Send + 'static,
+    {
+        let mut server = Server::bind(config, router).unwrap();
         let addr = server.local_addr().unwrap();
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = Arc::clone(&running);
@@ -339,6 +352,157 @@ fn embedded_assets_serve_with_content_encoding() {
 }
 
 #[test]
+fn keep_alive_header_reports_http_timeout() {
+    let router = Router::new().route_bytes("/style.css", b"body {}".to_vec(), "text/css");
+    let config = ServerConfig::default().http_timeout(Duration::from_secs(7));
+    let server = EmbeddedServer::start_with_config_and_events(config, router, |_, _| {});
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(b"GET /style.css HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+
+    let headers = read_http_headers(&mut stream);
+    assert!(headers.contains("Keep-Alive: timeout=7\r\n"), "{headers}");
+}
+
+#[test]
+fn completed_http_request_reports_start_and_end() {
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let router = Router::new().route_bytes("/style.css", b"body {}".to_vec(), "text/css");
+    let server = EmbeddedServer::start_with_config_and_events(
+        ServerConfig::default(),
+        router,
+        move |event, _| {
+            event_tx.send(event).unwrap();
+        },
+    );
+    let request = "GET /style.css HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = raw_request(server.addr, request);
+    assert!(response.ends_with("body {}"));
+
+    let start = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let end = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let ServerEvent::HttpRequestStart { id, method, path } = start else {
+        panic!("expected HTTP start event, got {start:?}");
+    };
+    assert_eq!(method, darkhttp::HttpMethod::Get);
+    assert_eq!(path, "/style.css");
+    match end {
+        ServerEvent::HttpRequestEnd {
+            id: end_id,
+            method,
+            path,
+            phase,
+            request_bytes,
+            response_bytes,
+            end,
+            ..
+        } => {
+            assert_eq!(end_id, id);
+            assert_eq!(method, Some(darkhttp::HttpMethod::Get));
+            assert_eq!(path.as_deref(), Some("/style.css"));
+            assert_eq!(phase, darkhttp::HttpRequestPhase::SendingResponse);
+            assert_eq!(request_bytes, request.len());
+            assert!(response_bytes >= b"body {}".len() as u64);
+            assert_eq!(
+                end,
+                darkhttp::HttpRequestEnd::Complete {
+                    status: 200,
+                    keep_alive: false,
+                }
+            );
+        }
+        other => panic!("expected HTTP end event, got {other:?}"),
+    }
+}
+
+#[test]
+fn incomplete_http_request_times_out_with_lifecycle_event() {
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let config = ServerConfig::default()
+        .http_timeout(Duration::from_millis(40))
+        .websocket_timeout(Duration::ZERO);
+    let server =
+        EmbeddedServer::start_with_config_and_events(config, Router::new(), move |event, _| {
+            event_tx.send(event).unwrap();
+        });
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let partial_request = b"GET /style.css HTTP/1.1\r\nHost: localhost\r\n";
+    stream.write_all(partial_request).unwrap();
+
+    let mut byte = [0u8; 1];
+    assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    match event {
+        ServerEvent::HttpRequestEnd {
+            method,
+            path,
+            phase,
+            request_bytes,
+            response_bytes,
+            end,
+            ..
+        } => {
+            assert_eq!(method, None);
+            assert_eq!(path, None);
+            assert_eq!(phase, darkhttp::HttpRequestPhase::ReceivingRequest);
+            assert_eq!(request_bytes, partial_request.len());
+            assert_eq!(response_bytes, 0);
+            assert_eq!(end, darkhttp::HttpRequestEnd::Timeout);
+        }
+        other => panic!("expected HTTP timeout event, got {other:?}"),
+    }
+}
+
+#[test]
+fn zero_websocket_timeout_does_not_disable_http_timeout() {
+    let config = ServerConfig::default()
+        .http_timeout(Duration::from_millis(40))
+        .websocket_timeout(Duration::ZERO);
+    let router = Router::new().websocket("/chat");
+    let server = EmbeddedServer::start_with_config_and_events(config, router, |event, server| {
+        if let ServerEvent::WebSocketMessage {
+            id,
+            message: WebSocketMessage::Text(text),
+        } = event
+        {
+            server
+                .send_websocket_text(id, format!("echo:{text}"))
+                .unwrap();
+        }
+    });
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(
+            b"GET /chat HTTP/1.1\r\n\
+Host: localhost\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n",
+        )
+        .unwrap();
+    let headers = read_http_headers(&mut stream);
+    assert!(headers.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+    thread::sleep(Duration::from_millis(120));
+    write_masked_ws_frame(&mut stream, 0x1, b"still here");
+    let (opcode, payload) = read_ws_frame(&mut stream);
+    assert_eq!(opcode, 0x1);
+    assert_eq!(payload, b"echo:still here");
+}
+
+#[test]
 fn static_dir_serves_index_and_assets_without_listing() {
     let root = TestRoot::new("static-dir");
     root.write("index.html", "home");
@@ -482,7 +646,10 @@ fn websocket_events_and_server_frames_work() {
                 .send_websocket_text(id, format!("echo:{text}"))
                 .unwrap();
         }
-        ServerEvent::WebSocketMessage { .. } | ServerEvent::WebSocketClose { .. } => {}
+        ServerEvent::HttpRequestStart { .. }
+        | ServerEvent::HttpRequestEnd { .. }
+        | ServerEvent::WebSocketMessage { .. }
+        | ServerEvent::WebSocketClose { .. } => {}
     });
 
     let mut stream = TcpStream::connect(server.addr).unwrap();
@@ -541,7 +708,10 @@ fn fragmented_websocket_text_reassembles() {
                 .send_websocket_text(id, format!("echo:{text}"))
                 .unwrap();
         }
-        ServerEvent::WebSocketMessage { .. } | ServerEvent::WebSocketClose { .. } => {}
+        ServerEvent::HttpRequestStart { .. }
+        | ServerEvent::HttpRequestEnd { .. }
+        | ServerEvent::WebSocketMessage { .. }
+        | ServerEvent::WebSocketClose { .. } => {}
     });
 
     let mut stream = TcpStream::connect(server.addr).unwrap();
