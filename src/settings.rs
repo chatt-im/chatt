@@ -62,6 +62,9 @@ pub struct SettingsDraft {
     pub(crate) output_raw: bool,
     pub(crate) web_enabled: bool,
     pub(crate) web_bind: String,
+    /// Config-file-only WebSocket origin allowlist, preserved by the settings
+    /// form even though it has no interactive row.
+    pub(crate) web_allowed_origins: Vec<String>,
     /// Preserved across the settings round-trip. The compose box is a dev-only
     /// flag with no settings-UI control, so it is carried but never edited here.
     pub(crate) web_readonly: bool,
@@ -141,6 +144,7 @@ impl SettingsDraft {
                 .is_some_and(is_raw_device_selection),
             web_enabled: WebConfig::default().enabled,
             web_bind: WebConfig::default().bind,
+            web_allowed_origins: WebConfig::default().allowed_origins,
             web_readonly: WebConfig::default().readonly,
             web_autoplay: WebConfig::default().autoplay,
             web_viewer_in_seperate_browser_tab: WebConfig::default().viewer_in_seperate_browser_tab,
@@ -167,6 +171,7 @@ impl SettingsDraft {
     pub fn set_web_from_config(&mut self, web: &WebConfig) {
         self.web_enabled = web.enabled;
         self.web_bind = web.bind.clone();
+        self.web_allowed_origins = web.allowed_origins.clone();
         self.web_readonly = web.readonly;
         self.web_autoplay = web.autoplay;
         self.web_viewer_in_seperate_browser_tab = web.viewer_in_seperate_browser_tab;
@@ -239,6 +244,7 @@ impl SettingsDraft {
         WebConfig {
             enabled: self.web_enabled,
             bind: self.web_bind.trim().to_string(),
+            allowed_origins: self.web_allowed_origins.clone(),
             readonly: self.web_readonly,
             autoplay: self.web_autoplay,
             viewer_in_seperate_browser_tab: self.web_viewer_in_seperate_browser_tab,
@@ -1319,6 +1325,7 @@ mod tests {
     fn settings_draft_preserves_config_file_only_web_options() {
         let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
         let web = WebConfig {
+            allowed_origins: vec!["https://chat.example.test".to_string()],
             autoplay: WebAutoplay::WithAudio,
             viewer_in_seperate_browser_tab: true,
             ..WebConfig::default()

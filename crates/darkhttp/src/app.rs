@@ -346,7 +346,10 @@ impl App {
                     && handshake::is_upgrade(&request)
                     && self.router.has_websocket(&request.path)
                 {
-                    match handshake::prepare_response(&request) {
+                    match handshake::prepare_response(
+                        &request,
+                        self.config.websocket_origins.as_deref(),
+                    ) {
                         Ok(response) => {
                             let id = WebSocketId(self.next_ws_id);
                             self.next_ws_id = self.next_ws_id.wrapping_add(1).max(1);
@@ -357,6 +360,14 @@ impl App {
                             self.conns[idx].set_response(response, AfterResponse::WebSocket);
                             return;
                         }
+                        Err(handshake::HandshakeError::ForbiddenOrigin) => response::error(
+                            403,
+                            "Forbidden",
+                            "The WebSocket origin is not allowed.",
+                            false,
+                            self.config.http_timeout,
+                            false,
+                        ),
                         Err(_) => response::error(
                             400,
                             "Bad Request",

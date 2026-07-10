@@ -219,11 +219,20 @@ from the side panel into separate browser tabs:
 
 ```toml
 [web]
+# Optional browser WebSocket allowlist. A non-empty list replaces the origins
+# derived from the configured bind address.
+allowed-origins = ["https://chat.example.test"]
 # false (default), true (muted), or "with-audio"
 autoplay = "with-audio"
 # false (default) keeps the side panel; true opens one preview per browser tab
 viewer-in-seperate-browser-tab = false
 ```
+
+The web server permits native WebSocket clients without an `Origin` header.
+Browser clients must send an origin from the allowlist; when the list is empty,
+chatt derives the bound `http://` origin and adds `localhost` for loopback or
+unspecified binds. This is browser hardening rather than authentication, so
+keep the web server bound to loopback unless the surrounding network is trusted.
 
 Unmuted autoplay remains subject to the browser's media policy. A standalone
 preview tab contains only the selected preview and its controls, without the

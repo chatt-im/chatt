@@ -48,6 +48,8 @@ pub(crate) struct Request {
     websocket_upgrade: bool,
     websocket_key: Option<HeaderValue<128>>,
     websocket_version_supported: bool,
+    origin: Option<HeaderValue<512>>,
+    origin_valid: bool,
     if_modified_since: Option<HeaderValue<64>>,
 }
 
@@ -82,6 +84,8 @@ impl Request {
         let mut connection_upgrade = false;
         let mut websocket_key = None;
         let mut websocket_version_supported = true;
+        let mut origin = None;
+        let mut origin_valid = true;
         let mut if_modified_since = None;
 
         for line in lines {
@@ -116,6 +120,15 @@ impl Request {
                 websocket_key = HeaderValue::copy_from(value);
             } else if name.eq_ignore_ascii_case("Sec-WebSocket-Version") {
                 websocket_version_supported = value == "13";
+            } else if name.eq_ignore_ascii_case("Origin") {
+                if origin.is_some() || !origin_valid {
+                    origin = None;
+                    origin_valid = false;
+                } else if let Some(value) = HeaderValue::copy_from(value) {
+                    origin = Some(value);
+                } else {
+                    origin_valid = false;
+                }
             } else if name.eq_ignore_ascii_case("If-Modified-Since") {
                 if_modified_since = HeaderValue::copy_from(value);
             }
@@ -132,6 +145,8 @@ impl Request {
             websocket_upgrade: upgrade_websocket && connection_upgrade,
             websocket_key,
             websocket_version_supported,
+            origin,
+            origin_valid,
             if_modified_since,
         })
     }
@@ -154,6 +169,17 @@ impl Request {
 
     pub(crate) fn websocket_version_supported(&self) -> bool {
         self.websocket_version_supported
+    }
+
+    pub(crate) fn origin(&self) -> Result<Option<&str>, ()> {
+        if !self.origin_valid {
+            return Err(());
+        }
+        Ok(self
+            .origin
+            .as_ref()
+            .map(HeaderValue::as_bytes)
+            .map(|value| std::str::from_utf8(value).expect("request headers came from UTF-8")))
     }
 
     pub(crate) fn if_modified_since(&self) -> Option<&[u8]> {

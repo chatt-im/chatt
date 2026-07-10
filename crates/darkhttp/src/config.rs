@@ -12,6 +12,10 @@ pub struct ServerConfig {
     /// independent from [`Self::http_timeout`] so long-lived, quiet sockets do
     /// not require leaving ordinary HTTP requests open forever.
     pub websocket_timeout: Duration,
+    /// Browser origins allowed to open WebSockets. `None` disables origin
+    /// filtering; when configured, requests without `Origin` remain available
+    /// to native clients.
+    pub websocket_origins: Option<Vec<String>>,
     pub max_request_length: usize,
     pub max_websocket_payload: usize,
     pub io_threads: usize,
@@ -24,6 +28,7 @@ impl Default for ServerConfig {
             keepalive: true,
             http_timeout: Duration::from_secs(30),
             websocket_timeout: Duration::from_secs(30),
+            websocket_origins: None,
             max_request_length: 8192,
             max_websocket_payload: 16 * 1024 * 1024,
             io_threads: 2,
@@ -54,6 +59,11 @@ impl ServerConfig {
 
     pub fn websocket_timeout(mut self, timeout: Duration) -> Self {
         self.websocket_timeout = timeout;
+        self
+    }
+
+    pub fn websocket_origins(mut self, origins: Vec<String>) -> Self {
+        self.websocket_origins = Some(origins);
         self
     }
 

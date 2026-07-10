@@ -102,6 +102,9 @@ prefer-ipv6 = true
 enabled = false
 
 [web]
+# Browser WebSocket origins default to the bound address and, for loopback or
+# unspecified binds, localhost. A non-empty list replaces those defaults.
+# allowed-origins = ["https://chat.example.test"]
 # Automatically play newly received videos. `true` autoplays muted; use
 # "with-audio" to request audio when the browser's autoplay policy allows it.
 autoplay = false

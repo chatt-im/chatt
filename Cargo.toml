@@ -42,7 +42,7 @@ mimalloc = { version = "0.1.52", features = ["override"], optional = true }
 dhat = { version = "0.3", optional = true }
 
 [features]
-default = ["audio-realtime", "mimalloc-allocator", "embed-web", "pipewire"]
+default = ["audio-realtime", "mimalloc-allocator"]
 pipewire = ["cpal/pipewire"]
 audio-realtime = ["cpal/realtime"]
 audio-realtime-dbus = ["audio-realtime", "cpal/realtime-dbus"]
@@ -63,8 +63,8 @@ dhat-heap = ["dep:dhat"]
 avx2 = ["opus-codec/presume-avx2", "nnnoiseless/presume-avx2"]
 # Bundle the built web frontend into the binary (served gzipped) instead of
 # reading it from `web/dist` at runtime. Off by default. Requires building the
-# frontend first (`cd web && bun run build`), which emits `web/dist/embed.rs`,
-# the generated asset resolver this feature includes.
+# committed `web/embedded` bundle and its asset resolver. Refresh them
+# deliberately with `cd web && bun run build:embedded` when shipping web changes.
 embed-web = []
 
 [dev-dependencies]

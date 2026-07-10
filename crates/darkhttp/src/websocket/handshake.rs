@@ -6,7 +6,21 @@ pub(crate) fn is_upgrade(request: &Request) -> bool {
     request.is_websocket_upgrade()
 }
 
-pub(crate) fn prepare_response(request: &Request) -> Result<PreparedResponse, HandshakeError> {
+pub(crate) fn prepare_response(
+    request: &Request,
+    allowed_origins: Option<&[String]>,
+) -> Result<PreparedResponse, HandshakeError> {
+    if let Some(allowed_origins) = allowed_origins {
+        match request.origin() {
+            Ok(None) => {}
+            Ok(Some(origin))
+                if serialized_http_origin(origin)
+                    && allowed_origins
+                        .iter()
+                        .any(|allowed| origin.eq_ignore_ascii_case(allowed)) => {}
+            Ok(Some(_)) | Err(()) => return Err(HandshakeError::ForbiddenOrigin),
+        }
+    }
     let key = request.websocket_key().ok_or(HandshakeError::MissingKey)?;
     if !request.websocket_version_supported() {
         return Err(HandshakeError::UnsupportedVersion);
@@ -18,6 +32,19 @@ pub(crate) fn prepare_response(request: &Request) -> Result<PreparedResponse, Ha
 pub(crate) enum HandshakeError {
     MissingKey,
     UnsupportedVersion,
+    ForbiddenOrigin,
+}
+
+fn serialized_http_origin(value: &str) -> bool {
+    let Some((scheme, authority)) = value.split_once("://") else {
+        return false;
+    };
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && !authority.is_empty()
+        && !authority
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | b' ' | b'\t'))
 }
 
 fn websocket_accept_key(key: &[u8]) -> [u8; 28] {
