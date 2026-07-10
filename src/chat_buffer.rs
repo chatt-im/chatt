@@ -883,6 +883,19 @@ impl VirtualChatBuffer {
         }
     }
 
+    /// Message indexes targeted by an action on the current chat selection.
+    /// A plain cursor targets its whole message; a visual-line range targets
+    /// each message touched by either endpoint or any line between them.
+    pub fn selected_message_indices(&mut self, width: u16) -> Vec<usize> {
+        let Some(cursor) = self.ensure_cursor(width) else {
+            return Vec::new();
+        };
+        let Some((lo, hi)) = self.visual_bounds() else {
+            return vec![cursor.message];
+        };
+        (lo.message..=hi.message).collect()
+    }
+
     /// Copies original body text covered by the visually selected rendered
     /// rows, content only (no sender column). Wrapped rows from the same
     /// message are sliced as one source range so clipboard text keeps the
@@ -2992,6 +3005,33 @@ mod tests {
         buf.set_cursor_to_message(1);
 
         assert_eq!(buf.cursor_message_body(), Some("second\nlines"));
+    }
+
+    #[test]
+    fn selected_message_indices_cover_each_visual_message_once() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_test("alice", "first wraps across rows", 1_000_000, false);
+        buf.push_test("bob", "second also wraps across rows", 1_001_000, false);
+        buf.push_test("carol", "third wraps as well", 1_002_000, false);
+        buf.set_cursor_to_message(0);
+        assert!(buf.toggle_visual_anchor(8));
+        buf.move_cursor_line(20, 8);
+
+        assert_eq!(buf.selected_message_indices(8), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn selected_message_indices_plain_cursor_targets_whole_message() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_test(
+            "alice",
+            "many wrapped body lines live here",
+            1_000_000,
+            false,
+        );
+        buf.cursor_to_last(6);
+
+        assert_eq!(buf.selected_message_indices(6), vec![0]);
     }
 
     #[test]

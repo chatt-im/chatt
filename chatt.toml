@@ -177,6 +177,7 @@ viewer-in-seperate-browser-tab = false
 "r" = "InsertMessageRef"
 "o" = "OpenMessageRef"
 "e" = "EditMessage"
+"d" = "DeleteMessage"
 "p" = "PasteClipboard"
 "C-v" = "PasteClipboard"
 "C-M-v" = "PasteClipboard"

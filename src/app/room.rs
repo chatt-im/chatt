@@ -630,6 +630,13 @@ impl MessageLog {
         self.messages.len() - index <= window
     }
 
+    /// Resident ordinary records from `key` through the newest message,
+    /// including `key` itself.
+    fn records_from(&self, key: MessageKey) -> Option<usize> {
+        let index = self.position(key)?;
+        Some(self.messages.len() - index)
+    }
+
     fn first(&self) -> Option<&ChatMessage> {
         self.messages.first()
     }
@@ -757,6 +764,16 @@ pub(crate) enum ComposerSubmission {
     },
 }
 
+/// Recent locally-authored messages selected for deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteSelection {
+    pub(crate) room_id: RoomId,
+    /// Oldest first so each appended delete record cannot age a later target
+    /// out of the server's bounded mutation window.
+    pub(crate) targets: Vec<MessageId>,
+    pub(crate) skipped: usize,
+}
+
 /// Client-side bound on how many messages back an edit may reach, tighter
 /// than the server's [`rpc::control::MUTATION_WINDOW_MESSAGES`] so a revision
 /// finished during ongoing traffic is rarely rejected.
@@ -780,6 +797,28 @@ impl EditDenied {
             EditDenied::NotYours => "not your message",
             EditDenied::FileMessage => "file messages cannot be edited",
             EditDenied::TooOld => "message too old to edit",
+        }
+    }
+}
+
+/// Why a cursor or visual selection contains no deletable messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteDenied {
+    NoMessage,
+    Notice,
+    NotYours,
+    TooOld,
+    NoEligible,
+}
+
+impl DeleteDenied {
+    pub(crate) fn status(self) -> &'static str {
+        match self {
+            DeleteDenied::NoMessage => "no message selected",
+            DeleteDenied::Notice => "notices cannot be deleted",
+            DeleteDenied::NotYours => "not your message",
+            DeleteDenied::TooOld => "message too old to delete",
+            DeleteDenied::NoEligible => "no deletable messages selected",
         }
     }
 }
@@ -2462,6 +2501,64 @@ impl RoomSession {
             parked_draft,
         });
         Ok(())
+    }
+
+    /// Collects deletable messages under the cursor or visual-line selection.
+    /// Ineligible entries are skipped so a contiguous visual range can cross
+    /// other users' messages and notices. The server remains authoritative if
+    /// concurrent traffic changes the window after this preflight.
+    pub(crate) fn delete_selection(&mut self, width: u16) -> Result<DeleteSelection, DeleteDenied> {
+        let Some(room_id) = self.viewed_room else {
+            return Err(DeleteDenied::NoMessage);
+        };
+        let indexes = self.active.chat.selected_message_indices(width);
+        if indexes.is_empty() {
+            return Err(DeleteDenied::NoMessage);
+        }
+        let single = indexes.len() == 1;
+        let mut first_denied = None;
+        let mut targets = Vec::new();
+        for index in indexes.iter().copied() {
+            let entry = self.active.chat.message(index);
+            let denied = if entry.id == 0 {
+                Some(DeleteDenied::Notice)
+            } else if !entry.local {
+                Some(DeleteDenied::NotYours)
+            } else {
+                let normal_records = self
+                    .active
+                    .messages
+                    .records_from(entry.id)
+                    .unwrap_or(usize::MAX);
+                let mutation_records = self
+                    .active
+                    .seen_mutations
+                    .iter()
+                    .filter(|id| **id > entry.id)
+                    .count();
+                (normal_records.saturating_add(mutation_records)
+                    > rpc::control::MUTATION_WINDOW_MESSAGES)
+                    .then_some(DeleteDenied::TooOld)
+            };
+            if let Some(denied) = denied {
+                first_denied.get_or_insert(denied);
+            } else {
+                targets.push(MessageId(entry.id));
+            }
+        }
+        if targets.is_empty() {
+            return Err(if single {
+                first_denied.unwrap_or(DeleteDenied::NoMessage)
+            } else {
+                DeleteDenied::NoEligible
+            });
+        }
+        targets.sort_unstable_by_key(|target| target.0);
+        Ok(DeleteSelection {
+            room_id,
+            skipped: indexes.len() - targets.len(),
+            targets,
+        })
     }
 
     pub(crate) fn has_pending_edit(&self) -> bool {
@@ -4477,6 +4574,74 @@ mod tests {
         let index = room.active.chat.find_message(4).expect("resident");
         room.active.chat.set_cursor_to_message(index);
         assert_eq!(room.begin_edit_cursor_message(80), Ok(()));
+    }
+
+    #[test]
+    fn delete_selection_keeps_eligible_messages_and_orders_them_oldest_first() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![
+                message(1, UserId(1), "mine one"),
+                message(2, UserId(2), "theirs"),
+                file_message(3, UserId(1), "my file", FileTransferId(9)),
+                message(4, UserId(1), "mine four"),
+            ],
+            Some(UserId(1)),
+        );
+        room.active.chat.set_cursor_to_message(0);
+        assert!(room.active.chat.toggle_visual_anchor(80));
+        room.active.chat.move_cursor_line(3, 80);
+
+        assert_eq!(
+            room.delete_selection(80),
+            Ok(DeleteSelection {
+                room_id: RoomId(1),
+                targets: vec![MessageId(1), MessageId(3), MessageId(4)],
+                skipped: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn delete_selection_counts_mutations_in_the_server_window() {
+        let mut room = test_room();
+        let history = (1..=rpc::control::MUTATION_WINDOW_MESSAGES as u64)
+            .map(|id| message(id, UserId(1), "mine"))
+            .collect();
+        enter(&mut room, Vec::new(), history, Some(UserId(1)));
+        room.active.chat.set_cursor_to_message(0);
+        assert_eq!(
+            room.delete_selection(80).unwrap().targets,
+            vec![MessageId(1)],
+            "the oldest of exactly 256 records is still eligible"
+        );
+
+        room.mutation_received(&edit_record(257, 2, UserId(1), "revised"), Some(UserId(1)));
+        assert_eq!(room.delete_selection(80), Err(DeleteDenied::TooOld));
+    }
+
+    #[test]
+    fn delete_selection_reports_single_ineligible_entry() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(2), "theirs")],
+            Some(UserId(1)),
+        );
+        room.active.chat.set_cursor_to_message(0);
+        assert_eq!(room.delete_selection(80), Err(DeleteDenied::NotYours));
+
+        room.active.chat.push_notice("network", "disconnected");
+        room.active.chat.set_cursor_to_message(1);
+        assert_eq!(room.delete_selection(80), Err(DeleteDenied::Notice));
+
+        room.active.chat.set_cursor_to_message(0);
+        assert!(room.active.chat.toggle_visual_anchor(80));
+        room.active.chat.move_cursor_line(1, 80);
+        assert_eq!(room.delete_selection(80), Err(DeleteDenied::NoEligible));
     }
 
     #[test]

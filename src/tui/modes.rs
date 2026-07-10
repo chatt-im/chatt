@@ -4,7 +4,10 @@ use extui_bindings::{InputKey, LayerId};
 use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 
 use crate::{
-    app::{App, ChatPanelFocus, PendingJoin, ServerEditDraft, ServerEditEvent, ToggleExpandResult},
+    app::{
+        App, ChatPanelFocus, DeleteSelection, PendingJoin, ServerEditDraft, ServerEditEvent,
+        ToggleExpandResult,
+    },
     bindings::{self, BindCommand, Resolved},
     chat_buffer::{Cursor as ChatCursor, LineKind, VisibleLine},
     settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft},
@@ -1064,6 +1067,7 @@ impl RoomMode {
             InsertMessageRef => self.insert_message_ref_if_focused(app),
             OpenMessageRef => self.open_message_ref_if_focused(app),
             EditMessage => self.edit_cursor_message_if_focused(app),
+            DeleteMessage => self.delete_selected_messages_if_focused(app),
             ToggleExpand => self.toggle_chat_expand_if_focused(app),
             FocusNext => self.move_focus(app, 1),
             FocusPrev => self.move_focus(app, -1),
@@ -1589,6 +1593,49 @@ impl RoomMode {
             }
             Err(denied) => app.set_status(denied.status()),
         }
+    }
+
+    fn delete_selected_messages_if_focused(&mut self, app: &mut App) {
+        if self.focus != ChatPanelFocus::ChatLog {
+            return;
+        }
+        let selection = match app.room.delete_selection(self.layout.chat_width) {
+            Ok(selection) => selection,
+            Err(denied) => {
+                app.set_status(denied.status());
+                return;
+            }
+        };
+        let DeleteSelection {
+            room_id,
+            targets,
+            skipped,
+        } = selection;
+        let count = targets.len();
+        let noun = if count == 1 { "message" } else { "messages" };
+        let mut prompt = format!("Delete {count} {noun}?");
+        if skipped > 0 {
+            prompt.push_str(&format!(" ({skipped} skipped)"));
+        }
+        kvlog::info!(
+            "chat delete confirmation opened",
+            room_id = room_id.0,
+            target_count = count,
+            skipped
+        );
+        app.push_mode(Box::new(ConfirmMode::new(
+            prompt,
+            "Delete",
+            "Cancel",
+            move |app| {
+                if app.delete_chat_messages(room_id, targets)
+                    && app.room.viewed_room == Some(room_id)
+                {
+                    app.room.active.chat.clear_visual_anchor();
+                }
+                ConfirmDisposition::Close
+            },
+        )));
     }
 
     fn scroll_focused_panel(&mut self, app: &mut App, direction: isize) {
@@ -2650,6 +2697,17 @@ mod tests {
         match resolve_binding(&mut app, bindings::CHAT_VISUAL_LAYER, key('j')) {
             BindingResolution::Action(BindCommand::ScrollDown) => {}
             other => panic!("expected inherited motion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn d_deletes_from_workspace_and_visual_layers() {
+        let mut app = test_app();
+        for layer in [bindings::WORKSPACE_LAYER, bindings::CHAT_VISUAL_LAYER] {
+            match resolve_binding(&mut app, layer, key('d')) {
+                BindingResolution::Action(BindCommand::DeleteMessage) => {}
+                other => panic!("expected DeleteMessage, got {other:?}"),
+            }
         }
     }
 
