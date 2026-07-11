@@ -3,13 +3,26 @@ use extui::{
     event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent},
 };
 use extui_bindings::LayerId;
+use std::sync::mpsc::Sender;
 
 use crate::{
-    app::{App, AppEvent, RoomSession, command::CoreCommand},
+    app::{RoomSession, command::CoreCommand},
+    client_channel::{ClientEvent, ClientId},
     config::Config,
     theme,
     tui::{Action, view::ClientView},
 };
+
+#[cfg(test)]
+use crate::app::App;
+
+pub(crate) enum CommandSink<'a> {
+    Local(&'a mut Vec<CoreCommand>),
+    Channel {
+        client_id: ClientId,
+        sender: &'a Sender<(ClientId, CoreCommand)>,
+    },
+}
 
 /// The state and command sink available to render-thread mode code.
 ///
@@ -20,13 +33,18 @@ pub(crate) struct ViewCx<'a> {
     pub(crate) view: &'a mut ClientView,
     pub(crate) session: &'a RoomSession,
     pub(crate) config: &'a Config,
-    pub(crate) commands: &'a mut Vec<CoreCommand>,
+    pub(crate) commands: CommandSink<'a>,
 }
 
 #[allow(dead_code)]
 impl ViewCx<'_> {
     pub(crate) fn send(&mut self, command: CoreCommand) {
-        self.commands.push(command);
+        match &mut self.commands {
+            CommandSink::Local(commands) => commands.push(command),
+            CommandSink::Channel { client_id, sender } => {
+                let _ = sender.send((*client_id, command));
+            }
+        }
     }
 
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
@@ -96,7 +114,7 @@ pub(crate) enum ExitReason {
 ///
 /// One dispatch may request at most one transition. The stack applies that
 /// transition only after the borrowed active mode returns.
-pub(crate) trait AppMode {
+pub(crate) trait AppMode: Send {
     fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64);
 
     fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action;
@@ -110,9 +128,8 @@ pub(crate) trait AppMode {
         let _ = (cx, text);
     }
 
-    fn process_app_event(&mut self, app: &mut App, event: AppEvent) -> Option<AppEvent> {
-        let _ = app;
-        Some(event)
+    fn process_client_event(&mut self, event: ClientEvent) {
+        let _ = event;
     }
 
     fn on_enter(&mut self, _cx: &mut ViewCx<'_>) {}
@@ -162,12 +179,18 @@ pub(crate) struct ModeStack {
 }
 
 impl ModeStack {
+    #[cfg(test)]
     pub(crate) fn new(mut root: Box<dyn AppMode>, app: &mut App) -> Self {
         {
             let mut cx = app.view_cx();
             root.on_enter(&mut cx);
         }
         app.drain_core_commands();
+        Self { modes: vec![root] }
+    }
+
+    pub(crate) fn new_with_cx(mut root: Box<dyn AppMode>, cx: &mut ViewCx<'_>) -> Self {
+        root.on_enter(cx);
         Self { modes: vec![root] }
     }
 
@@ -178,100 +201,98 @@ impl ModeStack {
             .expect("mode stack always has a root")
     }
 
-    /// Gives the active mode first chance to consume an application event. Most
-    /// events are global and fall through to [`App`], while modal flows can keep
-    /// their own transient UI state local.
-    pub(crate) fn process_app_event(&mut self, app: &mut App, event: AppEvent) {
-        if let Some(event) = self.active_mut().process_app_event(app, event) {
-            app.handle_app_event(event);
-        }
+    pub(crate) fn process_client_event(&mut self, event: ClientEvent) {
+        self.active_mut().process_client_event(event);
     }
 
+    #[cfg(test)]
     pub(crate) fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
         let action = {
             let mut cx = app.view_cx();
-            self.active_mut().process_input(&mut cx, key)
+            self.process_input_cx(&mut cx, key)
         };
         app.drain_core_commands();
         action
     }
 
-    pub(crate) fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.active_mut().process_mouse(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    pub(crate) fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.active_mut().process_input(cx, key)
     }
 
-    pub(crate) fn process_paste(&mut self, app: &mut App, text: String) {
-        {
-            let mut cx = app.view_cx();
-            self.active_mut().process_paste(&mut cx, text);
-        }
-        app.drain_core_commands();
+    pub(crate) fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.active_mut().process_mouse(cx, mouse)
+    }
+
+    pub(crate) fn process_paste_cx(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        self.active_mut().process_paste(cx, text);
     }
 
     /// Applies at most one requested transition. A root pop is an explicit
     /// no-op; navigation must use `Set` to replace the root.
+    #[cfg(test)]
     pub(crate) fn apply_pending(&mut self, app: &mut App) {
-        let Some(transition) = app.take_mode_transition() else {
-            return;
-        };
-
-        // Chords never cross a navigation boundary, including overlays.
-        app.view.chrome.binding.pending_chord = None;
-
-        match transition {
-            ModeTransition::Set(mut mode) => {
-                for mut removed in self.modes.drain(..).rev() {
-                    let mut cx = app.view_cx();
-                    removed.on_exit(&mut cx, ExitReason::Reset);
-                }
-                let mut cx = app.view_cx();
-                mode.on_enter(&mut cx);
-                self.modes.push(mode);
-            }
-            ModeTransition::Push(mut mode) => {
-                let mut cx = app.view_cx();
-                mode.on_enter(&mut cx);
-                self.modes.push(mode);
-            }
-            ModeTransition::Replace(mut mode) => {
-                if let Some(mut removed) = self.modes.pop() {
-                    let mut cx = app.view_cx();
-                    removed.on_exit(&mut cx, ExitReason::Replaced);
-                }
-                let mut cx = app.view_cx();
-                mode.on_enter(&mut cx);
-                self.modes.push(mode);
-            }
-            ModeTransition::Pop if self.modes.len() > 1 => {
-                let mut removed = self.modes.pop().expect("checked non-root mode");
-                let mut cx = app.view_cx();
-                removed.on_exit(&mut cx, ExitReason::Popped);
-            }
-            ModeTransition::Pop => {}
+        {
+            let mut cx = app.view_cx();
+            self.apply_pending_cx(&mut cx);
         }
         app.drain_core_commands();
     }
 
+    pub(crate) fn apply_pending_cx(&mut self, cx: &mut ViewCx<'_>) {
+        let Some(transition) = cx.view.pending_transition.take() else {
+            return;
+        };
+
+        // Chords never cross a navigation boundary, including overlays.
+        cx.view.chrome.binding.pending_chord = None;
+
+        match transition {
+            ModeTransition::Set(mut mode) => {
+                for mut removed in self.modes.drain(..).rev() {
+                    removed.on_exit(cx, ExitReason::Reset);
+                }
+                mode.on_enter(cx);
+                self.modes.push(mode);
+            }
+            ModeTransition::Push(mut mode) => {
+                mode.on_enter(cx);
+                self.modes.push(mode);
+            }
+            ModeTransition::Replace(mut mode) => {
+                if let Some(mut removed) = self.modes.pop() {
+                    removed.on_exit(cx, ExitReason::Replaced);
+                }
+                mode.on_enter(cx);
+                self.modes.push(mode);
+            }
+            ModeTransition::Pop if self.modes.len() > 1 => {
+                let mut removed = self.modes.pop().expect("checked non-root mode");
+                removed.on_exit(cx, ExitReason::Popped);
+            }
+            ModeTransition::Pop => {}
+        }
+    }
+
     /// Renders the highest full-screen mode and overlays above it. Covered
     /// full-screen modes retain state without mutating active layout caches.
+    #[cfg(test)]
     pub(crate) fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64) {
         {
             let mut cx = app.view_cx();
-            let start = self
-                .modes
-                .iter()
-                .rposition(|mode| mode.presentation(&cx).coverage == Coverage::FullScreen)
-                .unwrap_or(0);
-            for mode in &mut self.modes[start..] {
-                mode.render(&mut cx, buf, now_ms);
-            }
+            self.render_cx(&mut cx, buf, now_ms);
         }
         app.drain_core_commands();
+    }
+
+    pub(crate) fn render_cx(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64) {
+        let start = self
+            .modes
+            .iter()
+            .rposition(|mode| mode.presentation(cx).coverage == Coverage::FullScreen)
+            .unwrap_or(0);
+        for mode in &mut self.modes[start..] {
+            mode.render(cx, buf, now_ms);
+        }
     }
 
     #[cfg(test)]
@@ -304,10 +325,7 @@ impl ModeStack {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::{Cell, RefCell},
-        rc::Rc,
-    };
+    use std::sync::{Arc, Mutex};
 
     use extui::event::{KeyEvent, MouseEvent};
 
@@ -335,11 +353,11 @@ mod tests {
     struct RecordingMode {
         label: &'static str,
         presentation: ModePresentation,
-        rendered: Rc<RefCell<Vec<&'static str>>>,
+        rendered: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl RecordingMode {
-        fn full_screen(label: &'static str, rendered: Rc<RefCell<Vec<&'static str>>>) -> Self {
+        fn full_screen(label: &'static str, rendered: Arc<Mutex<Vec<&'static str>>>) -> Self {
             Self {
                 label,
                 rendered,
@@ -351,7 +369,7 @@ mod tests {
             }
         }
 
-        fn overlay(label: &'static str, rendered: Rc<RefCell<Vec<&'static str>>>) -> Self {
+        fn overlay(label: &'static str, rendered: Arc<Mutex<Vec<&'static str>>>) -> Self {
             Self {
                 label,
                 rendered,
@@ -362,7 +380,10 @@ mod tests {
 
     impl AppMode for RecordingMode {
         fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64) {
-            self.rendered.borrow_mut().push(self.label);
+            self.rendered
+                .lock()
+                .expect("render log mutex")
+                .push(self.label);
         }
 
         fn process_input(&mut self, _cx: &mut ViewCx<'_>, _key: KeyEvent) -> Action {
@@ -415,49 +436,6 @@ mod tests {
     }
 
     #[test]
-    fn active_mode_can_consume_app_event_before_global_app_handler() {
-        struct EventConsumer {
-            consumed: Rc<Cell<bool>>,
-        }
-
-        impl AppMode for EventConsumer {
-            fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64) {}
-
-            fn process_input(&mut self, _cx: &mut ViewCx<'_>, _key: KeyEvent) -> Action {
-                Action::Continue
-            }
-
-            fn process_app_event(&mut self, _app: &mut App, event: AppEvent) -> Option<AppEvent> {
-                if matches!(event, AppEvent::ReportBug(_)) {
-                    self.consumed.set(true);
-                    None
-                } else {
-                    Some(event)
-                }
-            }
-
-            fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
-                ModePresentation::OVERLAY
-            }
-        }
-
-        let mut app = app();
-        let status_before = app.view.status.text().to_string();
-        let consumed = Rc::new(Cell::new(false));
-        let mut stack = ModeStack::new(
-            Box::new(EventConsumer {
-                consumed: Rc::clone(&consumed),
-            }),
-            &mut app,
-        );
-
-        stack.process_app_event(&mut app, AppEvent::ReportBug("details".to_string()));
-
-        assert!(consumed.get());
-        assert_eq!(app.view.status.text(), status_before);
-    }
-
-    #[test]
     #[should_panic(expected = "multiple mode transitions")]
     fn requesting_two_transitions_in_one_dispatch_panics() {
         let mut pending = PendingTransition::default();
@@ -468,53 +446,56 @@ mod tests {
     #[test]
     fn render_skips_full_screen_modes_covered_by_a_later_full_screen_mode() {
         let mut app = app();
-        let rendered = Rc::new(RefCell::new(Vec::new()));
+        let rendered = Arc::new(Mutex::new(Vec::new()));
         let mut stack = ModeStack::new(
-            Box::new(RecordingMode::full_screen("list", Rc::clone(&rendered))),
+            Box::new(RecordingMode::full_screen("list", Arc::clone(&rendered))),
             &mut app,
         );
         app.push_mode(Box::new(RecordingMode::full_screen(
             "room",
-            Rc::clone(&rendered),
+            Arc::clone(&rendered),
         )));
         stack.apply_pending(&mut app);
         app.push_mode(Box::new(RecordingMode::full_screen(
             "settings",
-            Rc::clone(&rendered),
+            Arc::clone(&rendered),
         )));
         stack.apply_pending(&mut app);
 
         stack.render(&mut app, &mut Buffer::new(80, 24), 0);
 
-        assert_eq!(&*rendered.borrow(), &["settings"]);
+        assert_eq!(&*rendered.lock().expect("render log mutex"), &["settings"]);
     }
 
     #[test]
     fn render_draws_highest_full_screen_then_overlays_bottom_to_top() {
         let mut app = app();
-        let rendered = Rc::new(RefCell::new(Vec::new()));
+        let rendered = Arc::new(Mutex::new(Vec::new()));
         let mut stack = ModeStack::new(
-            Box::new(RecordingMode::full_screen("list", Rc::clone(&rendered))),
+            Box::new(RecordingMode::full_screen("list", Arc::clone(&rendered))),
             &mut app,
         );
         app.push_mode(Box::new(RecordingMode::full_screen(
             "room",
-            Rc::clone(&rendered),
+            Arc::clone(&rendered),
         )));
         stack.apply_pending(&mut app);
         app.push_mode(Box::new(RecordingMode::overlay(
             "confirm",
-            Rc::clone(&rendered),
+            Arc::clone(&rendered),
         )));
         stack.apply_pending(&mut app);
         app.push_mode(Box::new(RecordingMode::overlay(
             "volume",
-            Rc::clone(&rendered),
+            Arc::clone(&rendered),
         )));
         stack.apply_pending(&mut app);
 
         stack.render(&mut app, &mut Buffer::new(80, 24), 0);
 
-        assert_eq!(&*rendered.borrow(), &["room", "confirm", "volume"]);
+        assert_eq!(
+            &*rendered.lock().expect("render log mutex"),
+            &["room", "confirm", "volume"]
+        );
     }
 }

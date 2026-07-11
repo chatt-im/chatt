@@ -10,9 +10,8 @@ use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, AppEvent, UserVolumeDialog, command::CoreCommand},
+    app::{UserVolumeDialog, command::CoreCommand},
     bindings::{self, BindCommand, Resolved},
-    client_net::NetworkEvent,
     clipboard_paste::{ImagePaste, ImagePasteOrigin, ImagePasteSource},
     theme,
     theme::Theme,
@@ -26,6 +25,9 @@ use crate::{
         widgets::{RowPalette, button_label, draw_button, draw_labeled_editor_frame},
     },
 };
+
+#[cfg(test)]
+use crate::app::App;
 
 /// Overlay hosting the per-user local volume dialog.
 ///
@@ -85,7 +87,7 @@ pub(crate) struct ConfirmMode {
     selected_confirm: bool,
     cancel_button: Rect,
     confirm_button: Rect,
-    on_confirm: Option<Box<dyn FnOnce(&mut ViewCx<'_>) -> ConfirmDisposition>>,
+    on_confirm: Option<Box<dyn FnOnce(&mut ViewCx<'_>) -> ConfirmDisposition + Send>>,
 }
 
 impl ConfirmMode {
@@ -93,7 +95,7 @@ impl ConfirmMode {
         prompt: impl Into<String>,
         confirm_label: impl Into<String>,
         cancel_label: impl Into<String>,
-        on_confirm: impl FnOnce(&mut ViewCx<'_>) -> ConfirmDisposition + 'static,
+        on_confirm: impl FnOnce(&mut ViewCx<'_>) -> ConfirmDisposition + Send + 'static,
     ) -> Self {
         Self {
             prompt: prompt.into(),
@@ -594,38 +596,15 @@ impl AppMode for PasswordPromptMode {
         crate::tui::render::draw_overlay_key_preview(&mut app, bindings::PASSWORD_LAYER, buf);
     }
 
-    fn process_app_event(&mut self, app: &mut App, event: AppEvent) -> Option<AppEvent> {
+    fn process_client_event(&mut self, event: crate::client_channel::ClientEvent) {
+        use crate::client_channel::ClientEvent;
+
         match event {
-            AppEvent::Network(NetworkEvent::OpenPairingNeedsPassword {
-                retry,
-                server_public_key,
-            }) => {
-                match app.accept_open_pairing_password_challenge(server_public_key) {
-                    Ok(()) => self.apply_password_challenge(retry),
-                    Err(error) => self.apply_error(error),
-                }
-                None
+            ClientEvent::PairingPasswordChallenge { retry, .. } => {
+                self.apply_password_challenge(retry);
             }
-            AppEvent::Network(NetworkEvent::OpenPairingSucceeded {
-                token,
-                server_public_key,
-                udp_addr,
-                udp_probe_addr,
-            }) => {
-                self.submitting = false;
-                app.complete_open_pairing_from_password_prompt(
-                    token,
-                    server_public_key,
-                    udp_addr,
-                    udp_probe_addr,
-                );
-                None
-            }
-            AppEvent::Network(NetworkEvent::PairingFailed(error)) => {
-                self.apply_error(error);
-                None
-            }
-            event => Some(event),
+            ClientEvent::PairingSucceeded => self.submitting = false,
+            ClientEvent::PairingFailed(error) => self.apply_error(error),
         }
     }
 
@@ -1148,7 +1127,10 @@ fn format_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use super::*;
     use crate::{
@@ -1164,10 +1146,10 @@ mod tests {
     #[test]
     fn confirmation_buttons_are_clickable() {
         let mut app = test_app();
-        let confirmed = Rc::new(Cell::new(false));
-        let confirmed_by_callback = Rc::clone(&confirmed);
+        let confirmed = Arc::new(AtomicBool::new(false));
+        let confirmed_by_callback = Arc::clone(&confirmed);
         let mut mode = ConfirmMode::new("Delete message?", "Delete", "Cancel", move |_| {
-            confirmed_by_callback.set(true);
+            confirmed_by_callback.store(true, Ordering::Relaxed);
             ConfirmDisposition::Close
         });
         mode.render(&mut app, &mut Buffer::new(80, 24), 0);
@@ -1183,17 +1165,17 @@ mod tests {
             },
         );
 
-        assert!(confirmed.get());
+        assert!(confirmed.load(Ordering::Relaxed));
         assert!(!app.view.pending_transition.is_empty());
     }
 
     #[test]
     fn confirmation_cancel_button_does_not_run_callback() {
         let mut app = test_app();
-        let confirmed = Rc::new(Cell::new(false));
-        let confirmed_by_callback = Rc::clone(&confirmed);
+        let confirmed = Arc::new(AtomicBool::new(false));
+        let confirmed_by_callback = Arc::clone(&confirmed);
         let mut mode = ConfirmMode::new("Delete message?", "Delete", "Cancel", move |_| {
-            confirmed_by_callback.set(true);
+            confirmed_by_callback.store(true, Ordering::Relaxed);
             ConfirmDisposition::Close
         });
         mode.render(&mut app, &mut Buffer::new(80, 24), 0);
@@ -1209,7 +1191,7 @@ mod tests {
             },
         );
 
-        assert!(!confirmed.get());
+        assert!(!confirmed.load(Ordering::Relaxed));
         assert!(!app.view.pending_transition.is_empty());
     }
 
@@ -1472,32 +1454,19 @@ mod tests {
 
     #[test]
     fn password_prompt_consumes_retry_as_local_feedback() {
-        let mut app = test_app();
-        app.pending_pair = Some(pending_open_pair());
         let mut prompt = PasswordPromptMode::new(false);
         prompt.input = "bad".to_string();
         prompt.submitting = true;
-        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-        let unhandled = prompt.process_app_event(
-            &mut app,
-            AppEvent::Network(NetworkEvent::OpenPairingNeedsPassword {
-                retry: true,
-                server_public_key: key.to_string(),
-            }),
+        prompt.process_client_event(
+            crate::client_channel::ClientEvent::PairingPasswordChallenge { retry: true },
         );
 
-        assert!(unhandled.is_none());
         assert_eq!(
             prompt.feedback,
             PasswordFeedback::Error("Incorrect password; try again".to_string())
         );
         assert!(!prompt.submitting);
         assert!(prompt.input.is_empty());
-        assert_eq!(
-            app.pending_pair.as_ref().unwrap().server.server_public_key,
-            key
-        );
-        assert!(app.view.pending_transition.is_empty());
     }
 }

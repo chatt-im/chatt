@@ -295,6 +295,7 @@ dependencies = [
  "mio",
  "nnnoiseless",
  "opus-codec",
+ "parking_lot",
  "ring",
  "rpc",
  "sendfd",
