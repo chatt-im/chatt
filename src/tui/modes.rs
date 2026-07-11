@@ -2,6 +2,8 @@ use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use extui::{Buffer, Rect};
 use extui_bindings::{InputKey, LayerId};
 use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
@@ -1080,6 +1082,8 @@ pub(crate) struct RoomLayout {
     pub lobby_bar_rect: Rect,
     pub chat_log_bar_rect: Rect,
     pub composer_rect: Rect,
+    /// Composer editor plus its optional half-block frame and side gutters.
+    pub composer_frame_rect: Rect,
     pub compose_bar_rect: Rect,
 }
 
@@ -1097,6 +1101,7 @@ impl Default for RoomLayout {
             lobby_bar_rect: Rect::EMPTY,
             chat_log_bar_rect: Rect::EMPTY,
             composer_rect: Rect::EMPTY,
+            composer_frame_rect: Rect::EMPTY,
             compose_bar_rect: Rect::EMPTY,
         }
     }
@@ -1111,6 +1116,7 @@ impl RoomLayout {
         self.lobby_bar_rect = Rect::EMPTY;
         self.chat_log_bar_rect = Rect::EMPTY;
         self.composer_rect = Rect::EMPTY;
+        self.composer_frame_rect = Rect::EMPTY;
         self.compose_bar_rect = Rect::EMPTY;
     }
 
@@ -1131,6 +1137,67 @@ impl RoomLayout {
         let index = row.checked_sub(self.chat_rect.y)? as usize;
         self.visible_chat_lines.get(index).copied()
     }
+}
+
+/// Moves the composer cursor to the text boundary nearest a terminal click.
+/// Frame and gutter coordinates clamp onto the closest editor edge.
+fn move_composer_cursor_to_click(editor: &mut Editor, area: Rect, column: u16, row: u16) {
+    if area.is_empty() {
+        return;
+    }
+    let click_x = column.clamp(area.x, area.x.saturating_add(area.w).saturating_sub(1));
+    let click_y = row.clamp(area.y, area.y.saturating_add(area.h).saturating_sub(1));
+    let Some((_, cursor_y)) = editor.cursor_position(area) else {
+        return;
+    };
+    let width = area.w.max(1);
+    let tabstop = editor.tab_settings().tabstop.max(1);
+    let text = editor.text();
+    let cursor_visual_row =
+        composer_visual_position(&text, editor.cursor_offset() as usize, width, tabstop).0;
+    let visible_start = cursor_visual_row.saturating_sub(cursor_y.saturating_sub(area.y) as usize);
+    let target_row = visible_start + click_y.saturating_sub(area.y) as usize;
+    let target_col = click_x.saturating_sub(area.x);
+
+    let mut best = (usize::MAX, 0usize);
+    for offset in text
+        .grapheme_indices(true)
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(text.len()))
+    {
+        let (visual_row, visual_col) = composer_visual_position(&text, offset, width, tabstop);
+        let distance = visual_row.abs_diff(target_row) * (width as usize + 1)
+            + usize::from(visual_col.abs_diff(target_col));
+        if distance < best.0 {
+            best = (distance, offset);
+        }
+    }
+    editor.set_cursor_offset(best.1 as u32);
+}
+
+fn composer_visual_position(text: &str, offset: usize, width: u16, tabstop: u16) -> (usize, u16) {
+    let width = width.max(1);
+    let mut row = 0usize;
+    let mut col = 0u16;
+    for (start, grapheme) in text.grapheme_indices(true) {
+        if start >= offset {
+            break;
+        }
+        if grapheme == "\n" {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let cells = if grapheme == "\t" {
+            tabstop - col % tabstop
+        } else {
+            UnicodeWidthStr::width(grapheme).min(u16::MAX as usize) as u16
+        };
+        let visual = u32::from(col) + u32::from(cells);
+        row += (visual / u32::from(width)) as usize;
+        col = (visual % u32::from(width)) as u16;
+    }
+    (row, col)
 }
 
 /// An in-progress divider drag started on one of the inner status bars. The
@@ -1552,13 +1619,15 @@ impl RoomMode {
             crate::tui::form::rect_contains(self.layout.user_list_rect, mouse.column, mouse.row);
         let in_lobby_bar =
             crate::tui::form::rect_contains(self.layout.lobby_bar_rect, mouse.column, mouse.row);
-        let in_composer =
-            crate::tui::form::rect_contains(self.layout.composer_rect, mouse.column, mouse.row)
-                || crate::tui::form::rect_contains(
-                    self.layout.compose_bar_rect,
-                    mouse.column,
-                    mouse.row,
-                );
+        let in_composer = crate::tui::form::rect_contains(
+            self.layout.composer_frame_rect,
+            mouse.column,
+            mouse.row,
+        ) || crate::tui::form::rect_contains(
+            self.layout.compose_bar_rect,
+            mouse.column,
+            mouse.row,
+        );
         let transfer_hit = cx
             .view
             .chrome
@@ -1577,6 +1646,18 @@ impl RoomMode {
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_composer => {
                 self.enter_compose_insert_mode(cx);
+                if crate::tui::form::rect_contains(
+                    self.layout.composer_frame_rect,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    move_composer_cursor_to_click(
+                        &mut cx.view.composer,
+                        self.layout.composer_rect,
+                        mouse.column,
+                        mouse.row,
+                    );
+                }
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
                 if crate::tui::form::rect_contains(
@@ -3491,6 +3572,74 @@ mod tests {
         assert_eq!(app.view.composer_min_rows, Some(target));
         render_room(&mut app, &mut room, &mut buffer);
         assert_eq!(room.layout().composer_rect.h, target);
+    }
+
+    #[test]
+    fn clicking_composer_border_focuses_and_places_cursor_at_nearest_text() {
+        let mut app = test_app();
+        app.view.composer.set_lines("alpha\nbravo");
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(40, 20);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let editor = room.layout().composer_rect;
+        let frame = room.layout().composer_frame_rect;
+        assert_eq!(frame.h, editor.h + 2);
+        assert_eq!(editor.x, frame.x + 1);
+        assert_eq!(editor.w, frame.w - 2);
+
+        let bottom_border = frame.y + frame.h - 1;
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                editor.x + 2,
+                bottom_border,
+            ),
+        );
+
+        assert_eq!(room.focus(), ChatPanelFocus::Compose);
+        assert_eq!(app.view.composer.mode(), EditorMode::Insert);
+        assert_eq!(app.view.composer.cursor_offset(), 8);
+    }
+
+    #[test]
+    fn padded_composer_uses_transparent_full_width_borders_and_gutters() {
+        let mut app = test_app();
+        app.view.theme.panel = app.view.theme.panel.with_bg_rgb(0xaa, 0xbb, 0xcc);
+        app.view.theme.composer_border =
+            app.view.theme.composer_border.with_bg_rgb(0x11, 0x22, 0x33);
+        let mut room = RoomMode::default();
+        let width = 40u16;
+        let mut buffer = Buffer::new(width, 20);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let editor = room.layout().composer_rect;
+        let frame = room.layout().composer_frame_rect;
+        let top_y = frame.y;
+        let bottom_y = frame.y + frame.h - 1;
+        let cell = |grid: &extui::Grid, x: u16, y: u16| {
+            grid.cells()[(usize::from(y) * usize::from(width)) + usize::from(x)]
+        };
+        let grid = buffer.current();
+
+        for x in [frame.x, frame.x + frame.w - 1] {
+            let top = cell(grid, x, top_y);
+            let bottom = cell(grid, x, bottom_y);
+            assert_eq!(top.text_inline(), Some("▀"));
+            assert_eq!(bottom.text_inline(), Some("▄"));
+            assert_eq!(top.style().bg(), None);
+            assert_eq!(bottom.style().bg(), None);
+        }
+
+        let left_gutter = cell(grid, frame.x, editor.y);
+        assert_eq!(left_gutter.text_inline(), Some(" "));
+        assert_eq!(left_gutter.style().bg(), None);
+
+        let placeholder = cell(grid, editor.x, editor.y);
+        assert_eq!(placeholder.text_inline(), Some("M"));
+        assert_eq!(placeholder.style().fg(), app.view.theme.subtle.fg());
+        assert_eq!(placeholder.style().bg(), None);
     }
 
     #[test]

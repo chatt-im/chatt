@@ -4403,10 +4403,6 @@ impl App {
                     self.close_settings(session);
                     return;
                 }
-                SettingsButton::Exit => {
-                    self.request_quit();
-                    return;
-                }
             }
         }
         match output.device {
@@ -9409,7 +9405,8 @@ mod tests {
         render_room(&mut app, &mut room, &mut buffer);
 
         let expected_chat_top = 1 + app.config.ui.room_height + 1;
-        let expected_chat_bottom = buffer.height() - 4;
+        let composer_frame_rows = if app.config.ui.composer_padding { 2 } else { 0 };
+        let expected_chat_bottom = buffer.height() - 4 - composer_frame_rows;
         assert_eq!(room.layout().chat_rect.y, expected_chat_top);
         assert_eq!(room.layout().chat_rect.bottom(), expected_chat_bottom);
     }

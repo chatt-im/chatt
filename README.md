@@ -355,6 +355,10 @@ falls back to the compiled development server key.
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.
 
+Under `[ui]`, `composer-padding = true` (the default) insets the composer by one
+column and adds half-block borders above and below it. Set it to `false` for the
+compact, unframed composer.
+
 The `theme` key under `[ui]` selects the color theme. It may name a builtin —
 `"tomorrow-night"` (the default true-color dark palette), `"base16-dark"`, or
 `"base16-light"` — or a custom theme defined under `[ui.themes.<name>]`. The
@@ -404,7 +408,7 @@ reserved. The overridable slot names match the theme's roles — surfaces
 foreground roles (`text`, `muted`, `subtle`, `accent`, `good`, `warn`, `error`),
 chat lines (`local-line`, `selected-line`, `chat-visual-line`,
 `chat-cursor-line`, `room-selected`), the status bar
-(`status-fill`, `status-section`), inputs (`join-input-active`,
+(`status-fill`, `status-section`) and composer frame (`composer-border`), inputs (`join-input-active`,
 `join-input-inactive`, `join-input-boundary-active`), form rows (`row-focused`,
 `selected-focused`), mode badges (`mode-server-select`, `mode-server-edit`,
 `mode-compose`, `mode-log`, `mode-settings`), editor selection

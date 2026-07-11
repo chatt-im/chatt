@@ -306,9 +306,32 @@ pub(crate) fn draw_room_screen(
     let key_preview_height = key_preview_height(app, screen.w);
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
-    let composer_height = composer_height(app, screen.w, screen.h.saturating_sub(4));
-    let composer_area = screen.take_bottom(composer_height as i32);
-    layout.composer_rect = composer_area;
+    // Keep config heights and divider dragging measured in editor rows. The
+    // optional half-block frame consumes two additional decorative rows.
+    let composer_padding = app.config.ui.composer_padding && screen.h >= 7;
+    let frame_rows = u16::from(composer_padding) * 2;
+    let composer_width = screen.w.saturating_sub(u16::from(composer_padding) * 2);
+    let composer_height =
+        composer_height(app, composer_width, screen.h.saturating_sub(4 + frame_rows));
+    let mut composer_frame = screen.take_bottom((composer_height + frame_rows) as i32);
+    layout.composer_frame_rect = composer_frame;
+    let top_border = if composer_padding {
+        composer_frame.take_top(1)
+    } else {
+        Rect::EMPTY
+    };
+    let bottom_border = if composer_padding {
+        composer_frame.take_bottom(1)
+    } else {
+        Rect::EMPTY
+    };
+    let composer_area = composer_frame;
+    let mut composer_editor_area = composer_area;
+    if composer_padding {
+        composer_editor_area.take_left(1);
+        composer_editor_area.take_right(1);
+    }
+    layout.composer_rect = composer_editor_area;
     layout.compose_bar_rect = status_area;
     let chat_log_bar_area = screen.take_bottom(1);
     layout.chat_log_bar_rect = chat_log_bar_area;
@@ -316,7 +339,9 @@ pub(crate) fn draw_room_screen(
     draw_chat_log_bar(chat_log_bar_area, app, focus, buf);
 
     draw_compose_bar(status_area, app, focus, buf, mode, status_label);
-    draw_composer(composer_area, app, focus, buf);
+    draw_composer_border(top_border, app.view.theme, '▀', buf);
+    draw_composer(composer_area, app, focus, composer_padding, buf);
+    draw_composer_border(bottom_border, app.view.theme, '▄', buf);
     draw_key_preview(key_preview_area, app, buf);
 }
 
@@ -2251,11 +2276,29 @@ fn draw_status_segment_right(row: &mut Rect, buf: &mut Buffer, style: Style, tex
     area
 }
 
-fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, buf: &mut Buffer) {
+fn draw_composer_border(area: Rect, theme: Theme, glyph: char, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
-    area.with(app.view.theme.panel).fill(buf);
+    let border = glyph.to_string().repeat(area.w as usize);
+    area.with(theme.composer_border.without_bg())
+        .text(buf, &border);
+}
+
+fn draw_composer(
+    mut area: Rect,
+    app: &mut RenderState<'_>,
+    focus: ChatPanelFocus,
+    padded: bool,
+    buf: &mut Buffer,
+) {
+    if area.is_empty() {
+        return;
+    }
+    if padded {
+        area.take_left(1);
+        area.take_right(1);
+    }
     app.view.composer.resize(area.w.max(1));
     app.view
         .refresh_command_completion(focus == ChatPanelFocus::Compose, app.view.theme.subtle);
@@ -2270,7 +2313,7 @@ fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, b
             .view
             .viewed_room
             .and_then(|room_id| app.room.room_name_of(room_id));
-        area.with(app.view.theme.panel.patch(app.view.theme.muted))
+        area.with(app.view.theme.subtle.without_bg())
             .with(Ellipsis(true))
             .text(buf, &composer_placeholder(room_name));
     }

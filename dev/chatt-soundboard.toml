@@ -7,7 +7,6 @@ tcp-addr = "127.0.0.1:41000"
 udp-addr = "127.0.0.1:41000"
 
 [ui]
-placeholder = "Soundboard: press 1 or type /sound 1"
 room-height = 4
 max-composer-height = 6
 max-messages = 50000

@@ -59,6 +59,8 @@ pub struct Theme {
     // Status bar.
     pub status_fill: Style,
     pub status_section: Style,
+    /// Half-block frame around the padded composer.
+    pub composer_border: Style,
     // Join / text inputs.
     pub join_input_active: Style,
     pub join_input_inactive: Style,
@@ -147,6 +149,7 @@ impl Theme {
             status_section: d
                 .with_bg_rgb(0x46, 0x46, 0x46)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
+            composer_border: d.with_fg_rgb(0x20, 0x20, 0x20),
             join_input_active: d
                 .with_bg_rgb(0x29, 0x29, 0x29)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
@@ -254,6 +257,7 @@ impl Theme {
             status_section: d
                 .with_bg_ansi(AnsiColor::Grey[6])
                 .with_fg_ansi(bright_white),
+            composer_border: d.with_fg_ansi(AnsiColor::Grey[2]),
             join_input_active: d
                 .with_bg_ansi(AnsiColor::Grey[4])
                 .with_fg_ansi(bright_white),
@@ -329,6 +333,7 @@ impl Theme {
             room_selected: d.with_bg_ansi(AnsiColor::Grey[25]).with_fg_ansi(black),
             status_fill: d.with_bg_ansi(AnsiColor::Grey[27]).with_fg_ansi(black),
             status_section: d.with_bg_ansi(AnsiColor::Grey[23]).with_fg_ansi(black),
+            composer_border: d.with_fg_ansi(AnsiColor::Grey[25]),
             join_input_active: d.with_bg_ansi(AnsiColor::Grey[27]).with_fg_ansi(black),
             join_input_inactive: d.with_bg_ansi(AnsiColor::Grey[28]).with_fg_ansi(black),
             join_input_boundary_active: d.with_bg_ansi(AnsiColor::Grey[22]).with_fg_ansi(black),
@@ -384,6 +389,7 @@ impl Theme {
             ThemeSlot::RoomSelected => &mut self.room_selected,
             ThemeSlot::StatusFill => &mut self.status_fill,
             ThemeSlot::StatusSection => &mut self.status_section,
+            ThemeSlot::ComposerBorder => &mut self.composer_border,
             ThemeSlot::JoinInputActive => &mut self.join_input_active,
             ThemeSlot::JoinInputInactive => &mut self.join_input_inactive,
             ThemeSlot::JoinInputBoundaryActive => &mut self.join_input_boundary_active,
