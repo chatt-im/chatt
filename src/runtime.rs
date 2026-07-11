@@ -143,6 +143,13 @@ fn run_app_inner(
             handle_runtime_command(&mut app, &mut clients, client_id, command);
         }
         app.tick();
+        for client in clients.values() {
+            client.view.lock().sync_daemon_config(
+                &app.config,
+                app.view.theme,
+                &app.view.server_catalog,
+            );
+        }
 
         let quit = app.take_quit_requested() || polling::termination_requested();
         let current_resize = polling::resize_count();

@@ -34,6 +34,27 @@ fi
 '''
 info = "Run the Alice client; trailing args run a chatt subcommand against it"
 
+[action.alice2]
+profiles = ["default", "pop"]
+require = ["server"]
+managed = false
+allow_multiple = true
+cli.forward_arguments = true
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
+env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
+env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
+sh = '''
+if [ "$#" -gt 0 ]; then
+  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-alice.toml "$@"
+else
+  rm -f /tmp/chatt-alice-2.kvlog
+  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice-2.kvlog
+fi
+'''
+info = "Run the Alice client; trailing args run a chatt subcommand against it"
+
 [action.bob]
 profiles = ["default", "pop"]
 require = ["server"]
@@ -83,6 +104,7 @@ env.CARGO_TERM_COLOR = "never"
 sh = '''
 kvlog /tmp/chatt-server.kvlog --json > /tmp/chatt-server.json
 kvlog /tmp/chatt-alice.kvlog --json > /tmp/chatt-alice.json
+kvlog /tmp/chatt-alice-2.kvlog --json > /tmp/chatt-alice-2.json || true
 kvlog /tmp/chatt-soundboard.kvlog --json > /tmp/chatt-soundboard.json
 '''
 
