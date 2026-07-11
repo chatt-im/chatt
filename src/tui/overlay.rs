@@ -10,7 +10,7 @@ use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, AppEvent, UserVolumeDialog},
+    app::{App, AppEvent, UserVolumeDialog, command::CoreCommand},
     bindings::{self, BindCommand, Resolved},
     client_net::NetworkEvent,
     clipboard_paste::{ImagePaste, ImagePasteOrigin, ImagePasteSource},
@@ -19,7 +19,10 @@ use crate::{
     tui::{
         Action,
         form::rect_contains,
-        mode::{AppMode, ChromeSpec, Coverage, ModePresentation, ModeTransition, is_quit_key},
+        mode::{
+            AppMode, ChromeSpec, Coverage, ModePresentation, ModeTransition, ViewCx, is_quit_key,
+        },
+        modes::process_global_command_cx,
         widgets::{RowPalette, button_label, draw_button, draw_labeled_editor_frame},
     },
 };
@@ -29,28 +32,37 @@ use crate::{
 /// The mode owns the [`UserVolumeDialog`]; event handling lives on [`App`] so it
 /// can reach the audio and config state the dialog mutates.
 pub(crate) struct DialogMode {
-    dialog: UserVolumeDialog,
+    dialog: Option<UserVolumeDialog>,
 }
 
 impl DialogMode {
     pub(crate) fn new(dialog: UserVolumeDialog) -> Self {
-        Self { dialog }
+        Self {
+            dialog: Some(dialog),
+        }
     }
 }
 
 impl AppMode for DialogMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        self.dialog.render(buf.rect(), buf, &app.view.theme);
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.render(buf.rect(), buf, &app.view.theme);
+        }
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
         if is_quit_key(&key) {
             return Action::Quit;
         }
-        let event = self.dialog.handle_key(key);
-        if app.apply_volume_event(event, &mut self.dialog) {
-            app.pop_mode();
+        let Some(mut dialog) = self.dialog.take() else {
+            return Action::Continue;
+        };
+        let event = dialog.handle_key(key);
+        {
+            let mut cx = app.view_cx();
+            cx.send(CoreCommand::ApplyVolume { event, dialog });
         }
+        app.drain_core_commands();
         Action::Continue
     }
 
@@ -66,7 +78,7 @@ pub(crate) enum ConfirmDisposition {
 
 /// Reusable yes/no confirmation overlay.
 ///
-/// The confirm action runs the stored callback against [`App`], then pops the
+/// The confirm action runs the stored callback against [`ViewCx`], then pops the
 /// overlay. Cancel just pops. The cancel button is selected by default so a
 /// stray `Enter` does not trigger a destructive action.
 pub(crate) struct ConfirmMode {
@@ -76,7 +88,7 @@ pub(crate) struct ConfirmMode {
     selected_confirm: bool,
     cancel_button: Rect,
     confirm_button: Rect,
-    on_confirm: Option<Box<dyn FnOnce(&mut App) -> ConfirmDisposition>>,
+    on_confirm: Option<Box<dyn FnOnce(&mut ViewCx<'_>) -> ConfirmDisposition>>,
 }
 
 impl ConfirmMode {
@@ -84,7 +96,7 @@ impl ConfirmMode {
         prompt: impl Into<String>,
         confirm_label: impl Into<String>,
         cancel_label: impl Into<String>,
-        on_confirm: impl FnOnce(&mut App) -> ConfirmDisposition + 'static,
+        on_confirm: impl FnOnce(&mut ViewCx<'_>) -> ConfirmDisposition + 'static,
     ) -> Self {
         Self {
             prompt: prompt.into(),
@@ -97,18 +109,60 @@ impl ConfirmMode {
         }
     }
 
-    fn confirm(&mut self, app: &mut App) {
+    fn confirm(&mut self, cx: &mut ViewCx<'_>) {
         let disposition = self
             .on_confirm
             .take()
-            .map(|callback| callback(app))
+            .map(|callback| callback(cx))
             .unwrap_or(ConfirmDisposition::Close);
         match disposition {
-            ConfirmDisposition::Close => app.pop_mode(),
+            ConfirmDisposition::Close => cx.request_transition(ModeTransition::Pop),
             ConfirmDisposition::Transition(transition) => {
-                app.request_mode_transition(transition);
+                cx.request_transition(transition);
             }
         }
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                cx.request_transition(ModeTransition::Pop)
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm(cx),
+            KeyCode::Enter => {
+                if self.selected_confirm {
+                    self.confirm(cx);
+                } else {
+                    cx.request_transition(ModeTransition::Pop);
+                }
+            }
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h')
+            | KeyCode::Char('l') => self.selected_confirm = !self.selected_confirm,
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::Continue;
+        }
+        if rect_contains(self.cancel_button, mouse.column, mouse.row) {
+            cx.request_transition(ModeTransition::Pop);
+        } else if rect_contains(self.confirm_button, mouse.column, mouse.row) {
+            self.confirm(cx);
+        }
+        Action::Continue
     }
 
     fn render_buttons(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
@@ -157,43 +211,21 @@ impl AppMode for ConfirmMode {
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        if matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => app.pop_mode(),
-            KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm(app),
-            KeyCode::Enter => {
-                if self.selected_confirm {
-                    self.confirm(app);
-                } else {
-                    app.pop_mode();
-                }
-            }
-            KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Tab
-            | KeyCode::BackTab
-            | KeyCode::Char('h')
-            | KeyCode::Char('l') => self.selected_confirm = !self.selected_confirm,
-            _ => {}
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return Action::Continue;
-        }
-        if rect_contains(self.cancel_button, mouse.column, mouse.row) {
-            app.pop_mode();
-        } else if rect_contains(self.confirm_button, mouse.column, mouse.row) {
-            self.confirm(app);
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_mouse_cx(&mut cx, mouse)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
@@ -218,20 +250,57 @@ impl NativeEncryptionWarningMode {
         }
     }
 
-    fn accept(&mut self, app: &mut App) {
-        app.accept_native_encryption_warning(&self.label);
+    fn accept(&mut self, cx: &mut ViewCx<'_>) {
+        cx.send(CoreCommand::AcceptNativeEncryption(self.label.clone()));
     }
 
-    fn cancel(&mut self, app: &mut App) {
-        app.cancel_native_encryption_warning();
+    fn cancel(&mut self, cx: &mut ViewCx<'_>) {
+        cx.send(CoreCommand::CancelNativeEncryption);
     }
 
-    fn process_command(&mut self, app: &mut App, command: BindCommand) -> Action {
+    fn process_command(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
         use BindCommand::*;
         match command {
-            Cancel => self.cancel(app),
-            Activate => self.accept(app),
-            command => return app.process_global_command(command),
+            Cancel => self.cancel(cx),
+            Activate => self.accept(cx),
+            command => return process_global_command_cx(cx, command),
+        }
+        Action::Continue
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if let Some(input) = InputKey::from_event(&key) {
+            match bindings::resolve(
+                &cx.config.bindings.router,
+                bindings::DIALOG_LAYER,
+                &mut cx.view.chrome.binding.pending_chord,
+                input,
+            ) {
+                Resolved::Action(id) => {
+                    let command = cx.config.bindings.actions.get(id).clone();
+                    return self.process_command(cx, command);
+                }
+                Resolved::Consumed => return Action::Continue,
+                Resolved::Unmatched => {}
+            }
+        }
+        Action::Continue
+    }
+
+    fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::Continue;
+        }
+        if rect_contains(self.cancel_button, mouse.column, mouse.row) {
+            self.cancel(cx);
+        } else if rect_contains(self.connect_button, mouse.column, mouse.row) {
+            self.accept(cx);
         }
         Action::Continue
     }
@@ -352,40 +421,21 @@ impl AppMode for NativeEncryptionWarningMode {
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        if matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        if let Some(input) = InputKey::from_event(&key) {
-            match bindings::resolve(
-                &app.config.bindings.router,
-                bindings::DIALOG_LAYER,
-                &mut app.view.chrome.binding.pending_chord,
-                input,
-            ) {
-                Resolved::Action(id) => {
-                    let command = app.config.bindings.actions.get(id).clone();
-                    return self.process_command(app, command);
-                }
-                Resolved::Consumed => return Action::Continue,
-                Resolved::Unmatched => {}
-            }
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return Action::Continue;
-        }
-        if rect_contains(self.cancel_button, mouse.column, mouse.row) {
-            self.cancel(app);
-        } else if rect_contains(self.connect_button, mouse.column, mouse.row) {
-            self.accept(app);
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_mouse_cx(&mut cx, mouse)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
@@ -717,7 +767,7 @@ impl PasswordPromptMode {
 /// staged temp file. The upload pipeline takes over once confirmed.
 pub(crate) struct PasteImageUploadMode {
     editor: Editor,
-    source: ImagePasteSource,
+    source: Option<ImagePasteSource>,
     origin: ImagePasteOrigin,
     dimensions: Option<(u32, u32)>,
     size: Option<u64>,
@@ -735,7 +785,7 @@ impl PasteImageUploadMode {
         let editor = filename_editor(theme);
         Self {
             editor,
-            source: image.source,
+            source: Some(image.source),
             origin: image.origin,
             dimensions: image.dimensions,
             size,
@@ -787,26 +837,84 @@ impl PasteImageUploadMode {
         }
     }
 
-    fn submit(&mut self, app: &mut App) {
-        let name = self.finalize_name();
-        match app.confirm_paste_image_upload(&self.source, name) {
-            Ok(()) => app.pop_mode(),
-            Err(error) => self.error = Some(error),
+    fn submit(&mut self, cx: &mut ViewCx<'_>) {
+        if cx.session.active_server_label.is_none() {
+            self.error = Some("select a server before uploading files".to_string());
+            return;
         }
+        let name = crate::client_net::sanitize_file_name(&self.finalize_name());
+        if name.len() > rpc::control::MAX_FILE_NAME_BYTES {
+            self.error = Some("file name is too long".to_string());
+            return;
+        }
+        let Some(source) = self.source.take() else {
+            return;
+        };
+        cx.send(CoreCommand::UploadPastedImage {
+            source,
+            raw_name: name,
+        });
+        cx.request_transition(ModeTransition::Pop);
     }
 
-    fn cancel(&mut self, app: &mut App) {
-        if self.source.is_staged() {
-            let _ = std::fs::remove_file(self.source.path());
+    fn cancel(&mut self, cx: &mut ViewCx<'_>) {
+        if let Some(source) = self.source.as_ref()
+            && source.is_staged()
+        {
+            let _ = std::fs::remove_file(source.path());
         }
-        app.pop_mode();
+        cx.request_transition(ModeTransition::Pop);
     }
 
-    fn process_command(&mut self, app: &mut App, command: BindCommand) -> Action {
+    fn process_command(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
         match command {
-            BindCommand::Cancel => self.cancel(app),
-            BindCommand::Activate => self.submit(app),
-            command => return app.process_global_command(command),
+            BindCommand::Cancel => self.cancel(cx),
+            BindCommand::Activate => self.submit(cx),
+            command => return process_global_command_cx(cx, command),
+        }
+        Action::Continue
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if key.code == KeyCode::Esc && self.editor.mode() == EditorMode::Insert {
+            self.editor.send_key(&key);
+            return Action::Continue;
+        }
+        if let Some(input) = InputKey::from_event(&key) {
+            match bindings::resolve(
+                &cx.config.bindings.router,
+                bindings::PASTE_LAYER,
+                &mut cx.view.chrome.binding.pending_chord,
+                input,
+            ) {
+                Resolved::Action(id) => {
+                    let command = cx.config.bindings.actions.get(id).clone();
+                    return self.process_command(cx, command);
+                }
+                Resolved::Consumed => return Action::Continue,
+                Resolved::Unmatched => {}
+            }
+        }
+        if self.editor.send_key(&key) {
+            self.error = None;
+        }
+        Action::Continue
+    }
+
+    fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::Continue;
+        }
+        if rect_contains(self.cancel_button, mouse.column, mouse.row) {
+            self.cancel(cx);
+        } else if rect_contains(self.upload_button, mouse.column, mouse.row) {
+            self.submit(cx);
         }
         Action::Continue
     }
@@ -933,38 +1041,12 @@ impl AppMode for PasteImageUploadMode {
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        if matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        // In insert mode, Esc leaves the editor's insert mode rather than
-        // cancelling the dialog. Cancel is reachable with a second Esc from
-        // normal mode.
-        if key.code == KeyCode::Esc && self.editor.mode() == EditorMode::Insert {
-            self.editor.send_key(&key);
-            return Action::Continue;
-        }
-        if let Some(input) = InputKey::from_event(&key) {
-            match bindings::resolve(
-                &app.config.bindings.router,
-                bindings::PASTE_LAYER,
-                &mut app.view.chrome.binding.pending_chord,
-                input,
-            ) {
-                Resolved::Action(id) => {
-                    let command = app.config.bindings.actions.get(id).clone();
-                    return self.process_command(app, command);
-                }
-                Resolved::Consumed => return Action::Continue,
-                Resolved::Unmatched => {}
-            }
-        }
-        if self.editor.send_key(&key) {
-            self.error = None;
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn process_paste(&mut self, _app: &mut App, text: String) {
@@ -973,15 +1055,12 @@ impl AppMode for PasteImageUploadMode {
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return Action::Continue;
-        }
-        if rect_contains(self.cancel_button, mouse.column, mouse.row) {
-            self.cancel(app);
-        } else if rect_contains(self.upload_button, mouse.column, mouse.row) {
-            self.submit(app);
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_mouse_cx(&mut cx, mouse)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
@@ -1150,7 +1229,10 @@ mod tests {
             ),
             &app.view.theme,
         );
-        mode.submit(&mut app);
+        {
+            let mut cx = app.view_cx();
+            mode.submit(&mut cx);
+        }
         assert!(mode.error.is_some());
         assert!(app.view.pending_transition.is_empty());
     }
@@ -1187,7 +1269,10 @@ mod tests {
             image_paste(ImagePasteSource::StagedFile(path.clone()), "staged.png"),
             &app.view.theme,
         );
-        mode.cancel(&mut app);
+        {
+            let mut cx = app.view_cx();
+            mode.cancel(&mut cx);
+        }
         assert!(!path.exists());
         assert!(!app.view.pending_transition.is_empty());
     }

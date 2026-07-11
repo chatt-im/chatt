@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use hashbrown::{HashMap, HashSet};
 
@@ -727,6 +731,10 @@ pub(crate) struct RoomSession {
     pub capture_stats: Option<crate::audio::AudioStats>,
     /// Input/output device catalog, refreshed by the core's device probes.
     pub audio_devices: super::AudioDeviceCatalog,
+    /// The daemon-global settings editor. Only one client may own the settings
+    /// screen at a time; the inner lock lets that screen update form layout
+    /// caches while holding only a shared session read guard.
+    pub settings: Option<Arc<Mutex<crate::tui::modes::SettingsSession>>>,
     muted_users: HashSet<UserId>,
     stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
@@ -1235,6 +1243,7 @@ impl RoomSession {
             playback_health: super::AudioSideHealth::default(),
             capture_stats: None,
             audio_devices: super::AudioDeviceCatalog::default(),
+            settings: None,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,

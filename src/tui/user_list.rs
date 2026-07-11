@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     app::{
         App,
+        command::CoreCommand,
         room::{UserListRow, UserPresence},
     },
     bindings::{self, BindCommand},
@@ -19,8 +20,10 @@ use crate::{
     tui::{
         Action,
         form::rect_contains,
-        mode::{AppMode, ChromeSpec, Coverage, ModePresentation, is_quit_key},
-        modes::{BindingResolution, resolve_binding},
+        mode::{
+            AppMode, ChromeSpec, Coverage, ModePresentation, ModeTransition, ViewCx, is_quit_key,
+        },
+        modes::{BindingResolution, process_global_command_cx, resolve_binding_cx},
         render::age_label,
     },
 };
@@ -192,29 +195,43 @@ impl UserListMode {
         self.select_index(next);
     }
 
-    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+    pub(crate) fn process_action_cx(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        command: BindCommand,
+    ) -> Action {
         use BindCommand::*;
         match command {
             SelectNext => self.move_selection(1, Wrap::Cycle),
             SelectPrev => self.move_selection(-1, Wrap::Cycle),
             HalfPageDown => self.move_selection((self.page_rows / 2).max(1) as isize, Wrap::Clamp),
             HalfPageUp => self.move_selection(-((self.page_rows / 2).max(1) as isize), Wrap::Clamp),
-            Activate => self.activate(app),
-            StartDm => self.start_dm(app),
+            Activate => self.activate(cx),
+            StartDm => self.start_dm(cx),
             SearchServers => {
                 self.searching = true;
                 self.filter.clear();
             }
-            Cancel => app.pop_mode(),
-            command => return app.process_global_command(command),
+            Cancel => cx.request_transition(ModeTransition::Pop),
+            command => return process_global_command_cx(cx, command),
         }
         Action::Continue
     }
 
+    #[cfg(test)]
+    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_action_cx(&mut cx, command)
+        };
+        app.drain_core_commands();
+        action
+    }
+
     /// Joins the selected user's room: view it and move the voice call there.
-    fn activate(&mut self, app: &mut App) {
+    fn activate(&mut self, cx: &mut ViewCx<'_>) {
         let Some(row) = self.selected_row() else {
-            app.set_error("no user selected");
+            cx.set_error("no user selected");
             return;
         };
         match &row.presence {
@@ -222,30 +239,30 @@ impl UserListMode {
                 room: Some((room_id, _)),
             } => {
                 let room_id = *room_id;
-                app.set_viewed_room(room_id);
-                app.join_voice_room(room_id);
-                app.pop_mode();
+                cx.send(CoreCommand::SetViewedRoom(room_id));
+                cx.send(CoreCommand::JoinVoice(room_id));
+                cx.request_transition(ModeTransition::Pop);
             }
             UserPresence::Online { room: None } => {
-                app.set_error(format!("{} is not in a room", row.name));
+                cx.set_error(format!("{} is not in a room", row.name));
             }
             UserPresence::AwaySeen { .. } | UserPresence::AwayUnseen => {
-                app.set_error(format!("{} is away", row.name));
+                cx.set_error(format!("{} is away", row.name));
             }
         }
     }
 
-    fn start_dm(&mut self, app: &mut App) {
+    fn start_dm(&mut self, cx: &mut ViewCx<'_>) {
         let Some(row) = self.selected_row() else {
-            app.set_error("no user selected");
+            cx.set_error("no user selected");
             return;
         };
         if row.is_local {
-            app.set_error("cannot dm yourself");
+            cx.set_error("cannot dm yourself");
             return;
         }
-        app.open_dm_with(row.user_id);
-        app.pop_mode();
+        cx.send(CoreCommand::OpenDm(row.user_id));
+        cx.request_transition(ModeTransition::Pop);
     }
 
     fn edit_filter(&mut self, key: KeyEvent) -> bool {
@@ -300,6 +317,52 @@ impl UserListMode {
             }
         }
         self.scroll = self.scroll.min(lines.len().saturating_sub(visible_rows));
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if self.searching {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => self.searching = false,
+                _ => {
+                    let _ = self.edit_filter(key);
+                }
+            }
+            return Action::Continue;
+        }
+        match resolve_binding_cx(cx, bindings::USER_LIST_LAYER, key) {
+            BindingResolution::Action(command) => self.process_action_cx(cx, command),
+            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
+        }
+    }
+
+    fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self
+                    .row_hits
+                    .iter()
+                    .find(|(rect, _)| rect_contains(*rect, mouse.column, mouse.row))
+                    .map(|(_, index)| *index);
+                let Some(index) = hit else {
+                    return Action::Continue;
+                };
+                if self.resolved_index() == Some(index) {
+                    self.activate(cx);
+                } else {
+                    self.select_index(index);
+                }
+            }
+            MouseEventKind::ScrollDown => self.move_selection(1, Wrap::Clamp),
+            MouseEventKind::ScrollUp => self.move_selection(-1, Wrap::Clamp),
+            _ => {}
+        }
+        Action::Continue
     }
 }
 
@@ -409,49 +472,21 @@ impl AppMode for UserListMode {
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        if matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        if self.searching {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => self.searching = false,
-                _ => {
-                    let _ = self.edit_filter(key);
-                }
-            }
-            return Action::Continue;
-        }
-        match resolve_binding(app, bindings::USER_LIST_LAYER, key) {
-            BindingResolution::Action(command) => self.process_action(app, command),
-            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
-        }
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                let hit = self
-                    .row_hits
-                    .iter()
-                    .find(|(rect, _)| rect_contains(*rect, mouse.column, mouse.row))
-                    .map(|(_, index)| *index);
-                let Some(index) = hit else {
-                    return Action::Continue;
-                };
-                if self.resolved_index() == Some(index) {
-                    self.activate(app);
-                } else {
-                    self.select_index(index);
-                }
-            }
-            MouseEventKind::ScrollDown => self.move_selection(1, Wrap::Clamp),
-            MouseEventKind::ScrollUp => self.move_selection(-1, Wrap::Clamp),
-            _ => {}
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_mouse_cx(&mut cx, mouse)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
