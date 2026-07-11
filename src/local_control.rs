@@ -5,7 +5,11 @@ mod imp {
         env, fs,
         io::{self, BufReader, IsTerminal, Read, Write},
         path::{Path, PathBuf},
-        sync::mpsc::{self, Sender, TryRecvError},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         thread::{self, JoinHandle},
         time::Duration,
     };
@@ -19,6 +23,7 @@ mod imp {
 
     use crate::app::EventSender;
     use crate::client_net::UploadFileRequest;
+    use extui::event::{Polled, poll_with_custom_waker, polling::Waker};
     use jsony::Jsony;
     use sendfd::RecvWithFd;
 
@@ -42,7 +47,6 @@ mod imp {
     const STATUS_ERROR: u8 = 1;
     const MAX_PATH_BYTES: u32 = 64 * 1024;
     const MAX_RESPONSE_BYTES: u32 = 256 * 1024;
-    const ACCEPT_SLEEP: Duration = Duration::from_millis(20);
     const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
     /// Poll interval for `client-logs --follow` streaming.
     const FOLLOW_POLL: Duration = Duration::from_millis(150);
@@ -247,11 +251,65 @@ mod imp {
             .ok_or_else(|| "output-volume value must be finite".to_string())
     }
 
+    struct WorkerShutdown {
+        requested: AtomicBool,
+        waker: Waker,
+    }
+
+    impl WorkerShutdown {
+        fn new() -> io::Result<Self> {
+            Ok(Self {
+                requested: AtomicBool::new(false),
+                waker: Waker::new()?,
+            })
+        }
+
+        fn request(&self) -> io::Result<()> {
+            self.requested.store(true, Ordering::Release);
+            self.waker.wake()
+        }
+
+        fn is_requested(&self) -> bool {
+            self.requested.load(Ordering::Acquire)
+        }
+    }
+
+    fn run_control_worker(
+        listener: UnixListener,
+        events: EventSender,
+        shutdown: Arc<WorkerShutdown>,
+    ) {
+        loop {
+            match poll_with_custom_waker(&listener, Some(&shutdown.waker), None) {
+                Ok(Polled::Woken) => break,
+                Ok(Polled::ReadReady) if shutdown.is_requested() => break,
+                Ok(Polled::ReadReady) => match listener.accept() {
+                    Ok((_stream, _addr)) if shutdown.is_requested() => break,
+                    Ok((stream, _addr)) => handle_connection(stream, &events),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => {
+                        kvlog::warn!("local control accept failed", error = %error);
+                        break;
+                    }
+                },
+                Ok(Polled::TimedOut) => {}
+                Err(error) => {
+                    kvlog::warn!("local control poll failed", error = %error);
+                    break;
+                }
+            }
+        }
+    }
+
     pub struct ControlSocket {
         path: PathBuf,
         socket_identity: (u64, u64),
         _leadership: fs::File,
-        shutdown: Sender<()>,
+        shutdown: Arc<WorkerShutdown>,
         worker: Option<JoinHandle<()>>,
     }
 
@@ -290,31 +348,15 @@ mod imp {
                 .set_nonblocking(true)
                 .map_err(|error| format!("failed to make control socket nonblocking: {error}"))?;
 
+            let shutdown = Arc::new(WorkerShutdown::new().map_err(|error| {
+                format!("failed to create local control worker waker: {error}")
+            })?);
+            let worker_shutdown = Arc::clone(&shutdown);
             let path = config.path;
-            let (shutdown_tx, shutdown_rx) = mpsc::channel();
             let worker = thread::Builder::new()
                 .name("chatt-local-ctl".to_string())
                 .stack_size(256 * 1024)
-                .spawn(move || {
-                    loop {
-                        match shutdown_rx.try_recv() {
-                            Ok(()) | Err(TryRecvError::Disconnected) => break,
-                            Err(TryRecvError::Empty) => {}
-                        }
-
-                        match listener.accept() {
-                            Ok((stream, _addr)) => handle_connection(stream, &events),
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                thread::sleep(ACCEPT_SLEEP);
-                            }
-                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                            Err(error) => {
-                                kvlog::warn!("local control accept failed", error = %error);
-                                thread::sleep(ACCEPT_SLEEP);
-                            }
-                        }
-                    }
-                })
+                .spawn(move || run_control_worker(listener, events, worker_shutdown))
                 .map_err(|error| format!("failed to spawn local control worker: {error}"))?;
 
             kvlog::info!("local control socket listening", path = %path.display());
@@ -322,7 +364,7 @@ mod imp {
                 path,
                 socket_identity,
                 _leadership: leadership,
-                shutdown: shutdown_tx,
+                shutdown,
                 worker: Some(worker),
             })
         }
@@ -338,7 +380,9 @@ mod imp {
 
     impl Drop for ControlSocket {
         fn drop(&mut self) {
-            let _ = self.shutdown.send(());
+            if let Err(error) = self.shutdown.request() {
+                kvlog::warn!("failed to wake local control worker for shutdown", error = %error);
+            }
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
             }
@@ -1605,6 +1649,49 @@ mod imp {
             assert!(truncated.len() <= MAX_RESPONSE_BYTES as usize);
             assert!(truncated.ends_with("bytes"));
             assert!(truncated.contains("response truncated"));
+        }
+
+        #[test]
+        fn worker_shutdown_wakes_idle_poll() {
+            let (idle, _peer) = UnixStream::pair().unwrap();
+            let shutdown = Arc::new(WorkerShutdown::new().unwrap());
+            let worker_shutdown = Arc::clone(&shutdown);
+            let (result_tx, result_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let result = poll_with_custom_waker(&idle, Some(&worker_shutdown.waker), None);
+                result_tx.send(result).unwrap();
+            });
+
+            shutdown.request().unwrap();
+
+            assert_eq!(
+                result_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap(),
+                Polled::Woken
+            );
+            worker.join().unwrap();
+        }
+
+        #[test]
+        fn worker_shutdown_preempts_ready_listener() {
+            let dir = temp_test_dir("shutdown-preempts-listener");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut client = UnixStream::connect(&socket_path).unwrap();
+            write_voice_request(&mut client, VoiceCommand::ToggleMute).unwrap();
+            let (events_tx, events_rx) = mpsc::channel();
+            let shutdown = Arc::new(WorkerShutdown::new().unwrap());
+            shutdown.request().unwrap();
+
+            run_control_worker(listener, EventSender(events_tx), shutdown);
+
+            assert!(events_rx.try_recv().is_err());
+            let _ = fs::remove_file(socket_path);
+            let _ = fs::remove_dir_all(dir);
         }
 
         #[test]
