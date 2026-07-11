@@ -414,7 +414,12 @@ pub enum NetworkCommand {
         room_id: RoomId,
         target: MessageId,
     },
-    UploadFile(UploadFileRequest),
+    UploadFile {
+        /// An explicit terminal-local target. `None` is reserved for external
+        /// control clients, which intentionally use the daemon active room.
+        room_id: Option<RoomId>,
+        request: UploadFileRequest,
+    },
     /// Aborts an in-flight file transfer identified by its server transfer id.
     /// The worker resolves the direction: an outgoing upload is canceled
     /// ([`ClientControl::UploadFileCancel`]); an incoming download is skipped
@@ -3036,8 +3041,8 @@ impl WorkerState {
                 );
                 self.queue_control(ClientControl::DeleteChat { room_id, target })?;
             }
-            NetworkCommand::UploadFile(request) => {
-                self.queue_file_upload(request);
+            NetworkCommand::UploadFile { room_id, request } => {
+                self.queue_file_upload(room_id, request);
             }
             NetworkCommand::CancelTransfer { transfer_id } => {
                 self.cancel_transfer(transfer_id)?;
@@ -3256,8 +3261,8 @@ impl WorkerState {
         self.send_p2p_voice(stream_id, sequence, timestamp, frame.flags, &frame.payload);
     }
 
-    fn queue_file_upload(&mut self, request: UploadFileRequest) {
-        match self.prepare_file_upload(request) {
+    fn queue_file_upload(&mut self, room_id: Option<RoomId>, request: UploadFileRequest) {
+        match self.prepare_file_upload(room_id, request) {
             Ok(upload) => {
                 let name = upload.name.clone();
                 let size = upload.size;
@@ -3275,6 +3280,7 @@ impl WorkerState {
 
     fn prepare_file_upload(
         &mut self,
+        room_id: Option<RoomId>,
         request: UploadFileRequest,
     ) -> Result<OutgoingUpload, String> {
         let UploadFileRequest {
@@ -3363,8 +3369,8 @@ impl WorkerState {
         );
         let transfer_id = FileTransferId(self.next_file_transfer);
         self.next_file_transfer = self.next_file_transfer.wrapping_add(1).max(1);
-        let room_id = self
-            .active_room
+        let room_id = room_id
+            .or(self.active_room)
             .ok_or_else(|| "no active room for upload".to_string())?;
         Ok(OutgoingUpload {
             transfer_id,
@@ -5959,7 +5965,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SendChat { .. } => "send_chat",
         NetworkCommand::EditChat { .. } => "edit_chat",
         NetworkCommand::DeleteChat { .. } => "delete_chat",
-        NetworkCommand::UploadFile(_) => "upload_file",
+        NetworkCommand::UploadFile { .. } => "upload_file",
         NetworkCommand::CancelTransfer { .. } => "cancel_transfer",
         NetworkCommand::SetActiveRoom(_) => "set_active_room",
         NetworkCommand::JoinVoice(_) => "join_voice",

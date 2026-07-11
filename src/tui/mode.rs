@@ -1,9 +1,11 @@
+use std::collections::VecDeque;
+
 use extui::{
     Buffer,
     event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent},
 };
 use extui_bindings::LayerId;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 
 use crate::{
     app::{RoomSession, command::CoreCommand},
@@ -20,7 +22,7 @@ pub(crate) enum CommandSink<'a> {
     Local(&'a mut Vec<CoreCommand>),
     Channel {
         client_id: ClientId,
-        sender: &'a Sender<(ClientId, CoreCommand)>,
+        sender: &'a SyncSender<(ClientId, CoreCommand)>,
     },
 }
 
@@ -146,30 +148,26 @@ pub(crate) enum ModeTransition {
     Pop,
 }
 
-/// The single deferred transition slot.
+/// Ordered navigation requests waiting for the render-owned mode stack.
 ///
-/// Requesting twice during one dispatch is a programming error. Keeping this a
-/// slot rather than a queue makes event ordering explicit at the runtime loop.
+/// Producers run on both sides of the core/render boundary and may complete in
+/// one runtime batch. A FIFO queue preserves every request until the renderer
+/// applies it, so independently produced transitions cannot collide or replace
+/// one another.
 #[derive(Default)]
-pub(crate) struct PendingTransition(Option<ModeTransition>);
+pub(crate) struct PendingTransitions(VecDeque<ModeTransition>);
 
-impl PendingTransition {
+impl PendingTransitions {
     pub(crate) fn request(&mut self, transition: ModeTransition) {
-        debug_assert!(
-            self.0.is_none(),
-            "a dispatch requested multiple mode transitions"
-        );
-        if self.0.is_none() {
-            self.0 = Some(transition);
-        }
+        self.0.push_back(transition);
     }
 
-    pub(crate) fn take(&mut self) -> Option<ModeTransition> {
-        self.0.take()
+    pub(crate) fn pop_front(&mut self) -> Option<ModeTransition> {
+        self.0.pop_front()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_none()
+        self.0.is_empty()
     }
 }
 
@@ -227,8 +225,8 @@ impl ModeStack {
         self.active_mut().process_paste(cx, text);
     }
 
-    /// Applies at most one requested transition. A root pop is an explicit
-    /// no-op; navigation must use `Set` to replace the root.
+    /// Applies every queued transition in request order. A root pop is an
+    /// explicit no-op; navigation must use `Set` to replace the root.
     #[cfg(test)]
     pub(crate) fn apply_pending(&mut self, app: &mut App) {
         {
@@ -239,10 +237,12 @@ impl ModeStack {
     }
 
     pub(crate) fn apply_pending_cx(&mut self, cx: &mut ViewCx<'_>) {
-        let Some(transition) = cx.view.pending_transition.take() else {
-            return;
-        };
+        while let Some(transition) = cx.view.pending_transition.pop_front() {
+            self.apply_transition(cx, transition);
+        }
+    }
 
+    fn apply_transition(&mut self, cx: &mut ViewCx<'_>, transition: ModeTransition) {
         // Chords never cross a navigation boundary, including overlays.
         cx.view.chrome.binding.pending_chord = None;
 
@@ -436,11 +436,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "multiple mode transitions")]
-    fn requesting_two_transitions_in_one_dispatch_panics() {
-        let mut pending = PendingTransition::default();
-        pending.request(ModeTransition::Pop);
-        pending.request(ModeTransition::Pop);
+    fn queued_transitions_apply_once_in_request_order() {
+        let mut app = app();
+        let mut stack = ModeStack::new(Box::new(ServerListMode::new()), &mut app);
+
+        app.push_mode(Box::new(OverlayMode));
+        app.pop_mode();
+        stack.apply_pending(&mut app);
+
+        assert_eq!(stack.depth(), 1);
+        assert!(app.view.pending_transition.is_empty());
     }
 
     #[test]

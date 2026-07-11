@@ -547,14 +547,23 @@ fn run_interactive_app(
     let mut retaking = false;
     loop {
         if pending_join.is_none() {
-            match crate::attach::run_thin_client()? {
-                crate::attach::AttachOutcome::UserQuit => return Ok(()),
-                crate::attach::AttachOutcome::MasterGone => {
+            match crate::attach::run_thin_client() {
+                Err(_error) if retaking => {
+                    // The old master may be draining between accept and ACK,
+                    // or another contender may still be publishing the new
+                    // socket. Treat transient attach transport failures during
+                    // handoff as election retries.
+                    takeover_jitter();
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+                Ok(crate::attach::AttachOutcome::UserQuit) => return Ok(()),
+                Ok(crate::attach::AttachOutcome::MasterGone) => {
                     retaking = true;
                     takeover_jitter();
                     continue;
                 }
-                crate::attach::AttachOutcome::NoMaster => {}
+                Ok(crate::attach::AttachOutcome::NoMaster) => {}
             }
         }
 
@@ -575,7 +584,12 @@ fn run_interactive_app(
                 }
                 takeover_jitter();
             }
-            result => return result,
+            result => {
+                if retaking {
+                    crate::attach::restore_saved_terminal_state();
+                }
+                return result;
+            }
         }
     }
 }

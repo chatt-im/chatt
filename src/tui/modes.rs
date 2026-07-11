@@ -845,6 +845,8 @@ impl SettingsMode {
         let mut session = SettingsSession::new(&app.config, &app.room.audio_devices);
         session.form = form;
         app.room.settings = Some(std::sync::Arc::new(std::sync::Mutex::new(session)));
+        app.room
+            .set_settings_owner_for_test(crate::client_channel::ClientId::PRIMARY);
         Self
     }
 
@@ -1272,7 +1274,10 @@ impl RoomMode {
             }),
             crate::app::ComposerSubmission::Command(input) => {
                 if !self.run_ui_slash(cx, &input) {
-                    cx.send(CoreCommand::RunSlash { input });
+                    cx.send(CoreCommand::RunSlash {
+                        room_id: cx.view.viewed_room,
+                        input,
+                    });
                 }
             }
         }

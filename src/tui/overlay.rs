@@ -600,6 +600,10 @@ impl AppMode for PasswordPromptMode {
         use crate::client_channel::ClientEvent;
 
         match event {
+            ClientEvent::SetError(_) => {}
+            ClientEvent::OpenPairingPasswordChallenge { retry } => {
+                self.apply_password_challenge(retry);
+            }
             ClientEvent::PairingPasswordChallenge { retry, .. } => {
                 self.apply_password_challenge(retry);
             }
@@ -822,6 +826,7 @@ impl PasteImageUploadMode {
             return;
         };
         cx.send(CoreCommand::UploadPastedImage {
+            room_id: cx.view.viewed_room,
             source,
             raw_name: name,
         });

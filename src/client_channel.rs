@@ -2,15 +2,11 @@ use std::{
     io,
     sync::{
         Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use extui::event::polling::Waker;
-
-const TERMINATE: u64 = 1 << 63;
-const HANDOFF: u64 = 1 << 62;
-const RESIZE_MASK: u64 = HANDOFF - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ClientId(pub(crate) u32);
@@ -23,6 +19,8 @@ impl ClientId {
 /// session. The pairing variants replace the last App-owned mode callback.
 #[derive(Debug)]
 pub(crate) enum ClientEvent {
+    SetError(String),
+    OpenPairingPasswordChallenge { retry: bool },
     PairingPasswordChallenge { retry: bool },
     PairingSucceeded,
     PairingFailed(String),
@@ -38,7 +36,9 @@ pub(crate) struct ClientActions {
 /// Core-to-render-thread signalling for one terminal.
 pub(crate) struct ClientChannel {
     pub(crate) waker: Waker,
-    state: AtomicU64,
+    terminate: AtomicBool,
+    handoff: AtomicBool,
+    resize_generation: AtomicU64,
     events: Mutex<Vec<ClientEvent>>,
 }
 
@@ -46,7 +46,9 @@ impl ClientChannel {
     pub(crate) fn new() -> io::Result<Self> {
         Ok(Self {
             waker: Waker::new()?,
-            state: AtomicU64::new(0),
+            terminate: AtomicBool::new(false),
+            handoff: AtomicBool::new(false),
+            resize_generation: AtomicU64::new(0),
             events: Mutex::new(Vec::new()),
         })
     }
@@ -56,17 +58,17 @@ impl ClientChannel {
     }
 
     pub(crate) fn terminate(&self) {
-        self.state.fetch_or(TERMINATE, Ordering::Release);
+        self.terminate.store(true, Ordering::Release);
         self.wake();
     }
 
     pub(crate) fn handoff(&self) {
-        self.state.fetch_or(HANDOFF, Ordering::Release);
+        self.handoff.store(true, Ordering::Release);
         self.wake();
     }
 
     pub(crate) fn resize(&self) {
-        self.state.fetch_add(1, Ordering::Release);
+        self.resize_generation.fetch_add(1, Ordering::Release);
         self.wake();
     }
 
@@ -83,13 +85,12 @@ impl ClientChannel {
     }
 
     pub(crate) fn actions(&self, previous_resize: &mut u64) -> ClientActions {
-        let state = self.state.load(Ordering::Acquire);
-        let resize = state & RESIZE_MASK;
+        let resize = self.resize_generation.load(Ordering::Acquire);
         let resized = resize != *previous_resize;
         *previous_resize = resize;
         ClientActions {
-            terminate: state & TERMINATE != 0,
-            handoff: state & HANDOFF != 0,
+            terminate: self.terminate.load(Ordering::Acquire),
+            handoff: self.handoff.load(Ordering::Acquire),
             resized,
         }
     }

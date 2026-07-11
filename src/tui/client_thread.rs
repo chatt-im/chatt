@@ -2,7 +2,7 @@ use std::{
     fs::File,
     io::{self, Write},
     os::fd::{FromRawFd, RawFd},
-    sync::{Arc, mpsc::Sender},
+    sync::{Arc, mpsc::SyncSender},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,18 +15,20 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::{
     app::{RoomSession, command::CoreCommand},
-    client_channel::{ClientChannel, ClientId},
+    client_channel::{ClientChannel, ClientEvent, ClientId},
     config::Config,
     tui::{
         Action,
         mode::{AppMode, CommandSink, ViewCx},
         mode_stack::ModeStack,
         modes::{RoomMode, ServerListMode, WelcomeMode},
+        overlay::PasswordPromptMode,
         view::ClientView,
     },
 };
 
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) enum InitialMode {
     Welcome(WelcomeMode),
@@ -42,7 +44,7 @@ pub(crate) struct ClientThread {
     pub(crate) session: Arc<RwLock<RoomSession>>,
     pub(crate) view: Arc<Mutex<ClientView>>,
     pub(crate) config: Arc<RwLock<Config>>,
-    pub(crate) commands: Sender<(ClientId, CoreCommand)>,
+    pub(crate) commands: SyncSender<(ClientId, CoreCommand)>,
     pub(crate) initial_mode: InitialMode,
     pub(crate) follow_primary_view: bool,
 }
@@ -87,6 +89,7 @@ impl ClientThread {
             let config = config.read();
             crate::url_open::UrlOpener::new(config.url_open.clone())
         };
+        let mut url_open_command = config.read().url_open.clone();
 
         let root: Box<dyn AppMode> = match initial_mode {
             InitialMode::Welcome(mode) => Box::new(mode),
@@ -126,25 +129,29 @@ impl ClientThread {
                 let (width, height) = terminal.size()?;
                 buffer.resize(width, height);
             }
-            for event in channel.drain_events() {
-                mode_stack.process_client_event(event);
-            }
+            let client_events = channel.drain_events();
 
-            {
+            let active_animation = {
                 let session = session.read();
                 let config = config.read();
                 let mut view = view.lock();
+                view.status.expire(std::time::Instant::now());
+                if url_open_command != config.url_open {
+                    url_open_command = config.url_open.clone();
+                    url_opener = crate::url_open::UrlOpener::new(url_open_command.clone());
+                }
                 let previous_room = view.viewed_room;
-                if follow_primary_view {
-                    view.sync_active(&session);
+                let epoch_changed = if follow_primary_view {
+                    view.sync_active(&session)
                 } else {
-                    view.sync_independent(&session);
+                    let epoch_changed = view.sync_independent(&session);
                     if view.viewed_room != previous_room
                         && let Some(room_id) = view.viewed_room
                     {
                         let _ = commands.send((id, CoreCommand::SetViewedRoom(room_id)));
                     }
-                }
+                    epoch_changed
+                };
                 let mut cx = ViewCx {
                     view: &mut view,
                     session: &session,
@@ -154,16 +161,31 @@ impl ClientThread {
                         sender: &commands,
                     },
                 };
-                mode_stack.apply_pending_cx(&mut cx);
+                if epoch_changed {
+                    let mode: Box<dyn AppMode> = if session.network_selected {
+                        Box::new(RoomMode::default())
+                    } else {
+                        Box::new(ServerListMode::new())
+                    };
+                    cx.request_transition(crate::tui::mode::ModeTransition::Set(mode));
+                    mode_stack.apply_pending_cx(&mut cx);
+                }
+                process_client_events(&mut mode_stack, &mut cx, client_events);
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_millis() as u64)
                     .unwrap_or(0);
                 mode_stack.render_cx(&mut cx, &mut buffer, now_ms);
-            }
+                session.capture_stats.is_some()
+            };
             buffer.render(&mut terminal);
 
-            match event::poll_with_custom_waker(&stdin, Some(&channel.waker), Some(POLL_INTERVAL))?
+            let poll_interval = if active_animation {
+                ACTIVE_POLL_INTERVAL
+            } else {
+                IDLE_POLL_INTERVAL
+            };
+            match event::poll_with_custom_waker(&stdin, Some(&channel.waker), Some(poll_interval))?
             {
                 Polled::ReadReady => events.read_from(&stdin)?,
                 Polled::Woken | Polled::TimedOut => {}
@@ -221,5 +243,56 @@ impl ClientThread {
             }
         }
         Ok(())
+    }
+}
+
+fn process_client_events(
+    mode_stack: &mut ModeStack,
+    cx: &mut ViewCx<'_>,
+    client_events: Vec<ClientEvent>,
+) {
+    for event in client_events {
+        match event {
+            ClientEvent::SetError(error) => cx.set_error(error),
+            ClientEvent::OpenPairingPasswordChallenge { retry } => cx.request_transition(
+                crate::tui::mode::ModeTransition::Push(Box::new(PasswordPromptMode::new(retry))),
+            ),
+            ClientEvent::PairingSucceeded => {
+                mode_stack.process_client_event(ClientEvent::PairingSucceeded);
+                cx.request_transition(crate::tui::mode::ModeTransition::Pop);
+            }
+            event => mode_stack.process_client_event(event),
+        }
+        // Each channel event is its own dispatch. Apply its navigation before
+        // the next event so that event observes the mode produced by the one
+        // before it, even when both arrived in the same drained batch.
+        mode_stack.apply_pending_cx(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{app::App, config::Config};
+
+    #[test]
+    fn pairing_transitions_apply_between_batched_client_events() {
+        let mut app = App::new(Config::default(), None).expect("test app");
+        let mut stack = ModeStack::new(Box::new(ServerListMode::new()), &mut app);
+
+        {
+            let mut cx = app.view_cx();
+            process_client_events(
+                &mut stack,
+                &mut cx,
+                vec![
+                    ClientEvent::OpenPairingPasswordChallenge { retry: false },
+                    ClientEvent::PairingSucceeded,
+                ],
+            );
+        }
+
+        assert_eq!(stack.depth(), 1);
+        assert!(app.view.pending_transition.is_empty());
     }
 }
