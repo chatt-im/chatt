@@ -6978,7 +6978,8 @@ mod tests {
         let mut completed = false;
         let mut final_at_start = false;
         while !completed {
-            let payload = read_plaintext_server_payload(&mut peer);
+            let payload =
+                read_plaintext_server_payload_while_flushing(&mut server, Token(11), &mut peer);
             assert!(payload.len() <= rpc::control::MAX_CONTROL_PAYLOAD_BYTES);
             let chunk = decode_history_chunk(&payload);
             assert_eq!(chunk.room_id, RoomId(1));
@@ -9183,6 +9184,42 @@ mod tests {
         peer.read_exact(&mut len).expect("read frame length");
         let mut frame = vec![0u8; u32::from_le_bytes(len) as usize];
         peer.read_exact(&mut frame).expect("read frame body");
+        frame
+    }
+
+    /// Reads a frame while driving the server's nonblocking writer. Production
+    /// does this from writable poll events; large-frame tests have to model it
+    /// explicitly because socket buffer capacity varies by operating system.
+    fn read_plaintext_server_payload_while_flushing(
+        server: &mut Server,
+        token: Token,
+        peer: &mut std::net::TcpStream,
+    ) -> Vec<u8> {
+        peer.set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("set read timeout");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut read_exact = |buf: &mut [u8], what: &str| {
+            let mut offset = 0;
+            while offset < buf.len() {
+                server.write_client(token);
+                match peer.read(&mut buf[offset..]) {
+                    Ok(0) => panic!("server closed while reading {what}"),
+                    Ok(read) => offset += read,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("read {what}: {error}"),
+                }
+                assert!(Instant::now() < deadline, "timed out reading {what}");
+            }
+        };
+
+        let mut len = [0u8; 4];
+        read_exact(&mut len, "frame length");
+        let mut frame = vec![0u8; u32::from_le_bytes(len) as usize];
+        read_exact(&mut frame, "frame body");
         frame
     }
 

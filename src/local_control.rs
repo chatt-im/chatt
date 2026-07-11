@@ -1914,15 +1914,12 @@ mod imp {
             let _ = fs::remove_dir_all(dir);
         }
 
-        fn temp_test_dir(name: &str) -> PathBuf {
+        fn temp_test_dir(_name: &str) -> PathBuf {
             let suffix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            env::temp_dir().join(format!(
-                "chatt-local-control-{name}-{}-{suffix}",
-                std::process::id()
-            ))
+            env::temp_dir().join(format!("clc-{:x}-{suffix:x}", std::process::id()))
         }
     }
 }

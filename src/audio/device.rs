@@ -2207,6 +2207,18 @@ mod tests {
         assert!(looks_like_alsa_pcm_name("surround2"));
         assert!(looks_like_alsa_pcm_name("hw:0,0"));
         assert!(looks_like_alsa_pcm_name("plughw:CARD=PCH,DEV=0"));
+        assert!(!looks_like_alsa_pcm_name("usb microphone"));
+        assert!(!looks_like_alsa_pcm_name(""));
+    }
+
+    #[test]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    ))]
+    fn parses_alsa_pcm_names_as_device_ids() {
         assert_eq!(
             parse_configured_device_id("alsa/hw:0,0")
                 .map(|id| id.to_string())
@@ -2220,8 +2232,6 @@ mod tests {
             Some("alsa:my_custom_pcm")
         );
         assert_eq!(parse_configured_device_id("my_custom_pcm"), None);
-        assert!(!looks_like_alsa_pcm_name("usb microphone"));
-        assert!(!looks_like_alsa_pcm_name(""));
     }
 
     #[test]
