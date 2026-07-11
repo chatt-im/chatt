@@ -1419,14 +1419,6 @@ impl VirtualChatBuffer {
         1 + block.body_lines + usize::from(block.collapsed)
     }
 
-    pub fn total_lines_estimate(&self) -> usize {
-        self.messages
-            .iter()
-            .map(|message| message.layout.total_lines_estimate(&message.body))
-            .sum::<usize>()
-            .max(1)
-    }
-
     fn total_lines_exact(&mut self, width: u16) -> usize {
         self.ensure_layout_index(width);
         self.layout_index.total_rows()
@@ -1765,15 +1757,6 @@ impl MessageLayout {
             .min(text_len)
             .max(start);
         start..end
-    }
-
-    fn total_lines_estimate(&self, text: &str) -> usize {
-        if self.complete {
-            self.lines()
-        } else {
-            self.estimated_lines
-                .max(estimate_lines(text, self.wrap_width.max(1) as usize))
-        }
     }
 
     fn reset_layout(&mut self, width: u16, text: &str) {

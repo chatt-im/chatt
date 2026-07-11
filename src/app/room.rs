@@ -1041,6 +1041,7 @@ pub(crate) struct ParticipantNotice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HistoryChunkUpdate {
     pub(crate) changed: bool,
+    pub(crate) read_advanced: bool,
     pub(crate) next_backfill: Option<(RoomId, Option<MessageId>, u16)>,
 }
 
@@ -1717,6 +1718,19 @@ impl RoomSession {
         false
     }
 
+    /// Acknowledges the authoritative server head after the newest history
+    /// page has been displayed. The head may be an edit or delete record that
+    /// does not survive as a visible message in the folded history response.
+    fn mark_room_head_read(&mut self, room_id: RoomId) -> bool {
+        let Some(meta) = self.metas.get_mut(&room_id) else {
+            return false;
+        };
+        let previous = meta.last_read;
+        meta.unread = 0;
+        meta.last_read = meta.head.max(meta.last_read);
+        meta.last_read != previous
+    }
+
     /// Loads the room catalog persisted for this server and shows the last
     /// viewed room's capture without a live connection.
     pub(crate) fn load_offline_catalog(
@@ -2009,6 +2023,10 @@ impl RoomSession {
             );
         }
         let changed = self.merge_history(room_id, messages);
+        let read_advanced = completion.is_some()
+            && before.is_none()
+            && self.room_is_viewed(room_id)
+            && self.mark_room_head_read(room_id);
         self.clear_history_gap_if_bridged(room_id, page_oldest);
         let next_backfill = if completion.is_some() {
             self.gap_backfill_request(room_id)
@@ -2017,6 +2035,7 @@ impl RoomSession {
         };
         HistoryChunkUpdate {
             changed,
+            read_advanced,
             next_backfill,
         }
     }
@@ -3466,6 +3485,42 @@ mod tests {
         assert!(!items[0].behind_head, "checkout marks the viewed room read");
         assert!(items[1].behind_head);
         assert_eq!(items[1].unread, 0);
+    }
+
+    #[test]
+    fn viewed_initial_history_acknowledges_folded_server_head() {
+        let mut room = test_room();
+        let mut lobby = room_info(1);
+        let server_head = Some(MessageId(5));
+        lobby.head = server_head;
+        room.authenticated(
+            &[lobby, room_info(2)],
+            Vec::new(),
+            RoomId(2),
+            None,
+            Some(UserId(1)),
+        );
+
+        assert!(room.set_viewed_room(RoomId(1)));
+        assert!(room.begin_history_fetch(RoomId(1)));
+        let update = room.history_chunk_received(
+            RoomId(1),
+            None,
+            vec![message_in(RoomId(1), 1, UserId(2), "visible")],
+            true,
+            true,
+            Some(UserId(1)),
+        );
+
+        assert!(update.read_advanced);
+        assert_eq!(room.room_meta(RoomId(1)).unwrap().last_read, server_head);
+        assert!(room.set_viewed_room(RoomId(2)));
+        let lobby = room
+            .room_select_items(None)
+            .into_iter()
+            .find(|item| item.room_id == RoomId(1))
+            .unwrap();
+        assert!(!lobby.behind_head);
     }
 
     #[test]

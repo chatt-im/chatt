@@ -37,6 +37,8 @@ pub(crate) struct LobbyBarLayout {
     pub(crate) audio_widget: Rect,
     /// The `[reset]` button; `Rect::EMPTY` while audio is healthy (hidden).
     pub(crate) audio_reset: Rect,
+    /// The `JOIN` / `LEAVE` voice-call button at the far right.
+    pub(crate) call_button: Rect,
 }
 
 impl Default for LobbyBarLayout {
@@ -44,6 +46,7 @@ impl Default for LobbyBarLayout {
         Self {
             audio_widget: Rect::EMPTY,
             audio_reset: Rect::EMPTY,
+            call_button: Rect::EMPTY,
         }
     }
 }

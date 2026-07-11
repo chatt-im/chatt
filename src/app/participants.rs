@@ -400,10 +400,6 @@ impl Participants {
             .map_or(UNKNOWN_NAME, |entry| entry.display_name())
     }
 
-    pub(crate) fn online_count(&self) -> usize {
-        self.entries.iter().filter(|entry| entry.online).count()
-    }
-
     fn ensure_user(&mut self, user_id: UserId) -> &mut ParticipantState {
         if let Some(index) = self
             .entries

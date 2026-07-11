@@ -89,7 +89,7 @@ pub(crate) enum StatusKind {
     Error,
 }
 
-const TRANSIENT_STATUS_LIFETIME: Duration = Duration::from_secs(3);
+const STATUS_LIFETIME: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScreencastPhase {
@@ -213,6 +213,8 @@ pub(crate) struct StatusState {
 }
 
 impl StatusState {
+    /// Creates a persistent baseline status. Messages posted after construction
+    /// use the bounded lifetime applied by [`Self::set`] and [`Self::set_error`].
     pub(crate) fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -232,13 +234,13 @@ impl StatusState {
     pub(crate) fn set(&mut self, status: impl Into<String>) {
         self.text = status.into();
         self.kind = StatusKind::Info;
-        self.expires_at = None;
+        self.expires_at = Some(Instant::now() + STATUS_LIFETIME);
     }
 
     pub(crate) fn set_error(&mut self, status: impl Into<String>) {
         self.text = status.into();
         self.kind = StatusKind::Error;
-        self.expires_at = None;
+        self.expires_at = Some(Instant::now() + STATUS_LIFETIME);
     }
 
     pub(crate) fn set_transient(&mut self, status: impl Into<String>, expires_at: Instant) {
@@ -504,11 +506,10 @@ struct DeviceProbeState {
     last: Option<DeviceIdentityProbe>,
 }
 
-/// One audio direction's health plus its opened device, for the TUI.
+/// One audio direction's health, for the TUI.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AudioSideHealth {
     pub(crate) state: AudioHealthState,
-    pub(crate) device_name: Option<String>,
 }
 
 /// Edge detectors over the capture stats snapshot, so each failure episode
@@ -3248,6 +3249,9 @@ impl App {
                     self.user_id,
                 );
                 let changed = update.changed;
+                if update.read_advanced {
+                    self.mark_room_catalog_dirty();
+                }
                 if changed && self.room.viewed_room == Some(room_id) && self.web_feed.is_some() {
                     self.sync_viewed_room_to_feeds();
                 }
@@ -4740,25 +4744,16 @@ impl App {
         }
     }
 
-    /// Health of the capture side plus the opened device name, for the
-    /// lobby-bar widget and top-bar indicators.
+    /// Health of the capture side for status-bar error reporting.
     pub(crate) fn capture_audio_health(&self) -> AudioSideHealth {
         AudioSideHealth {
             state: self.supervisor.capture.health().state,
-            device_name: self
-                .capture
-                .as_ref()
-                .map(|capture| capture.device_info().device_name.clone()),
         }
     }
 
     pub(crate) fn playback_audio_health(&self) -> AudioSideHealth {
         AudioSideHealth {
             state: self.supervisor.playback.health().state,
-            device_name: self
-                .playback
-                .as_ref()
-                .map(|playback| playback.device_info().device_name.clone()),
         }
     }
 
@@ -7008,7 +7003,7 @@ impl App {
     pub(crate) fn set_transient_status(&mut self, status: impl Into<String>) {
         self.view
             .status
-            .set_transient(status, Instant::now() + TRANSIENT_STATUS_LIFETIME);
+            .set_transient(status, Instant::now() + STATUS_LIFETIME);
     }
 
     pub(crate) fn set_error(&mut self, status: impl Into<String>) {
@@ -7198,6 +7193,25 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn posted_statuses_expire_lazily() {
+        let mut status = StatusState::new("idle");
+
+        status.expire(Instant::now() + STATUS_LIFETIME);
+        assert_eq!(status.text(), "idle", "the baseline status is persistent");
+
+        status.set("updated");
+        status.expire(Instant::now());
+        assert_eq!(status.text(), "updated");
+        status.expire(Instant::now() + STATUS_LIFETIME);
+        assert_eq!(status.text(), "");
+
+        status.set_error("failed");
+        assert_eq!(status.kind(), StatusKind::Error);
+        status.expire(Instant::now() + STATUS_LIFETIME);
+        assert_eq!(status.text(), "");
     }
 
     fn attach_test_client(
@@ -9612,12 +9626,37 @@ mod tests {
     }
 
     #[test]
-    fn lobby_bar_shows_recovery_state_and_reset_button_resets_on_click() {
+    fn call_bar_shows_only_audio_errors_and_call_action() {
         let mut app = test_app();
         let mut room = RoomMode::default();
 
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
+        let bar = room.layout().lobby_bar_rect;
+        let text = rect_text(&mut buffer, bar);
+        assert!(text.contains("Call"));
+        assert!(text.contains("JOIN"));
+        assert!(!text.contains("Lobby"));
+        assert!(!text.contains("in call"));
+        assert!(!text.contains("voice:"));
+        assert_eq!(
+            rect_text(
+                &mut buffer,
+                Rect {
+                    x: room.layout().room_list_rect.x,
+                    y: bar.y,
+                    w: room.layout().room_list_rect.w,
+                    h: 1,
+                },
+            )
+            .trim(),
+            "Rooms"
+        );
+        let join_button = app.view.chrome.lobby_bar.call_button;
+        let join_style = cell_style(&mut buffer, join_button.x, join_button.y);
+        assert_eq!(join_style.bg(), app.view.theme.good.fg());
+        assert_eq!(join_style.fg(), app.view.theme.mode_server_edit.fg());
+        assert!(app.view.chrome.lobby_bar.audio_widget.is_empty());
         assert!(app.view.chrome.lobby_bar.audio_reset.is_empty());
 
         app.supervisor.capture.on_rebuild_failed(
@@ -9629,6 +9668,7 @@ mod tests {
         let reset_rect = app.view.chrome.lobby_bar.audio_reset;
         assert!(!reset_rect.is_empty());
         assert!(!app.view.chrome.lobby_bar.audio_widget.is_empty());
+        assert!(rect_text(&mut buffer, bar).contains("JOIN"));
 
         room.process_mouse(
             &mut app,
@@ -9642,7 +9682,64 @@ mod tests {
         assert!(app.supervisor.capture.is_healthy());
 
         render_room(&mut app, &mut room, &mut buffer);
+        assert!(app.view.chrome.lobby_bar.audio_widget.is_empty());
         assert!(app.view.chrome.lobby_bar.audio_reset.is_empty());
+
+        app.room.voice_room = Some(RoomId(1));
+        render_room(&mut app, &mut room, &mut buffer);
+        assert!(rect_text(&mut buffer, bar).contains("LEAVE"));
+        let leave_button = app.view.chrome.lobby_bar.call_button;
+        let leave_style = cell_style(&mut buffer, leave_button.x, leave_button.y);
+        assert_eq!(leave_style.bg(), app.view.theme.status_section.bg());
+        assert_eq!(leave_style.fg(), app.view.theme.muted.fg());
+    }
+
+    #[test]
+    fn call_bar_button_joins_and_leaves_voice() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+        app.deafened.store(true, Ordering::Relaxed);
+
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let join = app.view.chrome.lobby_bar.call_button;
+        click_top_bar_rect(&mut app, &mut room, join);
+        assert_eq!(app.requested_voice_room, Some(RoomId(1)));
+        assert!(
+            rx.try_iter()
+                .any(|command| matches!(command, NetworkCommand::JoinVoice(RoomId(1))))
+        );
+
+        app.requested_voice_room = None;
+        app.room.voice_room = Some(RoomId(1));
+        render_room(&mut app, &mut room, &mut buffer);
+        let leave = app.view.chrome.lobby_bar.call_button;
+        click_top_bar_rect(&mut app, &mut room, leave);
+        assert!(
+            rx.try_iter()
+                .any(|command| matches!(command, NetworkCommand::LeaveVoice))
+        );
+    }
+
+    #[test]
+    fn inactive_mode_headers_use_status_section_background() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let call_header = cell_style(
+            &mut buffer,
+            room.layout().user_list_rect.x,
+            room.layout().lobby_bar_rect.y,
+        );
+        assert_eq!(call_header.bg(), app.view.theme.status_section.bg());
+        assert_ne!(call_header.bg(), app.view.theme.status_fill.bg());
     }
 
     fn app_with_servers(entries: &[(&str, &str)]) -> App {
