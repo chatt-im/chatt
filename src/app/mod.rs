@@ -671,6 +671,10 @@ pub(crate) enum AppEvent {
     Soundboard(SoundboardEvent),
     Voice(local_control::VoiceCommand),
     Screencast(local_control::ScreencastCommand),
+    Upload {
+        request: UploadFileRequest,
+        reply: Sender<Result<String, String>>,
+    },
     OutputVolume {
         command: local_control::OutputVolumeCommand,
         reply: Sender<Result<f32, String>>,
@@ -1052,6 +1056,10 @@ enum JoinResolution {
 impl App {
     pub(crate) fn new(config: Config, pending_join: Option<PendingJoin>) -> Result<Self, String> {
         let events = AppEvents::new();
+        #[cfg(not(test))]
+        let control_socket = Some(local_control::ControlSocket::spawn(events.sender())?);
+        #[cfg(test)]
+        let control_socket = None;
         let soundboard_enabled = config.soundboard.enabled;
         let theme = config.ui.resolve_theme();
         let room = RoomSession::new(&config);
@@ -1082,7 +1090,7 @@ impl App {
             room,
             view,
             network: None,
-            control_socket: None,
+            control_socket,
             session_id: None,
             user_id: None,
             requested_voice_room: None,
@@ -1428,6 +1436,7 @@ impl App {
             AppEvent::Soundboard(event) => self.handle_soundboard_event(event),
             AppEvent::Voice(command) => self.apply_voice_command(command),
             AppEvent::Screencast(command) => self.handle_screencast_command(command),
+            AppEvent::Upload { request, reply } => self.handle_control_upload(request, reply),
             AppEvent::OutputVolume { command, reply } => {
                 self.handle_output_volume_command(command, reply)
             }
@@ -1469,6 +1478,20 @@ impl App {
             }
         };
         let _ = reply.send(Ok(value));
+    }
+
+    fn handle_control_upload(
+        &mut self,
+        request: UploadFileRequest,
+        reply: Sender<Result<String, String>>,
+    ) {
+        if self.network.is_none() {
+            let _ = reply.send(Err("not connected to a server".to_string()));
+            return;
+        }
+        let message = format!("queued upload {}", request.path.display());
+        self.send_network_command(NetworkCommand::UploadFile(request), true);
+        let _ = reply.send(Ok(message));
     }
 
     /// Re-reads the config file and re-resolves the theme, replying with a status
@@ -2080,22 +2103,6 @@ impl App {
                 return false;
             }
         };
-        self.control_socket =
-            match local_control::ControlSocket::spawn(network.sender(), self.events.sender()) {
-                Ok(socket) => {
-                    kvlog::info!(
-                        "chatt local control socket ready",
-                        path = %socket.path().display()
-                    );
-                    self.supervisor.control_socket.reset();
-                    Some(socket)
-                }
-                Err(error) => {
-                    self.push_network_notice("control", &error);
-                    self.schedule_control_socket_recovery(Instant::now(), error.clone());
-                    None
-                }
-            };
         let storage = crate::room_history::HistoryStorage::resolve(&self.config, &server);
         let continuity = self.room.connect_to_server(
             server.label.clone(),
@@ -2138,7 +2145,6 @@ impl App {
         self.active_tcp_addr = None;
         self.room.active_server_label = None;
         self.video_transport = None;
-        self.control_socket.take();
         if let Some(network) = self.network.take() {
             network.stop();
         }
@@ -2156,7 +2162,6 @@ impl App {
         self.room.udp_unreachable = false;
         self.pending_dm_open = None;
         self.supervisor.network.reset();
-        self.supervisor.control_socket.reset();
         self.supervisor.capture.reset();
         self.supervisor.playback.reset();
         self.supervisor.capture_watch = CaptureWatch::default();
@@ -4522,10 +4527,6 @@ impl App {
     }
 
     fn supervise_control_socket(&mut self, now: Instant) {
-        if self.network.is_none() {
-            self.supervisor.control_socket.reset();
-            return;
-        }
         if self
             .control_socket
             .as_ref()
@@ -4693,7 +4694,6 @@ impl App {
             RecoverySchedule::Pending => {}
             RecoverySchedule::Exhausted => {
                 self.stop_audio();
-                self.control_socket.take();
                 if let Some(network) = self.network.take() {
                     network.stop();
                 }
@@ -4735,14 +4735,12 @@ impl App {
         );
         let queued = std::mem::take(&mut self.pending_network_commands);
         let network_recovery = std::mem::take(&mut self.supervisor.network);
-        let control_recovery = std::mem::take(&mut self.supervisor.control_socket);
         self.start_network(&alias);
         self.pending_network_commands = queued;
         if self.network.is_some() {
             self.supervisor.network.reset();
         } else {
             self.supervisor.network = network_recovery;
-            self.supervisor.control_socket = control_recovery;
             self.schedule_network_recovery(
                 Instant::now(),
                 format!("failed to restart network worker after {reason}"),
@@ -4753,11 +4751,7 @@ impl App {
     fn restart_control_socket(&mut self, reason: &str) {
         kvlog::warn!("restarting local control socket", reason);
         self.control_socket.take();
-        let Some(network) = &self.network else {
-            self.supervisor.control_socket.reset();
-            return;
-        };
-        match local_control::ControlSocket::spawn(network.sender(), self.events.sender()) {
+        match local_control::ControlSocket::spawn(self.events.sender()) {
             Ok(socket) => {
                 kvlog::info!(
                     "chatt local control socket recovered",
@@ -6743,6 +6737,46 @@ mod tests {
             rx.recv().unwrap().unwrap(),
             config::MAX_OUTPUT_VOLUME_PERCENT
         );
+    }
+
+    #[test]
+    fn control_upload_replies_cleanly_while_offline() {
+        let mut app = test_app();
+        let (reply, response) = mpsc::channel();
+
+        app.handle_app_event(AppEvent::Upload {
+            request: UploadFileRequest::new("/tmp/offline.txt".into()),
+            reply,
+        });
+
+        assert_eq!(
+            response.recv().unwrap().unwrap_err(),
+            "not connected to a server"
+        );
+    }
+
+    #[test]
+    fn control_upload_routes_through_app_network_sender() {
+        let mut app = test_app();
+        let (network_tx, network_rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(network_tx));
+        app.room.network_selected = true;
+        let path = std::path::PathBuf::from("/tmp/online.txt");
+        let (reply, response) = mpsc::channel();
+
+        app.handle_app_event(AppEvent::Upload {
+            request: UploadFileRequest::new(path.clone()),
+            reply,
+        });
+
+        assert_eq!(
+            response.recv().unwrap().unwrap(),
+            format!("queued upload {}", path.display())
+        );
+        assert!(matches!(
+            network_rx.recv().unwrap(),
+            NetworkCommand::UploadFile(request) if request.path == path
+        ));
     }
 
     #[test]
