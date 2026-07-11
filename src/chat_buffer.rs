@@ -264,6 +264,11 @@ pub struct Cursor {
 
 pub struct VirtualChatBuffer {
     messages: Vec<ChatEntry>,
+    /// Advances whenever searchable message text or ordering changes.
+    revision: u64,
+    /// Advances only when existing index offsets may have changed. Search can
+    /// append incrementally while this remains stable.
+    reindex_revision: u64,
     max_messages: usize,
     scroll_offset: usize,
     /// Navigation cursor; `None` only while the buffer is empty. A stale
@@ -286,6 +291,8 @@ impl VirtualChatBuffer {
     pub fn new(max_messages: usize, syntax: SyntaxTheme) -> Self {
         Self {
             messages: Vec::new(),
+            revision: 0,
+            reindex_revision: 0,
             max_messages: max_messages.max(1),
             scroll_offset: 0,
             cursor: None,
@@ -359,6 +366,7 @@ impl VirtualChatBuffer {
         let mut entry = self.build_entry(message, local);
         entry.expanded = expanded;
         self.messages[index] = entry;
+        self.bump_reindex_revision();
         self.layout_index.invalidate();
         true
     }
@@ -377,6 +385,7 @@ impl VirtualChatBuffer {
         let old_len = self.messages.len();
         let entry = self.build_entry(message, local);
         self.messages.push(entry);
+        self.bump_revision();
         self.repair_layout_index_after_append(old_len);
         self.follow_bottom_after_push(old_len);
         self.trim_front();
@@ -416,6 +425,7 @@ impl VirtualChatBuffer {
             .map(|(message, local)| self.build_entry(message, local))
             .collect();
         self.messages.splice(0..0, entries);
+        self.bump_reindex_revision();
         if let Some(cursor) = &mut self.cursor {
             cursor.message += count;
         }
@@ -438,6 +448,7 @@ impl VirtualChatBuffer {
             .map_or(0, |newest_older| newest_older + 1);
         let entry = self.build_entry(message, local);
         self.messages.insert(index, entry);
+        self.bump_reindex_revision();
         if let Some(cursor) = &mut self.cursor
             && cursor.message >= index
         {
@@ -504,6 +515,7 @@ impl VirtualChatBuffer {
             notice_kind: Some(kind),
             layout: MessageLayout::new(),
         });
+        self.bump_revision();
         self.repair_layout_index_after_append(old_len);
         self.follow_bottom_after_push(old_len);
         self.trim_front();
@@ -524,6 +536,7 @@ impl VirtualChatBuffer {
 
     fn remove_at(&mut self, index: usize) {
         self.messages.remove(index);
+        self.bump_reindex_revision();
         let anchor_removed = self.anchor.is_some_and(|anchor| anchor.message == index);
         let cursor_removed = self.cursor.is_some_and(|cursor| cursor.message == index);
         if anchor_removed || cursor_removed {
@@ -609,6 +622,9 @@ impl VirtualChatBuffer {
     }
 
     pub fn clear(&mut self) {
+        if !self.messages.is_empty() {
+            self.bump_reindex_revision();
+        }
         self.messages.clear();
         self.scroll_offset = 0;
         self.cursor = None;
@@ -629,6 +645,23 @@ impl VirtualChatBuffer {
 
     pub fn message(&self, index: usize) -> &ChatEntry {
         &self.messages[index]
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn reindex_revision(&self) -> u64 {
+        self.reindex_revision
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn bump_reindex_revision(&mut self) {
+        self.bump_revision();
+        self.reindex_revision = self.reindex_revision.wrapping_add(1);
     }
 
     pub fn line(&self, message: usize, line: usize) -> &[Segment] {
@@ -1537,6 +1570,7 @@ impl VirtualChatBuffer {
                 && self.layout_index.line_counts.len() == self.messages.len()
                 && self.layout_index.rows.len() == self.layout_index.blocks.len();
             self.messages.drain(0..excess);
+            self.bump_reindex_revision();
             self.scroll_offset = self.scroll_offset.saturating_sub(excess);
             let anchor_evicted = self.anchor.is_some_and(|anchor| anchor.message < excess);
             let cursor_evicted = self.cursor.is_some_and(|cursor| cursor.message < excess);

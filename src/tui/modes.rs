@@ -17,6 +17,7 @@ use crate::{
     theme,
     tui::{
         form::{FormAction, FormFieldKind, FormMouseIntent, FormState},
+        history_search::{HistorySearch, SearchAction},
         mode::{
             AppMode, ChromeSpec, Coverage, ExitReason, ModePresentation, ModeTransition, ViewCx,
             is_quit_key,
@@ -1221,6 +1222,8 @@ pub(crate) struct RoomMode {
     lobby_list_focus: LobbyListFocus,
     layout: RoomLayout,
     divider_drag: Option<DividerDrag>,
+    history_search: Option<HistorySearch>,
+    last_history_search: Option<HistorySearch>,
 }
 
 impl Default for RoomMode {
@@ -1236,6 +1239,8 @@ impl RoomMode {
             lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
             divider_drag: None,
+            history_search: None,
+            last_history_search: None,
         }
     }
 
@@ -1246,6 +1251,8 @@ impl RoomMode {
             lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
             divider_drag: None,
+            history_search: None,
+            last_history_search: None,
         }
     }
 
@@ -2226,6 +2233,57 @@ impl RoomMode {
         if is_quit_key(&key) {
             return Action::Quit;
         }
+        if let Some(search) = &mut self.history_search {
+            if search.process_key(
+                &mut cx.view.active.chat,
+                key,
+                self.layout.chat_width,
+                self.layout.chat_height,
+            ) == SearchAction::Close
+            {
+                self.last_history_search = self.history_search.take();
+            }
+            return Action::Continue;
+        }
+        if self.focus == ChatPanelFocus::ChatLog
+            && self.last_history_search.is_some()
+            && !matches!(key.kind, KeyEventKind::Release)
+            && key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+        {
+            self.last_history_search = None;
+            return Action::Continue;
+        }
+        if self.focus == ChatPanelFocus::ChatLog
+            && self.last_history_search.is_some()
+            && !matches!(key.kind, KeyEventKind::Release)
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('n' | 'N'))
+        {
+            if let Some(search) = &mut self.last_history_search {
+                let delta = if key.code == KeyCode::Char('N') {
+                    -1
+                } else {
+                    1
+                };
+                search.repeat(
+                    &mut cx.view.active.chat,
+                    delta,
+                    self.layout.chat_width,
+                    self.layout.chat_height,
+                );
+            }
+            return Action::Continue;
+        }
+        if self.focus == ChatPanelFocus::ChatLog
+            && !matches!(key.kind, KeyEventKind::Release)
+            && key.code == KeyCode::Char('/')
+            && key.modifiers.is_empty()
+        {
+            self.last_history_search = None;
+            self.history_search = Some(HistorySearch::new(&cx.view.active.chat));
+            return Action::Continue;
+        }
         if self.focus == ChatPanelFocus::Compose {
             return self.process_compose_key(cx, key);
         }
@@ -2265,6 +2323,8 @@ impl AppMode for RoomMode {
             chrome.theme_mode,
             chrome.status_label,
             chrome.layer,
+            self.history_search.as_mut(),
+            self.last_history_search.as_ref(),
             buf,
             now_ms,
         );
@@ -2283,6 +2343,13 @@ impl AppMode for RoomMode {
     }
 
     fn presentation(&self, cx: &ViewCx<'_>) -> ModePresentation {
+        if self.history_search.is_some() {
+            return ModePresentation::full_screen(ChromeSpec {
+                theme_mode: theme::UiMode::Compose,
+                status_label: "Search",
+                layer: bindings::INSERT_LAYER,
+            });
+        }
         let theme_mode = if self.focus == ChatPanelFocus::Compose {
             theme::UiMode::Compose
         } else {
@@ -2940,6 +3007,97 @@ mod tests {
 
         room.process_input(&mut app, key('j'));
         assert_eq!(cursor_message(&app), Some(2));
+    }
+
+    #[test]
+    fn slash_opens_history_search_from_chat_log_and_preserves_composer() {
+        let mut app = test_app();
+        let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
+        push_room_message(&mut app, 1, UserId(1), 1_000, "a Boat afloat");
+        push_room_message(&mut app, 2, UserId(2), 2_000, "unrelated");
+        app.view.composer.set_lines("draft /command");
+
+        room.process_input(&mut app, key('/'));
+        assert!(room.history_search.is_some());
+        for ch in ['b', ' ', 't'] {
+            room.process_input(&mut app, key(ch));
+        }
+
+        let search = room.history_search.as_ref().expect("search open");
+        assert_eq!(search.query(), "b t");
+        assert_eq!(search.matches().len(), 1);
+        assert_eq!(search.selected_message(), Some(0));
+        assert_eq!(
+            app.view.active.chat.cursor().map(|cursor| cursor.message),
+            Some(0)
+        );
+        assert_eq!(app.view.composer.text(), "draft /command");
+
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(room.history_search.is_none());
+        assert_eq!(app.view.composer.text(), "draft /command");
+    }
+
+    #[test]
+    fn history_search_navigation_always_tracks_a_selected_result() {
+        let mut app = test_app();
+        let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
+        push_room_message(&mut app, 1, UserId(1), 1_000, "first needle");
+        push_room_message(&mut app, 2, UserId(2), 2_000, "skip");
+        push_room_message(&mut app, 3, UserId(3), 3_000, "last NEEDLE");
+
+        room.process_input(&mut app, key('/'));
+        for ch in "needle".chars() {
+            room.process_input(&mut app, key(ch));
+        }
+        assert_eq!(
+            app.view.active.chat.cursor().map(|cursor| cursor.message),
+            Some(2),
+            "the nearest result starts selected"
+        );
+
+        room.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            app.view.active.chat.cursor().map(|cursor| cursor.message),
+            Some(0),
+            "Ctrl-K selects and follows the previous result"
+        );
+        room.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            app.view.active.chat.cursor().map(|cursor| cursor.message),
+            Some(2)
+        );
+
+        room.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(room.history_search.is_none());
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        assert!(
+            row_text(&mut buffer, room.layout.chat_log_bar_rect.y).contains("/needle"),
+            "the closed search remains visible in the Chat Log bar"
+        );
+        room.process_input(&mut app, key('n'));
+        assert_eq!(
+            app.view.active.chat.cursor().map(|cursor| cursor.message),
+            Some(0),
+            "n repeats the closed search and wraps to its next result"
+        );
+        room.process_input(&mut app, key('N'));
+        assert_eq!(
+            app.view.active.chat.cursor().map(|cursor| cursor.message),
+            Some(2)
+        );
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(room.last_history_search.is_none());
     }
 
     #[test]

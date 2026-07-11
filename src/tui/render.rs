@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use extui::{AnsiColor, Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
+use extui::{AnsiColor, Buffer, CursorShape, Ellipsis, HAlign, Rect, Style, vt::Modifier};
 use extui_bindings::LayerId;
 use extui_editor::Mode as EditorMode;
 use rpc::ids::FileTransferId;
@@ -26,6 +26,7 @@ use crate::{
     config::Config,
     theme::{self, Theme},
     tui::{
+        history_search::HistorySearch,
         mode::ViewCx,
         modes::{LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
         view::ClientView,
@@ -293,6 +294,8 @@ pub(crate) fn draw_room_screen(
     mode: theme::UiMode,
     status_label: &'static str,
     layer: LayerId,
+    mut history_search: Option<&mut HistorySearch>,
+    last_history_search: Option<&HistorySearch>,
     buf: &mut Buffer,
     now_ms: u64,
 ) {
@@ -308,11 +311,25 @@ pub(crate) fn draw_room_screen(
     let status_area = screen.take_bottom(1);
     // Keep config heights and divider dragging measured in editor rows. The
     // optional half-block frame consumes two additional decorative rows.
-    let composer_padding = app.config.ui.composer_padding && screen.h >= 7;
+    let composer_padding =
+        history_search.is_none() && app.config.ui.composer_padding && screen.h >= 7;
     let frame_rows = u16::from(composer_padding) * 2;
     let composer_width = screen.w.saturating_sub(u16::from(composer_padding) * 2);
-    let composer_height =
-        composer_height(app, composer_width, screen.h.saturating_sub(4 + frame_rows));
+    if let Some(search) = history_search.as_mut() {
+        search.sync(&app.view.active.chat);
+    }
+    let max_bottom_rows = screen.h.saturating_sub(4 + frame_rows);
+    let composer_height = match history_search.as_deref() {
+        Some(search) => (search.matches().len().saturating_add(1) as u16).clamp(
+            1,
+            app.config
+                .ui
+                .max_composer_height
+                .max(2)
+                .min(max_bottom_rows.max(1)),
+        ),
+        None => composer_height(app, composer_width, max_bottom_rows),
+    };
     let mut composer_frame = screen.take_bottom((composer_height + frame_rows) as i32);
     layout.composer_frame_rect = composer_frame;
     let top_border = if composer_padding {
@@ -331,16 +348,39 @@ pub(crate) fn draw_room_screen(
         composer_editor_area.take_left(1);
         composer_editor_area.take_right(1);
     }
-    layout.composer_rect = composer_editor_area;
+    layout.composer_rect = if history_search.is_some() {
+        Rect::EMPTY
+    } else {
+        composer_editor_area
+    };
     layout.compose_bar_rect = status_area;
     let chat_log_bar_area = screen.take_bottom(1);
     layout.chat_log_bar_rect = chat_log_bar_area;
-    draw_workspace(screen, app, focus, lobby_list_focus, layout, buf, now_ms);
-    draw_chat_log_bar(chat_log_bar_area, app, focus, buf);
+    draw_workspace(
+        screen,
+        app,
+        focus,
+        lobby_list_focus,
+        layout,
+        history_search.as_deref().or(last_history_search),
+        buf,
+        now_ms,
+    );
+    draw_chat_log_bar(
+        chat_log_bar_area,
+        app,
+        focus,
+        last_history_search.map(HistorySearch::query),
+        buf,
+    );
 
     draw_compose_bar(status_area, app, focus, buf, mode, status_label);
     draw_composer_border(top_border, app.view.theme, '▀', buf);
-    draw_composer(composer_area, app, focus, composer_padding, buf);
+    if let Some(search) = history_search {
+        draw_history_search(composer_area, app, search, composer_padding, buf);
+    } else {
+        draw_composer(composer_area, app, focus, composer_padding, buf);
+    }
     draw_composer_border(bottom_border, app.view.theme, '▄', buf);
     draw_key_preview(key_preview_area, app, buf);
 }
@@ -437,6 +477,7 @@ fn draw_workspace(
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     layout: &mut RoomLayout,
+    history_search: Option<&HistorySearch>,
     buf: &mut Buffer,
     now_ms: u64,
 ) {
@@ -469,7 +510,7 @@ fn draw_workspace(
     }
 
     if rows.h > 0 {
-        draw_chat(rows, app, focus, layout, buf, now_ms);
+        draw_chat(rows, app, focus, layout, history_search, buf, now_ms);
     } else {
         layout.clear_chat();
     }
@@ -1338,7 +1379,13 @@ fn audio_health_status_text(prefix: &str, state: AudioHealthState) -> Option<Str
     }
 }
 
-fn draw_chat_log_bar(area: Rect, app: &RenderState<'_>, focus: ChatPanelFocus, buf: &mut Buffer) {
+fn draw_chat_log_bar(
+    area: Rect,
+    app: &RenderState<'_>,
+    focus: ChatPanelFocus,
+    search_query: Option<&str>,
+    buf: &mut Buffer,
+) {
     if area.is_empty() {
         return;
     }
@@ -1347,6 +1394,14 @@ fn draw_chat_log_bar(area: Rect, app: &RenderState<'_>, focus: ChatPanelFocus, b
     area.with(fill).fill(buf);
     let mut row = area;
     draw_status_segment(&mut row, buf, label, " Chat ");
+    if let Some(query) = search_query {
+        draw_status_segment(
+            &mut row,
+            buf,
+            fill.patch(app.view.theme.accent),
+            &format!(" /{query} "),
+        );
+    }
 }
 
 fn draw_compose_bar(
@@ -1424,6 +1479,7 @@ fn draw_chat(
     app: &mut RenderState<'_>,
     focus: ChatPanelFocus,
     layout: &mut RoomLayout,
+    history_search: Option<&HistorySearch>,
     buf: &mut Buffer,
     now_ms: u64,
 ) {
@@ -1459,6 +1515,9 @@ fn draw_chat(
         &mut layout.visible_chat_lines,
     );
     let chat_focused = focus == ChatPanelFocus::ChatLog;
+    let search_highlight = history_search
+        .and_then(HistorySearch::selected_match)
+        .map(|found| (found.message, found.ranges.as_slice()));
     // Content is top-anchored: lines are drawn from the top of `area` and the
     // already-background-filled rows below them stay empty.
     let mut row_area = area;
@@ -1520,9 +1579,24 @@ fn draw_chat(
                                 | extui::vt::Modifier::UNDERLINED;
                         }
                         let max_width = row.w.saturating_sub(seg.col) as usize;
-                        if max_width > 0 {
-                            buf.set_stringn(row.x + seg.col, row.y, text, max_width, style);
+                        if max_width == 0 {
+                            continue;
                         }
+                        let ranges = search_highlight
+                            .filter(|(message, _)| *message == line.message)
+                            .map(|(_, ranges)| ranges)
+                            .unwrap_or_default();
+                        draw_segment_with_highlights(
+                            row.x + seg.col,
+                            row.y,
+                            max_width,
+                            text,
+                            *seg,
+                            style,
+                            ranges,
+                            app.view.theme.warn | Modifier::REVERSED | Modifier::BOLD,
+                            buf,
+                        );
                     }
                     // A terminal transfer keeps its plain body and gains a dim
                     // `verb: reason` label where the cancel/skip button used to be.
@@ -2245,6 +2319,166 @@ fn draw_composer_border(area: Rect, theme: Theme, glyph: char, buf: &mut Buffer)
     let border = glyph.to_string().repeat(area.w as usize);
     area.with(theme.composer_border.without_bg())
         .text(buf, &border);
+}
+
+fn draw_history_search(
+    mut area: Rect,
+    app: &RenderState<'_>,
+    search: &mut HistorySearch,
+    padded: bool,
+    buf: &mut Buffer,
+) {
+    if area.is_empty() {
+        return;
+    }
+    area.with(app.view.theme.background).fill(buf);
+    if padded {
+        area.take_left(1);
+        area.take_right(1);
+    }
+    if area.is_empty() {
+        return;
+    }
+
+    let input = area.take_top(1);
+    input
+        .with(app.view.theme.background.patch(app.view.theme.accent))
+        .text(buf, "/");
+    let available = input.w.saturating_sub(1) as usize;
+    let query = visible_suffix(search.query(), available);
+    let mut query_area = input;
+    query_area.take_left(1);
+    query_area
+        .with(app.view.theme.background.patch(app.view.theme.text))
+        .with(Ellipsis(true))
+        .text(buf, query);
+    let cursor_x = input
+        .x
+        .saturating_add(1)
+        .saturating_add(query.width().min(available) as u16)
+        .min(input.x.saturating_add(input.w).saturating_sub(1));
+    buf.set_cursor(cursor_x, input.y, CursorShape::SteadyBar);
+
+    let visible = area.h as usize;
+    search.set_visible_rows(visible);
+    let start = search.list_offset();
+    let end = (start + visible).min(search.matches().len());
+    let mut rows = area;
+    for index in start..end {
+        let found = &search.matches()[index];
+        let row = rows.take_top(1);
+        let selected = index == search.selected_index();
+        let base = if selected {
+            app.view.theme.selected_focused
+        } else {
+            app.view.theme.background
+        };
+        row.with(base).fill(buf);
+        let message = app.view.active.chat.message(found.message);
+        let first_match = found.ranges.first().map(|range| range.start as usize);
+        let (line_start, line_end) = body_line_around(&message.body, first_match);
+        let prefix = format!("{}: ", message.sender);
+        let prefix_width = prefix.width().min(row.w as usize);
+        buf.set_stringn(
+            row.x,
+            row.y,
+            &prefix,
+            row.w as usize,
+            base.patch(app.view.theme.muted),
+        );
+        if prefix_width >= row.w as usize {
+            continue;
+        }
+        let body = &message.body[line_start..line_end];
+        let segment = chat_buffer::Segment {
+            col: 0,
+            start: line_start as u32,
+            end: line_end as u32,
+            style: Style::DEFAULT,
+            synth: false,
+        };
+        draw_segment_with_highlights(
+            row.x + prefix_width as u16,
+            row.y,
+            row.w as usize - prefix_width,
+            body,
+            segment,
+            base.patch(app.view.theme.text),
+            &found.ranges,
+            app.view.theme.warn | Modifier::REVERSED | Modifier::BOLD,
+            buf,
+        );
+    }
+}
+
+fn visible_suffix(text: &str, width: usize) -> &str {
+    if text.width() <= width {
+        return text;
+    }
+    text.char_indices()
+        .find_map(|(start, _)| (text[start..].width() <= width).then_some(&text[start..]))
+        .unwrap_or("")
+}
+
+fn body_line_around(body: &str, offset: Option<usize>) -> (usize, usize) {
+    let offset = offset.unwrap_or(0).min(body.len());
+    let start = body[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let end = body[offset..]
+        .find('\n')
+        .map_or(body.len(), |index| offset + index);
+    (start, end)
+}
+
+fn draw_segment_with_highlights(
+    x: u16,
+    y: u16,
+    max_width: usize,
+    text: &str,
+    segment: chat_buffer::Segment,
+    style: Style,
+    ranges: &[std::ops::Range<u32>],
+    highlight: Style,
+    buf: &mut Buffer,
+) {
+    if segment.synth
+        || ranges.is_empty()
+        || segment.end.saturating_sub(segment.start) as usize != text.len()
+    {
+        buf.set_stringn(x, y, text, max_width, style);
+        return;
+    }
+
+    let mut source = segment.start;
+    let mut column = 0usize;
+    for range in ranges {
+        let start = range.start.max(segment.start).min(segment.end);
+        let end = range.end.max(start).min(segment.end);
+        if start >= end || end <= source {
+            continue;
+        }
+        let start = start.max(source);
+        let plain = &text[(source - segment.start) as usize..(start - segment.start) as usize];
+        if column < max_width {
+            buf.set_stringn(x + column as u16, y, plain, max_width - column, style);
+        }
+        column = column.saturating_add(plain.width());
+        let matched = &text[(start - segment.start) as usize..(end - segment.start) as usize];
+        if column < max_width {
+            buf.set_stringn(
+                x + column as u16,
+                y,
+                matched,
+                max_width - column,
+                style.patch(highlight),
+            );
+        }
+        column = column.saturating_add(matched.width());
+        source = end;
+    }
+    let tail = &text[(source - segment.start) as usize..];
+    if column < max_width {
+        buf.set_stringn(x + column as u16, y, tail, max_width - column, style);
+    }
 }
 
 fn draw_composer(
