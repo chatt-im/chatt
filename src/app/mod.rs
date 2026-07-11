@@ -36,7 +36,7 @@ use crate::{
     config::{self, Config, ServerEntry, SoundboardClip, ThemeSelection, validate_server_entry},
     local_control, settings,
     tui::{
-        mode::{AppMode, CommandSink, ModeTransition, ViewCx},
+        mode::{AppMode, ModeTransition, ViewCx},
         modes::{
             RoomMode, RoomSwitchMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession,
         },
@@ -1200,16 +1200,15 @@ impl App {
         self.view.quit_requested = true;
     }
 
-    /// Builds the phase-1 in-process view context from disjoint App fields.
-    /// Render threads will receive the same shape with a shared session guard
-    /// and an mpsc-backed command sink in phase 3.
+    /// Builds an in-process view context over disjoint App fields, queueing
+    /// commands into [`Self::drain_core_commands`]'s queue.
     #[allow(dead_code)]
     pub(crate) fn view_cx(&mut self) -> ViewCx<'_> {
         ViewCx {
             view: &mut self.view,
             session: &self.room,
             config: &self.config,
-            commands: CommandSink::Local(&mut self.command_queue),
+            commands: &mut self.command_queue,
         }
     }
 

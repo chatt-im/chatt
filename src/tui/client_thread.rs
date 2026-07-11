@@ -19,7 +19,7 @@ use crate::{
     config::Config,
     tui::{
         Action,
-        mode::{AppMode, CommandSink, ViewCx},
+        mode::{AppMode, ViewCx},
         mode_stack::ModeStack,
         modes::{RoomMode, ServerListMode, WelcomeMode},
         overlay::PasswordPromptMode,
@@ -96,6 +96,7 @@ impl ClientThread {
             InitialMode::Room => Box::new(RoomMode::default()),
             InitialMode::Servers => Box::new(ServerListMode::new()),
         };
+        let mut queued = Vec::new();
         let mut mode_stack = {
             let session = session.read();
             let config = config.read();
@@ -104,13 +105,11 @@ impl ClientThread {
                 view: &mut view,
                 session: &session,
                 config: &config,
-                commands: CommandSink::Channel {
-                    client_id: id,
-                    sender: &commands,
-                },
+                commands: &mut queued,
             };
             ModeStack::new_with_cx(root, &mut cx)
         };
+        flush_commands(&mut queued, &commands, id);
 
         let mut resize_generation = 0;
         loop {
@@ -148,7 +147,7 @@ impl ClientThread {
                     if view.viewed_room != previous_room
                         && let Some(room_id) = view.viewed_room
                     {
-                        let _ = commands.send((id, CoreCommand::SetViewedRoom(room_id)));
+                        queued.push(CoreCommand::SetViewedRoom(room_id));
                     }
                     epoch_changed
                 };
@@ -156,10 +155,7 @@ impl ClientThread {
                     view: &mut view,
                     session: &session,
                     config: &config,
-                    commands: CommandSink::Channel {
-                        client_id: id,
-                        sender: &commands,
-                    },
+                    commands: &mut queued,
                 };
                 if epoch_changed {
                     let mode: Box<dyn AppMode> = if session.network_selected {
@@ -178,6 +174,7 @@ impl ClientThread {
                 mode_stack.render_cx(&mut cx, &mut buffer, now_ms);
                 session.capture_stats.is_some()
             };
+            flush_commands(&mut queued, &commands, id);
             buffer.render(&mut terminal);
 
             let poll_interval = if active_animation {
@@ -200,10 +197,7 @@ impl ClientThread {
                         view: &mut view,
                         session: &session,
                         config: &config,
-                        commands: CommandSink::Channel {
-                            client_id: id,
-                            sender: &commands,
-                        },
+                        commands: &mut queued,
                     };
                     let action = match event {
                         Event::Key(key) => mode_stack.process_input_cx(&mut cx, key),
@@ -227,9 +221,10 @@ impl ClientThread {
                     action
                 };
                 if matches!(action, Action::Quit) {
-                    let _ = commands.send((id, CoreCommand::Quit));
+                    queued.push(CoreCommand::Quit);
                 }
             }
+            flush_commands(&mut queued, &commands, id);
 
             let (clipboard_text, url) = {
                 let mut view = view.lock();
@@ -243,6 +238,19 @@ impl ClientThread {
             }
         }
         Ok(())
+    }
+}
+
+/// Transmits the commands a dispatch queued. Callers must have dropped the
+/// session/config/view guards first: the send blocks when the channel is full,
+/// and the core only drains it after acquiring those guards for writing.
+fn flush_commands(
+    queued: &mut Vec<CoreCommand>,
+    commands: &SyncSender<(ClientId, CoreCommand)>,
+    id: ClientId,
+) {
+    for command in queued.drain(..) {
+        let _ = commands.send((id, command));
     }
 }
 
@@ -274,6 +282,22 @@ fn process_client_events(
 mod tests {
     use super::*;
     use crate::{app::App, config::Config};
+
+    #[test]
+    fn flush_commands_transmits_queue_in_order_tagged_with_client_id() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let mut queued = vec![CoreCommand::Quit, CoreCommand::ToggleMute];
+        flush_commands(&mut queued, &tx, ClientId(7));
+        assert!(queued.is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok((ClientId(7), CoreCommand::Quit))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok((ClientId(7), CoreCommand::ToggleMute))
+        ));
+    }
 
     #[test]
     fn pairing_transitions_apply_between_batched_client_events() {
