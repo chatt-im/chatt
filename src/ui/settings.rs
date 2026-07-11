@@ -327,28 +327,24 @@ impl<'a> SettingsForm<'a> {
                 label: &self.action_labels.exit,
                 value: SettingsButton::Exit,
                 help: "Close chatt.",
-                primary: false,
             },
             ActionButton {
                 key: "Refresh",
                 label: &self.action_labels.refresh,
                 value: SettingsButton::Refresh,
                 help: "Re-scan audio devices using the current buffer requests.",
-                primary: false,
             },
             ActionButton {
                 key: "Close",
                 label: &self.action_labels.close,
                 value: SettingsButton::Close,
                 help: "Return to chat without saving further changes.",
-                primary: false,
             },
             ActionButton {
                 key: "Save",
                 label: &self.action_labels.save,
                 value: SettingsButton::Save,
                 help: "Persist the draft to chatt.toml.",
-                primary: true,
             },
         ];
         let response = self.form.actions(&specs);
@@ -824,10 +820,13 @@ pub fn draw_settings(
 
     let mut body = rows;
     let detail = if body.w >= MIN_DETAIL_SCREEN_WIDTH {
-        let mut detail = body.take_right(DETAIL_WIDTH as i32);
+        let detail = body.take_right(DETAIL_WIDTH as i32);
         body.take_right(1).with(theme.background).fill(buf);
-        detail = detail.inset(1, 0);
-        Some(detail)
+        Some(Rect {
+            x: detail.x.saturating_add(1),
+            w: detail.w.saturating_sub(1),
+            ..detail
+        })
     } else {
         None
     };

@@ -1512,7 +1512,8 @@ impl RoomMode {
 
     /// Reads the clipboard and either inserts text into the composer or opens
     /// the image upload dialog. Text focuses the composer first so the paste is
-    /// visible from any room focus.
+    /// visible from any room focus, while a command issued from compose Normal
+    /// mode leaves the editor in Normal mode.
     fn paste_from_clipboard(
         &mut self,
         cx: &mut ViewCx<'_>,
@@ -1521,8 +1522,14 @@ impl RoomMode {
         use crate::clipboard_paste::PastePayload;
         match provider.read_paste() {
             Ok(PastePayload::Text(text)) => {
-                self.enter_compose_insert_mode(cx);
-                cx.view.insert_paste(text);
+                let preserve_normal = self.focus == ChatPanelFocus::Compose
+                    && cx.view.composer.mode() == EditorMode::Normal;
+                if preserve_normal {
+                    cx.view.put_paste_after_cursor(text);
+                } else {
+                    self.enter_compose_insert_mode(cx);
+                    cx.view.insert_paste(text);
+                }
             }
             Ok(PastePayload::Image(image)) => {
                 let dialog = PasteImageUploadMode::new(image, &cx.view.theme);
@@ -2314,6 +2321,19 @@ mod tests {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
     }
 
+    struct TextClipboard(&'static str);
+
+    impl crate::clipboard_paste::ClipboardPasteProvider for TextClipboard {
+        fn read_paste(
+            &self,
+        ) -> Result<crate::clipboard_paste::PastePayload, crate::clipboard_paste::ClipboardPasteError>
+        {
+            Ok(crate::clipboard_paste::PastePayload::Text(
+                self.0.to_string(),
+            ))
+        }
+    }
+
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind,
@@ -2413,6 +2433,42 @@ mod tests {
                 other => panic!("expected paste command, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn paste_command_puts_after_cursor_and_preserves_vim_normal_mode() {
+        let mut app = test_app_vim();
+        let mut room = RoomMode::default();
+        app.view.composer.set_lines("tail");
+        app.view.composer.set_cursor_offset(4);
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
+
+        {
+            let mut cx = app.view_cx();
+            room.paste_from_clipboard(&mut cx, &TextClipboard(" pasted"));
+        }
+
+        assert_eq!(app.view.composer.text(), "tail pasted");
+        assert_eq!(app.view.composer.cursor_offset(), 10);
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
+    }
+
+    #[test]
+    fn paste_command_appends_at_insert_cursor_in_standard_mode() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        app.view.composer.set_lines("tail");
+        app.view.composer.set_cursor_offset(4);
+
+        {
+            let mut cx = app.view_cx();
+            room.paste_from_clipboard(&mut cx, &TextClipboard(" pasted"));
+        }
+
+        assert_eq!(app.view.composer.text(), "tail pasted");
+        assert_eq!(app.view.composer.cursor_offset(), 11);
+        assert_eq!(app.view.composer.mode(), EditorMode::Insert);
     }
 
     #[test]

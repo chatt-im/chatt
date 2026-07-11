@@ -2270,9 +2270,9 @@ fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, b
             .view
             .viewed_room
             .and_then(|room_id| app.room.room_name_of(room_id));
-        area.with(app.view.theme.muted)
+        area.with(app.view.theme.panel.patch(app.view.theme.muted))
             .with(Ellipsis(true))
-            .text(buf, &format!(" {}", composer_placeholder(room_name)));
+            .text(buf, &composer_placeholder(room_name));
     }
 }
 

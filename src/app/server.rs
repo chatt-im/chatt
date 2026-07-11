@@ -39,21 +39,18 @@ const ACTIONS: [ActionButton<'static, ServerEditButton>; 3] = [
         label: "Save",
         value: ServerEditButton::Save,
         help: "Persist these server settings to chatt.toml and return to the server list.",
-        primary: false,
     },
     ActionButton {
         key: "Save and join",
         label: "Save and join",
         value: ServerEditButton::SaveJoin,
         help: "Persist these server settings, then connect to this server.",
-        primary: true,
     },
     ActionButton {
         key: "Cancel",
         label: "Cancel",
         value: ServerEditButton::Cancel,
         help: "Discard this edit and return to the previous screen.",
-        primary: false,
     },
 ];
 

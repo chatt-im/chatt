@@ -30,14 +30,12 @@ const ACTIONS: [ActionButton<'static, RoomSettingsButton>; 2] = [
         label: "Save",
         value: RoomSettingsButton::Save,
         help: "Persist these room overrides to chatt.toml.",
-        primary: true,
     },
     ActionButton {
         key: "Cancel",
         label: "Cancel",
         value: RoomSettingsButton::Cancel,
         help: "Discard this edit and return to the room.",
-        primary: false,
     },
 ];
 

@@ -6,6 +6,7 @@ use extui::Style;
 use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use hashbrown::HashMap;
 use rpc::ids::{MessageId, RoomId, UserId};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     app::{
@@ -290,6 +291,32 @@ impl ClientView {
     pub(crate) fn insert_paste(&mut self, text: String) {
         let span = EditorSpan::empty_at(self.composer.cursor_offset());
         self.composer.replace_range(span, &text);
+    }
+
+    /// Applies Vim Normal-mode `p` placement for a host-provided paste: insert
+    /// after the grapheme under the cursor and leave the cursor on the final
+    /// pasted grapheme.
+    pub(crate) fn put_paste_after_cursor(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let source = self.composer.text();
+        let cursor = self.composer.cursor_offset() as usize;
+        let current_len = source
+            .get(cursor..)
+            .and_then(|tail| tail.graphemes(true).next())
+            .filter(|grapheme| !grapheme.contains('\n'))
+            .map_or(0, str::len);
+        let insertion = cursor.saturating_add(current_len) as u32;
+        self.composer
+            .replace_range(EditorSpan::empty_at(insertion), &text);
+
+        let final_grapheme = text
+            .grapheme_indices(true)
+            .last()
+            .map_or(0, |(offset, _)| offset as u32);
+        self.composer
+            .set_cursor_offset(insertion.saturating_add(final_grapheme));
     }
 
     pub(crate) fn refresh_command_completion(&mut self, enabled: bool, style: Style) {
