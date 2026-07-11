@@ -1033,6 +1033,7 @@ pub enum ThemeSlot {
     StatusSection,
     StatusSectionInactive,
     ComposerBorder,
+    Scrollbar,
     JoinInputActive,
     JoinInputInactive,
     JoinInputBoundaryActive,
@@ -1082,6 +1083,7 @@ impl ThemeSlot {
             "status-section" => Self::StatusSection,
             "status-section-inactive" => Self::StatusSectionInactive,
             "composer-border" => Self::ComposerBorder,
+            "scrollbar" => Self::Scrollbar,
             "join-input-active" => Self::JoinInputActive,
             "join-input-inactive" => Self::JoinInputInactive,
             "join-input-boundary-active" => Self::JoinInputBoundaryActive,
@@ -2942,6 +2944,7 @@ server-public-key = ""
                 "base = \"base16-dark\"\n",
                 "text = \"#ffffff\"\n",
                 "status-fill = { fg = \"#cccccc\", bg = \"#202030\" }\n",
+                "scrollbar = { fg = \"#dddddd\", bg = \"#303040\" }\n",
                 "[ui.themes.mine.syntax]\n",
                 "keyword = \"#c792ea\"\n",
             ),
@@ -2967,6 +2970,19 @@ server-public-key = ""
             .find(|(slot, _)| *slot == ThemeSlot::StatusFill)
             .unwrap();
         assert!(status.fg.is_some() && status.bg.is_some());
+        let (_, scrollbar) = theme
+            .overrides
+            .iter()
+            .find(|(slot, _)| *slot == ThemeSlot::Scrollbar)
+            .unwrap();
+        assert_eq!(
+            scrollbar.fg,
+            Some(direct_color(Color::Rgb(Rgb(0xdd, 0xdd, 0xdd))))
+        );
+        assert_eq!(
+            scrollbar.bg,
+            Some(direct_color(Color::Rgb(Rgb(0x30, 0x30, 0x40))))
+        );
         assert_eq!(
             theme.syntax,
             vec![(

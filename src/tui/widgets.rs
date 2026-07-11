@@ -2,6 +2,72 @@ use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
 
 use crate::theme::Theme;
 
+pub(crate) const SCROLLBAR_UNITS_PER_CELL: u32 = 8;
+pub(crate) const SCROLLBAR_MIN_THUMB_UNITS: u32 = 7;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScrollbarState {
+    pub(crate) total: u32,
+    pub(crate) viewport: u32,
+    pub(crate) offset: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScrollbarLayout {
+    pub(crate) rect: Rect,
+    pub(crate) state: ScrollbarState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScrollbarGeometry {
+    pub(crate) track_units: u32,
+    pub(crate) thumb_start: u32,
+    pub(crate) thumb_units: u32,
+    pub(crate) travel: u32,
+    pub(crate) max_scroll: u32,
+}
+
+impl ScrollbarGeometry {
+    pub(crate) fn new(height: u16, state: ScrollbarState) -> Option<Self> {
+        if height == 0 || state.viewport >= state.total {
+            return None;
+        }
+        let track_units = u32::from(height) * SCROLLBAR_UNITS_PER_CELL;
+        let proportional =
+            ((u64::from(track_units) * u64::from(state.viewport)) / u64::from(state.total)) as u32;
+        let thumb_units = proportional.max(SCROLLBAR_MIN_THUMB_UNITS).min(track_units);
+        let travel = track_units.saturating_sub(thumb_units);
+        let max_scroll = state.total.saturating_sub(state.viewport);
+        let offset = state.offset.min(max_scroll);
+        let mut thumb_start = if offset == 0 || max_scroll == 0 {
+            0
+        } else if offset == max_scroll {
+            travel
+        } else {
+            ((u64::from(travel) * u64::from(offset)) / u64::from(max_scroll)) as u32
+        };
+        if offset > 0 && offset < max_scroll && travel >= 2 {
+            thumb_start = thumb_start.clamp(1, travel - 1);
+        }
+        Some(Self {
+            track_units,
+            thumb_start,
+            thumb_units,
+            travel,
+            max_scroll,
+        })
+    }
+
+    pub(crate) fn offset_for_thumb_start(self, thumb_start: u32) -> u32 {
+        if self.travel == 0 {
+            return 0;
+        }
+        let thumb_start = thumb_start.min(self.travel);
+        ((u64::from(thumb_start) * u64::from(self.max_scroll) + u64::from(self.travel / 2))
+            / u64::from(self.travel)) as u32
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowPalette {
     pub(crate) base: Style,

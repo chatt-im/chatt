@@ -1,8 +1,78 @@
 use extui::{Buffer, Rect};
 use extui_editor::{Editor, Replacement, StyleRun, TextBuffer, TrackedChange};
 use tinyhl::{Highlighter, Source};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
+
+/// Maps a byte offset in wrapped composer text to its visual row and column.
+///
+/// Keep this in lockstep with extui-editor's wrapping rules: hard tabs advance
+/// to the next tab stop and every other grapheme contributes its terminal
+/// display width.
+pub(crate) fn composer_visual_position(
+    text: &str,
+    offset: usize,
+    width: u16,
+    tabstop: u16,
+) -> (usize, u16) {
+    let width = width.max(1);
+    let tabstop = tabstop.max(1);
+    let mut row = 0usize;
+    let mut col = 0u16;
+    for (start, grapheme) in text.grapheme_indices(true) {
+        if start >= offset {
+            break;
+        }
+        if grapheme == "\n" {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let cells = if grapheme == "\t" {
+            tabstop - col % tabstop
+        } else {
+            UnicodeWidthStr::width(grapheme).min(u16::MAX as usize) as u16
+        };
+        let visual = u32::from(col) + u32::from(cells);
+        row += (visual / u32::from(width)) as usize;
+        col = (visual % u32::from(width)) as u16;
+    }
+    (row, col)
+}
+
+/// Returns the first byte boundary on or below `target_row` in wrapped text.
+pub(crate) fn composer_offset_at_visual_row(
+    text: &str,
+    target_row: usize,
+    width: u16,
+    tabstop: u16,
+) -> usize {
+    let width = width.max(1);
+    let tabstop = tabstop.max(1);
+    let mut row = 0usize;
+    let mut col = 0u16;
+    for (start, grapheme) in text.grapheme_indices(true) {
+        if row >= target_row {
+            return start;
+        }
+        if grapheme == "\n" {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let cells = if grapheme == "\t" {
+            tabstop - col % tabstop
+        } else {
+            UnicodeWidthStr::width(grapheme).min(u16::MAX as usize) as u16
+        };
+        let visual = u32::from(col) + u32::from(cells);
+        row += (visual / u32::from(width)) as usize;
+        col = (visual % u32::from(width)) as u16;
+    }
+    text.len()
+}
 
 struct BufferSource<'a>(&'a TextBuffer);
 

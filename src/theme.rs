@@ -62,6 +62,8 @@ pub struct Theme {
     pub status_section_inactive: Style,
     /// Half-block frame around the padded composer.
     pub composer_border: Style,
+    /// Scrollbars: foreground is the thumb, background is the gutter.
+    pub scrollbar: Style,
     // Join / text inputs.
     pub join_input_active: Style,
     pub join_input_inactive: Style,
@@ -154,6 +156,9 @@ impl Theme {
                 .with_bg_rgb(0x46, 0x46, 0x46)
                 .with_fg_rgb(0xc8, 0xcd, 0xc3),
             composer_border: d.with_fg_rgb(0x20, 0x20, 0x20),
+            scrollbar: d
+                .with_fg_rgb(0xc8, 0xcd, 0xc3)
+                .with_bg_rgb(0x30, 0x30, 0x30),
             join_input_active: d
                 .with_bg_rgb(0x29, 0x29, 0x29)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
@@ -263,6 +268,7 @@ impl Theme {
                 .with_fg_ansi(bright_white),
             status_section_inactive: d.with_bg_ansi(AnsiColor::Grey[6]).with_fg_ansi(white),
             composer_border: d.with_fg_ansi(AnsiColor::Grey[2]),
+            scrollbar: d.with_fg_ansi(white).with_bg_ansi(AnsiColor::Grey[3]),
             join_input_active: d
                 .with_bg_ansi(AnsiColor::Grey[4])
                 .with_fg_ansi(bright_white),
@@ -340,6 +346,9 @@ impl Theme {
             status_section: d.with_bg_ansi(AnsiColor::Grey[23]).with_fg_ansi(black),
             status_section_inactive: d.with_bg_ansi(AnsiColor::Grey[23]).with_fg_ansi(black),
             composer_border: d.with_fg_ansi(AnsiColor::Grey[25]),
+            scrollbar: d
+                .with_fg_ansi(AnsiColor::Grey[15])
+                .with_bg_ansi(AnsiColor::Grey[27]),
             join_input_active: d.with_bg_ansi(AnsiColor::Grey[27]).with_fg_ansi(black),
             join_input_inactive: d.with_bg_ansi(AnsiColor::Grey[28]).with_fg_ansi(black),
             join_input_boundary_active: d.with_bg_ansi(AnsiColor::Grey[22]).with_fg_ansi(black),
@@ -397,6 +406,7 @@ impl Theme {
             ThemeSlot::StatusSection => &mut self.status_section,
             ThemeSlot::StatusSectionInactive => &mut self.status_section_inactive,
             ThemeSlot::ComposerBorder => &mut self.composer_border,
+            ThemeSlot::Scrollbar => &mut self.scrollbar,
             ThemeSlot::JoinInputActive => &mut self.join_input_active,
             ThemeSlot::JoinInputInactive => &mut self.join_input_inactive,
             ThemeSlot::JoinInputBoundaryActive => &mut self.join_input_boundary_active,
@@ -605,6 +615,8 @@ mod tests {
                 (ThemeSlot::StatusFill, pair(14)),
                 (ThemeSlot::StatusSection, pair(15)),
                 (ThemeSlot::StatusSectionInactive, pair(39)),
+                (ThemeSlot::ComposerBorder, pair(41)),
+                (ThemeSlot::Scrollbar, pair(40)),
                 (ThemeSlot::JoinInputActive, pair(16)),
                 (ThemeSlot::JoinInputInactive, pair(17)),
                 (ThemeSlot::JoinInputBoundaryActive, pair(18)),
@@ -647,6 +659,8 @@ mod tests {
         assert_eq!(theme.status_fill, style(14));
         assert_eq!(theme.status_section, style(15));
         assert_eq!(theme.status_section_inactive, style(39));
+        assert_eq!(theme.composer_border, style(41));
+        assert_eq!(theme.scrollbar, style(40));
         assert_eq!(theme.join_input_active, style(16));
         assert_eq!(theme.join_input_inactive, style(17));
         assert_eq!(theme.join_input_boundary_active, style(18));
@@ -670,5 +684,18 @@ mod tests {
         assert_eq!(theme.vu_peak, style(36));
         assert_eq!(theme.chat_visual_line, style(37));
         assert_eq!(theme.chat_cursor_line, style(38));
+    }
+
+    #[test]
+    fn builtin_scrollbar_gutters_match_status_fill_backgrounds() {
+        for choice in [
+            ThemeChoice::TomorrowNight,
+            ThemeChoice::Base16Dark,
+            ThemeChoice::Base16Light,
+        ] {
+            let theme = Theme::from_choice(choice);
+            assert_eq!(theme.scrollbar.bg(), theme.status_fill.bg());
+            assert!(theme.scrollbar.fg().is_some());
+        }
     }
 }
