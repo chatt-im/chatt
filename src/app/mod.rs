@@ -328,6 +328,13 @@ impl AudioDeviceCatalog {
     }
 }
 
+/// Core-side handle to one attached terminal: its wake channel and the view
+/// its render thread draws from.
+pub(crate) struct ClientHandle {
+    pub(crate) channel: Arc<crate::client_channel::ClientChannel>,
+    pub(crate) view: Arc<parking_lot::Mutex<ClientView>>,
+}
+
 pub(crate) struct App {
     pub config: CoreRw<Config>,
     events: AppEvents,
@@ -335,8 +342,7 @@ pub(crate) struct App {
     command_queue: Vec<command::CoreCommand>,
     issuing_client: crate::client_channel::ClientId,
     primary_channel: Option<Arc<crate::client_channel::ClientChannel>>,
-    client_channels:
-        HashMap<crate::client_channel::ClientId, Arc<crate::client_channel::ClientChannel>>,
+    clients: HashMap<crate::client_channel::ClientId, ClientHandle>,
     pairing_owner: Option<crate::client_channel::ClientId>,
     password_prompt_active: bool,
     pub room: CoreRw<RoomSession>,
@@ -1118,7 +1124,7 @@ impl App {
             command_queue: Vec::new(),
             issuing_client: crate::client_channel::ClientId::PRIMARY,
             primary_channel: None,
-            client_channels: HashMap::new(),
+            clients: HashMap::new(),
             pairing_owner: None,
             password_prompt_active: false,
             room: CoreRw::new(room),
@@ -1223,16 +1229,43 @@ impl App {
         self.primary_channel = Some(channel);
     }
 
-    pub(crate) fn register_client_channel(
+    /// Builds and registers the view for a newly attached terminal, mirroring
+    /// the primary's theme, catalog, status, and viewed room. Returns the view
+    /// handle the terminal's render thread draws from; [`Self::retire_client`]
+    /// releases it.
+    pub(crate) fn attach_client(
         &mut self,
         client_id: crate::client_channel::ClientId,
         channel: Arc<crate::client_channel::ClientChannel>,
-    ) {
-        self.client_channels.insert(client_id, channel);
+    ) -> Arc<parking_lot::Mutex<ClientView>> {
+        let mut view = ClientView::new(&self.config, self.view.theme);
+        view.mic_muted = self.mic_muted.clone();
+        view.deafened = self.deafened.clone();
+        view.server_catalog = self.view.server_catalog.clone();
+        view.status = self.view.status.clone();
+        if let Some(room_id) = self.room.viewed_room {
+            view.switch_room(room_id, &self.room);
+            self.room.prepare_client_view(client_id, room_id);
+        }
+        let view = Arc::new(parking_lot::Mutex::new(view));
+        self.clients.insert(
+            client_id,
+            ClientHandle {
+                channel,
+                view: view.clone(),
+            },
+        );
+        view
     }
 
-    pub(crate) fn unregister_client_channel(&mut self, client_id: crate::client_channel::ClientId) {
-        self.client_channels.remove(&client_id);
+    // Removed once the runtime dispatches every remote command through App.
+    pub(crate) fn remote_view(
+        &self,
+        client_id: crate::client_channel::ClientId,
+    ) -> Option<Arc<parking_lot::Mutex<ClientView>>> {
+        self.clients
+            .get(&client_id)
+            .map(|handle| handle.view.clone())
     }
 
     fn channel_for(
@@ -1242,7 +1275,9 @@ impl App {
         if client_id == crate::client_channel::ClientId::PRIMARY {
             self.primary_channel.clone()
         } else {
-            self.client_channels.get(&client_id).cloned()
+            self.clients
+                .get(&client_id)
+                .map(|handle| handle.channel.clone())
         }
     }
 
@@ -4190,7 +4225,8 @@ impl App {
     /// Revokes core-owned leases for a terminal on every retirement path. UI
     /// teardown is best-effort; preview resources cannot depend on it.
     pub(crate) fn retire_client(&mut self, client_id: crate::client_channel::ClientId) {
-        self.unregister_client_channel(client_id);
+        self.clients.remove(&client_id);
+        self.room.remove_client_view(client_id);
         if self.pairing_owner == Some(client_id) {
             self.pairing_owner = None;
             self.password_prompt_active = false;
@@ -4471,6 +4507,13 @@ impl App {
         self.apply_pending_audio_restart();
         self.apply_pending_room_catalog_save(now);
         self.supervise_voice_teardown(now);
+        for handle in self.clients.values() {
+            handle.view.lock().sync_daemon_config(
+                &self.config,
+                self.view.theme,
+                &self.view.server_catalog,
+            );
+        }
     }
 
     /// Projects audio display facts into the shared session so every view
@@ -8887,7 +8930,7 @@ mod tests {
         enter_test_room(&mut app);
         let owner = crate::client_channel::ClientId(77);
         let channel = Arc::new(crate::client_channel::ClientChannel::new().unwrap());
-        app.register_client_channel(owner, channel.clone());
+        app.attach_client(owner, channel.clone());
         app.handle_client_command(
             owner,
             command::CoreCommand::DeleteMessages {
