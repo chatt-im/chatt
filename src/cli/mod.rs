@@ -544,10 +544,51 @@ fn run_interactive_app(
     config_path: Option<&str>,
     pending_join: Option<crate::app::PendingJoin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match Config::load_for_app(config_path)? {
-        AppConfigLoad::Existing(config) => runtime::run_app(config, pending_join),
-        AppConfigLoad::Missing(config) => runtime::run_app_with_welcome(config, pending_join),
+    let mut retaking = false;
+    loop {
+        if pending_join.is_none() {
+            match crate::attach::run_thin_client()? {
+                crate::attach::AttachOutcome::UserQuit => return Ok(()),
+                crate::attach::AttachOutcome::MasterGone => {
+                    retaking = true;
+                    takeover_jitter();
+                    continue;
+                }
+                crate::attach::AttachOutcome::NoMaster => {}
+            }
+        }
+
+        let retake_join = if retaking && pending_join.is_none() {
+            local_control::read_last_server_hint(std::time::Duration::from_secs(60 * 60))
+                .map(|specifier| crate::app::PendingJoin::Named { specifier })
+        } else {
+            pending_join.clone()
+        };
+        let result = match Config::load_for_app(config_path)? {
+            AppConfigLoad::Existing(config) => runtime::run_app(config, retake_join),
+            AppConfigLoad::Missing(config) => runtime::run_app_with_welcome(config, retake_join),
+        };
+        match result {
+            Err(error) if local_control::is_live_socket_error(&error.to_string()) => {
+                if pending_join.is_some() {
+                    return Err(error);
+                }
+                takeover_jitter();
+            }
+            result => return result,
+        }
     }
+}
+
+fn takeover_jitter() {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = nanos ^ u64::from(std::process::id()).wrapping_mul(0x9e37_79b9);
+    std::thread::sleep(Duration::from_millis(50 + mixed % 201));
 }
 
 /// Polls the running client's config file and asks it to reload its theme on

@@ -44,6 +44,7 @@ pub(crate) struct ClientThread {
     pub(crate) config: Arc<RwLock<Config>>,
     pub(crate) commands: Sender<(ClientId, CoreCommand)>,
     pub(crate) initial_mode: InitialMode,
+    pub(crate) follow_primary_view: bool,
 }
 
 impl ClientThread {
@@ -58,6 +59,7 @@ impl ClientThread {
             config,
             commands,
             initial_mode,
+            follow_primary_view,
         } = self;
 
         // SAFETY: this render thread owns the descriptors for its lifetime. For
@@ -110,6 +112,13 @@ impl ClientThread {
         let mut resize_generation = 0;
         loop {
             let actions = channel.actions(&mut resize_generation);
+            if actions.handoff {
+                // A surviving shim is immediately racing to become/attach to
+                // the next master. Preserve raw/alternate-screen state so its
+                // old frame stays visible until that replacement paints.
+                std::mem::forget(terminal);
+                break;
+            }
             if actions.terminate {
                 break;
             }
@@ -125,7 +134,17 @@ impl ClientThread {
                 let session = session.read();
                 let config = config.read();
                 let mut view = view.lock();
-                view.sync_active(&session);
+                let previous_room = view.viewed_room;
+                if follow_primary_view {
+                    view.sync_active(&session);
+                } else {
+                    view.sync_independent(&session);
+                    if view.viewed_room != previous_room
+                        && let Some(room_id) = view.viewed_room
+                    {
+                        let _ = commands.send((id, CoreCommand::SetViewedRoom(room_id)));
+                    }
+                }
                 let mut cx = ViewCx {
                     view: &mut view,
                     session: &session,

@@ -5,11 +5,11 @@
 use extui::Style;
 use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use hashbrown::HashMap;
-use rpc::ids::{MessageId, RoomId};
+use rpc::ids::{MessageId, RoomId, UserId};
 
 use crate::{
     app::{
-        StatusState,
+        ParticipantState, StatusState,
         commands::{CommandCompletionState, RefCompletionState},
         room::{
             ComposerSubmission, DeleteDenied, DeleteSelection, EditDenied, PendingEdit, RefJump,
@@ -44,6 +44,8 @@ pub(crate) struct ClientView {
     /// of the collapsed per-participant latency estimate. Toggled by `/stats`,
     /// session-only (defaults off each launch).
     pub lobby_details: bool,
+    pub participant_scroll: usize,
+    pub participant_selected_user: Option<UserId>,
     pub composer: Editor,
     pub composer_hl: EditorHighlighter,
     /// A minimum composer height, in rows, set by dragging the Chat Log bar.
@@ -113,6 +115,8 @@ impl ClientView {
             mic_level_ballistics: MicLevelBallistics::default(),
             quit_requested: false,
             lobby_details: false,
+            participant_scroll: 0,
+            participant_selected_user: None,
             composer,
             composer_hl,
             composer_min_rows: None,
@@ -136,6 +140,24 @@ impl ClientView {
     /// and before any cursor-addressed operation.
     pub(crate) fn sync_active(&mut self, session: &RoomSession) {
         if session.viewed_room != self.viewed_room
+            && let Some(room_id) = session.viewed_room
+        {
+            self.switch_room(room_id, session);
+            return;
+        }
+        self.sync_buffer(session);
+    }
+
+    /// Synchronizes an attached client's current room without following the
+    /// primary view when it switches rooms.
+    pub(crate) fn sync_independent(&mut self, session: &RoomSession) {
+        if self
+            .viewed_room
+            .is_some_and(|room_id| session.room_meta(room_id).is_none())
+        {
+            self.reset_rooms();
+        }
+        if self.viewed_room.is_none()
             && let Some(room_id) = session.viewed_room
         {
             self.switch_room(room_id, session);
@@ -598,5 +620,72 @@ impl ClientView {
         for room in self.parked.values_mut() {
             room.chat.set_max_messages(max_messages as usize);
         }
+    }
+
+    fn participant_index(&self, entries: &[ParticipantState]) -> Option<usize> {
+        let selected = self.participant_selected_user?;
+        entries.iter().position(|entry| entry.user_id == selected)
+    }
+
+    pub(crate) fn selected_participant<'a>(
+        &mut self,
+        entries: &'a [ParticipantState],
+    ) -> Option<&'a ParticipantState> {
+        if self.participant_index(entries).is_none() {
+            self.participant_selected_user = entries.first().map(|entry| entry.user_id);
+        }
+        self.participant_index(entries).map(|index| &entries[index])
+    }
+
+    pub(crate) fn move_participant_selection(
+        &mut self,
+        entries: &[ParticipantState],
+        delta: isize,
+        visible_rows: usize,
+    ) -> Option<UserId> {
+        if entries.is_empty() {
+            self.participant_selected_user = None;
+            self.participant_scroll = 0;
+            return None;
+        }
+        let current = self.participant_index(entries).unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(entries.len() as isize) as usize;
+        let user_id = entries[next].user_id;
+        self.participant_selected_user = Some(user_id);
+        self.keep_participant_selection_visible(entries, visible_rows);
+        Some(user_id)
+    }
+
+    pub(crate) fn select_visible_participant(
+        &mut self,
+        entries: &[ParticipantState],
+        row: usize,
+        visible_rows: usize,
+    ) -> Option<UserId> {
+        let index = self.participant_scroll.saturating_add(row);
+        let user_id = entries.get(index)?.user_id;
+        self.participant_selected_user = Some(user_id);
+        self.keep_participant_selection_visible(entries, visible_rows);
+        Some(user_id)
+    }
+
+    pub(crate) fn keep_participant_selection_visible(
+        &mut self,
+        entries: &[ParticipantState],
+        visible_rows: usize,
+    ) {
+        let Some(index) = self.participant_index(entries) else {
+            self.participant_scroll = self.participant_scroll.min(entries.len().saturating_sub(1));
+            return;
+        };
+        let visible_rows = visible_rows.max(1);
+        if index < self.participant_scroll {
+            self.participant_scroll = index;
+        } else if index >= self.participant_scroll.saturating_add(visible_rows) {
+            self.participant_scroll = index.saturating_add(1).saturating_sub(visible_rows);
+        }
+        self.participant_scroll = self
+            .participant_scroll
+            .min(entries.len().saturating_sub(visible_rows));
     }
 }

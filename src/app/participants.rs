@@ -154,7 +154,7 @@ fn fold_participant_feedback(
     });
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Participants {
     pub(crate) entries: Vec<ParticipantState>,
     pub(crate) scroll: usize,
@@ -461,6 +461,7 @@ impl Participants {
         self.selected_user = self.entries.first().map(|entry| entry.user_id);
     }
 
+    #[cfg(test)]
     pub(crate) fn selected_index(&self) -> Option<usize> {
         let selected_user = self.selected_user?;
         self.entries
@@ -475,6 +476,7 @@ impl Participants {
             .find(|entry| entry.user_id == selected_user)
     }
 
+    #[cfg(test)]
     pub(crate) fn move_selection(&mut self, delta: isize) -> Option<UserId> {
         if self.entries.is_empty() {
             self.selected_user = None;
@@ -486,29 +488,6 @@ impl Participants {
         let user_id = self.entries[next].user_id;
         self.selected_user = Some(user_id);
         Some(user_id)
-    }
-
-    pub(crate) fn select_visible_row(&mut self, row: usize) -> Option<UserId> {
-        let index = self.scroll.saturating_add(row);
-        let user_id = self.entries.get(index)?.user_id;
-        self.selected_user = Some(user_id);
-        Some(user_id)
-    }
-
-    pub(crate) fn keep_selected_visible(&mut self, visible_rows: usize) {
-        let Some(index) = self.selected_index() else {
-            self.scroll = self.scroll.min(self.entries.len().saturating_sub(1));
-            return;
-        };
-        let visible_rows = visible_rows.max(1);
-        if index < self.scroll {
-            self.scroll = index;
-        } else if index >= self.scroll.saturating_add(visible_rows) {
-            self.scroll = index.saturating_add(1).saturating_sub(visible_rows);
-        }
-        self.scroll = self
-            .scroll
-            .min(self.entries.len().saturating_sub(visible_rows));
     }
 }
 

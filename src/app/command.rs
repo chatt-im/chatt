@@ -75,7 +75,7 @@ pub(crate) enum CoreCommand {
     ToggleMute,
     ToggleDeafen,
     SetVoiceMode(LocalVoiceMode),
-    ToggleSelectedUserMute,
+    ToggleUserMute(UserId),
     BeginVolumePreview {
         user_id: UserId,
         value_db: f32,
@@ -83,17 +83,6 @@ pub(crate) enum CoreCommand {
     ApplyVolume {
         event: UserVolumeEvent,
         dialog: UserVolumeDialog,
-    },
-    MoveParticipantSelection {
-        delta: isize,
-        visible_rows: usize,
-    },
-    KeepParticipantSelectionVisible {
-        visible_rows: usize,
-    },
-    SelectVisibleParticipant {
-        row: usize,
-        visible_rows: usize,
     },
     CancelTransfer(FileTransferId),
     SetRoomHeight(u16),

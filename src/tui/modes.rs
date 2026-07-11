@@ -581,6 +581,9 @@ impl RoomSwitchMode {
 
     fn refresh_cx(&mut self, cx: &ViewCx<'_>) {
         self.items = cx.session.room_select_items(cx.session.voice_room);
+        for item in &mut self.items {
+            item.viewed = cx.view.viewed_room == Some(item.room_id);
+        }
         self.select.refresh(&self.items);
     }
 
@@ -1329,37 +1332,31 @@ impl RoomMode {
             cx.config,
             server,
             room_id,
-            cx.session.room_name.clone(),
+            cx.session
+                .room_meta(room_id)
+                .map(|room| room.name.clone())
+                .unwrap_or_else(|| cx.session.room_name.clone()),
         );
         cx.request_transition(ModeTransition::Push(Box::new(RoomSettingsMode::new(draft))));
     }
 
     fn open_selected_user_volume(&self, cx: &mut ViewCx<'_>) {
-        let selected = match cx.session.selected_remote_user(cx.session.local_user) {
-            Ok(user) => user,
-            Err(error) => {
-                cx.set_status(error.status_text());
-                return;
-            }
+        let participants = cx.session.participant_snapshot(cx.view.viewed_room);
+        let Some(selected) = cx.view.selected_participant(&participants.entries) else {
+            cx.set_status("no user selected");
+            return;
         };
-        let value_db = cx
-            .config
-            .user_volume_db(&cx.session.server_alias, selected.user_id);
-        cx.send(CoreCommand::BeginVolumePreview {
-            user_id: selected.user_id,
-            value_db,
-        });
-        let dialog = UserVolumeDialog::new(
-            selected.user_id,
-            selected.display_name.clone(),
-            value_db,
-            &cx.view.theme,
-        );
+        if Some(selected.user_id) == cx.session.local_user {
+            cx.set_status("select another user to adjust volume");
+            return;
+        }
+        let user_id = selected.user_id;
+        let display_name = selected.display_name().to_string();
+        let value_db = cx.config.user_volume_db(&cx.session.server_alias, user_id);
+        cx.send(CoreCommand::BeginVolumePreview { user_id, value_db });
+        let dialog = UserVolumeDialog::new(user_id, display_name.clone(), value_db, &cx.view.theme);
         cx.request_transition(ModeTransition::Push(Box::new(DialogMode::new(dialog))));
-        cx.set_status(format!(
-            "adjusting local volume for {}",
-            selected.display_name
-        ));
+        cx.set_status(format!("adjusting local volume for {display_name}"));
     }
 
     fn cycle_room(&self, cx: &mut ViewCx<'_>, delta: isize) {
@@ -1417,7 +1414,12 @@ impl RoomMode {
                 if self.focus != ChatPanelFocus::Lobby {
                     cx.set_status("focus lobby to mute users");
                 } else if self.lobby_list_focus == LobbyListFocus::Users {
-                    cx.send(CoreCommand::ToggleSelectedUserMute);
+                    let participants = cx.session.participant_snapshot(cx.view.viewed_room);
+                    let Some(selected) = cx.view.selected_participant(&participants.entries) else {
+                        cx.set_status("no user selected");
+                        return Action::Continue;
+                    };
+                    cx.send(CoreCommand::ToggleUserMute(selected.user_id));
                 } else {
                     cx.set_status("focus users list to mute users");
                 }
@@ -1603,10 +1605,10 @@ impl RoomMode {
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_user_list => {
                 self.set_lobby_list_focus(cx, LobbyListFocus::Users);
                 let row = mouse.row.saturating_sub(self.layout.user_list_rect.y) as usize;
-                cx.send(CoreCommand::SelectVisibleParticipant {
-                    row,
-                    visible_rows: self.visible_user_rows(cx),
-                });
+                let visible_rows = self.visible_user_rows(cx);
+                let participants = cx.session.participant_snapshot(cx.view.viewed_room);
+                cx.view
+                    .select_visible_participant(&participants.entries, row, visible_rows);
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_chat_bar => {
                 self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
@@ -2085,10 +2087,15 @@ impl RoomMode {
     }
 
     fn move_user_selection(&mut self, cx: &mut ViewCx<'_>, delta: isize) {
-        cx.send(CoreCommand::MoveParticipantSelection {
-            delta,
-            visible_rows: self.visible_user_rows(cx),
-        });
+        let visible_rows = self.visible_user_rows(cx);
+        let participants = cx.session.participant_snapshot(cx.view.viewed_room);
+        if cx
+            .view
+            .move_participant_selection(&participants.entries, delta, visible_rows)
+            .is_none()
+        {
+            cx.set_status("no users in the current room yet");
+        }
         self.focus = ChatPanelFocus::Lobby;
         self.lobby_list_focus = LobbyListFocus::Users;
     }
@@ -2101,9 +2108,10 @@ impl RoomMode {
     }
 
     fn keep_selected_room_user_visible(&mut self, cx: &mut ViewCx<'_>) {
-        cx.send(CoreCommand::KeepParticipantSelectionVisible {
-            visible_rows: self.visible_user_rows(cx),
-        });
+        let visible_rows = self.visible_user_rows(cx);
+        let participants = cx.session.participant_snapshot(cx.view.viewed_room);
+        cx.view
+            .keep_participant_selection_visible(&participants.entries, visible_rows);
     }
 
     fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
