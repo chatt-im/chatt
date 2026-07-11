@@ -5,11 +5,10 @@ use extui::{
     event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent},
 };
 use extui_bindings::LayerId;
-use std::sync::mpsc::SyncSender;
 
 use crate::{
     app::{RoomSession, command::CoreCommand},
-    client_channel::{ClientEvent, ClientId},
+    client_channel::ClientEvent,
     config::Config,
     theme,
     tui::{Action, view::ClientView},
@@ -18,35 +17,24 @@ use crate::{
 #[cfg(test)]
 use crate::app::App;
 
-pub(crate) enum CommandSink<'a> {
-    Local(&'a mut Vec<CoreCommand>),
-    Channel {
-        client_id: ClientId,
-        sender: &'a SyncSender<(ClientId, CoreCommand)>,
-    },
-}
-
 /// The state and command sink available to render-thread mode code.
 ///
-/// The session is deliberately read-only. Once clients render on their own
-/// threads this reference will be backed by a scoped `RwLock` read guard.
+/// The session is deliberately read-only. Commands land in a local queue,
+/// never directly in a channel: a channel send could block while this context
+/// holds the session read guard the core needs before it can drain commands.
+/// The context's owner transmits the queue once the guards are dropped.
 #[allow(dead_code)]
 pub(crate) struct ViewCx<'a> {
     pub(crate) view: &'a mut ClientView,
     pub(crate) session: &'a RoomSession,
     pub(crate) config: &'a Config,
-    pub(crate) commands: CommandSink<'a>,
+    pub(crate) commands: &'a mut Vec<CoreCommand>,
 }
 
 #[allow(dead_code)]
 impl ViewCx<'_> {
     pub(crate) fn send(&mut self, command: CoreCommand) {
-        match &mut self.commands {
-            CommandSink::Local(commands) => commands.push(command),
-            CommandSink::Channel { client_id, sender } => {
-                let _ = sender.send((*client_id, command));
-            }
-        }
+        self.commands.push(command);
     }
 
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
