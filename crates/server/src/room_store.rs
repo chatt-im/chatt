@@ -1431,6 +1431,10 @@ fn load_log(path: &Path, repair: LogRepair) -> LoadedLog {
 }
 
 fn truncate_log(path: &Path, valid_bytes: u64) -> std::io::Result<()> {
+    #[cfg(test)]
+    if path.with_extension("fail-truncate").exists() {
+        return Err(std::io::Error::other("forced log truncation failure"));
+    }
     let file = OpenOptions::new().write(true).open(path)?;
     file.set_len(valid_bytes)?;
     file.sync_all()
@@ -1801,13 +1805,12 @@ mod tests {
 
     #[test]
     fn open_dm_rolls_back_when_state_persist_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = temp_dir("dm-rollback");
         let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let blocked_tmp = dir.join(format!("{STATE_FILE}.tmp"));
+        fs::create_dir(&blocked_tmp).unwrap();
         let result = store.open_dm(UserId(1), UserId(2), 1_000);
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir(&blocked_tmp).unwrap();
         assert!(result.is_err(), "unpersistable dm creation must fail");
         assert_eq!(store.dm_room_for(UserId(1), UserId(2)), None);
 
@@ -1847,8 +1850,6 @@ mod tests {
 
     #[test]
     fn unrepairable_corrupt_tail_degrades_to_memory() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = temp_dir("corrupt-unrepairable");
         let rooms = [durable_room(1)];
         let room = RoomId(1);
@@ -1865,9 +1866,11 @@ mod tests {
         bytes.truncate(bytes.len() - 3);
         bytes.extend_from_slice(&[0xFF, 0xFF]);
         fs::write(&log, &bytes).unwrap();
-        fs::set_permissions(&log, fs::Permissions::from_mode(0o444)).unwrap();
+        let fail_truncate = log.with_extension("fail-truncate");
+        fs::write(&fail_truncate, []).unwrap();
 
         let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
+        fs::remove_file(fail_truncate).unwrap();
         assert_eq!(store.recent(room, 10).len(), 2);
         let id = store.allocate_message_id(room);
         store.append(room, &test_message(room, id.0));
@@ -1883,7 +1886,6 @@ mod tests {
             bytes,
             "nothing may be written after the unrepaired corruption"
         );
-        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
