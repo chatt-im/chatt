@@ -47,6 +47,8 @@ pub(crate) struct ClientView {
     /// of the collapsed per-participant latency estimate. Toggled by `/stats`,
     /// session-only (defaults off each launch).
     pub lobby_details: bool,
+    /// First visible row in the Rooms list, relative to the room catalog.
+    pub rooms_offset: usize,
     pub participant_scroll: usize,
     pub participant_selected_user: Option<UserId>,
     pub composer: Editor,
@@ -121,6 +123,7 @@ impl ClientView {
             mic_level_ballistics: MicLevelBallistics::default(),
             quit_requested: false,
             lobby_details: false,
+            rooms_offset: 0,
             participant_scroll: 0,
             participant_selected_user: None,
             composer,
@@ -139,6 +142,29 @@ impl ClientView {
             max_messages,
             syntax,
         }
+    }
+
+    pub(crate) fn clamp_rooms_offset(&mut self, room_count: usize, visible_rows: usize) {
+        self.rooms_offset = self
+            .rooms_offset
+            .min(room_count.saturating_sub(visible_rows));
+    }
+
+    pub(crate) fn keep_room_index_visible(
+        &mut self,
+        index: usize,
+        room_count: usize,
+        visible_rows: usize,
+    ) {
+        self.clamp_rooms_offset(room_count, visible_rows);
+        if visible_rows == 0 {
+            self.rooms_offset = 0;
+        } else if index < self.rooms_offset {
+            self.rooms_offset = index;
+        } else if index >= self.rooms_offset.saturating_add(visible_rows) {
+            self.rooms_offset = index + 1 - visible_rows;
+        }
+        self.clamp_rooms_offset(room_count, visible_rows);
     }
 
     /// Catches the viewed room's buffer up to the shared session, following
@@ -230,6 +256,7 @@ impl ClientView {
     pub(crate) fn reset_rooms(&mut self) {
         self.pending_edit = None;
         self.viewed_room = None;
+        self.rooms_offset = 0;
         self.parked.clear();
         self.active = RoomView::detached(self.max_messages, self.syntax);
         self.composer.clear();
