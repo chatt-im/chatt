@@ -228,19 +228,19 @@ impl StatusState {
         self.kind
     }
 
-    fn set(&mut self, status: impl Into<String>) {
+    pub(crate) fn set(&mut self, status: impl Into<String>) {
         self.text = status.into();
         self.kind = StatusKind::Info;
         self.expires_at = None;
     }
 
-    fn set_error(&mut self, status: impl Into<String>) {
+    pub(crate) fn set_error(&mut self, status: impl Into<String>) {
         self.text = status.into();
         self.kind = StatusKind::Error;
         self.expires_at = None;
     }
 
-    fn set_transient(&mut self, status: impl Into<String>, expires_at: Instant) {
+    pub(crate) fn set_transient(&mut self, status: impl Into<String>, expires_at: Instant) {
         self.set(status);
         self.expires_at = Some(expires_at);
     }
@@ -1200,10 +1200,30 @@ impl App {
                 skipped,
             } => {
                 let _ = skipped;
-                self.delete_chat_messages(room_id, targets);
+                if self.delete_chat_messages(room_id, targets)
+                    && self.view.viewed_room == Some(room_id)
+                {
+                    self.view.active.chat.clear_visual_anchor();
+                }
             }
             CoreCommand::SetViewedRoom(room_id) => {
                 self.set_viewed_room(room_id);
+            }
+            CoreCommand::OpenMessageRef {
+                target,
+                width,
+                height,
+            } => {
+                if self.set_viewed_room(target.room_id) {
+                    match self.view.jump_to_ref(target, width, height) {
+                        room::RefJump::Jumped => {}
+                        _ => self.set_status("referenced message is not in this room's history"),
+                    }
+                } else if let Some(preview) = self.room.cross_room_ref_preview(target) {
+                    self.set_status(preview);
+                } else {
+                    self.set_status("reference points to another room");
+                }
             }
             CoreCommand::RequestOlderHistory { room_id } => {
                 self.request_older_history(room_id);
@@ -1217,7 +1237,32 @@ impl App {
             }
             CoreCommand::SetVoiceMode(mode) => self.set_local_voice_mode(mode),
             CoreCommand::ToggleSelectedUserMute => self.toggle_selected_user_mute(),
+            CoreCommand::BeginVolumePreview { user_id, value_db } => {
+                self.room.begin_volume_preview(user_id, value_db);
+            }
+            CoreCommand::MoveParticipantSelection {
+                delta,
+                visible_rows,
+            } => {
+                if self.room.move_participant_selection(delta).is_none() {
+                    self.set_status("no users in the current room yet");
+                } else {
+                    self.room.keep_selected_participant_visible(visible_rows);
+                }
+            }
+            CoreCommand::KeepParticipantSelectionVisible { visible_rows } => {
+                self.room.keep_selected_participant_visible(visible_rows);
+            }
+            CoreCommand::SelectVisibleParticipant { row, visible_rows } => {
+                if self.room.select_visible_participant(row).is_some() {
+                    self.room.keep_selected_participant_visible(visible_rows);
+                }
+            }
             CoreCommand::CancelTransfer(transfer_id) => self.cancel_transfer(transfer_id),
+            CoreCommand::SetRoomHeight(height) => self.config.ui.room_height = height,
+            CoreCommand::OpenSettings => self.open_settings(),
+            CoreCommand::PlaySoundboard(slot) => self.trigger_soundboard_slot(slot),
+            CoreCommand::ToggleVideo => self.activate_top_bar_video(),
             CoreCommand::Connect { alias } => {
                 self.start_network(&alias);
             }
@@ -2091,6 +2136,7 @@ impl App {
         true
     }
 
+    #[allow(dead_code)] // Removed after all modes dispatch through ViewCx.
     pub(crate) fn request_older_history_if_at_top(&mut self, width: u16, height: u16) {
         if !self.view.active.chat.is_at_top(width, height) {
             return;
@@ -2127,6 +2173,7 @@ impl App {
         self.push_mode(Box::new(RoomSwitchMode::new()));
     }
 
+    #[allow(dead_code)] // Removed after all modes dispatch through ViewCx.
     pub(crate) fn open_user_list(&mut self) {
         self.push_mode(Box::new(crate::tui::user_list::UserListMode::new()));
     }
@@ -2205,6 +2252,7 @@ impl App {
     }
 
     /// Switches the view to the neighboring room in catalog order, wrapping.
+    #[allow(dead_code)] // Retained while App-level behavior tests migrate.
     pub(crate) fn cycle_room(&mut self, delta: isize) {
         let rooms: Vec<RoomId> = self.room.room_metas().map(|(room_id, _)| room_id).collect();
         if rooms.is_empty() {
@@ -4882,6 +4930,7 @@ impl App {
         self.set_status("settings draft changed; save config when ready");
     }
 
+    #[allow(dead_code)] // Retained while App-level behavior tests migrate.
     pub(crate) fn open_selected_user_volume(&mut self) {
         let selected = match self.room.selected_remote_user(self.user_id) {
             Ok(user) => user,
@@ -5133,6 +5182,7 @@ impl App {
         self.set_status("refreshing audio devices");
     }
 
+    #[allow(dead_code)] // Retained while App-level behavior tests migrate.
     pub(crate) fn submit_input(&mut self) {
         let Some(submission) = self.view.submit_composer() else {
             return;
@@ -5329,6 +5379,7 @@ impl App {
     }
 
     /// Opens the filename confirmation dialog for a pasted image or file.
+    #[allow(dead_code)] // Removed after all modes dispatch through ViewCx.
     pub(crate) fn open_paste_image_dialog(&mut self, image: crate::clipboard_paste::ImagePaste) {
         let dialog = PasteImageUploadMode::new(image, &self.view.theme);
         self.push_mode(Box::new(dialog));

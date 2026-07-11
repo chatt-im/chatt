@@ -5,8 +5,8 @@ use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 
 use crate::{
     app::{
-        App, ChatPanelFocus, DeleteSelection, PendingJoin, ServerEditDraft, ServerEditEvent,
-        ToggleExpandResult,
+        App, ChatPanelFocus, DeleteSelection, PendingJoin, RoomSettingsDraft, ServerEditDraft,
+        ServerEditEvent, ToggleExpandResult, UserVolumeDialog, command::CoreCommand,
     },
     bindings::{self, BindCommand, Resolved},
     chat_buffer::{Cursor as ChatCursor, LineKind, VisibleLine},
@@ -15,10 +15,12 @@ use crate::{
     tui::{
         form::{FormAction, FormFieldKind, FormMouseIntent, FormState},
         mode::{
-            AppMode, ChromeSpec, Coverage, ExitReason, ModePresentation, ModeTransition,
+            AppMode, ChromeSpec, Coverage, ExitReason, ModePresentation, ModeTransition, ViewCx,
             is_quit_key,
         },
-        overlay::{ConfirmDisposition, ConfirmMode},
+        overlay::{ConfirmDisposition, ConfirmMode, DialogMode, PasteImageUploadMode},
+        room_settings::RoomSettingsMode,
+        user_list::UserListMode,
     },
     ui::{
         select::FuzzySelect,
@@ -230,17 +232,22 @@ pub(crate) enum BindingResolution {
 }
 
 pub(crate) fn resolve_binding(app: &mut App, layer: LayerId, key: KeyEvent) -> BindingResolution {
+    let mut cx = app.view_cx();
+    resolve_binding_cx(&mut cx, layer, key)
+}
+
+fn resolve_binding_cx(cx: &mut ViewCx<'_>, layer: LayerId, key: KeyEvent) -> BindingResolution {
     let Some(input) = InputKey::from_event(&key) else {
         return BindingResolution::Unmatched;
     };
     match bindings::resolve(
-        &app.config.bindings.router,
+        &cx.config.bindings.router,
         layer,
-        &mut app.view.chrome.binding.pending_chord,
+        &mut cx.view.chrome.binding.pending_chord,
         input,
     ) {
         Resolved::Action(id) => {
-            BindingResolution::Action(app.config.bindings.actions.get(id).clone())
+            BindingResolution::Action(cx.config.bindings.actions.get(id).clone())
         }
         Resolved::Consumed => BindingResolution::Consumed,
         Resolved::Unmatched => BindingResolution::Unmatched,
@@ -969,34 +976,50 @@ impl RoomMode {
         &self.layout
     }
 
-    pub(crate) fn set_focus(&mut self, app: &mut App, focus: ChatPanelFocus) {
+    fn set_focus_cx(&mut self, cx: &mut ViewCx<'_>, focus: ChatPanelFocus) {
         if self.focus == ChatPanelFocus::Compose && focus != ChatPanelFocus::Compose {
-            app.view.cancel_pending_edit();
+            cx.view.cancel_pending_edit();
         }
         self.focus = focus;
         match focus {
             ChatPanelFocus::Lobby if self.lobby_list_focus == LobbyListFocus::Users => {
-                self.keep_selected_room_user_visible(app);
+                self.keep_selected_room_user_visible(cx);
             }
             ChatPanelFocus::Lobby => {}
             ChatPanelFocus::ChatLog => {
-                app.view.active.chat.ensure_cursor(self.layout.chat_width);
+                cx.view.active.chat.ensure_cursor(self.layout.chat_width);
             }
             ChatPanelFocus::Compose => {}
         }
     }
 
-    fn enter_compose_insert_mode(&mut self, app: &mut App) {
-        app.view.composer.enter_insert_mode();
-        self.set_focus(app, ChatPanelFocus::Compose);
+    #[cfg(test)]
+    pub(crate) fn set_focus(&mut self, app: &mut App, focus: ChatPanelFocus) {
+        let mut cx = app.view_cx();
+        self.set_focus_cx(&mut cx, focus);
+        app.drain_core_commands();
     }
 
-    fn move_focus(&mut self, app: &mut App, delta: isize) {
-        self.set_focus(app, self.focus.moved(delta));
+    fn enter_compose_insert_mode(&mut self, cx: &mut ViewCx<'_>) {
+        cx.view.composer.enter_insert_mode();
+        self.set_focus_cx(cx, ChatPanelFocus::Compose);
+    }
+
+    fn move_focus(&mut self, cx: &mut ViewCx<'_>, delta: isize) {
+        self.set_focus_cx(cx, self.focus.moved(delta));
     }
 
     /// The binding layer for non-compose focus: the chat-visual overlay while
     /// the chat log holds a visual-line selection, the workspace otherwise.
+    fn workspace_layer_cx(&self, cx: &ViewCx<'_>) -> LayerId {
+        if self.focus == ChatPanelFocus::ChatLog && cx.view.active.chat.has_visual() {
+            bindings::CHAT_VISUAL_LAYER
+        } else {
+            bindings::WORKSPACE_LAYER
+        }
+    }
+
+    #[cfg(test)]
     fn workspace_layer(&self, app: &App) -> LayerId {
         if self.focus == ChatPanelFocus::ChatLog && app.view.active.chat.has_visual() {
             bindings::CHAT_VISUAL_LAYER
@@ -1005,123 +1028,282 @@ impl RoomMode {
         }
     }
 
-    fn set_lobby_list_focus(&mut self, app: &mut App, focus: LobbyListFocus) {
+    fn set_lobby_list_focus(&mut self, cx: &mut ViewCx<'_>, focus: LobbyListFocus) {
         self.lobby_list_focus = focus;
-        self.set_focus(app, ChatPanelFocus::Lobby);
+        self.set_focus_cx(cx, ChatPanelFocus::Lobby);
     }
 
-    fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+    fn submit_input(&mut self, cx: &mut ViewCx<'_>) {
+        let Some(submission) = cx.view.submit_composer() else {
+            return;
+        };
+        match submission {
+            crate::app::ComposerSubmission::Message(body) => cx.send(CoreCommand::SendChat {
+                room_id: cx.view.viewed_room,
+                body,
+            }),
+            crate::app::ComposerSubmission::Edit {
+                room_id,
+                target,
+                body,
+            } => cx.send(CoreCommand::SubmitEdit {
+                room_id,
+                target,
+                body,
+            }),
+            crate::app::ComposerSubmission::Command(input) => {
+                if !self.run_ui_slash(cx, &input) {
+                    cx.send(CoreCommand::RunSlash { input });
+                }
+            }
+        }
+    }
+
+    fn run_ui_slash(&mut self, cx: &mut ViewCx<'_>, input: &str) -> bool {
+        match input {
+            "/quit" => cx.set_status("use Ctrl-C to quit"),
+            "/stats" => {
+                cx.view.lobby_details = !cx.view.lobby_details;
+                cx.set_status(if cx.view.lobby_details {
+                    "lobby detail on (jitter buffer stats)"
+                } else {
+                    "lobby detail off (latency estimate)"
+                });
+            }
+            "/clear" => cx.view.clear_chat(),
+            "/config" | "/settings" => cx.send(CoreCommand::OpenSettings),
+            "/servers" if cx.session.active_server_label.is_some() => {
+                cx.request_transition(ModeTransition::Pop);
+            }
+            "/servers" => {
+                cx.request_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
+            }
+            "/rooms" => self.open_room_switcher(cx),
+            "/room-settings" => self.open_room_settings(cx),
+            _ => return false,
+        }
+        true
+    }
+
+    fn open_room_switcher(&self, cx: &mut ViewCx<'_>) {
+        cx.request_transition(ModeTransition::Push(Box::new(RoomSwitchMode::new())));
+    }
+
+    fn open_user_list(&self, cx: &mut ViewCx<'_>) {
+        cx.request_transition(ModeTransition::Push(Box::new(UserListMode::new())));
+    }
+
+    fn open_room_settings(&self, cx: &mut ViewCx<'_>) {
+        let Some(alias) = cx.session.active_server_label.as_ref() else {
+            cx.set_error("connect to a server first");
+            return;
+        };
+        let Some(room_id) = cx.view.viewed_room else {
+            cx.set_error("view a room first");
+            return;
+        };
+        let server = match cx.config.server(alias) {
+            Ok(server) => server,
+            Err(error) => {
+                cx.set_error(error);
+                return;
+            }
+        };
+        let draft = RoomSettingsDraft::from_config(
+            cx.config,
+            server,
+            room_id,
+            cx.session.room_name.clone(),
+        );
+        cx.request_transition(ModeTransition::Push(Box::new(RoomSettingsMode::new(draft))));
+    }
+
+    fn open_selected_user_volume(&self, cx: &mut ViewCx<'_>) {
+        let selected = match cx.session.selected_remote_user(cx.session.local_user) {
+            Ok(user) => user,
+            Err(error) => {
+                cx.set_status(error.status_text());
+                return;
+            }
+        };
+        let value_db = cx
+            .config
+            .user_volume_db(&cx.session.server_alias, selected.user_id);
+        cx.send(CoreCommand::BeginVolumePreview {
+            user_id: selected.user_id,
+            value_db,
+        });
+        let dialog = UserVolumeDialog::new(
+            selected.user_id,
+            selected.display_name.clone(),
+            value_db,
+            &cx.view.theme,
+        );
+        cx.request_transition(ModeTransition::Push(Box::new(DialogMode::new(dialog))));
+        cx.set_status(format!(
+            "adjusting local volume for {}",
+            selected.display_name
+        ));
+    }
+
+    fn cycle_room(&self, cx: &mut ViewCx<'_>, delta: isize) {
+        let rooms: Vec<_> = cx
+            .session
+            .room_metas()
+            .map(|(room_id, _)| room_id)
+            .collect();
+        if rooms.is_empty() {
+            cx.set_status("no rooms yet");
+            return;
+        }
+        let current = cx
+            .view
+            .viewed_room
+            .and_then(|viewed| rooms.iter().position(|room_id| *room_id == viewed));
+        let next = match current {
+            Some(current) => (current as isize + delta).rem_euclid(rooms.len() as isize) as usize,
+            None if delta < 0 => rooms.len() - 1,
+            None => 0,
+        };
+        cx.send(CoreCommand::SetViewedRoom(rooms[next]));
+    }
+
+    fn process_global_command(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
         use BindCommand::*;
         match command {
-            EnterCompose => self.enter_compose_insert_mode(app),
-            EnterLog => self.set_focus(app, ChatPanelFocus::ChatLog),
-            SubmitMessage => app.submit_input(),
-            Cancel => {
-                if self.focus == ChatPanelFocus::Compose && !app.view.cancel_pending_edit() {
-                    app.view.composer.clear();
-                }
-                self.enter_compose_insert_mode(app);
+            OpenSettings => cx.send(CoreCommand::OpenSettings),
+            Quit => return Action::Quit,
+            ToggleMute => cx.send(CoreCommand::ToggleMute),
+            ToggleDeafen => cx.send(CoreCommand::ToggleDeafen),
+            PlaySoundboard1 => cx.send(CoreCommand::PlaySoundboard(0)),
+            PlaySoundboard2 => cx.send(CoreCommand::PlaySoundboard(1)),
+            PlaySoundboard3 => cx.send(CoreCommand::PlaySoundboard(2)),
+            PlaySoundboard4 => cx.send(CoreCommand::PlaySoundboard(3)),
+            PlaySoundboard5 => cx.send(CoreCommand::PlaySoundboard(4)),
+            PlaySoundboard6 => cx.send(CoreCommand::PlaySoundboard(5)),
+            PlaySoundboard7 => cx.send(CoreCommand::PlaySoundboard(6)),
+            PlaySoundboard8 => cx.send(CoreCommand::PlaySoundboard(7)),
+            PlaySoundboard9 => cx.send(CoreCommand::PlaySoundboard(8)),
+            ToggleKeyPreview => {
+                cx.view.chrome.key_preview.expanded = !cx.view.chrome.key_preview.expanded;
             }
-            ScrollUp => self.scroll_focused_panel(app, -1),
-            ScrollDown => self.scroll_focused_panel(app, 1),
-            RoomScrollUp => self.move_user_selection_with_focus(app, -1),
-            RoomScrollDown => self.move_user_selection_with_focus(app, 1),
-            OpenSelectedUserVolume => {
-                if self.focus != ChatPanelFocus::Lobby {
-                    app.set_status("focus lobby to adjust users");
-                } else if self.lobby_list_focus == LobbyListFocus::Users {
-                    app.open_selected_user_volume();
-                } else {
-                    app.set_status("focus users list to adjust volume");
-                }
-            }
-            ToggleSelectedUserMute => {
-                if self.focus != ChatPanelFocus::Lobby {
-                    app.set_status("focus lobby to mute users");
-                } else if self.lobby_list_focus == LobbyListFocus::Users {
-                    app.toggle_selected_user_mute();
-                } else {
-                    app.set_status("focus users list to mute users");
-                }
-            }
-            HalfPageUp => {
-                self.scroll_chat_log_if_focused(app, -(self.chat_half_page_rows() as isize));
-            }
-            HalfPageDown => {
-                self.scroll_chat_log_if_focused(app, self.chat_half_page_rows() as isize);
-            }
-            Top => self.select_chat_top(app),
-            Bottom => self.select_chat_bottom(app),
-            ParagraphBack => self.move_chat_cursor_paragraph(app, -1),
-            ParagraphForward => self.move_chat_cursor_paragraph(app, 1),
-            ToggleVisual => self.toggle_chat_visual_if_focused(app),
-            ClearSelection => {
-                if self.focus == ChatPanelFocus::ChatLog {
-                    app.view.active.chat.clear_visual_anchor();
-                }
-            }
-            CopySelection => self.copy_chat_selection_if_focused(app),
-            CopyLine => self.copy_cursor_line_if_focused(app),
-            CopyMessage => self.copy_cursor_message_if_focused(app),
-            CopyMessageRef => self.copy_message_ref_if_focused(app),
-            InsertMessageRef => self.insert_message_ref_if_focused(app),
-            OpenMessageRef => self.open_message_ref_if_focused(app),
-            EditMessage => self.edit_cursor_message_if_focused(app),
-            DeleteMessage => self.delete_selected_messages_if_focused(app),
-            ToggleExpand => self.toggle_chat_expand_if_focused(app),
-            FocusNext => self.move_focus(app, 1),
-            FocusPrev => self.move_focus(app, -1),
-            SelectNext if self.focus == ChatPanelFocus::Lobby => self.scroll_focused_panel(app, 1),
-            SelectPrev if self.focus == ChatPanelFocus::Lobby => self.scroll_focused_panel(app, -1),
-            AdjustLeft if self.focus == ChatPanelFocus::Lobby => {
-                self.set_lobby_list_focus(app, LobbyListFocus::Rooms);
-            }
-            AdjustRight if self.focus == ChatPanelFocus::Lobby => {
-                self.set_lobby_list_focus(app, LobbyListFocus::Users);
-            }
-            ClearChat if self.focus == ChatPanelFocus::ChatLog => app.view.clear_chat(),
-            PasteClipboard => {
-                self.paste_from_clipboard(app, &crate::clipboard_paste::HelperClipboard)
-            }
-            RoomSwitcher => app.open_room_switcher(),
-            OpenUserList => app.open_user_list(),
-            OpenRoomSettings => app.open_room_settings(),
-            NextRoom => app.cycle_room(1),
-            PrevRoom => app.cycle_room(-1),
-            _ => return app.process_global_command(command),
+            _ => {}
         }
         Action::Continue
     }
 
-    fn process_compose_key(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if app.view.composer.mode() == EditorMode::Insert {
+    fn process_action(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
+        use BindCommand::*;
+        match command {
+            EnterCompose => self.enter_compose_insert_mode(cx),
+            EnterLog => self.set_focus_cx(cx, ChatPanelFocus::ChatLog),
+            SubmitMessage => self.submit_input(cx),
+            Cancel => {
+                if self.focus == ChatPanelFocus::Compose && !cx.view.cancel_pending_edit() {
+                    cx.view.composer.clear();
+                }
+                self.enter_compose_insert_mode(cx);
+            }
+            ScrollUp => self.scroll_focused_panel(cx, -1),
+            ScrollDown => self.scroll_focused_panel(cx, 1),
+            RoomScrollUp => self.move_user_selection_with_focus(cx, -1),
+            RoomScrollDown => self.move_user_selection_with_focus(cx, 1),
+            OpenSelectedUserVolume => {
+                if self.focus != ChatPanelFocus::Lobby {
+                    cx.set_status("focus lobby to adjust users");
+                } else if self.lobby_list_focus == LobbyListFocus::Users {
+                    self.open_selected_user_volume(cx);
+                } else {
+                    cx.set_status("focus users list to adjust volume");
+                }
+            }
+            ToggleSelectedUserMute => {
+                if self.focus != ChatPanelFocus::Lobby {
+                    cx.set_status("focus lobby to mute users");
+                } else if self.lobby_list_focus == LobbyListFocus::Users {
+                    cx.send(CoreCommand::ToggleSelectedUserMute);
+                } else {
+                    cx.set_status("focus users list to mute users");
+                }
+            }
+            HalfPageUp => {
+                self.scroll_chat_log_if_focused(cx, -(self.chat_half_page_rows() as isize));
+            }
+            HalfPageDown => {
+                self.scroll_chat_log_if_focused(cx, self.chat_half_page_rows() as isize);
+            }
+            Top => self.select_chat_top(cx),
+            Bottom => self.select_chat_bottom(cx),
+            ParagraphBack => self.move_chat_cursor_paragraph(cx, -1),
+            ParagraphForward => self.move_chat_cursor_paragraph(cx, 1),
+            ToggleVisual => self.toggle_chat_visual_if_focused(cx),
+            ClearSelection => {
+                if self.focus == ChatPanelFocus::ChatLog {
+                    cx.view.active.chat.clear_visual_anchor();
+                }
+            }
+            CopySelection => self.copy_chat_selection_if_focused(cx),
+            CopyLine => self.copy_cursor_line_if_focused(cx),
+            CopyMessage => self.copy_cursor_message_if_focused(cx),
+            CopyMessageRef => self.copy_message_ref_if_focused(cx),
+            InsertMessageRef => self.insert_message_ref_if_focused(cx),
+            OpenMessageRef => self.open_message_ref_if_focused(cx),
+            EditMessage => self.edit_cursor_message_if_focused(cx),
+            DeleteMessage => self.delete_selected_messages_if_focused(cx),
+            ToggleExpand => self.toggle_chat_expand_if_focused(cx),
+            FocusNext => self.move_focus(cx, 1),
+            FocusPrev => self.move_focus(cx, -1),
+            SelectNext if self.focus == ChatPanelFocus::Lobby => self.scroll_focused_panel(cx, 1),
+            SelectPrev if self.focus == ChatPanelFocus::Lobby => self.scroll_focused_panel(cx, -1),
+            AdjustLeft if self.focus == ChatPanelFocus::Lobby => {
+                self.set_lobby_list_focus(cx, LobbyListFocus::Rooms);
+            }
+            AdjustRight if self.focus == ChatPanelFocus::Lobby => {
+                self.set_lobby_list_focus(cx, LobbyListFocus::Users);
+            }
+            ClearChat if self.focus == ChatPanelFocus::ChatLog => cx.view.clear_chat(),
+            PasteClipboard => {
+                self.paste_from_clipboard(cx, &crate::clipboard_paste::HelperClipboard)
+            }
+            RoomSwitcher => self.open_room_switcher(cx),
+            OpenUserList => self.open_user_list(cx),
+            OpenRoomSettings => self.open_room_settings(cx),
+            NextRoom => self.cycle_room(cx, 1),
+            PrevRoom => self.cycle_room(cx, -1),
+            _ => return self.process_global_command(cx, command),
+        }
+        Action::Continue
+    }
+
+    fn process_compose_key(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if cx.view.composer.mode() == EditorMode::Insert {
             if key.code == extui::event::KeyCode::Tab
                 && key.modifiers.is_empty()
-                && app.view.complete_command()
+                && cx.view.complete_command()
             {
                 return Action::Continue;
             }
             if key.code != extui::event::KeyCode::Esc {
-                match resolve_binding(app, bindings::INSERT_LAYER, key) {
+                match resolve_binding_cx(cx, bindings::INSERT_LAYER, key) {
                     BindingResolution::Action(command) => {
-                        return self.process_action(app, command);
+                        return self.process_action(cx, command);
                     }
                     BindingResolution::Consumed => return Action::Continue,
                     BindingResolution::Unmatched => {}
                 }
             }
-            if app.view.composer.send_key(&key) {
-                maybe_auto_close_markdown_code_fence(&mut app.view.composer, key);
+            if cx.view.composer.send_key(&key) {
+                maybe_auto_close_markdown_code_fence(&mut cx.view.composer, key);
             }
             return Action::Continue;
         }
 
-        match resolve_binding(app, bindings::COMPOSE_NORMAL_LAYER, key) {
-            BindingResolution::Action(command) => return self.process_action(app, command),
+        match resolve_binding_cx(cx, bindings::COMPOSE_NORMAL_LAYER, key) {
+            BindingResolution::Action(command) => return self.process_action(cx, command),
             BindingResolution::Consumed => return Action::Continue,
             BindingResolution::Unmatched => {}
         }
-        let _ = app.view.composer.send_key(&key);
+        let _ = cx.view.composer.send_key(&key);
         Action::Continue
     }
 
@@ -1130,23 +1312,26 @@ impl RoomMode {
     /// visible from any room focus.
     fn paste_from_clipboard(
         &mut self,
-        app: &mut App,
+        cx: &mut ViewCx<'_>,
         provider: &dyn crate::clipboard_paste::ClipboardPasteProvider,
     ) {
         use crate::clipboard_paste::PastePayload;
         match provider.read_paste() {
             Ok(PastePayload::Text(text)) => {
-                self.enter_compose_insert_mode(app);
-                app.view.insert_paste(text);
+                self.enter_compose_insert_mode(cx);
+                cx.view.insert_paste(text);
             }
-            Ok(PastePayload::Image(image)) => app.open_paste_image_dialog(image),
-            Ok(PastePayload::Empty) => app.set_status("clipboard is empty"),
-            Ok(PastePayload::Unsupported(reason)) => app.set_status(reason),
-            Err(error) => app.set_error(error.to_string()),
+            Ok(PastePayload::Image(image)) => {
+                let dialog = PasteImageUploadMode::new(image, &cx.view.theme);
+                cx.request_transition(ModeTransition::Push(Box::new(dialog)));
+            }
+            Ok(PastePayload::Empty) => cx.set_status("clipboard is empty"),
+            Ok(PastePayload::Unsupported(reason)) => cx.set_status(reason),
+            Err(error) => cx.set_error(error.to_string()),
         }
     }
 
-    fn process_chat_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
+    fn process_chat_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
         let rect = self.layout.chat_rect;
         let in_chat = crate::tui::form::rect_contains(rect, mouse.column, mouse.row);
         let in_chat_bar =
@@ -1164,7 +1349,7 @@ impl RoomMode {
                     mouse.column,
                     mouse.row,
                 );
-        let transfer_hit = app
+        let transfer_hit = cx
             .view
             .chrome
             .transfer_buttons
@@ -1177,100 +1362,101 @@ impl RoomMode {
                 if transfer_hit.is_some() =>
             {
                 if let Some(transfer_id) = transfer_hit {
-                    app.cancel_transfer(transfer_id);
+                    cx.send(CoreCommand::CancelTransfer(transfer_id));
                 }
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_composer => {
-                self.enter_compose_insert_mode(app);
+                self.enter_compose_insert_mode(cx);
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
                 if crate::tui::form::rect_contains(
-                    app.view.chrome.lobby_bar.audio_reset,
+                    cx.view.chrome.lobby_bar.audio_reset,
                     mouse.column,
                     mouse.row,
                 ) =>
             {
-                app.audio_manual_reset();
+                cx.send(CoreCommand::AudioManualReset);
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_lobby_bar => {
-                self.set_focus(app, ChatPanelFocus::Lobby);
+                self.set_focus_cx(cx, ChatPanelFocus::Lobby);
                 self.divider_drag = Some(DividerDrag::LobbyBar {
                     anchor_row: mouse.row,
                     start_room_height: self.layout.room_list_rect.h.max(1),
                 });
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_room_list => {
-                self.set_lobby_list_focus(app, LobbyListFocus::Rooms);
+                self.set_lobby_list_focus(cx, LobbyListFocus::Rooms);
                 if let Some(room_id) = self.layout.room_hit(mouse.column, mouse.row) {
-                    app.set_viewed_room(room_id);
+                    cx.send(CoreCommand::SetViewedRoom(room_id));
                 }
             }
             extui::event::MouseEventKind::ScrollUp if in_room_list => {
-                self.set_lobby_list_focus(app, LobbyListFocus::Rooms);
-                app.cycle_room(-1);
+                self.set_lobby_list_focus(cx, LobbyListFocus::Rooms);
+                self.cycle_room(cx, -1);
             }
             extui::event::MouseEventKind::ScrollDown if in_room_list => {
-                self.set_lobby_list_focus(app, LobbyListFocus::Rooms);
-                app.cycle_room(1);
+                self.set_lobby_list_focus(cx, LobbyListFocus::Rooms);
+                self.cycle_room(cx, 1);
             }
             extui::event::MouseEventKind::ScrollUp if in_user_list => {
-                self.move_user_selection_with_focus(app, -1);
+                self.move_user_selection_with_focus(cx, -1);
             }
             extui::event::MouseEventKind::ScrollDown if in_user_list => {
-                self.move_user_selection_with_focus(app, 1);
+                self.move_user_selection_with_focus(cx, 1);
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_user_list => {
-                self.set_lobby_list_focus(app, LobbyListFocus::Users);
+                self.set_lobby_list_focus(cx, LobbyListFocus::Users);
                 let row = mouse.row.saturating_sub(self.layout.user_list_rect.y) as usize;
-                if app.room.select_visible_participant(row).is_some() {
-                    self.keep_selected_room_user_visible(app);
-                }
+                cx.send(CoreCommand::SelectVisibleParticipant {
+                    row,
+                    visible_rows: self.visible_user_rows(cx),
+                });
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_chat_bar => {
-                self.set_focus(app, ChatPanelFocus::ChatLog);
+                self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
                 self.divider_drag = Some(DividerDrag::ChatLogBar {
                     anchor_row: mouse.row,
                     start_rows: self.layout.composer_rect.h,
                 });
             }
             extui::event::MouseEventKind::ScrollUp if in_chat => {
-                self.set_focus(app, ChatPanelFocus::ChatLog);
-                self.scroll_chat_up(app, 5);
+                self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
+                self.scroll_chat_up(cx, 5);
             }
             extui::event::MouseEventKind::ScrollDown if in_chat => {
-                self.set_focus(app, ChatPanelFocus::ChatLog);
-                app.view.active.chat.scroll_down(5);
+                self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
+                cx.view.active.chat.scroll_down(5);
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_chat => {
-                self.set_focus(app, ChatPanelFocus::ChatLog);
+                self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
                 match self.layout.chat_line_at(mouse.row) {
                     Some(line) => match line.kind {
                         LineKind::Heading | LineKind::Ellipsis => {
-                            app.view
+                            cx.view
                                 .active
                                 .chat
                                 .toggle_expand(line.message, self.layout.chat_width);
-                            app.view
+                            cx.view
                                 .active
                                 .chat
                                 .clamp_scroll(self.layout.chat_width, self.layout.chat_height);
                         }
                         LineKind::Body => {
-                            app.view.active.chat.begin_drag(ChatCursor {
+                            cx.view.active.chat.begin_drag(ChatCursor {
                                 message: line.message,
                                 line: line.line,
                             });
                         }
                     },
                     _ => {
-                        app.view.active.chat.clear_visual_anchor();
+                        cx.view.active.chat.clear_visual_anchor();
                     }
                 }
             }
             extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
                 if self.divider_drag.is_some() =>
             {
-                self.drag_divider(app, mouse.row);
+                self.drag_divider(cx, mouse.row);
             }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left)
                 if self.divider_drag.is_some() =>
@@ -1278,26 +1464,26 @@ impl RoomMode {
                 self.divider_drag = None;
             }
             extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
-                if app.view.active.chat.is_dragging() =>
+                if cx.view.active.chat.is_dragging() =>
             {
-                self.set_focus(app, ChatPanelFocus::ChatLog);
-                self.drag_chat_selection(app, mouse.row);
+                self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
+                self.drag_chat_selection(cx, mouse.row);
             }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left) if in_chat => {
                 // A click (press and release without a drag) over a message
                 // reference jumps to it and over a URL opens it; a drag remains
                 // a visual selection.
-                if app.view.active.chat.drag_is_click() {
-                    if let Some(target) = self.chat_ref_at(app, mouse.column, mouse.row) {
-                        self.jump_to_ref(app, target);
-                    } else if let Some(url) = self.chat_link_at(app, mouse.column, mouse.row) {
-                        app.view.request_open_url(url);
+                if cx.view.active.chat.drag_is_click() {
+                    if let Some(target) = self.chat_ref_at(cx, mouse.column, mouse.row) {
+                        self.jump_to_ref(cx, target);
+                    } else if let Some(url) = self.chat_link_at(cx, mouse.column, mouse.row) {
+                        cx.view.request_open_url(url);
                     }
                 }
-                app.view.active.chat.end_drag();
+                cx.view.active.chat.end_drag();
             }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left) => {
-                app.view.active.chat.end_drag();
+                cx.view.active.chat.end_drag();
             }
             _ => {}
         }
@@ -1305,8 +1491,8 @@ impl RoomMode {
     }
 
     /// Resolves a screen cell to the URL of a link under it, if any. Returns an
-    /// owned string so the caller can mutably borrow `app` to queue the open.
-    fn chat_link_at(&self, app: &App, column: u16, row: u16) -> Option<String> {
+    /// owned string so the caller can mutably borrow the view to queue the open.
+    fn chat_link_at(&self, cx: &ViewCx<'_>, column: u16, row: u16) -> Option<String> {
         let line = self.layout.chat_line_at(row)?;
         if line.kind != LineKind::Body {
             return None;
@@ -1317,7 +1503,7 @@ impl RoomMode {
             return None;
         }
         let col_in_line = column - content_x;
-        app.view
+        cx.view
             .active
             .chat
             .link_at(line.message, line.line, col_in_line)
@@ -1325,7 +1511,12 @@ impl RoomMode {
     }
 
     /// Resolves a screen cell to the message reference under it, if any.
-    fn chat_ref_at(&self, app: &App, column: u16, row: u16) -> Option<rpc::msgref::MessageRef> {
+    fn chat_ref_at(
+        &self,
+        cx: &ViewCx<'_>,
+        column: u16,
+        row: u16,
+    ) -> Option<rpc::msgref::MessageRef> {
         let line = self.layout.chat_line_at(row)?;
         if line.kind != LineKind::Body {
             return None;
@@ -1335,7 +1526,7 @@ impl RoomMode {
             return None;
         }
         let col_in_line = column - content_x;
-        app.view
+        cx.view
             .active
             .chat
             .ref_at(line.message, line.line, col_in_line)
@@ -1343,86 +1534,71 @@ impl RoomMode {
 
     /// Jumps to a reference's target: selects and scrolls to the message when
     /// present in the buffer, otherwise reports why not.
-    fn jump_to_ref(&mut self, app: &mut App, target: rpc::msgref::MessageRef) {
-        match app
+    fn jump_to_ref(&mut self, cx: &mut ViewCx<'_>, target: rpc::msgref::MessageRef) {
+        match cx
             .view
             .jump_to_ref(target, self.layout.chat_width, self.layout.chat_height)
         {
-            crate::app::room::RefJump::Jumped => self.set_focus(app, ChatPanelFocus::ChatLog),
+            crate::app::room::RefJump::Jumped => self.set_focus_cx(cx, ChatPanelFocus::ChatLog),
             crate::app::room::RefJump::NotFound => {
-                app.set_status("referenced message is not in this room's history");
+                cx.set_status("referenced message is not in this room's history");
             }
             crate::app::room::RefJump::OtherRoom => {
-                if app.set_viewed_room(target.room_id) {
-                    match app.view.jump_to_ref(
-                        target,
-                        self.layout.chat_width,
-                        self.layout.chat_height,
-                    ) {
-                        crate::app::room::RefJump::Jumped => {
-                            self.set_focus(app, ChatPanelFocus::ChatLog)
-                        }
-                        _ => app.set_status("referenced message is not in this room's history"),
-                    }
-                    return;
-                }
-                match app.room.cross_room_ref_preview(target) {
-                    Some(preview) => app.set_status(preview),
-                    None => app.set_status("reference points to another room"),
-                }
+                self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
+                cx.send(CoreCommand::OpenMessageRef {
+                    target,
+                    width: self.layout.chat_width,
+                    height: self.layout.chat_height,
+                });
             }
         }
     }
 
-    fn copy_message_ref_if_focused(&mut self, app: &mut App) {
+    fn copy_message_ref_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        match app.view.copy_message_ref(self.layout.chat_width) {
-            Some(code) => app.set_status(format!("copied {code}")),
-            None => app.set_status("select a message to reference"),
+        match cx.view.copy_message_ref(self.layout.chat_width) {
+            Some(code) => cx.set_status(format!("copied {code}")),
+            None => cx.set_status("select a message to reference"),
         }
     }
 
-    fn insert_message_ref_if_focused(&mut self, app: &mut App) {
+    fn insert_message_ref_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        if app
-            .view
-            .insert_message_ref(self.layout.chat_width)
-            .is_some()
-        {
-            self.enter_compose_insert_mode(app);
+        if cx.view.insert_message_ref(self.layout.chat_width).is_some() {
+            self.enter_compose_insert_mode(cx);
         } else {
-            app.set_status("select a message to reference");
+            cx.set_status("select a message to reference");
         }
     }
 
-    fn open_message_ref_if_focused(&mut self, app: &mut App) {
+    fn open_message_ref_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        app.view.active.chat.ensure_cursor(self.layout.chat_width);
-        let Some(target) = app.view.active.chat.cursor_ref() else {
-            app.set_status("selected message contains no reference");
+        cx.view.active.chat.ensure_cursor(self.layout.chat_width);
+        let Some(target) = cx.view.active.chat.cursor_ref() else {
+            cx.set_status("selected message contains no reference");
             return;
         };
-        self.jump_to_ref(app, target);
+        self.jump_to_ref(cx, target);
     }
 
-    fn drag_chat_selection(&mut self, app: &mut App, row: u16) {
+    fn drag_chat_selection(&mut self, cx: &mut ViewCx<'_>, row: u16) {
         let rect = self.layout.chat_rect;
         if row < rect.y {
-            self.scroll_chat_up(app, 1);
+            self.scroll_chat_up(cx, 1);
         } else if row >= rect.y.saturating_add(rect.h) {
-            app.view.active.chat.scroll_down(1);
+            cx.view.active.chat.scroll_down(1);
         }
         let clamped = row.clamp(rect.y, rect.y.saturating_add(rect.h).saturating_sub(1));
         if let Some(line) = self.layout.chat_line_at(clamped)
             && line.kind == LineKind::Body
         {
-            app.view.active.chat.drag_to(ChatCursor {
+            cx.view.active.chat.drag_to(ChatCursor {
                 message: line.message,
                 line: line.line,
             });
@@ -1432,7 +1608,7 @@ impl RoomMode {
     /// Applies an in-progress divider drag, trading rows between the chat log
     /// and the neighboring region. Both dividers keep the chat log at a
     /// minimum of one row.
-    fn drag_divider(&mut self, app: &mut App, row: u16) {
+    fn drag_divider(&mut self, cx: &mut ViewCx<'_>, row: u16) {
         match self.divider_drag {
             Some(DividerDrag::LobbyBar {
                 anchor_row,
@@ -1444,7 +1620,7 @@ impl RoomMode {
                 let budget = i32::from(start_room_height) + i32::from(self.layout.chat_rect.h);
                 // Keep at least one lobby row and one chat row.
                 let height = (i32::from(start_room_height) + delta).clamp(1, (budget - 1).max(1));
-                app.config.ui.room_height = height as u16;
+                cx.send(CoreCommand::SetRoomHeight(height as u16));
             }
             Some(DividerDrag::ChatLogBar {
                 anchor_row,
@@ -1456,157 +1632,173 @@ impl RoomMode {
                 let delta = i32::from(anchor_row) - i32::from(row);
                 let budget = i32::from(start_rows) + i32::from(self.layout.chat_rect.h);
                 let rows = (i32::from(start_rows) + delta).clamp(1, (budget - 1).max(1)) as u16;
-                app.view.composer_min_rows = Some(rows);
+                cx.view.composer_min_rows = Some(rows);
             }
             None => {}
         }
     }
 
-    fn toggle_selected_log_collapse(&mut self, app: &mut App) {
+    fn toggle_selected_log_collapse(&mut self, cx: &mut ViewCx<'_>) {
         let width = self.layout.chat_width;
-        match app.view.toggle_cursor_message_expand(width) {
+        match cx.view.toggle_cursor_message_expand(width) {
             ToggleExpandResult::Toggled => {}
             ToggleExpandResult::NoMessages => {
-                app.set_status("no messages");
+                cx.set_status("no messages");
                 return;
             }
             ToggleExpandResult::NotCollapsible => {
-                app.set_status("selected log is not collapsible");
+                cx.set_status("selected log is not collapsible");
             }
         }
-        app.view
+        cx.view
             .active
             .chat
             .clamp_scroll(width, self.layout.chat_height);
-        self.keep_chat_cursor_visible(app);
+        self.keep_chat_cursor_visible(cx);
     }
 
-    fn scroll_chat_up(&mut self, app: &mut App, rows: usize) {
-        app.view
+    fn scroll_chat_up(&mut self, cx: &mut ViewCx<'_>, rows: usize) {
+        cx.view
             .active
             .chat
             .scroll_up(rows, self.layout.chat_width, self.layout.chat_height);
-        app.request_older_history_if_at_top(self.layout.chat_width, self.layout.chat_height);
+        if cx
+            .view
+            .active
+            .chat
+            .is_at_top(self.layout.chat_width, self.layout.chat_height)
+            && let Some(room_id) = cx.view.viewed_room
+        {
+            cx.send(CoreCommand::RequestOlderHistory { room_id });
+        }
     }
 
-    fn copy_chat_selection(&mut self, app: &mut App) {
-        if app
+    fn copy_chat_selection(&mut self, cx: &mut ViewCx<'_>) {
+        if cx
             .view
             .copy_chat_selection(self.layout.chat_width)
             .is_some()
         {
-            app.set_transient_status("copied to clipboard");
+            cx.set_transient_status("copied to clipboard");
         }
     }
 
-    fn select_chat_top(&mut self, app: &mut App) {
+    fn select_chat_top(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus == ChatPanelFocus::ChatLog {
-            app.view
+            cx.view
                 .active
                 .chat
                 .top(self.layout.chat_width, self.layout.chat_height);
-            app.view.active.chat.cursor_to_first();
-            self.keep_chat_cursor_visible(app);
-            app.request_older_history_if_at_top(self.layout.chat_width, self.layout.chat_height);
+            cx.view.active.chat.cursor_to_first();
+            self.keep_chat_cursor_visible(cx);
+            if cx
+                .view
+                .active
+                .chat
+                .is_at_top(self.layout.chat_width, self.layout.chat_height)
+                && let Some(room_id) = cx.view.viewed_room
+            {
+                cx.send(CoreCommand::RequestOlderHistory { room_id });
+            }
         }
     }
 
-    fn select_chat_bottom(&mut self, app: &mut App) {
+    fn select_chat_bottom(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus == ChatPanelFocus::ChatLog {
-            app.view.active.chat.bottom();
-            app.view.active.chat.cursor_to_last(self.layout.chat_width);
-            self.keep_chat_cursor_visible(app);
+            cx.view.active.chat.bottom();
+            cx.view.active.chat.cursor_to_last(self.layout.chat_width);
+            self.keep_chat_cursor_visible(cx);
         }
     }
 
-    fn copy_chat_selection_if_focused(&mut self, app: &mut App) {
+    fn copy_chat_selection_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus == ChatPanelFocus::ChatLog {
-            self.copy_chat_selection(app);
+            self.copy_chat_selection(cx);
         }
     }
 
-    fn copy_cursor_line_if_focused(&mut self, app: &mut App) {
+    fn copy_cursor_line_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        if app.view.copy_cursor_line(self.layout.chat_width).is_some() {
-            app.set_transient_status("copied line to clipboard");
+        if cx.view.copy_cursor_line(self.layout.chat_width).is_some() {
+            cx.set_transient_status("copied line to clipboard");
         }
     }
 
-    fn copy_cursor_message_if_focused(&mut self, app: &mut App) {
+    fn copy_cursor_message_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        if app
+        if cx
             .view
             .copy_cursor_message(self.layout.chat_width)
             .is_some()
         {
-            app.set_transient_status("copied message to clipboard");
+            cx.set_transient_status("copied message to clipboard");
         }
     }
 
-    fn move_chat_cursor_paragraph(&mut self, app: &mut App, delta: isize) {
+    fn move_chat_cursor_paragraph(&mut self, cx: &mut ViewCx<'_>, delta: isize) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        if app
+        if cx
             .view
             .active
             .chat
             .move_cursor_paragraph(delta, self.layout.chat_width)
             .is_none()
         {
-            app.set_status("no messages");
+            cx.set_status("no messages");
             return;
         }
-        self.keep_chat_cursor_visible(app);
+        self.keep_chat_cursor_visible(cx);
     }
 
-    fn toggle_chat_visual_if_focused(&mut self, app: &mut App) {
+    fn toggle_chat_visual_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        app.view
+        cx.view
             .active
             .chat
             .toggle_visual_anchor(self.layout.chat_width);
     }
 
-    fn toggle_chat_expand_if_focused(&mut self, app: &mut App) {
+    fn toggle_chat_expand_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus == ChatPanelFocus::ChatLog {
-            self.toggle_selected_log_collapse(app);
+            self.toggle_selected_log_collapse(cx);
         }
     }
 
     /// Starts editing the cursor message: the composer takes the original
     /// body and focus moves to it without forcing insert mode, so Vim
     /// bindings begin in Normal mode.
-    fn edit_cursor_message_if_focused(&mut self, app: &mut App) {
+    fn edit_cursor_message_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        match app
+        match cx
             .view
-            .begin_edit_cursor_message(&app.room, self.layout.chat_width)
+            .begin_edit_cursor_message(cx.session, self.layout.chat_width)
         {
             Ok(()) => {
-                self.set_focus(app, ChatPanelFocus::Compose);
-                app.set_status("editing message; submit to save");
+                self.set_focus_cx(cx, ChatPanelFocus::Compose);
+                cx.set_status("editing message; submit to save");
             }
-            Err(denied) => app.set_status(denied.status()),
+            Err(denied) => cx.set_status(denied.status()),
         }
     }
 
-    fn delete_selected_messages_if_focused(&mut self, app: &mut App) {
+    fn delete_selected_messages_if_focused(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        let selection = match app.view.delete_selection(&app.room, self.layout.chat_width) {
+        let selection = match cx.view.delete_selection(cx.session, self.layout.chat_width) {
             Ok(selection) => selection,
             Err(denied) => {
-                app.set_status(denied.status());
+                cx.set_status(denied.status());
                 return;
             }
         };
@@ -1627,40 +1819,44 @@ impl RoomMode {
             target_count = count,
             skipped
         );
-        app.push_mode(Box::new(ConfirmMode::new(
+        cx.request_transition(ModeTransition::Push(Box::new(ConfirmMode::new(
             prompt,
             "Delete",
             "Cancel",
             move |app| {
-                if app.delete_chat_messages(room_id, targets)
-                    && app.room.viewed_room == Some(room_id)
                 {
-                    app.view.active.chat.clear_visual_anchor();
+                    let mut cx = app.view_cx();
+                    cx.send(CoreCommand::DeleteMessages {
+                        room_id,
+                        targets,
+                        skipped,
+                    });
                 }
+                app.drain_core_commands();
                 ConfirmDisposition::Close
             },
-        )));
+        ))));
     }
 
-    fn scroll_focused_panel(&mut self, app: &mut App, direction: isize) {
+    fn scroll_focused_panel(&mut self, cx: &mut ViewCx<'_>, direction: isize) {
         match self.focus {
-            ChatPanelFocus::ChatLog => self.move_chat_cursor(app, direction),
+            ChatPanelFocus::ChatLog => self.move_chat_cursor(cx, direction),
             ChatPanelFocus::Lobby => match self.lobby_list_focus {
-                LobbyListFocus::Rooms => self.move_room_view_with_focus(app, direction),
-                LobbyListFocus::Users => self.move_user_selection_with_focus(app, direction),
+                LobbyListFocus::Rooms => self.move_room_view_with_focus(cx, direction),
+                LobbyListFocus::Users => self.move_user_selection_with_focus(cx, direction),
             },
             ChatPanelFocus::Compose => {}
         }
     }
 
-    fn scroll_chat_log_if_focused(&mut self, app: &mut App, rows: isize) {
+    fn scroll_chat_log_if_focused(&mut self, cx: &mut ViewCx<'_>, rows: isize) {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
         if rows < 0 {
-            self.scroll_chat_up(app, rows.unsigned_abs());
+            self.scroll_chat_up(cx, rows.unsigned_abs());
         } else {
-            app.view.active.chat.scroll_down(rows as usize);
+            cx.view.active.chat.scroll_down(rows as usize);
         }
     }
 
@@ -1668,50 +1864,123 @@ impl RoomMode {
         (self.layout.chat_height as usize / 2).max(1)
     }
 
-    fn move_chat_cursor(&mut self, app: &mut App, delta: isize) {
-        self.set_focus(app, ChatPanelFocus::ChatLog);
-        if !app.view.move_chat_cursor(delta, self.layout.chat_width) {
-            app.set_status("no messages");
+    fn move_chat_cursor(&mut self, cx: &mut ViewCx<'_>, delta: isize) {
+        self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
+        if !cx.view.move_chat_cursor(delta, self.layout.chat_width) {
+            cx.set_status("no messages");
             return;
         }
-        self.keep_chat_cursor_visible(app);
+        self.keep_chat_cursor_visible(cx);
     }
 
-    fn keep_chat_cursor_visible(&mut self, app: &mut App) {
-        app.view
+    fn keep_chat_cursor_visible(&mut self, cx: &mut ViewCx<'_>) {
+        cx.view
             .active
             .chat
             .keep_cursor_visible(self.layout.chat_width, self.layout.chat_height);
     }
 
-    fn move_room_view_with_focus(&mut self, app: &mut App, delta: isize) {
+    fn move_room_view_with_focus(&mut self, cx: &mut ViewCx<'_>, delta: isize) {
         self.lobby_list_focus = LobbyListFocus::Rooms;
-        self.set_focus(app, ChatPanelFocus::Lobby);
-        app.cycle_room(delta);
+        self.set_focus_cx(cx, ChatPanelFocus::Lobby);
+        self.cycle_room(cx, delta);
     }
 
-    fn move_user_selection_with_focus(&mut self, app: &mut App, delta: isize) {
+    fn move_user_selection_with_focus(&mut self, cx: &mut ViewCx<'_>, delta: isize) {
         self.lobby_list_focus = LobbyListFocus::Users;
-        self.set_focus(app, ChatPanelFocus::Lobby);
-        self.move_user_selection(app, delta);
+        self.set_focus_cx(cx, ChatPanelFocus::Lobby);
+        self.move_user_selection(cx, delta);
     }
 
-    fn move_user_selection(&mut self, app: &mut App, delta: isize) {
-        if app.room.move_participant_selection(delta).is_none() {
-            app.set_status("no users in the current room yet");
-            return;
-        }
-        self.keep_selected_room_user_visible(app);
+    fn move_user_selection(&mut self, cx: &mut ViewCx<'_>, delta: isize) {
+        cx.send(CoreCommand::MoveParticipantSelection {
+            delta,
+            visible_rows: self.visible_user_rows(cx),
+        });
         self.focus = ChatPanelFocus::Lobby;
         self.lobby_list_focus = LobbyListFocus::Users;
     }
 
-    fn keep_selected_room_user_visible(&mut self, app: &mut App) {
+    fn visible_user_rows(&self, cx: &ViewCx<'_>) -> usize {
         // Before the first render the participant rect is empty; fall back to
         // the configured lobby height.
-        let fallback = app.config.ui.room_height.max(1);
-        let visible_rows = self.layout.user_list_rect.h.max(fallback) as usize;
-        app.room.keep_selected_participant_visible(visible_rows);
+        let fallback = cx.config.ui.room_height.max(1);
+        self.layout.user_list_rect.h.max(fallback) as usize
+    }
+
+    fn keep_selected_room_user_visible(&mut self, cx: &mut ViewCx<'_>) {
+        cx.send(CoreCommand::KeepParticipantSelectionVisible {
+            visible_rows: self.visible_user_rows(cx),
+        });
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if self.focus == ChatPanelFocus::Compose {
+            return self.process_compose_key(cx, key);
+        }
+        let layer = self.workspace_layer_cx(cx);
+        match resolve_binding_cx(cx, layer, key) {
+            BindingResolution::Action(command) => self.process_action(cx, command),
+            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
+        }
+    }
+
+    fn process_top_bar_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> bool {
+        use extui::event::{MouseButton, MouseEventKind};
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let requested = if crate::tui::form::rect_contains(
+            cx.view.chrome.top_bar.live,
+            mouse.column,
+            mouse.row,
+        ) {
+            Some(crate::app::LocalVoiceMode::Live)
+        } else if crate::tui::form::rect_contains(
+            cx.view.chrome.top_bar.mute,
+            mouse.column,
+            mouse.row,
+        ) {
+            Some(crate::app::LocalVoiceMode::Muted)
+        } else if crate::tui::form::rect_contains(
+            cx.view.chrome.top_bar.deafen,
+            mouse.column,
+            mouse.row,
+        ) {
+            Some(crate::app::LocalVoiceMode::Deafened)
+        } else {
+            None
+        };
+        if let Some(requested) = requested {
+            let mode = if cx.view.local_voice_mode() == requested {
+                crate::app::LocalVoiceMode::Live
+            } else {
+                requested
+            };
+            cx.send(CoreCommand::SetVoiceMode(mode));
+            return true;
+        }
+        if crate::tui::form::rect_contains(cx.view.chrome.top_bar.video, mouse.column, mouse.row) {
+            cx.send(CoreCommand::ToggleVideo);
+            return true;
+        }
+        false
+    }
+
+    fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        if self.process_top_bar_mouse(cx, mouse) {
+            return Action::Continue;
+        }
+        self.process_chat_mouse(cx, mouse)
+    }
+
+    fn process_paste_cx(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        self.enter_compose_insert_mode(cx);
+        cx.view.insert_paste(text);
     }
 }
 
@@ -1732,29 +2001,29 @@ impl AppMode for RoomMode {
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        if self.focus == ChatPanelFocus::Compose {
-            return self.process_compose_key(app, key);
-        }
-        let layer = self.workspace_layer(app);
-        match resolve_binding(app, layer, key) {
-            BindingResolution::Action(command) => self.process_action(app, command),
-            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
-        }
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        if app.process_top_bar_mouse(mouse) {
-            return Action::Continue;
-        }
-        self.process_chat_mouse(app, mouse)
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_mouse_cx(&mut cx, mouse)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn process_paste(&mut self, app: &mut App, text: String) {
-        self.enter_compose_insert_mode(app);
-        app.view.insert_paste(text);
+        {
+            let mut cx = app.view_cx();
+            self.process_paste_cx(&mut cx, text);
+        }
+        app.drain_core_commands();
     }
 
     fn presentation(&self, app: &App) -> ModePresentation {
@@ -1764,7 +2033,11 @@ impl AppMode for RoomMode {
             theme::UiMode::Log
         };
         let layer = if self.focus != ChatPanelFocus::Compose {
-            self.workspace_layer(app)
+            if self.focus == ChatPanelFocus::ChatLog && app.view.active.chat.has_visual() {
+                bindings::CHAT_VISUAL_LAYER
+            } else {
+                bindings::WORKSPACE_LAYER
+            }
         } else if app.view.composer.mode() == EditorMode::Insert {
             bindings::INSERT_LAYER
         } else {

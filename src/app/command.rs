@@ -5,7 +5,10 @@
 //! explicitly; they must not depend on whichever room the primary view happens
 //! to show when the core eventually handles them.
 
-use rpc::ids::{FileTransferId, MessageId, RoomId, UserId};
+use rpc::{
+    ids::{FileTransferId, MessageId, RoomId, UserId},
+    msgref::MessageRef,
+};
 
 use super::{LocalVoiceMode, RoomSettingsDraft, ServerEditDraft};
 use crate::clipboard_paste::ImagePasteSource;
@@ -31,6 +34,11 @@ pub(crate) enum CoreCommand {
         skipped: usize,
     },
     SetViewedRoom(RoomId),
+    OpenMessageRef {
+        target: MessageRef,
+        width: u16,
+        height: u16,
+    },
     RequestOlderHistory {
         room_id: RoomId,
     },
@@ -41,7 +49,26 @@ pub(crate) enum CoreCommand {
     ToggleDeafen,
     SetVoiceMode(LocalVoiceMode),
     ToggleSelectedUserMute,
+    BeginVolumePreview {
+        user_id: UserId,
+        value_db: f32,
+    },
+    MoveParticipantSelection {
+        delta: isize,
+        visible_rows: usize,
+    },
+    KeepParticipantSelectionVisible {
+        visible_rows: usize,
+    },
+    SelectVisibleParticipant {
+        row: usize,
+        visible_rows: usize,
+    },
     CancelTransfer(FileTransferId),
+    SetRoomHeight(u16),
+    OpenSettings,
+    PlaySoundboard(usize),
+    ToggleVideo,
     Connect {
         alias: String,
     },

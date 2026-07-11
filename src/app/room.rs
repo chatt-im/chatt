@@ -981,7 +981,7 @@ pub(crate) enum UserSelectionError {
 }
 
 impl UserSelectionError {
-    pub(super) fn status_text(&self) -> &'static str {
+    pub(crate) fn status_text(&self) -> &'static str {
         match self {
             Self::NoSelection => "select a user first",
             Self::LocalUser => "select another user for local playback controls",
@@ -2576,7 +2576,7 @@ impl RoomSession {
             .map(|entry| (entry.user_id, entry.display_name().to_string()))
     }
 
-    pub(super) fn selected_remote_user(
+    pub(crate) fn selected_remote_user(
         &self,
         local_user: Option<UserId>,
     ) -> Result<SelectedRoomUser, UserSelectionError> {

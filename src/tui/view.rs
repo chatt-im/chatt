@@ -72,6 +72,21 @@ pub(crate) struct ClientView {
 }
 
 impl ClientView {
+    pub(crate) fn set_status(&mut self, status: impl Into<String>) {
+        self.status.set(status);
+    }
+
+    pub(crate) fn set_error(&mut self, status: impl Into<String>) {
+        self.status.set_error(status);
+    }
+
+    pub(crate) fn set_transient_status(&mut self, status: impl Into<String>) {
+        self.status.set_transient(
+            status,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        );
+    }
+
     pub(crate) fn new(config: &Config, theme: Theme) -> Self {
         let bindings = config.ui.default_bindings;
         let editor_bindings = match bindings {
