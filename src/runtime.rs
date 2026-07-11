@@ -21,7 +21,6 @@ use crate::{
     tui::{
         client_thread::{ClientThread, InitialMode},
         modes::WelcomeMode,
-        view::ClientView,
     },
 };
 
@@ -33,7 +32,6 @@ static PANIC_HOOK: Once = Once::new();
 
 struct RemoteClient {
     channel: Arc<ClientChannel>,
-    view: Arc<Mutex<ClientView>>,
     control: Arc<Mutex<UnixStream>>,
     render_thread: Option<JoinHandle<()>>,
     control_thread: Option<JoinHandle<()>>,
@@ -161,13 +159,6 @@ fn run_app_inner(
             handle_runtime_command(&mut app, &mut clients, client_id, command);
         }
         app.tick();
-        for client in clients.values() {
-            client.view.lock().sync_daemon_config(
-                &app.config,
-                app.view.theme,
-                &app.view.server_catalog,
-            );
-        }
 
         let quit = app.take_quit_requested() || polling::termination_requested();
         let current_resize = polling::resize_count();
@@ -226,13 +217,16 @@ fn handle_runtime_command(
     let Some(client) = clients.get(&client_id) else {
         return;
     };
+    let Some(remote_view) = app.remote_view(client_id) else {
+        return;
+    };
     match command {
         CoreCommand::Quit => {
             let _ = attach::write_frame(&mut client.control.lock(), attach::TERMINATE_ACK, &[]);
             client.channel.terminate();
         }
         CoreCommand::SetViewedRoom(room_id) => {
-            let mut view = client.view.lock();
+            let mut view = remote_view.lock();
             if !app.set_attached_viewed_room(client_id, &mut view, room_id) {
                 view.set_error("room is no longer available");
             }
@@ -242,7 +236,7 @@ fn handle_runtime_command(
             width,
             height,
         } => {
-            let mut view = client.view.lock();
+            let mut view = remote_view.lock();
             if app.set_attached_viewed_room(client_id, &mut view, target.room_id) {
                 if !matches!(
                     view.jump_to_ref(target, width, height),
@@ -257,11 +251,11 @@ fn handle_runtime_command(
             }
         }
         CoreCommand::RunSlash { input, .. } if input == "/room" => {
-            client.view.lock().set_error("usage: /room name");
+            remote_view.lock().set_error("usage: /room name");
         }
         CoreCommand::RunSlash { input, .. } if input.starts_with("/room ") => {
             let name = input.trim_start_matches("/room ").trim();
-            let mut view = client.view.lock();
+            let mut view = remote_view.lock();
             if let Some(room_id) = app.room.find_room_by_name(name) {
                 if !app.set_attached_viewed_room(client_id, &mut view, room_id) {
                     view.set_error("room is no longer available");
@@ -275,7 +269,7 @@ fn handle_runtime_command(
             // never a hand-picked subset of fields. Core handlers therefore
             // cannot accidentally mutate the primary terminal's selection,
             // editor, status, navigation, or room buffers.
-            let mut view = client.view.lock();
+            let mut view = remote_view.lock();
             std::mem::swap(&mut *app.view, &mut *view);
             app.handle_client_command(client_id, command);
             let detach = app.view.quit_requested;
@@ -331,7 +325,6 @@ fn handle_runtime_event(
                 event_sender.clone(),
             ) {
                 Ok(client) => {
-                    app.register_client_channel(id, client.channel.clone());
                     clients.insert(id, client);
                     kvlog::info!(
                         "terminal client attached",
@@ -344,14 +337,12 @@ fn handle_runtime_event(
         }
         AppEvent::ClientDetached(id) => {
             app.retire_client(id);
-            app.room.remove_client_view(id);
             if let Some(client) = clients.get(&id) {
                 client.channel.terminate();
             }
         }
         AppEvent::ClientExited(id) => {
             app.retire_client(id);
-            app.room.remove_client_view(id);
             if let Some(client) = clients.remove(&id) {
                 shutdown_remote(client, false);
                 kvlog::info!("terminal client detached", client_id = id.0);
@@ -362,8 +353,8 @@ fn handle_runtime_event(
             room_id,
             status,
         } => {
-            if let Some(client) = clients.get(&client_id) {
-                let mut view = client.view.lock();
+            if let Some(view) = app.remote_view(client_id) {
+                let mut view = view.lock();
                 if app.set_attached_viewed_room(client_id, &mut view, room_id) {
                     view.set_status(status);
                 }
@@ -390,16 +381,7 @@ fn spawn_remote_client(
             return Err(message);
         }
     };
-    let mut remote_view = ClientView::new(&app.config, app.view.theme);
-    remote_view.mic_muted = app.mic_muted.clone();
-    remote_view.deafened = app.deafened.clone();
-    remote_view.server_catalog = app.view.server_catalog.clone();
-    remote_view.status = app.view.status.clone();
-    if let Some(room_id) = app.room.viewed_room {
-        remote_view.switch_room(room_id, &app.room);
-        app.room.prepare_client_view(id, room_id);
-    }
-    let view = Arc::new(Mutex::new(remote_view));
+    let view = app.attach_client(id, channel.clone());
     let initial_mode = if app.network.is_some() || !app.room.server_alias.is_empty() {
         InitialMode::Room
     } else {
@@ -408,7 +390,7 @@ fn spawn_remote_client(
     let session = app.shared_session();
     let config = app.shared_config();
     let render_channel = channel.clone();
-    let render_view = view.clone();
+    let render_view = view;
     let render_commands = commands.clone();
     let render_events = events.clone();
     let render_thread = match thread::Builder::new()
@@ -433,6 +415,7 @@ fn spawn_remote_client(
         Err(error) => {
             let message = format!("failed to spawn attached render thread: {error}");
             let _ = crate::local_control::write_attach_ack(&mut stream, Err(&message));
+            app.retire_client(id);
             return Err(message);
         }
     };
@@ -444,6 +427,7 @@ fn spawn_remote_client(
             let _ = crate::local_control::write_attach_ack(&mut stream, Err(&message));
             channel.terminate();
             let _ = render_thread.join();
+            app.retire_client(id);
             return Err(message);
         }
     };
@@ -462,6 +446,7 @@ fn spawn_remote_client(
             let _ = crate::local_control::write_attach_ack(&mut control.lock(), Err(&message));
             channel.terminate();
             let _ = render_thread.join();
+            app.retire_client(id);
             return Err(message);
         }
     };
@@ -470,11 +455,11 @@ fn spawn_remote_client(
         channel.terminate();
         let _ = control.lock().shutdown(std::net::Shutdown::Both);
         let _ = control_thread.join();
+        app.retire_client(id);
         return Err(error);
     }
     Ok(RemoteClient {
         channel,
-        view,
         control,
         render_thread: Some(render_thread),
         control_thread: Some(control_thread),
