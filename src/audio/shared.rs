@@ -388,34 +388,82 @@ impl Default for LiveAudioTuning {
     }
 }
 
+/// Accepted bounds for the millisecond latency-tuning fields, shared between
+/// load-time validation and the settings-form field validators so both agree.
+pub const NETEQ_START_DELAY_MS_RANGE: (u64, u64) = (20, 1_000);
+pub const NETEQ_MIN_DELAY_MS_RANGE: (u64, u64) = (20, 1_000);
+pub const NETEQ_BASE_MINIMUM_DELAY_MS_RANGE: (u64, u64) = (0, 2_000);
+pub const NETEQ_MAX_DELAY_MS_RANGE: (u64, u64) = (20, 2_000);
+pub const HARD_QUEUE_BOUND_MS_RANGE: (u64, u64) = (40, 5_000);
+pub const INITIAL_BUFFER_MS_RANGE: (u64, u64) = (0, 500);
+pub const MAX_REORDER_DELAY_MS_RANGE: (u64, u64) = (0, 500);
+pub const DEVICE_PERIOD_MARGIN_MS_RANGE: (u64, u64) = (0, 200);
+pub const CAPTURE_LONG_SILENCE_STOP_MS_RANGE: (u64, u64) = (20, 60_000);
+pub const CAPTURE_SILENCE_PREROLL_MS_RANGE: (u64, u64) = (0, 1_000);
+pub const CAPTURE_SILENCE_RAMP_MS_RANGE: (u64, u64) = (0, 100);
+
 impl LiveAudioTuning {
     pub fn validate(self) -> Result<(), String> {
-        validate_duration_ms("neteq-start-delay-ms", self.neteq_start_delay, 20, 1_000)?;
-        validate_duration_ms("neteq-min-delay-ms", self.neteq_min_delay, 20, 1_000)?;
-        validate_duration_ms(
-            "neteq-base-minimum-delay-ms",
-            self.neteq_base_minimum_delay,
-            0,
-            2_000,
-        )?;
-        validate_duration_ms("neteq-max-delay-ms", self.neteq_max_delay, 20, 2_000)?;
-        validate_duration_ms("hard-queue-bound-ms", self.hard_queue_bound, 40, 5_000)?;
-        validate_duration_ms("initial-buffer-ms", self.initial_buffer, 0, 500)?;
-        validate_duration_ms("max-reorder-delay-ms", self.max_reorder_delay, 0, 500)?;
-        validate_duration_ms("device-period-margin-ms", self.device_period_margin, 0, 200)?;
-        validate_duration_ms(
-            "capture-long-silence-stop-ms",
-            self.capture_long_silence_stop,
-            20,
-            60_000,
-        )?;
-        validate_duration_ms(
-            "capture-silence-preroll-ms",
-            self.capture_silence_preroll,
-            0,
-            1_000,
-        )?;
-        validate_duration_ms("capture-silence-ramp-ms", self.capture_silence_ramp, 0, 100)?;
+        let checks = [
+            (
+                "neteq-start-delay-ms",
+                self.neteq_start_delay,
+                NETEQ_START_DELAY_MS_RANGE,
+            ),
+            (
+                "neteq-min-delay-ms",
+                self.neteq_min_delay,
+                NETEQ_MIN_DELAY_MS_RANGE,
+            ),
+            (
+                "neteq-base-minimum-delay-ms",
+                self.neteq_base_minimum_delay,
+                NETEQ_BASE_MINIMUM_DELAY_MS_RANGE,
+            ),
+            (
+                "neteq-max-delay-ms",
+                self.neteq_max_delay,
+                NETEQ_MAX_DELAY_MS_RANGE,
+            ),
+            (
+                "hard-queue-bound-ms",
+                self.hard_queue_bound,
+                HARD_QUEUE_BOUND_MS_RANGE,
+            ),
+            (
+                "initial-buffer-ms",
+                self.initial_buffer,
+                INITIAL_BUFFER_MS_RANGE,
+            ),
+            (
+                "max-reorder-delay-ms",
+                self.max_reorder_delay,
+                MAX_REORDER_DELAY_MS_RANGE,
+            ),
+            (
+                "device-period-margin-ms",
+                self.device_period_margin,
+                DEVICE_PERIOD_MARGIN_MS_RANGE,
+            ),
+            (
+                "capture-long-silence-stop-ms",
+                self.capture_long_silence_stop,
+                CAPTURE_LONG_SILENCE_STOP_MS_RANGE,
+            ),
+            (
+                "capture-silence-preroll-ms",
+                self.capture_silence_preroll,
+                CAPTURE_SILENCE_PREROLL_MS_RANGE,
+            ),
+            (
+                "capture-silence-ramp-ms",
+                self.capture_silence_ramp,
+                CAPTURE_SILENCE_RAMP_MS_RANGE,
+            ),
+        ];
+        for (name, duration, (min, max)) in checks {
+            validate_duration_ms(name, duration, min, max)?;
+        }
         if self.hard_queue_bound < self.neteq_start_delay {
             return Err("hard-queue-bound-ms must be at least neteq-start-delay-ms".to_string());
         }
@@ -1217,6 +1265,76 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+
+    #[test]
+    fn latency_range_consts_agree_with_validate() {
+        // Each per-field bound accepts its min/max and rejects one past them,
+        // so the settings-form validators built on these consts match load-time
+        // validation. Cross-field constraints are satisfied by pinning the
+        // other fields to compatible values per case.
+        let base = || LiveAudioTuning {
+            neteq_start_delay: Duration::from_millis(100),
+            neteq_min_delay: Duration::from_millis(20),
+            neteq_base_minimum_delay: Duration::ZERO,
+            neteq_max_delay: Duration::from_millis(1_000),
+            hard_queue_bound: Duration::from_millis(1_500),
+            ..LiveAudioTuning::default()
+        };
+
+        let cases: [(&str, (u64, u64), fn(&mut LiveAudioTuning, u64)); 4] = [
+            (
+                "initial-buffer-ms",
+                INITIAL_BUFFER_MS_RANGE,
+                |tuning, ms| tuning.initial_buffer = Duration::from_millis(ms),
+            ),
+            (
+                "max-reorder-delay-ms",
+                MAX_REORDER_DELAY_MS_RANGE,
+                |tuning, ms| tuning.max_reorder_delay = Duration::from_millis(ms),
+            ),
+            (
+                "device-period-margin-ms",
+                DEVICE_PERIOD_MARGIN_MS_RANGE,
+                |tuning, ms| tuning.device_period_margin = Duration::from_millis(ms),
+            ),
+            (
+                "capture-silence-ramp-ms",
+                CAPTURE_SILENCE_RAMP_MS_RANGE,
+                |tuning, ms| tuning.capture_silence_ramp = Duration::from_millis(ms),
+            ),
+        ];
+        for (name, (min, max), set) in cases {
+            for ms in [min, max] {
+                let mut tuning = base();
+                set(&mut tuning, ms);
+                assert!(tuning.validate().is_ok(), "{name} = {ms}");
+            }
+            for ms in [min.checked_sub(1), max.checked_add(1)] {
+                let Some(ms) = ms else { continue };
+                let mut tuning = base();
+                set(&mut tuning, ms);
+                let error = tuning.validate().unwrap_err();
+                assert!(error.contains(name), "{name} = {ms}: {error}");
+            }
+        }
+
+        let mut tuning = base();
+        tuning.neteq_start_delay = Duration::from_millis(NETEQ_START_DELAY_MS_RANGE.1 + 1);
+        assert!(
+            tuning
+                .validate()
+                .unwrap_err()
+                .contains("neteq-start-delay-ms")
+        );
+        let mut tuning = base();
+        tuning.neteq_min_delay = Duration::from_millis(NETEQ_MIN_DELAY_MS_RANGE.0 - 1);
+        assert!(
+            tuning
+                .validate()
+                .unwrap_err()
+                .contains("neteq-min-delay-ms")
+        );
+    }
 
     #[test]
     fn converts_i16_scale_samples_for_opus_pcm_input() {

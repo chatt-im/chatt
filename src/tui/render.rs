@@ -256,8 +256,11 @@ pub(crate) fn draw_settings_screen(
         input_picker,
         output_picker,
         dirty,
+        tab,
+        tab_rects,
         ..
     } = &mut *session;
+    *tab_rects = ui::settings::draw_settings_tabs(screen.take_top(1), buf, &app.view.theme, *tab);
     ui::settings::draw_settings(
         screen,
         buf,
@@ -265,6 +268,7 @@ pub(crate) fn draw_settings_screen(
         &app.config.bindings,
         draft,
         form,
+        *tab,
         *dirty,
         capture.as_ref(),
         input_items,

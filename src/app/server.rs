@@ -173,6 +173,16 @@ impl ServerEditDraft {
                 self.drive(theme, FieldIntent::Adjust(delta), event.commit, None);
                 ServerEditEvent::Consumed
             }
+            FormAction::ActivateNextInsert => {
+                self.drive(theme, FieldIntent::None, event.commit, None);
+                self.move_focus(theme, 1);
+                self.form.enter_insert_mode();
+                ServerEditEvent::Consumed
+            }
+            FormAction::MoveFocus(delta) => {
+                self.move_focus(theme, delta);
+                ServerEditEvent::Consumed
+            }
             FormAction::Activate if text_focused => {
                 self.drive(theme, FieldIntent::None, event.commit, None);
                 self.move_focus(theme, 1);

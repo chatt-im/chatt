@@ -24,15 +24,20 @@ pub use lifecycle::{
 };
 pub use notifications::{NotificationSound, sound_samples};
 pub use shared::{
-    AudioStats, BufferRequest, CHANNELS, DEFAULT_DENOISE_RELEASE, DEFAULT_DENOISE_SUPPRESSION,
-    DEFAULT_DENOISE_TYPING_RELEASE_MS, DEFAULT_DENOISE_TYPING_SUPPRESSION,
-    DEFAULT_DENOISE_TYPING_VAD_ENTER, DEFAULT_DENOISE_TYPING_VAD_RELEASE,
-    DEFAULT_LIVE_MAX_AMPLIFICATION, DEFAULT_OUTPUT_VOLUME_PERCENT, DenoiseConfig,
-    DenoiseSuppression, DenoiseTypingSuppression, DredConfig, FRAME_SAMPLES, LOOPBACK_STREAM_ID,
-    LiveAudioTuning, LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSnapshot,
-    LocalVoiceFrame, LoopbackTap, MAX_OUTPUT_VOLUME_PERCENT, PlaybackSnapshot, PlaybackStats,
-    PlaybackStreamControl, RemoteVoicePacket, SAMPLE_RATE, StatsSnapshot, VoicePayload,
-    VoicePayloadRef, normalize_output_volume_percent, output_volume_percent_to_gain,
+    AudioStats, BufferRequest, CAPTURE_LONG_SILENCE_STOP_MS_RANGE,
+    CAPTURE_SILENCE_PREROLL_MS_RANGE, CAPTURE_SILENCE_RAMP_MS_RANGE, CHANNELS,
+    DEFAULT_DENOISE_RELEASE, DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_RELEASE_MS,
+    DEFAULT_DENOISE_TYPING_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
+    DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_LIVE_MAX_AMPLIFICATION,
+    DEFAULT_OUTPUT_VOLUME_PERCENT, DEVICE_PERIOD_MARGIN_MS_RANGE, DenoiseConfig,
+    DenoiseSuppression, DenoiseTypingSuppression, DredConfig, FRAME_SAMPLES,
+    HARD_QUEUE_BOUND_MS_RANGE, INITIAL_BUFFER_MS_RANGE, LOOPBACK_STREAM_ID, LiveAudioTuning,
+    LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSnapshot, LocalVoiceFrame, LoopbackTap,
+    MAX_OUTPUT_VOLUME_PERCENT, MAX_REORDER_DELAY_MS_RANGE, NETEQ_BASE_MINIMUM_DELAY_MS_RANGE,
+    NETEQ_MAX_DELAY_MS_RANGE, NETEQ_MIN_DELAY_MS_RANGE, NETEQ_START_DELAY_MS_RANGE,
+    PlaybackSnapshot, PlaybackStats, PlaybackStreamControl, RemoteVoicePacket, SAMPLE_RATE,
+    StatsSnapshot, VoicePayload, VoicePayloadRef, normalize_output_volume_percent,
+    output_volume_percent_to_gain,
 };
 pub use sim::{
     LiveAudioContentionBenchCondition, LiveAudioContentionBenchConfig,

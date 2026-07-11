@@ -3,6 +3,8 @@
 
 export type MediaKind = "image" | "video" | "audio" | "file";
 export type AutoplayMode = "disabled" | "muted" | "with-audio";
+// Where a clicked file preview opens: the in-page side panel or its own tab.
+export type ViewerMode = "panel" | "tab";
 // Which side of a transfer this view is on: "incoming" is a download this
 // client is receiving, "outgoing" is an upload it is sending.
 export type TransferDirection = "incoming" | "outgoing";
@@ -111,12 +113,13 @@ export type ServerEnvelope =
       verb: string;
       reason: string | null;
     }
-  // Sent once on connect with browser behavior settings and the active room.
+  // Sent on connect with browser behavior settings and the active room, and
+  // re-sent whenever those settings change live.
   | {
       type: "config";
       readonly: boolean;
       autoplay: AutoplayMode;
-      viewer_in_seperate_browser_tab: boolean;
+      viewer: ViewerMode;
       max_upload_bytes: number;
       room_name: string;
     }
