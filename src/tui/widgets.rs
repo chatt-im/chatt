@@ -34,9 +34,6 @@ impl RowPalette {
 }
 
 pub(crate) fn draw_section_header(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str) {
-    if area.is_empty() {
-        return;
-    }
     area.with(theme.status_section | Modifier::BOLD)
         .with(Ellipsis(true))
         .text(buf, label);
@@ -131,9 +128,6 @@ pub(crate) fn draw_action(
     focused: bool,
     dialog: bool,
 ) {
-    if area.is_empty() {
-        return;
-    }
     let style = if dialog {
         let style = if focused {
             theme.selected_focused
@@ -177,9 +171,6 @@ pub(crate) fn draw_metadata_line(
     label: &str,
     value: &str,
 ) {
-    if area.is_empty() {
-        return;
-    }
     let mut row = area;
     row.take_left(label_width as i32)
         .with(base.patch(theme.subtle))
