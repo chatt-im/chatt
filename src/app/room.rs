@@ -3402,6 +3402,39 @@ mod tests {
     }
 
     #[test]
+    fn submitting_message_returns_only_the_issuing_view_to_live_chat() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            (1..=20)
+                .map(|id| message(id, UserId(2), "history"))
+                .collect(),
+            Some(UserId(1)),
+        );
+        room.chat().scroll_up(5, 80, 5);
+        room.chat().set_cursor_to_message(0);
+        assert!(room.chat().toggle_visual_anchor(80));
+        let history_offset = room.chat().scroll_offset();
+
+        room.view.composer.set_lines("/help");
+        assert_eq!(
+            room.view.submit_composer(),
+            Some(ComposerSubmission::Command("/help".to_string()))
+        );
+        assert_eq!(room.chat().scroll_offset(), history_offset);
+        assert!(room.chat().has_visual());
+
+        room.view.composer.set_lines("back to live");
+        assert_eq!(
+            room.view.submit_composer(),
+            Some(ComposerSubmission::Message("back to live".to_string()))
+        );
+        assert_eq!(room.chat().scroll_offset(), 0);
+        assert!(!room.chat().has_visual());
+    }
+
+    #[test]
     fn switching_rooms_preserves_buffers_and_drafts() {
         let mut room = test_room();
         enter(
