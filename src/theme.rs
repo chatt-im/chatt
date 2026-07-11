@@ -34,7 +34,7 @@ pub struct SyntaxTheme {
 /// The full set of styles the UI draws with. One value is resolved from
 /// [`ThemeChoice`] at startup and read during render. Every field is a `Copy`
 /// [`Style`], so `Theme` is cheap to store and pass by value.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
     // Surfaces.
     pub background: Style,

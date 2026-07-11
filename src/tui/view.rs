@@ -622,6 +622,23 @@ impl ClientView {
         }
     }
 
+    pub(crate) fn sync_daemon_config(
+        &mut self,
+        config: &Config,
+        theme: Theme,
+        server_catalog: &crate::app::ServerCatalog,
+    ) {
+        if self.theme != theme {
+            self.apply_theme(theme);
+        }
+        if self.max_messages != config.ui.max_messages as usize {
+            self.set_max_messages(config.ui.max_messages);
+        }
+        if self.server_catalog.generation() != server_catalog.generation() {
+            self.server_catalog = server_catalog.clone();
+        }
+    }
+
     fn participant_index(&self, entries: &[ParticipantState]) -> Option<usize> {
         let selected = self.participant_selected_user?;
         entries.iter().position(|entry| entry.user_id == selected)

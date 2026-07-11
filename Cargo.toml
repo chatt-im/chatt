@@ -70,6 +70,7 @@ avx2 = ["opus-codec/presume-avx2", "nnnoiseless/presume-avx2"]
 embed-web = []
 
 [dev-dependencies]
+portable-pty="0.9"
 # The dev server, linked only for the in-crate end-to-end upload benchmark
 # (`src/bench_upload.rs`) so it can drive a real server + clients over loopback.
 server = { path = "crates/server" }
