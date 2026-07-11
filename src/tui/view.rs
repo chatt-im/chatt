@@ -368,6 +368,11 @@ impl ClientView {
             if input.starts_with(" /") {
                 input.remove(0);
             }
+            // Sending is an explicit return to the live conversation. Do this
+            // on the submitting view, before the server echo arrives, so a
+            // client reading history sees its own message when it is appended.
+            self.active.chat.bottom();
+            self.active.chat.clear_visual_anchor();
             ComposerSubmission::Message(input)
         };
         self.reset_composer("");
