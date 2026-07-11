@@ -44,13 +44,14 @@ impl DialogMode {
 }
 
 impl AppMode for DialogMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        let app = crate::tui::render::RenderState::new(cx);
         if let Some(dialog) = self.dialog.as_mut() {
             dialog.render(buf.rect(), buf, &app.view.theme);
         }
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
         if is_quit_key(&key) {
             return Action::Quit;
         }
@@ -58,15 +59,11 @@ impl AppMode for DialogMode {
             return Action::Continue;
         };
         let event = dialog.handle_key(key);
-        {
-            let mut cx = app.view_cx();
-            cx.send(CoreCommand::ApplyVolume { event, dialog });
-        }
-        app.drain_core_commands();
+        cx.send(CoreCommand::ApplyVolume { event, dialog });
         Action::Continue
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation::OVERLAY
     }
 }
@@ -182,7 +179,8 @@ impl ConfirmMode {
 }
 
 impl AppMode for ConfirmMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        let app = crate::tui::render::RenderState::new(cx);
         let theme = &app.view.theme;
         let area = buf.rect();
         if area.w < 24 || area.h < 5 {
@@ -210,25 +208,15 @@ impl AppMode for ConfirmMode {
         self.render_buttons(rows.take_top(1), buf, theme);
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_mouse_cx(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation::OVERLAY
     }
 }
@@ -305,7 +293,13 @@ impl NativeEncryptionWarningMode {
         Action::Continue
     }
 
-    fn render_buttons(&mut self, area: Rect, app: &App, buf: &mut Buffer, theme: &Theme) {
+    fn render_buttons(
+        &mut self,
+        area: Rect,
+        app: &crate::tui::render::RenderState<'_>,
+        buf: &mut Buffer,
+        theme: &Theme,
+    ) {
         if area.is_empty() {
             self.cancel_button = Rect::EMPTY;
             self.connect_button = Rect::EMPTY;
@@ -348,7 +342,8 @@ impl NativeEncryptionWarningMode {
 }
 
 impl AppMode for NativeEncryptionWarningMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        let mut app = crate::tui::render::RenderState::new(cx);
         let theme = &app.view.theme;
         let area = buf.rect();
         if area.w < 34 || area.h < 11 {
@@ -415,30 +410,20 @@ impl AppMode for NativeEncryptionWarningMode {
             body.take_top(1);
         }
         if body.h > 0 {
-            self.render_buttons(body.take_top(1), app, buf, theme);
+            self.render_buttons(body.take_top(1), &app, buf, theme);
         }
-        crate::tui::render::draw_overlay_key_preview(app, bindings::DIALOG_LAYER, buf);
+        crate::tui::render::draw_overlay_key_preview(&mut app, bindings::DIALOG_LAYER, buf);
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_mouse_cx(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,
             chrome: Some(ChromeSpec {
@@ -491,14 +476,14 @@ impl PasswordPromptMode {
         mode
     }
 
-    fn submit(&mut self, app: &mut App) {
+    fn submit(&mut self, cx: &mut ViewCx<'_>) {
         if self.submitting {
             return;
         }
         let password = std::mem::take(&mut self.input);
         self.submitting = true;
         self.feedback = PasswordFeedback::Info("Checking password...".to_string());
-        app.submit_open_pair_password(password);
+        cx.send(CoreCommand::SubmitPairPassword(password));
     }
 
     fn apply_password_challenge(&mut self, retry: bool) {
@@ -524,13 +509,13 @@ impl PasswordPromptMode {
         }
     }
 
-    fn process_command(&mut self, app: &mut App, command: BindCommand) -> Action {
+    fn process_command(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
         use BindCommand::*;
         match command {
-            Cancel => app.cancel_open_pairing(),
-            SubmitPassword | Activate => self.submit(app),
+            Cancel => cx.send(CoreCommand::CancelPairing),
+            SubmitPassword | Activate => self.submit(cx),
             TogglePasswordVisibility => self.show_password = !self.show_password,
-            command => return app.process_global_command(command),
+            command => return process_global_command_cx(cx, command),
         }
         Action::Continue
     }
@@ -555,7 +540,8 @@ impl PasswordPromptMode {
 }
 
 impl AppMode for PasswordPromptMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        let mut app = crate::tui::render::RenderState::new(cx);
         let theme = &app.view.theme;
         let area = buf.rect();
         if area.w < 28 || area.h < 9 {
@@ -603,9 +589,9 @@ impl AppMode for PasswordPromptMode {
                 .text(buf, visibility);
         }
         if body.h > 0 {
-            self.render_buttons(body.take_top(1), app, buf, theme);
+            self.render_buttons(body.take_top(1), &app, buf, theme);
         }
-        crate::tui::render::draw_overlay_key_preview(app, bindings::PASSWORD_LAYER, buf);
+        crate::tui::render::draw_overlay_key_preview(&mut app, bindings::PASSWORD_LAYER, buf);
     }
 
     fn process_app_event(&mut self, app: &mut App, event: AppEvent) -> Option<AppEvent> {
@@ -643,7 +629,7 @@ impl AppMode for PasswordPromptMode {
         }
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
         if is_quit_key(&key) {
             return Action::Quit;
         }
@@ -652,14 +638,14 @@ impl AppMode for PasswordPromptMode {
         }
         if let Some(input) = InputKey::from_event(&key) {
             match bindings::resolve(
-                &app.config.bindings.router,
+                &cx.config.bindings.router,
                 bindings::PASSWORD_LAYER,
-                &mut app.view.chrome.binding.pending_chord,
+                &mut cx.view.chrome.binding.pending_chord,
                 input,
             ) {
                 Resolved::Action(id) => {
-                    let command = app.config.bindings.actions.get(id).clone();
-                    return self.process_command(app, command);
+                    let command = cx.config.bindings.actions.get(id).clone();
+                    return self.process_command(cx, command);
                 }
                 Resolved::Consumed => return Action::Continue,
                 Resolved::Unmatched => {}
@@ -669,19 +655,19 @@ impl AppMode for PasswordPromptMode {
         Action::Continue
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return Action::Continue;
         }
         if rect_contains(self.cancel_button, mouse.column, mouse.row) {
-            app.cancel_open_pairing();
+            cx.send(CoreCommand::CancelPairing);
         } else if rect_contains(self.submit_button, mouse.column, mouse.row) {
-            self.submit(app);
+            self.submit(cx);
         }
         Action::Continue
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,
             chrome: Some(ChromeSpec {
@@ -718,7 +704,13 @@ impl PasswordPromptMode {
             .text(buf, &shown);
     }
 
-    fn render_buttons(&mut self, area: Rect, app: &App, buf: &mut Buffer, theme: &Theme) {
+    fn render_buttons(
+        &mut self,
+        area: Rect,
+        app: &crate::tui::render::RenderState<'_>,
+        buf: &mut Buffer,
+        theme: &Theme,
+    ) {
         if area.is_empty() {
             self.cancel_button = Rect::EMPTY;
             self.submit_button = Rect::EMPTY;
@@ -931,7 +923,13 @@ impl PasteImageUploadMode {
         parts.join("  ·  ")
     }
 
-    fn render_buttons(&mut self, area: Rect, app: &App, buf: &mut Buffer, theme: &Theme) {
+    fn render_buttons(
+        &mut self,
+        area: Rect,
+        app: &crate::tui::render::RenderState<'_>,
+        buf: &mut Buffer,
+        theme: &Theme,
+    ) {
         if area.is_empty() {
             self.cancel_button = Rect::EMPTY;
             self.upload_button = Rect::EMPTY;
@@ -974,7 +972,8 @@ impl PasteImageUploadMode {
 }
 
 impl AppMode for PasteImageUploadMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        let mut app = crate::tui::render::RenderState::new(cx);
         let theme = &app.view.theme;
         let area = buf.rect();
         if area.w < 28 || area.h < 7 {
@@ -1035,34 +1034,83 @@ impl AppMode for PasteImageUploadMode {
             }
         }
         if body.h > 0 {
-            self.render_buttons(body.take_top(1), app, buf, theme);
+            self.render_buttons(body.take_top(1), &app, buf, theme);
         }
-        crate::tui::render::draw_overlay_key_preview(app, bindings::PASTE_LAYER, buf);
+        crate::tui::render::draw_overlay_key_preview(&mut app, bindings::PASTE_LAYER, buf);
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn process_paste(&mut self, _app: &mut App, text: String) {
+    fn process_paste(&mut self, _cx: &mut ViewCx<'_>, text: String) {
         let span = EditorSpan::empty_at(self.editor.cursor_offset());
         self.editor.replace_range(span, text.trim());
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_mouse_cx(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
+        ModePresentation {
+            coverage: Coverage::Overlay,
+            chrome: Some(ChromeSpec {
+                theme_mode: theme::UiMode::Compose,
+                status_label: "Upload",
+                layer: bindings::PASTE_LAYER,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+macro_rules! app_mode_test_bridge {
+    ($($mode:ty),+ $(,)?) => {
+        $(
+            #[allow(dead_code)]
+            impl $mode {
+                fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64) {
+                    {
+                        let mut cx = app.view_cx();
+                        AppMode::render(self, &mut cx, buf, now_ms);
+                    }
+                    app.drain_core_commands();
+                }
+
+                fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+                    let action = {
+                        let mut cx = app.view_cx();
+                        AppMode::process_input(self, &mut cx, key)
+                    };
+                    app.drain_core_commands();
+                    action
+                }
+
+                fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
+                    let action = {
+                        let mut cx = app.view_cx();
+                        AppMode::process_mouse(self, &mut cx, mouse)
+                    };
+                    app.drain_core_commands();
+                    action
+                }
+            }
+        )+
+    };
+}
+
+#[cfg(test)]
+app_mode_test_bridge!(
+    DialogMode,
+    ConfirmMode,
+    NativeEncryptionWarningMode,
+    PasswordPromptMode,
+    PasteImageUploadMode,
+);
+
+#[cfg(test)]
+impl PasteImageUploadMode {
     fn presentation(&self, _app: &App) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,

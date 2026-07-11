@@ -715,6 +715,9 @@ pub(crate) struct RoomSession {
     pub server_rtt_ms: Option<u16>,
     /// A reconnect is in flight for the current server.
     pub network_disconnected: bool,
+    /// Whether a network worker/server selection exists. Render threads use
+    /// this projection instead of reaching into the core's worker handle.
+    pub network_selected: bool,
     /// UDP media path to the server never bound after repeated retries while
     /// the TCP session is otherwise up. Surfaced as "UDP Connection Failure".
     pub udp_unreachable: bool,
@@ -1235,6 +1238,7 @@ impl RoomSession {
             join_notice: None,
             server_rtt_ms: None,
             network_disconnected: false,
+            network_selected: false,
             udp_unreachable: false,
             screencast_status: super::ScreencastStatus::default(),
             available_shares: HashMap::new(),

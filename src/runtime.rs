@@ -104,18 +104,18 @@ fn run_app_inner(
         while let Some(event) = events.next(terminal.is_raw()) {
             match event {
                 Event::Key(key) => {
-                    let action = mode_stack.active_mut().process_input(&mut app, key);
+                    let action = mode_stack.process_input(&mut app, key);
                     if matches!(action, Action::Quit) {
                         return Ok(());
                     }
                 }
                 Event::Mouse(mouse) => {
-                    let action = mode_stack.active_mut().process_mouse(&mut app, mouse);
+                    let action = mode_stack.process_mouse(&mut app, mouse);
                     if matches!(action, Action::Quit) {
                         return Ok(());
                     }
                 }
-                Event::Paste(text) => mode_stack.active_mut().process_paste(&mut app, text),
+                Event::Paste(text) => mode_stack.process_paste(&mut app, text),
                 Event::Resized => {
                     let (new_w, new_h) = terminal.size()?;
                     buffer.resize(new_w, new_h);
