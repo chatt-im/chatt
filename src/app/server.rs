@@ -57,7 +57,7 @@ const ACTIONS: [ActionButton<'static, ServerEditButton>; 3] = [
     },
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServerSelectItem {
     pub(crate) label: String,
     pub(crate) username: String,

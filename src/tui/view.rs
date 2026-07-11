@@ -644,12 +644,17 @@ impl ClientView {
         self.theme = theme;
     }
 
-    pub(crate) fn set_max_messages(&mut self, max_messages: u32) {
-        self.max_messages = max_messages as usize;
-        self.active.chat.set_max_messages(max_messages as usize);
-        for room in self.parked.values_mut() {
-            room.chat.set_max_messages(max_messages as usize);
+    pub(crate) fn set_max_messages(&mut self, max_messages: u32) -> bool {
+        let max_messages = max_messages as usize;
+        if self.max_messages == max_messages {
+            return false;
         }
+        self.max_messages = max_messages;
+        self.active.chat.set_max_messages(max_messages);
+        for room in self.parked.values_mut() {
+            room.chat.set_max_messages(max_messages);
+        }
+        true
     }
 
     pub(crate) fn sync_daemon_config(

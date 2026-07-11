@@ -281,8 +281,8 @@ pub(crate) struct ServerCatalog {
 }
 
 impl ServerCatalog {
-    fn rebuild(&mut self, config: &Config) {
-        self.items = config
+    fn rebuild(&mut self, config: &Config) -> bool {
+        let items = config
             .servers
             .iter()
             .map(|server| ServerSelectItem {
@@ -293,7 +293,12 @@ impl ServerCatalog {
                 search_text: format!("{} {} {}", server.label, server.username, server.tcp_addr),
             })
             .collect();
+        if self.items == items {
+            return false;
+        }
+        self.items = items;
         self.generation = self.generation.saturating_add(1);
+        true
     }
 
     pub(crate) fn items(&self) -> &[ServerSelectItem] {
@@ -343,6 +348,10 @@ pub(crate) struct App {
     issuing_client: crate::client_channel::ClientId,
     primary_channel: Option<Arc<crate::client_channel::ClientChannel>>,
     clients: HashMap<crate::client_channel::ClientId, ClientHandle>,
+    /// Advances when configuration mirrored into attached terminal views changes.
+    daemon_config_generation: u64,
+    /// Last generation copied into every currently attached terminal view.
+    synced_daemon_config_generation: u64,
     pairing_owner: Option<crate::client_channel::ClientId>,
     password_prompt_active: bool,
     pub room: CoreRw<RoomSession>,
@@ -1120,6 +1129,8 @@ impl App {
             issuing_client: crate::client_channel::ClientId::PRIMARY,
             primary_channel: None,
             clients: HashMap::new(),
+            daemon_config_generation: 0,
+            synced_daemon_config_generation: 0,
             pairing_owner: None,
             password_prompt_active: false,
             room: CoreRw::new(room),
@@ -1514,13 +1525,20 @@ impl App {
             self.set_error(format!("not saved: {reason}"));
             return false;
         }
+        let previous_bindings = self.config.ui.default_bindings;
+        let previous_theme = self.config.ui.resolve_theme();
         draft.apply_to_config(&mut self.config);
-        self.view.apply_theme(self.config.ui.resolve_theme());
+        let theme = self.config.ui.resolve_theme();
+        let daemon_config_changed =
+            previous_bindings != self.config.ui.default_bindings || previous_theme != theme;
+        self.view.apply_theme(theme);
+        if daemon_config_changed {
+            self.mark_daemon_config_changed();
+        }
         match self.config.save_runtime() {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
-                self.room.set_max_messages(self.config.ui.max_messages);
-                self.view.set_max_messages(self.config.ui.max_messages);
+                self.apply_max_messages();
                 self.set_status(format!("setup saved to {}", path.display()));
                 true
             }
@@ -1754,7 +1772,11 @@ impl App {
         };
         self.config.ui.theme = reloaded.ui.theme;
         self.config.ui.themes = reloaded.ui.themes;
-        self.view.apply_theme(self.config.ui.resolve_theme());
+        let theme = self.config.ui.resolve_theme();
+        if self.view.theme != theme {
+            self.view.apply_theme(theme);
+            self.mark_daemon_config_changed();
+        }
         let _ = reply.send(Ok("theme reloaded".to_string()));
     }
 
@@ -2289,7 +2311,9 @@ impl App {
     }
 
     fn rebuild_server_items(&mut self) {
-        self.view.server_catalog.rebuild(&self.config);
+        if self.view.server_catalog.rebuild(&self.config) {
+            self.mark_daemon_config_changed();
+        }
     }
 
     #[cfg(test)]
@@ -4411,7 +4435,11 @@ impl App {
     /// Slow fields (device, bitrate, denoise, buffer, latency) schedule a
     /// debounced stream restart. The on-disk file is only written by `Save`.
     fn sync_settings_change(&mut self, session: &mut SettingsSession) {
-        self.config.ui.default_bindings = session.draft.form_bindings();
+        let bindings = session.draft.form_bindings();
+        if self.config.ui.default_bindings != bindings {
+            self.config.ui.default_bindings = bindings;
+            self.mark_daemon_config_changed();
+        }
         self.apply_theme(session.draft.theme());
         // Never place malformed free-form settings into the live config. Hold
         // the last valid state until the text is fixed, then the diff below
@@ -4465,6 +4493,7 @@ impl App {
         }
         self.config.ui.theme = selection;
         self.view.apply_theme(self.config.ui.resolve_theme());
+        self.mark_daemon_config_changed();
     }
 
     fn apply_web_setting(&mut self, old: &config::WebConfig) {
@@ -4569,12 +4598,35 @@ impl App {
         self.apply_pending_audio_restart();
         self.apply_pending_room_catalog_save(now);
         self.supervise_voice_teardown(now);
+        self.sync_daemon_config_if_changed();
+    }
+
+    fn mark_daemon_config_changed(&mut self) {
+        self.daemon_config_generation = self.daemon_config_generation.wrapping_add(1);
+    }
+
+    fn sync_daemon_config_if_changed(&mut self) {
+        if self.synced_daemon_config_generation == self.daemon_config_generation {
+            return;
+        }
+        let theme = self.config.ui.resolve_theme();
+        self.view.server_catalog.rebuild(&self.config);
+        let server_catalog = self.view.server_catalog.clone();
+        self.view
+            .sync_daemon_config(&self.config, theme, &server_catalog);
         for handle in self.clients.values() {
-            handle.view.lock().sync_daemon_config(
-                &self.config,
-                self.view.theme,
-                &self.view.server_catalog,
-            );
+            handle
+                .view
+                .lock()
+                .sync_daemon_config(&self.config, theme, &server_catalog);
+        }
+        self.synced_daemon_config_generation = self.daemon_config_generation;
+    }
+
+    fn apply_max_messages(&mut self) {
+        self.room.set_max_messages(self.config.ui.max_messages);
+        if self.view.set_max_messages(self.config.ui.max_messages) {
+            self.mark_daemon_config_changed();
         }
     }
 
@@ -5572,8 +5624,7 @@ impl App {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 session.dirty = false;
-                self.room.set_max_messages(self.config.ui.max_messages);
-                self.view.set_max_messages(self.config.ui.max_messages);
+                self.apply_max_messages();
                 // Commit the download runtime effects together: the memory ring
                 // cap and the network worker's file policy flip on Save, so the
                 // UI, the ring, and the worker stay consistent.
@@ -9221,6 +9272,7 @@ mod tests {
     fn server_catalog_rebuild_tracks_generation() {
         let mut app = test_app();
         let initial_generation = app.view.server_catalog.generation();
+        let initial_daemon_generation = app.daemon_config_generation;
         app.config.servers.push(crate::config::ServerEntry {
             label: "s1".to_string(),
             ..Default::default()
@@ -9233,6 +9285,95 @@ mod tests {
             app.view.server_catalog.generation(),
             initial_generation.saturating_add(1)
         );
+        assert_eq!(
+            app.daemon_config_generation,
+            initial_daemon_generation.wrapping_add(1)
+        );
+
+        app.rebuild_server_items();
+
+        assert_eq!(
+            app.daemon_config_generation,
+            initial_daemon_generation.wrapping_add(1)
+        );
+    }
+
+    #[test]
+    fn daemon_config_sync_is_generation_gated() {
+        let mut app = test_app();
+        let remote = attach_test_client(&mut app, crate::client_channel::ClientId(7));
+
+        app.sync_daemon_config_if_changed();
+        assert_eq!(
+            app.synced_daemon_config_generation,
+            app.daemon_config_generation
+        );
+        let idle_generation = app.synced_daemon_config_generation;
+
+        app.sync_daemon_config_if_changed();
+        assert_eq!(app.synced_daemon_config_generation, idle_generation);
+
+        app.apply_theme(ThemeSelection::Builtin(config::ThemeChoice::Base16Light));
+        assert_ne!(
+            app.synced_daemon_config_generation,
+            app.daemon_config_generation
+        );
+        let expected_theme = app.view.theme;
+
+        app.sync_daemon_config_if_changed();
+
+        assert_eq!(remote.lock().theme, expected_theme);
+        assert_eq!(
+            app.synced_daemon_config_generation,
+            app.daemon_config_generation
+        );
+    }
+
+    #[test]
+    fn daemon_config_sync_preserves_theme_changed_by_secondary_client() {
+        let mut app = test_app();
+        let client_id = crate::client_channel::ClientId(7);
+        let remote = attach_test_client(&mut app, client_id);
+        let selection = ThemeSelection::Builtin(config::ThemeChoice::Base16Light);
+
+        app.run_as_client(client_id, |app| app.apply_theme(selection));
+        let expected_theme = app.config.ui.resolve_theme();
+
+        assert_ne!(app.view.theme, expected_theme);
+        assert_eq!(remote.lock().theme, expected_theme);
+
+        app.sync_daemon_config_if_changed();
+
+        assert_eq!(app.view.theme, expected_theme);
+        assert_eq!(remote.lock().theme, expected_theme);
+    }
+
+    #[test]
+    fn welcome_theme_preview_still_advances_daemon_config_generation() {
+        let mut app = test_app();
+        let remote = attach_test_client(&mut app, crate::client_channel::ClientId(7));
+        let path = std::env::temp_dir().join(format!(
+            "chatt-welcome-theme-preview-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        app.config.config_path = Some(path.clone());
+        let mut draft = WelcomeDraft::privacy_first();
+        draft.theme = ThemeSelection::Builtin(config::ThemeChoice::Base16Light);
+        let preview = crate::theme::Theme::resolve(&draft.theme, &app.config.ui.themes);
+        app.view.apply_theme(preview);
+        let previous_generation = app.daemon_config_generation;
+
+        assert!(app.save_welcome(&draft));
+        assert_eq!(
+            app.daemon_config_generation,
+            previous_generation.wrapping_add(1)
+        );
+
+        app.sync_daemon_config_if_changed();
+
+        assert_eq!(remote.lock().theme, preview);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
