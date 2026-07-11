@@ -5,13 +5,40 @@
 //! explicitly; they must not depend on whichever room the primary view happens
 //! to show when the core eventually handles them.
 
+use extui::event::{KeyEvent, MouseEvent};
 use rpc::{
     ids::{FileTransferId, MessageId, RoomId, UserId},
     msgref::MessageRef,
 };
 
-use super::{LocalVoiceMode, RoomSettingsDraft, ServerEditDraft};
+use super::{
+    LocalVoiceMode, PendingJoin, RoomSettingsDraft, ServerEditDraft, UserVolumeDialog,
+    UserVolumeEvent,
+};
 use crate::clipboard_paste::ImagePasteSource;
+use crate::ui::settings::{FieldId, FieldIntent};
+use crate::ui::welcome::WelcomeDraft;
+
+pub(crate) enum SettingsOp {
+    Save,
+    Drive {
+        intent: FieldIntent,
+        commit: Option<(FieldId, String)>,
+        focus_column: Option<u16>,
+    },
+    MoveFocus(isize),
+    MoveSelection(isize),
+    CancelOrClose,
+    RefreshDevices,
+    MarkDirty,
+    PickerKey(KeyEvent),
+    PickerMouse(MouseEvent),
+    ActivatePickerItem {
+        field: FieldId,
+        item_index: usize,
+    },
+    Finish,
+}
 
 // Variants become live mode by mode during the incremental ViewCx migration.
 #[allow(dead_code)]
@@ -53,6 +80,10 @@ pub(crate) enum CoreCommand {
         user_id: UserId,
         value_db: f32,
     },
+    ApplyVolume {
+        event: UserVolumeEvent,
+        dialog: UserVolumeDialog,
+    },
     MoveParticipantSelection {
         delta: isize,
         visible_rows: usize,
@@ -67,8 +98,11 @@ pub(crate) enum CoreCommand {
     CancelTransfer(FileTransferId),
     SetRoomHeight(u16),
     OpenSettings,
+    Settings(SettingsOp),
     PlaySoundboard(usize),
     ToggleVideo,
+    AcceptNativeEncryption(String),
+    CancelNativeEncryption,
     Connect {
         alias: String,
     },
@@ -80,6 +114,10 @@ pub(crate) enum CoreCommand {
         join_after_save: bool,
     },
     SaveRoomSettings(RoomSettingsDraft),
+    SaveWelcome {
+        draft: WelcomeDraft,
+        pending_join: Option<PendingJoin>,
+    },
     UploadPastedImage {
         source: ImagePasteSource,
         raw_name: String,

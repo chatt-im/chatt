@@ -21,9 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use extui::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use rpc::{
     control::{ChatMutationKind, ERROR_TOKEN_STALE_EPOCH, InviteTicket, ParticipantVoiceStatus},
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
@@ -39,7 +37,6 @@ use crate::{
     local_control, settings,
     tui::{
         Action,
-        form::rect_contains,
         mode::{AppMode, ModeTransition, ViewCx},
         modes::{
             RoomMode, RoomSwitchMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession,
@@ -1027,6 +1024,7 @@ impl AppEvents {
 }
 
 /// A join requested on the command line, to be started once the app is running.
+#[derive(Clone)]
 pub(crate) enum PendingJoin {
     /// Invite-based pairing from a `tcj1_` join string.
     Invite(InviteTicket),
@@ -1240,6 +1238,13 @@ impl App {
             CoreCommand::BeginVolumePreview { user_id, value_db } => {
                 self.room.begin_volume_preview(user_id, value_db);
             }
+            CoreCommand::ApplyVolume { event, mut dialog } => {
+                if self.apply_volume_event(event, &mut dialog) {
+                    self.pop_mode();
+                } else {
+                    self.replace_mode(Box::new(DialogMode::new(dialog)));
+                }
+            }
             CoreCommand::MoveParticipantSelection {
                 delta,
                 visible_rows,
@@ -1261,17 +1266,44 @@ impl App {
             CoreCommand::CancelTransfer(transfer_id) => self.cancel_transfer(transfer_id),
             CoreCommand::SetRoomHeight(height) => self.config.ui.room_height = height,
             CoreCommand::OpenSettings => self.open_settings(),
+            CoreCommand::Settings(operation) => self.handle_settings_op(operation),
             CoreCommand::PlaySoundboard(slot) => self.trigger_soundboard_slot(slot),
             CoreCommand::ToggleVideo => self.activate_top_bar_video(),
+            CoreCommand::AcceptNativeEncryption(label) => {
+                self.accept_native_encryption_warning(&label);
+            }
+            CoreCommand::CancelNativeEncryption => self.cancel_native_encryption_warning(),
             CoreCommand::Connect { alias } => {
-                self.start_network(&alias);
+                if self.start_network(&alias) {
+                    self.push_mode(Box::new(RoomMode::default()));
+                }
             }
             CoreCommand::DeleteServer { label } => self.delete_server(&label),
             CoreCommand::SaveServerEdit {
                 draft,
                 join_after_save,
-            } => self.save_server_edit_with(&draft, join_after_save),
-            CoreCommand::SaveRoomSettings(draft) => self.save_room_settings(&draft),
+            } => {
+                if !self.save_server_edit_with(&draft, join_after_save)
+                    && self.view.pending_transition.is_empty()
+                {
+                    self.replace_mode(Box::new(ServerEditMode::new(draft)));
+                }
+            }
+            CoreCommand::SaveRoomSettings(draft) => {
+                if !self.save_room_settings(&draft) && self.view.pending_transition.is_empty() {
+                    self.replace_mode(Box::new(crate::tui::room_settings::RoomSettingsMode::new(
+                        draft,
+                    )));
+                }
+            }
+            CoreCommand::SaveWelcome {
+                draft,
+                pending_join,
+            } => {
+                if self.save_welcome(&draft) {
+                    self.finish_welcome(pending_join);
+                }
+            }
             CoreCommand::UploadPastedImage { source, raw_name } => {
                 if let Err(error) = self.confirm_paste_image_upload(&source, raw_name) {
                     self.set_error(error);
@@ -1284,6 +1316,57 @@ impl App {
             CoreCommand::AudioManualReset => self.audio_manual_reset(),
             CoreCommand::ReportBug(description) => self.start_bug_report(description),
             CoreCommand::Quit => self.request_quit(),
+        }
+    }
+
+    fn handle_settings_op(&mut self, operation: command::SettingsOp) {
+        use command::SettingsOp;
+
+        if matches!(operation, SettingsOp::Finish) {
+            if let Some(settings) = self.room.settings.take() {
+                let mut session = settings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.finish_settings_session(&mut session);
+            }
+            return;
+        }
+
+        let Some(settings) = self.room.settings.clone() else {
+            self.set_error("settings session is no longer active");
+            return;
+        };
+        let mut session = settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match operation {
+            SettingsOp::Save => self.save_settings(&mut session),
+            SettingsOp::Drive {
+                intent,
+                commit,
+                focus_column,
+            } => self.drive_settings(&mut session, intent, commit, focus_column),
+            SettingsOp::MoveFocus(delta) => self.move_settings_focus(&mut session, delta),
+            SettingsOp::MoveSelection(delta) => {
+                self.move_settings_selection(&mut session, delta);
+            }
+            SettingsOp::CancelOrClose => {
+                if !self.cancel_open_audio_picker(&mut session) {
+                    self.close_settings(&mut session);
+                }
+            }
+            SettingsOp::RefreshDevices => self.refresh_audio_devices_for_settings(&session),
+            SettingsOp::MarkDirty => self.mark_settings_dirty(&mut session),
+            SettingsOp::PickerKey(key) => {
+                self.handle_open_settings_picker_key(&mut session, key);
+            }
+            SettingsOp::PickerMouse(mouse) => {
+                self.handle_open_settings_picker_mouse(&mut session, mouse);
+            }
+            SettingsOp::ActivatePickerItem { field, item_index } => {
+                self.activate_settings_picker_item(&mut session, field, item_index);
+            }
+            SettingsOp::Finish => unreachable!("handled before taking settings lock"),
         }
     }
 
@@ -1959,14 +2042,6 @@ impl App {
         }
     }
 
-    pub(crate) fn open_server_edit(&mut self, label: &str) {
-        let Some((server_label, draft)) = self.server_edit_draft(label) else {
-            return;
-        };
-        self.push_mode(Box::new(ServerEditMode::new(draft)));
-        self.set_status(format!("editing server {server_label}"));
-    }
-
     pub(crate) fn replace_with_server_edit(&mut self, label: &str) {
         let Some((server_label, draft)) = self.server_edit_draft(label) else {
             return;
@@ -2205,12 +2280,12 @@ impl App {
         )));
     }
 
-    pub(crate) fn save_room_settings(&mut self, draft: &RoomSettingsDraft) {
+    pub(crate) fn save_room_settings(&mut self, draft: &RoomSettingsDraft) -> bool {
         let overrides = match draft.to_overrides() {
             Ok(overrides) => overrides,
             Err(error) => {
                 self.set_error(error);
-                return;
+                return false;
             }
         };
         let Some(server) = self
@@ -2220,7 +2295,7 @@ impl App {
             .find(|server| server.label == draft.server_label())
         else {
             self.set_error(format!("server {} is not configured", draft.server_label()));
-            return;
+            return false;
         };
         let previous_history = server
             .rooms
@@ -2246,8 +2321,12 @@ impl App {
                 } else {
                     self.set_status(format!("room settings saved to {}", path.display()));
                 }
+                true
             }
-            Err(error) => self.set_error(error),
+            Err(error) => {
+                self.set_error(error);
+                false
+            }
         }
     }
 
@@ -3535,29 +3614,6 @@ impl App {
         self.view.pending_transition.take()
     }
 
-    pub(crate) fn process_top_bar_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return false;
-        }
-        if rect_contains(self.view.chrome.top_bar.live, mouse.column, mouse.row) {
-            self.activate_top_bar_voice_mode(LocalVoiceMode::Live);
-            return true;
-        }
-        if rect_contains(self.view.chrome.top_bar.mute, mouse.column, mouse.row) {
-            self.activate_top_bar_voice_mode(LocalVoiceMode::Muted);
-            return true;
-        }
-        if rect_contains(self.view.chrome.top_bar.deafen, mouse.column, mouse.row) {
-            self.activate_top_bar_voice_mode(LocalVoiceMode::Deafened);
-            return true;
-        }
-        if rect_contains(self.view.chrome.top_bar.video, mouse.column, mouse.row) {
-            self.activate_top_bar_video();
-            return true;
-        }
-        false
-    }
-
     pub(crate) fn delete_server(&mut self, label: &str) {
         self.config.servers.retain(|server| server.label != label);
         self.config
@@ -3629,12 +3685,16 @@ impl App {
         self.set_status("connection canceled");
     }
 
-    pub(crate) fn save_server_edit_with(&mut self, draft: &ServerEditDraft, join_after_save: bool) {
+    pub(crate) fn save_server_edit_with(
+        &mut self,
+        draft: &ServerEditDraft,
+        join_after_save: bool,
+    ) -> bool {
         let update = match draft.to_update() {
             Ok(update) => update,
             Err(error) => {
                 self.set_error(error);
-                return;
+                return false;
             }
         };
         let original_label = update.original_label;
@@ -3647,7 +3707,7 @@ impl App {
                 .any(|existing| existing.label == server.label)
         {
             self.set_error(format!("server label {} already exists", server.label));
-            return;
+            return false;
         }
         let label = server.label.clone();
         let history_changed = self
@@ -3686,7 +3746,9 @@ impl App {
                 if join_after_save {
                     if self.start_network(&label) {
                         self.replace_mode(Box::new(RoomMode::default()));
+                        return true;
                     }
+                    return false;
                 } else {
                     self.pop_mode();
                     if history_changed
@@ -3698,8 +3760,12 @@ impl App {
                         self.set_status(format!("server saved to {}", path.display()));
                     }
                 }
+                true
             }
-            Err(error) => self.set_error(error),
+            Err(error) => {
+                self.set_error(error);
+                false
+            }
         }
     }
 
@@ -3807,6 +3873,10 @@ impl App {
     }
 
     pub(crate) fn open_settings(&mut self) {
+        if self.room.settings.is_some() {
+            self.set_error("settings are already open in another client");
+            return;
+        }
         if self.allow_settings_preview_capture
             && (self.room.audio_devices.input_devices.is_empty()
                 || self.room.audio_devices.output_devices.is_empty())
@@ -3814,7 +3884,11 @@ impl App {
             self.refresh_audio_devices();
         }
         self.start_settings_preview_capture();
-        self.push_mode(Box::new(SettingsMode::new(self)));
+        self.room.settings = Some(Arc::new(std::sync::Mutex::new(SettingsSession::new(
+            &self.config,
+            &self.room.audio_devices,
+        ))));
+        self.push_mode(Box::new(SettingsMode::new()));
     }
 
     pub(crate) fn close_settings(&mut self, session: &mut SettingsSession) {
@@ -5473,25 +5547,6 @@ impl App {
         }
     }
 
-    pub(crate) fn local_voice_mode(&self) -> LocalVoiceMode {
-        if self.deafened.load(Ordering::Relaxed) {
-            LocalVoiceMode::Deafened
-        } else if self.mic_muted.load(Ordering::Relaxed) {
-            LocalVoiceMode::Muted
-        } else {
-            LocalVoiceMode::Live
-        }
-    }
-
-    fn activate_top_bar_voice_mode(&mut self, requested: LocalVoiceMode) {
-        let mode = if self.local_voice_mode() == requested {
-            LocalVoiceMode::Live
-        } else {
-            requested
-        };
-        self.set_local_voice_mode(mode);
-    }
-
     fn set_local_voice_mode(&mut self, mode: LocalVoiceMode) {
         match mode {
             LocalVoiceMode::Live => {
@@ -6645,7 +6700,10 @@ fn auth_failure_status(detail: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::{settings::SettingsDraft, tui::form::FormState};
-    use extui::{Buffer, Rect, Style, event::KeyModifiers};
+    use extui::{
+        Buffer, Rect, Style,
+        event::{KeyModifiers, MouseButton},
+    };
     use extui_editor::Mode as EditorMode;
 
     fn test_app() -> App {
@@ -7807,34 +7865,39 @@ mod tests {
             crate::ui::settings::capture_device_id(),
             app.config.ui.default_bindings,
         );
-        let mut mode = SettingsMode::with_form_for_test(form, &app);
-        mode.session_mut().input_items = ["System default", "USB Mic", "Line In"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, name)| settings::AudioDeviceItem {
-                selection: Some(format!("device-{index}")),
-                aliases: Vec::new(),
-                backend_id: None,
-                device_index: Some(index as u32),
-                name: name.to_string(),
-                search_text: name.to_string(),
-                rank: 0,
-                supported: true,
-                preview: None,
-                issue: None,
-                variants: Vec::new(),
-                default_source: "test",
-            })
-            .collect();
-        let session = mode.session_mut();
-        let input_selection = session.draft.input_selection().map(ToOwned::to_owned);
-        let input_items = session.input_items.clone();
-        session
-            .input_picker
-            .open(&input_items, input_selection.as_deref());
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings_session = app.room.settings.clone().expect("settings session");
+        {
+            let mut session = settings_session.lock().unwrap();
+            session.input_items = ["System default", "USB Mic", "Line In"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| settings::AudioDeviceItem {
+                    selection: Some(format!("device-{index}")),
+                    aliases: Vec::new(),
+                    backend_id: None,
+                    device_index: Some(index as u32),
+                    name: name.to_string(),
+                    search_text: name.to_string(),
+                    rank: 0,
+                    supported: true,
+                    preview: None,
+                    issue: None,
+                    variants: Vec::new(),
+                    default_source: "test",
+                })
+                .collect();
+            let input_selection = session.draft.input_selection().map(ToOwned::to_owned);
+            let input_items = session.input_items.clone();
+            session
+                .input_picker
+                .open(&input_items, input_selection.as_deref());
+        }
 
         assert_eq!(
-            mode.session_mut()
+            settings_session
+                .lock()
+                .unwrap()
                 .input_picker
                 .selector
                 .current_item_index(),
@@ -7852,7 +7915,9 @@ mod tests {
         );
 
         assert_eq!(
-            mode.session_mut()
+            settings_session
+                .lock()
+                .unwrap()
                 .input_picker
                 .selector
                 .current_item_index(),
@@ -7867,7 +7932,8 @@ mod tests {
             crate::ui::settings::field_id_for("Capture Settings", "Bitrate"),
             app.config.ui.default_bindings,
         );
-        let mut mode = SettingsMode::with_form_for_test(form, &app);
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings_session = app.room.settings.clone().expect("settings session");
         let before = app.config.audio.bitrate_bps;
 
         mode.process_input(
@@ -7875,7 +7941,7 @@ mod tests {
             KeyEvent::new(KeyCode::Right, KeyModifiers::empty()),
         );
 
-        assert!(mode.session_mut().dirty);
+        assert!(settings_session.lock().unwrap().dirty);
         assert_ne!(app.config.audio.bitrate_bps, before);
     }
 
@@ -8387,35 +8453,35 @@ mod tests {
         assert!(!deafen_rect.is_empty());
 
         click_top_bar_rect(&mut app, &mut room, mute_rect);
-        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Muted);
+        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Muted);
         assert!(app.mic_muted.load(Ordering::Relaxed));
         assert!(!app.deafened.load(Ordering::Relaxed));
 
         click_top_bar_rect(&mut app, &mut room, mute_rect);
-        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Live);
+        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Live);
         assert!(!app.mic_muted.load(Ordering::Relaxed));
         assert!(!app.deafened.load(Ordering::Relaxed));
 
         click_top_bar_rect(&mut app, &mut room, deafen_rect);
-        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Deafened);
+        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Deafened);
         assert!(app.mic_muted.load(Ordering::Relaxed));
         assert!(app.deafened.load(Ordering::Relaxed));
 
         click_top_bar_rect(&mut app, &mut room, mute_rect);
-        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Muted);
+        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Muted);
         assert!(app.mic_muted.load(Ordering::Relaxed));
         assert!(!app.deafened.load(Ordering::Relaxed));
 
         click_top_bar_rect(&mut app, &mut room, live_rect);
-        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Live);
+        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Live);
         assert!(!app.mic_muted.load(Ordering::Relaxed));
         assert!(!app.deafened.load(Ordering::Relaxed));
 
         click_top_bar_rect(&mut app, &mut room, deafen_rect);
-        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Deafened);
+        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Deafened);
 
         click_top_bar_rect(&mut app, &mut room, deafen_rect);
-        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Live);
+        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Live);
         assert!(!app.mic_muted.load(Ordering::Relaxed));
         assert!(!app.deafened.load(Ordering::Relaxed));
     }

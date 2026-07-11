@@ -175,7 +175,7 @@ pub(crate) fn draw_server_edit_overlay(
 
 pub(crate) fn draw_settings_screen(
     app: &mut App,
-    settings_mode: &mut SettingsMode,
+    _settings_mode: &mut SettingsMode,
     mode: theme::UiMode,
     status_label: &'static str,
     layer: LayerId,
@@ -189,20 +189,35 @@ pub(crate) fn draw_settings_screen(
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
 
-    let session = settings_mode.session_mut();
+    let Some(settings) = app.room.settings.clone() else {
+        return;
+    };
+    let mut session = settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let crate::tui::modes::SettingsSession {
+        draft,
+        form,
+        input_items,
+        output_items,
+        input_picker,
+        output_picker,
+        dirty,
+        ..
+    } = &mut *session;
     ui::settings::draw_settings(
         screen,
         buf,
         &app.view.theme,
         &app.config.bindings,
-        &mut session.draft,
-        &mut session.form,
-        session.dirty,
+        draft,
+        form,
+        *dirty,
         capture.as_ref(),
-        &session.input_items,
-        &mut session.input_picker,
-        &session.output_items,
-        &mut session.output_picker,
+        input_items,
+        input_picker,
+        output_items,
+        output_picker,
     );
     draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
     draw_key_preview(key_preview_area, app, buf);

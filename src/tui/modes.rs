@@ -6,7 +6,8 @@ use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 use crate::{
     app::{
         App, ChatPanelFocus, DeleteSelection, PendingJoin, RoomSettingsDraft, ServerEditDraft,
-        ServerEditEvent, ToggleExpandResult, UserVolumeDialog, command::CoreCommand,
+        ServerEditEvent, ToggleExpandResult, UserVolumeDialog,
+        command::{CoreCommand, SettingsOp},
     },
     bindings::{self, BindCommand, Resolved},
     chat_buffer::{Cursor as ChatCursor, LineKind, VisibleLine},
@@ -64,7 +65,7 @@ impl WelcomeMode {
 
     fn drive(
         &mut self,
-        app: &mut App,
+        cx: &mut ViewCx<'_>,
         intent: FieldIntent,
         commit: Option<(FieldId, String)>,
         focus_column: Option<u16>,
@@ -72,54 +73,113 @@ impl WelcomeMode {
         let output = welcome::welcome_logic(
             &mut self.form,
             &mut self.draft,
-            &app.view.theme,
-            &app.config.bindings,
+            &cx.view.theme,
+            &cx.config.bindings,
             intent,
             commit,
             focus_column,
         );
-        self.handle_output(app, output);
+        self.handle_output(cx, output);
     }
 
-    fn handle_output(&mut self, app: &mut App, output: WelcomeOutput) {
+    fn handle_output(&mut self, cx: &mut ViewCx<'_>, output: WelcomeOutput) {
         if output.changed {
             let _ = self.form.set_bindings(self.draft.default_bindings);
-            app.apply_theme(self.draft.theme.clone());
+            cx.view.apply_theme(crate::theme::Theme::resolve(
+                &self.draft.theme,
+                &cx.config.ui.themes,
+            ));
         }
         match output.button {
-            Some(WelcomeButton::Save) if app.save_welcome(&self.draft) => {
-                app.finish_welcome(self.pending_join.take());
-            }
-            Some(WelcomeButton::Exit) => app.request_quit(),
-            Some(WelcomeButton::Save) | None => {}
+            Some(WelcomeButton::Save) => self.save_and_continue(cx),
+            Some(WelcomeButton::Exit) => cx.send(CoreCommand::Quit),
+            None => {}
         }
     }
 
-    fn save_and_continue(&mut self, app: &mut App) {
+    fn save_and_continue(&mut self, cx: &mut ViewCx<'_>) {
         let commit = self.form.clear_text();
-        self.drive(app, FieldIntent::None, commit, None);
-        if app.save_welcome(&self.draft) {
-            app.finish_welcome(self.pending_join.take());
-        }
+        self.drive(cx, FieldIntent::None, commit, None);
+        cx.send(CoreCommand::SaveWelcome {
+            draft: self.draft.clone(),
+            pending_join: self.pending_join.clone(),
+        });
     }
 
-    fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+    fn process_action(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
         match command {
-            BindCommand::SaveSettings => self.save_and_continue(app),
+            BindCommand::SaveSettings => self.save_and_continue(cx),
             BindCommand::Cancel | BindCommand::CloseSettings => {
-                app.set_status("save setup to continue");
+                cx.set_status("save setup to continue");
             }
             BindCommand::Quit => return Action::Quit,
-            _ => return app.process_global_command(command),
+            _ => return process_global_command_cx(cx, command),
         }
         Action::Continue
     }
 
-    fn resolve_binding(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        match resolve_binding(app, bindings::SETTINGS_LAYER, key) {
-            BindingResolution::Action(command) => self.process_action(app, command),
+    fn resolve_binding(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        match resolve_binding_cx(cx, bindings::SETTINGS_LAYER, key) {
+            BindingResolution::Action(command) => self.process_action(cx, command),
             BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
         }
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if is_control_save_chord_cx(cx, &key) {
+            self.save_and_continue(cx);
+            return Action::Continue;
+        }
+
+        let kind = self.form.focused_kind();
+        let text_focused = kind == FormFieldKind::Text;
+        let event = self.form.handle_key(key, kind);
+        match event.action {
+            FormAction::None if !text_focused => return self.resolve_binding(cx, key),
+            FormAction::None => self.drive(cx, FieldIntent::None, event.commit, None),
+            FormAction::Cancel => cx.set_status("save setup to continue"),
+            FormAction::Activate if text_focused => {
+                self.drive(cx, FieldIntent::None, event.commit, None);
+                let commit = self.form.move_focus(1);
+                self.drive(cx, FieldIntent::None, commit, None);
+            }
+            FormAction::Activate => {
+                self.drive(cx, FieldIntent::Activate, event.commit, None);
+            }
+            FormAction::Adjust(delta) => {
+                self.drive(cx, FieldIntent::Adjust(delta), event.commit, None);
+            }
+            FormAction::FocusMoved | FormAction::Scrolled => {
+                self.drive(cx, FieldIntent::None, event.commit, None);
+            }
+            FormAction::TextChanged => {}
+        }
+        Action::Continue
+    }
+
+    fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        let event = self.form.handle_mouse(mouse);
+        match event.intent {
+            FormMouseIntent::None | FormMouseIntent::PickerItem(_, _) => {
+                self.drive(cx, FieldIntent::None, event.commit, None);
+            }
+            FormMouseIntent::Activate(_) => {
+                self.drive(cx, FieldIntent::Activate, event.commit, None);
+            }
+            FormMouseIntent::Adjust(_, delta) => {
+                self.drive(cx, FieldIntent::Adjust(delta), event.commit, None);
+            }
+            FormMouseIntent::Text(_, _, column) => {
+                self.drive(cx, FieldIntent::None, event.commit, Some(column));
+            }
+        }
+        Action::Continue
     }
 
     pub(crate) fn draw_body(&mut self, area: Rect, app: &App, buf: &mut Buffer) {
@@ -150,62 +210,21 @@ impl AppMode for WelcomeMode {
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        if matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        if is_control_save_chord(app, &key) {
-            self.save_and_continue(app);
-            return Action::Continue;
-        }
-
-        let kind = self.form.focused_kind();
-        let text_focused = kind == FormFieldKind::Text;
-        let event = self.form.handle_key(key, kind);
-        match event.action {
-            FormAction::None if !text_focused => return self.resolve_binding(app, key),
-            FormAction::None => self.drive(app, FieldIntent::None, event.commit, None),
-            FormAction::Cancel => {
-                app.set_status("save setup to continue");
-            }
-            FormAction::Activate if text_focused => {
-                self.drive(app, FieldIntent::None, event.commit, None);
-                let commit = self.form.move_focus(1);
-                self.drive(app, FieldIntent::None, commit, None);
-            }
-            FormAction::Activate => {
-                self.drive(app, FieldIntent::Activate, event.commit, None);
-            }
-            FormAction::Adjust(delta) => {
-                self.drive(app, FieldIntent::Adjust(delta), event.commit, None);
-            }
-            FormAction::FocusMoved | FormAction::Scrolled => {
-                self.drive(app, FieldIntent::None, event.commit, None);
-            }
-            FormAction::TextChanged => {}
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let event = self.form.handle_mouse(mouse);
-        match event.intent {
-            FormMouseIntent::None | FormMouseIntent::PickerItem(_, _) => {
-                self.drive(app, FieldIntent::None, event.commit, None);
-            }
-            FormMouseIntent::Activate(_) => {
-                self.drive(app, FieldIntent::Activate, event.commit, None);
-            }
-            FormMouseIntent::Adjust(_, delta) => {
-                self.drive(app, FieldIntent::Adjust(delta), event.commit, None);
-            }
-            FormMouseIntent::Text(_, _, column) => {
-                self.drive(app, FieldIntent::None, event.commit, Some(column));
-            }
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_mouse_cx(&mut cx, mouse)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
@@ -231,12 +250,17 @@ pub(crate) enum BindingResolution {
     Unmatched,
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_binding(app: &mut App, layer: LayerId, key: KeyEvent) -> BindingResolution {
     let mut cx = app.view_cx();
     resolve_binding_cx(&mut cx, layer, key)
 }
 
-fn resolve_binding_cx(cx: &mut ViewCx<'_>, layer: LayerId, key: KeyEvent) -> BindingResolution {
+pub(crate) fn resolve_binding_cx(
+    cx: &mut ViewCx<'_>,
+    layer: LayerId,
+    key: KeyEvent,
+) -> BindingResolution {
     let Some(input) = InputKey::from_event(&key) else {
         return BindingResolution::Unmatched;
     };
@@ -252,6 +276,70 @@ fn resolve_binding_cx(cx: &mut ViewCx<'_>, layer: LayerId, key: KeyEvent) -> Bin
         Resolved::Consumed => BindingResolution::Consumed,
         Resolved::Unmatched => BindingResolution::Unmatched,
     }
+}
+
+pub(crate) fn process_global_command_cx(cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
+    use BindCommand::*;
+    match command {
+        OpenSettings => cx.send(CoreCommand::OpenSettings),
+        Quit => return Action::Quit,
+        ToggleMute => cx.send(CoreCommand::ToggleMute),
+        ToggleDeafen => cx.send(CoreCommand::ToggleDeafen),
+        PlaySoundboard1 => cx.send(CoreCommand::PlaySoundboard(0)),
+        PlaySoundboard2 => cx.send(CoreCommand::PlaySoundboard(1)),
+        PlaySoundboard3 => cx.send(CoreCommand::PlaySoundboard(2)),
+        PlaySoundboard4 => cx.send(CoreCommand::PlaySoundboard(3)),
+        PlaySoundboard5 => cx.send(CoreCommand::PlaySoundboard(4)),
+        PlaySoundboard6 => cx.send(CoreCommand::PlaySoundboard(5)),
+        PlaySoundboard7 => cx.send(CoreCommand::PlaySoundboard(6)),
+        PlaySoundboard8 => cx.send(CoreCommand::PlaySoundboard(7)),
+        PlaySoundboard9 => cx.send(CoreCommand::PlaySoundboard(8)),
+        ToggleKeyPreview => {
+            cx.view.chrome.key_preview.expanded = !cx.view.chrome.key_preview.expanded;
+        }
+        _ => {}
+    }
+    Action::Continue
+}
+
+fn process_top_bar_mouse_cx(cx: &mut ViewCx<'_>, mouse: MouseEvent) -> bool {
+    use extui::event::{MouseButton, MouseEventKind};
+
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    let requested =
+        if crate::tui::form::rect_contains(cx.view.chrome.top_bar.live, mouse.column, mouse.row) {
+            Some(crate::app::LocalVoiceMode::Live)
+        } else if crate::tui::form::rect_contains(
+            cx.view.chrome.top_bar.mute,
+            mouse.column,
+            mouse.row,
+        ) {
+            Some(crate::app::LocalVoiceMode::Muted)
+        } else if crate::tui::form::rect_contains(
+            cx.view.chrome.top_bar.deafen,
+            mouse.column,
+            mouse.row,
+        ) {
+            Some(crate::app::LocalVoiceMode::Deafened)
+        } else {
+            None
+        };
+    if let Some(requested) = requested {
+        let mode = if cx.view.local_voice_mode() == requested {
+            crate::app::LocalVoiceMode::Live
+        } else {
+            requested
+        };
+        cx.send(CoreCommand::SetVoiceMode(mode));
+        return true;
+    }
+    if crate::tui::form::rect_contains(cx.view.chrome.top_bar.video, mouse.column, mouse.row) {
+        cx.send(CoreCommand::ToggleVideo);
+        return true;
+    }
+    false
 }
 
 fn maybe_auto_close_markdown_code_fence(editor: &mut Editor, key: KeyEvent) {
@@ -283,7 +371,7 @@ fn maybe_auto_close_markdown_code_fence(editor: &mut Editor, key: KeyEvent) {
     editor.set_cursor_offset(cursor as u32);
 }
 
-fn is_control_save_chord(app: &App, key: &KeyEvent) -> bool {
+fn is_control_save_chord_cx(cx: &ViewCx<'_>, key: &KeyEvent) -> bool {
     if !key.modifiers.contains(KeyModifiers::CONTROL) {
         return false;
     }
@@ -291,7 +379,7 @@ fn is_control_save_chord(app: &App, key: &KeyEvent) -> bool {
         return false;
     };
     let pending = None;
-    bindings::reachable(&app.config.bindings, bindings::SETTINGS_LAYER, &pending)
+    bindings::reachable(&cx.config.bindings, bindings::SETTINGS_LAYER, &pending)
         .into_iter()
         .any(|reachable| {
             reachable.key == input
@@ -327,24 +415,26 @@ impl ServerListMode {
         }
     }
 
-    fn selected_label(&self, app: &App) -> Option<String> {
+    fn selected_label(&self, cx: &ViewCx<'_>) -> Option<String> {
         self.select
             .current_item_index()
-            .and_then(|index| app.server_items().get(index))
+            .and_then(|index| cx.view.server_catalog.items().get(index))
             .map(|item| item.label.clone())
     }
 
-    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+    pub(crate) fn process_action_cx(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        command: BindCommand,
+    ) -> Action {
         use BindCommand::*;
         match command {
             Activate => {
-                let Some(label) = self.selected_label(app) else {
-                    app.set_error("no server selected");
+                let Some(label) = self.selected_label(cx) else {
+                    cx.set_error("no server selected");
                     return Action::Continue;
                 };
-                if app.start_network(&label) {
-                    app.push_mode(Box::new(RoomMode::default()));
-                }
+                cx.send(CoreCommand::Connect { alias: label });
             }
             SelectNext => {
                 self.select.move_selection(1);
@@ -353,37 +443,83 @@ impl ServerListMode {
                 self.select.move_selection(-1);
             }
             EditServer => {
-                let Some(label) = self.selected_label(app) else {
-                    app.set_error("no server selected");
+                let Some(label) = self.selected_label(cx) else {
+                    cx.set_error("no server selected");
                     return Action::Continue;
                 };
-                app.open_server_edit(&label);
+                let server = match cx.config.server(&label) {
+                    Ok(server) => server,
+                    Err(error) => {
+                        cx.set_error(error);
+                        return Action::Continue;
+                    }
+                };
+                let draft = ServerEditDraft::from_server(server, cx.config);
+                cx.request_transition(ModeTransition::Push(Box::new(ServerEditMode::new(draft))));
+                cx.set_status(format!("editing server {label}"));
             }
             DeleteServer => {
-                let Some(label) = self.selected_label(app) else {
-                    app.set_error("no server selected");
+                let Some(label) = self.selected_label(cx) else {
+                    cx.set_error("no server selected");
                     return Action::Continue;
                 };
                 let prompt = format!("Delete server '{label}'?");
-                app.push_mode(Box::new(ConfirmMode::new(
+                cx.request_transition(ModeTransition::Push(Box::new(ConfirmMode::new(
                     prompt,
                     "Delete",
                     "Cancel",
-                    move |app| {
-                        app.delete_server(&label);
+                    move |cx| {
+                        cx.send(CoreCommand::DeleteServer { label });
                         ConfirmDisposition::Transition(ModeTransition::Pop)
                     },
-                )));
+                ))));
             }
             SearchServers => {
                 self.searching = true;
                 self.select.clear_query();
-                self.select.refresh(app.server_items());
+                self.select.refresh(cx.view.server_catalog.items());
             }
-            Cancel if app.network.is_some() => app.push_mode(Box::new(RoomMode::default())),
-            _ => return app.process_global_command(command),
+            Cancel if cx.session.active_server_label.is_some() => {
+                cx.request_transition(ModeTransition::Push(Box::new(RoomMode::default())));
+            }
+            _ => return process_global_command_cx(cx, command),
         }
         Action::Continue
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_action_cx(&mut cx, command)
+        };
+        app.drain_core_commands();
+        action
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if self.searching {
+            match key.code {
+                extui::event::KeyCode::Esc | extui::event::KeyCode::Enter => {
+                    self.searching = false;
+                }
+                _ if self.select.edit_query(key) => {
+                    self.select.refresh(cx.view.server_catalog.items())
+                }
+                _ => {}
+            }
+            return Action::Continue;
+        }
+        match resolve_binding_cx(cx, bindings::PICKER_LAYER, key) {
+            BindingResolution::Action(command) => self.process_action_cx(cx, command),
+            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
+        }
     }
 }
 
@@ -409,26 +545,12 @@ impl AppMode for ServerListMode {
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        if matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        if self.searching {
-            match key.code {
-                extui::event::KeyCode::Esc | extui::event::KeyCode::Enter => {
-                    self.searching = false;
-                }
-                _ if self.select.edit_query(key) => self.select.refresh(app.server_items()),
-                _ => {}
-            }
-            return Action::Continue;
-        }
-        match resolve_binding(app, bindings::PICKER_LAYER, key) {
-            BindingResolution::Action(command) => self.process_action(app, command),
-            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
-        }
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
@@ -470,16 +592,25 @@ impl RoomSwitchMode {
         self.select.refresh(&self.items);
     }
 
-    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+    fn refresh_cx(&mut self, cx: &ViewCx<'_>) {
+        self.items = cx.session.room_select_items(cx.session.voice_room);
+        self.select.refresh(&self.items);
+    }
+
+    pub(crate) fn process_action_cx(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        command: BindCommand,
+    ) -> Action {
         use BindCommand::*;
         match command {
             Activate => {
                 let Some(room_id) = self.selected_room() else {
-                    app.set_error("no room selected");
+                    cx.set_error("no room selected");
                     return Action::Continue;
                 };
-                app.set_viewed_room(room_id);
-                app.pop_mode();
+                cx.send(CoreCommand::SetViewedRoom(room_id));
+                cx.request_transition(ModeTransition::Pop);
             }
             SelectNext => {
                 self.select.move_selection(1);
@@ -490,12 +621,45 @@ impl RoomSwitchMode {
             SearchServers => {
                 self.searching = true;
                 self.select.clear_query();
-                self.refresh(app);
+                self.refresh_cx(cx);
             }
-            Cancel | RoomSwitcher => app.pop_mode(),
-            _ => return app.process_global_command(command),
+            Cancel | RoomSwitcher => cx.request_transition(ModeTransition::Pop),
+            _ => return process_global_command_cx(cx, command),
         }
         Action::Continue
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_action_cx(&mut cx, command)
+        };
+        app.drain_core_commands();
+        action
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if self.searching {
+            match key.code {
+                extui::event::KeyCode::Esc | extui::event::KeyCode::Enter => {
+                    self.searching = false;
+                }
+                _ if self.select.edit_query(key) => self.refresh_cx(cx),
+                _ => {}
+            }
+            return Action::Continue;
+        }
+        match resolve_binding_cx(cx, bindings::PICKER_LAYER, key) {
+            BindingResolution::Action(command) => self.process_action_cx(cx, command),
+            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
+        }
     }
 }
 
@@ -516,26 +680,12 @@ impl AppMode for RoomSwitchMode {
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        if matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        if self.searching {
-            match key.code {
-                extui::event::KeyCode::Esc | extui::event::KeyCode::Enter => {
-                    self.searching = false;
-                }
-                _ if self.select.edit_query(key) => self.refresh(app),
-                _ => {}
-            }
-            return Action::Continue;
-        }
-        match resolve_binding(app, bindings::PICKER_LAYER, key) {
-            BindingResolution::Action(command) => self.process_action(app, command),
-            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
-        }
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
@@ -548,43 +698,72 @@ impl AppMode for RoomSwitchMode {
 }
 
 pub(crate) struct ServerEditMode {
-    draft: ServerEditDraft,
+    draft: Option<ServerEditDraft>,
 }
 
 impl ServerEditMode {
     pub(crate) fn new(draft: ServerEditDraft) -> Self {
-        Self { draft }
+        Self { draft: Some(draft) }
     }
 
-    fn handle_event(&mut self, app: &mut App, event: ServerEditEvent) {
+    fn handle_event(&mut self, cx: &mut ViewCx<'_>, event: ServerEditEvent) {
         match event {
             ServerEditEvent::Consumed => {}
-            ServerEditEvent::Cancel => app.pop_mode(),
+            ServerEditEvent::Cancel => cx.request_transition(ModeTransition::Pop),
             ServerEditEvent::Save { join_after_save } => {
-                app.save_server_edit_with(&self.draft, join_after_save);
+                if let Some(draft) = self.draft.take() {
+                    cx.send(CoreCommand::SaveServerEdit {
+                        draft,
+                        join_after_save,
+                    });
+                }
             }
         }
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if let Some(draft) = self.draft.as_mut() {
+            let event = draft.handle_key(key, &cx.view.theme);
+            self.handle_event(cx, event);
+        }
+        Action::Continue
+    }
+
+    fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        if let Some(draft) = self.draft.as_mut() {
+            let event = draft.handle_mouse(mouse, &cx.view.theme);
+            self.handle_event(cx, event);
+        }
+        Action::Continue
     }
 }
 
 impl AppMode for ServerEditMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        crate::tui::render::draw_server_edit_overlay(app, &mut self.draft, buf);
+        if let Some(draft) = self.draft.as_mut() {
+            crate::tui::render::draw_server_edit_overlay(app, draft, buf);
+        }
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        let event = self.draft.handle_key(key, &app.view.theme);
-        self.handle_event(app, event);
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let event = self.draft.handle_mouse(mouse, &app.view.theme);
-        self.handle_event(app, event);
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_mouse_cx(&mut cx, mouse)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
@@ -611,20 +790,23 @@ pub(crate) struct SettingsSession {
 }
 
 impl SettingsSession {
-    fn new(app: &App) -> Self {
-        let mut draft = SettingsDraft::from_audio(&app.config.audio);
-        draft.set_form_bindings_from_config(app.config.ui.default_bindings);
+    pub(crate) fn new(
+        config: &crate::config::Config,
+        devices: &crate::app::AudioDeviceCatalog,
+    ) -> Self {
+        let mut draft = SettingsDraft::from_audio(&config.audio);
+        draft.set_form_bindings_from_config(config.ui.default_bindings);
         draft.set_theme_from_config(
-            app.config.ui.theme.clone(),
-            app.config.ui.themes.resolved.keys().cloned().collect(),
+            config.ui.theme.clone(),
+            config.ui.themes.resolved.keys().cloned().collect(),
         );
-        draft.set_web_from_config(&app.config.web);
-        draft.set_notifications_from_config(&app.config.notifications);
-        draft.set_files_from_config(&app.config.files);
-        draft.set_p2p_from_config(&app.config.p2p);
-        draft.set_history_from_config(&app.config.history);
-        let input_items = settings::audio_input_items(app.room.audio_devices.input_devices());
-        let output_items = settings::audio_output_items(app.room.audio_devices.output_devices());
+        draft.set_web_from_config(&config.web);
+        draft.set_notifications_from_config(&config.notifications);
+        draft.set_files_from_config(&config.files);
+        draft.set_p2p_from_config(&config.p2p);
+        draft.set_history_from_config(&config.history);
+        let input_items = settings::audio_input_items(devices.input_devices());
+        let output_items = settings::audio_output_items(devices.output_devices());
         let mut input_picker = AudioInputPickerState::default();
         input_picker.reset(&input_items, draft.input_selection());
         let mut output_picker = AudioOutputPickerState::default();
@@ -632,7 +814,7 @@ impl SettingsSession {
         Self {
             form: FormState::new(
                 crate::ui::settings::initial_focus(),
-                app.config.ui.default_bindings,
+                config.ui.default_bindings,
             ),
             draft,
             input_items,
@@ -640,16 +822,16 @@ impl SettingsSession {
             input_picker,
             output_picker,
             dirty: false,
-            catalog_generation: app.room.audio_devices.generation(),
+            catalog_generation: devices.generation(),
         }
     }
 
-    pub(crate) fn sync_catalog(&mut self, app: &App) {
-        if self.catalog_generation == app.room.audio_devices.generation() {
+    pub(crate) fn sync_catalog(&mut self, devices: &crate::app::AudioDeviceCatalog) {
+        if self.catalog_generation == devices.generation() {
             return;
         }
-        self.catalog_generation = app.room.audio_devices.generation();
-        self.input_items = settings::audio_input_items(app.room.audio_devices.input_devices());
+        self.catalog_generation = devices.generation();
+        self.input_items = settings::audio_input_items(devices.input_devices());
         if self.input_picker.open {
             self.input_picker
                 .refresh_items(&self.input_items, self.draft.input_selection());
@@ -657,7 +839,7 @@ impl SettingsSession {
             self.input_picker
                 .reset(&self.input_items, self.draft.input_selection());
         }
-        self.output_items = settings::audio_output_items(app.room.audio_devices.output_devices());
+        self.output_items = settings::audio_output_items(devices.output_devices());
         if self.output_picker.open {
             self.output_picker
                 .refresh_items(&self.output_items, self.draft.output_selection());
@@ -668,65 +850,204 @@ impl SettingsSession {
     }
 }
 
-pub(crate) struct SettingsMode {
-    session: SettingsSession,
-}
+pub(crate) struct SettingsMode;
 
 impl SettingsMode {
-    pub(crate) fn new(app: &App) -> Self {
-        Self {
-            session: SettingsSession::new(app),
-        }
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     #[cfg(test)]
-    pub(crate) fn with_form_for_test(form: FormState<FieldId>, app: &App) -> Self {
-        let mut mode = Self::new(app);
-        mode.session.form = form;
-        mode
+    pub(crate) fn with_form_for_test(form: FormState<FieldId>, app: &mut App) -> Self {
+        let mut session = SettingsSession::new(&app.config, &app.room.audio_devices);
+        session.form = form;
+        app.room.settings = Some(std::sync::Arc::new(std::sync::Mutex::new(session)));
+        Self
     }
 
-    pub(crate) fn session_mut(&mut self) -> &mut SettingsSession {
-        &mut self.session
-    }
-
-    fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+    fn process_action(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
         use BindCommand::*;
         match command {
-            SaveSettings => app.save_settings(&mut self.session),
-            Activate => app.drive_settings(&mut self.session, FieldIntent::Activate, None, None),
-            FocusNext => app.move_settings_focus(&mut self.session, 1),
-            FocusPrev => app.move_settings_focus(&mut self.session, -1),
-            SelectNext => app.move_settings_selection(&mut self.session, 1),
-            SelectPrev => app.move_settings_selection(&mut self.session, -1),
-            AdjustLeft => {
-                app.drive_settings(&mut self.session, FieldIntent::Adjust(-1), None, None)
-            }
-            AdjustRight => {
-                app.drive_settings(&mut self.session, FieldIntent::Adjust(1), None, None)
-            }
+            SaveSettings => cx.send(CoreCommand::Settings(SettingsOp::Save)),
+            Activate => cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                intent: FieldIntent::Activate,
+                commit: None,
+                focus_column: None,
+            })),
+            FocusNext => cx.send(CoreCommand::Settings(SettingsOp::MoveFocus(1))),
+            FocusPrev => cx.send(CoreCommand::Settings(SettingsOp::MoveFocus(-1))),
+            SelectNext => cx.send(CoreCommand::Settings(SettingsOp::MoveSelection(1))),
+            SelectPrev => cx.send(CoreCommand::Settings(SettingsOp::MoveSelection(-1))),
+            AdjustLeft => cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                intent: FieldIntent::Adjust(-1),
+                commit: None,
+                focus_column: None,
+            })),
+            AdjustRight => cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                intent: FieldIntent::Adjust(1),
+                commit: None,
+                focus_column: None,
+            })),
             Cancel | CloseSettings => {
-                if !app.cancel_open_audio_picker(&mut self.session) {
-                    app.close_settings(&mut self.session);
-                }
+                cx.send(CoreCommand::Settings(SettingsOp::CancelOrClose));
             }
-            RefreshDevices => app.refresh_audio_devices_for_settings(&self.session),
-            _ => return app.process_global_command(command),
+            RefreshDevices => cx.send(CoreCommand::Settings(SettingsOp::RefreshDevices)),
+            _ => return process_global_command_cx(cx, command),
         }
         Action::Continue
     }
 
-    fn resolve_binding(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        match resolve_binding(app, bindings::SETTINGS_LAYER, key) {
-            BindingResolution::Action(command) => self.process_action(app, command),
+    fn resolve_binding(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        match resolve_binding_cx(cx, bindings::SETTINGS_LAYER, key) {
+            BindingResolution::Action(command) => self.process_action(cx, command),
             BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
         }
+    }
+
+    fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        let Some(settings) = cx.session.settings.clone() else {
+            cx.set_error("settings session is no longer active");
+            return Action::Continue;
+        };
+        let mut session = settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session.sync_catalog(&cx.session.audio_devices);
+        if session.input_picker.open || session.output_picker.open {
+            drop(session);
+            cx.send(CoreCommand::Settings(SettingsOp::PickerKey(key)));
+            return Action::Continue;
+        }
+        if is_control_save_chord_cx(cx, &key) {
+            drop(session);
+            cx.send(CoreCommand::Settings(SettingsOp::Save));
+            return Action::Continue;
+        }
+
+        let kind = session.form.focused_kind();
+        let text_focused = kind == FormFieldKind::Text;
+        let event = session.form.handle_key(key, kind);
+        drop(session);
+        match event.action {
+            FormAction::None if !text_focused => return self.resolve_binding(cx, key),
+            FormAction::None => cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                intent: FieldIntent::None,
+                commit: event.commit,
+                focus_column: None,
+            })),
+            FormAction::Cancel => {
+                cx.send(CoreCommand::Settings(SettingsOp::CancelOrClose));
+            }
+            FormAction::Activate if text_focused => {
+                cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                    intent: FieldIntent::None,
+                    commit: event.commit,
+                    focus_column: None,
+                }));
+                cx.send(CoreCommand::Settings(SettingsOp::MoveFocus(1)));
+            }
+            FormAction::Activate => cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                intent: FieldIntent::Activate,
+                commit: event.commit,
+                focus_column: None,
+            })),
+            FormAction::Adjust(delta) => cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                intent: FieldIntent::Adjust(delta),
+                commit: event.commit,
+                focus_column: None,
+            })),
+            FormAction::FocusMoved | FormAction::Scrolled => {
+                cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                    intent: FieldIntent::None,
+                    commit: event.commit,
+                    focus_column: None,
+                }));
+            }
+            FormAction::TextChanged => {
+                cx.send(CoreCommand::Settings(SettingsOp::MarkDirty));
+            }
+        }
+        Action::Continue
+    }
+
+    fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        if process_top_bar_mouse_cx(cx, mouse) {
+            return Action::Continue;
+        }
+        let Some(settings) = cx.session.settings.clone() else {
+            cx.set_error("settings session is no longer active");
+            return Action::Continue;
+        };
+        let mut session = settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session.sync_catalog(&cx.session.audio_devices);
+        if (session.input_picker.open || session.output_picker.open)
+            && matches!(
+                mouse.kind,
+                extui::event::MouseEventKind::ScrollDown | extui::event::MouseEventKind::ScrollUp
+            )
+        {
+            drop(session);
+            cx.send(CoreCommand::Settings(SettingsOp::PickerMouse(mouse)));
+            return Action::Continue;
+        }
+
+        let event = session.form.handle_mouse(mouse);
+        drop(session);
+        match event.intent {
+            FormMouseIntent::None => cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                intent: FieldIntent::None,
+                commit: event.commit,
+                focus_column: None,
+            })),
+            FormMouseIntent::Activate(_) => {
+                cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                    intent: FieldIntent::Activate,
+                    commit: event.commit,
+                    focus_column: None,
+                }));
+            }
+            FormMouseIntent::Adjust(_, delta) => {
+                cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                    intent: FieldIntent::Adjust(delta),
+                    commit: event.commit,
+                    focus_column: None,
+                }));
+            }
+            FormMouseIntent::Text(_, _, column) => {
+                cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                    intent: FieldIntent::None,
+                    commit: event.commit,
+                    focus_column: Some(column),
+                }));
+            }
+            FormMouseIntent::PickerItem(field, item_index) => {
+                cx.send(CoreCommand::Settings(SettingsOp::ActivatePickerItem {
+                    field,
+                    item_index,
+                }));
+            }
+        }
+        Action::Continue
     }
 }
 
 impl AppMode for SettingsMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        self.session.sync_catalog(app);
+        let Some(settings) = app.room.settings.clone() else {
+            return;
+        };
+        settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sync_catalog(&app.room.audio_devices);
         let chrome = self.presentation(app).chrome.expect("base mode has chrome");
         crate::tui::render::draw_settings_screen(
             app,
@@ -739,101 +1060,29 @@ impl AppMode for SettingsMode {
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        if is_quit_key(&key) {
-            return Action::Quit;
-        }
-        if matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        self.session.sync_catalog(app);
-        if app.handle_open_settings_picker_key(&mut self.session, key) {
-            return Action::Continue;
-        }
-        if is_control_save_chord(app, &key) {
-            app.save_settings(&mut self.session);
-            return Action::Continue;
-        }
-
-        let kind = self.session.form.focused_kind();
-        let text_focused = kind == FormFieldKind::Text;
-        let event = self.session.form.handle_key(key, kind);
-        match event.action {
-            FormAction::None if !text_focused => return self.resolve_binding(app, key),
-            FormAction::None => {
-                app.drive_settings(&mut self.session, FieldIntent::None, event.commit, None);
-            }
-            FormAction::Cancel => {
-                if !app.cancel_open_audio_picker(&mut self.session) {
-                    app.close_settings(&mut self.session);
-                }
-            }
-            FormAction::Activate if text_focused => {
-                // Enter in a text field commits the edit then advances focus,
-                // matching the previous buffer/web-bind behavior.
-                app.drive_settings(&mut self.session, FieldIntent::None, event.commit, None);
-                app.move_settings_focus(&mut self.session, 1);
-            }
-            FormAction::Activate => {
-                app.drive_settings(&mut self.session, FieldIntent::Activate, event.commit, None);
-            }
-            FormAction::Adjust(delta) => {
-                app.drive_settings(
-                    &mut self.session,
-                    FieldIntent::Adjust(delta),
-                    event.commit,
-                    None,
-                );
-            }
-            FormAction::FocusMoved | FormAction::Scrolled => {
-                app.drive_settings(&mut self.session, FieldIntent::None, event.commit, None);
-            }
-            FormAction::TextChanged => app.mark_settings_dirty(&mut self.session),
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_input_cx(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        if app.process_top_bar_mouse(mouse) {
-            return Action::Continue;
-        }
-        self.session.sync_catalog(app);
-        if app.handle_open_settings_picker_mouse(&mut self.session, mouse) {
-            return Action::Continue;
-        }
-
-        let event = self.session.form.handle_mouse(mouse);
-        match event.intent {
-            FormMouseIntent::None => {
-                app.drive_settings(&mut self.session, FieldIntent::None, event.commit, None);
-            }
-            FormMouseIntent::Activate(_) => {
-                app.drive_settings(&mut self.session, FieldIntent::Activate, event.commit, None);
-            }
-            FormMouseIntent::Adjust(_, delta) => {
-                app.drive_settings(
-                    &mut self.session,
-                    FieldIntent::Adjust(delta),
-                    event.commit,
-                    None,
-                );
-            }
-            FormMouseIntent::Text(_, _, column) => {
-                app.drive_settings(
-                    &mut self.session,
-                    FieldIntent::None,
-                    event.commit,
-                    Some(column),
-                );
-            }
-            FormMouseIntent::PickerItem(field, item_index) => {
-                app.activate_settings_picker_item(&mut self.session, field, item_index);
-            }
-        }
-        Action::Continue
+        let action = {
+            let mut cx = app.view_cx();
+            self.process_mouse_cx(&mut cx, mouse)
+        };
+        app.drain_core_commands();
+        action
     }
 
     fn on_exit(&mut self, app: &mut App, _reason: ExitReason) {
-        app.finish_settings_session(&mut self.session);
+        {
+            let mut cx = app.view_cx();
+            cx.send(CoreCommand::Settings(SettingsOp::Finish));
+        }
+        app.drain_core_commands();
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
@@ -1169,27 +1418,7 @@ impl RoomMode {
     }
 
     fn process_global_command(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
-        use BindCommand::*;
-        match command {
-            OpenSettings => cx.send(CoreCommand::OpenSettings),
-            Quit => return Action::Quit,
-            ToggleMute => cx.send(CoreCommand::ToggleMute),
-            ToggleDeafen => cx.send(CoreCommand::ToggleDeafen),
-            PlaySoundboard1 => cx.send(CoreCommand::PlaySoundboard(0)),
-            PlaySoundboard2 => cx.send(CoreCommand::PlaySoundboard(1)),
-            PlaySoundboard3 => cx.send(CoreCommand::PlaySoundboard(2)),
-            PlaySoundboard4 => cx.send(CoreCommand::PlaySoundboard(3)),
-            PlaySoundboard5 => cx.send(CoreCommand::PlaySoundboard(4)),
-            PlaySoundboard6 => cx.send(CoreCommand::PlaySoundboard(5)),
-            PlaySoundboard7 => cx.send(CoreCommand::PlaySoundboard(6)),
-            PlaySoundboard8 => cx.send(CoreCommand::PlaySoundboard(7)),
-            PlaySoundboard9 => cx.send(CoreCommand::PlaySoundboard(8)),
-            ToggleKeyPreview => {
-                cx.view.chrome.key_preview.expanded = !cx.view.chrome.key_preview.expanded;
-            }
-            _ => {}
-        }
-        Action::Continue
+        process_global_command_cx(cx, command)
     }
 
     fn process_action(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
@@ -1823,16 +2052,12 @@ impl RoomMode {
             prompt,
             "Delete",
             "Cancel",
-            move |app| {
-                {
-                    let mut cx = app.view_cx();
-                    cx.send(CoreCommand::DeleteMessages {
-                        room_id,
-                        targets,
-                        skipped,
-                    });
-                }
-                app.drain_core_commands();
+            move |cx| {
+                cx.send(CoreCommand::DeleteMessages {
+                    room_id,
+                    targets,
+                    skipped,
+                });
                 ConfirmDisposition::Close
             },
         ))));
@@ -1929,46 +2154,7 @@ impl RoomMode {
     }
 
     fn process_top_bar_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> bool {
-        use extui::event::{MouseButton, MouseEventKind};
-
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return false;
-        }
-        let requested = if crate::tui::form::rect_contains(
-            cx.view.chrome.top_bar.live,
-            mouse.column,
-            mouse.row,
-        ) {
-            Some(crate::app::LocalVoiceMode::Live)
-        } else if crate::tui::form::rect_contains(
-            cx.view.chrome.top_bar.mute,
-            mouse.column,
-            mouse.row,
-        ) {
-            Some(crate::app::LocalVoiceMode::Muted)
-        } else if crate::tui::form::rect_contains(
-            cx.view.chrome.top_bar.deafen,
-            mouse.column,
-            mouse.row,
-        ) {
-            Some(crate::app::LocalVoiceMode::Deafened)
-        } else {
-            None
-        };
-        if let Some(requested) = requested {
-            let mode = if cx.view.local_voice_mode() == requested {
-                crate::app::LocalVoiceMode::Live
-            } else {
-                requested
-            };
-            cx.send(CoreCommand::SetVoiceMode(mode));
-            return true;
-        }
-        if crate::tui::form::rect_contains(cx.view.chrome.top_bar.video, mouse.column, mouse.row) {
-            cx.send(CoreCommand::ToggleVideo);
-            return true;
-        }
-        false
+        process_top_bar_mouse_cx(cx, mouse)
     }
 
     fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
