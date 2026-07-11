@@ -627,7 +627,7 @@ mod tests {
         let body = format!("see @@{code}");
         let resolved = split_fragments(&body, &|_| {
             Some(ResolvedRef {
-                label: "↩ alice: <hi>".to_string(),
+                label: "@@ alice: <hi>".to_string(),
                 attachment: None,
             })
         });
@@ -636,7 +636,7 @@ mod tests {
         };
         assert!(html.contains("class=\"msg-ref\""), "html: {html}");
         assert!(html.contains("data-mid=\"7\""), "html: {html}");
-        assert!(html.contains("↩ alice: &lt;hi&gt;"), "html: {html}");
+        assert!(html.contains("@@ alice: &lt;hi&gt;"), "html: {html}");
 
         let unresolved = split_fragments(&body, &|_| None);
         let Fragment::Text { html, .. } = &unresolved[0] else {
@@ -663,7 +663,7 @@ mod tests {
         let body = format!("see @@{code}");
         let fragments = split_fragments(&body, &|_| {
             Some(ResolvedRef {
-                label: "↩ alice: sent file".to_string(),
+                label: "@@ alice: sent file".to_string(),
                 attachment: Some(WebAttachment {
                     name: "wide \"one\".png".to_string(),
                     kind: "image".to_string(),

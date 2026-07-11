@@ -604,9 +604,17 @@ impl ClientView {
     }
 
     /// Inserts the cursor message's `@@code ` into the composer, returning it.
+    ///
+    /// A leading space is included when the preceding byte would prevent the
+    /// Markdown tokenizer from recognizing the reference. The trailing space
+    /// both terminates the reference and leaves the composer ready for more
+    /// text.
     pub(crate) fn insert_message_ref(&mut self, width: u16) -> Option<String> {
         let code = self.cursor_message_ref(width)?.encode();
-        let code = format!("{}{code} ", rpc::msgref::REF_PREFIX);
+        let reference = format!("{}{code}", rpc::msgref::REF_PREFIX);
+        let source = self.composer.text();
+        let cursor = self.composer.cursor_offset() as usize;
+        let code = message_ref_insertion(&source, cursor, &reference);
         self.insert_paste(code.clone());
         Some(code)
     }
@@ -788,5 +796,74 @@ impl ClientView {
         self.participant_scroll = self
             .participant_scroll
             .min(entries.len().saturating_sub(visible_rows));
+    }
+}
+
+fn message_ref_insertion(source: &str, cursor: usize, reference: &str) -> String {
+    let needs_leading_space = cursor
+        .checked_sub(1)
+        .and_then(|index| source.as_bytes().get(index))
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'@');
+    let mut insertion = String::with_capacity(reference.len() + 2);
+    if needs_leading_space {
+        insertion.push(' ');
+    }
+    insertion.push_str(reference);
+    insertion.push(' ');
+    insertion
+}
+
+#[cfg(test)]
+mod tests {
+    use super::message_ref_insertion;
+    use rpc::{
+        ids::{MessageId, RoomId},
+        msgref::MessageRef,
+    };
+
+    fn insert_reference(source: &str, cursor: usize) -> (String, String) {
+        let reference = format!(
+            "@@{}",
+            MessageRef {
+                room_id: RoomId(1),
+                message_id: MessageId(42),
+            }
+            .encode()
+        );
+        let insertion = message_ref_insertion(source, cursor, &reference);
+        let result = format!("{}{}{}", &source[..cursor], insertion, &source[cursor..]);
+        (result, reference)
+    }
+
+    #[test]
+    fn message_ref_insertion_separates_reference_from_adjacent_text() {
+        for (source, cursor) in [("before", 6), ("after", 0), ("beforeafter", 6)] {
+            let (result, reference) = insert_reference(source, cursor);
+            let ranges = crate::markdown::inline_ranges(&result).refs;
+            assert_eq!(ranges.len(), 1, "reference not tokenized in {result:?}");
+            let range = &ranges[0];
+            assert_eq!(&result[range.start as usize..range.end as usize], reference);
+        }
+    }
+
+    #[test]
+    fn message_ref_insertion_adds_leading_space_only_for_invalid_boundaries() {
+        let (_, reference) = insert_reference("", 0);
+        assert_eq!(
+            message_ref_insertion("word", 4, &reference),
+            format!(" {reference} ")
+        );
+        assert_eq!(
+            message_ref_insertion("@", 1, &reference),
+            format!(" {reference} ")
+        );
+        assert_eq!(
+            message_ref_insertion("(", 1, &reference),
+            format!("{reference} ")
+        );
+        assert_eq!(
+            message_ref_insertion(" ", 1, &reference),
+            format!("{reference} ")
+        );
     }
 }

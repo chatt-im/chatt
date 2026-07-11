@@ -489,7 +489,7 @@ mod tests {
             .inline_completion(&editor, &chat, Style::DEFAULT)
             .expect("ghost hint for a fuzzy match");
         assert!(
-            hint.replacement.starts_with("@@delay ↩ alice:"),
+            hint.replacement.starts_with("@@delay @@ alice:"),
             "unexpected hint {:?}",
             hint.replacement
         );
