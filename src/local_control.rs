@@ -10,6 +10,7 @@ mod imp {
         time::Duration,
     };
 
+    use std::os::fd::RawFd;
     use std::os::unix::{
         ffi::{OsStrExt, OsStringExt},
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -17,7 +18,9 @@ mod imp {
     };
 
     use crate::app::EventSender;
-    use crate::client_net::{CommandSender, NetworkCommand, UploadFileRequest};
+    use crate::client_net::UploadFileRequest;
+    use jsony::Jsony;
+    use sendfd::RecvWithFd;
 
     pub const SOCKET_ENV: &str = "CHATT_CONTROL_SOCKET";
     pub const RUN_DIR_ENV: &str = "CHATT_RUN_DIR";
@@ -32,6 +35,7 @@ mod imp {
     const OP_OUTPUT_VOLUME: u8 = 6;
     const OP_RELOAD_THEME: u8 = 7;
     const OP_CONFIG_PATH: u8 = 8;
+    const OP_ATTACH: u8 = 9;
     const SCREENCAST_START: u8 = 0;
     const SCREENCAST_STOP: u8 = 1;
     const STATUS_OK: u8 = 0;
@@ -51,6 +55,15 @@ mod imp {
     const OUTPUT_VOLUME_QUERY: u8 = 0;
     const OUTPUT_VOLUME_SET: u8 = 1;
     const OUTPUT_VOLUME_ADJUST: u8 = 2;
+
+    #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+    #[jsony(Binary, version)]
+    pub struct ClientHello {
+        pub version: u32,
+        pub pid: u32,
+        /// Reserved for per-terminal UI preferences in the attach protocol.
+        pub ui_overrides: Option<Vec<u8>>,
+    }
 
     /// A voice-control intent forwarded from the CLI to the running client. The
     /// client applies it through the same App methods the UI keybindings use.
@@ -240,32 +253,23 @@ mod imp {
     }
 
     impl ControlSocket {
-        pub fn spawn(commands: CommandSender, voice: EventSender) -> Result<Self, String> {
+        pub fn spawn(events: EventSender) -> Result<Self, String> {
             let config = socket_config()?;
-            Self::spawn_with_config(config, commands, voice)
+            Self::spawn_with_config(config, events)
         }
 
         #[cfg(test)]
-        fn spawn_at_path(
-            path: PathBuf,
-            commands: CommandSender,
-            voice: EventSender,
-        ) -> Result<Self, String> {
+        fn spawn_at_path(path: PathBuf, events: EventSender) -> Result<Self, String> {
             Self::spawn_with_config(
                 SocketConfig {
                     path,
                     private_dir: None,
                 },
-                commands,
-                voice,
+                events,
             )
         }
 
-        fn spawn_with_config(
-            config: SocketConfig,
-            commands: CommandSender,
-            voice: EventSender,
-        ) -> Result<Self, String> {
+        fn spawn_with_config(config: SocketConfig, events: EventSender) -> Result<Self, String> {
             prepare_socket_parent(&config)?;
             let listener = bind_listener(&config.path)?;
             listener
@@ -285,9 +289,7 @@ mod imp {
                         }
 
                         match listener.accept() {
-                            Ok((mut stream, _addr)) => {
-                                handle_connection(&mut stream, &commands, &voice)
-                            }
+                            Ok((mut stream, _addr)) => handle_connection(&mut stream, &events),
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 thread::sleep(ACCEPT_SLEEP);
                             }
@@ -503,6 +505,25 @@ mod imp {
         ConfigPath,
         ClientLogs { follow: bool },
         ReportBug(String),
+        Attach(ClientHello),
+    }
+
+    struct ReceivedFds {
+        raw: [RawFd; 2],
+        count: usize,
+    }
+
+    impl Drop for ReceivedFds {
+        fn drop(&mut self) {
+            for fd in &self.raw[..self.count] {
+                // SAFETY: every descriptor in this prefix was returned by
+                // recvmsg and is owned by this guard until a later attach phase
+                // deliberately transfers it.
+                unsafe {
+                    libc::close(*fd);
+                }
+            }
+        }
     }
 
     struct Response {
@@ -624,20 +645,20 @@ mod imp {
         }
     }
 
-    fn handle_connection(stream: &mut UnixStream, commands: &CommandSender, voice: &EventSender) {
+    fn handle_connection(stream: &mut UnixStream, events: &EventSender) {
         let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
         let _ = stream.set_write_timeout(Some(STREAM_TIMEOUT));
-        let request = read_request(stream);
+        let request = read_request_with_fds(stream);
         // `client-logs` streams the in-memory ring directly, bypassing the
         // bounded `Response` path (a snapshot far exceeds `MAX_RESPONSE_BYTES`).
-        if let Ok(Request::ClientLogs { follow }) = request {
+        if let Ok((Request::ClientLogs { follow }, _fds)) = request {
             stream_client_logs(stream, follow);
             return;
         }
         let response = match request {
-            Ok(Request::ClientLogs { .. }) => unreachable!("handled above"),
-            Ok(Request::ReportBug(description)) => {
-                match voice.send(crate::app::AppEvent::ReportBug(description)) {
+            Ok((Request::ClientLogs { .. }, _)) => unreachable!("handled above"),
+            Ok((Request::ReportBug(description), _)) => {
+                match events.send(crate::app::AppEvent::ReportBug(description)) {
                     Ok(()) => Response {
                         status: STATUS_OK,
                         message: "queued bug report".to_string(),
@@ -648,20 +669,46 @@ mod imp {
                     },
                 }
             }
-            Ok(Request::Upload(path)) => {
-                let message = format!("queued upload {}", path.display());
-                match commands.send(NetworkCommand::UploadFile(UploadFileRequest::new(path))) {
-                    Ok(()) => Response {
-                        status: STATUS_OK,
-                        message,
+            Ok((Request::Upload(path), _)) => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                match events.send(crate::app::AppEvent::Upload {
+                    request: UploadFileRequest::new(path),
+                    reply: reply_tx,
+                }) {
+                    Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
+                        Ok(Ok(message)) => Response {
+                            status: STATUS_OK,
+                            message,
+                        },
+                        Ok(Err(error)) => Response {
+                            status: STATUS_ERROR,
+                            message: error,
+                        },
+                        Err(mpsc::RecvTimeoutError::Timeout) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client did not answer upload request".to_string(),
+                        },
+                        Err(mpsc::RecvTimeoutError::Disconnected) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client stopped before answering upload request"
+                                .to_string(),
+                        },
                     },
                     Err(_) => Response {
                         status: STATUS_ERROR,
-                        message: "chatt network worker is not running".to_string(),
+                        message: "chatt client is not running".to_string(),
                     },
                 }
             }
-            Ok(Request::Voice(command)) => match voice.send(command) {
+            Ok((Request::Attach(_hello), fds)) => Response {
+                status: STATUS_ERROR,
+                message: if fds.count == 2 {
+                    "attach not supported yet".to_string()
+                } else {
+                    "attach request must carry exactly 2 file descriptors".to_string()
+                },
+            },
+            Ok((Request::Voice(command), _)) => match events.send(command) {
                 Ok(()) => Response {
                     status: STATUS_OK,
                     message: command.ack_message(),
@@ -671,9 +718,9 @@ mod imp {
                     message: "chatt client is not running".to_string(),
                 },
             },
-            Ok(Request::OutputVolume(command)) => {
+            Ok((Request::OutputVolume(command), _)) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
-                match voice.send(crate::app::AppEvent::OutputVolume {
+                match events.send(crate::app::AppEvent::OutputVolume {
                     command,
                     reply: reply_tx,
                 }) {
@@ -703,9 +750,9 @@ mod imp {
                     },
                 }
             }
-            Ok(Request::ReloadTheme { styled_diagnostics }) => {
+            Ok((Request::ReloadTheme { styled_diagnostics }, _)) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
-                match voice.send(crate::app::AppEvent::ReloadTheme {
+                match events.send(crate::app::AppEvent::ReloadTheme {
                     styled_diagnostics,
                     reply: reply_tx,
                 }) {
@@ -734,9 +781,9 @@ mod imp {
                     },
                 }
             }
-            Ok(Request::ConfigPath) => {
+            Ok((Request::ConfigPath, _)) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
-                match voice.send(crate::app::AppEvent::ConfigPath { reply: reply_tx }) {
+                match events.send(crate::app::AppEvent::ConfigPath { reply: reply_tx }) {
                     Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
                         Ok(Ok(message)) => Response {
                             status: STATUS_OK,
@@ -762,9 +809,9 @@ mod imp {
                     },
                 }
             }
-            Ok(Request::Screencast(command)) => {
+            Ok((Request::Screencast(command), _)) => {
                 let ack = command.ack_message();
-                match voice.send(command) {
+                match events.send(command) {
                     Ok(()) => Response {
                         status: STATUS_OK,
                         message: ack,
@@ -894,20 +941,44 @@ mod imp {
             .map_err(|error| format!("failed to write control request: {error}"))
     }
 
+    #[cfg(test)]
     fn read_request(stream: &mut UnixStream) -> Result<Request, String> {
-        let mut reader = BufReader::new(stream);
-        let mut magic = vec![0u8; MAGIC.len()];
-        reader
-            .read_exact(&mut magic)
+        read_request_with_fds(stream).map(|(request, _fds)| request)
+    }
+
+    fn read_request_with_fds(stream: &mut UnixStream) -> Result<(Request, ReceivedFds), String> {
+        let mut prefix = [0u8; MAGIC.len() + 5];
+        let mut raw = [-1; 2];
+        let (read, count) = stream
+            .recv_with_fd(&mut prefix, &mut raw)
             .map_err(|error| format!("failed to read control request: {error}"))?;
-        if magic != MAGIC {
+        let fds = ReceivedFds { raw, count };
+        for fd in &fds.raw[..fds.count] {
+            // SAFETY: recvmsg returned each descriptor to this process and the
+            // ReceivedFds guard owns it on every error path.
+            let result = unsafe { libc::fcntl(*fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            if result == -1 {
+                return Err(format!(
+                    "failed to set close-on-exec on attached descriptor: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+        }
+        if read == 0 {
+            return Err("failed to read control request: unexpected EOF".to_string());
+        }
+        if read < prefix.len() {
+            stream
+                .read_exact(&mut prefix[read..])
+                .map_err(|error| format!("failed to read control request: {error}"))?;
+        }
+        if &prefix[..MAGIC.len()] != MAGIC {
             return Err("invalid control request magic".to_string());
         }
 
-        let mut header = [0u8; 5];
-        reader
-            .read_exact(&mut header)
-            .map_err(|error| format!("failed to read control request header: {error}"))?;
+        let header: [u8; 5] = prefix[MAGIC.len()..]
+            .try_into()
+            .expect("fixed control prefix has five-byte header");
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
         if len > MAX_PATH_BYTES {
             return Err(format!(
@@ -916,11 +987,11 @@ mod imp {
         }
 
         let mut body = vec![0u8; len as usize];
-        reader
+        stream
             .read_exact(&mut body)
             .map_err(|error| format!("failed to read control request body: {error}"))?;
 
-        match header[0] {
+        let request = match header[0] {
             OP_UPLOAD => Ok(Request::Upload(PathBuf::from(
                 std::ffi::OsString::from_vec(body),
             ))),
@@ -937,8 +1008,12 @@ mod imp {
             OP_REPORT_BUG => String::from_utf8(body)
                 .map(Request::ReportBug)
                 .map_err(|_| "bug report description is not UTF-8".to_string()),
+            OP_ATTACH => jsony::from_binary(&body)
+                .map(Request::Attach)
+                .map_err(|error| format!("invalid attach hello: {error}")),
             opcode => Err(format!("unknown control request opcode {opcode}")),
-        }
+        }?;
+        Ok((request, fds))
     }
 
     fn write_upload_request(stream: &mut UnixStream, path: &Path) -> Result<(), String> {
@@ -1111,7 +1186,11 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use sendfd::SendWithFd;
+        use std::{
+            os::fd::AsRawFd,
+            time::{SystemTime, UNIX_EPOCH},
+        };
 
         #[test]
         fn upload_request_round_trips_path() {
@@ -1124,6 +1203,45 @@ mod imp {
             match request {
                 Request::Upload(actual) => assert_eq!(actual, path),
                 other => panic!("unexpected request: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn attach_request_receives_cloexec_fd_pair() {
+            let hello = ClientHello {
+                version: 1,
+                pid: std::process::id(),
+                ui_overrides: None,
+            };
+            let body = jsony::to_binary(&hello);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(MAGIC);
+            frame.push(OP_ATTACH);
+            frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&body);
+
+            let (writer, mut reader) = UnixStream::pair().unwrap();
+            let stdin = fs::File::open("/dev/null").unwrap();
+            let stdout = fs::File::open("/dev/null").unwrap();
+            writer
+                .send_with_fd(&frame, &[stdin.as_raw_fd(), stdout.as_raw_fd()])
+                .unwrap();
+
+            let (request, fds) = read_request_with_fds(&mut reader).unwrap();
+            assert!(matches!(request, Request::Attach(actual) if actual == hello));
+            assert_eq!(fds.count, 2);
+            let received = fds.raw;
+            for fd in &received {
+                // SAFETY: the descriptors remain owned by `fds` here.
+                let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+                assert_ne!(flags, -1);
+                assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            }
+            drop(fds);
+            for fd in &received {
+                // SAFETY: this probes that ReceivedFds::drop closed its owned
+                // descriptor; it does not transfer or reuse the raw value.
+                assert_eq!(unsafe { libc::fcntl(*fd, libc::F_GETFD) }, -1);
             }
         }
 
@@ -1234,28 +1352,31 @@ mod imp {
         }
 
         #[test]
-        fn control_socket_upload_sends_network_command() {
+        fn control_socket_upload_waits_for_app_reply() {
             let dir = temp_test_dir("upload-sends-command");
             fs::create_dir_all(&dir).unwrap();
             let socket_path = dir.join("control.sock");
             let upload_path = dir.join("some_file/foo.md");
-            let (tx, rx) = mpsc::channel();
-            let (voice_tx, _voice_rx) = mpsc::channel();
-            let socket = ControlSocket::spawn_at_path(
-                socket_path.clone(),
-                CommandSender::for_test(tx),
-                EventSender(voice_tx),
-            )
-            .unwrap();
+            let (events_tx, events_rx) = mpsc::channel();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(events_tx)).unwrap();
 
-            let response = send_upload_to_path(&socket_path, &upload_path).unwrap();
-            let command = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-
-            assert_eq!(response, format!("queued upload {}", upload_path.display()));
-            match command {
-                NetworkCommand::UploadFile(request) => assert_eq!(request.path, upload_path),
-                other => panic!("unexpected command: {other:?}"),
+            let send_path = socket_path.clone();
+            let expected_path = upload_path.clone();
+            let handle = thread::spawn(move || send_upload_to_path(&send_path, &expected_path));
+            match events_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                crate::app::AppEvent::Upload { request, reply } => {
+                    assert_eq!(request.path, upload_path);
+                    reply
+                        .send(Ok(format!("queued upload {}", request.path.display())))
+                        .unwrap();
+                }
+                _ => panic!("unexpected event"),
             }
+            assert_eq!(
+                handle.join().unwrap().unwrap(),
+                format!("queued upload {}", upload_path.display())
+            );
 
             drop(socket);
             assert!(!socket_path.exists());
@@ -1267,14 +1388,9 @@ mod imp {
             let dir = temp_test_dir("voice-sends-command");
             fs::create_dir_all(&dir).unwrap();
             let socket_path = dir.join("control.sock");
-            let (tx, _rx) = mpsc::channel();
             let (voice_tx, voice_rx) = mpsc::channel();
-            let socket = ControlSocket::spawn_at_path(
-                socket_path.clone(),
-                CommandSender::for_test(tx),
-                EventSender(voice_tx),
-            )
-            .unwrap();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(voice_tx)).unwrap();
 
             let response = send_voice_to_path(&socket_path, VoiceCommand::SetDeafen(true)).unwrap();
             let event = voice_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1295,14 +1411,9 @@ mod imp {
             let dir = temp_test_dir("output-volume-replies");
             fs::create_dir_all(&dir).unwrap();
             let socket_path = dir.join("control.sock");
-            let (tx, _rx) = mpsc::channel();
             let (voice_tx, voice_rx) = mpsc::channel();
-            let socket = ControlSocket::spawn_at_path(
-                socket_path.clone(),
-                CommandSender::for_test(tx),
-                EventSender(voice_tx),
-            )
-            .unwrap();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(voice_tx)).unwrap();
 
             let send_path = socket_path.clone();
             let handle = thread::spawn(move || {
@@ -1329,14 +1440,9 @@ mod imp {
             let dir = temp_test_dir("reload-theme-replies");
             fs::create_dir_all(&dir).unwrap();
             let socket_path = dir.join("control.sock");
-            let (tx, _rx) = mpsc::channel();
             let (voice_tx, voice_rx) = mpsc::channel();
-            let socket = ControlSocket::spawn_at_path(
-                socket_path.clone(),
-                CommandSender::for_test(tx),
-                EventSender(voice_tx),
-            )
-            .unwrap();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(voice_tx)).unwrap();
 
             let send_path = socket_path.clone();
             let handle = thread::spawn(move || send_reload_theme_to_path(&send_path, false));
@@ -1364,14 +1470,9 @@ mod imp {
             let dir = temp_test_dir("reload-theme-error");
             fs::create_dir_all(&dir).unwrap();
             let socket_path = dir.join("control.sock");
-            let (tx, _rx) = mpsc::channel();
             let (voice_tx, voice_rx) = mpsc::channel();
-            let socket = ControlSocket::spawn_at_path(
-                socket_path.clone(),
-                CommandSender::for_test(tx),
-                EventSender(voice_tx),
-            )
-            .unwrap();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(voice_tx)).unwrap();
 
             let send_path = socket_path.clone();
             let handle = thread::spawn(move || send_reload_theme_to_path(&send_path, true));
@@ -1398,14 +1499,9 @@ mod imp {
             fs::create_dir_all(&dir).unwrap();
             let socket_path = dir.join("control.sock");
             let config_path = dir.join("client.toml");
-            let (tx, _rx) = mpsc::channel();
             let (voice_tx, voice_rx) = mpsc::channel();
-            let socket = ControlSocket::spawn_at_path(
-                socket_path.clone(),
-                CommandSender::for_test(tx),
-                EventSender(voice_tx),
-            )
-            .unwrap();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(voice_tx)).unwrap();
 
             let send_path = socket_path.clone();
             let handle = thread::spawn(move || send_config_path_to_path(&send_path));
@@ -1458,7 +1554,13 @@ mod imp {
     use std::path::Path;
 
     use crate::app::EventSender;
-    use crate::client_net::{CommandSender, NetworkCommand, UploadFileRequest};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ClientHello {
+        pub version: u32,
+        pub pid: u32,
+        pub ui_overrides: Option<Vec<u8>>,
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum VoiceCommand {
@@ -1484,7 +1586,7 @@ mod imp {
     pub struct ControlSocket;
 
     impl ControlSocket {
-        pub fn spawn(_commands: CommandSender, _voice: EventSender) -> Result<Self, String> {
+        pub fn spawn(_events: EventSender) -> Result<Self, String> {
             Err("chatt local control sockets are only supported on Unix".to_string())
         }
 
