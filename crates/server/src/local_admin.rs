@@ -13,9 +13,12 @@ mod imp {
         time::{Duration, Instant},
     };
 
-    use std::os::unix::{
-        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-        net::{UnixListener, UnixStream},
+    use std::os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::{UnixListener, UnixStream},
+        },
     };
 
     const SOCKET_NAME: &str = "control.sock";
@@ -366,31 +369,57 @@ mod imp {
     ) -> Result<(), String> {
         let mut filled = 0;
         while filled < buf.len() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(format!("timed out reading server control {what}"));
-            }
-            stream
-                .set_read_timeout(Some(remaining))
-                .map_err(|error| format!("failed to set server control read timeout: {error}"))?;
+            wait_until_ready(stream, libc::POLLIN, deadline, what)?;
             match stream.read(&mut buf[filled..]) {
                 Ok(0) => return Err(format!("server control {what} ended early")),
                 Ok(count) => filled += count,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return Err(format!("timed out reading server control {what}"));
-                }
                 Err(error) => {
                     return Err(format!("failed to read server control {what}: {error}"));
                 }
             }
         }
         Ok(())
+    }
+
+    /// Blocks until `events` are ready on `stream` or `deadline` passes.
+    ///
+    /// Deadlines are enforced with `poll` rather than `SO_RCVTIMEO` and
+    /// `SO_SNDTIMEO` because macOS rejects those `setsockopt` calls with
+    /// `EINVAL` once the peer has disconnected, even while buffered data is
+    /// still readable.
+    fn wait_until_ready(
+        stream: &UnixStream,
+        events: libc::c_short,
+        deadline: Instant,
+        what: &str,
+    ) -> Result<(), String> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("timed out waiting for server control {what}"));
+            }
+            let timeout_ms = remaining
+                .as_millis()
+                .saturating_add(1)
+                .min(i32::MAX as u128) as i32;
+            let mut descriptor = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if ready > 0 {
+                return Ok(());
+            }
+            if ready == 0 {
+                return Err(format!("timed out waiting for server control {what}"));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(format!("failed waiting for server control {what}: {error}"));
+            }
+        }
     }
 
     fn write_frame(
@@ -409,12 +438,20 @@ mod imp {
         frame.push(tag);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(body);
-        stream
-            .set_write_timeout(Some(STREAM_TIMEOUT))
-            .map_err(|error| format!("failed to set server control write timeout: {error}"))?;
-        stream
-            .write_all(&frame)
-            .map_err(|error| format!("failed to write server control {what}: {error}"))
+        let deadline = Instant::now() + STREAM_TIMEOUT;
+        let mut written = 0;
+        while written < frame.len() {
+            wait_until_ready(stream, libc::POLLOUT, deadline, what)?;
+            match stream.write(&frame[written..]) {
+                Ok(0) => return Err(format!("server control {what} connection closed")),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(format!("failed to write server control {what}: {error}"));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn current_uid() -> u32 {
