@@ -702,6 +702,7 @@ pub(crate) struct RoomSession {
     pub local_user_name: String,
     pub room_name: String,
     pub participants: Participants,
+    attached_views: HashMap<crate::client_channel::ClientId, RoomId>,
     /// The room whose voice call this client is in, independent of any viewed
     /// room. Mirrors the worker's view; confirmed by our own `VoiceStarted`.
     pub voice_room: Option<RoomId>,
@@ -1234,6 +1235,7 @@ impl RoomSession {
             local_user_name: String::new(),
             room_name: "servers".to_string(),
             participants: Participants::default(),
+            attached_views: HashMap::new(),
             voice_room: None,
             join_notice: None,
             server_rtt_ms: None,
@@ -1326,6 +1328,7 @@ impl RoomSession {
                 self.muted_users.clear();
                 self.stream_users.clear();
                 self.volume_preview = None;
+                self.attached_views.clear();
             }
         }
         continuity
@@ -1349,6 +1352,7 @@ impl RoomSession {
         self.muted_users.clear();
         self.stream_users.clear();
         self.volume_preview = None;
+        self.attached_views.clear();
     }
 
     /// Marks every user offline and clears live voice state while keeping the
@@ -1564,6 +1568,34 @@ impl RoomSession {
         true
     }
 
+    /// Materializes a room selected by any client and advances its shared read
+    /// watermark without changing the primary view/web projection.
+    pub(crate) fn prepare_client_view(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+        room_id: RoomId,
+    ) -> bool {
+        if !self.metas.contains_key(&room_id) {
+            return false;
+        }
+        self.room_mut_materializing(room_id);
+        self.attached_views.insert(client_id, room_id);
+        self.mark_room_read(room_id);
+        true
+    }
+
+    pub(crate) fn remove_client_view(&mut self, client_id: crate::client_channel::ClientId) {
+        self.attached_views.remove(&client_id);
+    }
+
+    fn room_is_viewed(&self, room_id: RoomId) -> bool {
+        self.viewed_room == Some(room_id)
+            || self
+                .attached_views
+                .values()
+                .any(|viewed| *viewed == room_id)
+    }
+
     fn archive_inaccessible_rooms(&mut self, accessible: &HashSet<RoomId>) {
         if self
             .viewed_room
@@ -1626,6 +1658,10 @@ impl RoomSession {
         let Some(room_id) = self.viewed_room else {
             return false;
         };
+        self.mark_room_read(room_id)
+    }
+
+    fn mark_room_read(&mut self, room_id: RoomId) -> bool {
         let Some(room) = self.rooms.get(&room_id) else {
             return false;
         };
@@ -1959,14 +1995,14 @@ impl RoomSession {
     /// Merges a server history page into whichever room holds `room_id`,
     /// returning whether the room gained any messages.
     pub(crate) fn merge_history(&mut self, room_id: RoomId, messages: Vec<ChatMessage>) -> bool {
-        let viewed = self.viewed_room == Some(room_id);
+        let viewed = self.room_is_viewed(room_id);
         let max_messages = self.max_messages;
         let Some(room) = self.room_mut(room_id) else {
             return false;
         };
         let changed = room.merge_history_page(messages, max_messages);
         if changed && viewed {
-            self.mark_viewed_read();
+            self.mark_room_read(room_id);
         }
         changed
     }
@@ -2133,12 +2169,16 @@ impl RoomSession {
             self.participants.replace_room(Vec::new());
             return;
         };
+        let seeds = self.roster_seeds(room_id);
+        self.participants.replace_room(seeds);
+    }
+
+    fn roster_seeds(&self, room_id: RoomId) -> Vec<RosterSeed> {
         let Some(meta) = self.metas.get(&room_id) else {
-            return;
+            return Vec::new();
         };
         let voice_users = meta.voice_users.clone();
-        let seeds: Vec<RosterSeed> = self
-            .users
+        self.users
             .values()
             .filter_map(|user| {
                 if !self.seen_in_voice(room_id, user.user_id) {
@@ -2157,8 +2197,22 @@ impl RoomSession {
                     away_since,
                 })
             })
-            .collect();
-        self.participants.replace_room(seeds);
+            .collect()
+    }
+
+    /// Snapshot of the voice roster belonging to one client's viewed room.
+    /// The primary room keeps live feedback/talking state; other rooms are
+    /// derived from canonical occupancy and voice-seen history.
+    pub(crate) fn participant_snapshot(&self, room_id: Option<RoomId>) -> Participants {
+        let Some(room_id) = room_id else {
+            return Participants::default();
+        };
+        if self.viewed_room == Some(room_id) {
+            return self.participants.clone();
+        }
+        let mut participants = Participants::default();
+        participants.replace_room(self.roster_seeds(room_id));
+        participants
     }
 
     /// Builds the server-wide user list in its final display order: online
@@ -2221,14 +2275,14 @@ impl RoomSession {
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.head = Some(message.message_id).max(meta.head);
         }
-        let viewed = self.viewed_room == Some(room_id);
+        let viewed = self.room_is_viewed(room_id);
         let max_messages = self.max_messages;
         let room = self.room_mut_materializing(room_id)?;
         let fresh = room.receive_chat(&message, max_messages);
         let mut read_advanced = false;
         if fresh {
             if viewed {
-                read_advanced = self.mark_viewed_read();
+                read_advanced = self.mark_room_read(room_id);
             } else if !local && let Some(meta) = self.metas.get_mut(&room_id) {
                 meta.unread = meta.unread.saturating_add(1);
             }
@@ -2254,12 +2308,12 @@ impl RoomSession {
             meta.head = Some(record.message_id).max(meta.head);
         }
         let _ = local_user;
-        let viewed = self.viewed_room == Some(room_id);
+        let viewed = self.room_is_viewed(room_id);
         let room = self.room_mut_materializing(room_id)?;
         let outcome = room.receive_mutation(record);
         let mut read_advanced = false;
         if viewed {
-            read_advanced = self.mark_viewed_read();
+            read_advanced = self.mark_room_read(room_id);
         }
         Some(RoomMutationUpdate {
             outcome,
@@ -2648,16 +2702,9 @@ impl RoomSession {
         )
     }
 
-    pub(crate) fn select_visible_participant(&mut self, row: usize) -> Option<UserId> {
-        self.participants.select_visible_row(row)
-    }
-
+    #[cfg(test)]
     pub(crate) fn move_participant_selection(&mut self, delta: isize) -> Option<UserId> {
         self.participants.move_selection(delta)
-    }
-
-    pub(crate) fn keep_selected_participant_visible(&mut self, visible_rows: usize) {
-        self.participants.keep_selected_visible(visible_rows);
     }
 
     /// Previews a reference into another room from that room's on-disk history:
@@ -2924,6 +2971,36 @@ mod tests {
             .find(|row| row.user_id == user_id)
             .expect("user in list")
             .presence
+    }
+
+    #[test]
+    fn attached_view_can_select_an_empty_room_without_moving_primary() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), None);
+
+        assert!(room.prepare_client_view(crate::client_channel::ClientId(1), RoomId(2)));
+        let mut attached = ClientView::new(&Config::default(), Theme::tomorrow_night());
+        attached.switch_room(RoomId(2), &room);
+        attached.sync_independent(&room);
+
+        assert_eq!(room.viewed_room, Some(RoomId(1)));
+        assert_eq!(attached.viewed_room, Some(RoomId(2)));
+        assert!(room.rooms.contains_key(&RoomId(2)));
+    }
+
+    #[test]
+    fn room_open_in_attached_view_does_not_accumulate_unread() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), None);
+        assert!(room.prepare_client_view(crate::client_channel::ClientId(2), RoomId(2)));
+
+        room.chat_received(
+            message_in(RoomId(2), 1, UserId(8), "visible remotely"),
+            None,
+        );
+
+        assert_eq!(room.metas[&RoomId(2)].unread, 0);
+        assert_eq!(room.viewed_room, Some(RoomId(1)));
     }
 
     #[test]

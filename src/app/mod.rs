@@ -205,6 +205,7 @@ impl ScreencastStatus {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct StatusState {
     text: String,
     kind: StatusKind,
@@ -273,7 +274,7 @@ impl ChatPanelFocus {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ServerCatalog {
     items: Vec<ServerSelectItem>,
     generation: u64,
@@ -333,6 +334,7 @@ pub(crate) struct App {
     events: AppEvents,
     #[allow(dead_code)] // Used as modes move to ViewCx incrementally.
     command_queue: Vec<command::CoreCommand>,
+    issuing_client: crate::client_channel::ClientId,
     primary_channel: Option<Arc<crate::client_channel::ClientChannel>>,
     password_prompt_active: bool,
     pub room: CoreRw<RoomSession>,
@@ -385,7 +387,8 @@ pub(crate) struct App {
     /// their mute fade-out tail before transport closes.
     pending_voice_teardown_at: Option<Instant>,
     pending_network_commands: VecDeque<NetworkCommand>,
-    pending_dm_open: Option<(RoomId, UserId)>,
+    pending_dm_open: Option<(RoomId, UserId, crate::client_channel::ClientId)>,
+    pending_dm_clients: HashMap<UserId, crate::client_channel::ClientId>,
     pending_room_catalog_save: Option<PendingRoomCatalogSave>,
     supervisor: SupervisorState,
     /// Recent audio device events (losses, recoveries, default changes) shown
@@ -678,6 +681,20 @@ pub(crate) enum AppEvent {
     Upload {
         request: UploadFileRequest,
         reply: Sender<Result<String, String>>,
+    },
+    #[cfg(unix)]
+    ClientAttach {
+        stream: std::os::unix::net::UnixStream,
+        stdin: std::fs::File,
+        stdout: std::fs::File,
+        hello: local_control::ClientHello,
+    },
+    ClientDetached(crate::client_channel::ClientId),
+    ClientExited(crate::client_channel::ClientId),
+    ClientViewRoom {
+        client_id: crate::client_channel::ClientId,
+        room_id: RoomId,
+        status: String,
     },
     OutputVolume {
         command: local_control::OutputVolumeCommand,
@@ -1095,6 +1112,7 @@ impl App {
         let mut app = Self {
             events,
             command_queue: Vec::new(),
+            issuing_client: crate::client_channel::ClientId::PRIMARY,
             primary_channel: None,
             password_prompt_active: false,
             room: CoreRw::new(room),
@@ -1131,6 +1149,7 @@ impl App {
             pending_voice_teardown_at: None,
             pending_network_commands: VecDeque::new(),
             pending_dm_open: None,
+            pending_dm_clients: HashMap::new(),
             pending_room_catalog_save: None,
             supervisor: SupervisorState::default(),
             audio_events: AudioEventLog::default(),
@@ -1287,7 +1306,7 @@ impl App {
                 self.set_deafen(!self.deafened.load(Ordering::Relaxed));
             }
             CoreCommand::SetVoiceMode(mode) => self.set_local_voice_mode(mode),
-            CoreCommand::ToggleSelectedUserMute => self.toggle_selected_user_mute(),
+            CoreCommand::ToggleUserMute(user_id) => self.toggle_user_mute(user_id),
             CoreCommand::BeginVolumePreview { user_id, value_db } => {
                 self.room.begin_volume_preview(user_id, value_db);
             }
@@ -1296,24 +1315,6 @@ impl App {
                     self.pop_mode();
                 } else {
                     self.replace_mode(Box::new(DialogMode::new(dialog)));
-                }
-            }
-            CoreCommand::MoveParticipantSelection {
-                delta,
-                visible_rows,
-            } => {
-                if self.room.move_participant_selection(delta).is_none() {
-                    self.set_status("no users in the current room yet");
-                } else {
-                    self.room.keep_selected_participant_visible(visible_rows);
-                }
-            }
-            CoreCommand::KeepParticipantSelectionVisible { visible_rows } => {
-                self.room.keep_selected_participant_visible(visible_rows);
-            }
-            CoreCommand::SelectVisibleParticipant { row, visible_rows } => {
-                if self.room.select_visible_participant(row).is_some() {
-                    self.room.keep_selected_participant_visible(visible_rows);
                 }
             }
             CoreCommand::CancelTransfer(transfer_id) => self.cancel_transfer(transfer_id),
@@ -1476,13 +1477,19 @@ impl App {
         self.events.wait(timeout)
     }
 
+    pub(crate) fn event_sender(&self) -> EventSender {
+        self.events.sender()
+    }
+
     pub(crate) fn handle_client_command(
         &mut self,
-        _client_id: crate::client_channel::ClientId,
+        client_id: crate::client_channel::ClientId,
         command: command::CoreCommand,
     ) {
+        let previous = std::mem::replace(&mut self.issuing_client, client_id);
         self.handle_core_command(command);
         self.drain_core_commands();
+        self.issuing_client = previous;
     }
 
     pub(crate) fn handle_app_event(&mut self, event: AppEvent) {
@@ -1494,6 +1501,16 @@ impl App {
             AppEvent::Voice(command) => self.apply_voice_command(command),
             AppEvent::Screencast(command) => self.handle_screencast_command(command),
             AppEvent::Upload { request, reply } => self.handle_control_upload(request, reply),
+            #[cfg(unix)]
+            AppEvent::ClientAttach { .. } => {
+                unreachable!("client attach events are owned by the daemon runtime")
+            }
+            AppEvent::ClientDetached(_) | AppEvent::ClientExited(_) => {
+                unreachable!("client lifecycle events are owned by the daemon runtime")
+            }
+            AppEvent::ClientViewRoom { .. } => {
+                unreachable!("client view events are owned by the daemon runtime")
+            }
             AppEvent::OutputVolume { command, reply } => {
                 self.handle_output_volume_command(command, reply)
             }
@@ -2193,6 +2210,9 @@ impl App {
         self.supervisor.network.reset();
         self.room.join_notice = None;
         self.set_status("connecting");
+        if let Err(error) = local_control::write_last_server_hint(&server.label) {
+            kvlog::warn!("failed to update last-server hint", error = %error);
+        }
         true
     }
 
@@ -2218,6 +2238,7 @@ impl App {
         self.room.network_disconnected = true;
         self.room.udp_unreachable = false;
         self.pending_dm_open = None;
+        self.pending_dm_clients.clear();
         self.supervisor.network.reset();
         self.supervisor.capture.reset();
         self.supervisor.playback.reset();
@@ -2233,6 +2254,7 @@ impl App {
         self.room.voice_room = None;
         self.requested_voice_room = None;
         self.pending_dm_open = None;
+        self.pending_dm_clients.clear();
         self.view.cancel_pending_edit();
         self.room.reset_for_disconnect();
     }
@@ -2263,6 +2285,40 @@ impl App {
         }
         self.view.switch_room(room_id, &self.room);
         self.after_view_switch();
+        true
+    }
+
+    pub(crate) fn set_attached_viewed_room(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+        view: &mut ClientView,
+        room_id: RoomId,
+    ) -> bool {
+        if !self.room.prepare_client_view(client_id, room_id) {
+            return false;
+        }
+        view.switch_room(room_id, &self.room);
+        if self.room.begin_history_fetch(room_id)
+            && !self.send_network_command(
+                NetworkCommand::FetchHistory {
+                    room_id,
+                    before: None,
+                    limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+                },
+                false,
+            )
+        {
+            self.room.abort_history_fetch(room_id, None);
+        }
+        self.mark_room_catalog_dirty();
+        let name = self
+            .room
+            .room_select_items(None)
+            .into_iter()
+            .find(|item| item.room_id == room_id)
+            .map(|item| item.name)
+            .unwrap_or_else(|| format!("room {}", room_id.0));
+        view.set_status(format!("viewing {name}"));
         true
     }
 
@@ -2950,20 +3006,23 @@ impl App {
                 if self.room.viewed_room == Some(room_id) {
                     self.request_initial_history_for_viewed_room();
                 }
-                if let Some((pending_room, peer)) = self.pending_dm_open
+                if let Some((pending_room, peer, client_id)) = self.pending_dm_open
                     && pending_room == room_id
-                    && self.set_viewed_room(room_id)
                 {
                     self.pending_dm_open = None;
-                    self.set_status(format!("dm with {}", self.room.display_name_of(peer)));
+                    self.open_dm_room_for_client(client_id, room_id, peer);
                 }
                 self.mark_room_catalog_dirty();
             }
             NetworkEvent::DmOpened { room_id, peer } => {
-                if self.set_viewed_room(room_id) {
-                    self.set_status(format!("dm with {}", self.room.display_name_of(peer)));
+                let client_id = self
+                    .pending_dm_clients
+                    .remove(&peer)
+                    .unwrap_or(crate::client_channel::ClientId::PRIMARY);
+                if self.room.room_meta(room_id).is_some() {
+                    self.open_dm_room_for_client(client_id, room_id, peer);
                 } else {
-                    self.pending_dm_open = Some((room_id, peer));
+                    self.pending_dm_open = Some((room_id, peer, client_id));
                 }
             }
             NetworkEvent::HistoryChunk {
@@ -5105,16 +5164,12 @@ impl App {
         self.set_status(format!("adjusting local volume for {name}"));
     }
 
-    pub(crate) fn toggle_selected_user_mute(&mut self) {
-        let selected = match self.room.selected_remote_user(self.user_id) {
-            Ok(user) => user,
-            Err(error) => {
-                self.set_status(error.status_text());
-                return;
-            }
-        };
-        let user_id = selected.user_id;
-        let name = selected.display_name;
+    pub(crate) fn toggle_user_mute(&mut self, user_id: UserId) {
+        if Some(user_id) == self.user_id {
+            self.set_status("select another user to mute");
+            return;
+        }
+        let name = self.room.display_name_of(user_id);
         let muted = self.room.toggle_user_mute(user_id);
         self.apply_user_audio_control(user_id);
         self.set_status(format!(
@@ -5444,11 +5499,33 @@ impl App {
             self.set_error("select a server before opening dms");
             return;
         }
-        self.send_network_command(NetworkCommand::OpenDm(user_id), true);
+        if self.send_network_command(NetworkCommand::OpenDm(user_id), true) {
+            self.pending_dm_clients.insert(user_id, self.issuing_client);
+        }
         self.set_status(format!(
             "opening dm with {}",
             self.room.display_name_of(user_id)
         ));
+    }
+
+    fn open_dm_room_for_client(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+        room_id: RoomId,
+        peer: UserId,
+    ) {
+        let status = format!("dm with {}", self.room.display_name_of(peer));
+        if client_id == crate::client_channel::ClientId::PRIMARY {
+            if self.set_viewed_room(room_id) {
+                self.set_status(status);
+            }
+            return;
+        }
+        let _ = self.events.sender().send(AppEvent::ClientViewRoom {
+            client_id,
+            room_id,
+            status,
+        });
     }
 
     /// Moves the voice call to `name`'s room, or the viewed room without an
@@ -7497,7 +7574,10 @@ mod tests {
             peer: UserId(2),
         });
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
-        assert_eq!(app.pending_dm_open, Some((dm_id, UserId(2))));
+        assert_eq!(
+            app.pending_dm_open,
+            Some((dm_id, UserId(2), crate::client_channel::ClientId::PRIMARY))
+        );
 
         app.handle_network_event(NetworkEvent::RoomUpserted(dm_room_info(
             dm_id.0,
@@ -7508,6 +7588,86 @@ mod tests {
         assert_eq!(app.pending_dm_open, None);
         assert_eq!(app.room.viewed_room, Some(dm_id));
         assert_eq!(app.view.status.text(), "dm with bob");
+    }
+
+    #[test]
+    fn dm_opened_routes_to_the_requesting_attached_client() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[test_room_info(1)],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        let client_id = crate::client_channel::ClientId(7);
+        let dm_id = RoomId(0x8000_0001);
+
+        app.handle_client_command(client_id, command::CoreCommand::OpenDm(UserId(2)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::OpenDm(UserId(2)))
+        ));
+        app.handle_network_event(NetworkEvent::DmOpened {
+            room_id: dm_id,
+            peer: UserId(2),
+        });
+        app.handle_network_event(NetworkEvent::RoomUpserted(dm_room_info(
+            dm_id.0,
+            UserId(1),
+            UserId(2),
+        )));
+
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+        match app.next_event() {
+            Some(AppEvent::ClientViewRoom {
+                client_id: actual_client,
+                room_id,
+                status,
+            }) => {
+                assert_eq!(actual_client, client_id);
+                assert_eq!(room_id, dm_id);
+                assert_eq!(status, "dm with bob");
+            }
+            _ => panic!("expected targeted client room event"),
+        }
+    }
+
+    #[test]
+    fn app_drop_reacquires_released_core_state() {
+        let mut app = test_app();
+        app.release_core_state();
+        drop(app);
+    }
+
+    #[test]
+    fn attached_client_sends_to_its_explicit_room_without_moving_primary() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        enter_test_room(&mut app);
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+
+        app.handle_client_command(
+            crate::client_channel::ClientId(9),
+            command::CoreCommand::SendChat {
+                room_id: Some(RoomId(2)),
+                body: "from attached".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::SendChat { room_id: RoomId(2), body })
+                if body == "from attached"
+        ));
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
     }
 
     #[test]
@@ -8276,7 +8436,9 @@ mod tests {
         );
         observe_room_voice(&mut app, UserId(1), 1);
         observe_room_voice(&mut app, UserId(2), 2);
-        app.room.move_participant_selection(1);
+        let participants = app.room.participant_snapshot(app.view.viewed_room);
+        app.view
+            .move_participant_selection(&participants.entries, 1, 10);
 
         let mut h = Harness::new(app);
         let mut chat_room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
@@ -8836,6 +8998,10 @@ mod tests {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Runtime normally reacquires before returning, but construction or
+        // thread-spawn failures may unwind while render access is open. Drop
+        // still needs the core projections to persist history and stop audio.
+        self.acquire_core_state();
         self.save_room_catalog();
         self.stop_audio();
     }

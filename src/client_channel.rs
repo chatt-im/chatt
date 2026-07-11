@@ -9,7 +9,8 @@ use std::{
 use extui::event::polling::Waker;
 
 const TERMINATE: u64 = 1 << 63;
-const RESIZE_MASK: u64 = !TERMINATE;
+const HANDOFF: u64 = 1 << 62;
+const RESIZE_MASK: u64 = HANDOFF - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ClientId(pub(crate) u32);
@@ -30,6 +31,7 @@ pub(crate) enum ClientEvent {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ClientActions {
     pub(crate) terminate: bool,
+    pub(crate) handoff: bool,
     pub(crate) resized: bool,
 }
 
@@ -58,6 +60,11 @@ impl ClientChannel {
         self.wake();
     }
 
+    pub(crate) fn handoff(&self) {
+        self.state.fetch_or(HANDOFF, Ordering::Release);
+        self.wake();
+    }
+
     pub(crate) fn resize(&self) {
         self.state.fetch_add(1, Ordering::Release);
         self.wake();
@@ -82,6 +89,7 @@ impl ClientChannel {
         *previous_resize = resize;
         ClientActions {
             terminate: state & TERMINATE != 0,
+            handoff: state & HANDOFF != 0,
             resized,
         }
     }
@@ -102,6 +110,7 @@ mod tests {
             channel.actions(&mut resize),
             ClientActions {
                 terminate: false,
+                handoff: false,
                 resized: true,
             }
         );
@@ -110,5 +119,15 @@ mod tests {
         channel.terminate();
         assert!(channel.actions(&mut resize).terminate);
         assert!(channel.actions(&mut resize).terminate);
+    }
+
+    #[test]
+    fn handoff_is_sticky_and_distinct_from_termination() {
+        let channel = ClientChannel::new().expect("channel");
+        let mut resize = 0;
+        channel.handoff();
+        let actions = channel.actions(&mut resize);
+        assert!(actions.handoff);
+        assert!(!actions.terminate);
     }
 }

@@ -50,7 +50,11 @@ impl<'a> RenderState<'a> {
     }
 
     fn room_select_items(&self) -> Vec<RoomSelectItem> {
-        self.room.room_select_items(self.room.voice_room)
+        let mut items = self.room.room_select_items(self.room.voice_room);
+        for item in &mut items {
+            item.viewed = self.view.viewed_room == Some(item.room_id);
+        }
+        items
     }
 
     fn server_items(&self) -> &[ServerSelectItem] {
@@ -334,7 +338,7 @@ fn composer_height(app: &mut RenderState<'_>, width: u16, max_rows: u16) -> u16 
 
 fn draw_user_list(
     area: Rect,
-    app: &RenderState<'_>,
+    app: &mut RenderState<'_>,
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     buf: &mut Buffer,
@@ -342,24 +346,15 @@ fn draw_user_list(
     area.with(app.view.theme.panel_alt).fill(buf);
     let mut rows = area;
     let visible = rows.h as usize;
-    let start = app
-        .room
-        .participants
-        .scroll
-        .min(app.room.participants.entries.len());
+    let participants = app.room.participant_snapshot(app.view.viewed_room);
+    app.view.selected_participant(&participants.entries);
+    let start = app.view.participant_scroll.min(participants.entries.len());
     let lobby_focused = focus == ChatPanelFocus::Lobby;
-    for participant in app
-        .room
-        .participants
-        .entries
-        .iter()
-        .skip(start)
-        .take(visible)
-    {
+    for participant in participants.entries.iter().skip(start).take(visible) {
         let row = rows.take_top(1);
         let selected = lobby_focused
             && lobby_list_focus == LobbyListFocus::Users
-            && Some(participant.user_id) == app.room.participants.selected_user;
+            && Some(participant.user_id) == app.view.participant_selected_user;
         let state = if Some(participant.user_id) == app.room.local_user
             && app.view.deafened.load(Ordering::Relaxed)
         {
@@ -1245,6 +1240,13 @@ fn draw_lobby_bar(
         Some(meta) => format!("voice: {} {}", meta.name, meta.voice_users.len()),
         None => "voice: off".to_string(),
     };
+    let viewed_room_name = app
+        .view
+        .viewed_room
+        .and_then(|room_id| app.room.room_meta(room_id))
+        .map(|room| room.name.as_str())
+        .unwrap_or(&app.room.room_name);
+    let participants = app.room.participant_snapshot(app.view.viewed_room);
     let mut row = lobby_bar;
     draw_status_segment(&mut row, buf, label, " Lobby ");
     draw_status_segment(
@@ -1253,9 +1255,9 @@ fn draw_lobby_bar(
         detail,
         &format!(
             " {} | in call {}/{} | {} ",
-            app.room.room_name,
-            app.room.participants.online_count(),
-            app.room.participants.entries.len(),
+            viewed_room_name,
+            participants.online_count(),
+            participants.entries.len(),
             voice_label
         ),
     );

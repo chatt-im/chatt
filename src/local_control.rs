@@ -46,6 +46,7 @@ mod imp {
     const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
     /// Poll interval for `client-logs --follow` streaming.
     const FOLLOW_POLL: Duration = Duration::from_millis(150);
+    const LIVE_SOCKET_ERROR: &str = "another chatt instance is already listening on ";
 
     const VOICE_TARGET_MUTE: u8 = 0;
     const VOICE_TARGET_DEAFEN: u8 = 1;
@@ -289,7 +290,7 @@ mod imp {
                         }
 
                         match listener.accept() {
-                            Ok((mut stream, _addr)) => handle_connection(&mut stream, &events),
+                            Ok((stream, _addr)) => handle_connection(stream, &events),
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 thread::sleep(ACCEPT_SLEEP);
                             }
@@ -526,6 +527,23 @@ mod imp {
         }
     }
 
+    impl ReceivedFds {
+        fn take_pair(&mut self) -> Result<(fs::File, fs::File), String> {
+            if self.count != 2 {
+                return Err("attach request must carry exactly 2 file descriptors".to_string());
+            }
+            let stdin = self.raw[0];
+            let stdout = self.raw[1];
+            self.count = 0;
+            // SAFETY: recvmsg transferred ownership of both descriptors and
+            // clearing count transfers that ownership out of this drop guard.
+            Ok(unsafe {
+                use std::os::fd::FromRawFd;
+                (fs::File::from_raw_fd(stdin), fs::File::from_raw_fd(stdout))
+            })
+        }
+    }
+
     struct Response {
         status: u8,
         message: String,
@@ -598,7 +616,7 @@ mod imp {
             Ok(listener) => Ok(listener),
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => match stale_socket(path)? {
                 StaleSocket::Live => Err(format!(
-                    "another chatt instance is already listening on {}; set {SOCKET_ENV} or {RUN_DIR_ENV} to use a different control socket",
+                    "{LIVE_SOCKET_ERROR}{}; set {SOCKET_ENV} or {RUN_DIR_ENV} to use a different control socket",
                     path.display()
                 )),
                 StaleSocket::Stale => {
@@ -645,14 +663,38 @@ mod imp {
         }
     }
 
-    fn handle_connection(stream: &mut UnixStream, events: &EventSender) {
+    fn handle_connection(mut stream: UnixStream, events: &EventSender) {
         let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
         let _ = stream.set_write_timeout(Some(STREAM_TIMEOUT));
-        let request = read_request_with_fds(stream);
+        let request = read_request_with_fds(&mut stream);
         // `client-logs` streams the in-memory ring directly, bypassing the
         // bounded `Response` path (a snapshot far exceeds `MAX_RESPONSE_BYTES`).
         if let Ok((Request::ClientLogs { follow }, _fds)) = request {
-            stream_client_logs(stream, follow);
+            stream_client_logs(&mut stream, follow);
+            return;
+        }
+        if let Ok((Request::Attach(hello), mut fds)) = request {
+            let attached = fds.take_pair().and_then(|(stdin, stdout)| {
+                stream
+                    .set_read_timeout(None)
+                    .map_err(|error| format!("failed to clear attach read timeout: {error}"))?;
+                stream
+                    .set_write_timeout(None)
+                    .map_err(|error| format!("failed to clear attach write timeout: {error}"))?;
+                events
+                    .send(crate::app::AppEvent::ClientAttach {
+                        stream,
+                        stdin,
+                        stdout,
+                        hello,
+                    })
+                    .map_err(|_| "chatt master stopped before accepting client".to_string())
+            });
+            if let Err(error) = attached {
+                // The stream may already have moved into the event on success;
+                // error paths before the send retain it and can answer below.
+                kvlog::warn!("client attach failed", error = %error);
+            }
             return;
         }
         let response = match request {
@@ -700,14 +742,7 @@ mod imp {
                     },
                 }
             }
-            Ok((Request::Attach(_hello), fds)) => Response {
-                status: STATUS_ERROR,
-                message: if fds.count == 2 {
-                    "attach not supported yet".to_string()
-                } else {
-                    "attach request must carry exactly 2 file descriptors".to_string()
-                },
-            },
+            Ok((Request::Attach(_), _)) => unreachable!("handled above"),
             Ok((Request::Voice(command), _)) => match events.send(command) {
                 Ok(()) => Response {
                     status: STATUS_OK,
@@ -827,7 +862,7 @@ mod imp {
                 message: error,
             },
         };
-        if let Err(error) = write_response(stream, response.status, &response.message) {
+        if let Err(error) = write_response(&mut stream, response.status, &response.message) {
             kvlog::warn!("local control response failed", error = %error);
         }
     }
@@ -1159,6 +1194,121 @@ mod imp {
         stream
             .write_all(&frame)
             .map_err(|error| format!("failed to write control response: {error}"))
+    }
+
+    pub(crate) fn write_attach_ack(
+        stream: &mut UnixStream,
+        result: Result<u32, &str>,
+    ) -> Result<(), String> {
+        match result {
+            Ok(client_id) => write_response(stream, STATUS_OK, &client_id.to_string()),
+            Err(error) => write_response(stream, STATUS_ERROR, error),
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) enum AttachConnectError {
+        NoMaster,
+        Rejected(String),
+        Failed(String),
+    }
+
+    pub(crate) fn connect_attach(
+        stdin_fd: RawFd,
+        stdout_fd: RawFd,
+    ) -> Result<UnixStream, AttachConnectError> {
+        use sendfd::SendWithFd;
+
+        let path = socket_path().map_err(AttachConnectError::Failed)?;
+        let mut stream = match UnixStream::connect(&path) {
+            Ok(stream) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Err(AttachConnectError::NoMaster);
+            }
+            Err(error) => {
+                return Err(AttachConnectError::Failed(format!(
+                    "failed to connect to chatt master at {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        stream
+            .set_read_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| AttachConnectError::Failed(error.to_string()))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| AttachConnectError::Failed(error.to_string()))?;
+        let hello = ClientHello {
+            version: 1,
+            pid: std::process::id(),
+            ui_overrides: None,
+        };
+        let body = jsony::to_binary(&hello);
+        let mut frame = Vec::with_capacity(MAGIC.len() + 5 + body.len());
+        frame.extend_from_slice(MAGIC);
+        frame.push(OP_ATTACH);
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        stream
+            .send_with_fd(&frame, &[stdin_fd, stdout_fd])
+            .map_err(|error| {
+                AttachConnectError::Failed(format!("failed to send attach: {error}"))
+            })?;
+        let response = read_response(&mut stream).map_err(AttachConnectError::Failed)?;
+        if response.status != STATUS_OK {
+            return Err(AttachConnectError::Rejected(response.message));
+        }
+        stream
+            .set_read_timeout(None)
+            .map_err(|error| AttachConnectError::Failed(error.to_string()))?;
+        stream
+            .set_write_timeout(None)
+            .map_err(|error| AttachConnectError::Failed(error.to_string()))?;
+        Ok(stream)
+    }
+
+    pub(crate) fn is_live_socket_error(error: &str) -> bool {
+        error.starts_with(LIVE_SOCKET_ERROR)
+    }
+
+    fn last_server_hint_path() -> Result<PathBuf, String> {
+        let config = socket_config()?;
+        let parent = config
+            .path
+            .parent()
+            .ok_or_else(|| "control socket has no parent directory".to_string())?;
+        Ok(parent.join("last-server"))
+    }
+
+    pub(crate) fn write_last_server_hint(alias: &str) -> Result<(), String> {
+        let path = last_server_hint_path()?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_secs();
+        fs::write(&path, format!("{timestamp}\n{alias}\n"))
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))
+    }
+
+    pub(crate) fn read_last_server_hint(max_age: Duration) -> Option<String> {
+        let path = last_server_hint_path().ok()?;
+        let text = fs::read_to_string(path).ok()?;
+        let mut lines = text.lines();
+        let timestamp = lines.next()?.parse::<u64>().ok()?;
+        let alias = lines.next()?.trim();
+        if alias.is_empty() {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        (now.saturating_sub(timestamp) <= max_age.as_secs()).then(|| alias.to_string())
     }
 
     fn response_message_within_limit(message: &str) -> Cow<'_, str> {
@@ -1585,6 +1735,13 @@ mod imp {
 
     pub struct ControlSocket;
 
+    #[derive(Debug)]
+    pub(crate) enum AttachConnectError {
+        NoMaster,
+        Rejected(String),
+        Failed(String),
+    }
+
     impl ControlSocket {
         pub fn spawn(_events: EventSender) -> Result<Self, String> {
             Err("chatt local control sockets are only supported on Unix".to_string())
@@ -1630,10 +1787,35 @@ mod imp {
     pub fn send_report_bug(_description: &str) -> Result<String, String> {
         Err("chatt report-bug is only supported on Unix".to_string())
     }
+
+    pub(crate) fn connect_attach(
+        _stdin_fd: i32,
+        _stdout_fd: i32,
+    ) -> Result<(), AttachConnectError> {
+        Err(AttachConnectError::NoMaster)
+    }
+
+    pub(crate) fn is_live_socket_error(_error: &str) -> bool {
+        false
+    }
+
+    pub(crate) fn write_last_server_hint(_alias: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub(crate) fn read_last_server_hint(_max_age: std::time::Duration) -> Option<String> {
+        None
+    }
 }
 
+#[cfg(unix)]
+pub(crate) use imp::write_attach_ack;
+pub(crate) use imp::{
+    AttachConnectError, connect_attach, is_live_socket_error, read_last_server_hint,
+    write_last_server_hint,
+};
 pub use imp::{
-    ControlSocket, OutputVolumeCommand, ScreencastCommand, VoiceCommand, send_client_logs,
-    send_config_path, send_output_volume, send_reload_theme, send_report_bug, send_screencast,
-    send_upload, send_voice,
+    ClientHello, ControlSocket, OutputVolumeCommand, ScreencastCommand, VoiceCommand,
+    send_client_logs, send_config_path, send_output_volume, send_reload_theme, send_report_bug,
+    send_screencast, send_upload, send_voice,
 };
