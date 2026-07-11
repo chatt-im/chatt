@@ -210,78 +210,14 @@ fn handle_runtime_command(
     client_id: ClientId,
     command: CoreCommand,
 ) {
-    if client_id == ClientId::PRIMARY {
-        app.handle_client_command(client_id, command);
+    if !app.handle_client_command(client_id, command) {
         return;
     }
     let Some(client) = clients.get(&client_id) else {
         return;
     };
-    let Some(remote_view) = app.remote_view(client_id) else {
-        return;
-    };
-    match command {
-        CoreCommand::Quit => {
-            let _ = attach::write_frame(&mut client.control.lock(), attach::TERMINATE_ACK, &[]);
-            client.channel.terminate();
-        }
-        CoreCommand::SetViewedRoom(room_id) => {
-            let mut view = remote_view.lock();
-            if !app.set_attached_viewed_room(client_id, &mut view, room_id) {
-                view.set_error("room is no longer available");
-            }
-        }
-        CoreCommand::OpenMessageRef {
-            target,
-            width,
-            height,
-        } => {
-            let mut view = remote_view.lock();
-            if app.set_attached_viewed_room(client_id, &mut view, target.room_id) {
-                if !matches!(
-                    view.jump_to_ref(target, width, height),
-                    crate::app::room::RefJump::Jumped
-                ) {
-                    view.set_status("referenced message is not in this room's history");
-                }
-            } else if let Some(preview) = app.room.cross_room_ref_preview(target) {
-                view.set_status(preview);
-            } else {
-                view.set_status("reference points to another room");
-            }
-        }
-        CoreCommand::RunSlash { input, .. } if input == "/room" => {
-            remote_view.lock().set_error("usage: /room name");
-        }
-        CoreCommand::RunSlash { input, .. } if input.starts_with("/room ") => {
-            let name = input.trim_start_matches("/room ").trim();
-            let mut view = remote_view.lock();
-            if let Some(room_id) = app.room.find_room_by_name(name) {
-                if !app.set_attached_viewed_room(client_id, &mut view, room_id) {
-                    view.set_error("room is no longer available");
-                }
-            } else {
-                view.set_error(format!("no room named {name}"));
-            }
-        }
-        command => {
-            // The command executes with the issuing terminal's entire view,
-            // never a hand-picked subset of fields. Core handlers therefore
-            // cannot accidentally mutate the primary terminal's selection,
-            // editor, status, navigation, or room buffers.
-            let mut view = remote_view.lock();
-            std::mem::swap(&mut *app.view, &mut *view);
-            app.handle_client_command(client_id, command);
-            let detach = app.view.quit_requested;
-            app.view.quit_requested = false;
-            std::mem::swap(&mut *app.view, &mut *view);
-            drop(view);
-            if detach {
-                let _ = attach::write_frame(&mut client.control.lock(), attach::TERMINATE_ACK, &[]);
-                client.channel.terminate();
-            }
-        }
-    }
+    let _ = attach::write_frame(&mut client.control.lock(), attach::TERMINATE_ACK, &[]);
+    client.channel.terminate();
 }
 
 fn handle_runtime_event(
@@ -346,18 +282,6 @@ fn handle_runtime_event(
             if let Some(client) = clients.remove(&id) {
                 shutdown_remote(client, false);
                 kvlog::info!("terminal client detached", client_id = id.0);
-            }
-        }
-        AppEvent::ClientViewRoom {
-            client_id,
-            room_id,
-            status,
-        } => {
-            if let Some(view) = app.remote_view(client_id) {
-                let mut view = view.lock();
-                if app.set_attached_viewed_room(client_id, &mut view, room_id) {
-                    view.set_status(status);
-                }
             }
         }
         event => app.handle_app_event(event),
