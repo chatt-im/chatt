@@ -28,7 +28,6 @@ use rpc::{
 };
 
 use crate::{
-    bindings::BindCommand,
     client_net::{
         NetworkClient, NetworkCommand, NetworkEvent, TerminalVerb, TransferDirection,
         UploadFileRequest, spawn_open_pair_once, spawn_pair_once,
@@ -36,7 +35,6 @@ use crate::{
     config::{self, Config, ServerEntry, SoundboardClip, ThemeSelection, validate_server_entry},
     local_control, settings,
     tui::{
-        Action,
         mode::{AppMode, ModeTransition, ViewCx},
         modes::{
             RoomMode, RoomSwitchMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession,
@@ -52,6 +50,9 @@ use crate::{
     },
     ui::welcome::WelcomeDraft,
 };
+
+#[cfg(test)]
+use crate::{bindings::BindCommand, tui::Action};
 
 use crate::audio::{
     self, AudioStartError, BufferRequest, DeviceInfo, EchoCancellationControl, LOOPBACK_STREAM_ID,
@@ -2028,6 +2029,7 @@ impl App {
         self.view.server_catalog.rebuild(&self.config);
     }
 
+    #[cfg(test)]
     pub(crate) fn server_items(&self) -> &[ServerSelectItem] {
         self.view.server_catalog.items()
     }
@@ -2122,22 +2124,12 @@ impl App {
         );
         self.room.active_server_label = Some(server.label.clone());
         self.network = Some(network);
+        self.room.network_selected = true;
         self.room.network_disconnected = false;
         self.supervisor.network.reset();
         self.room.join_notice = None;
         self.set_status("connecting");
         true
-    }
-
-    /// Whether the client has no live session: either the worker is gone or a
-    /// reconnect is in flight. Drives the "Offline" top-bar label.
-    pub(crate) fn is_offline(&self) -> bool {
-        self.network.is_none() || self.room.network_disconnected
-    }
-
-    /// Whether the TCP session is up but the UDP media path never bound.
-    pub(crate) fn is_udp_unreachable(&self) -> bool {
-        self.room.udp_unreachable
     }
 
     fn disconnect_network(&mut self) {
@@ -2150,6 +2142,7 @@ impl App {
         if let Some(network) = self.network.take() {
             network.stop();
         }
+        self.room.network_selected = false;
         self.session_id = None;
         self.user_id = None;
         self.reset_room_for_disconnect();
@@ -2236,12 +2229,6 @@ impl App {
         ) {
             self.room.abort_history_fetch(room_id, before);
         }
-    }
-
-    /// The switcher and lobby room-list rows for the current catalog, voice,
-    /// and view state.
-    pub(crate) fn room_select_items(&self) -> Vec<room::RoomSelectItem> {
-        self.room.room_select_items(self.room.voice_room)
     }
 
     pub(crate) fn open_room_switcher(&mut self) {
@@ -3848,6 +3835,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn process_global_command(&mut self, command: BindCommand) -> Action {
         use BindCommand::*;
         match command {
@@ -4158,6 +4146,7 @@ impl App {
     /// Projects audio display facts into the shared session so every view
     /// renders them without reaching into core state. Runs once per tick.
     fn refresh_session_projection(&mut self) {
+        self.room.network_selected = self.network.is_some();
         self.room.capture_health = self.capture_audio_health();
         self.room.playback_health = self.playback_audio_health();
         self.room.capture_stats = self.capture.as_ref().map(|capture| capture.stats());
@@ -6813,9 +6802,10 @@ mod tests {
             .collect::<String>()
     }
 
-    fn base_mode_label(app: &App) -> &'static str {
-        app.base_mode()
-            .presentation(app)
+    fn base_mode_label(app: &mut App) -> &'static str {
+        let mode = app.base_mode();
+        let cx = app.view_cx();
+        mode.presentation(&cx)
             .chrome
             .expect("base mode has chrome")
             .status_label
@@ -6825,12 +6815,12 @@ mod tests {
     fn base_mode_stays_in_room_while_a_server_is_selected() {
         let mut app = test_app();
         // No server selected and no network: the server picker is the base.
-        assert_eq!(base_mode_label(&app), "Servers");
+        assert_eq!(base_mode_label(&mut app), "Servers");
 
         // A selected server (kept across a disconnect) holds the room view so
         // its offline logs stay readable.
         app.room.server_alias = "lab".to_string();
-        assert_eq!(base_mode_label(&app), "Compose");
+        assert_eq!(base_mode_label(&mut app), "Compose");
     }
 
     #[test]
@@ -7003,18 +6993,18 @@ mod tests {
         }
 
         fn key(&mut self, key: KeyEvent) -> Action {
-            let action = self.stack.active_mut().process_input(&mut self.app, key);
+            let action = self.stack.process_input(&mut self.app, key);
             self.apply();
             action
         }
 
-        fn overlay_active(&self) -> bool {
-            self.stack.overlay_active(&self.app)
+        fn overlay_active(&mut self) -> bool {
+            self.stack.overlay_active(&mut self.app)
         }
 
-        fn top_theme_mode(&self) -> crate::theme::UiMode {
+        fn top_theme_mode(&mut self) -> crate::theme::UiMode {
             self.stack
-                .top_presentation(&self.app)
+                .top_presentation(&mut self.app)
                 .chrome
                 .expect("base mode has chrome")
                 .theme_mode

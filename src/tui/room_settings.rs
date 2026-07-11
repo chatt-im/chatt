@@ -7,7 +7,7 @@ use extui::{
 };
 
 use crate::{
-    app::{App, RoomSettingsDraft, RoomSettingsEvent, command::CoreCommand},
+    app::{RoomSettingsDraft, RoomSettingsEvent, command::CoreCommand},
     bindings, theme,
     tui::{
         Action,
@@ -59,7 +59,8 @@ impl RoomSettingsMode {
 }
 
 impl AppMode for RoomSettingsMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        let mut app = crate::tui::render::RenderState::new(cx);
         let area = buf.rect();
         let Some(draft) = self.draft.as_mut() else {
             return;
@@ -70,28 +71,18 @@ impl AppMode for RoomSettingsMode {
         let body =
             crate::tui::render::draw_form_dialog_frame(panel, buf, &app.view.theme, &draft.title());
         draft.render(body, buf, &app.view.theme);
-        crate::tui::render::draw_overlay_key_preview(app, bindings::FORM_LAYER, buf);
+        crate::tui::render::draw_overlay_key_preview(&mut app, bindings::FORM_LAYER, buf);
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_mouse_cx(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,
             chrome: Some(ChromeSpec {

@@ -14,7 +14,7 @@ use crate::audio::StatsSnapshot;
 
 use crate::{
     app::{
-        App, ChatPanelFocus, LocalVoiceMode, ParticipantState, ParticipantVoiceFeedback,
+        ChatPanelFocus, LocalVoiceMode, ParticipantState, ParticipantVoiceFeedback, RoomSession,
         ScreencastPhase, ServerEditDraft, ServerSelectItem, StatusKind,
         audio_supervisor::AudioHealthState,
         room::{RoomSelectItem, TransferProgress, TransferStatus},
@@ -23,13 +23,50 @@ use crate::{
     bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind, NoticeKind},
     client_net::{TerminalVerb, TransferDirection, format_bytes},
+    config::Config,
     theme::{self, Theme},
-    tui::modes::{LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
+    tui::{
+        mode::ViewCx,
+        modes::{LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
+        view::ClientView,
+    },
     ui,
     ui::select::FuzzySelect,
 };
 
-fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
+pub(crate) struct RenderState<'a> {
+    pub(crate) view: &'a mut ClientView,
+    pub(crate) room: &'a RoomSession,
+    pub(crate) config: &'a Config,
+}
+
+impl<'a> RenderState<'a> {
+    pub(crate) fn new(cx: &'a mut ViewCx<'_>) -> Self {
+        Self {
+            view: &mut *cx.view,
+            room: cx.session,
+            config: cx.config,
+        }
+    }
+
+    fn room_select_items(&self) -> Vec<RoomSelectItem> {
+        self.room.room_select_items(self.room.voice_room)
+    }
+
+    fn server_items(&self) -> &[ServerSelectItem] {
+        self.view.server_catalog.items()
+    }
+
+    fn is_offline(&self) -> bool {
+        !self.room.network_selected || self.room.network_disconnected
+    }
+
+    fn is_udp_unreachable(&self) -> bool {
+        self.room.udp_unreachable
+    }
+}
+
+fn prepare_screen(app: &mut RenderState<'_>, buf: &mut Buffer) -> Option<StatsSnapshot> {
     buf.rect().with(app.view.theme.background).fill(buf);
     buf.hide_cursor();
     let capture = app
@@ -62,7 +99,7 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
 
 /// Draws the `chatt join` fallback warning as a warm header block when set,
 /// consuming the top three rows of `screen` when there is enough space.
-fn draw_join_notice(screen: &mut Rect, app: &App, buf: &mut Buffer) {
+fn draw_join_notice(screen: &mut Rect, app: &RenderState<'_>, buf: &mut Buffer) {
     let Some(notice) = app.room.join_notice.as_deref() else {
         return;
     };
@@ -103,7 +140,7 @@ fn join_notice_header_style(theme: &Theme) -> Style {
 }
 
 pub(crate) fn draw_server_select_screen(
-    app: &mut App,
+    app: &mut RenderState<'_>,
     select: &mut FuzzySelect,
     searching: bool,
     mode: theme::UiMode,
@@ -160,7 +197,7 @@ pub(crate) fn draw_form_dialog_frame(
 }
 
 pub(crate) fn draw_server_edit_overlay(
-    app: &mut App,
+    app: &mut RenderState<'_>,
     draft: &mut ServerEditDraft,
     buf: &mut Buffer,
 ) {
@@ -174,7 +211,7 @@ pub(crate) fn draw_server_edit_overlay(
 }
 
 pub(crate) fn draw_settings_screen(
-    app: &mut App,
+    app: &mut RenderState<'_>,
     _settings_mode: &mut SettingsMode,
     mode: theme::UiMode,
     status_label: &'static str,
@@ -224,7 +261,7 @@ pub(crate) fn draw_settings_screen(
 }
 
 pub(crate) fn draw_welcome_screen(
-    app: &mut App,
+    app: &mut RenderState<'_>,
     welcome_mode: &mut WelcomeMode,
     mode: theme::UiMode,
     status_label: &'static str,
@@ -245,7 +282,7 @@ pub(crate) fn draw_welcome_screen(
 }
 
 pub(crate) fn draw_room_screen(
-    app: &mut App,
+    app: &mut RenderState<'_>,
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     layout: &mut RoomLayout,
@@ -279,7 +316,7 @@ pub(crate) fn draw_room_screen(
     draw_key_preview(key_preview_area, app, buf);
 }
 
-fn composer_height(app: &mut App, width: u16, max_rows: u16) -> u16 {
+fn composer_height(app: &mut RenderState<'_>, width: u16, max_rows: u16) -> u16 {
     if max_rows == 0 {
         return 0;
     }
@@ -297,7 +334,7 @@ fn composer_height(app: &mut App, width: u16, max_rows: u16) -> u16 {
 
 fn draw_user_list(
     area: Rect,
-    app: &App,
+    app: &RenderState<'_>,
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     buf: &mut Buffer,
@@ -376,7 +413,7 @@ fn draw_user_list(
 
 fn draw_workspace(
     area: Rect,
-    app: &mut App,
+    app: &mut RenderState<'_>,
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     layout: &mut RoomLayout,
@@ -440,7 +477,7 @@ fn split_lobby_lists(area: Rect) -> (Rect, Rect, Rect) {
 /// per visible room.
 fn draw_room_list(
     area: Rect,
-    app: &App,
+    app: &RenderState<'_>,
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     layout: &mut RoomLayout,
@@ -526,7 +563,7 @@ fn draw_room_list_item(
 }
 
 pub(crate) fn draw_room_select_screen(
-    app: &mut App,
+    app: &mut RenderState<'_>,
     select: &mut FuzzySelect,
     items: &[RoomSelectItem],
     searching: bool,
@@ -548,7 +585,7 @@ pub(crate) fn draw_room_select_screen(
 
 fn draw_room_select(
     area: Rect,
-    app: &App,
+    app: &RenderState<'_>,
     select: &mut FuzzySelect,
     items: &[RoomSelectItem],
     searching: bool,
@@ -628,7 +665,7 @@ fn draw_room_select_item(
 
 fn draw_server_select(
     area: Rect,
-    app: &mut App,
+    app: &mut RenderState<'_>,
     select: &mut FuzzySelect,
     searching: bool,
     buf: &mut Buffer,
@@ -981,7 +1018,10 @@ fn participant_latency_estimate_ms(
         .saturating_add(rtt_ms.unwrap_or(0) / 2)
 }
 
-fn room_user_status_indicator(app: &App, participant: &ParticipantState) -> (&'static str, Style) {
+fn room_user_status_indicator(
+    app: &RenderState<'_>,
+    participant: &ParticipantState,
+) -> (&'static str, Style) {
     let local_user = Some(participant.user_id) == app.room.local_user;
     if !participant.online {
         return ("▇", app.view.theme.muted);
@@ -1008,7 +1048,7 @@ fn room_user_status_indicator(app: &App, participant: &ParticipantState) -> (&'s
     ("▇", app.view.theme.muted)
 }
 
-fn room_user_control_label(app: &App, participant: &ParticipantState) -> String {
+fn room_user_control_label(app: &RenderState<'_>, participant: &ParticipantState) -> String {
     if Some(participant.user_id) == app.room.local_user {
         return String::new();
     }
@@ -1024,7 +1064,12 @@ fn room_user_control_label(app: &App, participant: &ParticipantState) -> String 
     }
 }
 
-fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&StatsSnapshot>) {
+fn draw_top_bar(
+    area: Rect,
+    app: &mut RenderState<'_>,
+    buf: &mut Buffer,
+    capture: Option<&StatsSnapshot>,
+) {
     if area.is_empty() {
         return;
     }
@@ -1072,7 +1117,7 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
     app.view.chrome.top_bar.video = draw_video_status_block(&mut right, app, buf);
 }
 
-fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect {
+fn draw_video_status_block(row: &mut Rect, app: &RenderState<'_>, buf: &mut Buffer) -> Rect {
     let (style, label) = match app.room.screencast_status.phase {
         ScreencastPhase::Starting => (
             top_bar_active_button_style(app.view.theme, app.view.theme.good),
@@ -1098,7 +1143,7 @@ fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect 
     draw_status_segment_right(row, buf, style | Modifier::BOLD, &label)
 }
 
-fn draw_top_bar_voice_buttons(row: &mut Rect, app: &mut App, buf: &mut Buffer) {
+fn draw_top_bar_voice_buttons(row: &mut Rect, app: &mut RenderState<'_>, buf: &mut Buffer) {
     app.view.chrome.top_bar.deafen = draw_status_segment_right(
         row,
         buf,
@@ -1119,7 +1164,7 @@ fn draw_top_bar_voice_buttons(row: &mut Rect, app: &mut App, buf: &mut Buffer) {
     );
 }
 
-fn top_bar_voice_button_style(app: &App, button: LocalVoiceMode) -> Style {
+fn top_bar_voice_button_style(app: &RenderState<'_>, button: LocalVoiceMode) -> Style {
     let theme = app.view.theme;
     if app.view.local_voice_mode() != button {
         return top_bar_inactive_button_style(theme, button);
@@ -1151,7 +1196,7 @@ fn top_bar_active_button_style(theme: Theme, accent: Style) -> Style {
 
 fn draw_lobby_bar(
     area: Rect,
-    app: &mut App,
+    app: &mut RenderState<'_>,
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     room_list_rect: Rect,
@@ -1233,7 +1278,12 @@ fn bar_rect_for(bar: Rect, source: Rect) -> Rect {
 /// The audio health widget on the right of the lobby bar: compact device
 /// names while healthy, recovery state plus a clickable `[reset]` button
 /// while a stream is reconnecting or waiting for a device.
-fn draw_lobby_audio_widget(remaining: Rect, app: &mut App, fill: Style, buf: &mut Buffer) {
+fn draw_lobby_audio_widget(
+    remaining: Rect,
+    app: &mut RenderState<'_>,
+    fill: Style,
+    buf: &mut Buffer,
+) {
     app.view.chrome.lobby_bar.audio_widget = Rect::EMPTY;
     app.view.chrome.lobby_bar.audio_reset = Rect::EMPTY;
     let theme = app.view.theme;
@@ -1302,7 +1352,7 @@ fn truncate_device_name(name: &str) -> String {
     format!("{head}…")
 }
 
-fn draw_chat_log_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
+fn draw_chat_log_bar(area: Rect, app: &RenderState<'_>, focus: ChatPanelFocus, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
@@ -1326,7 +1376,7 @@ fn draw_chat_log_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buf
 
 fn draw_compose_bar(
     area: Rect,
-    app: &App,
+    app: &RenderState<'_>,
     focus: ChatPanelFocus,
     buf: &mut Buffer,
     mode: theme::UiMode,
@@ -1353,7 +1403,7 @@ fn draw_compose_bar(
     draw_status_text_right(row, app, buf, fill);
 }
 
-fn composer_mode_label(app: &App) -> &'static str {
+fn composer_mode_label(app: &RenderState<'_>) -> &'static str {
     if app.view.has_pending_edit() {
         return match app.view.composer.mode() {
             EditorMode::Normal => "edit normal",
@@ -1396,7 +1446,7 @@ fn panel_mode_style(theme: Theme, panel: ChatPanelFocus) -> Style {
 
 fn draw_chat(
     area: Rect,
-    app: &mut App,
+    app: &mut RenderState<'_>,
     focus: ChatPanelFocus,
     layout: &mut RoomLayout,
     buf: &mut Buffer,
@@ -1539,7 +1589,7 @@ fn draw_transfer_progress(
     progress: TransferProgress,
     file_name: &str,
     transfer_id: FileTransferId,
-    app: &mut App,
+    app: &mut RenderState<'_>,
     buf: &mut Buffer,
 ) {
     if row.w == 0 {
@@ -1628,7 +1678,7 @@ fn draw_transfer_terminal(
 fn draw_chat_heading(
     marker: Rect,
     row: Rect,
-    app: &App,
+    app: &RenderState<'_>,
     message: usize,
     now_ms: u64,
     buf: &mut Buffer,
@@ -1848,7 +1898,7 @@ fn chat_age(timestamp_ms: u64, now_ms: u64) -> String {
 
 fn draw_status(
     area: Rect,
-    app: &App,
+    app: &RenderState<'_>,
     buf: &mut Buffer,
     mode: theme::UiMode,
     label: &'static str,
@@ -1864,7 +1914,7 @@ fn draw_status(
     draw_status_text_right(row, app, buf, theme.status_fill);
 }
 
-fn draw_status_text_right(area: Rect, app: &App, buf: &mut Buffer, fill: Style) {
+fn draw_status_text_right(area: Rect, app: &RenderState<'_>, buf: &mut Buffer, fill: Style) {
     let theme = &app.view.theme;
     let right_style = match app.view.status.kind() {
         StatusKind::Info => fill.patch(theme.muted),
@@ -1912,7 +1962,7 @@ struct KeyPreviewRow {
 const KEY_PREVIEW_ENTRY_GAP: &str = "  ";
 const KEY_PREVIEW_ENTRY_GAP_WIDTH: usize = 2;
 
-fn key_preview_height(app: &App, width: u16) -> u16 {
+fn key_preview_height(app: &RenderState<'_>, width: u16) -> u16 {
     let entries = &app.view.chrome.key_preview.cache.entries;
     if entries.is_empty() {
         return 0;
@@ -1925,7 +1975,7 @@ fn key_preview_height(app: &App, width: u16) -> u16 {
     }
 }
 
-fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
+fn draw_key_preview(area: Rect, app: &RenderState<'_>, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
@@ -1994,7 +2044,11 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
     }
 }
 
-pub(crate) fn draw_overlay_key_preview(app: &mut App, layer: LayerId, buf: &mut Buffer) {
+pub(crate) fn draw_overlay_key_preview(
+    app: &mut RenderState<'_>,
+    layer: LayerId,
+    buf: &mut Buffer,
+) {
     let mut screen = buf.rect();
     let previous_height = key_preview_height(app, screen.w);
     refresh_key_preview_cache(app, Some(layer));
@@ -2023,7 +2077,7 @@ pub(crate) fn draw_overlay_key_preview(app: &mut App, layer: LayerId, buf: &mut 
 /// chord layer has changed since the last render, and is a cheap key comparison
 /// otherwise. The stored entries back both [`key_preview_height`] and
 /// [`draw_key_preview`], which read them without recomputing.
-fn refresh_key_preview_cache(app: &mut App, base: Option<LayerId>) {
+fn refresh_key_preview_cache(app: &mut RenderState<'_>, base: Option<LayerId>) {
     let pending = app
         .view
         .chrome
@@ -2180,7 +2234,7 @@ fn draw_status_segment_right(row: &mut Rect, buf: &mut Buffer, style: Style, tex
     area
 }
 
-fn draw_composer(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buffer) {
+fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
@@ -2204,7 +2258,7 @@ fn draw_composer(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buf
 /// The top-bar status suffix and its style, or `None` in the healthy connected
 /// state (where only the server name shows). Failures take priority over the
 /// transient "Connecting" phase.
-fn connection_status_label(app: &App) -> Option<(&'static str, Style)> {
+fn connection_status_label(app: &RenderState<'_>) -> Option<(&'static str, Style)> {
     let theme = app.view.theme;
     if app.is_offline() {
         Some(("Offline", theme.status_fill.patch(theme.error)))

@@ -97,17 +97,17 @@ pub(crate) enum ExitReason {
 /// One dispatch may request at most one transition. The stack applies that
 /// transition only after the borrowed active mode returns.
 pub(crate) trait AppMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64);
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64);
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action;
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action;
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let _ = (app, mouse);
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        let _ = (cx, mouse);
         Action::Continue
     }
 
-    fn process_paste(&mut self, app: &mut App, text: String) {
-        let _ = (app, text);
+    fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        let _ = (cx, text);
     }
 
     fn process_app_event(&mut self, app: &mut App, event: AppEvent) -> Option<AppEvent> {
@@ -115,11 +115,11 @@ pub(crate) trait AppMode {
         Some(event)
     }
 
-    fn on_enter(&mut self, _app: &mut App) {}
+    fn on_enter(&mut self, _cx: &mut ViewCx<'_>) {}
 
-    fn on_exit(&mut self, _app: &mut App, _reason: ExitReason) {}
+    fn on_exit(&mut self, _cx: &mut ViewCx<'_>, _reason: ExitReason) {}
 
-    fn presentation(&self, app: &App) -> ModePresentation;
+    fn presentation(&self, cx: &ViewCx<'_>) -> ModePresentation;
 }
 
 pub(crate) enum ModeTransition {
@@ -163,7 +163,11 @@ pub(crate) struct ModeStack {
 
 impl ModeStack {
     pub(crate) fn new(mut root: Box<dyn AppMode>, app: &mut App) -> Self {
-        root.on_enter(app);
+        {
+            let mut cx = app.view_cx();
+            root.on_enter(&mut cx);
+        }
+        app.drain_core_commands();
         Self { modes: vec![root] }
     }
 
@@ -183,6 +187,32 @@ impl ModeStack {
         }
     }
 
+    pub(crate) fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+        let action = {
+            let mut cx = app.view_cx();
+            self.active_mut().process_input(&mut cx, key)
+        };
+        app.drain_core_commands();
+        action
+    }
+
+    pub(crate) fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
+        let action = {
+            let mut cx = app.view_cx();
+            self.active_mut().process_mouse(&mut cx, mouse)
+        };
+        app.drain_core_commands();
+        action
+    }
+
+    pub(crate) fn process_paste(&mut self, app: &mut App, text: String) {
+        {
+            let mut cx = app.view_cx();
+            self.active_mut().process_paste(&mut cx, text);
+        }
+        app.drain_core_commands();
+    }
+
     /// Applies at most one requested transition. A root pop is an explicit
     /// no-op; navigation must use `Set` to replace the root.
     pub(crate) fn apply_pending(&mut self, app: &mut App) {
@@ -196,41 +226,52 @@ impl ModeStack {
         match transition {
             ModeTransition::Set(mut mode) => {
                 for mut removed in self.modes.drain(..).rev() {
-                    removed.on_exit(app, ExitReason::Reset);
+                    let mut cx = app.view_cx();
+                    removed.on_exit(&mut cx, ExitReason::Reset);
                 }
-                mode.on_enter(app);
+                let mut cx = app.view_cx();
+                mode.on_enter(&mut cx);
                 self.modes.push(mode);
             }
             ModeTransition::Push(mut mode) => {
-                mode.on_enter(app);
+                let mut cx = app.view_cx();
+                mode.on_enter(&mut cx);
                 self.modes.push(mode);
             }
             ModeTransition::Replace(mut mode) => {
                 if let Some(mut removed) = self.modes.pop() {
-                    removed.on_exit(app, ExitReason::Replaced);
+                    let mut cx = app.view_cx();
+                    removed.on_exit(&mut cx, ExitReason::Replaced);
                 }
-                mode.on_enter(app);
+                let mut cx = app.view_cx();
+                mode.on_enter(&mut cx);
                 self.modes.push(mode);
             }
             ModeTransition::Pop if self.modes.len() > 1 => {
                 let mut removed = self.modes.pop().expect("checked non-root mode");
-                removed.on_exit(app, ExitReason::Popped);
+                let mut cx = app.view_cx();
+                removed.on_exit(&mut cx, ExitReason::Popped);
             }
             ModeTransition::Pop => {}
         }
+        app.drain_core_commands();
     }
 
     /// Renders the highest full-screen mode and overlays above it. Covered
     /// full-screen modes retain state without mutating active layout caches.
     pub(crate) fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64) {
-        let start = self
-            .modes
-            .iter()
-            .rposition(|mode| mode.presentation(app).coverage == Coverage::FullScreen)
-            .unwrap_or(0);
-        for mode in &mut self.modes[start..] {
-            mode.render(app, buf, now_ms);
+        {
+            let mut cx = app.view_cx();
+            let start = self
+                .modes
+                .iter()
+                .rposition(|mode| mode.presentation(&cx).coverage == Coverage::FullScreen)
+                .unwrap_or(0);
+            for mode in &mut self.modes[start..] {
+                mode.render(&mut cx, buf, now_ms);
+            }
         }
+        app.drain_core_commands();
     }
 
     #[cfg(test)]
@@ -244,18 +285,20 @@ impl ModeStack {
     }
 
     #[cfg(test)]
-    pub(crate) fn overlay_active(&self, app: &App) -> bool {
+    pub(crate) fn overlay_active(&self, app: &mut App) -> bool {
+        let cx = app.view_cx();
         self.modes
             .last()
-            .is_some_and(|mode| mode.presentation(app).coverage == Coverage::Overlay)
+            .is_some_and(|mode| mode.presentation(&cx).coverage == Coverage::Overlay)
     }
 
     #[cfg(test)]
-    pub(crate) fn top_presentation(&self, app: &App) -> ModePresentation {
+    pub(crate) fn top_presentation(&self, app: &mut App) -> ModePresentation {
+        let cx = app.view_cx();
         self.modes
             .last()
             .expect("mode stack always has a root")
-            .presentation(app)
+            .presentation(&cx)
     }
 }
 
@@ -274,17 +317,17 @@ mod tests {
     struct OverlayMode;
 
     impl AppMode for OverlayMode {
-        fn render(&mut self, _app: &mut App, _buf: &mut Buffer, _now_ms: u64) {}
+        fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64) {}
 
-        fn process_input(&mut self, _app: &mut App, _key: KeyEvent) -> Action {
+        fn process_input(&mut self, _cx: &mut ViewCx<'_>, _key: KeyEvent) -> Action {
             Action::Continue
         }
 
-        fn process_mouse(&mut self, _app: &mut App, _mouse: MouseEvent) -> Action {
+        fn process_mouse(&mut self, _cx: &mut ViewCx<'_>, _mouse: MouseEvent) -> Action {
             Action::Continue
         }
 
-        fn presentation(&self, _app: &App) -> ModePresentation {
+        fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
             ModePresentation::OVERLAY
         }
     }
@@ -318,15 +361,15 @@ mod tests {
     }
 
     impl AppMode for RecordingMode {
-        fn render(&mut self, _app: &mut App, _buf: &mut Buffer, _now_ms: u64) {
+        fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64) {
             self.rendered.borrow_mut().push(self.label);
         }
 
-        fn process_input(&mut self, _app: &mut App, _key: KeyEvent) -> Action {
+        fn process_input(&mut self, _cx: &mut ViewCx<'_>, _key: KeyEvent) -> Action {
             Action::Continue
         }
 
-        fn presentation(&self, _app: &App) -> ModePresentation {
+        fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
             self.presentation
         }
     }
@@ -378,9 +421,9 @@ mod tests {
         }
 
         impl AppMode for EventConsumer {
-            fn render(&mut self, _app: &mut App, _buf: &mut Buffer, _now_ms: u64) {}
+            fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64) {}
 
-            fn process_input(&mut self, _app: &mut App, _key: KeyEvent) -> Action {
+            fn process_input(&mut self, _cx: &mut ViewCx<'_>, _key: KeyEvent) -> Action {
                 Action::Continue
             }
 
@@ -393,7 +436,7 @@ mod tests {
                 }
             }
 
-            fn presentation(&self, _app: &App) -> ModePresentation {
+            fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
                 ModePresentation::OVERLAY
             }
         }

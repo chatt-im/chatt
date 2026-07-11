@@ -8,9 +8,11 @@ use extui::{
 use rpc::ids::UserId;
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
+use crate::app::App;
+
 use crate::{
     app::{
-        App,
         command::CoreCommand,
         room::{UserListRow, UserPresence},
     },
@@ -75,10 +77,6 @@ impl UserListMode {
             page_rows: 10,
             row_hits: Vec::new(),
         }
-    }
-
-    fn refresh(&mut self, app: &App) {
-        self.apply_rows(app.room.user_list_rows());
     }
 
     /// Replaces the visible list with the rows matching the filter, then
@@ -383,8 +381,9 @@ fn row_matches(filter: &str, row: &UserListRow) -> bool {
 }
 
 impl AppMode for UserListMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        self.refresh(app);
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        self.apply_rows(cx.session.user_list_rows());
+        let mut app = crate::tui::render::RenderState::new(cx);
         self.row_hits.clear();
         let theme = &app.view.theme;
         let area = buf.rect();
@@ -468,28 +467,18 @@ impl AppMode for UserListMode {
             }
         }
 
-        crate::tui::render::draw_overlay_key_preview(app, bindings::USER_LIST_LAYER, buf);
+        crate::tui::render::draw_overlay_key_preview(&mut app, bindings::USER_LIST_LAYER, buf);
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_mouse_cx(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,
             chrome: Some(ChromeSpec {
@@ -498,6 +487,18 @@ impl AppMode for UserListMode {
                 layer: bindings::USER_LIST_LAYER,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+impl UserListMode {
+    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+        let action = {
+            let mut cx = app.view_cx();
+            AppMode::process_input(self, &mut cx, key)
+        };
+        app.drain_core_commands();
+        action
     }
 }
 

@@ -182,7 +182,12 @@ impl WelcomeMode {
         Action::Continue
     }
 
-    pub(crate) fn draw_body(&mut self, area: Rect, app: &App, buf: &mut Buffer) {
+    pub(crate) fn draw_body(
+        &mut self,
+        area: Rect,
+        app: &crate::tui::render::RenderState<'_>,
+        buf: &mut Buffer,
+    ) {
         welcome::draw_welcome(
             area,
             buf,
@@ -197,10 +202,11 @@ impl WelcomeMode {
 }
 
 impl AppMode for WelcomeMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        let chrome = self.presentation(app).chrome.expect("base mode has chrome");
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
+        let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_welcome_screen(
-            app,
+            &mut render,
             self,
             chrome.theme_mode,
             chrome.status_label,
@@ -209,25 +215,15 @@ impl AppMode for WelcomeMode {
         );
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_mouse_cx(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation::full_screen(ChromeSpec {
             theme_mode: theme::UiMode::Settings,
             status_label: "Setup",
@@ -530,11 +526,12 @@ impl Default for ServerListMode {
 }
 
 impl AppMode for ServerListMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        self.select.refresh(app.server_items());
-        let chrome = self.presentation(app).chrome.expect("base mode has chrome");
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        self.select.refresh(cx.view.server_catalog.items());
+        let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
+        let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_server_select_screen(
-            app,
+            &mut render,
             &mut self.select,
             self.searching,
             chrome.theme_mode,
@@ -544,16 +541,11 @@ impl AppMode for ServerListMode {
         );
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation::full_screen(ChromeSpec {
             theme_mode: theme::UiMode::ServerSelect,
             status_label: "Servers",
@@ -587,13 +579,14 @@ impl RoomSwitchMode {
             .map(|item| item.room_id)
     }
 
-    fn refresh(&mut self, app: &App) {
-        self.items = app.room_select_items();
+    fn refresh_cx(&mut self, cx: &ViewCx<'_>) {
+        self.items = cx.session.room_select_items(cx.session.voice_room);
         self.select.refresh(&self.items);
     }
 
-    fn refresh_cx(&mut self, cx: &ViewCx<'_>) {
-        self.items = cx.session.room_select_items(cx.session.voice_room);
+    #[cfg(test)]
+    fn refresh(&mut self, app: &App) {
+        self.items = app.room.room_select_items(app.room.voice_room);
         self.select.refresh(&self.items);
     }
 
@@ -664,11 +657,12 @@ impl RoomSwitchMode {
 }
 
 impl AppMode for RoomSwitchMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        self.refresh(app);
-        let chrome = self.presentation(app).chrome.expect("base mode has chrome");
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        self.refresh_cx(cx);
+        let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
+        let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_room_select_screen(
-            app,
+            &mut render,
             &mut self.select,
             &self.items,
             self.searching,
@@ -679,16 +673,11 @@ impl AppMode for RoomSwitchMode {
         );
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation::full_screen(ChromeSpec {
             theme_mode: theme::UiMode::ServerSelect,
             status_label: "Rooms",
@@ -742,31 +731,22 @@ impl ServerEditMode {
 }
 
 impl AppMode for ServerEditMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
         if let Some(draft) = self.draft.as_mut() {
-            crate::tui::render::draw_server_edit_overlay(app, draft, buf);
+            let mut render = crate::tui::render::RenderState::new(cx);
+            crate::tui::render::draw_server_edit_overlay(&mut render, draft, buf);
         }
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_mouse_cx(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,
             chrome: Some(ChromeSpec {
@@ -1040,17 +1020,18 @@ impl SettingsMode {
 }
 
 impl AppMode for SettingsMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        let Some(settings) = app.room.settings.clone() else {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+        let Some(settings) = cx.session.settings.clone() else {
             return;
         };
         settings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .sync_catalog(&app.room.audio_devices);
-        let chrome = self.presentation(app).chrome.expect("base mode has chrome");
+            .sync_catalog(&cx.session.audio_devices);
+        let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
+        let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_settings_screen(
-            app,
+            &mut render,
             self,
             chrome.theme_mode,
             chrome.status_label,
@@ -1059,33 +1040,19 @@ impl AppMode for SettingsMode {
         );
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_mouse_cx(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
-    fn on_exit(&mut self, app: &mut App, _reason: ExitReason) {
-        {
-            let mut cx = app.view_cx();
-            cx.send(CoreCommand::Settings(SettingsOp::Finish));
-        }
-        app.drain_core_commands();
+    fn on_exit(&mut self, cx: &mut ViewCx<'_>, _reason: ExitReason) {
+        cx.send(CoreCommand::Settings(SettingsOp::Finish));
     }
 
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation::full_screen(ChromeSpec {
             theme_mode: theme::UiMode::Settings,
             status_label: "Settings",
@@ -2171,10 +2138,11 @@ impl RoomMode {
 }
 
 impl AppMode for RoomMode {
-    fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64) {
-        let chrome = self.presentation(app).chrome.expect("base mode has chrome");
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64) {
+        let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
+        let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_room_screen(
-            app,
+            &mut render,
             self.focus,
             self.lobby_list_focus,
             &mut self.layout,
@@ -2186,45 +2154,31 @@ impl AppMode for RoomMode {
         );
     }
 
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_input_cx(&mut cx, key)
-        };
-        app.drain_core_commands();
-        action
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        self.process_input_cx(cx, key)
     }
 
-    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let action = {
-            let mut cx = app.view_cx();
-            self.process_mouse_cx(&mut cx, mouse)
-        };
-        app.drain_core_commands();
-        action
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
-    fn process_paste(&mut self, app: &mut App, text: String) {
-        {
-            let mut cx = app.view_cx();
-            self.process_paste_cx(&mut cx, text);
-        }
-        app.drain_core_commands();
+    fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        self.process_paste_cx(cx, text);
     }
 
-    fn presentation(&self, app: &App) -> ModePresentation {
+    fn presentation(&self, cx: &ViewCx<'_>) -> ModePresentation {
         let theme_mode = if self.focus == ChatPanelFocus::Compose {
             theme::UiMode::Compose
         } else {
             theme::UiMode::Log
         };
         let layer = if self.focus != ChatPanelFocus::Compose {
-            if self.focus == ChatPanelFocus::ChatLog && app.view.active.chat.has_visual() {
+            if self.focus == ChatPanelFocus::ChatLog && cx.view.active.chat.has_visual() {
                 bindings::CHAT_VISUAL_LAYER
             } else {
                 bindings::WORKSPACE_LAYER
             }
-        } else if app.view.composer.mode() == EditorMode::Insert {
+        } else if cx.view.composer.mode() == EditorMode::Insert {
             bindings::INSERT_LAYER
         } else {
             bindings::COMPOSE_NORMAL_LAYER
@@ -2236,6 +2190,69 @@ impl AppMode for RoomMode {
         })
     }
 }
+
+#[cfg(test)]
+macro_rules! app_mode_test_bridge {
+    ($($mode:ty),+ $(,)?) => {
+        $(
+            #[allow(dead_code)]
+            impl $mode {
+                pub(crate) fn render(
+                    &mut self,
+                    app: &mut App,
+                    buf: &mut Buffer,
+                    now_ms: u64,
+                ) {
+                    {
+                        let mut cx = app.view_cx();
+                        AppMode::render(self, &mut cx, buf, now_ms);
+                    }
+                    app.drain_core_commands();
+                }
+
+                pub(crate) fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+                    let action = {
+                        let mut cx = app.view_cx();
+                        AppMode::process_input(self, &mut cx, key)
+                    };
+                    app.drain_core_commands();
+                    action
+                }
+
+                pub(crate) fn process_mouse(
+                    &mut self,
+                    app: &mut App,
+                    mouse: MouseEvent,
+                ) -> Action {
+                    let action = {
+                        let mut cx = app.view_cx();
+                        AppMode::process_mouse(self, &mut cx, mouse)
+                    };
+                    app.drain_core_commands();
+                    action
+                }
+
+                pub(crate) fn process_paste(&mut self, app: &mut App, text: String) {
+                    {
+                        let mut cx = app.view_cx();
+                        AppMode::process_paste(self, &mut cx, text);
+                    }
+                    app.drain_core_commands();
+                }
+            }
+        )+
+    };
+}
+
+#[cfg(test)]
+app_mode_test_bridge!(
+    WelcomeMode,
+    ServerListMode,
+    RoomSwitchMode,
+    ServerEditMode,
+    SettingsMode,
+    RoomMode,
+);
 
 #[cfg(test)]
 mod tests {
