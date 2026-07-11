@@ -463,6 +463,13 @@ pub(crate) fn append_alsa_physical_devices(
 ) {
 }
 
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AlsaPhysicalPcm {
     card: u32,
@@ -482,6 +489,13 @@ pub(crate) fn alsa_physical_pcm_devices(direction: AudioDeviceDirection) -> Vec<
         .unwrap_or_default()
 }
 
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+))]
 pub(crate) fn parse_alsa_physical_pcm_devices(
     content: &str,
     direction: AudioDeviceDirection,
@@ -515,6 +529,13 @@ pub(crate) fn parse_alsa_physical_pcm_devices(
     devices
 }
 
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+))]
 pub(crate) fn parse_alsa_pcm_address(address: &str) -> Option<(u32, u32)> {
     let (card, device) = address.split_once('-')?;
     Some((card.parse().ok()?, device.parse().ok()?))
