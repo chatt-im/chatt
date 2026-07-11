@@ -15,14 +15,11 @@ impl ClientId {
     pub(crate) const PRIMARY: Self = Self(0);
 }
 
-/// Events whose state belongs to a render-thread mode rather than the shared
-/// session. The pairing variants replace the last App-owned mode callback.
+/// Events whose state belongs to an open render-thread mode (the pairing
+/// password prompt); everything else reaches a terminal through its view.
 #[derive(Debug)]
 pub(crate) enum ClientEvent {
-    SetError(String),
-    OpenPairingPasswordChallenge { retry: bool },
     PairingPasswordChallenge { retry: bool },
-    PairingSucceeded,
     PairingFailed(String),
 }
 

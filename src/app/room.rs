@@ -2061,6 +2061,11 @@ impl RoomSession {
         self.metas.get(&room_id)
     }
 
+    /// The catalog display name of `room_id`, when the room is known.
+    pub(crate) fn room_name_of(&self, room_id: RoomId) -> Option<&str> {
+        self.metas.get(&room_id).map(|meta| meta.name.as_str())
+    }
+
     /// Builds the switcher and rooms-strip rows: every known room in catalog
     /// order with its unread, voice, and viewed markers.
     pub(crate) fn room_select_items(&self, voice_room: Option<RoomId>) -> Vec<RoomSelectItem> {
@@ -2996,6 +3001,15 @@ mod tests {
             flags: rpc::control::MessageFlags::default(),
             target: None,
         }
+    }
+
+    #[test]
+    fn room_name_of_reports_known_rooms_only() {
+        let mut client = test_room();
+        enter(&mut client, vec![user(UserId(1), "alice")], vec![], None);
+
+        assert_eq!(client.session.room_name_of(RoomId(1)), Some("room-1"));
+        assert_eq!(client.session.room_name_of(RoomId(9)), None);
     }
 
     #[test]

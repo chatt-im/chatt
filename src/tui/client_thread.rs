@@ -15,14 +15,13 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::{
     app::{RoomSession, command::CoreCommand},
-    client_channel::{ClientChannel, ClientEvent, ClientId},
+    client_channel::{ClientChannel, ClientId},
     config::Config,
     tui::{
         Action,
         mode::{AppMode, ViewCx},
         mode_stack::ModeStack,
         modes::{RoomMode, ServerListMode, WelcomeMode},
-        overlay::PasswordPromptMode,
         view::ClientView,
     },
 };
@@ -169,7 +168,9 @@ impl ClientThread {
                 // apply them on the wake that delivered them rather than after
                 // the next input event.
                 mode_stack.apply_pending_cx(&mut cx);
-                process_client_events(&mut mode_stack, &mut cx, client_events);
+                for event in client_events {
+                    mode_stack.process_client_event(event);
+                }
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_millis() as u64)
@@ -257,34 +258,9 @@ fn flush_commands(
     }
 }
 
-fn process_client_events(
-    mode_stack: &mut ModeStack,
-    cx: &mut ViewCx<'_>,
-    client_events: Vec<ClientEvent>,
-) {
-    for event in client_events {
-        match event {
-            ClientEvent::SetError(error) => cx.set_error(error),
-            ClientEvent::OpenPairingPasswordChallenge { retry } => cx.request_transition(
-                crate::tui::mode::ModeTransition::Push(Box::new(PasswordPromptMode::new(retry))),
-            ),
-            ClientEvent::PairingSucceeded => {
-                mode_stack.process_client_event(ClientEvent::PairingSucceeded);
-                cx.request_transition(crate::tui::mode::ModeTransition::Pop);
-            }
-            event => mode_stack.process_client_event(event),
-        }
-        // Each channel event is its own dispatch. Apply its navigation before
-        // the next event so that event observes the mode produced by the one
-        // before it, even when both arrived in the same drained batch.
-        mode_stack.apply_pending_cx(cx);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{app::App, config::Config};
 
     #[test]
     fn flush_commands_transmits_queue_in_order_tagged_with_client_id() {
@@ -300,26 +276,5 @@ mod tests {
             rx.try_recv(),
             Ok((ClientId(7), CoreCommand::ToggleMute))
         ));
-    }
-
-    #[test]
-    fn pairing_transitions_apply_between_batched_client_events() {
-        let mut app = App::new(Config::default(), None).expect("test app");
-        let mut stack = ModeStack::new(Box::new(ServerListMode::new()), &mut app);
-
-        {
-            let mut cx = app.view_cx();
-            process_client_events(
-                &mut stack,
-                &mut cx,
-                vec![
-                    ClientEvent::OpenPairingPasswordChallenge { retry: false },
-                    ClientEvent::PairingSucceeded,
-                ],
-            );
-        }
-
-        assert_eq!(stack.depth(), 1);
-        assert!(app.view.pending_transition.is_empty());
     }
 }
