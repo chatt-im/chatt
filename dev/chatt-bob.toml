@@ -5,9 +5,6 @@ token = "bob-dev-token"
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
 
-[ui]
-placeholder = "Bob #lobby"
-
 [files]
 download = "persistent"
 download-dir = "/tmp/chatt-bob"

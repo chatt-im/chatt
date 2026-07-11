@@ -7,7 +7,6 @@ tcp-addr = "127.0.0.1:41000"
 udp-addr = "127.0.0.1:41000"
 
 [ui]
-placeholder = "Alice #lobby"
 room-height = 4
 max-composer-height = 6
 max-messages = 50000
@@ -60,6 +59,7 @@ selected-line.bg = "selection"
 room-selected = { fg = "text", bg = "selection" }
 status-fill = { fg = "subtext1", bg = "mantle" }
 status-section = { fg = "subtext0", bg = "mantle" }
+composer-border.fg = "#20212e"
 join-input-active = { fg = "text", bg = "surface0" }
 join-input-inactive = { fg = "subtext0", bg = "mantle" }
 join-input-boundary-active = { fg = "base", bg = "rosewater" }

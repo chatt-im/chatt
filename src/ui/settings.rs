@@ -77,7 +77,6 @@ pub(crate) enum SettingsButton {
     Refresh,
     Save,
     Close,
-    Exit,
 }
 
 /// What the focused field did this logic pass, applied by the app layer.
@@ -110,7 +109,6 @@ struct SettingsActionLabels {
     refresh: String,
     save: String,
     close: String,
-    exit: String,
 }
 
 impl SettingsActionLabels {
@@ -127,7 +125,6 @@ impl SettingsActionLabels {
                 BindCommand::SaveSettings,
             ),
             close: action_label(bindings, "Back to chat", BindCommand::CloseSettings),
-            exit: action_label(bindings, "Exit", BindCommand::Quit),
         }
     }
 }
@@ -322,12 +319,6 @@ impl<'a> SettingsForm<'a> {
     /// virtual row so left/right moves between them.
     fn actions(&mut self) {
         let specs = [
-            ActionButton {
-                key: "Exit",
-                label: &self.action_labels.exit,
-                value: SettingsButton::Exit,
-                help: "Close chatt.",
-            },
             ActionButton {
                 key: "Refresh",
                 label: &self.action_labels.refresh,

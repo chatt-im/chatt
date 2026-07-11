@@ -332,6 +332,8 @@ pub struct UiConfig {
     pub room_height: u16,
     #[toml(default = 6)]
     pub max_composer_height: u16,
+    #[toml(default = true, ToToml skip_if = |value: &bool| *value)]
+    pub composer_padding: bool,
     #[toml(default = 50_000)]
     pub max_messages: u32,
     #[toml(default = 24)]
@@ -371,6 +373,7 @@ impl Default for UiConfig {
         Self {
             room_height: 4,
             max_composer_height: 6,
+            composer_padding: true,
             max_messages: 50_000,
             overscan: 24,
             default_bindings: DefaultBindings::Standard,
@@ -1028,6 +1031,7 @@ pub enum ThemeSlot {
     RoomSelected,
     StatusFill,
     StatusSection,
+    ComposerBorder,
     JoinInputActive,
     JoinInputInactive,
     JoinInputBoundaryActive,
@@ -1075,6 +1079,7 @@ impl ThemeSlot {
             "room-selected" => Self::RoomSelected,
             "status-fill" => Self::StatusFill,
             "status-section" => Self::StatusSection,
+            "composer-border" => Self::ComposerBorder,
             "join-input-active" => Self::JoinInputActive,
             "join-input-inactive" => Self::JoinInputInactive,
             "join-input-boundary-active" => Self::JoinInputBoundaryActive,
@@ -2860,6 +2865,20 @@ server-public-key = ""
             config.ui.theme,
             ThemeSelection::Builtin(ThemeChoice::TomorrowNight)
         );
+    }
+
+    #[test]
+    fn composer_padding_defaults_on_and_can_be_disabled() {
+        let arena = Arena::new();
+        let default_config: Config = toml_spanner::parse("", &arena).unwrap().to().unwrap();
+        assert!(default_config.ui.composer_padding);
+
+        let arena = Arena::new();
+        let disabled: Config = toml_spanner::parse("[ui]\ncomposer-padding = false\n", &arena)
+            .unwrap()
+            .to()
+            .unwrap();
+        assert!(!disabled.ui.composer_padding);
     }
 
     #[test]
