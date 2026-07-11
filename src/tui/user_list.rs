@@ -397,27 +397,19 @@ impl AppMode for UserListMode {
             .max(1)
             .min(area.h.saturating_sub(4) as usize)
             .max(3);
-        let height = (body_rows + 2) as u16;
+        let height = (body_rows + 4) as u16;
         let panel = Rect {
             x: area.x + area.w.saturating_sub(width) / 2,
             y: area.y + area.h.saturating_sub(height) / 2,
             w: width,
             h: height,
         };
-        buf.clear_rect(panel, theme.dialog_panel);
-
-        let mut rows = panel;
         let title = if app.room.server_alias.is_empty() {
             "Users".to_string()
         } else {
             format!("Users — {}", app.room.server_alias)
         };
-        rows.take_top(1)
-            .with(theme.dialog_header | Modifier::BOLD)
-            .fill(buf)
-            .with(HAlign::Center)
-            .with(Ellipsis(true))
-            .text(buf, &title);
+        let mut rows = crate::tui::render::draw_dialog_frame(panel, buf, theme, &title);
 
         let search = rows.take_top(1);
         if self.searching {

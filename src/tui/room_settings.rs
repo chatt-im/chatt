@@ -69,7 +69,7 @@ impl AppMode for RoomSettingsMode {
             return;
         };
         let body =
-            crate::tui::render::draw_form_dialog_frame(panel, buf, &app.view.theme, &draft.title());
+            crate::tui::render::draw_dialog_frame(panel, buf, &app.view.theme, &draft.title());
         draft.render(body, buf, &app.view.theme);
         crate::tui::render::draw_overlay_key_preview(&mut app, bindings::FORM_LAYER, buf);
     }

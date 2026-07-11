@@ -510,14 +510,9 @@ fn draw_dialog(
     if dialog.is_empty() {
         return;
     }
-    dialog.with(theme.dialog_panel).fill(buf);
     let mut rows = dialog;
-    rows.take_top(1)
-        .with(theme.dialog_header | Modifier::BOLD)
-        .fill(buf)
-        .with(Ellipsis(true))
-        .text(buf, " Welcome to Chatt ");
-    let mut body = rows.inset(1, 1);
+    rows.take_top(1);
+    let mut body = crate::tui::render::draw_dialog_frame(dialog, buf, theme, "Welcome to Chatt");
     let detail = if body.w >= MIN_DETAIL_WIDTH {
         let detail_panel = body.take_right(DETAIL_PANEL_WIDTH as i32);
         body.take_right(1).with(theme.dialog_panel).fill(buf);
