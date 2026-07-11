@@ -59,6 +59,7 @@ pub struct Theme {
     // Status bar.
     pub status_fill: Style,
     pub status_section: Style,
+    pub status_section_inactive: Style,
     /// Half-block frame around the padded composer.
     pub composer_border: Style,
     // Join / text inputs.
@@ -149,6 +150,9 @@ impl Theme {
             status_section: d
                 .with_bg_rgb(0x46, 0x46, 0x46)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
+            status_section_inactive: d
+                .with_bg_rgb(0x46, 0x46, 0x46)
+                .with_fg_rgb(0xc8, 0xcd, 0xc3),
             composer_border: d.with_fg_rgb(0x20, 0x20, 0x20),
             join_input_active: d
                 .with_bg_rgb(0x29, 0x29, 0x29)
@@ -257,6 +261,7 @@ impl Theme {
             status_section: d
                 .with_bg_ansi(AnsiColor::Grey[6])
                 .with_fg_ansi(bright_white),
+            status_section_inactive: d.with_bg_ansi(AnsiColor::Grey[6]).with_fg_ansi(white),
             composer_border: d.with_fg_ansi(AnsiColor::Grey[2]),
             join_input_active: d
                 .with_bg_ansi(AnsiColor::Grey[4])
@@ -333,6 +338,7 @@ impl Theme {
             room_selected: d.with_bg_ansi(AnsiColor::Grey[25]).with_fg_ansi(black),
             status_fill: d.with_bg_ansi(AnsiColor::Grey[27]).with_fg_ansi(black),
             status_section: d.with_bg_ansi(AnsiColor::Grey[23]).with_fg_ansi(black),
+            status_section_inactive: d.with_bg_ansi(AnsiColor::Grey[23]).with_fg_ansi(black),
             composer_border: d.with_fg_ansi(AnsiColor::Grey[25]),
             join_input_active: d.with_bg_ansi(AnsiColor::Grey[27]).with_fg_ansi(black),
             join_input_inactive: d.with_bg_ansi(AnsiColor::Grey[28]).with_fg_ansi(black),
@@ -389,6 +395,7 @@ impl Theme {
             ThemeSlot::RoomSelected => &mut self.room_selected,
             ThemeSlot::StatusFill => &mut self.status_fill,
             ThemeSlot::StatusSection => &mut self.status_section,
+            ThemeSlot::StatusSectionInactive => &mut self.status_section_inactive,
             ThemeSlot::ComposerBorder => &mut self.composer_border,
             ThemeSlot::JoinInputActive => &mut self.join_input_active,
             ThemeSlot::JoinInputInactive => &mut self.join_input_inactive,
@@ -597,6 +604,7 @@ mod tests {
                 (ThemeSlot::ChatCursorLine, pair(38)),
                 (ThemeSlot::StatusFill, pair(14)),
                 (ThemeSlot::StatusSection, pair(15)),
+                (ThemeSlot::StatusSectionInactive, pair(39)),
                 (ThemeSlot::JoinInputActive, pair(16)),
                 (ThemeSlot::JoinInputInactive, pair(17)),
                 (ThemeSlot::JoinInputBoundaryActive, pair(18)),
@@ -638,6 +646,7 @@ mod tests {
         assert_eq!(theme.room_selected, style(13));
         assert_eq!(theme.status_fill, style(14));
         assert_eq!(theme.status_section, style(15));
+        assert_eq!(theme.status_section_inactive, style(39));
         assert_eq!(theme.join_input_active, style(16));
         assert_eq!(theme.join_input_inactive, style(17));
         assert_eq!(theme.join_input_boundary_active, style(18));

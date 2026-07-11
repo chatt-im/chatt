@@ -1233,59 +1233,44 @@ fn draw_lobby_bar(
 
     let rooms_bar = bar_rect_for(area, room_list_rect);
     if !rooms_bar.is_empty() {
-        let (_, label, detail) = section_bar_styles(
+        let (_, label, _) = section_bar_styles(
             app.view.theme,
             ChatPanelFocus::Lobby,
             lobby_focused && lobby_list_focus == LobbyListFocus::Rooms,
         );
-        let room_count = app.room_select_items().len();
         let mut row = rooms_bar;
         draw_status_segment(&mut row, buf, label, " Rooms ");
-        draw_status_segment(&mut row, buf, detail, &format!(" {} ", room_count));
     }
 
     bar_rect_for(area, divider_rect).with(fill).fill(buf);
 
+    app.view.chrome.lobby_bar.call_button = Rect::EMPTY;
     let lobby_bar = bar_rect_for(area, user_list_rect);
     if lobby_bar.is_empty() {
         draw_lobby_audio_widget(Rect::EMPTY, app, fill, buf);
         return;
     }
 
-    let (_, label, detail) = section_bar_styles(
+    let (_, label, _) = section_bar_styles(
         app.view.theme,
         ChatPanelFocus::Lobby,
         lobby_focused && lobby_list_focus == LobbyListFocus::Users,
     );
-    let voice_label = match app
-        .room
-        .voice_room
-        .and_then(|room_id| app.room.room_meta(room_id))
-    {
-        Some(meta) => format!("voice: {} {}", meta.name, meta.voice_users.len()),
-        None => "voice: off".to_string(),
-    };
-    let viewed_room_name = app
-        .view
-        .viewed_room
-        .and_then(|room_id| app.room.room_meta(room_id))
-        .map(|room| room.name.as_str())
-        .unwrap_or(&app.room.room_name);
-    let participants = app.room.participant_snapshot(app.view.viewed_room);
     let mut row = lobby_bar;
-    draw_status_segment(&mut row, buf, label, " Lobby ");
-    draw_status_segment(
-        &mut row,
-        buf,
-        detail,
-        &format!(
-            " {} | in call {}/{} | {} ",
-            viewed_room_name,
-            participants.online_count(),
-            participants.entries.len(),
-            voice_label
-        ),
-    );
+    draw_status_segment(&mut row, buf, label, " Call ");
+    let (button_label, button_style) = if app.room.voice_room.is_some() {
+        (
+            " LEAVE ",
+            app.view.theme.status_section.patch(app.view.theme.muted),
+        )
+    } else {
+        (
+            " JOIN ",
+            top_bar_active_button_style(app.view.theme, app.view.theme.good),
+        )
+    };
+    app.view.chrome.lobby_bar.call_button =
+        draw_status_segment_right(&mut row, buf, button_style | Modifier::BOLD, button_label);
     draw_lobby_audio_widget(row, app, fill, buf);
 }
 
@@ -1302,9 +1287,8 @@ fn bar_rect_for(bar: Rect, source: Rect) -> Rect {
     .intersect(bar)
 }
 
-/// The audio health widget on the right of the lobby bar: compact device
-/// names while healthy, recovery state plus a clickable `[reset]` button
-/// while a stream is reconnecting or waiting for a device.
+/// Audio errors on the right of the lobby bar, plus a clickable `[reset]`
+/// button while a stream is reconnecting or waiting for a device.
 fn draw_lobby_audio_widget(
     remaining: Rect,
     app: &mut RenderState<'_>,
@@ -1325,37 +1309,21 @@ fn draw_lobby_audio_widget(
     if let Some(text) = audio_health_status_text("spk", spk.state) {
         trouble.push(text);
     }
-    if !trouble.is_empty() {
-        app.view.chrome.lobby_bar.audio_reset = draw_status_segment_right(
-            &mut right,
-            buf,
-            theme.status_section.patch(theme.warn) | Modifier::BOLD,
-            " [reset] ",
-        );
-        app.view.chrome.lobby_bar.audio_widget = draw_status_segment_right(
-            &mut right,
-            buf,
-            fill.patch(theme.warn),
-            &format!(" {} ", trouble.join(" | ")),
-        );
+    if trouble.is_empty() {
         return;
     }
 
-    let mut devices = Vec::new();
-    if let Some(name) = spk.device_name.as_deref() {
-        devices.push(format!("spk:{}", truncate_device_name(name)));
-    }
-    if let Some(name) = mic.device_name.as_deref() {
-        devices.push(format!("mic:{}", truncate_device_name(name)));
-    }
-    if devices.is_empty() {
-        return;
-    }
+    app.view.chrome.lobby_bar.audio_reset = draw_status_segment_right(
+        &mut right,
+        buf,
+        theme.status_section.patch(theme.warn) | Modifier::BOLD,
+        " [reset] ",
+    );
     app.view.chrome.lobby_bar.audio_widget = draw_status_segment_right(
         &mut right,
         buf,
-        fill.patch(theme.muted),
-        &format!(" {} ", devices.join(" | ")),
+        fill.patch(theme.warn),
+        &format!(" {} ", trouble.join(" | ")),
     );
 }
 
@@ -1370,35 +1338,15 @@ fn audio_health_status_text(prefix: &str, state: AudioHealthState) -> Option<Str
     }
 }
 
-fn truncate_device_name(name: &str) -> String {
-    const MAX_CHARS: usize = 14;
-    if name.chars().count() <= MAX_CHARS {
-        return name.to_string();
-    }
-    let head: String = name.chars().take(MAX_CHARS.saturating_sub(1)).collect();
-    format!("{head}…")
-}
-
 fn draw_chat_log_bar(area: Rect, app: &RenderState<'_>, focus: ChatPanelFocus, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
     let focused = focus == ChatPanelFocus::ChatLog;
-    let (fill, label, detail) =
-        section_bar_styles(app.view.theme, ChatPanelFocus::ChatLog, focused);
+    let (fill, label, _) = section_bar_styles(app.view.theme, ChatPanelFocus::ChatLog, focused);
     area.with(fill).fill(buf);
     let mut row = area;
-    draw_status_segment(&mut row, buf, label, " Chat Log ");
-    draw_status_segment(
-        &mut row,
-        buf,
-        detail,
-        &format!(
-            " {} msg/{} rows ",
-            app.view.active.chat.len(),
-            app.view.active.chat.total_lines_estimate()
-        ),
-    );
+    draw_status_segment(&mut row, buf, label, " Chat ");
 }
 
 fn draw_compose_bar(
@@ -1459,7 +1407,7 @@ fn section_bar_styles(theme: Theme, panel: ChatPanelFocus, focused: bool) -> (St
         )
     } else {
         let dim = fill.patch(theme.subtle);
-        (fill, dim, dim)
+        (fill, theme.status_section_inactive, dim)
     }
 }
 
@@ -1872,6 +1820,20 @@ mod tests {
         assert!(deaf.bg().is_some());
         assert_ne!(live.bg(), mute.bg());
         assert_ne!(mute.bg(), deaf.bg());
+    }
+
+    #[test]
+    fn inactive_status_mode_names_use_inactive_section_theme_slot() {
+        let theme = Theme::tomorrow_night();
+
+        for panel in [
+            ChatPanelFocus::Lobby,
+            ChatPanelFocus::ChatLog,
+            ChatPanelFocus::Compose,
+        ] {
+            let (_, label, _) = section_bar_styles(theme, panel, false);
+            assert_eq!(label, theme.status_section_inactive);
+        }
     }
 
     #[test]

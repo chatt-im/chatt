@@ -1668,6 +1668,21 @@ impl RoomMode {
             {
                 cx.send(CoreCommand::AudioManualReset);
             }
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
+                if crate::tui::form::rect_contains(
+                    cx.view.chrome.lobby_bar.call_button,
+                    mouse.column,
+                    mouse.row,
+                ) =>
+            {
+                if cx.session.voice_room.is_some() {
+                    cx.send(CoreCommand::LeaveVoice);
+                } else if let Some(room_id) = cx.view.viewed_room {
+                    cx.send(CoreCommand::JoinVoice(room_id));
+                } else {
+                    cx.set_status("no room selected");
+                }
+            }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_lobby_bar => {
                 self.set_focus_cx(cx, ChatPanelFocus::Lobby);
                 self.divider_drag = Some(DividerDrag::LobbyBar {
@@ -3791,7 +3806,7 @@ mod tests {
                 layout.user_list_rect.x + 1,
                 layout.lobby_bar_rect.y
             ),
-            "L",
+            "C",
         );
         assert_eq!(layout.room_hits.len(), 3);
         assert!(
