@@ -327,6 +327,7 @@ fn on_wayland() -> bool {
 }
 
 /// Filters helper output listing MIME types down to supported `image/*` types.
+#[cfg(target_os = "linux")]
 fn parse_image_mimes(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
     let mut mimes = Vec::new();
@@ -341,6 +342,7 @@ fn parse_image_mimes(bytes: &[u8]) -> Vec<String> {
 
 /// Parses a `text/uri-list` body into local file paths, dropping comments and
 /// non-`file://` entries.
+#[cfg(target_os = "linux")]
 fn parse_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
     let text = String::from_utf8_lossy(bytes);
     let mut paths = Vec::new();

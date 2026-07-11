@@ -360,7 +360,9 @@ mod imp {
 
     /// Reads exactly `buf.len()` bytes, bounding the whole read by `deadline`
     /// so a peer trickling one byte per timeout window cannot hold the
-    /// connection open indefinitely.
+    /// connection open indefinitely. Readiness polling is used instead of
+    /// resetting `SO_RCVTIMEO`: Darwin rejects that socket option after the
+    /// peer disconnects, even while its buffered response remains readable.
     fn read_full(
         stream: &mut UnixStream,
         buf: &mut [u8],
