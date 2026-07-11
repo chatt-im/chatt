@@ -73,6 +73,7 @@ theme = "tomorrow-night"
 # background.bg = "surface"
 # accent.fg = "sky"
 # status-fill = { fg = "#cccccc", bg = "#202030" }
+# scrollbar = { fg = "#cccccc", bg = "#202030" }
 # [ui.themes.midnight.syntax]
 # keyword = "#c792ea"
 

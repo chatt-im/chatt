@@ -383,6 +383,7 @@ palette.violet = "#c792ea"
 background.bg = "surface"
 accent.fg = "sky"
 status-fill = { fg = "#cccccc", bg = "#202030" }
+scrollbar = { fg = "#cccccc", bg = "#202030" }
 
 [ui.themes.midnight.syntax]
 keyword = "violet"
@@ -408,7 +409,9 @@ reserved. The overridable slot names match the theme's roles — surfaces
 foreground roles (`text`, `muted`, `subtle`, `accent`, `good`, `warn`, `error`),
 chat lines (`local-line`, `selected-line`, `chat-visual-line`,
 `chat-cursor-line`, `room-selected`), the status bar
-(`status-fill`, `status-section`) and composer frame (`composer-border`), inputs (`join-input-active`,
+(`status-fill`, `status-section`), composer frame (`composer-border`), and
+scrollbars (`scrollbar`, where `fg` colors the thumb and `bg` colors the
+gutter), inputs (`join-input-active`,
 `join-input-inactive`, `join-input-boundary-active`), form rows (`row-focused`,
 `selected-focused`), mode badges (`mode-server-select`, `mode-server-edit`,
 `mode-compose`, `mode-log`, `mode-settings`), editor selection

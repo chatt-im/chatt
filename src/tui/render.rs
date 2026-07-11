@@ -8,7 +8,7 @@ use extui::{
     AnsiColor, Buffer, Cell, CursorShape, DisplayRect, Ellipsis, HAlign, Rect, Style, vt::Modifier,
 };
 use extui_bindings::LayerId;
-use extui_editor::Mode as EditorMode;
+use extui_editor::{Editor, Mode as EditorMode};
 use rpc::ids::FileTransferId;
 use unicode_width::UnicodeWidthStr;
 
@@ -28,10 +28,12 @@ use crate::{
     config::Config,
     theme::{self, Theme},
     tui::{
+        editor::composer_visual_position,
         history_search::HistorySearch,
         mode::ViewCx,
         modes::{LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
         view::ClientView,
+        widgets::{SCROLLBAR_UNITS_PER_CELL, ScrollbarGeometry, ScrollbarLayout, ScrollbarState},
     },
     ui,
     ui::select::FuzzySelect,
@@ -321,18 +323,22 @@ pub(crate) fn draw_room_screen(
         search.sync(&app.view.active.chat);
     }
     let max_bottom_rows = screen.h.saturating_sub(4 + frame_rows);
-    let composer_height = match history_search.as_deref() {
-        Some(search) => (search.matches().len().saturating_add(1) as u16).clamp(
-            1,
-            app.config
-                .ui
-                .max_composer_height
-                .max(2)
-                .min(max_bottom_rows.max(1)),
-        ),
-        None => composer_height(app, composer_width, max_bottom_rows),
+    let composer_layout = match history_search.as_deref() {
+        Some(search) => ComposerLayout {
+            height: (search.matches().len().saturating_add(1) as u16).clamp(
+                1,
+                app.config
+                    .ui
+                    .max_composer_height
+                    .max(2)
+                    .min(max_bottom_rows.max(1)),
+            ),
+            editor_width: composer_width,
+            overflow: false,
+        },
+        None => composer_layout(app, composer_width, max_bottom_rows, composer_padding),
     };
-    let mut composer_frame = screen.take_bottom((composer_height + frame_rows) as i32);
+    let mut composer_frame = screen.take_bottom((composer_layout.height + frame_rows) as i32);
     layout.composer_frame_rect = composer_frame;
     let top_border = if composer_padding {
         composer_frame.take_top(1)
@@ -348,6 +354,8 @@ pub(crate) fn draw_room_screen(
     let mut composer_editor_area = composer_area;
     if composer_padding {
         composer_editor_area.take_left(1);
+        composer_editor_area.take_right(1);
+    } else if composer_layout.overflow {
         composer_editor_area.take_right(1);
     }
     layout.composer_rect = if history_search.is_some() {
@@ -381,22 +389,80 @@ pub(crate) fn draw_room_screen(
     if let Some(search) = history_search {
         draw_history_search(composer_area, app, search, composer_padding, buf);
     } else {
-        draw_composer(composer_area, app, focus, composer_padding, buf);
+        debug_assert_eq!(composer_editor_area.w, composer_layout.editor_width);
+        draw_composer(composer_editor_area, app, focus, buf);
     }
     draw_composer_border(bottom_border, app.view.theme, "▄", buf);
+    if composer_layout.overflow
+        && let Some(scroll) = composer_scroll_state(&app.view.composer, composer_editor_area)
+    {
+        let frame = layout.composer_frame_rect;
+        let scrollbar_rect = Rect {
+            x: frame.x + frame.w - 1,
+            y: frame.y,
+            w: 1,
+            h: frame.h,
+        };
+        layout.composer_scrollbar = Some(ScrollbarLayout {
+            rect: scrollbar_rect,
+            state: scroll,
+        });
+        draw_composer_scrollbar(scrollbar_rect, scroll, app.view.theme, buf);
+    }
     draw_key_preview(key_preview_area, app, buf);
 }
 
-fn composer_height(app: &mut RenderState<'_>, width: u16, max_rows: u16) -> u16 {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComposerLayout {
+    height: u16,
+    editor_width: u16,
+    overflow: bool,
+}
+
+fn composer_layout(
+    app: &mut RenderState<'_>,
+    available_width: u16,
+    max_rows: u16,
+    padded: bool,
+) -> ComposerLayout {
     if max_rows == 0 {
-        return 0;
+        return ComposerLayout {
+            height: 0,
+            editor_width: available_width,
+            overflow: false,
+        };
     }
-    app.view.composer.resize(width.max(1));
-    let floor = app.view.composer_min_rows.unwrap_or(1).max(1);
+
+    let mut editor_width = available_width;
+    app.view.composer.resize(editor_width.max(1));
+    let mut desired = app.view.composer.desired_height();
+    let mut height = composer_height(app, desired, max_rows);
+    let mut overflow = desired > height;
+
+    // A padded composer already has a right gutter. In borderless mode, only
+    // narrow the editor once overflow proves that the scrollbar is needed.
+    if overflow && !padded && editor_width > 1 {
+        editor_width -= 1;
+        app.view.composer.resize(editor_width);
+        desired = app.view.composer.desired_height();
+        height = composer_height(app, desired, max_rows);
+        overflow = desired > height;
+    } else if overflow && !padded {
+        // Preserve the sole text column in degenerate terminal widths.
+        overflow = false;
+    }
+
+    ComposerLayout {
+        height,
+        editor_width,
+        overflow,
+    }
+}
+
+fn composer_height(app: &RenderState<'_>, desired: u16, max_rows: u16) -> u16 {
     let config_cap = app.config.ui.max_composer_height.max(1);
-    let desired = app.view.composer.desired_height();
-    let height = if app.view.composer_min_rows.is_some() {
-        desired.max(floor)
+    let height = if let Some(rows) = app.view.composer_rows {
+        rows.max(1)
     } else {
         desired.min(config_cap)
     };
@@ -1816,6 +1882,111 @@ mod tests {
     }
 
     #[test]
+    fn composer_scrollbar_uses_full_frame_and_snaps_to_ends() {
+        let theme = Theme::base16_dark();
+        let area = Rect {
+            x: 2,
+            y: 1,
+            w: 5,
+            h: 4,
+        };
+        let x = area.x + area.w - 1;
+        let mut buf = Buffer::new(10, 7);
+        let cell = |buf: &mut Buffer, y: u16| {
+            let grid = buf.current();
+            grid.cells()[(usize::from(y) * usize::from(grid.width())) + usize::from(x)]
+        };
+
+        draw_composer_scrollbar(
+            area,
+            ScrollbarState {
+                total: 8,
+                viewport: 4,
+                offset: 0,
+            },
+            theme,
+            &mut buf,
+        );
+        assert_eq!(cell(&mut buf, area.y).text_inline(), Some("█"));
+        assert_eq!(cell(&mut buf, area.y + 1).text_inline(), Some("█"));
+        assert_eq!(cell(&mut buf, area.y + 2).text_inline(), Some(" "));
+        assert_eq!(cell(&mut buf, area.y + 3).text_inline(), Some(" "));
+
+        draw_composer_scrollbar(
+            area,
+            ScrollbarState {
+                total: 8,
+                viewport: 4,
+                offset: 4,
+            },
+            theme,
+            &mut buf,
+        );
+        assert_eq!(cell(&mut buf, area.y).text_inline(), Some(" "));
+        assert_eq!(cell(&mut buf, area.y + 1).text_inline(), Some(" "));
+        assert_eq!(cell(&mut buf, area.y + 2).text_inline(), Some("█"));
+        assert_eq!(cell(&mut buf, area.y + 3).text_inline(), Some("█"));
+    }
+
+    #[test]
+    fn composer_scrollbar_minimum_thumb_has_eighth_cell_edge_gaps() {
+        let theme = Theme::base16_dark();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 3,
+        };
+        let x = area.x + area.w - 1;
+        let mut buf = Buffer::new(3, 3);
+        let cell = |buf: &mut Buffer, y: u16| {
+            let grid = buf.current();
+            grid.cells()[(usize::from(y) * usize::from(grid.width())) + usize::from(x)]
+        };
+
+        draw_composer_scrollbar(
+            area,
+            ScrollbarState {
+                total: 100,
+                viewport: 1,
+                offset: 1,
+            },
+            theme,
+            &mut buf,
+        );
+        assert_eq!(cell(&mut buf, 0).text_inline(), Some("▇"));
+        assert_eq!(cell(&mut buf, 0).style().fg(), theme.scrollbar.fg());
+        assert_eq!(cell(&mut buf, 0).style().bg(), theme.scrollbar.bg());
+        assert_eq!(cell(&mut buf, 1).text_inline(), Some(" "));
+
+        draw_composer_scrollbar(
+            area,
+            ScrollbarState {
+                total: 100,
+                viewport: 1,
+                offset: 98,
+            },
+            theme,
+            &mut buf,
+        );
+        assert_eq!(cell(&mut buf, 1).text_inline(), Some(" "));
+        assert_eq!(cell(&mut buf, 2).text_inline(), Some("▁"));
+
+        draw_composer_scrollbar(
+            area,
+            ScrollbarState {
+                total: 100,
+                viewport: 1,
+                offset: 99,
+            },
+            theme,
+            &mut buf,
+        );
+        assert_eq!(cell(&mut buf, 1).text_inline(), Some(" "));
+        assert_eq!(cell(&mut buf, 2).text_inline(), Some("▇"));
+    }
+
+    #[test]
     fn latency_estimate_sums_buffer_and_half_rtt() {
         // jitter buffer 60 + ring 10 + rtt 40/2 = 90.
         assert_eq!(
@@ -2473,19 +2644,9 @@ fn draw_segment_with_highlights(
     }
 }
 
-fn draw_composer(
-    mut area: Rect,
-    app: &mut RenderState<'_>,
-    focus: ChatPanelFocus,
-    padded: bool,
-    buf: &mut Buffer,
-) {
+fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, buf: &mut Buffer) {
     if area.is_empty() {
         return;
-    }
-    if padded {
-        area.take_left(1);
-        area.take_right(1);
     }
     app.view.composer.resize(area.w.max(1));
     app.view
@@ -2504,6 +2665,72 @@ fn draw_composer(
         area.with(app.view.theme.subtle.without_bg())
             .with(Ellipsis(true))
             .text(buf, &composer_placeholder(room_name));
+    }
+}
+
+/// Recovers the editor's private visual-row scroll offset after rendering.
+/// The cursor is always inside the viewport, so its absolute visual row minus
+/// its rendered row is the viewport's first visible row.
+fn composer_scroll_state(editor: &Editor, area: Rect) -> Option<ScrollbarState> {
+    if area.is_empty() {
+        return None;
+    }
+    let (_, cursor_y) = editor.cursor_position(area)?;
+    let text = editor.text();
+    let tabstop = editor.tab_settings().tabstop.max(1);
+    let cursor_row = composer_visual_position(
+        &text,
+        editor.cursor_offset() as usize,
+        area.w.max(1),
+        tabstop,
+    )
+    .0 as u32;
+    let viewport = u32::from(area.h);
+    let total = u32::from(editor.desired_height()).max(viewport);
+    let offset = cursor_row
+        .saturating_sub(u32::from(cursor_y.saturating_sub(area.y)))
+        .min(total.saturating_sub(viewport));
+    Some(ScrollbarState {
+        total,
+        viewport,
+        offset,
+    })
+}
+
+/// Draws a thick composer scrollbar in eighth-cell virtual units. The right
+/// edge of `area` is a dedicated themed gutter; unlike extui's generic widget,
+/// the track includes the composer's optional border rows.
+fn draw_composer_scrollbar(area: Rect, scroll: ScrollbarState, theme: Theme, buf: &mut Buffer) {
+    let Some(geometry) = ScrollbarGeometry::new(area.h, scroll) else {
+        return;
+    };
+
+    const BLOCKS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+    let style = theme.scrollbar;
+    let x = area.x + area.w - 1;
+    let thumb_end = geometry.thumb_start + geometry.thumb_units;
+
+    let blank = Cell::new_unchecked(" ", style);
+    for row in 0..area.h {
+        let y = area.y + row;
+        let cell_start = u32::from(row) * SCROLLBAR_UNITS_PER_CELL;
+        let cell_end = cell_start + SCROLLBAR_UNITS_PER_CELL;
+        let overlap_start = cell_start.max(geometry.thumb_start);
+        let overlap_end = cell_end.min(thumb_end);
+        let coverage = overlap_end.saturating_sub(overlap_start);
+
+        let cell = match coverage {
+            0 => blank,
+            SCROLLBAR_UNITS_PER_CELL => Cell::new_unchecked(BLOCKS[8], style),
+            coverage if overlap_start == cell_start => {
+                let uncovered_at_bottom = (SCROLLBAR_UNITS_PER_CELL - coverage) as usize;
+                Cell::new_unchecked(BLOCKS[uncovered_at_bottom], style)
+                    .with_style_merged(Modifier::REVERSED.into())
+            }
+            coverage => Cell::new_unchecked(BLOCKS[coverage as usize], style),
+        };
+        buf.set_cell(x, y, cell);
     }
 }
 

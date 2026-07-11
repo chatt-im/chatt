@@ -51,11 +51,11 @@ pub(crate) struct ClientView {
     pub participant_selected_user: Option<UserId>,
     pub composer: Editor,
     pub composer_hl: EditorHighlighter,
-    /// A minimum composer height, in rows, set by dragging the Chat Log bar.
+    /// A fixed composer height, in rows, set by dragging the Chat Log bar.
     /// In-memory only (never persisted to config); `None` restores the
     /// content-driven default. Survives sending so a dragged-taller composer
     /// does not collapse back to one line once its message clears.
-    pub composer_min_rows: Option<u16>,
+    pub composer_rows: Option<u16>,
     command_completion: CommandCompletionState,
     ref_completion: RefCompletionState,
     /// Which binding set the composer was built with, deciding how an edit
@@ -125,7 +125,7 @@ impl ClientView {
             participant_selected_user: None,
             composer,
             composer_hl,
-            composer_min_rows: None,
+            composer_rows: None,
             command_completion: CommandCompletionState::default(),
             ref_completion: RefCompletionState::default(),
             bindings,

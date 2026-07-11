@@ -3,7 +3,6 @@ use extui::{Buffer, Rect};
 use extui_bindings::{InputKey, LayerId};
 use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
@@ -16,6 +15,7 @@ use crate::{
     settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft},
     theme,
     tui::{
+        editor::{composer_offset_at_visual_row, composer_visual_position},
         form::{FormAction, FormFieldKind, FormMouseIntent, FormState},
         history_search::{HistorySearch, SearchAction},
         mode::{
@@ -25,6 +25,7 @@ use crate::{
         overlay::{ConfirmDisposition, ConfirmMode, DialogMode, PasteImageUploadMode},
         room_settings::RoomSettingsMode,
         user_list::UserListMode,
+        widgets::{SCROLLBAR_UNITS_PER_CELL, ScrollbarGeometry, ScrollbarLayout},
     },
     ui::{
         select::FuzzySelect,
@@ -1085,6 +1086,7 @@ pub(crate) struct RoomLayout {
     pub composer_rect: Rect,
     /// Composer editor plus its optional half-block frame and side gutters.
     pub composer_frame_rect: Rect,
+    pub composer_scrollbar: Option<ScrollbarLayout>,
     pub compose_bar_rect: Rect,
 }
 
@@ -1103,6 +1105,7 @@ impl Default for RoomLayout {
             chat_log_bar_rect: Rect::EMPTY,
             composer_rect: Rect::EMPTY,
             composer_frame_rect: Rect::EMPTY,
+            composer_scrollbar: None,
             compose_bar_rect: Rect::EMPTY,
         }
     }
@@ -1118,6 +1121,7 @@ impl RoomLayout {
         self.chat_log_bar_rect = Rect::EMPTY;
         self.composer_rect = Rect::EMPTY;
         self.composer_frame_rect = Rect::EMPTY;
+        self.composer_scrollbar = None;
         self.compose_bar_rect = Rect::EMPTY;
     }
 
@@ -1176,29 +1180,41 @@ fn move_composer_cursor_to_click(editor: &mut Editor, area: Rect, column: u16, r
     editor.set_cursor_offset(best.1 as u32);
 }
 
-fn composer_visual_position(text: &str, offset: usize, width: u16, tabstop: u16) -> (usize, u16) {
-    let width = width.max(1);
-    let mut row = 0usize;
-    let mut col = 0u16;
-    for (start, grapheme) in text.grapheme_indices(true) {
-        if start >= offset {
-            break;
-        }
-        if grapheme == "\n" {
-            row += 1;
-            col = 0;
-            continue;
-        }
-        let cells = if grapheme == "\t" {
-            tabstop - col % tabstop
-        } else {
-            UnicodeWidthStr::width(grapheme).min(u16::MAX as usize) as u16
-        };
-        let visual = u32::from(col) + u32::from(cells);
-        row += (visual / u32::from(width)) as usize;
-        col = (visual % u32::from(width)) as u16;
+/// Moves the cursor just far enough for extui-editor to establish `target` as
+/// the viewport's first visible visual row on the next render.
+fn scroll_composer_to_offset(
+    editor: &mut Editor,
+    area: Rect,
+    current: u32,
+    target: u32,
+    viewport: u32,
+) {
+    if area.is_empty() || current == target {
+        return;
     }
-    (row, col)
+    let cursor_row = if target < current {
+        target
+    } else {
+        target.saturating_add(viewport.saturating_sub(1))
+    } as usize;
+    let text = editor.text();
+    let offset = composer_offset_at_visual_row(
+        &text,
+        cursor_row,
+        area.w.max(1),
+        editor.tab_settings().tabstop.max(1),
+    );
+    editor.set_cursor_offset(offset as u32);
+}
+
+/// The scrollbar is painted in the terminal's last column. Accept the cell
+/// immediately to its left as well: several terminal/multiplexer combinations
+/// report right-edge clicks one column inward, and a one-cell target is brittle
+/// even when coordinates are exact.
+fn composer_scrollbar_contains(scrollbar: ScrollbarLayout, column: u16, row: u16) -> bool {
+    row >= scrollbar.rect.y
+        && row < scrollbar.rect.y.saturating_add(scrollbar.rect.h)
+        && (column == scrollbar.rect.x || column.saturating_add(1) == scrollbar.rect.x)
 }
 
 /// An in-progress divider drag started on one of the inner status bars. The
@@ -1216,12 +1232,19 @@ enum DividerDrag {
     ChatLogBar { anchor_row: u16, start_rows: u16 },
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ComposerScrollbarDrag {
+    grab_units: u32,
+    current_offset: u32,
+}
+
 #[derive(Debug)]
 pub(crate) struct RoomMode {
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     layout: RoomLayout,
     divider_drag: Option<DividerDrag>,
+    composer_scrollbar_drag: Option<ComposerScrollbarDrag>,
     history_search: Option<HistorySearch>,
     last_history_search: Option<HistorySearch>,
 }
@@ -1239,6 +1262,7 @@ impl RoomMode {
             lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
             divider_drag: None,
+            composer_scrollbar_drag: None,
             history_search: None,
             last_history_search: None,
         }
@@ -1251,6 +1275,7 @@ impl RoomMode {
             lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
             divider_drag: None,
+            composer_scrollbar_drag: None,
             history_search: None,
             last_history_search: None,
         }
@@ -1635,6 +1660,10 @@ impl RoomMode {
             mouse.column,
             mouse.row,
         );
+        let composer_scrollbar = self
+            .layout
+            .composer_scrollbar
+            .filter(|scrollbar| composer_scrollbar_contains(*scrollbar, mouse.column, mouse.row));
         let transfer_hit = cx
             .view
             .chrome
@@ -1650,6 +1679,11 @@ impl RoomMode {
                 if let Some(transfer_id) = transfer_hit {
                     cx.send(CoreCommand::CancelTransfer(transfer_id));
                 }
+            }
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
+                if composer_scrollbar.is_some() =>
+            {
+                self.start_composer_scrollbar_drag(cx, composer_scrollbar.unwrap(), mouse.row);
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_composer => {
                 self.enter_compose_insert_mode(cx);
@@ -1767,6 +1801,16 @@ impl RoomMode {
                 }
             }
             extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
+                if self.composer_scrollbar_drag.is_some() =>
+            {
+                self.drag_composer_scrollbar(cx, mouse.row);
+            }
+            extui::event::MouseEventKind::Up(extui::event::MouseButton::Left)
+                if self.composer_scrollbar_drag.is_some() =>
+            {
+                self.composer_scrollbar_drag = None;
+            }
+            extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
                 if self.divider_drag.is_some() =>
             {
                 self.drag_divider(cx, mouse.row);
@@ -1801,6 +1845,77 @@ impl RoomMode {
             _ => {}
         }
         Action::Continue
+    }
+
+    fn start_composer_scrollbar_drag(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        scrollbar: ScrollbarLayout,
+        row: u16,
+    ) {
+        let Some(geometry) = ScrollbarGeometry::new(scrollbar.rect.h, scrollbar.state) else {
+            return;
+        };
+        self.enter_compose_insert_mode(cx);
+        let relative_row = row
+            .clamp(
+                scrollbar.rect.y,
+                scrollbar.rect.y + scrollbar.rect.h.saturating_sub(1),
+            )
+            .saturating_sub(scrollbar.rect.y);
+        let cell_start = u32::from(relative_row) * SCROLLBAR_UNITS_PER_CELL;
+        let cell_end = cell_start + SCROLLBAR_UNITS_PER_CELL;
+        let pointer = cell_start + SCROLLBAR_UNITS_PER_CELL / 2;
+        let thumb_end = geometry.thumb_start + geometry.thumb_units;
+        let on_thumb = cell_start < thumb_end && cell_end > geometry.thumb_start;
+        let grab_units = if on_thumb {
+            pointer
+                .saturating_sub(geometry.thumb_start)
+                .min(geometry.thumb_units)
+        } else {
+            geometry.thumb_units / 2
+        };
+        self.composer_scrollbar_drag = Some(ComposerScrollbarDrag {
+            grab_units,
+            current_offset: scrollbar.state.offset,
+        });
+        if !on_thumb {
+            self.drag_composer_scrollbar(cx, row);
+        }
+    }
+
+    fn drag_composer_scrollbar(&mut self, cx: &mut ViewCx<'_>, row: u16) {
+        let (Some(scrollbar), Some(mut drag)) =
+            (self.layout.composer_scrollbar, self.composer_scrollbar_drag)
+        else {
+            self.composer_scrollbar_drag = None;
+            return;
+        };
+        let Some(geometry) = ScrollbarGeometry::new(scrollbar.rect.h, scrollbar.state) else {
+            self.composer_scrollbar_drag = None;
+            return;
+        };
+        let bottom = scrollbar.rect.y + scrollbar.rect.h.saturating_sub(1);
+        let thumb_start = if row <= scrollbar.rect.y {
+            0
+        } else if row >= bottom {
+            geometry.travel
+        } else {
+            let relative_row = row.saturating_sub(scrollbar.rect.y);
+            let pointer =
+                u32::from(relative_row) * SCROLLBAR_UNITS_PER_CELL + SCROLLBAR_UNITS_PER_CELL / 2;
+            pointer.saturating_sub(drag.grab_units).min(geometry.travel)
+        };
+        let target = geometry.offset_for_thumb_start(thumb_start);
+        scroll_composer_to_offset(
+            &mut cx.view.composer,
+            self.layout.composer_rect,
+            drag.current_offset,
+            target,
+            scrollbar.state.viewport,
+        );
+        drag.current_offset = target;
+        self.composer_scrollbar_drag = Some(drag);
     }
 
     /// Resolves a screen cell to the URL of a link under it, if any. Returns an
@@ -1941,11 +2056,11 @@ impl RoomMode {
             }) => {
                 // Dragging up grows the compose window; it and the chat log
                 // share their rows. The dragged height becomes the composer's
-                // new floor and is allowed past `max_composer_height`.
+                // fixed viewport and is allowed past `max_composer_height`.
                 let delta = i32::from(anchor_row) - i32::from(row);
                 let budget = i32::from(start_rows) + i32::from(self.layout.chat_rect.h);
                 let rows = (i32::from(start_rows) + delta).clamp(1, (budget - 1).max(1)) as u16;
-                cx.view.composer_min_rows = Some(rows);
+                cx.view.composer_rows = Some(rows);
             }
             None => {}
         }
@@ -3700,7 +3815,7 @@ mod tests {
     }
 
     #[test]
-    fn drag_chat_log_bar_sets_composer_floor_that_survives_send() {
+    fn drag_chat_log_bar_sets_composer_height_that_survives_send() {
         let mut app = test_app();
         let mut room = RoomMode::default();
         let mut buffer = Buffer::new(80, 24);
@@ -3734,17 +3849,49 @@ mod tests {
             ),
         );
 
-        assert_eq!(app.view.composer_min_rows, Some(target));
+        assert_eq!(app.view.composer_rows, Some(target));
         render_room(&mut app, &mut room, &mut buffer);
         assert_eq!(room.layout().composer_rect.h, target);
 
-        // The floor persists once the message clears on send.
+        // The chosen height persists once the message clears on send.
         type_text(&mut room, &mut app, "hello");
         app.view.submit_composer();
         assert!(app.view.composer.text().is_empty());
-        assert_eq!(app.view.composer_min_rows, Some(target));
+        assert_eq!(app.view.composer_rows, Some(target));
         render_room(&mut app, &mut room, &mut buffer);
         assert_eq!(room.layout().composer_rect.h, target);
+    }
+
+    #[test]
+    fn dragging_scrolled_composer_sets_exact_viewport_height() {
+        let mut app = test_app();
+        app.config.ui.max_composer_height = 2;
+        app.view.composer.set_lines("one\ntwo\nthree\nfour\nfive");
+        let end = app.view.composer.text_len();
+        app.view.composer.set_cursor_offset(end);
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(room.layout().composer_rect.h, 2);
+
+        let bar_row = room.layout().chat_log_bar_rect.y;
+        let column = room.layout().chat_log_bar_rect.x;
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), column, bar_row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), column, bar_row - 1),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), column, bar_row - 1),
+        );
+
+        assert_eq!(app.view.composer_rows, Some(3));
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(room.layout().composer_rect.h, 3);
     }
 
     #[test]
@@ -3816,7 +3963,182 @@ mod tests {
     }
 
     #[test]
-    fn composer_floor_is_clamped_by_current_terminal_height() {
+    fn padded_overflow_scrollbar_uses_right_gutter_and_border_rows() {
+        let mut app = test_app();
+        app.config.ui.max_composer_height = 2;
+        app.view.composer.set_lines("one\ntwo\nthree\nfour");
+        let mut room = RoomMode::default();
+        let width = 40u16;
+        let mut buffer = Buffer::new(width, 20);
+
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let editor = room.layout().composer_rect;
+        let frame = room.layout().composer_frame_rect;
+        assert_eq!(editor.w, frame.w - 2);
+        assert_eq!(editor.h, 2);
+        let scrollbar_x = frame.x + frame.w - 1;
+        let cell = |grid: &extui::Grid, x: u16, y: u16| {
+            grid.cells()[(usize::from(y) * usize::from(width)) + usize::from(x)]
+        };
+        let grid = buffer.current();
+        assert_ne!(cell(grid, scrollbar_x, frame.y).text_inline(), Some("▀"));
+        assert_eq!(
+            cell(grid, scrollbar_x, frame.y).style().bg(),
+            app.view.theme.scrollbar.bg()
+        );
+        assert_eq!(
+            cell(grid, scrollbar_x, frame.y + frame.h - 1).text_inline(),
+            Some(" ")
+        );
+
+        let end = app.view.composer.text_len();
+        app.view.composer.set_cursor_offset(end);
+        render_room(&mut app, &mut room, &mut buffer);
+        let grid = buffer.current();
+        assert_eq!(cell(grid, scrollbar_x, frame.y).text_inline(), Some(" "));
+        assert_ne!(
+            cell(grid, scrollbar_x, frame.y + frame.h - 1).text_inline(),
+            Some("▄")
+        );
+    }
+
+    #[test]
+    fn clicking_composer_scrollbar_track_jumps_to_that_end() {
+        let mut app = test_app();
+        app.config.ui.max_composer_height = 2;
+        app.view
+            .composer
+            .set_lines("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(40, 20);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let scrollbar = room.layout().composer_scrollbar.unwrap();
+        assert_eq!(scrollbar.state.offset, 0);
+        let x = scrollbar.rect.x;
+        let bottom = scrollbar.rect.y + scrollbar.rect.h - 1;
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), x, bottom),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), x, bottom),
+        );
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let scrollbar = room.layout().composer_scrollbar.unwrap();
+        assert_eq!(
+            scrollbar.state.offset,
+            scrollbar.state.total - scrollbar.state.viewport
+        );
+    }
+
+    #[test]
+    fn clicking_large_composer_scrollbar_maps_across_full_buffer() {
+        let mut app = test_app();
+        app.config.ui.max_composer_height = 6;
+        let text = (0..2000)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.view.composer.set_lines(&text);
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let scrollbar = room.layout().composer_scrollbar.unwrap();
+        let middle = scrollbar.rect.y + scrollbar.rect.h / 2;
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                scrollbar.rect.x - 1,
+                middle,
+            ),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                scrollbar.rect.x - 1,
+                middle,
+            ),
+        );
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let scrollbar = room.layout().composer_scrollbar.unwrap();
+        assert!(
+            scrollbar.state.offset > 500,
+            "offset was {}",
+            scrollbar.state.offset
+        );
+        assert!(
+            scrollbar.state.offset < 1500,
+            "offset was {}",
+            scrollbar.state.offset
+        );
+    }
+
+    #[test]
+    fn dragging_composer_scrollbar_thumb_scrolls_to_bottom() {
+        let mut app = test_app();
+        app.config.ui.max_composer_height = 2;
+        app.view
+            .composer
+            .set_lines("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(40, 20);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let scrollbar = room.layout().composer_scrollbar.unwrap();
+        let x = scrollbar.rect.x;
+        let top = scrollbar.rect.y;
+        let bottom = scrollbar.rect.y + scrollbar.rect.h - 1;
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), x, top),
+        );
+        assert!(room.composer_scrollbar_drag.is_some());
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), x, bottom),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), x, bottom),
+        );
+        assert!(room.composer_scrollbar_drag.is_none());
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let scrollbar = room.layout().composer_scrollbar.unwrap();
+        assert_eq!(
+            scrollbar.state.offset,
+            scrollbar.state.total - scrollbar.state.viewport
+        );
+    }
+
+    #[test]
+    fn borderless_overflow_reserves_one_column_only_while_needed() {
+        let mut app = test_app();
+        app.config.ui.composer_padding = false;
+        app.config.ui.max_composer_height = 2;
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(40, 20);
+
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(room.layout().composer_rect.w, 40);
+
+        app.view.composer.set_lines("one\ntwo\nthree");
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(room.layout().composer_frame_rect.w, 40);
+        assert_eq!(room.layout().composer_rect.w, 39);
+        assert_eq!(room.layout().composer_rect.h, 2);
+    }
+
+    #[test]
+    fn composer_height_is_clamped_by_current_terminal_height() {
         let mut app = test_app();
         let mut room = RoomMode::default();
         let mut tall = Buffer::new(80, 30);
@@ -3845,7 +4167,7 @@ mod tests {
                 bar_row - (target - 1),
             ),
         );
-        assert_eq!(app.view.composer_min_rows, Some(target));
+        assert_eq!(app.view.composer_rows, Some(target));
 
         let mut short = Buffer::new(80, 12);
         render_room(&mut app, &mut room, &mut short);
@@ -3861,7 +4183,7 @@ mod tests {
     fn overlarge_resize_preserves_lobby_row_bar_and_chat_row() {
         let mut app = test_app();
         app.config.ui.room_height = 100;
-        app.view.composer_min_rows = Some(100);
+        app.view.composer_rows = Some(100);
         let mut room = RoomMode::default();
         let mut buffer = Buffer::new(80, 12);
 
@@ -3874,17 +4196,17 @@ mod tests {
     }
 
     #[test]
-    fn manual_composer_floor_does_not_cap_taller_content() {
+    fn manual_composer_height_caps_taller_content() {
         let mut app = test_app();
         app.config.ui.max_composer_height = 2;
-        app.view.composer_min_rows = Some(3);
+        app.view.composer_rows = Some(3);
         app.view.composer.set_lines("a\nb\nc\nd\ne");
         let mut room = RoomMode::default();
         let mut buffer = Buffer::new(80, 24);
 
         render_room(&mut app, &mut room, &mut buffer);
 
-        assert_eq!(room.layout().composer_rect.h, 5);
+        assert_eq!(room.layout().composer_rect.h, 3);
     }
 
     #[test]
