@@ -704,9 +704,13 @@ pub(crate) struct ScreencastProgress {
     pub(crate) rolling_bytes_per_sec: u64,
 }
 
-/// An event delivered from a worker thread to the UI thread over the single
-/// application event channel.
+/// An event delivered to the core thread over the single application event
+/// channel.
 pub(crate) enum AppEvent {
+    ClientCommand {
+        client_id: crate::client_channel::ClientId,
+        command: command::CoreCommand,
+    },
     Network(NetworkEvent),
     NetworkFor {
         generation: u64,
@@ -1615,7 +1619,16 @@ impl App {
                 commit,
                 focus_column,
             } => self.drive_settings(&mut session, intent, commit, focus_column),
+            SettingsOp::SetTab(tab) => self.set_settings_tab(&mut session, tab),
+            SettingsOp::CycleTab(delta) => {
+                let tab = session.tab.cycle(delta);
+                self.set_settings_tab(&mut session, tab);
+            }
             SettingsOp::MoveFocus(delta) => self.move_settings_focus(&mut session, delta),
+            SettingsOp::MoveFocusInsert(delta) => {
+                self.move_settings_focus(&mut session, delta);
+                session.form.enter_insert_mode();
+            }
             SettingsOp::MoveSelection(delta) => {
                 self.move_settings_selection(&mut session, delta);
             }
@@ -1798,6 +1811,9 @@ impl App {
     pub(crate) fn handle_app_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Network(event) => self.handle_network_event(event),
+            AppEvent::ClientCommand { .. } => {
+                unreachable!("client commands are handled by the runtime")
+            }
             AppEvent::NetworkFor { generation, event } => {
                 if self.active_network_generation == Some(generation) {
                     self.handle_network_event(event);
@@ -4566,9 +4582,26 @@ impl App {
             return;
         }
         let commit = session.form.move_focus(delta);
-        if commit.is_some() {
-            self.drive_settings(session, FieldIntent::None, commit, None);
+        // Replay even without an editor commit: the destination may not have
+        // been registered in the initial headless state yet, and this keeps
+        // focus relocation plus rendering in one core update.
+        self.drive_settings(session, FieldIntent::None, commit, None);
+    }
+
+    /// Switches the active settings tab: commits any live editor text first so
+    /// the leaving tab's field applies, then replays the logic pass so the new
+    /// tab's fields register (focus lands on its first field automatically).
+    fn set_settings_tab(
+        &mut self,
+        session: &mut SettingsSession,
+        tab: crate::ui::settings::SettingsTab,
+    ) {
+        if session.tab == tab {
+            return;
         }
+        let commit = session.form.clear_text();
+        session.tab = tab;
+        self.drive_settings(session, FieldIntent::None, commit, None);
     }
 
     /// Replays the immediate-mode settings form to apply `intent` (and any
@@ -4585,6 +4618,7 @@ impl App {
         let output = crate::ui::settings::settings_logic(
             &mut session.form,
             &mut session.draft,
+            session.tab,
             &self.view.theme,
             &self.config.bindings,
             session.dirty,
@@ -4655,6 +4689,7 @@ impl App {
         }
         let old = self.config.audio.clone();
         let old_web = self.config.web.clone();
+        let old_files = self.config.files.clone();
         let old_p2p_enabled = self.config.p2p.enabled;
         let old_history_enabled = self.config.history.enabled;
         self.config.audio = session.draft.to_audio();
@@ -4663,13 +4698,11 @@ impl App {
         self.config.files = session.draft.to_files(&self.config.files);
         self.config.p2p = session.draft.to_p2p(&self.config.p2p);
         self.config.history = session.draft.to_history();
-        self.apply_web_setting(&old_web);
+        self.apply_ui_settings(session);
+        self.apply_web_setting(&old_web, old_files.max_upload_bytes());
         self.apply_p2p_setting(old_p2p_enabled);
         self.apply_history_setting(old_history_enabled);
-        // The memory cap and the network file policy are runtime effects that
-        // commit together on Save (see `save_settings`), so the live config, the
-        // ring, and the network worker never disagree about the download mode
-        // mid-edit.
+        self.apply_file_settings(&old_files);
         self.apply_echo_cancellation_setting();
         self.apply_output_volume_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
@@ -4700,7 +4733,7 @@ impl App {
         self.mark_daemon_config_changed();
     }
 
-    fn apply_web_setting(&mut self, old: &config::WebConfig) {
+    fn apply_web_setting(&mut self, old: &config::WebConfig, old_max_upload_bytes: u64) {
         if old.enabled && !self.config.web.enabled {
             if let Some(feed) = self.web_feed.take() {
                 feed.stop();
@@ -4717,6 +4750,19 @@ impl App {
             if let Some(feed) = self.web_feed.take() {
                 feed.stop();
             }
+        }
+
+        // Behavior-only changes reach the running server and its connected
+        // browsers over the feed channel; no restart.
+        let web = &self.config.web;
+        let max_upload_bytes = self.config.files.max_upload_bytes();
+        if let Some(feed) = &self.web_feed
+            && (old.readonly != web.readonly
+                || old.autoplay != web.autoplay
+                || old.viewer != web.viewer
+                || old_max_upload_bytes != max_upload_bytes)
+        {
+            feed.set_config(web.readonly, web.autoplay, web.viewer, max_upload_bytes);
         }
 
         if self.config.web.enabled && self.web_feed.is_none() {
@@ -4740,6 +4786,54 @@ impl App {
                     self.set_error("web log server failed to start".to_string());
                 }
             }
+        }
+    }
+
+    /// Applies the interface knobs and url-open command live. Layout fields
+    /// are read from the config per frame, so updating the config plus the
+    /// daemon sync is enough; a max-messages change retrims scrollback now.
+    fn apply_ui_settings(&mut self, session: &SettingsSession) {
+        let old_max_messages = self.config.ui.max_messages;
+        let ui = session.draft.to_ui(&self.config.ui);
+        let ui_changed = ui.room_height != self.config.ui.room_height
+            || ui.max_composer_height != self.config.ui.max_composer_height
+            || ui.composer_padding != self.config.ui.composer_padding
+            || ui.max_messages != self.config.ui.max_messages
+            || ui.overscan != self.config.ui.overscan;
+        if ui_changed {
+            self.config.ui = ui;
+            self.mark_daemon_config_changed();
+        }
+        if old_max_messages != self.config.ui.max_messages {
+            self.apply_max_messages();
+        }
+        let url_open = session.draft.url_open_clean();
+        if url_open != self.config.url_open {
+            self.config.url_open = url_open;
+            self.mark_daemon_config_changed();
+        }
+    }
+
+    /// Applies file-transfer settings live: the memory ring re-caps, the
+    /// network worker's resolved policy refreshes, and the upload throttle
+    /// re-paces as soon as a field commits.
+    fn apply_file_settings(&mut self, old: &config::FileConfig) {
+        let files = self.config.files.clone();
+        if old.download_memory_mb != files.download_memory_mb {
+            self.download_store.set_cap(files.download_memory_bytes());
+        }
+        if old.download != files.download
+            || old.download_dir != files.download_dir
+            || old.max_download_mb != files.max_download_mb
+            || old.max_upload_mb != files.max_upload_mb
+        {
+            self.push_file_policy();
+        }
+        if old.upload_rate_bytes != files.upload_rate_bytes && self.network.is_some() {
+            self.send_network_command(
+                NetworkCommand::SetUploadRate(files.upload_rate_bytes),
+                false,
+            );
         }
     }
 
@@ -5821,10 +5915,9 @@ impl App {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 session.dirty = false;
+                // Idempotent re-application; the live-apply path already synced
+                // these when the fields committed.
                 self.apply_max_messages();
-                // Commit the download runtime effects together: the memory ring
-                // cap and the network worker's file policy flip on Save, so the
-                // UI, the ring, and the worker stay consistent.
                 self.download_store
                     .set_cap(self.config.files.download_memory_bytes());
                 self.push_file_policy();
@@ -5835,7 +5928,7 @@ impl App {
     }
 
     /// Refreshes the network worker's resolved download policy after a config
-    /// save. The join-time advertisement to the server updates on reconnect.
+    /// change. The join-time advertisement to the server updates on reconnect.
     pub(crate) fn push_file_policy(&mut self) {
         if self.network.is_none() {
             return;
@@ -9114,6 +9207,174 @@ mod tests {
 
         assert!(settings_session.lock().unwrap().dirty);
         assert_ne!(app.config.audio.bitrate_bps, before);
+    }
+
+    #[test]
+    fn latency_text_edit_commits_via_key_flow() {
+        let mut app = test_app();
+        let form = FormState::new(
+            crate::ui::settings::field_id_for("Latency", "Min Delay"),
+            app.config.ui.default_bindings,
+        );
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings_session = app.room.settings.clone().expect("settings session");
+        settings_session.lock().unwrap().draft.show_advanced = true;
+
+        // The first key finds an empty field order, so the focus move is a
+        // no-op that still runs a logic pass, registering the advanced fields
+        // and seeding the editor for the focused row.
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            settings_session.lock().unwrap().form.focus(),
+            crate::ui::settings::field_id_for("Latency", "Min Delay"),
+        );
+
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::empty()),
+        );
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        let session = settings_session.lock().unwrap();
+        assert_eq!(session.draft.latency_ms.neteq_min_delay_ms, "205");
+    }
+
+    #[test]
+    fn alt_l_and_alt_h_cycle_settings_tabs_and_relocate_focus() {
+        use crate::ui::settings::SettingsTab;
+
+        let mut app = test_app();
+        let form = FormState::new(
+            crate::ui::settings::capture_device_id(),
+            app.config.ui.default_bindings,
+        );
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings_session = app.room.settings.clone().expect("settings session");
+        assert_eq!(settings_session.lock().unwrap().tab, SettingsTab::Audio);
+
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+        );
+        {
+            let session = settings_session.lock().unwrap();
+            assert_eq!(session.tab, SettingsTab::Interface);
+            // The Audio-only device row vanished, so focus fell to the new
+            // tab's first field.
+            assert_ne!(
+                session.form.focus(),
+                crate::ui::settings::capture_device_id()
+            );
+        }
+
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT),
+        );
+        assert_eq!(settings_session.lock().unwrap().tab, SettingsTab::Audio);
+
+        // Cycling does not dirty the draft: no config value changed.
+        assert!(!settings_session.lock().unwrap().dirty);
+    }
+
+    #[test]
+    fn tab_and_backtab_cycle_settings_tabs() {
+        use crate::ui::settings::SettingsTab;
+
+        let mut app = test_app();
+        let form = FormState::new(
+            crate::ui::settings::capture_device_id(),
+            app.config.ui.default_bindings,
+        );
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings_session = app.room.settings.clone().expect("settings session");
+
+        mode.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(settings_session.lock().unwrap().tab, SettingsTab::Interface);
+
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        );
+        let session = settings_session.lock().unwrap();
+        assert_eq!(session.tab, SettingsTab::Audio);
+        assert!(!session.dirty);
+    }
+
+    #[test]
+    fn vim_insert_enter_advances_to_next_list_row_in_insert_mode() {
+        let mut app = test_app();
+        let first_row = crate::ui::settings::field_id_for("Advanced", "Origin 1");
+        let form = FormState::new(first_row, crate::config::FormBindings::Vim);
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings_session = app.room.settings.clone().expect("settings session");
+        settings_session.lock().unwrap().draft.show_advanced = true;
+
+        // Register the Interface fields and seed the focused editor in normal
+        // mode, then enter insert mode and type a valid origin.
+        settings_session.lock().unwrap().tab = crate::ui::settings::SettingsTab::Interface;
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        for character in "https://chat.example.test".chars() {
+            mode.process_input(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::empty()),
+            );
+        }
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        let mut session = settings_session.lock().unwrap();
+        assert_eq!(
+            session.form.focus(),
+            crate::ui::settings::field_id_for("Advanced", "Origin 2")
+        );
+        assert_eq!(session.form.editor_mut().mode(), EditorMode::Insert);
+    }
+
+    #[test]
+    fn alt_l_cycles_tabs_while_a_text_field_is_focused() {
+        use crate::ui::settings::SettingsTab;
+
+        let mut app = test_app();
+        let form = FormState::new(
+            crate::ui::settings::field_id_for("Playback Settings", "Output Volume"),
+            app.config.ui.default_bindings,
+        );
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings_session = app.room.settings.clone().expect("settings session");
+
+        // Register fields and seed the focused row's editor.
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+        );
+
+        // The chord is intercepted before the editor sees the key, while a
+        // plain bracket still types into the field.
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+        );
+        assert_eq!(settings_session.lock().unwrap().tab, SettingsTab::Interface);
     }
 
     #[test]

@@ -30,7 +30,7 @@ use rpc::{
     video::{self, SharedVideoFrame},
 };
 
-use crate::config::{WebAutoplay, WebConfig};
+use crate::config::{WebAutoplay, WebConfig, WebViewer};
 use crate::receive_store::{DownloadStore, Source};
 use crate::web_wire::{self, Fragment, split_fragments};
 
@@ -480,6 +480,14 @@ enum WebFeed {
     /// forwarded to browsers as a binary WebSocket message without re-framing.
     /// Shared so the fast-start cache and the WebSocket writer never copy it.
     VideoFrame(SharedVideoFrame),
+    /// Replaces the browser behavior settings and re-broadcasts the config
+    /// envelope, so a running server tracks live settings edits.
+    Config {
+        readonly: bool,
+        autoplay: WebAutoplay,
+        viewer: WebViewer,
+        max_upload_bytes: u64,
+    },
     Stop,
 }
 
@@ -692,6 +700,24 @@ impl WebFeedSender {
         self.wake.wake();
     }
 
+    /// Replaces the browser behavior settings on the running server and
+    /// re-broadcasts the config envelope to every connected browser.
+    pub fn set_config(
+        &self,
+        readonly: bool,
+        autoplay: WebAutoplay,
+        viewer: WebViewer,
+        max_upload_bytes: u64,
+    ) {
+        let _ = self.tx.send(WebFeed::Config {
+            readonly,
+            autoplay,
+            viewer,
+            max_upload_bytes,
+        });
+        self.wake.wake();
+    }
+
     pub fn stop(&self) {
         let _ = self.tx.send(WebFeed::Stop);
         self.wake.wake();
@@ -882,7 +908,7 @@ pub fn spawn_with_upload_limit(
 
     let (tx, rx) = mpsc::channel();
     let autoplay = cfg.autoplay;
-    let viewer_in_seperate_browser_tab = cfg.viewer_in_seperate_browser_tab;
+    let viewer = cfg.viewer;
     thread::Builder::new()
         .name("web-server".to_string())
         .spawn(move || {
@@ -893,7 +919,7 @@ pub fn spawn_with_upload_limit(
                 web_requests,
                 readonly,
                 autoplay,
-                viewer_in_seperate_browser_tab,
+                viewer,
                 max_upload_bytes,
                 room_name,
             )
@@ -914,10 +940,10 @@ fn run(
     rx: Receiver<WebFeed>,
     max_messages: usize,
     web_requests: Sender<WebRequest>,
-    readonly: bool,
-    autoplay: WebAutoplay,
-    viewer_in_seperate_browser_tab: bool,
-    max_upload_bytes: u64,
+    mut readonly: bool,
+    mut autoplay: WebAutoplay,
+    mut viewer: WebViewer,
+    mut max_upload_bytes: u64,
     mut room_name: String,
 ) {
     // Open uploads keyed by connection and browser-assigned id, each an
@@ -998,7 +1024,7 @@ fn run(
                             &config_envelope(
                                 readonly,
                                 autoplay,
-                                viewer_in_seperate_browser_tab,
+                                viewer,
                                 max_upload_bytes,
                                 &room_name,
                             ),
@@ -1538,6 +1564,22 @@ fn run(
                         let _ = server.send_websocket_text(*id, &payload);
                     }
                 }
+                Ok(WebFeed::Config {
+                    readonly: new_readonly,
+                    autoplay: new_autoplay,
+                    viewer: new_viewer,
+                    max_upload_bytes: new_max_upload_bytes,
+                }) => {
+                    readonly = new_readonly;
+                    autoplay = new_autoplay;
+                    viewer = new_viewer;
+                    max_upload_bytes = new_max_upload_bytes;
+                    let payload =
+                        config_envelope(readonly, autoplay, viewer, max_upload_bytes, &room_name);
+                    for id in &clients {
+                        let _ = server.send_websocket_text(*id, &payload);
+                    }
+                }
                 Ok(WebFeed::ShareAvailable { stream_id, payload }) => {
                     active_shares.insert(stream_id, payload.clone());
                     for id in &clients {
@@ -1699,11 +1741,12 @@ fn ref_preview_frame(ts: u64, mid: u64, history: &[WebMessage]) -> Vec<u8> {
     web_wire::encode_ref_preview(ts, mid, found)
 }
 
-/// The JSON envelope sent on connect with browser behavior settings and room name.
+/// The JSON envelope sent on connect (and re-sent on live settings changes)
+/// with browser behavior settings and room name.
 fn config_envelope(
     readonly: bool,
     autoplay: WebAutoplay,
-    viewer_in_seperate_browser_tab: bool,
+    viewer: WebViewer,
     max_upload_bytes: u64,
     room_name: &str,
 ) -> String {
@@ -1711,7 +1754,7 @@ fn config_envelope(
         type: "config",
         readonly: readonly,
         autoplay: autoplay.wire_name(),
-        viewer_in_seperate_browser_tab: viewer_in_seperate_browser_tab,
+        viewer: viewer.wire_name(),
         max_upload_bytes: max_upload_bytes,
         room_name: room_name,
     }
@@ -3201,7 +3244,7 @@ Sec-WebSocket-Version: 13\r\n\
             bind: "127.0.0.1:0".to_string(),
             allowed_origins: Vec::new(),
             autoplay: WebAutoplay::WithAudio,
-            viewer_in_seperate_browser_tab: true,
+            viewer: WebViewer::Tab,
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let sender = spawn_with_upload_limit(
@@ -3227,10 +3270,48 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(text.contains("\"readonly\":true"), "{text}");
         assert!(text.contains("\"autoplay\":\"with-audio\""), "{text}");
         assert!(text.contains("\"room_name\":\"lobby\""), "{text}");
-        assert!(
-            text.contains("\"viewer_in_seperate_browser_tab\":true"),
-            "{text}"
-        );
+        assert!(text.contains("\"viewer\":\"tab\""), "{text}");
+    }
+
+    #[test]
+    fn set_config_rebroadcasts_envelope_to_connected_browser() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let sender = spawn_with_upload_limit(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            100,
+            web_tx,
+            true,
+            rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            "lobby".to_string(),
+        )
+        .unwrap();
+
+        let mut stream = open_ws(sender.local_addr());
+        let (opcode, _sync) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x2);
+        let (opcode, config) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        let text = String::from_utf8(config).unwrap();
+        assert!(text.contains("\"readonly\":true"), "{text}");
+        assert!(text.contains("\"viewer\":\"panel\""), "{text}");
+
+        sender.set_config(false, WebAutoplay::Muted, WebViewer::Tab, 123);
+        let (opcode, config) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        let text = String::from_utf8(config).unwrap();
+        assert!(text.contains("\"config\""), "{text}");
+        assert!(text.contains("\"readonly\":false"), "{text}");
+        assert!(text.contains("\"autoplay\":\"muted\""), "{text}");
+        assert!(text.contains("\"viewer\":\"tab\""), "{text}");
+        assert!(text.contains("\"max_upload_bytes\":123"), "{text}");
+        assert!(text.contains("\"room_name\":\"lobby\""), "{text}");
     }
 
     #[test]

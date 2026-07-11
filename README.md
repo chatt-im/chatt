@@ -224,8 +224,8 @@ from the side panel into separate browser tabs:
 allowed-origins = ["https://chat.example.test"]
 # false (default), true (muted), or "with-audio"
 autoplay = "with-audio"
-# false (default) keeps the side panel; true opens one preview per browser tab
-viewer-in-seperate-browser-tab = false
+# "panel" (default) keeps the side panel; "tab" opens one preview per browser tab
+viewer = "panel"
 ```
 
 The web server permits native WebSocket clients without an `Origin` header.
@@ -297,6 +297,12 @@ Useful in-app slash commands:
 - `/soundboard` and `/sound N|name`: list or trigger configured soundboard clips.
 - `/settings` or `/config`: open settings.
 - `/clear`: clear the local chat view.
+
+The settings screen is split into four tabs (Audio, Interface, Data, Extra);
+`Alt-l` and `Alt-h` cycle between them (even while a text field is focused),
+and the tab bar is clickable. Tabs with low-level rows end with a
+`Show Advanced` toggle that reveals them for the session. The detail panel
+notes each setting's default value.
 
 The default key bindings are in `chatt.toml` under `[bindings.*]`. A bindings
 table can set `inherit = ["name", ...]` to pull in another table's bindings

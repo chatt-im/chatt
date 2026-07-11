@@ -1,16 +1,30 @@
 use crate::audio::{DenoiseConfig, DredConfig};
-use crate::config::{FormBindings, ThemeSelection};
+use crate::config::{
+    AudioConfig, AudioLatencyConfig, CandidatePrivacy, DEFAULT_MAX_AMPLIFICATION, FileConfig,
+    FormBindings, MAX_NOTIFICATION_VOLUME_DB, MIN_NOTIFICATION_VOLUME_DB, ThemeSelection, UiConfig,
+    WebAutoplay, WebConfig, WebViewer, default_url_open,
+};
 use crate::{
-    audio::StatsSnapshot,
+    audio::{
+        CAPTURE_LONG_SILENCE_STOP_MS_RANGE, CAPTURE_SILENCE_PREROLL_MS_RANGE,
+        CAPTURE_SILENCE_RAMP_MS_RANGE, DEVICE_PERIOD_MARGIN_MS_RANGE, HARD_QUEUE_BOUND_MS_RANGE,
+        INITIAL_BUFFER_MS_RANGE, MAX_REORDER_DELAY_MS_RANGE, NETEQ_BASE_MINIMUM_DELAY_MS_RANGE,
+        NETEQ_MAX_DELAY_MS_RANGE, NETEQ_MIN_DELAY_MS_RANGE, NETEQ_START_DELAY_MS_RANGE,
+        StatsSnapshot,
+    },
     bindings::{self, BindCommand, BindingRuntime},
     settings::{
         AudioDeviceItem, AudioDevicePickerState, AudioInputItem, AudioInputPickerState,
         AudioOutputItem, AudioOutputPickerState, BITRATES, DENOISE_RELEASE_LABELS,
         DENOISE_RELEASES, DENOISE_SUPPRESSION_LABELS, DENOISE_SUPPRESSIONS,
-        DENOISE_TYPING_VAD_LABELS, DENOISE_TYPING_VAD_THRESHOLDS, MAX_AMPLIFICATIONS,
-        NOTIFICATION_VOLUMES_DB, SettingsDraft, buffer_field_error, download_path_error,
-        form_bindings_label, output_volume_field_error, raw_device_error, raw_device_selection,
-        selected_audio_input_label, selected_audio_output_label, volume_db_label, web_bind_error,
+        DENOISE_TYPING_VAD_LABELS, DENOISE_TYPING_VAD_THRESHOLDS, MAX_AMPLIFICATION_DB_RANGE,
+        SettingsDraft, UI_MAX_COMPOSER_HEIGHT_RANGE, UI_MAX_MESSAGES_RANGE, UI_OVERSCAN_RANGE,
+        UI_ROOM_HEIGHT_RANGE, buffer_field_error, byte_size_error, download_path_error,
+        form_bindings_label, int_range_error, latency_ms_error, max_amplification_error,
+        notification_volume_error, output_volume_field_error, parse_db_value, positive_mib_error,
+        raw_device_error, raw_device_selection, selected_audio_input_label,
+        selected_audio_output_label, vad_level_error, volume_db_label, web_bind_error,
+        web_origin_error,
     },
     theme::Theme,
     tui::{
@@ -26,7 +40,7 @@ use extui::{Buffer, Ellipsis, HAlign, Rect, vt::Modifier};
 
 pub(crate) use crate::ui::form::{FieldId, FieldIntent};
 
-const LABEL_WIDTH: u16 = 18;
+const LABEL_WIDTH: u16 = 20;
 const DETAIL_WIDTH: u16 = 34;
 const MIN_DETAIL_SCREEN_WIDTH: u16 = 92;
 const MIN_PICKER_ROWS: u16 = 3;
@@ -50,11 +64,89 @@ pub(crate) fn initial_focus() -> FieldId {
     capture_device_id()
 }
 
+/// Whether `field` is one of the two trailing list-entry rows. These rows are
+/// committed on the first text change so the next blank row can appear while
+/// the user keeps typing in the same editor.
+pub(crate) fn is_list_add_field(draft: &SettingsDraft, field: FieldId) -> bool {
+    field == FieldId::new("Links", &format!("Open Arg {}", draft.url_open.len() + 1))
+        || field
+            == FieldId::new(
+                "Advanced",
+                &format!("Origin {}", draft.web_allowed_origins.len() + 1),
+            )
+}
+
 /// Builds the id for an arbitrary section/label pair. Used by tests that drive
 /// the form without running the full declaration pass.
 #[cfg(test)]
 pub(crate) fn field_id_for(section: &str, label: &str) -> FieldId {
     FieldId::new(section, label)
+}
+
+/// The four settings tabs. Every row lives on exactly one tab; both the draw
+/// and logic passes gate on the session's active tab so field registration
+/// stays identical between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingsTab {
+    Audio,
+    Interface,
+    Data,
+    Extra,
+}
+
+impl SettingsTab {
+    pub(crate) const ALL: [SettingsTab; 4] = [
+        SettingsTab::Audio,
+        SettingsTab::Interface,
+        SettingsTab::Data,
+        SettingsTab::Extra,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Audio => "Audio",
+            SettingsTab::Interface => "Interface",
+            SettingsTab::Data => "Data",
+            SettingsTab::Extra => "Extra",
+        }
+    }
+
+    pub(crate) fn cycle(self, delta: isize) -> SettingsTab {
+        let index = Self::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .unwrap_or_default();
+        let len = Self::ALL.len() as isize;
+        let index = (index as isize + delta).rem_euclid(len) as usize;
+        Self::ALL[index]
+    }
+}
+
+/// Draws the tab bar as flat colored segments and returns each segment's rect
+/// for mouse hit testing.
+pub(crate) fn draw_settings_tabs(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    active: SettingsTab,
+) -> [Rect; 4] {
+    area.with(theme.background).fill(buf);
+    let mut rects = [Rect::EMPTY; 4];
+    let mut row = area;
+    for (index, tab) in SettingsTab::ALL.into_iter().enumerate() {
+        let label = tab.label();
+        let segment = row.take_left(label.len() as i32 + 2);
+        let style = if tab == active {
+            theme.mode_settings
+        } else {
+            theme.status_section_inactive
+        };
+        buf.clear_rect(segment, style);
+        segment.with(style).with(HAlign::Center).text(buf, label);
+        rects[index] = segment;
+        row.take_left(1);
+    }
+    rects
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +184,7 @@ pub(crate) struct SettingsOutput {
 enum FocusDetail {
     Option {
         current: String,
+        default: Option<String>,
         error: Option<String>,
         help: &'static str,
     },
@@ -227,6 +320,23 @@ impl<'a> SettingsForm<'a> {
         response
     }
 
+    fn adjustable_text(
+        &mut self,
+        label: &str,
+        value: &mut String,
+        validate: impl Fn(&str) -> Option<String>,
+        adjust: impl Fn(&str, isize) -> String,
+    ) -> crate::ui::form::Response {
+        let response = self.form.adjustable_text(label, value, &validate, adjust);
+        if response.changed() {
+            self.output.changed = true;
+        }
+        if response.is_focus() {
+            self.set_option_detail(value.clone(), validate(value));
+        }
+        response
+    }
+
     /// Records the help text for the focused field. Call from the `is_focus`
     /// guard of a widget. The widget already filled the current value and any
     /// validation error.
@@ -234,6 +344,69 @@ impl<'a> SettingsForm<'a> {
         if let Some(FocusDetail::Option { help: slot, .. }) = &mut self.detail {
             *slot = help;
         }
+    }
+
+    /// Records the default value shown under `Current` in the detail panel.
+    /// Call next to [`SettingsForm::set_help`] from the `is_focus` guard.
+    fn set_default(&mut self, default: impl Into<String>) {
+        if let Some(FocusDetail::Option { default: slot, .. }) = &mut self.detail {
+            *slot = Some(default.into());
+        }
+    }
+
+    /// A checkbox for session-only state: identical to
+    /// [`SettingsForm::checkbox`] but never marks the draft changed, so
+    /// toggling it cannot dirty the config or trigger a live resync.
+    fn transient_checkbox(&mut self, label: &str, value: &mut bool) -> crate::ui::form::Response {
+        let response = self.form.checkbox(label, value);
+        if response.is_focus() {
+            self.set_option_detail(if *value { "on" } else { "off" }.to_string(), None);
+        }
+        response
+    }
+
+    /// A one-item-per-row list field with one trailing blank numbered row.
+    /// Once that row receives text it is promoted into `items`; its stable
+    /// numbered id keeps the editor on it while the next blank row appears.
+    fn string_list(
+        &mut self,
+        label: &str,
+        items: &mut Vec<String>,
+        scratch: &mut String,
+        validate: impl Fn(&str) -> Option<String>,
+    ) -> crate::ui::form::Response {
+        let mut focused = false;
+        let mut changed = false;
+        let mut index = 0;
+        while index < items.len() {
+            let row_label = format!("{label} {}", index + 1);
+            let response = self.text(&row_label, &mut items[index], &validate);
+            focused |= response.is_focus();
+            if response.changed() && items[index].trim().is_empty() {
+                items.remove(index);
+                changed = true;
+                continue;
+            }
+            changed |= response.changed();
+            index += 1;
+        }
+        let add_label = format!("{label} {}", items.len() + 1);
+        let response =
+            self.form
+                .text_with_placeholder(&add_label, scratch, Some("add\u{2026}"), &validate);
+        focused |= response.is_focus();
+        if response.is_focus() {
+            self.set_option_detail(scratch.clone(), validate(scratch));
+        }
+        if response.changed() && !scratch.trim().is_empty() {
+            items.push(scratch.trim().to_string());
+            scratch.clear();
+            changed = true;
+        }
+        if changed {
+            self.output.changed = true;
+        }
+        self.form.respond(focused, changed)
     }
 
     /// A device picker row: an enumerated [`FormFieldKind::Select`], or a raw
@@ -315,30 +488,33 @@ impl<'a> SettingsForm<'a> {
         self.form.respond(focused, false)
     }
 
-    /// The trailing action-button row. Buttons share a
-    /// virtual row so left/right moves between them.
-    fn actions(&mut self) {
-        let specs = [
-            ActionButton {
-                key: "Refresh",
-                label: &self.action_labels.refresh,
-                value: SettingsButton::Refresh,
-                help: "Re-scan audio devices using the current buffer requests.",
-            },
-            ActionButton {
-                key: "Close",
-                label: &self.action_labels.close,
-                value: SettingsButton::Close,
-                help: "Return to chat without saving further changes.",
-            },
-            ActionButton {
-                key: "Save",
-                label: &self.action_labels.save,
-                value: SettingsButton::Save,
-                help: "Persist the draft to chatt.toml.",
-            },
-        ];
-        let response = self.form.actions(&specs);
+    /// The trailing action-button row. Buttons share a virtual row so
+    /// left/right moves between them. The device Refresh button only appears
+    /// on the Audio tab.
+    fn actions(&mut self, show_refresh: bool) {
+        let refresh = ActionButton {
+            key: "Refresh",
+            label: &self.action_labels.refresh,
+            value: SettingsButton::Refresh,
+            help: "Re-scan audio devices using the current buffer requests.",
+        };
+        let close = ActionButton {
+            key: "Close",
+            label: &self.action_labels.close,
+            value: SettingsButton::Close,
+            help: "Return to chat without saving further changes.",
+        };
+        let save = ActionButton {
+            key: "Save",
+            label: &self.action_labels.save,
+            value: SettingsButton::Save,
+            help: "Persist the draft to chatt.toml.",
+        };
+        let response = if show_refresh {
+            self.form.actions(&[refresh, close, save])
+        } else {
+            self.form.actions(&[close, save])
+        };
         if let Some(button) = response.activated {
             self.output.button = Some(button);
         }
@@ -353,6 +529,7 @@ impl<'a> SettingsForm<'a> {
     fn set_option_detail(&mut self, current: String, error: Option<String>) {
         self.detail = Some(FocusDetail::Option {
             current,
+            default: None,
             error,
             help: "",
         });
@@ -397,10 +574,53 @@ impl<'a> SettingsForm<'a> {
     }
 }
 
-/// Declares the whole settings form. The single place every field lives: one
-/// widget call per row carries its label, the `&mut` it mutates, its input
-/// kind, and (via the `is_focus` guard) its detail help.
+/// Declares the settings form for the active tab. The single place every
+/// field lives: one widget call per row carries its label, the `&mut` it
+/// mutates, its input kind, and (via the `is_focus` guard) its detail help
+/// and default. Both the draw and logic passes replay this with the same tab.
 fn settings_ui(
+    form: &mut SettingsForm,
+    draft: &mut SettingsDraft,
+    tab: SettingsTab,
+    input_items: &[AudioInputItem],
+    input_picker: &mut AudioInputPickerState,
+    output_items: &[AudioOutputItem],
+    output_picker: &mut AudioOutputPickerState,
+) {
+    match tab {
+        SettingsTab::Audio => audio_tab(
+            form,
+            draft,
+            input_items,
+            input_picker,
+            output_items,
+            output_picker,
+        ),
+        SettingsTab::Interface => interface_tab(form, draft),
+        SettingsTab::Data => data_tab(form, draft),
+        SettingsTab::Extra => extra_tab(form, draft),
+    }
+    form.form.spacer(1);
+    form.actions(tab == SettingsTab::Audio);
+}
+
+/// The shared `Advanced` section opener: a session-only toggle revealing the
+/// tab's low-level rows. Returns whether they should be declared.
+fn advanced_section(form: &mut SettingsForm, draft: &mut SettingsDraft) -> bool {
+    form.section("Advanced");
+    if form
+        .transient_checkbox("Show Advanced", &mut draft.show_advanced)
+        .is_focus()
+    {
+        form.set_help(
+            "Reveals this tab's low-level tuning rows. Session-only; never saved to the config.",
+        );
+        form.set_default("off");
+    }
+    draft.show_advanced
+}
+
+fn audio_tab(
     form: &mut SettingsForm,
     draft: &mut SettingsDraft,
     input_items: &[AudioInputItem],
@@ -422,7 +642,9 @@ fn settings_ui(
         form.set_help(
             "Type a raw ALSA device string (e.g. hw:0,0) instead of picking an enumerated device.",
         );
+        form.set_default("off");
     }
+    let audio_defaults = AudioConfig::default();
     if form
         .choice("Bitrate", &mut draft.bitrate_index, BITRATES.len(), |i| {
             format!("{} kbps", BITRATES[i] / 1000)
@@ -430,6 +652,7 @@ fn settings_ui(
         .is_focus()
     {
         form.set_help("Opus target bitrate for outgoing voice packets.");
+        form.set_default(format!("{} kbps", audio_defaults.bitrate_bps / 1000));
     }
     if form
         .choice_value(
@@ -441,6 +664,7 @@ fn settings_ui(
         .is_focus()
     {
         form.set_help("Noise suppression before encoding. Useful for fans and room noise.");
+        form.set_default(audio_defaults.denoise.label());
     }
     if form
         .choice_value("DRED", &mut draft.dred, &DredConfig::ALL, |dred| {
@@ -451,94 +675,33 @@ fn settings_ui(
         form.set_help(
             "Embed Opus DRED redundancy in outgoing voice so peers recover lost packets. Auto matches on for now.",
         );
+        form.set_default(audio_defaults.dred.label());
     }
     if form
         .checkbox("Echo Cancel", &mut draft.echo_cancellation)
         .is_focus()
     {
         form.set_help("Cancels speaker echo from the microphone path when supported.");
+        form.set_default("off");
     }
     if form
-        .choice(
+        .adjustable_text(
             "Max Gain",
-            &mut draft.amplification_index,
-            MAX_AMPLIFICATIONS.len(),
-            amplification_label,
+            &mut draft.max_amplification,
+            max_amplification_error,
+            |value, delta| {
+                adjust_db(
+                    value,
+                    delta,
+                    MAX_AMPLIFICATION_DB_RANGE,
+                    DEFAULT_MAX_AMPLIFICATION,
+                )
+            },
         )
         .is_focus()
     {
         form.set_help("Auto-gain ceiling for quiet microphones; 0 dB disables amplification.");
-    }
-
-    let denoise_disabled = draft.denoise_tuning_disabled();
-    form.enabled(denoise_disabled, |form| {
-        if form
-            .choice(
-                "Suppression",
-                &mut draft.suppression_index,
-                DENOISE_SUPPRESSIONS.len(),
-                |i| DENOISE_SUPPRESSION_LABELS[i].to_string(),
-            )
-            .is_focus()
-        {
-            form.set_help(
-                "RNNoise over-suppression of residual noise (typing, fans). off keeps stock denoising.",
-            );
-        }
-        if form
-            .choice("Release", &mut draft.release_index, DENOISE_RELEASES.len(), |i| {
-                DENOISE_RELEASE_LABELS[i].to_string()
-            })
-            .is_focus()
-        {
-            form.set_help(
-                "Smooths how fast RNNoise releases suppression, stopping noise swelling up after a pause.",
-            );
-        }
-        if form.checkbox("Typing Gate", &mut draft.typing_suppression).is_focus() {
-            form.set_help("Ducks loud low-VAD desk and keyboard thumps after RNNoise.");
-        }
-    });
-
-    let vad_disabled = draft.typing_vad_disabled();
-    form.enabled(vad_disabled, |form| {
-        let enter = form.choice(
-            "Gate Start",
-            &mut draft.typing_vad_enter_index,
-            DENOISE_TYPING_VAD_THRESHOLDS.len(),
-            |i| DENOISE_TYPING_VAD_LABELS[i].to_string(),
-        );
-        if enter.is_focus() {
-            form.set_help(
-                "Typing gate engages when Earshot VAD is below this threshold and acoustic guards match.",
-            );
-        }
-        if enter.changed() && draft.typing_vad_release_index < draft.typing_vad_enter_index {
-            draft.typing_vad_release_index = draft.typing_vad_enter_index;
-        }
-        let release = form.choice(
-            "Gate Release",
-            &mut draft.typing_vad_release_index,
-            DENOISE_TYPING_VAD_THRESHOLDS.len(),
-            |i| DENOISE_TYPING_VAD_LABELS[i].to_string(),
-        );
-        if release.is_focus() {
-            form.set_help("Typing gate releases only after Earshot VAD reaches this threshold.");
-        }
-        if release.changed() && draft.typing_vad_release_index < draft.typing_vad_enter_index {
-            draft.typing_vad_enter_index = draft.typing_vad_release_index;
-        }
-    });
-
-    if form
-        .text(
-            "Capture Buffer",
-            &mut draft.input_buffer,
-            buffer_field_error,
-        )
-        .is_focus()
-    {
-        form.set_help("Requested capture buffer in samples, or default for the host backend.");
+        form.set_default(format!("{:.0} dB", audio_defaults.max_amplification));
     }
 
     form.section(PLAYBACK_SECTION);
@@ -558,16 +721,7 @@ fn settings_ui(
         form.set_help(
             "Type a raw ALSA device string (e.g. hw:0,0) instead of picking an enumerated device.",
         );
-    }
-    if form
-        .text(
-            "Playback Buffer",
-            &mut draft.output_buffer,
-            buffer_field_error,
-        )
-        .is_focus()
-    {
-        form.set_help("Requested playback buffer in samples, or default for the host backend.");
+        form.set_default("off");
     }
     if form
         .text(
@@ -578,6 +732,153 @@ fn settings_ui(
         .is_focus()
     {
         form.set_help("Global playback volume. 100% is unchanged; the maximum is 130%.");
+        form.set_default("100%");
+    }
+    if form.checkbox("Loopback", &mut draft.loopback).is_focus() {
+        form.set_help(
+            "Plays your microphone back through the output device to test your setup. Turns off automatically when settings closes; use headphones to avoid feedback.",
+        );
+        form.set_default("off");
+    }
+
+    form.section("Notifications");
+    if form
+        .adjustable_text(
+            "Message Volume",
+            &mut draft.message_notification_volume,
+            notification_volume_error,
+            adjust_notification_db,
+        )
+        .is_focus()
+    {
+        form.set_help("Volume for incoming-message notification sounds.");
+        form.set_default(volume_db_label(0.0));
+    }
+    if form
+        .adjustable_text(
+            "Join Volume",
+            &mut draft.peer_join_notification_volume,
+            notification_volume_error,
+            adjust_notification_db,
+        )
+        .is_focus()
+    {
+        form.set_help("Volume for peer-joined notification sounds.");
+        form.set_default(volume_db_label(0.0));
+    }
+    if form
+        .adjustable_text(
+            "Leave Volume",
+            &mut draft.peer_leave_notification_volume,
+            notification_volume_error,
+            adjust_notification_db,
+        )
+        .is_focus()
+    {
+        form.set_help("Volume for peer-left notification sounds.");
+        form.set_default(volume_db_label(0.0));
+    }
+
+    if !advanced_section(form, draft) {
+        return;
+    }
+    if form
+        .text(
+            "Capture Buffer",
+            &mut draft.input_buffer,
+            buffer_field_error,
+        )
+        .is_focus()
+    {
+        form.set_help("Requested capture buffer in samples, or default for the host backend.");
+        form.set_default("default");
+    }
+    if form
+        .text(
+            "Playback Buffer",
+            &mut draft.output_buffer,
+            buffer_field_error,
+        )
+        .is_focus()
+    {
+        form.set_help("Requested playback buffer in samples, or default for the host backend.");
+        form.set_default("default");
+    }
+
+    let denoise_disabled = draft.denoise_tuning_disabled();
+    form.enabled(denoise_disabled, |form| {
+        if form
+            .choice(
+                "Suppression",
+                &mut draft.suppression_index,
+                DENOISE_SUPPRESSIONS.len(),
+                |i| DENOISE_SUPPRESSION_LABELS[i].to_string(),
+            )
+            .is_focus()
+        {
+            form.set_help(
+                "RNNoise over-suppression of residual noise (typing, fans). off keeps stock denoising.",
+            );
+            form.set_default(DENOISE_SUPPRESSION_LABELS[0]);
+        }
+        if form
+            .choice("Release", &mut draft.release_index, DENOISE_RELEASES.len(), |i| {
+                DENOISE_RELEASE_LABELS[i].to_string()
+            })
+            .is_focus()
+        {
+            form.set_help(
+                "Smooths how fast RNNoise releases suppression, stopping noise swelling up after a pause.",
+            );
+            form.set_default(DENOISE_RELEASE_LABELS[0]);
+        }
+        if form.checkbox("Typing Gate", &mut draft.typing_suppression).is_focus() {
+            form.set_help("Ducks loud low-VAD desk and keyboard thumps after RNNoise.");
+            form.set_default("off");
+        }
+    });
+
+    let vad_disabled = draft.typing_vad_disabled();
+    form.enabled(vad_disabled, |form| {
+        let enter = form.choice(
+            "Gate Start",
+            &mut draft.typing_vad_enter_index,
+            DENOISE_TYPING_VAD_THRESHOLDS.len(),
+            |i| DENOISE_TYPING_VAD_LABELS[i].to_string(),
+        );
+        if enter.is_focus() {
+            form.set_help(
+                "Typing gate engages when Earshot VAD is below this threshold and acoustic guards match.",
+            );
+            form.set_default("80%");
+        }
+        if enter.changed() && draft.typing_vad_release_index < draft.typing_vad_enter_index {
+            draft.typing_vad_release_index = draft.typing_vad_enter_index;
+        }
+        let release = form.choice(
+            "Gate Release",
+            &mut draft.typing_vad_release_index,
+            DENOISE_TYPING_VAD_THRESHOLDS.len(),
+            |i| DENOISE_TYPING_VAD_LABELS[i].to_string(),
+        );
+        if release.is_focus() {
+            form.set_help("Typing gate releases only after Earshot VAD reaches this threshold.");
+            form.set_default("82%");
+        }
+        if release.changed() && draft.typing_vad_release_index < draft.typing_vad_enter_index {
+            draft.typing_vad_enter_index = draft.typing_vad_release_index;
+        }
+    });
+
+    form.section("Latency");
+    if form
+        .checkbox("Silence Gate", &mut draft.latency.capture_silence_gate)
+        .is_focus()
+    {
+        form.set_help(
+            "Stops sending packets during capture silence so the receiver can expand and re-converge to a shallower buffer.",
+        );
+        form.set_default("on");
     }
     if form
         .checkbox("Render Assist", &mut draft.latency.render_assist)
@@ -586,61 +887,116 @@ fn settings_ui(
         form.set_help(
             "Pre-renders playout blocks off the audio callback thread. Enable only on devices too slow to decode within the callback; it adds output latency, so leave it off on capable hardware.",
         );
+        form.set_default("off");
     }
-    if form.checkbox("Loopback", &mut draft.loopback).is_focus() {
+    let latency_defaults = AudioLatencyConfig::default();
+    let cross = draft.latency_cross_error();
+    let rows: [(&str, &mut String, (u64, u64), u64, &'static str); 11] = [
+        (
+            "Start Delay",
+            &mut draft.latency_ms.neteq_start_delay_ms,
+            NETEQ_START_DELAY_MS_RANGE,
+            latency_defaults.neteq_start_delay_ms,
+            "NetEQ target delay when a stream starts, before interarrival statistics take over.",
+        ),
+        (
+            "Min Delay",
+            &mut draft.latency_ms.neteq_min_delay_ms,
+            NETEQ_MIN_DELAY_MS_RANGE,
+            latency_defaults.neteq_min_delay_ms,
+            "Floor for the learned NetEQ target delay.",
+        ),
+        (
+            "Base Min Delay",
+            &mut draft.latency_ms.neteq_base_minimum_delay_ms,
+            NETEQ_BASE_MINIMUM_DELAY_MS_RANGE,
+            latency_defaults.neteq_base_minimum_delay_ms,
+            "Application-requested minimum playout delay, like WebRTC's base minimum.",
+        ),
+        (
+            "Max Delay",
+            &mut draft.latency_ms.neteq_max_delay_ms,
+            NETEQ_MAX_DELAY_MS_RANGE,
+            latency_defaults.neteq_max_delay_ms,
+            "Ceiling for the learned NetEQ target delay.",
+        ),
+        (
+            "Queue Bound",
+            &mut draft.latency_ms.hard_queue_bound_ms,
+            HARD_QUEUE_BOUND_MS_RANGE,
+            latency_defaults.hard_queue_bound_ms,
+            "Hard cap on buffered audio; packets beyond this are dropped to bound worst-case latency.",
+        ),
+        (
+            "Initial Buffer",
+            &mut draft.latency_ms.initial_buffer_ms,
+            INITIAL_BUFFER_MS_RANGE,
+            latency_defaults.initial_buffer_ms,
+            "Audio buffered before playback starts on a fresh stream.",
+        ),
+        (
+            "Reorder Delay",
+            &mut draft.latency_ms.max_reorder_delay_ms,
+            MAX_REORDER_DELAY_MS_RANGE,
+            latency_defaults.max_reorder_delay_ms,
+            "How long a gap waits for a late packet before concealment fills it.",
+        ),
+        (
+            "Period Margin",
+            &mut draft.latency_ms.device_period_margin_ms,
+            DEVICE_PERIOD_MARGIN_MS_RANGE,
+            latency_defaults.device_period_margin_ms,
+            "Safety margin added on top of the device callback period.",
+        ),
+        (
+            "Silence Stop",
+            &mut draft.latency_ms.capture_long_silence_stop_ms,
+            CAPTURE_LONG_SILENCE_STOP_MS_RANGE,
+            latency_defaults.capture_long_silence_stop_ms,
+            "Continuous capture silence before the sender stops emitting packets entirely.",
+        ),
+        (
+            "Silence Preroll",
+            &mut draft.latency_ms.capture_silence_preroll_ms,
+            CAPTURE_SILENCE_PREROLL_MS_RANGE,
+            latency_defaults.capture_silence_preroll_ms,
+            "Audio replayed from before speech resumed so onsets are not clipped.",
+        ),
+        (
+            "Silence Ramp",
+            &mut draft.latency_ms.capture_silence_ramp_ms,
+            CAPTURE_SILENCE_RAMP_MS_RANGE,
+            latency_defaults.capture_silence_ramp_ms,
+            "Fade applied when the silence gate opens or closes to avoid clicks.",
+        ),
+    ];
+    for (label, value, range, default_ms, help) in rows {
+        if form
+            .text(label, value, |text| {
+                latency_ms_error(text, range).or_else(|| cross.clone())
+            })
+            .is_focus()
+        {
+            form.set_help(help);
+            form.set_default(format!("{default_ms} ms"));
+        }
+    }
+    if form
+        .text(
+            "Silence VAD Max",
+            &mut draft.latency_ms.silence_vad_max,
+            |text| vad_level_error(text).or_else(|| cross.clone()),
+        )
+        .is_focus()
+    {
         form.set_help(
-            "Plays your microphone back through the output device to test your setup. Turns off automatically when settings closes; use headphones to avoid feedback.",
+            "Highest Earshot VAD level (0-255) still treated as capture silence by the silence gate.",
         );
+        form.set_default(latency_defaults.silence_vad_max.to_string());
     }
+}
 
-    form.section("Web Log Server");
-    if form.checkbox("Web Log", &mut draft.web_enabled).is_focus() {
-        form.set_help("Starts the browser chat-log server. Bind is saved even while disabled.");
-    }
-    if form
-        .text("Web Bind", &mut draft.web_bind, web_bind_error)
-        .is_focus()
-    {
-        form.set_help(
-            "Loopback socket address for the browser chat-log server, for example 127.0.0.1:8080.",
-        );
-    }
-
-    form.section("Notifications");
-    if form
-        .choice(
-            "Message Volume",
-            &mut draft.message_notification_volume_index,
-            NOTIFICATION_VOLUMES_DB.len(),
-            notification_volume_label,
-        )
-        .is_focus()
-    {
-        form.set_help("Volume for incoming-message notification sounds.");
-    }
-    if form
-        .choice(
-            "Join Volume",
-            &mut draft.peer_join_notification_volume_index,
-            NOTIFICATION_VOLUMES_DB.len(),
-            notification_volume_label,
-        )
-        .is_focus()
-    {
-        form.set_help("Volume for peer-joined notification sounds.");
-    }
-    if form
-        .choice(
-            "Leave Volume",
-            &mut draft.peer_leave_notification_volume_index,
-            NOTIFICATION_VOLUMES_DB.len(),
-            notification_volume_label,
-        )
-        .is_focus()
-    {
-        form.set_help("Volume for peer-left notification sounds.");
-    }
-
+fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
     form.section("Interface Settings");
     if form
         .choice_value(
@@ -652,6 +1008,7 @@ fn settings_ui(
         .is_focus()
     {
         form.set_help("Keyboard model used by editable controls throughout the interface.");
+        form.set_default(form_bindings_label(FormBindings::Standard));
     }
     let themes = ThemeSelection::cycle_list(&draft.theme_names);
     let mut theme_index = themes
@@ -664,14 +1021,144 @@ fn settings_ui(
     draft.theme = themes[theme_index].clone();
     if theme_response.is_focus() {
         form.set_help("Color theme for the interface. Applies immediately; Save persists it.");
+        form.set_default(ThemeSelection::default().label());
+    }
+    let ui_defaults = UiConfig::default();
+    if form
+        .text("Room Height", &mut draft.ui_room_height, |text| {
+            int_range_error(text, UI_ROOM_HEIGHT_RANGE)
+        })
+        .is_focus()
+    {
+        form.set_help("Rows each room occupies in the room list.");
+        form.set_default(ui_defaults.room_height.to_string());
+    }
+    if form
+        .text(
+            "Composer Height",
+            &mut draft.ui_max_composer_height,
+            |text| int_range_error(text, UI_MAX_COMPOSER_HEIGHT_RANGE),
+        )
+        .is_focus()
+    {
+        form.set_help("Maximum rows the message composer grows to while typing.");
+        form.set_default(ui_defaults.max_composer_height.to_string());
+    }
+    if form
+        .checkbox("Composer Padding", &mut draft.ui_composer_padding)
+        .is_focus()
+    {
+        form.set_help("Draws a padded frame around the message composer.");
+        form.set_default("on");
     }
 
-    form.section("Privacy And Storage");
-    if form.checkbox("P2P", &mut draft.p2p_enabled).is_focus() {
+    form.section("Links");
+    if form
+        .string_list(
+            "Open Arg",
+            &mut draft.url_open,
+            &mut draft.url_open_new,
+            |_| None,
+        )
+        .is_focus()
+    {
         form.set_help(
-            "Direct peer media can reduce latency, but may expose your IP address to other users in a voice room.",
+            "Command that opens a clicked URL, one argument per row; the URL is appended last. Empty rows are removed; an empty list uses the platform opener.",
         );
+        form.set_default(default_url_open_label());
     }
+
+    form.section("Web Log Server");
+    if form.checkbox("Web Log", &mut draft.web_enabled).is_focus() {
+        form.set_help("Starts the browser chat-log server. Bind is saved even while disabled.");
+        form.set_default("off");
+    }
+    if form
+        .text("Web Bind", &mut draft.web_bind, web_bind_error)
+        .is_focus()
+    {
+        form.set_help(
+            "Loopback socket address for the browser chat-log server, for example 127.0.0.1:8080.",
+        );
+        form.set_default(WebConfig::default().bind);
+    }
+    if form
+        .choice_value("Viewer", &mut draft.web_viewer, &WebViewer::ALL, |viewer| {
+            viewer.label().to_string()
+        })
+        .is_focus()
+    {
+        form.set_help(
+            "Where the browser opens a clicked file preview: the in-page side panel or its own browser tab. Applies live to connected browsers.",
+        );
+        form.set_default(WebViewer::Panel.label());
+    }
+    if form
+        .choice_value(
+            "Autoplay",
+            &mut draft.web_autoplay,
+            &WebAutoplay::ALL,
+            |autoplay| autoplay.label().to_string(),
+        )
+        .is_focus()
+    {
+        form.set_help(
+            "Automatically play newly received videos in the browser. Muted playback starts without interaction; with audio needs the browser's autoplay policy to allow it.",
+        );
+        form.set_default(WebAutoplay::Disabled.label());
+    }
+
+    if !advanced_section(form, draft) {
+        return;
+    }
+    let ui_defaults = UiConfig::default();
+    if form
+        .text("Overscan", &mut draft.ui_overscan, |text| {
+            int_range_error(text, UI_OVERSCAN_RANGE)
+        })
+        .is_focus()
+    {
+        form.set_help("Extra chat rows rendered beyond the viewport for smoother scrolling.");
+        form.set_default(ui_defaults.overscan.to_string());
+    }
+    if form
+        .text("Max Messages", &mut draft.ui_max_messages, |text| {
+            int_range_error(text, UI_MAX_MESSAGES_RANGE)
+        })
+        .is_focus()
+    {
+        form.set_help(
+            "In-memory scrollback ceiling per room; the oldest messages are dropped past it.",
+        );
+        form.set_default(ui_defaults.max_messages.to_string());
+    }
+    if form
+        .checkbox("Web Readonly", &mut draft.web_readonly)
+        .is_focus()
+    {
+        form.set_help(
+            "View-only browser page. Turning it off enables the browser compose box and uploads. Applies live to connected browsers.",
+        );
+        form.set_default("on");
+    }
+    if form
+        .string_list(
+            "Origin",
+            &mut draft.web_allowed_origins,
+            &mut draft.web_origins_new,
+            web_origin_error,
+        )
+        .is_focus()
+    {
+        form.set_help(
+            "Browser origins allowed to open the web log WebSocket, one per row. Empty derives origins from the bind address. Changes restart the web server.",
+        );
+        form.set_default("derived from Web Bind");
+    }
+}
+
+fn data_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
+    form.section("Downloads");
     if form
         .choice_value(
             "Downloads",
@@ -684,6 +1171,7 @@ fn settings_ui(
         form.set_help(
             "How received files are handled: off rejects them, memory keeps them in a RAM buffer (lost on restart, viewable in the web log), persistent saves them to disk.",
         );
+        form.set_default(crate::config::DownloadMode::Memory.label());
     }
     let download_mode = draft.download_mode;
     if download_mode == crate::config::DownloadMode::Persistent
@@ -694,6 +1182,7 @@ fn settings_ui(
             .is_focus()
     {
         form.set_help("Directory where received files are saved.");
+        form.set_default(crate::settings::default_download_path_text());
     }
     if download_mode == crate::config::DownloadMode::Memory
         && form
@@ -707,7 +1196,23 @@ fn settings_ui(
         form.set_help(
             "How much RAM the in-memory download buffer may use, in MiB (e.g. 512). The oldest files are dropped once this fills.",
         );
+        form.set_default(FileConfig::default().download_memory_mb.to_string());
     }
+    if form
+        .text(
+            "Max Download",
+            &mut draft.files_max_download_mb,
+            positive_mib_error,
+        )
+        .is_focus()
+    {
+        form.set_help(
+            "Largest incoming file accepted, in MiB. Per-server and per-room overrides can lower it.",
+        );
+        form.set_default(FileConfig::default().max_download_mb.to_string());
+    }
+
+    form.section("History");
     if form
         .checkbox("Chat Persistence", &mut draft.history_enabled)
         .is_focus()
@@ -715,6 +1220,7 @@ fn settings_ui(
         form.set_help(
             "Stores local room catalogs and chat logs under the chatt data directory for offline browsing.",
         );
+        form.set_default("off");
     }
     if draft.history_enabled
         && form
@@ -724,23 +1230,91 @@ fn settings_ui(
         form.set_help(
             "Base directory for room catalogs and chat logs. Empty uses the chatt data directory. Applies on the next connection.",
         );
+        form.set_default("chatt data directory");
     }
 
-    form.form.spacer(1);
-    form.actions();
+    form.section("Uploads");
+    if form
+        .text(
+            "Max Upload",
+            &mut draft.files_max_upload_mb,
+            positive_mib_error,
+        )
+        .is_focus()
+    {
+        form.set_help("Largest file this client offers for upload, in MiB.");
+        form.set_default(FileConfig::default().max_upload_mb.to_string());
+    }
+
+    if !advanced_section(form, draft) {
+        return;
+    }
+    if form
+        .text("Upload Rate", &mut draft.files_upload_rate, byte_size_error)
+        .is_focus()
+    {
+        form.set_help(
+            "Upload pacing ceiling in bytes per second, with optional K/M/G suffix. 0 streams at full socket speed.",
+        );
+        form.set_default("0 (unthrottled)");
+    }
 }
 
-fn amplification_label(index: usize) -> String {
-    let value = MAX_AMPLIFICATIONS[index];
-    if value <= 0.0 {
-        "off".to_string()
+fn extra_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
+    form.section("Peer To Peer");
+    if form.checkbox("P2P", &mut draft.p2p_enabled).is_focus() {
+        form.set_help(
+            "Direct peer media can reduce latency, but may expose your IP address to other users in a voice room.",
+        );
+        form.set_default("off");
+    }
+    if form
+        .choice_value(
+            "Candidate Privacy",
+            &mut draft.p2p_candidate_privacy,
+            &CandidatePrivacy::ALL,
+            |privacy| privacy.label().to_string(),
+        )
+        .is_focus()
+    {
+        form.set_help(
+            "How local host candidates are exposed to peers: mdns publishes random .local names, ip address publishes literal IPs, no host relies on reflexive and relay only. Applies on the next connection.",
+        );
+        form.set_default(CandidatePrivacy::Mdns.label());
+    }
+    if form
+        .checkbox("Prefer IPv6", &mut draft.p2p_prefer_ipv6)
+        .is_focus()
+    {
+        form.set_help(
+            "Prefer native IPv6 over IPv4 at equal candidate type. Turn off to force IPv4-first for diagnostics. Applies on the next connection.",
+        );
+        form.set_default("on");
+    }
+}
+
+/// The platform url-open default, rendered for the detail panel.
+fn default_url_open_label() -> String {
+    let command = default_url_open();
+    if command.is_empty() {
+        "none (clicks are inert)".to_string()
     } else {
-        format!("{value:.0} dB")
+        command.join(" ")
     }
 }
 
-fn notification_volume_label(index: usize) -> String {
-    volume_db_label(NOTIFICATION_VOLUMES_DB[index])
+fn adjust_db(value: &str, delta: isize, (min, max): (f32, f32), fallback: f32) -> String {
+    let value = parse_db_value(value).unwrap_or(fallback);
+    (value + delta as f32 * 3.0).clamp(min, max).to_string()
+}
+
+fn adjust_notification_db(value: &str, delta: isize) -> String {
+    adjust_db(
+        value,
+        delta,
+        (MIN_NOTIFICATION_VOLUME_DB, MAX_NOTIFICATION_VOLUME_DB),
+        0.0,
+    )
 }
 
 /// Replays the form layout headlessly to apply `intent` (and any pending text
@@ -749,6 +1323,7 @@ fn notification_volume_label(index: usize) -> String {
 pub(crate) fn settings_logic(
     state: &mut FormState<FieldId>,
     draft: &mut SettingsDraft,
+    tab: SettingsTab,
     theme: &Theme,
     bindings: &BindingRuntime,
     dirty: bool,
@@ -776,6 +1351,7 @@ pub(crate) fn settings_logic(
     settings_ui(
         &mut form,
         draft,
+        tab,
         input_items,
         input_picker,
         output_items,
@@ -794,6 +1370,7 @@ pub fn draw_settings(
     bindings: &BindingRuntime,
     settings: &mut SettingsDraft,
     form: &mut FormState<FieldId>,
+    tab: SettingsTab,
     dirty: bool,
     capture: Option<&StatsSnapshot>,
     input_items: &[AudioInputItem],
@@ -807,7 +1384,9 @@ pub fn draw_settings(
     }
 
     let mut rows = area;
-    vu::draw_settings_vu_row(rows.take_top(1), buf, capture, false, theme);
+    if tab == SettingsTab::Audio {
+        vu::draw_settings_vu_row(rows.take_top(1), buf, capture, false, theme);
+    }
 
     let mut body = rows;
     let detail = if body.w >= MIN_DETAIL_SCREEN_WIDTH {
@@ -841,6 +1420,7 @@ pub fn draw_settings(
         settings_ui(
             &mut context,
             settings,
+            tab,
             input_items,
             input_picker,
             output_items,
@@ -969,9 +1549,18 @@ fn draw_focus_detail(
         ),
         FocusDetail::Option {
             current,
+            default,
             error,
             help,
-        } => draw_option_detail(rows, buf, theme, &current, error.as_deref(), help),
+        } => draw_option_detail(
+            rows,
+            buf,
+            theme,
+            &current,
+            default.as_deref(),
+            error.as_deref(),
+            help,
+        ),
     }
 }
 
@@ -1080,6 +1669,7 @@ fn draw_option_detail(
     buf: &mut Buffer,
     theme: &Theme,
     current: &str,
+    default: Option<&str>,
     error: Option<&str>,
     help: &str,
 ) {
@@ -1087,6 +1677,9 @@ fn draw_option_detail(
     let mut rows = area;
     if !current.is_empty() {
         widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "Current", current);
+    }
+    if let Some(default) = default {
+        widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "Default", default);
     }
     if let Some(error) = error {
         rows.take_top(1).with(panel).fill(buf);
@@ -1173,5 +1766,154 @@ mod tests {
     #[test]
     fn device_field_ids_are_distinct() {
         assert_ne!(capture_device_id(), playback_device_id());
+    }
+
+    fn run_logic(
+        state: &mut FormState<FieldId>,
+        draft: &mut SettingsDraft,
+        tab: SettingsTab,
+        commit: Option<(FieldId, String)>,
+    ) -> SettingsOutput {
+        let config = crate::config::Config::default();
+        let theme = Theme::tomorrow_night();
+        let mut input_picker = AudioInputPickerState::default();
+        let mut output_picker = AudioOutputPickerState::default();
+        settings_logic(
+            state,
+            draft,
+            tab,
+            &theme,
+            &config.bindings,
+            false,
+            FieldIntent::None,
+            commit,
+            None,
+            &[],
+            &mut input_picker,
+            &[],
+            &mut output_picker,
+        )
+    }
+
+    fn test_draft() -> SettingsDraft {
+        SettingsDraft::from_audio(&crate::config::AudioConfig::default())
+    }
+
+    #[test]
+    fn tab_cycle_wraps_both_directions() {
+        assert_eq!(SettingsTab::Audio.cycle(1), SettingsTab::Interface);
+        assert_eq!(SettingsTab::Extra.cycle(1), SettingsTab::Audio);
+        assert_eq!(SettingsTab::Audio.cycle(-1), SettingsTab::Extra);
+    }
+
+    #[test]
+    fn db_adjustment_moves_three_db_and_clamps_to_bounds() {
+        assert_eq!(adjust_notification_db("-7.25", 1), "-4.25");
+        assert_eq!(adjust_notification_db("11.5", 1), "12");
+        assert_eq!(adjust_notification_db("-23", -1), "-24");
+        assert_eq!(
+            adjust_db("9.5", -1, MAX_AMPLIFICATION_DB_RANGE, 12.0),
+            "6.5"
+        );
+    }
+
+    #[test]
+    fn tabs_register_disjoint_fields() {
+        // A field id registered on the Audio tab must vanish on the Data tab,
+        // so focus falls back to the new tab's first field.
+        let config = crate::config::Config::default();
+        let mut draft = test_draft();
+
+        let mut state = FormState::new(capture_device_id(), config.ui.default_bindings);
+        run_logic(&mut state, &mut draft, SettingsTab::Audio, None);
+        assert_eq!(state.focus(), capture_device_id());
+
+        let mut state = FormState::new(capture_device_id(), config.ui.default_bindings);
+        run_logic(&mut state, &mut draft, SettingsTab::Data, None);
+        assert_ne!(state.focus(), capture_device_id());
+    }
+
+    #[test]
+    fn advanced_rows_hidden_until_toggle() {
+        let config = crate::config::Config::default();
+        let buffer_field = field_id_for("Advanced", "Capture Buffer");
+        let mut draft = test_draft();
+
+        let mut state = FormState::new(buffer_field, config.ui.default_bindings);
+        run_logic(&mut state, &mut draft, SettingsTab::Audio, None);
+        assert_ne!(state.focus(), buffer_field);
+
+        draft.show_advanced = true;
+        let mut state = FormState::new(buffer_field, config.ui.default_bindings);
+        run_logic(&mut state, &mut draft, SettingsTab::Audio, None);
+        assert_eq!(state.focus(), buffer_field);
+    }
+
+    #[test]
+    fn string_list_promotes_numbered_add_row_and_registers_the_next() {
+        let config = crate::config::Config::default();
+        let mut draft = test_draft();
+        draft.show_advanced = true;
+        let add_row = field_id_for("Advanced", "Origin 1");
+
+        let mut state = FormState::new(add_row, config.ui.default_bindings);
+        let output = run_logic(
+            &mut state,
+            &mut draft,
+            SettingsTab::Interface,
+            Some((add_row, "https://chat.example.test".to_string())),
+        );
+        assert!(output.changed);
+        assert_eq!(draft.web_allowed_origins, ["https://chat.example.test"]);
+        assert!(draft.web_origins_new.is_empty());
+
+        run_logic(&mut state, &mut draft, SettingsTab::Interface, None);
+        let next_row = field_id_for("Advanced", "Origin 2");
+        state.move_focus(1);
+        assert_eq!(state.focus(), next_row);
+
+        let first_row = field_id_for("Advanced", "Origin 1");
+        let mut state = FormState::new(first_row, config.ui.default_bindings);
+        let output = run_logic(
+            &mut state,
+            &mut draft,
+            SettingsTab::Interface,
+            Some((first_row, "  ".to_string())),
+        );
+        assert!(output.changed);
+        assert!(draft.web_allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn latency_row_commit_lands_in_draft() {
+        let config = crate::config::Config::default();
+        let mut draft = test_draft();
+        draft.show_advanced = true;
+        let field = field_id_for("Latency", "Min Delay");
+
+        let mut state = FormState::new(field, config.ui.default_bindings);
+        let output = run_logic(
+            &mut state,
+            &mut draft,
+            SettingsTab::Audio,
+            Some((field, "205".to_string())),
+        );
+        assert!(output.changed);
+        assert_eq!(draft.latency_ms.neteq_min_delay_ms, "205");
+        assert!(draft.latency_cross_error().is_some());
+    }
+
+    #[test]
+    fn tab_bar_returns_four_hit_rects() {
+        let theme = Theme::tomorrow_night();
+        let mut buf = Buffer::new(60, 1);
+        let rects = draw_settings_tabs(buf.rect(), &mut buf, &theme, SettingsTab::Audio);
+
+        for rect in rects {
+            assert!(!rect.is_empty());
+        }
+        for pair in rects.windows(2) {
+            assert!(pair[0].x + pair[0].w < pair[1].x);
+        }
     }
 }

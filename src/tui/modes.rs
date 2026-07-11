@@ -148,6 +148,16 @@ impl WelcomeMode {
             FormAction::None if !text_focused => return self.resolve_binding(cx, key),
             FormAction::None => self.drive(cx, FieldIntent::None, event.commit, None),
             FormAction::Cancel => cx.set_status("save setup to continue"),
+            FormAction::ActivateNextInsert => {
+                self.drive(cx, FieldIntent::None, event.commit, None);
+                let commit = self.form.move_focus(1);
+                self.drive(cx, FieldIntent::None, commit, None);
+                self.form.enter_insert_mode();
+            }
+            FormAction::MoveFocus(delta) => {
+                let commit = self.form.move_focus(delta);
+                self.drive(cx, FieldIntent::None, commit, None);
+            }
             FormAction::Activate if text_focused => {
                 self.drive(cx, FieldIntent::None, event.commit, None);
                 let commit = self.form.move_focus(1);
@@ -369,6 +379,29 @@ fn maybe_auto_close_markdown_code_fence(editor: &mut Editor, key: KeyEvent) {
 
     editor.replace_range(EditorSpan::empty_at(cursor as u32), "\n```");
     editor.set_cursor_offset(cursor as u32);
+}
+
+/// Resolves a tab-cycling chord on the settings layer, checked before the
+/// form editor sees the key so switching works while a text field is focused.
+/// Requiring a modifier keeps plain typed characters (like a `]` in an IPv6
+/// bind address) out of the intercept.
+fn settings_tab_chord_cx(cx: &ViewCx<'_>, key: &KeyEvent) -> Option<isize> {
+    if key.modifiers.is_empty() {
+        return None;
+    }
+    let input = InputKey::from_event(key)?;
+    let pending = None;
+    for reachable in bindings::reachable(&cx.config.bindings, bindings::SETTINGS_LAYER, &pending) {
+        if reachable.key != input {
+            continue;
+        }
+        match reachable.kind {
+            bindings::ReachableKind::Action(BindCommand::NextSettingsTab) => return Some(1),
+            bindings::ReachableKind::Action(BindCommand::PrevSettingsTab) => return Some(-1),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn is_control_save_chord_cx(cx: &ViewCx<'_>, key: &KeyEvent) -> bool {
@@ -773,6 +806,11 @@ pub(crate) struct SettingsSession {
     pub(crate) input_picker: AudioInputPickerState,
     pub(crate) output_picker: AudioOutputPickerState,
     pub(crate) dirty: bool,
+    /// The active tab. Both the draw and logic passes gate their field
+    /// declarations on this, so it lives in the shared session.
+    pub(crate) tab: crate::ui::settings::SettingsTab,
+    /// Tab-bar segment hit boxes written by the draw pass for mouse routing.
+    pub(crate) tab_rects: [Rect; 4],
     catalog_generation: u64,
 }
 
@@ -792,6 +830,8 @@ impl SettingsSession {
         draft.set_files_from_config(&config.files);
         draft.set_p2p_from_config(&config.p2p);
         draft.set_history_from_config(&config.history);
+        draft.set_ui_from_config(&config.ui);
+        draft.set_url_open_from_config(&config.url_open);
         let input_items = settings::audio_input_items(devices.input_devices());
         let output_items = settings::audio_output_items(devices.output_devices());
         let mut input_picker = AudioInputPickerState::default();
@@ -809,6 +849,8 @@ impl SettingsSession {
             input_picker,
             output_picker,
             dirty: false,
+            tab: crate::ui::settings::SettingsTab::Audio,
+            tab_rects: [Rect::EMPTY; 4],
             catalog_generation: devices.generation(),
         }
     }
@@ -881,6 +923,8 @@ impl SettingsMode {
                 cx.send(CoreCommand::Settings(SettingsOp::CancelOrClose));
             }
             RefreshDevices => cx.send(CoreCommand::Settings(SettingsOp::RefreshDevices)),
+            NextSettingsTab => cx.send(CoreCommand::Settings(SettingsOp::CycleTab(1))),
+            PrevSettingsTab => cx.send(CoreCommand::Settings(SettingsOp::CycleTab(-1))),
             _ => return process_global_command_cx(cx, command),
         }
         Action::Continue
@@ -918,10 +962,28 @@ impl SettingsMode {
             cx.send(CoreCommand::Settings(SettingsOp::Save));
             return Action::Continue;
         }
+        let tab_delta = match key.code {
+            KeyCode::Tab => Some(1),
+            KeyCode::BackTab => Some(-1),
+            _ => None,
+        };
+        if let Some(delta) = tab_delta {
+            drop(session);
+            cx.send(CoreCommand::Settings(SettingsOp::CycleTab(delta)));
+            return Action::Continue;
+        }
+        if let Some(delta) = settings_tab_chord_cx(cx, &key) {
+            drop(session);
+            cx.send(CoreCommand::Settings(SettingsOp::CycleTab(delta)));
+            return Action::Continue;
+        }
 
         let kind = session.form.focused_kind();
-        let text_focused = kind == FormFieldKind::Text;
+        let text_focused = matches!(kind, FormFieldKind::Text | FormFieldKind::AdjustableText);
         let event = session.form.handle_key(key, kind);
+        let live_list_edit = event.commit.as_ref().is_some_and(|(field, _)| {
+            crate::ui::settings::is_list_add_field(&session.draft, *field)
+        });
         drop(session);
         match event.action {
             FormAction::None if !text_focused => return self.resolve_binding(cx, key),
@@ -933,12 +995,18 @@ impl SettingsMode {
             FormAction::Cancel => {
                 cx.send(CoreCommand::Settings(SettingsOp::CancelOrClose));
             }
+            FormAction::ActivateNextInsert => {
+                // Moving focus clears and commits the active editor itself.
+                // Keep this as one core operation so a render cannot expose an
+                // intermediate frame with the completed list row still active.
+                cx.send(CoreCommand::Settings(SettingsOp::MoveFocusInsert(1)));
+            }
+            FormAction::MoveFocus(delta) => {
+                cx.send(CoreCommand::Settings(SettingsOp::MoveFocus(delta)));
+            }
             FormAction::Activate if text_focused => {
-                cx.send(CoreCommand::Settings(SettingsOp::Drive {
-                    intent: FieldIntent::None,
-                    commit: event.commit,
-                    focus_column: None,
-                }));
+                // MoveFocus commits the active editor and registers the next
+                // field in one core update, avoiding an intermediate redraw.
                 cx.send(CoreCommand::Settings(SettingsOp::MoveFocus(1)));
             }
             FormAction::Activate => cx.send(CoreCommand::Settings(SettingsOp::Drive {
@@ -959,7 +1027,15 @@ impl SettingsMode {
                 }));
             }
             FormAction::TextChanged => {
-                cx.send(CoreCommand::Settings(SettingsOp::MarkDirty));
+                if live_list_edit {
+                    cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                        intent: FieldIntent::None,
+                        commit: event.commit,
+                        focus_column: None,
+                    }));
+                } else {
+                    cx.send(CoreCommand::Settings(SettingsOp::MarkDirty));
+                }
             }
         }
         Action::Continue
@@ -977,6 +1053,20 @@ impl SettingsMode {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         session.sync_catalog(&cx.session.audio_devices);
+        if matches!(
+            mouse.kind,
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
+        ) && let Some(tab) = session
+            .tab_rects
+            .iter()
+            .zip(crate::ui::settings::SettingsTab::ALL)
+            .find(|(rect, _)| crate::tui::form::rect_contains(**rect, mouse.column, mouse.row))
+            .map(|(_, tab)| tab)
+        {
+            drop(session);
+            cx.send(CoreCommand::Settings(SettingsOp::SetTab(tab)));
+            return Action::Continue;
+        }
         if (session.input_picker.open || session.output_picker.open)
             && matches!(
                 mouse.kind,

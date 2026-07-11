@@ -2,7 +2,7 @@ use std::{
     fs::File,
     io::{self, Write},
     os::fd::{FromRawFd, RawFd},
-    sync::{Arc, mpsc::SyncSender},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +14,7 @@ use extui::{
 use parking_lot::{Mutex, RwLock};
 
 use crate::{
-    app::{RoomSession, command::CoreCommand},
+    app::{AppEvent, EventSender, RoomSession, command::CoreCommand},
     client_channel::{ClientChannel, ClientId},
     config::Config,
     tui::{
@@ -43,7 +43,7 @@ pub(crate) struct ClientThread {
     pub(crate) session: Arc<RwLock<RoomSession>>,
     pub(crate) view: Arc<Mutex<ClientView>>,
     pub(crate) config: Arc<RwLock<Config>>,
-    pub(crate) commands: SyncSender<(ClientId, CoreCommand)>,
+    pub(crate) events: EventSender,
     pub(crate) initial_mode: InitialMode,
     pub(crate) follow_primary_view: bool,
 }
@@ -58,7 +58,7 @@ impl ClientThread {
             session,
             view,
             config,
-            commands,
+            events: app_events,
             initial_mode,
             follow_primary_view,
         } = self;
@@ -110,7 +110,7 @@ impl ClientThread {
             };
             ModeStack::new_with_cx(root, &mut cx)
         };
-        flush_commands(&mut queued, &commands, id);
+        flush_commands(&mut queued, &app_events, id);
 
         let mut resize_generation = 0;
         loop {
@@ -169,7 +169,7 @@ impl ClientThread {
                 mode_stack.render_cx(&mut cx, &mut buffer, now_ms);
                 session.capture_stats.is_some()
             };
-            flush_commands(&mut queued, &commands, id);
+            flush_commands(&mut queued, &app_events, id);
             buffer.render(&mut terminal);
 
             let poll_interval = if active_animation {
@@ -220,7 +220,7 @@ impl ClientThread {
                     queued.push(CoreCommand::Quit);
                 }
             }
-            flush_commands(&mut queued, &commands, id);
+            flush_commands(&mut queued, &app_events, id);
 
             let (clipboard_text, url) = {
                 let mut view = view.lock();
@@ -237,16 +237,14 @@ impl ClientThread {
     }
 }
 
-/// Transmits the commands a dispatch queued. Callers must have dropped the
-/// session/config/view guards first: the send blocks when the channel is full,
-/// and the core only drains it after acquiring those guards for writing.
-fn flush_commands(
-    queued: &mut Vec<CoreCommand>,
-    commands: &SyncSender<(ClientId, CoreCommand)>,
-    id: ClientId,
-) {
+/// Transmits the commands a dispatch queued. Callers drop the session/config/view
+/// guards first so the core can acquire them as soon as the event wakes it.
+fn flush_commands(queued: &mut Vec<CoreCommand>, events: &EventSender, id: ClientId) {
     for command in queued.drain(..) {
-        let _ = commands.send((id, command));
+        let _ = events.send(AppEvent::ClientCommand {
+            client_id: id,
+            command,
+        });
     }
 }
 
@@ -256,17 +254,24 @@ mod tests {
 
     #[test]
     fn flush_commands_transmits_queue_in_order_tagged_with_client_id() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = EventSender(tx);
         let mut queued = vec![CoreCommand::Quit, CoreCommand::ToggleMute];
-        flush_commands(&mut queued, &tx, ClientId(7));
+        flush_commands(&mut queued, &events, ClientId(7));
         assert!(queued.is_empty());
         assert!(matches!(
             rx.try_recv(),
-            Ok((ClientId(7), CoreCommand::Quit))
+            Ok(AppEvent::ClientCommand {
+                client_id: ClientId(7),
+                command: CoreCommand::Quit,
+            })
         ));
         assert!(matches!(
             rx.try_recv(),
-            Ok((ClientId(7), CoreCommand::ToggleMute))
+            Ok(AppEvent::ClientCommand {
+                client_id: ClientId(7),
+                command: CoreCommand::ToggleMute,
+            })
         ));
     }
 }

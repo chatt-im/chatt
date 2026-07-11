@@ -5,7 +5,7 @@ use std::{
     os::fd::IntoRawFd,
     os::unix::net::UnixStream,
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Once, mpsc},
+    sync::{Arc, Once},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -26,7 +26,6 @@ use crate::{
 
 const CORE_INTERVAL: Duration = Duration::from_millis(50);
 const REMOTE_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
-const CORE_COMMAND_CAPACITY: usize = 1024;
 const CORE_BATCH_BUDGET: usize = 256;
 static PANIC_HOOK: Once = Once::new();
 
@@ -85,13 +84,11 @@ fn run_app_inner(
     let session = app.shared_session();
     let view = app.shared_view();
     let config = app.shared_config();
-    let (command_tx, command_rx) =
-        mpsc::sync_channel::<(ClientId, CoreCommand)>(CORE_COMMAND_CAPACITY);
     let event_sender = app.event_sender();
     app.release_core_state();
 
     let render_channel = channel.clone();
-    let render_commands = command_tx.clone();
+    let render_events = event_sender.clone();
     let render_thread = match thread::Builder::new()
         .name("chatt-tui-0".to_string())
         .spawn(move || {
@@ -103,12 +100,15 @@ fn run_app_inner(
                 session,
                 view,
                 config,
-                commands: render_commands.clone(),
+                events: render_events.clone(),
                 initial_mode,
                 follow_primary_view: true,
             };
             let result = panic::catch_unwind(AssertUnwindSafe(|| client.run()));
-            let _ = render_commands.send((ClientId::PRIMARY, CoreCommand::Quit));
+            let _ = render_events.send(AppEvent::ClientCommand {
+                client_id: ClientId::PRIMARY,
+                command: CoreCommand::Quit,
+            });
             result
         }) {
         Ok(thread) => thread,
@@ -133,7 +133,6 @@ fn run_app_inner(
                 event,
                 &mut clients,
                 &mut next_client_id,
-                &command_tx,
                 &event_sender,
             );
         }
@@ -147,16 +146,8 @@ fn run_app_inner(
                 event,
                 &mut clients,
                 &mut next_client_id,
-                &command_tx,
                 &event_sender,
             );
-        }
-        for _ in 0..CORE_BATCH_BUDGET {
-            let Ok((client_id, command)) = command_rx.try_recv() else {
-                break;
-            };
-            dirty = true;
-            handle_runtime_command(&mut app, &mut clients, client_id, command);
         }
         app.tick();
 
@@ -225,10 +216,12 @@ fn handle_runtime_event(
     event: AppEvent,
     clients: &mut HashMap<ClientId, RemoteClient>,
     next_client_id: &mut u64,
-    command_tx: &mpsc::SyncSender<(ClientId, CoreCommand)>,
     event_sender: &EventSender,
 ) {
     match event {
+        AppEvent::ClientCommand { client_id, command } => {
+            handle_runtime_command(app, clients, client_id, command);
+        }
         AppEvent::ClientAttach {
             mut stream,
             stdin,
@@ -251,15 +244,7 @@ fn handle_runtime_event(
             }
             let id = ClientId(*next_client_id as u32);
             *next_client_id += 1;
-            match spawn_remote_client(
-                app,
-                id,
-                stream,
-                stdin,
-                stdout,
-                command_tx.clone(),
-                event_sender.clone(),
-            ) {
+            match spawn_remote_client(app, id, stream, stdin, stdout, event_sender.clone()) {
                 Ok(client) => {
                     clients.insert(id, client);
                     kvlog::info!(
@@ -294,7 +279,6 @@ fn spawn_remote_client(
     mut stream: UnixStream,
     stdin: std::fs::File,
     stdout: std::fs::File,
-    commands: mpsc::SyncSender<(ClientId, CoreCommand)>,
     events: EventSender,
 ) -> Result<RemoteClient, String> {
     let channel = match ClientChannel::new() {
@@ -315,7 +299,6 @@ fn spawn_remote_client(
     let config = app.shared_config();
     let render_channel = channel.clone();
     let render_view = view;
-    let render_commands = commands.clone();
     let render_events = events.clone();
     let render_thread = match thread::Builder::new()
         .name(format!("chatt-tui-{}", id.0))
@@ -328,7 +311,7 @@ fn spawn_remote_client(
                 session,
                 view: render_view,
                 config,
-                commands: render_commands,
+                events: render_events.clone(),
                 initial_mode,
                 follow_primary_view: false,
             };

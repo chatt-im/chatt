@@ -460,6 +460,52 @@ impl<'a> Form<'a> {
         self.text_with_placeholder(label, value, None, validate)
     }
 
+    pub(crate) fn adjustable_text(
+        &mut self,
+        label: &str,
+        value: &mut String,
+        validate: impl Fn(&str) -> Option<String>,
+        adjust: impl Fn(&str, isize) -> String,
+    ) -> Response {
+        if !self.enabled {
+            return self.disabled_row(label, value.clone());
+        }
+        let id = self.id(label);
+        let row = self.state.next_row(1);
+        let area = self
+            .state
+            .register_field(row, id, FormFieldKind::AdjustableText);
+        let focused = self.state.focus() == id;
+        let mut changed = false;
+        if let Some((commit_id, text)) = self.commit.take() {
+            if commit_id == id {
+                if *value != text {
+                    *value = text;
+                    changed = true;
+                }
+            } else {
+                self.commit = Some((commit_id, text));
+            }
+        }
+        if focused && let FieldIntent::Adjust(delta) = self.intent {
+            let adjusted = adjust(value, delta);
+            if *value != adjusted {
+                *value = adjusted;
+                changed = true;
+            }
+            self.state.sync_active_text(id, value);
+        }
+        if focused {
+            self.seed_editor(id, value, area);
+        }
+        let error = validate(value);
+        self.render_text_row(id, label, value, None, focused, error.is_some(), area);
+        if let Some(area) = area {
+            self.register_choice_adjust(id, area);
+        }
+        self.respond(focused, changed)
+    }
+
     /// Text field with display-only placeholder text when `value` is empty.
     /// The placeholder is never committed into `value`; empty still saves as
     /// empty and keeps the caller's inherit/default semantics.

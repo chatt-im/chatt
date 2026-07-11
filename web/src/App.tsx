@@ -14,6 +14,7 @@ import {
 } from "./vendor/virtua/solid/Virtualizer";
 import type {
   AutoplayMode,
+  ViewerMode,
   WebMessage,
   ServerEnvelope,
   ClientRequest,
@@ -1432,8 +1433,7 @@ export default function App() {
   const [compactPreview, setCompactPreview] = createSignal(false);
   const [autoplay, setAutoplay] =
     createSignal<AutoplayMode>("disabled");
-  const [viewerInSeparateBrowserTab, setViewerInSeparateBrowserTab] =
-    createSignal(false);
+  const [viewer, setViewer] = createSignal<ViewerMode>("panel");
   let previewOpener: HTMLElement | undefined;
   let deleteOpener: HTMLButtonElement | undefined;
   let deleteErrorTimer: number | undefined;
@@ -1447,7 +1447,7 @@ export default function App() {
   };
 
   function openPreview(item: PreviewItem, opener: HTMLElement) {
-    if (viewerInSeparateBrowserTab()) {
+    if (viewer() === "tab") {
       window.open(standalonePreviewUrl(item, autoplay()), "_blank", "noopener");
       return;
     }
@@ -3236,9 +3236,7 @@ export default function App() {
         }
         setReadonly(env.readonly);
         setAutoplay(env.autoplay);
-        setViewerInSeparateBrowserTab(
-          env.viewer_in_seperate_browser_tab
-        );
+        setViewer(env.viewer);
         setMaxUploadBytes(env.max_upload_bytes);
         document.title = `Chatt | ${env.room_name}`;
       } else if (env.type === "room") {

@@ -175,6 +175,16 @@ impl RoomSettingsDraft {
                 self.drive(theme, FieldIntent::Adjust(delta), event.commit, None);
                 RoomSettingsEvent::Consumed
             }
+            FormAction::ActivateNextInsert => {
+                self.drive(theme, FieldIntent::None, event.commit, None);
+                self.move_focus(theme, 1);
+                self.form.enter_insert_mode();
+                RoomSettingsEvent::Consumed
+            }
+            FormAction::MoveFocus(delta) => {
+                self.move_focus(theme, delta);
+                RoomSettingsEvent::Consumed
+            }
             FormAction::Activate if text_focused => {
                 self.drive(theme, FieldIntent::None, event.commit, None);
                 self.move_focus(theme, 1);

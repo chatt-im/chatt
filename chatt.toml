@@ -109,8 +109,9 @@ enabled = false
 # Automatically play newly received videos. `true` autoplays muted; use
 # "with-audio" to request audio when the browser's autoplay policy allows it.
 autoplay = false
-# Open each preview in a separate browser tab instead of the side panel.
-viewer-in-seperate-browser-tab = false
+# Where a clicked file preview opens: "panel" keeps the in-page side panel,
+# "tab" opens each preview in its own browser tab.
+viewer = "panel"
 
 [bindings.insert]
 "C-c" = "Quit"
@@ -257,6 +258,8 @@ inherit = ["list"]
 "ENTER" = "Activate"
 "r" = "RefreshDevices"
 "C-s" = "SaveSettings"
+"M-l" = "NextSettingsTab"
+"M-h" = "PrevSettingsTab"
 "." = "ToggleKeyPreview"
 
 [bindings.dialog]

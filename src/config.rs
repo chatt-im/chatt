@@ -348,7 +348,7 @@ pub struct UiConfig {
 
 /// The platform default URL opener: `open` on macOS, `xdg-open` on Linux, and
 /// nothing elsewhere (clicks are then inert until `url-open` is configured).
-fn default_url_open() -> Vec<String> {
+pub(crate) fn default_url_open() -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
         vec!["open".to_string()]
@@ -536,6 +536,22 @@ pub enum CandidatePrivacy {
     NoHost,
 }
 
+impl CandidatePrivacy {
+    pub const ALL: [CandidatePrivacy; 3] = [
+        CandidatePrivacy::Mdns,
+        CandidatePrivacy::Disabled,
+        CandidatePrivacy::NoHost,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mdns => "mdns",
+            Self::Disabled => "ip address",
+            Self::NoHost => "no host",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct P2pConfig {
@@ -569,11 +585,25 @@ pub enum WebAutoplay {
 }
 
 impl WebAutoplay {
+    pub const ALL: [WebAutoplay; 3] = [
+        WebAutoplay::Disabled,
+        WebAutoplay::Muted,
+        WebAutoplay::WithAudio,
+    ];
+
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
             Self::Muted => "muted",
             Self::WithAudio => "with-audio",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "off",
+            Self::Muted => "muted",
+            Self::WithAudio => "with audio",
         }
     }
 }
@@ -599,6 +629,49 @@ impl ToToml for WebAutoplay {
     }
 }
 
+/// Where the browser opens a clicked file preview: the in-page side panel or a
+/// dedicated browser tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WebViewer {
+    #[default]
+    Panel,
+    Tab,
+}
+
+impl WebViewer {
+    pub const ALL: [WebViewer; 2] = [WebViewer::Panel, WebViewer::Tab];
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Panel => "panel",
+            Self::Tab => "tab",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Panel => "panel",
+            Self::Tab => "browser tab",
+        }
+    }
+}
+
+impl<'de> FromToml<'de> for WebViewer {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        match item.as_str() {
+            Some("panel") => Ok(Self::Panel),
+            Some("tab") => Ok(Self::Tab),
+            _ => Err(ctx.report_custom_error("expected \"panel\" or \"tab\"", item)),
+        }
+    }
+}
+
+impl ToToml for WebViewer {
+    fn to_toml<'a>(&'a self, _arena: &'a Arena) -> Result<Item<'a>, ToTomlError> {
+        Ok(Item::string(self.wire_name()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct WebConfig {
@@ -621,10 +694,9 @@ pub struct WebConfig {
     /// audio, which browsers may reject under their autoplay policy.
     #[toml(default)]
     pub autoplay: WebAutoplay,
-    /// Open each file preview in its own browser tab instead of the side panel.
-    /// The misspelling is part of the user-facing configuration key.
+    /// Where the browser opens a clicked file preview.
     #[toml(default)]
-    pub viewer_in_seperate_browser_tab: bool,
+    pub viewer: WebViewer,
 }
 
 impl Default for WebConfig {
@@ -635,7 +707,7 @@ impl Default for WebConfig {
             allowed_origins: Vec::new(),
             readonly: true,
             autoplay: WebAutoplay::Disabled,
-            viewer_in_seperate_browser_tab: false,
+            viewer: WebViewer::Panel,
         }
     }
 }
@@ -646,7 +718,7 @@ impl WebConfig {
     }
 }
 
-fn valid_web_origin(value: &str) -> bool {
+pub(crate) fn valid_web_origin(value: &str) -> bool {
     let Some((scheme, authority)) = value.split_once("://") else {
         return false;
     };
@@ -2838,11 +2910,36 @@ server-public-key = ""
     fn runtime_config_writes_web_view_settings() {
         let mut config = Config::default();
         config.web.autoplay = WebAutoplay::WithAudio;
-        config.web.viewer_in_seperate_browser_tab = true;
+        config.web.viewer = WebViewer::Tab;
         let content = render_runtime(&config);
 
         assert!(content.contains("autoplay = \"with-audio\""));
-        assert!(content.contains("viewer-in-seperate-browser-tab = true"));
+        assert!(content.contains("viewer = \"tab\""));
+    }
+
+    #[test]
+    fn web_viewer_parses_panel_and_tab() {
+        let arena = Arena::new();
+        for (text, expected) in [
+            ("[web]\nviewer = \"panel\"\n", WebViewer::Panel),
+            ("[web]\nviewer = \"tab\"\n", WebViewer::Tab),
+        ] {
+            let config = toml_spanner::parse(text, &arena)
+                .unwrap()
+                .to::<Config>()
+                .unwrap();
+            assert_eq!(config.web.viewer, expected);
+        }
+    }
+
+    #[test]
+    fn web_viewer_rejects_other_values() {
+        let arena = Arena::new();
+        let result = toml_spanner::parse("[web]\nviewer = true\n", &arena)
+            .unwrap()
+            .to::<Config>();
+
+        assert!(result.is_err());
     }
 
     #[test]

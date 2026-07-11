@@ -10,6 +10,7 @@ use crate::{config::FormBindings, theme::Theme};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FormFieldKind {
     Text,
+    AdjustableText,
     Toggle,
     Choice,
     Select,
@@ -24,6 +25,8 @@ pub(crate) enum FormAction {
     None,
     Cancel,
     Activate,
+    ActivateNextInsert,
+    MoveFocus(isize),
     Adjust(isize),
     FocusMoved,
     TextChanged,
@@ -169,6 +172,13 @@ impl<F: Copy + Eq> FormState<F> {
         self.active_text
     }
 
+    /// Keeps Vim editing continuous after a commit-and-advance operation.
+    pub(crate) fn enter_insert_mode(&mut self) {
+        if self.active_text.is_some() {
+            self.editor.enter_insert_mode();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn editor_mut(&mut self) -> &mut Editor {
         &mut self.editor
@@ -228,7 +238,7 @@ impl<F: Copy + Eq> FormState<F> {
         });
         if let Some(rect) = row.rect {
             let hit = match kind {
-                FormFieldKind::Text => HitKind::Focus,
+                FormFieldKind::Text | FormFieldKind::AdjustableText => HitKind::Focus,
                 FormFieldKind::Toggle
                 | FormFieldKind::Choice
                 | FormFieldKind::Select
@@ -262,7 +272,7 @@ impl<F: Copy + Eq> FormState<F> {
             height: row.height,
         });
         let hit = match kind {
-            FormFieldKind::Text => HitKind::Focus,
+            FormFieldKind::Text | FormFieldKind::AdjustableText => HitKind::Focus,
             FormFieldKind::Toggle
             | FormFieldKind::Choice
             | FormFieldKind::Select
@@ -399,6 +409,25 @@ impl<F: Copy + Eq> FormState<F> {
         Some((active, self.editor.text()))
     }
 
+    /// Replaces the active editor contents after an out-of-band adjustment to
+    /// the field value, keeping a following commit from restoring stale text.
+    pub(crate) fn sync_active_text(&mut self, field: F, value: &str) {
+        if self.active_text == Some(field) {
+            self.editor.set_lines(value);
+            self.editor.set_cursor_offset(self.editor.text_len());
+        }
+    }
+
+    /// The active editor's pending commit without disarming the editor. The
+    /// in-place Enter commit uses this: clearing would let a render pass that
+    /// interleaves before the core applies the commit re-seed the editor from
+    /// the stale field value, and the following focus move would then commit
+    /// that stale text back over the edit.
+    fn text_commit(&self) -> Option<(F, String)> {
+        let active = self.active_text?;
+        Some((active, self.editor.text()))
+    }
+
     pub(crate) fn text(&self) -> String {
         self.editor.text()
     }
@@ -498,21 +527,27 @@ impl<F: Copy + Eq> FormState<F> {
                 };
             }
             KeyCode::Tab | KeyCode::Down => {
-                return FormEvent {
-                    commit: self.move_focus(1),
-                    action: FormAction::FocusMoved,
-                };
+                return FormEvent::action(FormAction::MoveFocus(1));
             }
             KeyCode::BackTab | KeyCode::Up => {
-                return FormEvent {
-                    commit: self.move_focus(-1),
-                    action: FormAction::FocusMoved,
-                };
+                return FormEvent::action(FormAction::MoveFocus(-1));
             }
             KeyCode::Enter => {
                 return FormEvent {
-                    commit: self.clear_text(),
+                    commit: self.text_commit(),
                     action: FormAction::Activate,
+                };
+            }
+            KeyCode::Left if focused_kind == FormFieldKind::AdjustableText => {
+                return FormEvent {
+                    commit: self.text_commit(),
+                    action: FormAction::Adjust(-1),
+                };
+            }
+            KeyCode::Right if focused_kind == FormFieldKind::AdjustableText => {
+                return FormEvent {
+                    commit: self.text_commit(),
+                    action: FormAction::Adjust(1),
                 };
             }
             KeyCode::Left if focused_kind != FormFieldKind::Text => {
@@ -536,7 +571,11 @@ impl<F: Copy + Eq> FormState<F> {
             _ => {}
         }
 
-        if focused_kind == FormFieldKind::Text && self.active_text.is_some() {
+        if matches!(
+            focused_kind,
+            FormFieldKind::Text | FormFieldKind::AdjustableText
+        ) && self.active_text.is_some()
+        {
             let before = self.editor.text();
             if self.editor.send_key(&key) {
                 let action = if self.editor.text() == before {
@@ -544,7 +583,12 @@ impl<F: Copy + Eq> FormState<F> {
                 } else {
                     FormAction::TextChanged
                 };
-                return FormEvent::action(action);
+                return FormEvent {
+                    commit: matches!(action, FormAction::TextChanged)
+                        .then(|| self.text_commit())
+                        .flatten(),
+                    action,
+                };
             }
         }
 
@@ -552,20 +596,18 @@ impl<F: Copy + Eq> FormState<F> {
     }
 
     fn handle_vim_key(&mut self, key: KeyEvent, focused_kind: FormFieldKind) -> FormEvent<F> {
-        if focused_kind == FormFieldKind::Text && self.active_text.is_some() {
+        if matches!(
+            focused_kind,
+            FormFieldKind::Text | FormFieldKind::AdjustableText
+        ) && self.active_text.is_some()
+        {
             match self.editor.mode() {
                 Mode::Normal => match key.code {
                     KeyCode::Char('j') | KeyCode::Down => {
-                        return FormEvent {
-                            commit: self.move_focus(1),
-                            action: FormAction::FocusMoved,
-                        };
+                        return FormEvent::action(FormAction::MoveFocus(1));
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        return FormEvent {
-                            commit: self.move_focus(-1),
-                            action: FormAction::FocusMoved,
-                        };
+                        return FormEvent::action(FormAction::MoveFocus(-1));
                     }
                     KeyCode::Enter => {
                         self.editor.enter_insert_mode();
@@ -585,10 +627,21 @@ impl<F: Copy + Eq> FormState<F> {
                             } else {
                                 FormAction::TextChanged
                             };
-                            return FormEvent::action(action);
+                            return FormEvent {
+                                commit: matches!(action, FormAction::TextChanged)
+                                    .then(|| self.text_commit())
+                                    .flatten(),
+                                action,
+                            };
                         }
                     }
                 },
+                Mode::Insert if key.code == KeyCode::Enter => {
+                    return FormEvent {
+                        commit: self.text_commit(),
+                        action: FormAction::ActivateNextInsert,
+                    };
+                }
                 Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                     let before = self.editor.text();
                     if self.editor.send_key(&key) {
@@ -597,7 +650,12 @@ impl<F: Copy + Eq> FormState<F> {
                         } else {
                             FormAction::TextChanged
                         };
-                        return FormEvent::action(action);
+                        return FormEvent {
+                            commit: matches!(action, FormAction::TextChanged)
+                                .then(|| self.text_commit())
+                                .flatten(),
+                            action,
+                        };
                     }
                 }
             }
@@ -606,14 +664,12 @@ impl<F: Copy + Eq> FormState<F> {
 
         match key.code {
             KeyCode::Esc => FormEvent::action(FormAction::Cancel),
-            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => FormEvent {
-                commit: self.move_focus(1),
-                action: FormAction::FocusMoved,
-            },
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => FormEvent {
-                commit: self.move_focus(-1),
-                action: FormAction::FocusMoved,
-            },
+            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => {
+                FormEvent::action(FormAction::MoveFocus(1))
+            }
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => {
+                FormEvent::action(FormAction::MoveFocus(-1))
+            }
             KeyCode::Left | KeyCode::Char('h') => match self.horizontal_target(-1) {
                 Some(target) => FormEvent {
                     commit: self.set_focus(target),
@@ -744,7 +800,35 @@ mod tests {
     }
 
     #[test]
-    fn focus_moves_through_registered_order() {
+    fn enter_commits_text_without_disarming_the_editor() {
+        // Enter's commit crosses a thread boundary before it is applied. If
+        // Enter disarmed the editor, a render interleaved in that window would
+        // re-seed it from the stale field value and the follow-up focus move
+        // would commit the stale text back, reverting the edit.
+        let mut form = FormState::new(Field::One, FormBindings::Standard);
+        form.begin_frame(Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 5,
+        });
+        let row = form.next_row(1);
+        form.register_field(row, Field::One, FormFieldKind::Text);
+        form.finish_frame();
+        form.focus_text(Field::One, "205", false);
+
+        let event = form.handle_key(key(KeyCode::Enter), FormFieldKind::Text);
+
+        assert_eq!(event.action, FormAction::Activate);
+        assert_eq!(event.commit, Some((Field::One, "205".to_string())));
+        assert_eq!(form.active_text(), Some(Field::One));
+        // The eventual focus move still commits (the same text) and disarms.
+        assert_eq!(form.clear_text(), Some((Field::One, "205".to_string())));
+        assert_eq!(form.active_text(), None);
+    }
+
+    #[test]
+    fn vertical_key_requests_focus_move_without_mutating_form() {
         let mut form = FormState::new(Field::One, FormBindings::Standard);
         form.begin_frame(Rect {
             x: 0,
@@ -759,8 +843,8 @@ mod tests {
         form.finish_frame();
 
         let event = form.handle_key(key(KeyCode::Down), FormFieldKind::Choice);
-        assert_eq!(event.action, FormAction::FocusMoved);
-        assert_eq!(form.focus(), Field::Two);
+        assert_eq!(event.action, FormAction::MoveFocus(1));
+        assert_eq!(form.focus(), Field::One);
     }
 
     #[test]
@@ -949,13 +1033,14 @@ mod tests {
     }
 
     #[test]
-    fn vim_normal_j_moves_form_focus() {
+    fn vim_normal_j_requests_atomic_focus_move() {
         let mut form =
             FormState::with_order(Field::One, FormBindings::Vim, [Field::One, Field::Two]);
         form.focus_text(Field::One, "abc", false);
         let event = form.handle_key(key(KeyCode::Char('j')), FormFieldKind::Text);
-        assert_eq!(event.action, FormAction::FocusMoved);
-        assert_eq!(form.focus(), Field::Two);
+        assert_eq!(event.action, FormAction::MoveFocus(1));
+        assert_eq!(form.focus(), Field::One);
+        assert_eq!(form.active_text(), Some(Field::One));
     }
 
     #[test]
@@ -971,6 +1056,18 @@ mod tests {
         assert_eq!(event.action, FormAction::TextChanged);
         assert_eq!(form.text(), "");
         assert_eq!(form.editor_mut().mode(), Mode::Insert);
+    }
+
+    #[test]
+    fn vim_insert_enter_commits_and_activates_text_field() {
+        let mut form = FormState::with_order(Field::One, FormBindings::Vim, [Field::One]);
+        form.focus_text(Field::One, "value", true);
+
+        let event = form.handle_key(key(KeyCode::Enter), FormFieldKind::Text);
+
+        assert_eq!(event.action, FormAction::ActivateNextInsert);
+        assert_eq!(event.commit, Some((Field::One, "value".to_string())));
+        assert_eq!(form.active_text(), Some(Field::One));
     }
 
     #[test]

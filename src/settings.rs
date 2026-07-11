@@ -1,21 +1,25 @@
 use crate::{
-    audio::{BufferRequest, DenoiseConfig, DeviceInfo, DredConfig, StreamPreview},
+    audio::{
+        BufferRequest, CAPTURE_LONG_SILENCE_STOP_MS_RANGE, CAPTURE_SILENCE_PREROLL_MS_RANGE,
+        CAPTURE_SILENCE_RAMP_MS_RANGE, DEVICE_PERIOD_MARGIN_MS_RANGE, DenoiseConfig, DeviceInfo,
+        DredConfig, HARD_QUEUE_BOUND_MS_RANGE, INITIAL_BUFFER_MS_RANGE, MAX_REORDER_DELAY_MS_RANGE,
+        NETEQ_BASE_MINIMUM_DELAY_MS_RANGE, NETEQ_MAX_DELAY_MS_RANGE, NETEQ_MIN_DELAY_MS_RANGE,
+        NETEQ_START_DELAY_MS_RANGE, StreamPreview,
+    },
     config::{
-        AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_DENOISE_RELEASE,
+        AudioConfig, AudioLatencyConfig, BufferSize, CandidatePrivacy, DEFAULT_DENOISE_RELEASE,
         DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_TARGET_LATENCY,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_TARGET_LATENCY, DownloadMode, FileConfig,
-        FormBindings, HistoryConfig, NotificationConfig, P2pConfig, ThemeSelection, WebAutoplay,
-        WebConfig, output_volume_percent_label, parse_output_volume_percent,
+        FormBindings, HistoryConfig, MAX_NOTIFICATION_VOLUME_DB, MIN_NOTIFICATION_VOLUME_DB,
+        NotificationConfig, P2pConfig, ThemeSelection, UiConfig, WebAutoplay, WebConfig, WebViewer,
+        output_volume_percent_label, parse_output_volume_percent, valid_web_origin,
     },
     paths,
     ui::select::{FuzzySelect, SelectableItem},
 };
 
 pub const BITRATES: [i32; 6] = [16_000, 24_000, 32_000, 48_000, 64_000, 96_000];
-/// Auto-gain ceiling options, in dB. `0` disables auto gain entirely for a
-/// well-levelled rig; higher values let AGC2 lift a quieter mic further.
-pub const MAX_AMPLIFICATIONS: [f32; 6] = [0.0, 6.0, 12.0, 18.0, 24.0, 30.0];
 /// RNNoise over-suppression exponent options. `1.0` is stock RNNoise, higher
 /// values push down residual non-voice noise (keyboard, fans).
 pub const DENOISE_SUPPRESSIONS: [f32; 5] = [1.0, 1.5, 2.0, 2.5, 3.0];
@@ -28,10 +32,6 @@ pub const DENOISE_RELEASE_LABELS: [&str; 5] = ["off", "light", "medium", "strong
 /// Earshot VAD thresholds for the post-RNNoise typing gate.
 pub const DENOISE_TYPING_VAD_THRESHOLDS: [f32; 7] = [0.60, 0.70, 0.75, 0.80, 0.82, 0.85, 0.90];
 pub const DENOISE_TYPING_VAD_LABELS: [&str; 7] = ["60%", "70%", "75%", "80%", "82%", "85%", "90%"];
-pub const NOTIFICATION_VOLUMES_DB: [f32; 11] = [
-    -24.0, -18.0, -12.0, -9.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0, 12.0,
-];
-
 /// Smallest accepted explicit buffer in samples (~0.7 ms at 48 kHz).
 pub const MIN_BUFFER_SAMPLES: u32 = 32;
 /// Largest accepted explicit buffer in samples (~170 ms at 48 kHz).
@@ -40,12 +40,14 @@ pub const MAX_BUFFER_SAMPLES: u32 = 8192;
 /// Mutable settings state. Fields are crate-visible so the immediate-mode
 /// settings form mutates them in place through `&mut`, replacing the previous
 /// focus-enum dispatch. The `*_index` fields select into the option tables
-/// ([`BITRATES`], [`MAX_AMPLIFICATIONS`], and the rest).
+/// ([`BITRATES`] and the denoise tuning tables).
 pub struct SettingsDraft {
     pub(crate) input_device_id: Option<String>,
     pub(crate) output_device_id: Option<String>,
     pub(crate) bitrate_index: usize,
-    pub(crate) amplification_index: usize,
+    /// Auto-gain ceiling in dB, kept as text so arbitrary valid values can be
+    /// entered instead of being rounded to a fixed option table.
+    pub(crate) max_amplification: String,
     pub(crate) suppression_index: usize,
     pub(crate) release_index: usize,
     pub(crate) typing_suppression: bool,
@@ -62,42 +64,143 @@ pub struct SettingsDraft {
     pub(crate) output_raw: bool,
     pub(crate) web_enabled: bool,
     pub(crate) web_bind: String,
-    /// Config-file-only WebSocket origin allowlist, preserved by the settings
-    /// form even though it has no interactive row.
+    /// WebSocket origin allowlist, edited as a one-origin-per-row list field.
     pub(crate) web_allowed_origins: Vec<String>,
-    /// Preserved across the settings round-trip. The compose box is a dev-only
-    /// flag with no settings-UI control, so it is carried but never edited here.
     pub(crate) web_readonly: bool,
-    /// Config-file-only web viewer settings, preserved when the settings form
-    /// writes the rest of `[web]`.
     pub(crate) web_autoplay: WebAutoplay,
-    pub(crate) web_viewer_in_seperate_browser_tab: bool,
-    pub(crate) message_notification_volume_index: usize,
-    pub(crate) peer_join_notification_volume_index: usize,
-    pub(crate) peer_leave_notification_volume_index: usize,
+    pub(crate) web_viewer: WebViewer,
+    /// Transient add-row buffer for the allowed-origins list field. Never
+    /// persisted; a committed value moves into `web_allowed_origins`.
+    pub(crate) web_origins_new: String,
+    pub(crate) message_notification_volume: String,
+    pub(crate) peer_join_notification_volume: String,
+    pub(crate) peer_leave_notification_volume: String,
     pub(crate) form_bindings: FormBindings,
     pub(crate) theme: ThemeSelection,
     /// Custom theme names from the config registry, in sorted order. Seeded at
     /// session start so the Theme row can cycle builtins plus custom themes.
     pub(crate) theme_names: Vec<String>,
     pub(crate) p2p_enabled: bool,
+    pub(crate) p2p_candidate_privacy: CandidatePrivacy,
+    pub(crate) p2p_prefer_ipv6: bool,
     pub(crate) download_mode: DownloadMode,
     pub(crate) download_path: String,
     /// The in-memory download ring-buffer size, editable as a MiB count. Shown
     /// only in [`DownloadMode::Memory`].
     pub(crate) download_memory_mb: String,
+    pub(crate) files_max_download_mb: String,
+    pub(crate) files_max_upload_mb: String,
+    /// Upload pacing ceiling as editable text with an optional `K`/`M`/`G`
+    /// suffix; `0` streams at full socket speed.
+    pub(crate) files_upload_rate: String,
     pub(crate) history_enabled: bool,
     /// Base directory for persisted history; empty means the platform default.
     pub(crate) history_location: String,
+    pub(crate) ui_room_height: String,
+    pub(crate) ui_max_composer_height: String,
+    pub(crate) ui_composer_padding: bool,
+    pub(crate) ui_max_messages: String,
+    pub(crate) ui_overscan: String,
+    /// The URL opener command, one argument per row; the clicked URL is
+    /// appended last. Empty falls back to platform behavior (inert opener).
+    pub(crate) url_open: Vec<String>,
+    /// Transient add-row buffer for the url-open list field.
+    pub(crate) url_open_new: String,
     pub(crate) denoise: DenoiseConfig,
     pub(crate) dred: DredConfig,
     pub(crate) echo_cancellation: bool,
+    /// Carries the two latency booleans plus the last-valid numeric values the
+    /// editable [`LatencyMsDraft`] fields fall back to while mid-edit.
     pub(crate) latency: AudioLatencyConfig,
+    /// Editable text for the numeric latency-tuning fields.
+    pub(crate) latency_ms: LatencyMsDraft,
     /// Transient settings-only microphone loopback monitor. Never persisted:
     /// [`SettingsDraft::from_audio`] always seeds it off and
     /// [`SettingsDraft::to_audio`] ignores it, matching the auto-disable-on-close
     /// contract enforced in the app.
     pub(crate) loopback: bool,
+    /// Transient toggle revealing the advanced rows on tabs that have them.
+    /// Session-only, like [`SettingsDraft::loopback`]: seeded off and never
+    /// persisted.
+    pub(crate) show_advanced: bool,
+}
+
+/// Editable text for every numeric [`AudioLatencyConfig`] field. Values are
+/// millisecond counts except `silence_vad_max` (a raw `0..=255` VAD level).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LatencyMsDraft {
+    pub(crate) neteq_start_delay_ms: String,
+    pub(crate) neteq_min_delay_ms: String,
+    pub(crate) neteq_base_minimum_delay_ms: String,
+    pub(crate) neteq_max_delay_ms: String,
+    pub(crate) hard_queue_bound_ms: String,
+    pub(crate) initial_buffer_ms: String,
+    pub(crate) max_reorder_delay_ms: String,
+    pub(crate) device_period_margin_ms: String,
+    pub(crate) silence_vad_max: String,
+    pub(crate) capture_long_silence_stop_ms: String,
+    pub(crate) capture_silence_preroll_ms: String,
+    pub(crate) capture_silence_ramp_ms: String,
+}
+
+impl LatencyMsDraft {
+    pub(crate) fn from_config(config: &AudioLatencyConfig) -> Self {
+        Self {
+            neteq_start_delay_ms: config.neteq_start_delay_ms.to_string(),
+            neteq_min_delay_ms: config.neteq_min_delay_ms.to_string(),
+            neteq_base_minimum_delay_ms: config.neteq_base_minimum_delay_ms.to_string(),
+            neteq_max_delay_ms: config.neteq_max_delay_ms.to_string(),
+            hard_queue_bound_ms: config.hard_queue_bound_ms.to_string(),
+            initial_buffer_ms: config.initial_buffer_ms.to_string(),
+            max_reorder_delay_ms: config.max_reorder_delay_ms.to_string(),
+            device_period_margin_ms: config.device_period_margin_ms.to_string(),
+            silence_vad_max: config.silence_vad_max.to_string(),
+            capture_long_silence_stop_ms: config.capture_long_silence_stop_ms.to_string(),
+            capture_silence_preroll_ms: config.capture_silence_preroll_ms.to_string(),
+            capture_silence_ramp_ms: config.capture_silence_ramp_ms.to_string(),
+        }
+    }
+
+    /// Writes every field that parses into `config`, leaving unparseable ones
+    /// at their previous (last-valid) values.
+    pub(crate) fn apply_to(&self, config: &mut AudioLatencyConfig) {
+        let fields = [
+            (&self.neteq_start_delay_ms, &mut config.neteq_start_delay_ms),
+            (&self.neteq_min_delay_ms, &mut config.neteq_min_delay_ms),
+            (
+                &self.neteq_base_minimum_delay_ms,
+                &mut config.neteq_base_minimum_delay_ms,
+            ),
+            (&self.neteq_max_delay_ms, &mut config.neteq_max_delay_ms),
+            (&self.hard_queue_bound_ms, &mut config.hard_queue_bound_ms),
+            (&self.initial_buffer_ms, &mut config.initial_buffer_ms),
+            (&self.max_reorder_delay_ms, &mut config.max_reorder_delay_ms),
+            (
+                &self.device_period_margin_ms,
+                &mut config.device_period_margin_ms,
+            ),
+            (
+                &self.capture_long_silence_stop_ms,
+                &mut config.capture_long_silence_stop_ms,
+            ),
+            (
+                &self.capture_silence_preroll_ms,
+                &mut config.capture_silence_preroll_ms,
+            ),
+            (
+                &self.capture_silence_ramp_ms,
+                &mut config.capture_silence_ramp_ms,
+            ),
+        ];
+        for (text, slot) in fields {
+            if let Ok(value) = text.trim().parse::<u64>() {
+                *slot = value;
+            }
+        }
+        if let Ok(value) = self.silence_vad_max.trim().parse::<u8>() {
+            config.silence_vad_max = value;
+        }
+    }
 }
 
 impl SettingsDraft {
@@ -109,7 +212,7 @@ impl SettingsDraft {
                 .iter()
                 .position(|bitrate| *bitrate == config.bitrate_bps)
                 .unwrap_or(3),
-            amplification_index: amplification_index(config.max_amplification),
+            max_amplification: db_value_text(config.max_amplification),
             suppression_index: nearest_index(
                 &DENOISE_SUPPRESSIONS,
                 config.denoise_suppression,
@@ -147,24 +250,39 @@ impl SettingsDraft {
             web_allowed_origins: WebConfig::default().allowed_origins,
             web_readonly: WebConfig::default().readonly,
             web_autoplay: WebConfig::default().autoplay,
-            web_viewer_in_seperate_browser_tab: WebConfig::default().viewer_in_seperate_browser_tab,
-            message_notification_volume_index: notification_volume_index(0.0),
-            peer_join_notification_volume_index: notification_volume_index(0.0),
-            peer_leave_notification_volume_index: notification_volume_index(0.0),
+            web_viewer: WebConfig::default().viewer,
+            web_origins_new: String::new(),
+            message_notification_volume: db_value_text(0.0),
+            peer_join_notification_volume: db_value_text(0.0),
+            peer_leave_notification_volume: db_value_text(0.0),
             form_bindings: FormBindings::Standard,
             theme: ThemeSelection::default(),
             theme_names: Vec::new(),
             p2p_enabled: P2pConfig::default().enabled,
+            p2p_candidate_privacy: P2pConfig::default().candidate_privacy,
+            p2p_prefer_ipv6: P2pConfig::default().prefer_ipv6,
             download_mode: DownloadMode::default(),
             download_path: default_download_path_text(),
             download_memory_mb: FileConfig::default().download_memory_mb.to_string(),
+            files_max_download_mb: FileConfig::default().max_download_mb.to_string(),
+            files_max_upload_mb: FileConfig::default().max_upload_mb.to_string(),
+            files_upload_rate: FileConfig::default().upload_rate_bytes.to_string(),
             history_enabled: HistoryConfig::default().enabled,
             history_location: String::new(),
+            ui_room_height: UiConfig::default().room_height.to_string(),
+            ui_max_composer_height: UiConfig::default().max_composer_height.to_string(),
+            ui_composer_padding: UiConfig::default().composer_padding,
+            ui_max_messages: UiConfig::default().max_messages.to_string(),
+            ui_overscan: UiConfig::default().overscan.to_string(),
+            url_open: Vec::new(),
+            url_open_new: String::new(),
             denoise: config.denoise,
             dred: config.dred,
             echo_cancellation: config.echo_cancellation,
             latency: config.latency.clone(),
+            latency_ms: LatencyMsDraft::from_config(&config.latency),
             loopback: false,
+            show_advanced: false,
         }
     }
 
@@ -174,16 +292,13 @@ impl SettingsDraft {
         self.web_allowed_origins = web.allowed_origins.clone();
         self.web_readonly = web.readonly;
         self.web_autoplay = web.autoplay;
-        self.web_viewer_in_seperate_browser_tab = web.viewer_in_seperate_browser_tab;
+        self.web_viewer = web.viewer;
     }
 
     pub fn set_notifications_from_config(&mut self, notifications: &NotificationConfig) {
-        self.message_notification_volume_index =
-            notification_volume_index(notifications.message_volume_db);
-        self.peer_join_notification_volume_index =
-            notification_volume_index(notifications.peer_join_volume_db);
-        self.peer_leave_notification_volume_index =
-            notification_volume_index(notifications.peer_leave_volume_db);
+        self.message_notification_volume = db_value_text(notifications.message_volume_db);
+        self.peer_join_notification_volume = db_value_text(notifications.peer_join_volume_db);
+        self.peer_leave_notification_volume = db_value_text(notifications.peer_leave_volume_db);
     }
 
     pub fn set_form_bindings_from_config(&mut self, form_bindings: FormBindings) {
@@ -203,15 +318,33 @@ impl SettingsDraft {
             files.download_dir.clone()
         };
         self.download_memory_mb = files.download_memory_mb.to_string();
+        self.files_max_download_mb = files.max_download_mb.to_string();
+        self.files_max_upload_mb = files.max_upload_mb.to_string();
+        self.files_upload_rate = files.upload_rate_bytes.to_string();
     }
 
     pub fn set_p2p_from_config(&mut self, p2p: &P2pConfig) {
         self.p2p_enabled = p2p.enabled;
+        self.p2p_candidate_privacy = p2p.candidate_privacy;
+        self.p2p_prefer_ipv6 = p2p.prefer_ipv6;
     }
 
     pub fn set_history_from_config(&mut self, history: &HistoryConfig) {
         self.history_enabled = history.enabled;
         self.history_location = history.location.clone().unwrap_or_default();
+    }
+
+    pub fn set_ui_from_config(&mut self, ui: &UiConfig) {
+        self.ui_room_height = ui.room_height.to_string();
+        self.ui_max_composer_height = ui.max_composer_height.to_string();
+        self.ui_composer_padding = ui.composer_padding;
+        self.ui_max_messages = ui.max_messages.to_string();
+        self.ui_overscan = ui.overscan.to_string();
+    }
+
+    pub fn set_url_open_from_config(&mut self, url_open: &[String]) {
+        self.url_open = url_open.to_vec();
+        self.url_open_new.clear();
     }
 
     pub fn theme(&self) -> ThemeSelection {
@@ -236,8 +369,17 @@ impl SettingsDraft {
             output_buffer: parse_buffer_size(&self.output_buffer),
             output_volume: parse_output_volume_percent(&self.output_volume)
                 .unwrap_or(crate::config::DEFAULT_OUTPUT_VOLUME_PERCENT),
-            latency: self.latency.clone(),
+            latency: self.latency_config(),
         }
+    }
+
+    /// The latency config assembled from the two carried booleans plus every
+    /// numeric field that currently parses; mid-edit fields keep their
+    /// last-valid values.
+    pub(crate) fn latency_config(&self) -> AudioLatencyConfig {
+        let mut latency = self.latency.clone();
+        self.latency_ms.apply_to(&mut latency);
+        latency
     }
 
     pub fn to_web(&self) -> WebConfig {
@@ -247,7 +389,7 @@ impl SettingsDraft {
             allowed_origins: self.web_allowed_origins.clone(),
             readonly: self.web_readonly,
             autoplay: self.web_autoplay,
-            viewer_in_seperate_browser_tab: self.web_viewer_in_seperate_browser_tab,
+            viewer: self.web_viewer,
         }
     }
 
@@ -272,13 +414,57 @@ impl SettingsDraft {
         if let Some(mb) = parse_mib_count(self.download_memory_mb.trim()) {
             files.download_memory_mb = mb;
         }
+        if let Some(mb) = parse_mib_count(self.files_max_download_mb.trim()) {
+            files.max_download_mb = mb;
+        }
+        if let Some(mb) = parse_mib_count(self.files_max_upload_mb.trim()) {
+            files.max_upload_mb = mb;
+        }
+        if let Some(rate) = parse_byte_size(&self.files_upload_rate) {
+            files.upload_rate_bytes = rate;
+        }
         files
     }
 
     pub fn to_p2p(&self, previous: &P2pConfig) -> P2pConfig {
         let mut p2p = previous.clone();
         p2p.enabled = self.p2p_enabled;
+        p2p.candidate_privacy = self.p2p_candidate_privacy;
+        p2p.prefer_ipv6 = self.p2p_prefer_ipv6;
         p2p
+    }
+
+    /// The UI section rebuilt from the draft, preserving fields this form
+    /// applies through other paths (theme, bindings, the custom theme
+    /// registry) at their `previous` values.
+    pub fn to_ui(&self, previous: &UiConfig) -> UiConfig {
+        let mut ui = previous.clone();
+        if let Ok(value) = self.ui_room_height.trim().parse::<u16>() {
+            ui.room_height = value;
+        }
+        if let Ok(value) = self.ui_max_composer_height.trim().parse::<u16>() {
+            ui.max_composer_height = value;
+        }
+        ui.composer_padding = self.ui_composer_padding;
+        if let Ok(value) = self.ui_max_messages.trim().parse::<u32>() {
+            ui.max_messages = value;
+        }
+        if let Ok(value) = self.ui_overscan.trim().parse::<u32>() {
+            ui.overscan = value;
+        }
+        ui
+    }
+
+    /// The url-open command with surrounding whitespace and empty rows dropped.
+    pub fn url_open_clean(&self) -> Vec<String> {
+        let mut command = Vec::with_capacity(self.url_open.len());
+        for argument in &self.url_open {
+            let argument = argument.trim();
+            if !argument.is_empty() {
+                command.push(argument.to_string());
+            }
+        }
+        command
     }
 
     pub fn to_history(&self) -> HistoryConfig {
@@ -338,6 +524,10 @@ impl SettingsDraft {
     pub fn settings_text_invalid(&self) -> Option<String> {
         self.device_string_invalid()
             .or_else(|| output_volume_field_error(&self.output_volume))
+            .or_else(|| max_amplification_error(&self.max_amplification))
+            .or_else(|| notification_volume_error(&self.message_notification_volume))
+            .or_else(|| notification_volume_error(&self.peer_join_notification_volume))
+            .or_else(|| notification_volume_error(&self.peer_leave_notification_volume))
             .or_else(|| web_bind_error(&self.web_bind))
             .or_else(|| {
                 download_path_error(
@@ -350,6 +540,134 @@ impl SettingsDraft {
                     .then(|| download_memory_error(&self.download_memory_mb))
                     .flatten()
             })
+            .or_else(|| self.ui_text_invalid())
+            .or_else(|| self.files_text_invalid())
+            .or_else(|| self.web_origins_invalid())
+            .or_else(|| self.latency_field_error())
+            .or_else(|| self.latency_cross_error())
+    }
+
+    fn ui_text_invalid(&self) -> Option<String> {
+        labeled_error(
+            "room height",
+            int_range_error(&self.ui_room_height, UI_ROOM_HEIGHT_RANGE),
+        )
+        .or_else(|| {
+            labeled_error(
+                "composer height",
+                int_range_error(&self.ui_max_composer_height, UI_MAX_COMPOSER_HEIGHT_RANGE),
+            )
+        })
+        .or_else(|| {
+            labeled_error(
+                "max messages",
+                int_range_error(&self.ui_max_messages, UI_MAX_MESSAGES_RANGE),
+            )
+        })
+        .or_else(|| {
+            labeled_error(
+                "overscan",
+                int_range_error(&self.ui_overscan, UI_OVERSCAN_RANGE),
+            )
+        })
+    }
+
+    fn files_text_invalid(&self) -> Option<String> {
+        labeled_error(
+            "max download",
+            positive_mib_error(&self.files_max_download_mb),
+        )
+        .or_else(|| labeled_error("max upload", positive_mib_error(&self.files_max_upload_mb)))
+        .or_else(|| labeled_error("upload rate", byte_size_error(&self.files_upload_rate)))
+    }
+
+    fn web_origins_invalid(&self) -> Option<String> {
+        for origin in &self.web_allowed_origins {
+            if let Some(error) = web_origin_error(origin) {
+                return Some(format!("allowed origin {error}"));
+            }
+        }
+        None
+    }
+
+    /// The first per-field latency error, checked field-by-field so each row
+    /// can also validate itself with the same range.
+    pub(crate) fn latency_field_error(&self) -> Option<String> {
+        let fields = [
+            (
+                "start delay",
+                &self.latency_ms.neteq_start_delay_ms,
+                NETEQ_START_DELAY_MS_RANGE,
+            ),
+            (
+                "min delay",
+                &self.latency_ms.neteq_min_delay_ms,
+                NETEQ_MIN_DELAY_MS_RANGE,
+            ),
+            (
+                "base min delay",
+                &self.latency_ms.neteq_base_minimum_delay_ms,
+                NETEQ_BASE_MINIMUM_DELAY_MS_RANGE,
+            ),
+            (
+                "max delay",
+                &self.latency_ms.neteq_max_delay_ms,
+                NETEQ_MAX_DELAY_MS_RANGE,
+            ),
+            (
+                "queue bound",
+                &self.latency_ms.hard_queue_bound_ms,
+                HARD_QUEUE_BOUND_MS_RANGE,
+            ),
+            (
+                "initial buffer",
+                &self.latency_ms.initial_buffer_ms,
+                INITIAL_BUFFER_MS_RANGE,
+            ),
+            (
+                "reorder delay",
+                &self.latency_ms.max_reorder_delay_ms,
+                MAX_REORDER_DELAY_MS_RANGE,
+            ),
+            (
+                "period margin",
+                &self.latency_ms.device_period_margin_ms,
+                DEVICE_PERIOD_MARGIN_MS_RANGE,
+            ),
+            (
+                "silence stop",
+                &self.latency_ms.capture_long_silence_stop_ms,
+                CAPTURE_LONG_SILENCE_STOP_MS_RANGE,
+            ),
+            (
+                "silence preroll",
+                &self.latency_ms.capture_silence_preroll_ms,
+                CAPTURE_SILENCE_PREROLL_MS_RANGE,
+            ),
+            (
+                "silence ramp",
+                &self.latency_ms.capture_silence_ramp_ms,
+                CAPTURE_SILENCE_RAMP_MS_RANGE,
+            ),
+        ];
+        for (label, text, range) in fields {
+            if let Some(error) = latency_ms_error(text, range) {
+                return Some(format!("{label} {error}"));
+            }
+        }
+        labeled_error(
+            "silence vad max",
+            vad_level_error(&self.latency_ms.silence_vad_max),
+        )
+    }
+
+    /// The cross-field latency constraint violation, or `None`. Suppressed
+    /// while any single field is out of range, so its own error shows instead.
+    pub(crate) fn latency_cross_error(&self) -> Option<String> {
+        if self.latency_field_error().is_some() {
+            return None;
+        }
+        self.latency_config().to_tuning().validate().err()
     }
 
     /// Reason the rnnoise-tuning rows are inert, or `None` when they apply. The
@@ -375,7 +693,7 @@ impl SettingsDraft {
     }
 
     pub fn max_amplification(&self) -> f32 {
-        MAX_AMPLIFICATIONS[self.amplification_index]
+        parse_db_value(&self.max_amplification).unwrap_or(DEFAULT_MAX_AMPLIFICATION)
     }
 
     pub fn suppression_strength(&self) -> f32 {
@@ -395,15 +713,15 @@ impl SettingsDraft {
     }
 
     pub fn message_notification_volume_db(&self) -> f32 {
-        NOTIFICATION_VOLUMES_DB[self.message_notification_volume_index]
+        parse_db_value(&self.message_notification_volume).unwrap_or(0.0)
     }
 
     pub fn peer_join_notification_volume_db(&self) -> f32 {
-        NOTIFICATION_VOLUMES_DB[self.peer_join_notification_volume_index]
+        parse_db_value(&self.peer_join_notification_volume).unwrap_or(0.0)
     }
 
     pub fn peer_leave_notification_volume_db(&self) -> f32 {
-        NOTIFICATION_VOLUMES_DB[self.peer_leave_notification_volume_index]
+        parse_db_value(&self.peer_leave_notification_volume).unwrap_or(0.0)
     }
 }
 
@@ -517,6 +835,103 @@ impl DownloadChoice {
             DownloadChoice::Memory => "memory".to_string(),
             DownloadChoice::Persistent => "persistent".to_string(),
         }
+    }
+}
+
+/// Accepted bounds for the numeric interface-settings fields.
+pub(crate) const UI_ROOM_HEIGHT_RANGE: (u64, u64) = (1, 32);
+pub(crate) const UI_MAX_COMPOSER_HEIGHT_RANGE: (u64, u64) = (1, 32);
+pub(crate) const UI_MAX_MESSAGES_RANGE: (u64, u64) = (100, 1_000_000);
+pub(crate) const UI_OVERSCAN_RANGE: (u64, u64) = (0, 1_000);
+pub(crate) const MAX_AMPLIFICATION_DB_RANGE: (f32, f32) = (0.0, 30.0);
+
+/// Prefixes `error` with the human field name for the settings status line.
+fn labeled_error(label: &str, error: Option<String>) -> Option<String> {
+    error.map(|error| format!("{label} {error}"))
+}
+
+/// Validates integer field text against an inclusive range.
+pub(crate) fn int_range_error(text: &str, (min, max): (u64, u64)) -> Option<String> {
+    match text.trim().parse::<u64>() {
+        Ok(value) if (min..=max).contains(&value) => None,
+        _ => Some(format!("must be {min}-{max}")),
+    }
+}
+
+/// Parses a dB field, accepting either a bare number or a trailing `dB`.
+pub(crate) fn parse_db_value(text: &str) -> Option<f32> {
+    let text = text.trim();
+    let number = text
+        .strip_suffix("dB")
+        .or_else(|| text.strip_suffix("db"))
+        .unwrap_or(text)
+        .trim();
+    number.parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
+fn db_value_text(value: f32) -> String {
+    value.to_string()
+}
+
+fn db_range_error(text: &str, (min, max): (f32, f32)) -> Option<String> {
+    match parse_db_value(text) {
+        Some(value) if (min..=max).contains(&value) => None,
+        _ => Some(format!("must be between {min} and {max} dB")),
+    }
+}
+
+pub(crate) fn max_amplification_error(text: &str) -> Option<String> {
+    db_range_error(text, MAX_AMPLIFICATION_DB_RANGE)
+}
+
+pub(crate) fn notification_volume_error(text: &str) -> Option<String> {
+    db_range_error(
+        text,
+        (MIN_NOTIFICATION_VOLUME_DB, MAX_NOTIFICATION_VOLUME_DB),
+    )
+}
+
+/// Validates a millisecond latency field against its shared tuning range.
+pub(crate) fn latency_ms_error(text: &str, (min, max): (u64, u64)) -> Option<String> {
+    match text.trim().parse::<u64>() {
+        Ok(value) if (min..=max).contains(&value) => None,
+        _ => Some(format!("must be {min}-{max} ms")),
+    }
+}
+
+/// Validates the silence VAD level field (`0..=255`).
+pub(crate) fn vad_level_error(text: &str) -> Option<String> {
+    match text.trim().parse::<u8>() {
+        Ok(_) => None,
+        _ => Some("must be 0-255".to_string()),
+    }
+}
+
+/// Validates a required positive MiB count field.
+pub(crate) fn positive_mib_error(text: &str) -> Option<String> {
+    match parse_mib_count(text.trim()) {
+        Some(_) => None,
+        None => Some("must be a positive MiB count".to_string()),
+    }
+}
+
+/// Validates a byte-count field with an optional `K`/`M`/`G` suffix. `0` is
+/// accepted (it means unthrottled for the upload rate).
+pub(crate) fn byte_size_error(text: &str) -> Option<String> {
+    match parse_byte_size(text) {
+        Some(_) => None,
+        None => Some("must be a byte count, optionally with a K/M/G suffix".to_string()),
+    }
+}
+
+/// Validates one allowed-origins row: empty (removed on commit) or an http(s)
+/// origin without a path.
+pub(crate) fn web_origin_error(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || valid_web_origin(text) {
+        None
+    } else {
+        Some("must be an http(s) origin without a path".to_string())
     }
 }
 
@@ -685,29 +1100,6 @@ fn nearest_index(options: &[f32], value: f32, default: f32) -> usize {
         })
         .map(|(index, _)| index)
         .unwrap_or(0)
-}
-
-fn amplification_index(value: f32) -> usize {
-    let value = if value.is_finite() {
-        value
-    } else {
-        DEFAULT_MAX_AMPLIFICATION
-    };
-    MAX_AMPLIFICATIONS
-        .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| {
-            (*left - value)
-                .abs()
-                .partial_cmp(&(*right - value).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(1)
-}
-
-fn notification_volume_index(value: f32) -> usize {
-    nearest_index(&NOTIFICATION_VOLUMES_DB, value, 0.0)
 }
 
 #[derive(Clone, Debug)]
@@ -1322,18 +1714,158 @@ mod tests {
     }
 
     #[test]
-    fn settings_draft_preserves_config_file_only_web_options() {
+    fn settings_draft_round_trips_web_options() {
         let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
         let web = WebConfig {
             allowed_origins: vec!["https://chat.example.test".to_string()],
+            readonly: false,
             autoplay: WebAutoplay::WithAudio,
-            viewer_in_seperate_browser_tab: true,
+            viewer: WebViewer::Tab,
             ..WebConfig::default()
         };
 
         draft.set_web_from_config(&web);
 
         assert_eq!(draft.to_web(), web);
+    }
+
+    #[test]
+    fn settings_draft_round_trips_ui_knobs() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        let ui = UiConfig {
+            room_height: 7,
+            max_composer_height: 12,
+            composer_padding: false,
+            max_messages: 12_345,
+            overscan: 48,
+            ..UiConfig::default()
+        };
+
+        draft.set_ui_from_config(&ui);
+        let produced = draft.to_ui(&UiConfig::default());
+
+        assert_eq!(produced.room_height, 7);
+        assert_eq!(produced.max_composer_height, 12);
+        assert!(!produced.composer_padding);
+        assert_eq!(produced.max_messages, 12_345);
+        assert_eq!(produced.overscan, 48);
+    }
+
+    #[test]
+    fn settings_draft_round_trips_file_limits() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        let files = FileConfig {
+            max_download_mb: 100,
+            max_upload_mb: 2_048,
+            upload_rate_bytes: 512 * 1024,
+            ..FileConfig::default()
+        };
+
+        draft.set_files_from_config(&files);
+        let produced = draft.to_files(&FileConfig::default());
+
+        assert_eq!(produced.max_download_mb, 100);
+        assert_eq!(produced.max_upload_mb, 2_048);
+        assert_eq!(produced.upload_rate_bytes, 512 * 1024);
+    }
+
+    #[test]
+    fn upload_rate_field_accepts_size_suffixes() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        draft.files_upload_rate = "2M".to_string();
+
+        let produced = draft.to_files(&FileConfig::default());
+        assert_eq!(produced.upload_rate_bytes, 2 * 1024 * 1024);
+        assert!(byte_size_error("2M").is_none());
+        assert!(byte_size_error("0").is_none());
+        assert!(byte_size_error("fast").is_some());
+        assert!(byte_size_error("").is_some());
+    }
+
+    #[test]
+    fn settings_draft_round_trips_p2p_privacy() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        let p2p = P2pConfig {
+            enabled: true,
+            candidate_privacy: CandidatePrivacy::NoHost,
+            prefer_ipv6: false,
+        };
+
+        draft.set_p2p_from_config(&p2p);
+
+        assert_eq!(draft.to_p2p(&P2pConfig::default()), p2p);
+    }
+
+    #[test]
+    fn settings_draft_round_trips_latency_ms_fields() {
+        let config = AudioConfig {
+            latency: AudioLatencyConfig {
+                neteq_start_delay_ms: 80,
+                silence_vad_max: 100,
+                ..AudioLatencyConfig::default()
+            },
+            ..AudioConfig::default()
+        };
+
+        let mut draft = SettingsDraft::from_audio(&config);
+        assert_eq!(draft.latency_ms.neteq_start_delay_ms, "80");
+        assert_eq!(draft.latency_ms.silence_vad_max, "100");
+        assert_eq!(draft.to_audio().latency.neteq_start_delay_ms, 80);
+
+        draft.latency_ms.neteq_start_delay_ms = "120".to_string();
+        assert_eq!(draft.to_audio().latency.neteq_start_delay_ms, 120);
+        // An unparseable field keeps the last-valid value instead of resetting.
+        draft.latency_ms.neteq_start_delay_ms = "junk".to_string();
+        assert_eq!(draft.to_audio().latency.neteq_start_delay_ms, 80);
+    }
+
+    #[test]
+    fn latency_cross_error_reports_min_over_start() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        assert!(draft.latency_cross_error().is_none());
+
+        draft.latency_ms.neteq_min_delay_ms = "200".to_string();
+        draft.latency_ms.neteq_start_delay_ms = "100".to_string();
+        let error = draft.latency_cross_error().unwrap();
+        assert!(error.contains("neteq-min-delay-ms"), "{error}");
+        assert!(draft.settings_text_invalid().is_some());
+
+        // A per-field range error suppresses the cross-field message.
+        draft.latency_ms.neteq_min_delay_ms = "abc".to_string();
+        assert!(draft.latency_cross_error().is_none());
+        assert!(draft.latency_field_error().is_some());
+    }
+
+    #[test]
+    fn settings_text_invalid_blocks_on_bad_overscan() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        assert!(draft.settings_text_invalid().is_none());
+
+        draft.ui_overscan = "9999".to_string();
+        let error = draft.settings_text_invalid().unwrap();
+        assert!(error.contains("overscan"), "{error}");
+    }
+
+    #[test]
+    fn web_origin_error_rejects_paths_and_garbage() {
+        assert!(web_origin_error("https://chat.example.test").is_none());
+        assert!(web_origin_error("http://localhost:8080").is_none());
+        assert!(web_origin_error("").is_none());
+        assert!(web_origin_error("https://chat.example.test/path").is_some());
+        assert!(web_origin_error("chat.example.test").is_some());
+        assert!(web_origin_error("ftp://chat.example.test").is_some());
+    }
+
+    #[test]
+    fn url_open_clean_drops_blank_rows() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        draft.set_url_open_from_config(&[
+            "firefox".to_string(),
+            "  ".to_string(),
+            " --new-tab ".to_string(),
+        ]);
+
+        assert_eq!(draft.url_open_clean(), vec!["firefox", "--new-tab"]);
     }
 
     #[test]
@@ -1393,7 +1925,7 @@ mod tests {
             input_device_id: Some("usb mic".to_string()),
             output_device_id: Some("usb speakers".to_string()),
             echo_cancellation: true,
-            max_amplification: 30.0,
+            max_amplification: 17.25,
             ..AudioConfig::default()
         };
 
@@ -1403,7 +1935,31 @@ mod tests {
         assert_eq!(audio.input_device_id.as_deref(), Some("usb mic"));
         assert_eq!(audio.output_device_id.as_deref(), Some("usb speakers"));
         assert!(audio.echo_cancellation);
-        assert_eq!(audio.max_amplification, 30.0);
+        assert_eq!(draft.max_amplification, "17.25");
+        assert_eq!(audio.max_amplification, 17.25);
+    }
+
+    #[test]
+    fn settings_draft_accepts_typed_db_values() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        draft.max_amplification = "9.75 dB".to_string();
+        draft.message_notification_volume = "-7.25".to_string();
+        draft.peer_join_notification_volume = "1.5 dB".to_string();
+        draft.peer_leave_notification_volume = "11.75".to_string();
+
+        assert!(draft.settings_text_invalid().is_none());
+        assert_eq!(draft.to_audio().max_amplification, 9.75);
+        assert_eq!(
+            draft.to_notifications(),
+            NotificationConfig {
+                message_volume_db: -7.25,
+                peer_join_volume_db: 1.5,
+                peer_leave_volume_db: 11.75,
+            }
+        );
+
+        draft.message_notification_volume = "12.1".to_string();
+        assert!(draft.settings_text_invalid().is_some());
     }
 
     #[test]
