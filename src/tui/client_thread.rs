@@ -164,8 +164,11 @@ impl ClientThread {
                         Box::new(ServerListMode::new())
                     };
                     cx.request_transition(crate::tui::mode::ModeTransition::Set(mode));
-                    mode_stack.apply_pending_cx(&mut cx);
                 }
+                // Core handlers queue transitions on the view between frames;
+                // apply them on the wake that delivered them rather than after
+                // the next input event.
+                mode_stack.apply_pending_cx(&mut cx);
                 process_client_events(&mut mode_stack, &mut cx, client_events);
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
