@@ -600,14 +600,9 @@ impl AppMode for PasswordPromptMode {
         use crate::client_channel::ClientEvent;
 
         match event {
-            ClientEvent::SetError(_) => {}
-            ClientEvent::OpenPairingPasswordChallenge { retry } => {
-                self.apply_password_challenge(retry);
-            }
             ClientEvent::PairingPasswordChallenge { retry, .. } => {
                 self.apply_password_challenge(retry);
             }
-            ClientEvent::PairingSucceeded => self.submitting = false,
             ClientEvent::PairingFailed(error) => self.apply_error(error),
         }
     }

@@ -51,7 +51,6 @@ capture-silence-ramp-ms = 10
 [ui]
 room-height = 4
 max-composer-height = 6
-placeholder = "Message #lobby"
 max-messages = 50000
 overscan = 24
 default-bindings = "standard"

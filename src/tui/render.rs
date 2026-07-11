@@ -1746,6 +1746,21 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_names_the_viewed_room() {
+        assert_eq!(composer_placeholder(Some("den")), "Message #den");
+    }
+
+    #[test]
+    fn placeholder_addresses_dm_rooms_without_hash() {
+        assert_eq!(composer_placeholder(Some("@zoe")), "Message @zoe");
+    }
+
+    #[test]
+    fn placeholder_without_viewed_room_degrades_cleanly() {
+        assert_eq!(composer_placeholder(None), "Message");
+    }
+
+    #[test]
     fn latency_estimate_sums_buffer_and_half_rtt() {
         // jitter buffer 60 + ring 10 + rtt 40/2 = 90.
         assert_eq!(
@@ -2251,9 +2266,23 @@ fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, b
         buf.hide_cursor();
     }
     if app.view.composer.text_len() == 0 {
+        let room_name = app
+            .view
+            .viewed_room
+            .and_then(|room_id| app.room.room_name_of(room_id));
         area.with(app.view.theme.muted)
             .with(Ellipsis(true))
-            .text(buf, &format!(" {}", app.config.ui.placeholder));
+            .text(buf, &format!(" {}", composer_placeholder(room_name)));
+    }
+}
+
+/// The composer's empty-state hint, naming the issuing view's room so each
+/// attached terminal labels the room it actually shows.
+fn composer_placeholder(room_name: Option<&str>) -> String {
+    match room_name {
+        Some(name) if name.starts_with('@') => format!("Message {name}"),
+        Some(name) => format!("Message #{name}"),
+        None => "Message".to_string(),
     }
 }
 

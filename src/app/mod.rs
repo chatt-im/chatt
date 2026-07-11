@@ -1609,6 +1609,49 @@ impl App {
         detach
     }
 
+    /// Runs `f` as the terminal that initiated the in-flight pairing, so
+    /// completion UI (editor, statuses, prompt close) lands on the head that
+    /// asked for it. Falls back to the primary when no owner is recorded.
+    /// A recorded owner is always a live handle: [`Self::retire_client`]
+    /// clears `pairing_owner` in the same core context that removes the
+    /// handle, so `run_as_client` never drops the completion.
+    fn run_as_pairing_owner(&mut self, f: impl FnOnce(&mut Self)) {
+        let owner = self
+            .pairing_owner
+            .unwrap_or(crate::client_channel::ClientId::PRIMARY);
+        self.run_as_client(owner, f);
+        // A completion under a remote swap rebuilds only the owner's server
+        // catalog; refresh the primary's too, since the tick propagates the
+        // primary's catalog to every remote view.
+        if owner != crate::client_channel::ClientId::PRIMARY {
+            self.rebuild_server_items();
+        }
+    }
+
+    /// Mutates the view belonging to `client_id`: the issuing terminal's
+    /// (`self.view`, which [`Self::run_as_client`] may have swapped) or a
+    /// registered remote handle. Returns false when the terminal is gone.
+    fn with_client_view(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+        f: impl FnOnce(&mut ClientView),
+    ) -> bool {
+        if client_id == self.issuing_client {
+            f(&mut self.view);
+            return true;
+        }
+        debug_assert_ne!(
+            client_id,
+            crate::client_channel::ClientId::PRIMARY,
+            "primary view is unreachable while a remote view is swapped in"
+        );
+        let Some(handle) = self.clients.get(&client_id) else {
+            return false;
+        };
+        f(&mut handle.view.lock());
+        true
+    }
+
     pub(crate) fn handle_app_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Network(event) => self.handle_network_event(event),
@@ -2436,14 +2479,11 @@ impl App {
             self.room.abort_history_fetch(room_id, None);
         }
         self.mark_room_catalog_dirty();
-        let name = self
-            .room
-            .room_select_items(None)
-            .into_iter()
-            .find(|item| item.room_id == room_id)
-            .map(|item| item.name)
-            .unwrap_or_else(|| format!("room {}", room_id.0));
-        self.set_status(format!("viewing {name}"));
+        let status = match self.room.room_name_of(room_id) {
+            Some(name) => format!("viewing {name}"),
+            None => format!("viewing room {}", room_id.0),
+        };
+        self.set_status(status);
         true
     }
 
@@ -2887,8 +2927,6 @@ impl App {
         udp_probe_addr: Option<String>,
         close_prompt_if_idle: bool,
     ) {
-        let close_prompt_if_idle = close_prompt_if_idle
-            && self.pairing_owner == Some(crate::client_channel::ClientId::PRIMARY);
         let Some(mut pair) = self.pending_pair.take() else {
             self.set_status("pairing succeeded");
             if close_prompt_if_idle && self.view.pending_transition.is_empty() {
@@ -3216,19 +3254,13 @@ impl App {
                 );
                 let owner =
                     self.pop_mutation_owner(room_id, target, kind == ChatMutationKind::Delete);
-                if let Some(owner) = owner {
-                    if owner == crate::client_channel::ClientId::PRIMARY {
-                        self.set_error(message.clone());
-                    } else if let Some(channel) = self.channel_for(owner) {
-                        channel.push(crate::client_channel::ClientEvent::SetError(
-                            message.clone(),
-                        ));
-                    } else {
-                        kvlog::warn!(
-                            "mutation rejection owner is no longer connected",
-                            client_id = owner.0
-                        );
-                    }
+                if let Some(owner) = owner
+                    && !self.with_client_view(owner, |view| view.set_error(message.clone()))
+                {
+                    kvlog::warn!(
+                        "mutation rejection owner is no longer connected",
+                        client_id = owner.0
+                    );
                 }
                 if let Some(feed) = &self.web_feed {
                     let operation = match kind {
@@ -3645,11 +3677,13 @@ impl App {
                 self.set_error("server is not using native encryption");
             }
             NetworkEvent::PairingSucceeded => {
-                let Some(pair) = self.pending_pair.take() else {
-                    self.set_status("pairing succeeded");
-                    return;
-                };
-                self.complete_pairing(pair.server, pair.completion);
+                self.run_as_pairing_owner(|app| {
+                    let Some(pair) = app.pending_pair.take() else {
+                        app.set_status("pairing succeeded");
+                        return;
+                    };
+                    app.complete_pairing(pair.server, pair.completion);
+                });
                 self.pairing_owner = None;
             }
             NetworkEvent::OpenPairingSucceeded {
@@ -3660,22 +3694,25 @@ impl App {
             } => {
                 if self.password_prompt_active {
                     self.password_prompt_active = false;
-                    if let Some(channel) =
-                        self.pairing_owner.and_then(|owner| self.channel_for(owner))
-                    {
-                        channel.push(crate::client_channel::ClientEvent::PairingSucceeded);
-                    }
-                    self.complete_open_pairing_from_password_prompt(
-                        token,
-                        server_public_key,
-                        udp_addr,
-                        udp_probe_addr,
-                    );
-                    self.pairing_owner = None;
+                    self.run_as_pairing_owner(|app| {
+                        app.complete_open_pairing_from_password_prompt(
+                            token,
+                            server_public_key,
+                            udp_addr,
+                            udp_probe_addr,
+                        );
+                    });
                 } else {
-                    self.complete_open_pairing(token, server_public_key, udp_addr, udp_probe_addr);
-                    self.pairing_owner = None;
+                    self.run_as_pairing_owner(|app| {
+                        app.complete_open_pairing(
+                            token,
+                            server_public_key,
+                            udp_addr,
+                            udp_probe_addr,
+                        );
+                    });
                 }
+                self.pairing_owner = None;
             }
             NetworkEvent::OpenPairingNeedsPassword {
                 retry,
@@ -3691,7 +3728,7 @@ impl App {
                             ));
                         }
                     }
-                    self.set_error(error);
+                    self.run_as_pairing_owner(|app| app.set_error(error));
                     return;
                 }
                 if self.password_prompt_active {
@@ -3705,21 +3742,20 @@ impl App {
                 } else {
                     self.password_prompt_active = true;
                     match self.pairing_owner {
-                        Some(owner) if owner != crate::client_channel::ClientId::PRIMARY => {
-                            if let Some(channel) = self.channel_for(owner) {
-                                channel.push(
-                                    crate::client_channel::ClientEvent::OpenPairingPasswordChallenge {
-                                        retry,
-                                    },
-                                );
-                            } else {
+                        Some(owner) => {
+                            let opened = self.with_client_view(owner, |view| {
+                                view.pending_transition
+                                    .request(ModeTransition::Push(Box::new(
+                                        PasswordPromptMode::new(retry),
+                                    )));
+                            });
+                            if !opened {
                                 kvlog::warn!(
                                     "pairing prompt owner is no longer connected",
                                     client_id = owner.0
                                 );
                             }
                         }
-                        Some(_) => self.push_mode(Box::new(PasswordPromptMode::new(retry))),
                         None => kvlog::warn!("pairing password challenge has no owner"),
                     }
                 }
@@ -3733,11 +3769,14 @@ impl App {
                             error.clone(),
                         ));
                     }
-                    self.set_error(error);
+                    self.run_as_pairing_owner(|app| app.set_error(error));
                     return;
                 }
-                self.pending_pair.take();
-                self.set_error(error);
+                self.run_as_pairing_owner(|app| {
+                    app.pending_pair.take();
+                    app.set_error(error);
+                });
+                self.pairing_owner = None;
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.room.network_disconnected = true;
@@ -7375,6 +7414,148 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn remote_pairing_challenge_opens_prompt_on_owning_view() {
+        let mut app = test_app();
+        let owner = crate::client_channel::ClientId(6);
+        let view = attach_test_client(&mut app, owner);
+        app.pending_pair = Some(pending_open_pair("public"));
+        app.pairing_owner = Some(owner);
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        app.handle_app_event(
+            NetworkEvent::OpenPairingNeedsPassword {
+                retry: false,
+                server_public_key: key.to_string(),
+            }
+            .into(),
+        );
+
+        assert!(app.view.pending_transition.is_empty());
+        assert!(matches!(
+            view.lock().pending_transition.pop_front(),
+            Some(ModeTransition::Push(_))
+        ));
+    }
+
+    #[test]
+    fn remote_pairing_success_replaces_owning_prompt_with_editor() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-remote-pair-success-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut app = test_app();
+        app.config.config_path = Some(path.clone());
+        let owner = crate::client_channel::ClientId(6);
+        let view = attach_test_client(&mut app, owner);
+        app.pending_pair = Some(pending_open_pair("public"));
+        app.pairing_owner = Some(owner);
+        app.password_prompt_active = true;
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        app.handle_app_event(
+            NetworkEvent::OpenPairingSucceeded {
+                token: "tct1_token-with-enough-content".to_string(),
+                server_public_key: key.to_string(),
+                udp_addr: "198.51.100.20:54100".to_string(),
+                udp_probe_addr: None,
+            }
+            .into(),
+        );
+
+        let mut transitions = Vec::new();
+        while let Some(transition) = view.lock().pending_transition.pop_front() {
+            transitions.push(transition);
+        }
+        assert!(matches!(
+            transitions.as_slice(),
+            [ModeTransition::Replace(_)]
+        ));
+        assert!(app.view.pending_transition.is_empty());
+        assert_eq!(app.pairing_owner, None);
+        assert!(!app.password_prompt_active);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_pairing_failure_reports_on_owning_view() {
+        let mut app = test_app();
+        let owner = crate::client_channel::ClientId(6);
+        let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("test channel"));
+        let view = app.attach_client(owner, channel.clone());
+        app.pending_pair = Some(pending_open_pair("public"));
+        app.pairing_owner = Some(owner);
+        app.password_prompt_active = true;
+
+        app.handle_app_event(NetworkEvent::PairingFailed("bad password".to_string()).into());
+
+        {
+            let view = view.lock();
+            assert_eq!(view.status.text(), "bad password");
+            assert_eq!(view.status.kind(), StatusKind::Error);
+        }
+        assert_ne!(app.view.status.text(), "bad password");
+        assert!(matches!(
+            channel.drain_events().as_slice(),
+            [crate::client_channel::ClientEvent::PairingFailed(error)] if error == "bad password"
+        ));
+    }
+
+    #[test]
+    fn pairing_completion_without_owner_falls_back_to_primary() {
+        let mut app = test_app();
+        app.pairing_owner = None;
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        app.handle_app_event(
+            NetworkEvent::OpenPairingSucceeded {
+                token: "tct1_token-with-enough-content".to_string(),
+                server_public_key: key.to_string(),
+                udp_addr: "198.51.100.20:54100".to_string(),
+                udp_probe_addr: None,
+            }
+            .into(),
+        );
+
+        assert_eq!(app.view.status.text(), "pairing succeeded");
+    }
+
+    #[test]
+    fn primary_password_pairing_success_does_not_pop_the_replacement_editor() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-primary-pair-success-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut app = test_app();
+        app.config.config_path = Some(path.clone());
+        app.pending_pair = Some(pending_open_pair("public"));
+        app.pairing_owner = Some(crate::client_channel::ClientId::PRIMARY);
+        app.password_prompt_active = true;
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        app.handle_app_event(
+            NetworkEvent::OpenPairingSucceeded {
+                token: "tct1_token-with-enough-content".to_string(),
+                server_public_key: key.to_string(),
+                udp_addr: "198.51.100.20:54100".to_string(),
+                udp_probe_addr: None,
+            }
+            .into(),
+        );
+
+        let mut transitions = Vec::new();
+        while let Some(transition) = app.take_mode_transition() {
+            transitions.push(transition);
+        }
+        assert!(matches!(
+            transitions.as_slice(),
+            [ModeTransition::Replace(_)]
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
     fn user_summary(user_id: UserId, display_name: &str) -> rpc::control::UserSummary {
         rpc::control::UserSummary {
             user_id,
@@ -9005,8 +9186,7 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(network_tx));
         enter_test_room(&mut app);
         let owner = crate::client_channel::ClientId(77);
-        let channel = Arc::new(crate::client_channel::ClientChannel::new().unwrap());
-        app.attach_client(owner, channel.clone());
+        let view = attach_test_client(&mut app, owner);
         app.handle_client_command(
             owner,
             command::CoreCommand::DeleteMessages {
@@ -9032,10 +9212,9 @@ mod tests {
         });
 
         assert_eq!(app.view.status.text(), "primary steady");
-        assert!(matches!(
-            channel.drain_events().as_slice(),
-            [crate::client_channel::ClientEvent::SetError(error)] if error == "message is too old"
-        ));
+        let view = view.lock();
+        assert_eq!(view.status.text(), "message is too old");
+        assert_eq!(view.status.kind(), StatusKind::Error);
     }
 
     #[test]

@@ -332,8 +332,6 @@ pub struct UiConfig {
     pub room_height: u16,
     #[toml(default = 6)]
     pub max_composer_height: u16,
-    #[toml(default = "Message #lobby".to_string())]
-    pub placeholder: String,
     #[toml(default = 50_000)]
     pub max_messages: u32,
     #[toml(default = 24)]
@@ -373,7 +371,6 @@ impl Default for UiConfig {
         Self {
             room_height: 4,
             max_composer_height: 6,
-            placeholder: "Message #lobby".to_string(),
             max_messages: 50_000,
             overscan: 24,
             default_bindings: DefaultBindings::Standard,
