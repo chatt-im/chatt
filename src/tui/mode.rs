@@ -28,6 +28,22 @@ impl ViewCx<'_> {
     pub(crate) fn send(&mut self, command: CoreCommand) {
         self.commands.push(command);
     }
+
+    pub(crate) fn set_status(&mut self, status: impl Into<String>) {
+        self.view.set_status(status);
+    }
+
+    pub(crate) fn set_error(&mut self, status: impl Into<String>) {
+        self.view.set_error(status);
+    }
+
+    pub(crate) fn set_transient_status(&mut self, status: impl Into<String>) {
+        self.view.set_transient_status(status);
+    }
+
+    pub(crate) fn request_transition(&mut self, transition: ModeTransition) {
+        self.view.pending_transition.request(transition);
+    }
 }
 
 /// Whether `key` is the global quit chord (Ctrl-C). Overlay modes check this so
