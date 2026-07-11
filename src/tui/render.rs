@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use extui::{AnsiColor, Buffer, CursorShape, Ellipsis, HAlign, Rect, Style, vt::Modifier};
+use extui::{AnsiColor, Buffer, Cell, CursorShape, Ellipsis, HAlign, Rect, Style, vt::Modifier};
 use extui_bindings::LayerId;
 use extui_editor::Mode as EditorMode;
 use rpc::ids::FileTransferId;
@@ -375,13 +375,13 @@ pub(crate) fn draw_room_screen(
     );
 
     draw_compose_bar(status_area, app, focus, buf, mode, status_label);
-    draw_composer_border(top_border, app.view.theme, '▀', buf);
+    draw_composer_border(top_border, app.view.theme, "▀", buf);
     if let Some(search) = history_search {
         draw_history_search(composer_area, app, search, composer_padding, buf);
     } else {
         draw_composer(composer_area, app, focus, composer_padding, buf);
     }
-    draw_composer_border(bottom_border, app.view.theme, '▄', buf);
+    draw_composer_border(bottom_border, app.view.theme, "▄", buf);
     draw_key_preview(key_preview_area, app, buf);
 }
 
@@ -1808,6 +1808,35 @@ mod tests {
     }
 
     #[test]
+    fn composer_border_writes_styled_cells_directly_without_allocating() {
+        let theme = Theme::base16_dark();
+        let style = theme.composer_border.without_bg();
+        let area = Rect {
+            x: 3,
+            y: 1,
+            w: 10,
+            h: 1,
+        };
+        let mut buf = Buffer::new(16, 2);
+
+        let (_, allocations) = crate::test_alloc::count_alloc(|| {
+            draw_composer_border(area, theme, "▀", &mut buf);
+        });
+
+        assert_eq!(allocations.allocs, 0);
+        assert_eq!(allocations.deallocs, 0);
+        assert_eq!(allocations.reallocs, 0);
+        let cells = buf.current().cells();
+        let row = &cells[16..32];
+        assert_eq!(row[2].text_inline(), Some(" "));
+        assert_eq!(row[13].text_inline(), Some(" "));
+        for cell in &row[3..13] {
+            assert_eq!(cell.text_inline(), Some("▀"));
+            assert_eq!(cell.style(), style);
+        }
+    }
+
+    #[test]
     fn latency_estimate_sums_buffer_and_half_rtt() {
         // jitter buffer 60 + ring 10 + rtt 40/2 = 90.
         assert_eq!(
@@ -2312,13 +2341,18 @@ fn draw_status_segment_right(row: &mut Rect, buf: &mut Buffer, style: Style, tex
     area
 }
 
-fn draw_composer_border(area: Rect, theme: Theme, glyph: char, buf: &mut Buffer) {
+fn draw_composer_border(area: Rect, theme: Theme, glyph: &str, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
-    let border = glyph.to_string().repeat(area.w as usize);
-    area.with(theme.composer_border.without_bg())
-        .text(buf, &border);
+
+    let style = theme.composer_border.without_bg();
+    let cell = Cell::new_unchecked(glyph, style);
+    if let Some(row) = buf.current().row_remaining_mut(area.x, area.y) {
+        row.iter_mut()
+            .take(area.w as usize)
+            .for_each(|slot| *slot = cell);
+    }
 }
 
 fn draw_history_search(
