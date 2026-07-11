@@ -186,23 +186,30 @@ pub(crate) fn form_dialog_panel(area: Rect, form_height: u16) -> Option<Rect> {
     })
 }
 
-/// Clears the dialog panel, draws its header row, and returns the padded body
-/// rect the caller renders the form into.
-pub(crate) fn draw_form_dialog_frame(
+/// Clears a dialog panel, draws its full-width title at the top, and returns
+/// the consistently padded body rect.
+pub(crate) fn draw_dialog_frame(panel: Rect, buf: &mut Buffer, theme: &Theme, title: &str) -> Rect {
+    draw_dialog_frame_with_header(panel, buf, theme, title, theme.dialog_header)
+}
+
+/// Variant of [`draw_dialog_frame`] for dialogs whose title needs a semantic
+/// header style, such as a destructive warning.
+pub(crate) fn draw_dialog_frame_with_header(
     panel: Rect,
     buf: &mut Buffer,
     theme: &Theme,
     title: &str,
+    header_style: Style,
 ) -> Rect {
     buf.clear_rect(panel, theme.dialog_panel);
     let mut rows = panel;
     rows.take_top(1)
-        .with(theme.dialog_header | Modifier::BOLD)
+        .with(header_style | Modifier::BOLD)
         .fill(buf)
         .with(HAlign::Center)
         .with(Ellipsis(true))
         .text(buf, &format!(" {title} "));
-    rows.inset(1, 1)
+    rows.inset(2, 1)
 }
 
 pub(crate) fn draw_server_edit_overlay(
@@ -214,7 +221,7 @@ pub(crate) fn draw_server_edit_overlay(
     let Some(panel) = form_dialog_panel(area, draft.form_height()) else {
         return;
     };
-    let body = draw_form_dialog_frame(panel, buf, &app.view.theme, &draft.title());
+    let body = draw_dialog_frame(panel, buf, &app.view.theme, &draft.title());
     draft.render(body, buf, &app.view.theme);
     draw_overlay_key_preview(app, bindings::FORM_LAYER, buf);
 }
@@ -1842,6 +1849,36 @@ fn chat_entry_accent(theme: Theme, local: bool, notice_kind: Option<NoticeKind>)
 mod tests {
     use super::*;
     use rpc::ids::{StreamId, UserId};
+
+    #[test]
+    fn dialog_frame_uses_full_width_top_title_and_uniform_padding() {
+        let theme = Theme::base16_dark();
+        let panel = Rect {
+            x: 3,
+            y: 2,
+            w: 20,
+            h: 7,
+        };
+        let mut buf = Buffer::new(28, 12);
+
+        let body = draw_dialog_frame(panel, &mut buf, &theme, "Delete message?");
+
+        assert_eq!(
+            body,
+            Rect {
+                x: 5,
+                y: 4,
+                w: 16,
+                h: 4,
+            }
+        );
+        let grid = buf.current();
+        let width = usize::from(grid.width());
+        for x in panel.x..panel.x + panel.w {
+            let cell = grid.cells()[usize::from(panel.y) * width + usize::from(x)];
+            assert_eq!(cell.style().bg(), theme.dialog_header.bg());
+        }
+    }
 
     fn feedback(jitter_buffer_ms: u16, ring_ms: u16) -> ParticipantVoiceFeedback {
         ParticipantVoiceFeedback {

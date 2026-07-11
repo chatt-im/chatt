@@ -175,8 +175,10 @@ impl ConfirmMode {
         } else {
             (selected, idle)
         };
-        draw_button(self.cancel_button, buf, cancel_style, &self.cancel_label);
-        draw_button(self.confirm_button, buf, confirm_style, &self.confirm_label);
+        let cancel = button_label(&self.cancel_label, Some("n".to_string()));
+        let confirm = button_label(&self.confirm_label, Some("y".to_string()));
+        draw_button(self.cancel_button, buf, cancel_style, &cancel);
+        draw_button(self.confirm_button, buf, confirm_style, &confirm);
     }
 }
 
@@ -198,16 +200,9 @@ impl AppMode for ConfirmMode {
             w: width,
             h: height,
         };
-        buf.clear_rect(panel, theme.dialog_panel);
-
-        let mut rows = panel.inset(2, 1);
-        rows.take_top(1)
-            .with(theme.dialog_header | Modifier::BOLD)
-            .with(HAlign::Center)
-            .with(Ellipsis(true))
-            .text(buf, &self.prompt);
-        rows.take_top(1);
-        self.render_buttons(rows.take_top(1), buf, theme);
+        let mut body = crate::tui::render::draw_dialog_frame(panel, buf, theme, &self.prompt);
+        body.take_top(1);
+        self.render_buttons(body.take_top(1), buf, theme);
     }
 
     fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
@@ -227,6 +222,7 @@ impl AppMode for ConfirmMode {
 /// ExternalSecureLink transport.
 pub(crate) struct NativeEncryptionWarningMode {
     label: String,
+    selected_connect: bool,
     cancel_button: Rect,
     connect_button: Rect,
 }
@@ -235,6 +231,7 @@ impl NativeEncryptionWarningMode {
     pub(crate) fn new(label: String) -> Self {
         Self {
             label,
+            selected_connect: false,
             cancel_button: Rect::EMPTY,
             connect_button: Rect::EMPTY,
         }
@@ -264,6 +261,34 @@ impl NativeEncryptionWarningMode {
         }
         if matches!(key.kind, KeyEventKind::Release) {
             return Action::Continue;
+        }
+        match key.code {
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.cancel(cx);
+                return Action::Continue;
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.accept(cx);
+                return Action::Continue;
+            }
+            KeyCode::Enter => {
+                if self.selected_connect {
+                    self.accept(cx);
+                } else {
+                    self.cancel(cx);
+                }
+                return Action::Continue;
+            }
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h')
+            | KeyCode::Char('l') => {
+                self.selected_connect = !self.selected_connect;
+                return Action::Continue;
+            }
+            _ => {}
         }
         if let Some(input) = InputKey::from_event(&key) {
             match bindings::resolve(
@@ -298,7 +323,6 @@ impl NativeEncryptionWarningMode {
     fn render_buttons(
         &mut self,
         area: Rect,
-        app: &crate::tui::render::RenderState<'_>,
         buf: &mut Buffer,
         theme: &Theme,
     ) {
@@ -317,29 +341,26 @@ impl NativeEncryptionWarningMode {
         }
         self.connect_button = row;
 
-        let cancel = button_label(
-            "Cancel",
-            bindings::command_key_hint(
-                &app.config.bindings,
-                bindings::DIALOG_LAYER,
-                BindCommand::Cancel,
-            ),
-        );
-        let connect = button_label(
-            "Connect",
-            bindings::command_key_hint(
-                &app.config.bindings,
-                bindings::DIALOG_LAYER,
-                BindCommand::Activate,
-            ),
-        );
+        let cancel = button_label("Cancel", Some("n".to_string()));
+        let connect = button_label("Connect", Some("y".to_string()));
+        let (cancel_style, connect_style) = if self.selected_connect {
+            (
+                theme.dialog_panel.patch(theme.muted),
+                theme.selected_focused,
+            )
+        } else {
+            (
+                theme.selected_focused,
+                theme.dialog_panel.patch(theme.muted),
+            )
+        };
         draw_button(
             self.cancel_button,
             buf,
-            theme.dialog_panel.patch(theme.muted),
+            cancel_style,
             &cancel,
         );
-        draw_button(self.connect_button, buf, theme.selected_focused, &connect);
+        draw_button(self.connect_button, buf, connect_style, &connect);
     }
 }
 
@@ -359,17 +380,13 @@ impl AppMode for NativeEncryptionWarningMode {
             w: width,
             h: height,
         };
-        buf.clear_rect(panel, theme.dialog_panel);
-
-        let mut rows = panel;
-        rows.take_top(1)
-            .with(native_encryption_header_style(theme) | Modifier::BOLD)
-            .fill(buf)
-            .with(HAlign::Center)
-            .with(Ellipsis(true))
-            .text(buf, "No Native Encryption to Server");
-
-        let mut body = rows.inset(2, 1);
+        let mut body = crate::tui::render::draw_dialog_frame_with_header(
+            panel,
+            buf,
+            theme,
+            "No Native Encryption to Server",
+            native_encryption_header_style(theme),
+        );
         body.take_top(1)
             .with(theme.dialog_panel.patch(theme.error | Modifier::BOLD))
             .with(HAlign::Center)
@@ -412,7 +429,7 @@ impl AppMode for NativeEncryptionWarningMode {
             body.take_top(1);
         }
         if body.h > 0 {
-            self.render_buttons(body.take_top(1), &app, buf, theme);
+            self.render_buttons(body.take_top(1), buf, theme);
         }
         crate::tui::render::draw_overlay_key_preview(&mut app, bindings::DIALOG_LAYER, buf);
     }
@@ -557,17 +574,8 @@ impl AppMode for PasswordPromptMode {
             w: width,
             h: height,
         };
-        buf.clear_rect(panel, theme.dialog_panel);
-
-        let mut rows = panel;
-        let prompt = "Server password required";
-        rows.take_top(1)
-            .with(theme.dialog_header | Modifier::BOLD)
-            .fill(buf)
-            .with(HAlign::Center)
-            .with(Ellipsis(true))
-            .text(buf, prompt);
-        let mut body = rows.inset(2, 1);
+        let mut body =
+            crate::tui::render::draw_dialog_frame(panel, buf, theme, "Server password required");
         body.take_top(1);
         self.render_input_row(body.take_top(1), buf, theme);
         body.take_top(1);
@@ -966,17 +974,7 @@ impl AppMode for PasteImageUploadMode {
             w: width,
             h: height,
         };
-        buf.clear_rect(panel, theme.dialog_panel);
-
-        let mut rows = panel;
-        rows.take_top(1)
-            .with(theme.dialog_header | Modifier::BOLD)
-            .fill(buf)
-            .with(HAlign::Center)
-            .with(Ellipsis(true))
-            .text(buf, "Upload image");
-
-        let mut body = rows.inset(2, 1);
+        let mut body = crate::tui::render::draw_dialog_frame(panel, buf, theme, "Upload image");
         body.take_top(1)
             .with(theme.dialog_panel.patch(theme.muted))
             .with(Ellipsis(true))
@@ -1167,6 +1165,32 @@ mod tests {
 
         assert!(confirmed.load(Ordering::Relaxed));
         assert!(!app.view.pending_transition.is_empty());
+    }
+
+    #[test]
+    fn confirmation_buttons_show_yes_and_no_shortcuts() {
+        let mut app = test_app();
+        let mut mode = ConfirmMode::new("Delete message?", "Delete", "Cancel", |_| {
+            ConfirmDisposition::Close
+        });
+        let mut buffer = Buffer::new(80, 24);
+
+        mode.render(&mut app, &mut buffer, 0);
+
+        let screen: String = buffer
+            .current()
+            .cells()
+            .iter()
+            .filter_map(|cell| cell.text_inline())
+            .collect();
+        assert!(
+            screen.contains("Cancel [n]"),
+            "cancel hint missing: {screen}"
+        );
+        assert!(
+            screen.contains("Delete [y]"),
+            "confirm hint missing: {screen}"
+        );
     }
 
     #[test]

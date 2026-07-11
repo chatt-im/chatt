@@ -1,4 +1,4 @@
-use extui::{Buffer, Ellipsis, Rect, vt::Modifier};
+use extui::{Buffer, Ellipsis, Rect};
 use extui_editor::Editor;
 use rpc::ids::UserId;
 use unicode_width::UnicodeWidthStr;
@@ -106,15 +106,12 @@ impl UserVolumeDialog {
             w: width,
             h: height,
         };
-        buf.clear_rect(panel, theme.dialog_panel);
-
-        let mut rows = panel;
-        rows.take_top(1)
-            .with(theme.dialog_header | Modifier::BOLD)
-            .with(Ellipsis(true))
-            .text(buf, &format!(" Local volume: {} ", self.user_name));
-
-        let mut body = rows.inset(2, 0);
+        let mut body = crate::tui::render::draw_dialog_frame(
+            panel,
+            buf,
+            theme,
+            &format!("Local volume: {}", self.user_name),
+        );
         body.take_top(1)
             .with(theme.dialog_panel.patch(theme.muted))
             .with(Ellipsis(true))
