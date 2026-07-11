@@ -222,15 +222,17 @@ impl AppMode for ConfirmMode {
 /// ExternalSecureLink transport.
 pub(crate) struct NativeEncryptionWarningMode {
     label: String,
+    generation: u64,
     selected_connect: bool,
     cancel_button: Rect,
     connect_button: Rect,
 }
 
 impl NativeEncryptionWarningMode {
-    pub(crate) fn new(label: String) -> Self {
+    pub(crate) fn new(label: String, generation: u64) -> Self {
         Self {
             label,
+            generation,
             selected_connect: false,
             cancel_button: Rect::EMPTY,
             connect_button: Rect::EMPTY,
@@ -238,11 +240,16 @@ impl NativeEncryptionWarningMode {
     }
 
     fn accept(&mut self, cx: &mut ViewCx<'_>) {
-        cx.send(CoreCommand::AcceptNativeEncryption(self.label.clone()));
+        cx.send(CoreCommand::AcceptNativeEncryption {
+            label: self.label.clone(),
+            generation: self.generation,
+        });
     }
 
     fn cancel(&mut self, cx: &mut ViewCx<'_>) {
-        cx.send(CoreCommand::CancelNativeEncryption);
+        cx.send(CoreCommand::CancelNativeEncryption {
+            generation: self.generation,
+        });
     }
 
     fn process_command(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
@@ -320,12 +327,7 @@ impl NativeEncryptionWarningMode {
         Action::Continue
     }
 
-    fn render_buttons(
-        &mut self,
-        area: Rect,
-        buf: &mut Buffer,
-        theme: &Theme,
-    ) {
+    fn render_buttons(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         if area.is_empty() {
             self.cancel_button = Rect::EMPTY;
             self.connect_button = Rect::EMPTY;
@@ -354,12 +356,7 @@ impl NativeEncryptionWarningMode {
                 theme.dialog_panel.patch(theme.muted),
             )
         };
-        draw_button(
-            self.cancel_button,
-            buf,
-            cancel_style,
-            &cancel,
-        );
+        draw_button(self.cancel_button, buf, cancel_style, &cancel);
         draw_button(self.connect_button, buf, connect_style, &connect);
     }
 }
@@ -604,14 +601,15 @@ impl AppMode for PasswordPromptMode {
         crate::tui::render::draw_overlay_key_preview(&mut app, bindings::PASSWORD_LAYER, buf);
     }
 
-    fn process_client_event(&mut self, event: crate::client_channel::ClientEvent) {
-        use crate::client_channel::ClientEvent;
+    fn process_client_event(&mut self, event: crate::client_channel::TerminalEvent) {
+        use crate::client_channel::TerminalEvent;
 
         match event {
-            ClientEvent::PairingPasswordChallenge { retry, .. } => {
+            TerminalEvent::PairingPasswordChallenge { retry, .. } => {
                 self.apply_password_challenge(retry);
             }
-            ClientEvent::PairingFailed(error) => self.apply_error(error),
+            TerminalEvent::PairingFailed(error) => self.apply_error(error),
+            TerminalEvent::Navigation(_) => {}
         }
     }
 
@@ -1164,7 +1162,7 @@ mod tests {
         );
 
         assert!(confirmed.load(Ordering::Relaxed));
-        assert!(!app.view.pending_transition.is_empty());
+        assert!(!app.test_navigation.is_empty());
     }
 
     #[test]
@@ -1216,7 +1214,7 @@ mod tests {
         );
 
         assert!(!confirmed.load(Ordering::Relaxed));
-        assert!(!app.view.pending_transition.is_empty());
+        assert!(!app.test_navigation.is_empty());
     }
 
     fn image_paste(source: ImagePasteSource, default_name: &str) -> ImagePaste {
@@ -1288,7 +1286,7 @@ mod tests {
             mode.submit(&mut cx);
         }
         assert!(mode.error.is_some());
-        assert!(app.view.pending_transition.is_empty());
+        assert!(app.test_navigation.is_empty());
     }
 
     #[test]
@@ -1306,11 +1304,11 @@ mod tests {
         // First Esc: editor leaves insert mode, dialog stays open.
         mode.process_input(&mut app, esc);
         assert_eq!(mode.editor.mode(), EditorMode::Normal);
-        assert!(app.view.pending_transition.is_empty());
+        assert!(app.test_navigation.is_empty());
 
         // Second Esc: from normal mode this cancels the dialog.
         mode.process_input(&mut app, esc);
-        assert!(!app.view.pending_transition.is_empty());
+        assert!(!app.test_navigation.is_empty());
     }
 
     #[test]
@@ -1328,7 +1326,7 @@ mod tests {
             mode.cancel(&mut cx);
         }
         assert!(!path.exists());
-        assert!(!app.view.pending_transition.is_empty());
+        assert!(!app.test_navigation.is_empty());
     }
 
     #[test]
@@ -1473,7 +1471,12 @@ mod tests {
         );
 
         assert!(app.pending_pair.is_none());
-        assert!(!app.view.pending_transition.is_empty());
+        assert!(matches!(
+            app.take_terminal_event(),
+            Some(crate::client_channel::TerminalEvent::Navigation(
+                crate::client_channel::NavigationEvent::CloseOverlay
+            ))
+        ));
     }
 
     #[test]
@@ -1483,7 +1486,7 @@ mod tests {
         prompt.submitting = true;
 
         prompt.process_client_event(
-            crate::client_channel::ClientEvent::PairingPasswordChallenge { retry: true },
+            crate::client_channel::TerminalEvent::PairingPasswordChallenge { retry: true },
         );
 
         assert_eq!(

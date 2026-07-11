@@ -96,6 +96,7 @@ impl ClientThread {
             InitialMode::Servers => Box::new(ServerListMode::new()),
         };
         let mut queued = Vec::new();
+        let mut local_navigation = std::collections::VecDeque::new();
         let mut mode_stack = {
             let session = session.read();
             let config = config.read();
@@ -105,6 +106,7 @@ impl ClientThread {
                 session: &session,
                 config: &config,
                 commands: &mut queued,
+                navigation: &mut local_navigation,
             };
             ModeStack::new_with_cx(root, &mut cx)
         };
@@ -139,37 +141,26 @@ impl ClientThread {
                     url_opener = crate::url_open::UrlOpener::new(url_open_command.clone());
                 }
                 let previous_room = view.viewed_room;
-                let epoch_changed = if follow_primary_view {
-                    view.sync_active(&session)
+                if follow_primary_view {
+                    view.sync_active(&session);
                 } else {
-                    let epoch_changed = view.sync_independent(&session);
+                    view.sync_independent(&session);
                     if view.viewed_room != previous_room
                         && let Some(room_id) = view.viewed_room
                     {
                         queued.push(CoreCommand::SetViewedRoom(room_id));
                     }
-                    epoch_changed
-                };
+                }
                 let mut cx = ViewCx {
                     view: &mut view,
                     session: &session,
                     config: &config,
                     commands: &mut queued,
+                    navigation: &mut local_navigation,
                 };
-                if epoch_changed {
-                    let mode: Box<dyn AppMode> = if session.network_selected {
-                        Box::new(RoomMode::default())
-                    } else {
-                        Box::new(ServerListMode::new())
-                    };
-                    cx.request_transition(crate::tui::mode::ModeTransition::Set(mode));
-                }
-                // Core handlers queue transitions on the view between frames;
-                // apply them on the wake that delivered them rather than after
-                // the next input event.
                 mode_stack.apply_pending_cx(&mut cx);
                 for event in client_events {
-                    mode_stack.process_client_event(event);
+                    mode_stack.process_terminal_event(&mut cx, event);
                 }
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -202,6 +193,7 @@ impl ClientThread {
                         session: &session,
                         config: &config,
                         commands: &mut queued,
+                        navigation: &mut local_navigation,
                     };
                     let action = match event {
                         Event::Key(key) => mode_stack.process_input_cx(&mut cx, key),

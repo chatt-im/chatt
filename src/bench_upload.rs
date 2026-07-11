@@ -23,7 +23,7 @@ use rpc::control::FileContentEncoding;
 use rpc::crypto::dev_server_seed_hex;
 use rpc::ids::{RoomId, UserId};
 
-use crate::app::{AppEvent, EventSender};
+use crate::app::{AppEvent, NetworkEventSender};
 use crate::client_net::{
     ClientConfig, FilePolicy, NetworkClient, NetworkCommand, NetworkEvent, UploadFileRequest,
 };
@@ -125,7 +125,8 @@ fn client_config(
 
 fn spawn_client(config: ClientConfig) -> Client {
     let (tx, rx) = mpsc::channel();
-    let handle = NetworkClient::spawn(config, EventSender(tx)).expect("spawn network client");
+    let handle = NetworkClient::spawn(config, NetworkEventSender::for_test(tx))
+        .expect("spawn network client");
     Client { handle, events: rx }
 }
 

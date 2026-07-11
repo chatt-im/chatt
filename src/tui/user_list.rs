@@ -670,7 +670,7 @@ mod tests {
 
         mode.process_action(&mut app, BindCommand::Activate);
 
-        assert!(app.view.pending_transition.is_empty());
+        assert!(app.test_navigation.is_empty());
         assert_eq!(app.view.status.text(), "ann is away");
     }
 
