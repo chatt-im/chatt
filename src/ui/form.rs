@@ -72,7 +72,6 @@ pub(crate) struct ActionButton<'a, T> {
     pub(crate) label: &'a str,
     pub(crate) value: T,
     pub(crate) help: &'static str,
-    pub(crate) primary: bool,
 }
 
 pub(crate) struct ActionResponse<T> {
@@ -559,7 +558,6 @@ impl<'a> Form<'a> {
                     self.theme,
                     spec.label,
                     focused,
-                    spec.primary,
                     matches!(self.surface, FormSurface::Dialog),
                 );
             }

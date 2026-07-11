@@ -129,14 +129,13 @@ pub(crate) fn draw_action(
     theme: &Theme,
     label: &str,
     focused: bool,
-    primary: bool,
     dialog: bool,
 ) {
     if area.is_empty() {
         return;
     }
     let style = if dialog {
-        let style = if focused || primary {
+        let style = if focused {
             theme.selected_focused
         } else {
             theme.dialog_panel.patch(theme.muted)
@@ -148,8 +147,6 @@ pub(crate) fn draw_action(
         }
     } else if focused {
         theme.background.patch(theme.good | Modifier::BOLD)
-    } else if primary {
-        theme.background.patch(theme.text | Modifier::BOLD)
     } else {
         theme.background.patch(theme.muted)
     };

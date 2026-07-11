@@ -15,6 +15,7 @@ extui-bindings = { git = "https://github.com/exrok/extui", rev = "0438812f44b039
 bwrap.path = "crates/bwrap"
 tinyhl = { git = "https://github.com/exrok/extui", rev = "0438812f44b0394c220c520effc5dbd38a86aa1a" }
 unicode-width = "0.2"
+unicode-segmentation = "1"
 opus-codec = { path = "crates/opus-codec", features = ["dred"] }
 ring = "0.17.14"
 jsony = "0.1.10"

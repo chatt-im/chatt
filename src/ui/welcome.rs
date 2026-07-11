@@ -235,14 +235,12 @@ impl<'a> WelcomeForm<'a> {
                 label: &self.action_labels.exit,
                 value: WelcomeButton::Exit,
                 help: "Close chatt.",
-                primary: false,
             },
             ActionButton {
                 key: "Save",
                 label: &self.action_labels.save,
                 value: WelcomeButton::Save,
                 help: "Write the client config and continue startup.",
-                primary: true,
             },
         ];
         let response = self.form.actions(&actions);

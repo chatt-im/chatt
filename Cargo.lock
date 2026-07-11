@@ -325,6 +325,7 @@ dependencies = [
  "tempfile",
  "tinyhl",
  "toml-spanner",
+ "unicode-segmentation",
  "unicode-width",
  "zstd",
 ]
