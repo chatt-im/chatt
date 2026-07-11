@@ -33,7 +33,7 @@ use crate::{
         mode::ViewCx,
         modes::{LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
         view::ClientView,
-        widgets::{SCROLLBAR_UNITS_PER_CELL, ScrollbarGeometry, ScrollbarLayout, ScrollbarState},
+        widgets::{ScrollbarId, ScrollbarLayout, ScrollbarState, draw_scrollbar},
     },
     ui,
     ui::select::FuzzySelect,
@@ -404,10 +404,11 @@ pub(crate) fn draw_room_screen(
             h: frame.h,
         };
         layout.composer_scrollbar = Some(ScrollbarLayout {
+            id: ScrollbarId::Compose,
             rect: scrollbar_rect,
             state: scroll,
         });
-        draw_composer_scrollbar(scrollbar_rect, scroll, app.view.theme, buf);
+        draw_scrollbar(layout.composer_scrollbar.unwrap(), app.view.theme, buf);
     }
     draw_key_preview(key_preview_area, app, buf);
 }
@@ -558,7 +559,13 @@ fn draw_workspace(
         layout.lobby_divider_rect = divider_area;
         layout.user_list_rect = users_area;
         draw_room_list(rooms_area, app, focus, lobby_list_focus, layout, buf);
-        divider_area.with(app.view.theme.status_fill).fill(buf);
+        let rooms_focused =
+            focus == ChatPanelFocus::Lobby && lobby_list_focus == LobbyListFocus::Rooms;
+        if let Some(scrollbar) = layout.rooms_scrollbar.filter(|_| rooms_focused) {
+            draw_scrollbar(scrollbar, app.view.theme, buf);
+        } else {
+            divider_area.with(app.view.theme.status_fill).fill(buf);
+        }
         draw_user_list(users_area, app, focus, lobby_list_focus, buf);
     }
 
@@ -606,19 +613,21 @@ fn split_lobby_lists(area: Rect) -> (Rect, Rect, Rect) {
 /// per visible room.
 fn draw_room_list(
     area: Rect,
-    app: &RenderState<'_>,
+    app: &mut RenderState<'_>,
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     layout: &mut RoomLayout,
     buf: &mut Buffer,
 ) {
+    let items = app.room_select_items();
+    let visible = area.h as usize;
+    app.view.clamp_rooms_offset(items.len(), visible);
     if area.is_empty() {
         return;
     }
     let theme = app.view.theme;
     area.with(theme.panel_alt).fill(buf);
 
-    let items = app.room_select_items();
     if items.is_empty() {
         area.with(theme.panel_alt.patch(theme.muted))
             .with(Ellipsis(true))
@@ -626,9 +635,18 @@ fn draw_room_list(
         return;
     }
 
-    let visible = area.h as usize;
-    let viewed = items.iter().position(|item| item.viewed).unwrap_or(0);
-    let start = viewed.saturating_sub(visible.saturating_sub(1));
+    let start = app.view.rooms_offset;
+    if items.len() > visible && !layout.lobby_divider_rect.is_empty() {
+        layout.rooms_scrollbar = Some(ScrollbarLayout {
+            id: ScrollbarId::Rooms,
+            rect: layout.lobby_divider_rect,
+            state: ScrollbarState {
+                total: items.len() as u32,
+                viewport: visible as u32,
+                offset: start as u32,
+            },
+        });
+    }
     let active = focus == ChatPanelFocus::Lobby && lobby_list_focus == LobbyListFocus::Rooms;
     let mut rows = area;
     for item in items.iter().skip(start).take(visible) {
@@ -2697,41 +2715,17 @@ fn composer_scroll_state(editor: &Editor, area: Rect) -> Option<ScrollbarState> 
     })
 }
 
-/// Draws a thick composer scrollbar in eighth-cell virtual units. The right
-/// edge of `area` is a dedicated themed gutter; unlike extui's generic widget,
-/// the track includes the composer's optional border rows.
-fn draw_composer_scrollbar(area: Rect, scroll: ScrollbarState, theme: Theme, buf: &mut Buffer) {
-    let Some(geometry) = ScrollbarGeometry::new(area.h, scroll) else {
-        return;
-    };
-
-    const BLOCKS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-
-    let style = theme.scrollbar;
-    let x = area.x + area.w - 1;
-    let thumb_end = geometry.thumb_start + geometry.thumb_units;
-
-    let blank = Cell::new_unchecked(" ", style);
-    for row in 0..area.h {
-        let y = area.y + row;
-        let cell_start = u32::from(row) * SCROLLBAR_UNITS_PER_CELL;
-        let cell_end = cell_start + SCROLLBAR_UNITS_PER_CELL;
-        let overlap_start = cell_start.max(geometry.thumb_start);
-        let overlap_end = cell_end.min(thumb_end);
-        let coverage = overlap_end.saturating_sub(overlap_start);
-
-        let cell = match coverage {
-            0 => blank,
-            SCROLLBAR_UNITS_PER_CELL => Cell::new_unchecked(BLOCKS[8], style),
-            coverage if overlap_start == cell_start => {
-                let uncovered_at_bottom = (SCROLLBAR_UNITS_PER_CELL - coverage) as usize;
-                Cell::new_unchecked(BLOCKS[uncovered_at_bottom], style)
-                    .with_style_merged(Modifier::REVERSED.into())
-            }
-            coverage => Cell::new_unchecked(BLOCKS[coverage as usize], style),
-        };
-        buf.set_cell(x, y, cell);
-    }
+#[cfg(test)]
+fn draw_composer_scrollbar(area: Rect, state: ScrollbarState, theme: Theme, buf: &mut Buffer) {
+    draw_scrollbar(
+        ScrollbarLayout {
+            id: ScrollbarId::Compose,
+            rect: area,
+            state,
+        },
+        theme,
+        buf,
+    );
 }
 
 /// The composer's empty-state hint, naming the issuing view's room so each

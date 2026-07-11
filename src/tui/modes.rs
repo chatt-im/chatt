@@ -25,7 +25,7 @@ use crate::{
         overlay::{ConfirmDisposition, ConfirmMode, DialogMode, PasteImageUploadMode},
         room_settings::RoomSettingsMode,
         user_list::UserListMode,
-        widgets::{SCROLLBAR_UNITS_PER_CELL, ScrollbarGeometry, ScrollbarLayout},
+        widgets::{ScrollbarDrag, ScrollbarId, ScrollbarLayout},
     },
     ui::{
         select::FuzzySelect,
@@ -1078,6 +1078,7 @@ pub(crate) struct RoomLayout {
     pub visible_chat_lines: Vec<VisibleLine>,
     pub room_list_rect: Rect,
     pub lobby_divider_rect: Rect,
+    pub rooms_scrollbar: Option<ScrollbarLayout>,
     pub user_list_rect: Rect,
     /// Hit boxes of the room rows drawn in the room list.
     pub room_hits: Vec<(Rect, rpc::ids::RoomId)>,
@@ -1099,6 +1100,7 @@ impl Default for RoomLayout {
             visible_chat_lines: Vec::new(),
             room_list_rect: Rect::EMPTY,
             lobby_divider_rect: Rect::EMPTY,
+            rooms_scrollbar: None,
             user_list_rect: Rect::EMPTY,
             room_hits: Vec::new(),
             lobby_bar_rect: Rect::EMPTY,
@@ -1115,6 +1117,7 @@ impl RoomLayout {
     pub(crate) fn clear_workspace(&mut self) {
         self.room_list_rect = Rect::EMPTY;
         self.lobby_divider_rect = Rect::EMPTY;
+        self.rooms_scrollbar = None;
         self.user_list_rect = Rect::EMPTY;
         self.room_hits.clear();
         self.lobby_bar_rect = Rect::EMPTY;
@@ -1207,16 +1210,6 @@ fn scroll_composer_to_offset(
     editor.set_cursor_offset(offset as u32);
 }
 
-/// The scrollbar is painted in the terminal's last column. Accept the cell
-/// immediately to its left as well: several terminal/multiplexer combinations
-/// report right-edge clicks one column inward, and a one-cell target is brittle
-/// even when coordinates are exact.
-fn composer_scrollbar_contains(scrollbar: ScrollbarLayout, column: u16, row: u16) -> bool {
-    row >= scrollbar.rect.y
-        && row < scrollbar.rect.y.saturating_add(scrollbar.rect.h)
-        && (column == scrollbar.rect.x || column.saturating_add(1) == scrollbar.rect.x)
-}
-
 /// An in-progress divider drag started on one of the inner status bars. The
 /// anchor is the row the drag began on and the starting size lets each `Drag`
 /// apply `start + delta` from that anchor, robust against the layout rects
@@ -1232,19 +1225,13 @@ enum DividerDrag {
     ChatLogBar { anchor_row: u16, start_rows: u16 },
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ComposerScrollbarDrag {
-    grab_units: u32,
-    current_offset: u32,
-}
-
 #[derive(Debug)]
 pub(crate) struct RoomMode {
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     layout: RoomLayout,
     divider_drag: Option<DividerDrag>,
-    composer_scrollbar_drag: Option<ComposerScrollbarDrag>,
+    scrollbar_drag: Option<ScrollbarDrag>,
     history_search: Option<HistorySearch>,
     last_history_search: Option<HistorySearch>,
 }
@@ -1262,7 +1249,7 @@ impl RoomMode {
             lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
             divider_drag: None,
-            composer_scrollbar_drag: None,
+            scrollbar_drag: None,
             history_search: None,
             last_history_search: None,
         }
@@ -1275,7 +1262,7 @@ impl RoomMode {
             lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
             divider_drag: None,
-            composer_scrollbar_drag: None,
+            scrollbar_drag: None,
             history_search: None,
             last_history_search: None,
         }
@@ -1482,6 +1469,8 @@ impl RoomMode {
             None if delta < 0 => rooms.len() - 1,
             None => 0,
         };
+        cx.view
+            .keep_room_index_visible(next, rooms.len(), self.layout.room_list_rect.h as usize);
         cx.send(CoreCommand::SetViewedRoom(rooms[next]));
     }
 
@@ -1660,10 +1649,15 @@ impl RoomMode {
             mouse.column,
             mouse.row,
         );
-        let composer_scrollbar = self
+        let scrollbar = self
             .layout
-            .composer_scrollbar
-            .filter(|scrollbar| composer_scrollbar_contains(*scrollbar, mouse.column, mouse.row));
+            .rooms_scrollbar
+            .filter(|scrollbar| scrollbar.contains(mouse.column, mouse.row))
+            .or_else(|| {
+                self.layout
+                    .composer_scrollbar
+                    .filter(|scrollbar| scrollbar.contains(mouse.column, mouse.row))
+            });
         let transfer_hit = cx
             .view
             .chrome
@@ -1681,9 +1675,9 @@ impl RoomMode {
                 }
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
-                if composer_scrollbar.is_some() =>
+                if scrollbar.is_some() =>
             {
-                self.start_composer_scrollbar_drag(cx, composer_scrollbar.unwrap(), mouse.row);
+                self.start_scrollbar_drag(cx, scrollbar.unwrap(), mouse.column, mouse.row);
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_composer => {
                 self.enter_compose_insert_mode(cx);
@@ -1801,14 +1795,14 @@ impl RoomMode {
                 }
             }
             extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
-                if self.composer_scrollbar_drag.is_some() =>
+                if self.scrollbar_drag.is_some() =>
             {
-                self.drag_composer_scrollbar(cx, mouse.row);
+                self.drag_scrollbar(cx, mouse.row);
             }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left)
-                if self.composer_scrollbar_drag.is_some() =>
+                if self.scrollbar_drag.is_some() =>
             {
-                self.composer_scrollbar_drag = None;
+                self.scrollbar_drag = None;
             }
             extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
                 if self.divider_drag.is_some() =>
@@ -1847,75 +1841,70 @@ impl RoomMode {
         Action::Continue
     }
 
-    fn start_composer_scrollbar_drag(
+    fn start_scrollbar_drag(
         &mut self,
         cx: &mut ViewCx<'_>,
         scrollbar: ScrollbarLayout,
+        column: u16,
         row: u16,
     ) {
-        let Some(geometry) = ScrollbarGeometry::new(scrollbar.rect.h, scrollbar.state) else {
+        let Some(press) = scrollbar.press(column, row) else {
             return;
         };
-        self.enter_compose_insert_mode(cx);
-        let relative_row = row
-            .clamp(
-                scrollbar.rect.y,
-                scrollbar.rect.y + scrollbar.rect.h.saturating_sub(1),
-            )
-            .saturating_sub(scrollbar.rect.y);
-        let cell_start = u32::from(relative_row) * SCROLLBAR_UNITS_PER_CELL;
-        let cell_end = cell_start + SCROLLBAR_UNITS_PER_CELL;
-        let pointer = cell_start + SCROLLBAR_UNITS_PER_CELL / 2;
-        let thumb_end = geometry.thumb_start + geometry.thumb_units;
-        let on_thumb = cell_start < thumb_end && cell_end > geometry.thumb_start;
-        let grab_units = if on_thumb {
-            pointer
-                .saturating_sub(geometry.thumb_start)
-                .min(geometry.thumb_units)
-        } else {
-            geometry.thumb_units / 2
-        };
-        self.composer_scrollbar_drag = Some(ComposerScrollbarDrag {
-            grab_units,
-            current_offset: scrollbar.state.offset,
-        });
-        if !on_thumb {
-            self.drag_composer_scrollbar(cx, row);
+        match scrollbar.id {
+            ScrollbarId::Rooms => self.set_lobby_list_focus(cx, LobbyListFocus::Rooms),
+            ScrollbarId::Compose => self.enter_compose_insert_mode(cx),
+        }
+        self.scrollbar_drag = Some(press.drag);
+        if let Some(target) = press.target {
+            self.apply_scrollbar_target(cx, scrollbar, target);
         }
     }
 
-    fn drag_composer_scrollbar(&mut self, cx: &mut ViewCx<'_>, row: u16) {
-        let (Some(scrollbar), Some(mut drag)) =
-            (self.layout.composer_scrollbar, self.composer_scrollbar_drag)
-        else {
-            self.composer_scrollbar_drag = None;
+    fn drag_scrollbar(&mut self, cx: &mut ViewCx<'_>, row: u16) {
+        let Some(mut drag) = self.scrollbar_drag else {
             return;
         };
-        let Some(geometry) = ScrollbarGeometry::new(scrollbar.rect.h, scrollbar.state) else {
-            self.composer_scrollbar_drag = None;
+        let scrollbar = match drag.id {
+            ScrollbarId::Rooms => self.layout.rooms_scrollbar,
+            ScrollbarId::Compose => self.layout.composer_scrollbar,
+        };
+        let Some(scrollbar) = scrollbar else {
+            self.scrollbar_drag = None;
             return;
         };
-        let bottom = scrollbar.rect.y + scrollbar.rect.h.saturating_sub(1);
-        let thumb_start = if row <= scrollbar.rect.y {
-            0
-        } else if row >= bottom {
-            geometry.travel
-        } else {
-            let relative_row = row.saturating_sub(scrollbar.rect.y);
-            let pointer =
-                u32::from(relative_row) * SCROLLBAR_UNITS_PER_CELL + SCROLLBAR_UNITS_PER_CELL / 2;
-            pointer.saturating_sub(drag.grab_units).min(geometry.travel)
+        let Some(target) = scrollbar.drag_target(drag, row) else {
+            self.scrollbar_drag = None;
+            return;
         };
-        let target = geometry.offset_for_thumb_start(thumb_start);
-        scroll_composer_to_offset(
-            &mut cx.view.composer,
-            self.layout.composer_rect,
-            drag.current_offset,
-            target,
-            scrollbar.state.viewport,
-        );
+        self.apply_scrollbar_target(cx, scrollbar, target);
         drag.current_offset = target;
-        self.composer_scrollbar_drag = Some(drag);
+        self.scrollbar_drag = Some(drag);
+    }
+
+    fn apply_scrollbar_target(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        scrollbar: ScrollbarLayout,
+        target: u32,
+    ) {
+        match scrollbar.id {
+            ScrollbarId::Rooms => {
+                cx.view.rooms_offset = target as usize;
+                cx.view.clamp_rooms_offset(
+                    scrollbar.state.total as usize,
+                    scrollbar.state.viewport as usize,
+                );
+            }
+            ScrollbarId::Compose => scroll_composer_to_offset(
+                &mut cx.view.composer,
+                self.layout.composer_rect,
+                self.scrollbar_drag
+                    .map_or(scrollbar.state.offset, |drag| drag.current_offset),
+                target,
+                scrollbar.state.viewport,
+            ),
+        }
     }
 
     /// Resolves a screen cell to the URL of a link under it, if any. Returns an
@@ -4100,7 +4089,7 @@ mod tests {
             &mut app,
             mouse(MouseEventKind::Down(MouseButton::Left), x, top),
         );
-        assert!(room.composer_scrollbar_drag.is_some());
+        assert_eq!(room.scrollbar_drag.unwrap().id, ScrollbarId::Compose);
         room.process_mouse(
             &mut app,
             mouse(MouseEventKind::Drag(MouseButton::Left), x, bottom),
@@ -4109,7 +4098,7 @@ mod tests {
             &mut app,
             mouse(MouseEventKind::Up(MouseButton::Left), x, bottom),
         );
-        assert!(room.composer_scrollbar_drag.is_none());
+        assert!(room.scrollbar_drag.is_none());
         render_room(&mut app, &mut room, &mut buffer);
 
         let scrollbar = room.layout().composer_scrollbar.unwrap();
@@ -4303,6 +4292,174 @@ mod tests {
             ),
             app.view.theme.status_fill,
         );
+        assert!(layout.rooms_scrollbar.is_none());
+    }
+
+    #[test]
+    fn overflowing_rooms_use_divider_scrollbar_and_offset_aligned_hits() {
+        let mut app = test_app();
+        app.config.ui.room_height = 3;
+        enter_rooms(&mut app, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        app.view.rooms_offset = 3;
+        let mut room = RoomMode::with_focus(ChatPanelFocus::Lobby);
+        let mut buffer = Buffer::new(80, 24);
+        room.process_input(&mut app, key('h'));
+
+        render_room(&mut app, &mut room, &mut buffer);
+        let scrollbar = room.layout().rooms_scrollbar.unwrap();
+        assert_eq!(scrollbar.id, ScrollbarId::Rooms);
+        assert_eq!(scrollbar.state.offset, 3);
+        assert_eq!(scrollbar.state.viewport, 3);
+        assert_eq!(room.layout().room_hits[0].1, RoomId(4));
+        assert_eq!(room.layout().room_hits[2].1, RoomId(6));
+        assert_eq!(
+            cell_style(&mut buffer, scrollbar.rect.x, scrollbar.rect.y).bg(),
+            app.view.theme.scrollbar.bg()
+        );
+    }
+
+    #[test]
+    fn overflowing_rooms_hide_thumb_until_rooms_view_is_focused() {
+        let mut app = test_app();
+        app.config.ui.room_height = 3;
+        enter_rooms(&mut app, &[1, 2, 3, 4, 5]);
+        let mut room = RoomMode::with_focus(ChatPanelFocus::Lobby);
+        let mut buffer = Buffer::new(80, 24);
+
+        render_room(&mut app, &mut room, &mut buffer);
+        let divider = room.layout().lobby_divider_rect;
+        assert!(room.layout().rooms_scrollbar.is_some());
+        assert_eq!(
+            cell_style(&mut buffer, divider.x, divider.y),
+            app.view.theme.status_fill
+        );
+
+        room.process_input(&mut app, key('h'));
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(room.lobby_list_focus(), LobbyListFocus::Rooms);
+        assert_ne!(cell_text(&mut buffer, divider.x, divider.y), " ");
+    }
+
+    #[test]
+    fn passive_rooms_divider_cannot_start_scrollbar_drag() {
+        let mut app = test_app();
+        app.config.ui.room_height = 3;
+        enter_rooms(&mut app, &[1, 2, 3]);
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        assert!(room.layout().rooms_scrollbar.is_none());
+        let divider = room.layout().lobby_divider_rect;
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.x,
+                divider.y,
+            ),
+        );
+        assert!(room.scrollbar_drag.is_none());
+    }
+
+    #[test]
+    fn rooms_keyboard_selection_scrolls_only_enough_to_remain_visible() {
+        let mut app = test_app();
+        app.config.ui.room_height = 3;
+        enter_rooms(&mut app, &[1, 2, 3, 4, 5]);
+        let mut room = RoomMode::with_focus(ChatPanelFocus::Lobby);
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        room.process_input(&mut app, key('h'));
+
+        room.process_input(&mut app, key('j'));
+        room.process_input(&mut app, key('j'));
+        assert_eq!(app.view.rooms_offset, 0);
+        room.process_input(&mut app, key('j'));
+        assert_eq!(app.room.viewed_room, Some(RoomId(4)));
+        assert_eq!(app.view.rooms_offset, 1);
+        room.process_input(&mut app, key('k'));
+        assert_eq!(app.view.rooms_offset, 1);
+    }
+
+    #[test]
+    fn rooms_track_click_and_thumb_drag_map_across_complete_list() {
+        let mut app = test_app();
+        app.config.ui.room_height = 4;
+        enter_rooms(&mut app, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let scrollbar = room.layout().rooms_scrollbar.unwrap();
+        let bottom = scrollbar.rect.y + scrollbar.rect.h - 1;
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                scrollbar.rect.x,
+                bottom,
+            ),
+        );
+        assert_eq!(app.view.rooms_offset, 8);
+        assert_eq!(room.scrollbar_drag.unwrap().id, ScrollbarId::Rooms);
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                scrollbar.rect.x,
+                bottom,
+            ),
+        );
+
+        render_room(&mut app, &mut room, &mut buffer);
+        let scrollbar = room.layout().rooms_scrollbar.unwrap();
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                scrollbar.rect.x,
+                bottom,
+            ),
+        );
+        assert_eq!(app.view.rooms_offset, 8, "thumb press must not jump");
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                scrollbar.rect.x,
+                scrollbar.rect.y,
+            ),
+        );
+        assert_eq!(app.view.rooms_offset, 0);
+    }
+
+    #[test]
+    fn rooms_offset_clamps_after_resize_and_catalog_mutation() {
+        let mut app = test_app();
+        app.config.ui.room_height = 3;
+        enter_rooms(&mut app, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        app.view.rooms_offset = 5;
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(app.view.rooms_offset, 5);
+
+        app.config.ui.room_height = 6;
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(app.view.rooms_offset, 2);
+
+        enter_rooms(&mut app, &[1, 2, 3, 4]);
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(app.view.rooms_offset, 0);
+        assert!(room.layout().rooms_scrollbar.is_none());
+
+        app.view.rooms_offset = 3;
+        app.room
+            .authenticated(&[], Vec::new(), RoomId(99), None, None);
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(app.view.rooms_offset, 0);
+        assert!(room.layout().room_hits.is_empty());
     }
 
     #[test]
