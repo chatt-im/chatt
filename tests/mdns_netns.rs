@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 //! Opt-in Linux netns integration test for mDNS host candidate resolution.
 //!
 //! Two network namespaces are connected by a veth pair forming a virtual LAN.
@@ -22,9 +24,6 @@ fn opt_in_netns_mdns_resolves_local_candidate() {
     if std::env::var("CHATT_NETNS_TESTS").ok().as_deref() != Some("1") {
         eprintln!("skipping netns mdns test; set CHATT_NETNS_TESTS=1 to enable");
         return;
-    }
-    if !cfg!(target_os = "linux") {
-        panic!("netns tests are Linux-only");
     }
     if command_output("id", &["-u"]).trim() != "0" {
         panic!("netns tests require root or CAP_NET_ADMIN");

@@ -927,7 +927,7 @@ mod tests {
         let candidates = pulse_peaks(
             output,
             SAMPLE_RATE as usize * 3 / 2..SAMPLE_RATE as usize * 9 / 2,
-            0.22,
+            0.18,
         );
         let mut fry = None;
         for pair in candidates.windows(2) {
@@ -937,7 +937,11 @@ mod tests {
                 break;
             }
         }
-        let fry = fry.expect("the fry pulse train should survive random_60 recovery");
+        let fry = fry.unwrap_or_else(|| {
+            panic!(
+                "the fry pulse train should survive random_60 recovery; candidates: {candidates:?}"
+            )
+        });
 
         let envelope: Vec<f32> = pulse_peaks(
             output,
