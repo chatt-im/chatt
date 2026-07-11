@@ -2,3 +2,9 @@
 status-level = "none"
 final-status-level = "fail"
 failure-output = "final"
+
+[profile.ci]
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"

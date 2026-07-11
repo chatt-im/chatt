@@ -1,0 +1,78 @@
+stages:
+  - test
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+variables:
+  RUST_VERSION: "1.96.1"
+  NEXTEST_VERSION: "0.9.140"
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target"
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+
+default:
+  interruptible: true
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: "$CI_JOB_NAME_SLUG-rust-$RUST_VERSION-nextest-$NEXTEST_VERSION"
+    paths:
+      - .cargo-home/registry/index/
+      - .cargo-home/registry/cache/
+      - .cargo-home/git/db/
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - target/nextest/ci/junit.xml
+    reports:
+      junit: target/nextest/ci/junit.xml
+
+test:linux-x86_64:
+  image: rust:1.96.1-bookworm
+  tags:
+    - saas-linux-small-amd64
+  before_script:
+    - apt-get update
+    - >-
+      apt-get install --yes --no-install-recommends
+      clang
+      cmake
+      ffmpeg
+      libasound2-dev
+      libclang-dev
+      libpipewire-0.3-dev
+      pkg-config
+    - mkdir -p "$CARGO_HOME/bin"
+    - curl -LsSf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$CARGO_HOME/bin"
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - test "$(uname -m)" = "x86_64"
+    - rustc --version
+    - cargo nextest --version
+  script:
+    - cargo nextest run --workspace --profile ci
+
+test:macos-arm64:
+  image: macos-26-xcode-26
+  tags:
+    - saas-macos-medium-m1
+  variables:
+    RUSTUP_HOME: "$CI_PROJECT_DIR/.rustup"
+  before_script:
+    - brew install cmake ffmpeg
+    - mkdir -p "$CARGO_HOME/bin"
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - curl -LsSf "https://get.nexte.st/$NEXTEST_VERSION/mac" | tar zxf - -C "$CARGO_HOME/bin"
+    - test "$(uname -m)" = "arm64"
+    - rustc --version
+    - cargo nextest --version
+  script:
+    # pipewire-sys requires Linux PipeWire headers and shared-library semantics.
+    - cargo nextest run --workspace --exclude pipewire-sys --profile ci
