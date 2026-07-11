@@ -701,11 +701,6 @@ pub(crate) enum AppEvent {
     },
     ClientDetached(crate::client_channel::ClientId),
     ClientExited(crate::client_channel::ClientId),
-    ClientViewRoom {
-        client_id: crate::client_channel::ClientId,
-        room_id: RoomId,
-        status: String,
-    },
     OutputVolume {
         command: local_control::OutputVolumeCommand,
         reply: Sender<Result<f32, String>>,
@@ -1258,16 +1253,6 @@ impl App {
         view
     }
 
-    // Removed once the runtime dispatches every remote command through App.
-    pub(crate) fn remote_view(
-        &self,
-        client_id: crate::client_channel::ClientId,
-    ) -> Option<Arc<parking_lot::Mutex<ClientView>>> {
-        self.clients
-            .get(&client_id)
-            .map(|handle| handle.view.clone())
-    }
-
     fn channel_for(
         &self,
         client_id: crate::client_channel::ClientId,
@@ -1359,7 +1344,9 @@ impl App {
                 }
             }
             CoreCommand::SetViewedRoom(room_id) => {
-                self.set_viewed_room(room_id);
+                if !self.set_viewed_room(room_id) {
+                    self.set_error("room is no longer available");
+                }
             }
             CoreCommand::OpenMessageRef {
                 target,
@@ -1573,15 +1560,53 @@ impl App {
         self.events.sender()
     }
 
+    /// Dispatches one terminal's command through the core handlers and reports
+    /// whether that terminal requested detach.
     pub(crate) fn handle_client_command(
         &mut self,
         client_id: crate::client_channel::ClientId,
         command: command::CoreCommand,
-    ) {
+    ) -> bool {
+        self.run_as_client(client_id, |app| {
+            app.handle_core_command(command);
+            app.drain_core_commands();
+        })
+    }
+
+    /// Runs `f` with `client_id` as the issuing client and, for an attached
+    /// terminal, that terminal's view swapped into `self.view`. The dispatch
+    /// executes with the issuing terminal's entire view, never a hand-picked
+    /// subset of fields, so core handlers cannot accidentally mutate the
+    /// primary terminal's selection, editor, status, navigation, or room
+    /// buffers. Commands from unknown terminals are dropped. Returns whether
+    /// the terminal requested detach.
+    fn run_as_client(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+        f: impl FnOnce(&mut Self),
+    ) -> bool {
         let previous = std::mem::replace(&mut self.issuing_client, client_id);
-        self.handle_core_command(command);
-        self.drain_core_commands();
+        if client_id == crate::client_channel::ClientId::PRIMARY {
+            f(self);
+            self.issuing_client = previous;
+            return false;
+        }
+        debug_assert_eq!(
+            previous,
+            crate::client_channel::ClientId::PRIMARY,
+            "client dispatch does not nest"
+        );
+        let Some(handle) = self.clients.get(&client_id) else {
+            self.issuing_client = previous;
+            return false;
+        };
+        let mut view = handle.view.lock_arc();
+        std::mem::swap(&mut *self.view, &mut *view);
+        f(self);
         self.issuing_client = previous;
+        let detach = std::mem::take(&mut self.view.quit_requested);
+        std::mem::swap(&mut *self.view, &mut *view);
+        detach
     }
 
     pub(crate) fn handle_app_event(&mut self, event: AppEvent) {
@@ -1599,9 +1624,6 @@ impl App {
             }
             AppEvent::ClientDetached(_) | AppEvent::ClientExited(_) => {
                 unreachable!("client lifecycle events are owned by the daemon runtime")
-            }
-            AppEvent::ClientViewRoom { .. } => {
-                unreachable!("client view events are owned by the daemon runtime")
             }
             AppEvent::OutputVolume { command, reply } => {
                 self.handle_output_volume_command(command, reply)
@@ -2379,9 +2401,15 @@ impl App {
         }
     }
 
-    /// Switches the viewed room, updating the web feed, upload target, and the
-    /// persisted catalog. Returns false when the room is unknown.
+    /// Switches the issuing terminal's viewed room. For the primary this moves
+    /// the shared `session.viewed_room` projection (web feed, upload target,
+    /// persisted catalog); for an attached terminal it only points that
+    /// terminal's view, which [`Self::run_as_client`] has swapped into
+    /// `self.view`. Returns false when the room is unknown.
     pub(crate) fn set_viewed_room(&mut self, room_id: RoomId) -> bool {
+        if self.issuing_client != crate::client_channel::ClientId::PRIMARY {
+            return self.set_attached_viewed_room(room_id);
+        }
         if !self.room.set_viewed_room(room_id) {
             return false;
         }
@@ -2390,16 +2418,11 @@ impl App {
         true
     }
 
-    pub(crate) fn set_attached_viewed_room(
-        &mut self,
-        client_id: crate::client_channel::ClientId,
-        view: &mut ClientView,
-        room_id: RoomId,
-    ) -> bool {
-        if !self.room.prepare_client_view(client_id, room_id) {
+    fn set_attached_viewed_room(&mut self, room_id: RoomId) -> bool {
+        if !self.room.prepare_client_view(self.issuing_client, room_id) {
             return false;
         }
-        view.switch_room(room_id, &self.room);
+        self.view.switch_room(room_id, &self.room);
         if self.room.begin_history_fetch(room_id)
             && !self.send_network_command(
                 NetworkCommand::FetchHistory {
@@ -2420,7 +2443,7 @@ impl App {
             .find(|item| item.room_id == room_id)
             .map(|item| item.name)
             .unwrap_or_else(|| format!("room {}", room_id.0));
-        view.set_status(format!("viewing {name}"));
+        self.set_status(format!("viewing {name}"));
         true
     }
 
@@ -5690,7 +5713,9 @@ impl App {
             self.set_error(format!("no room named {name}"));
             return;
         };
-        self.set_viewed_room(room_id);
+        if !self.set_viewed_room(room_id) {
+            self.set_error("room is no longer available");
+        }
     }
 
     fn open_dm_command(&mut self, command: &str) {
@@ -5732,16 +5757,10 @@ impl App {
         peer: UserId,
     ) {
         let status = format!("dm with {}", self.room.display_name_of(peer));
-        if client_id == crate::client_channel::ClientId::PRIMARY {
-            if self.set_viewed_room(room_id) {
-                self.set_status(status);
+        self.run_as_client(client_id, |app| {
+            if app.set_viewed_room(room_id) {
+                app.set_status(status);
             }
-            return;
-        }
-        let _ = self.events.sender().send(AppEvent::ClientViewRoom {
-            client_id,
-            room_id,
-            status,
         });
     }
 
@@ -7095,6 +7114,14 @@ mod tests {
         App::new(Config::default(), None).expect("test app")
     }
 
+    fn attach_test_client(
+        app: &mut App,
+        id: crate::client_channel::ClientId,
+    ) -> Arc<parking_lot::Mutex<ClientView>> {
+        let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("test channel"));
+        app.attach_client(id, channel)
+    }
+
     #[test]
     fn parse_upload_rate_accepts_suffixes_and_off() {
         assert_eq!(parse_upload_rate("off"), Ok(0));
@@ -7838,6 +7865,7 @@ mod tests {
             app.user_id,
         );
         let client_id = crate::client_channel::ClientId(7);
+        let view = attach_test_client(&mut app, client_id);
         let dm_id = RoomId(0x8000_0001);
 
         app.handle_client_command(client_id, command::CoreCommand::OpenDm(UserId(2)));
@@ -7856,18 +7884,9 @@ mod tests {
         )));
 
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
-        match app.next_event() {
-            Some(AppEvent::ClientViewRoom {
-                client_id: actual_client,
-                room_id,
-                status,
-            }) => {
-                assert_eq!(actual_client, client_id);
-                assert_eq!(room_id, dm_id);
-                assert_eq!(status, "dm with bob");
-            }
-            _ => panic!("expected targeted client room event"),
-        }
+        let view = view.lock();
+        assert_eq!(view.viewed_room, Some(dm_id));
+        assert_eq!(view.status.text(), "dm with bob");
     }
 
     #[test]
@@ -7890,6 +7909,7 @@ mod tests {
             crate::client_channel::ClientId(7),
             crate::client_channel::ClientId(8),
         ];
+        let views = clients.map(|client| attach_test_client(&mut app, client));
         for client in clients {
             app.handle_client_command(client, command::CoreCommand::OpenDm(UserId(2)));
             assert!(matches!(
@@ -7908,12 +7928,9 @@ mod tests {
             UserId(2),
         )));
 
-        let mut routed = Vec::new();
-        while let Some(AppEvent::ClientViewRoom { client_id, .. }) = app.next_event() {
-            routed.push(client_id);
+        for view in views {
+            assert_eq!(view.lock().viewed_room, Some(dm_id));
         }
-        routed.sort_by_key(|client| client.0);
-        assert_eq!(routed, clients);
     }
 
     #[test]
@@ -7930,9 +7947,11 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         enter_test_room(&mut app);
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+        let client_id = crate::client_channel::ClientId(9);
+        attach_test_client(&mut app, client_id);
 
         app.handle_client_command(
-            crate::client_channel::ClientId(9),
+            client_id,
             command::CoreCommand::SendChat {
                 room_id: Some(RoomId(2)),
                 body: "from attached".to_string(),
@@ -7944,6 +7963,62 @@ mod tests {
             Ok(NetworkCommand::SendChat { room_id: RoomId(2), body })
                 if body == "from attached"
         ));
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+    }
+
+    #[test]
+    fn remote_set_viewed_room_switches_only_the_remote_view() {
+        let mut app = test_app();
+        let (tx, _rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.room.authenticated(
+            &[test_room_info(1), test_room_info(2)],
+            Vec::new(),
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        app.view.switch_room(RoomId(1), &app.room);
+        let client_id = crate::client_channel::ClientId(4);
+        let view = attach_test_client(&mut app, client_id);
+
+        app.handle_client_command(client_id, command::CoreCommand::SetViewedRoom(RoomId(2)));
+
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+        let view = view.lock();
+        assert_eq!(view.viewed_room, Some(RoomId(2)));
+        assert_eq!(view.status.text(), "viewing room-2");
+    }
+
+    #[test]
+    fn remote_quit_requests_detach_without_touching_primary() {
+        let mut app = test_app();
+        enter_test_room(&mut app);
+        let client_id = crate::client_channel::ClientId(5);
+        let view = attach_test_client(&mut app, client_id);
+
+        assert!(app.handle_client_command(client_id, command::CoreCommand::Quit));
+
+        assert!(!app.take_quit_requested());
+        assert!(!view.lock().quit_requested);
+    }
+
+    #[test]
+    fn commands_from_unknown_remote_clients_are_dropped() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        enter_test_room(&mut app);
+
+        app.handle_client_command(
+            crate::client_channel::ClientId(41),
+            command::CoreCommand::SendChat {
+                room_id: None,
+                body: "ghost".to_string(),
+            },
+        );
+
+        assert!(rx.try_recv().is_err());
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
     }
 
@@ -8424,6 +8499,7 @@ mod tests {
         let mut app = test_app();
         app.allow_settings_preview_capture = false;
         let owner = crate::client_channel::ClientId(41);
+        attach_test_client(&mut app, owner);
         app.handle_client_command(owner, command::CoreCommand::OpenSettings);
         assert_eq!(app.room.settings_owner, Some(owner));
         assert!(app.room.settings.is_some());
@@ -8432,8 +8508,8 @@ mod tests {
 
         assert_eq!(app.room.settings_owner, None);
         assert!(app.room.settings.is_none());
-        let _ = app.take_mode_transition();
         let successor = crate::client_channel::ClientId(42);
+        attach_test_client(&mut app, successor);
         app.handle_client_command(successor, command::CoreCommand::OpenSettings);
         assert_eq!(app.room.settings_owner, Some(successor));
     }
