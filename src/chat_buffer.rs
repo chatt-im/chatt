@@ -2640,7 +2640,7 @@ fn append_synth_prefix(
 /// sender and body.
 fn ref_label(sender: &str, body: &str) -> String {
     const SNIPPET_CHARS: usize = 40;
-    let mut label = format!("↩ {sender}: ");
+    let mut label = format!("@@ {sender}: ");
     let snippet = body.lines().next().unwrap_or("");
     let mut truncated = body.lines().nth(1).is_some();
     for (count, ch) in snippet.chars().enumerate() {
@@ -3244,7 +3244,7 @@ mod tests {
         let pills = pill_segments(&buf, 1);
         assert!(!pills.is_empty(), "no synthetic pill segment emitted");
         assert!(
-            pills[0].1.starts_with("↩ alice: the delay manager"),
+            pills[0].1.starts_with("@@ alice: the delay manager"),
             "unexpected pill text {:?}",
             pills[0].1
         );
