@@ -3,9 +3,12 @@ mod imp {
     use std::{
         fs::OpenOptions,
         io::{self, Read, Write},
-        os::fd::FromRawFd,
+        os::fd::{AsRawFd, FromRawFd},
         os::unix::net::UnixStream,
-        sync::atomic::{AtomicU8, Ordering},
+        sync::{
+            OnceLock,
+            atomic::{AtomicI32, AtomicU8, Ordering},
+        },
     };
 
     use crate::local_control::{self, AttachConnectError};
@@ -19,7 +22,9 @@ mod imp {
     pub(crate) const TERMINATE_ACK: u8 = 3;
     pub(crate) const MASTER_SHUTDOWN: u8 = 4;
 
-    static SIGNALS: AtomicU8 = AtomicU8::new(0);
+    static SIGNAL_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+    static SIGNAL_PENDING: AtomicU8 = AtomicU8::new(0);
+    static ORIGINAL_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum AttachOutcome {
@@ -29,6 +34,7 @@ mod imp {
     }
 
     pub(crate) fn run_thin_client() -> Result<AttachOutcome, String> {
+        capture_original_termios();
         let mut stream = match local_control::connect_attach(0, 1) {
             Ok(stream) => stream,
             Err(AttachConnectError::NoMaster) => return Ok(AttachOutcome::NoMaster),
@@ -36,9 +42,9 @@ mod imp {
                 return Err(error);
             }
         };
+        let signals = SignalPipe::new()?;
         install_signal_handlers()?;
-        SIGNALS.store(0, Ordering::Relaxed);
-        let outcome = client_loop(&mut stream);
+        let outcome = client_loop(&mut stream, &signals);
         match outcome {
             Ok((outcome, true)) => {
                 reset_terminal_to_canonical();
@@ -55,10 +61,13 @@ mod imp {
         }
     }
 
-    fn client_loop(stream: &mut UnixStream) -> Result<(AttachOutcome, bool), String> {
+    fn client_loop(
+        stream: &mut UnixStream,
+        signal_pipe: &SignalPipe,
+    ) -> Result<(AttachOutcome, bool), String> {
         let mut terminating = false;
         loop {
-            let signals = SIGNALS.swap(0, Ordering::Relaxed);
+            let signals = signal_pipe.wait(stream)?;
             if signals & SIGNAL_RESIZE != 0 {
                 write_frame(stream, CLIENT_RESIZE, &[])
                     .map_err(|error| format!("failed to forward resize: {error}"))?;
@@ -69,11 +78,13 @@ mod imp {
                     .map_err(|error| format!("failed to request detach: {error}"))?;
             }
 
+            if !signal_pipe.stream_ready() {
+                continue;
+            }
             match read_frame(stream) {
                 Ok((TERMINATE_ACK, _)) => return Ok((AttachOutcome::UserQuit, false)),
                 Ok((MASTER_SHUTDOWN, _)) => return Ok((AttachOutcome::MasterGone, true)),
                 Ok((_opcode, _)) => {}
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -124,32 +135,37 @@ mod imp {
         Ok((header[0], payload))
     }
 
-    extern "C" fn termination_handler(_signal: libc::c_int) {
-        SIGNALS.fetch_or(SIGNAL_TERMINATE, Ordering::Relaxed);
-    }
-
-    extern "C" fn resize_handler(_signal: libc::c_int) {
-        SIGNALS.fetch_or(SIGNAL_RESIZE, Ordering::Relaxed);
+    extern "C" fn signal_handler(signal: libc::c_int) {
+        let byte = if signal == libc::SIGWINCH {
+            SIGNAL_RESIZE
+        } else {
+            SIGNAL_TERMINATE
+        };
+        SIGNAL_PENDING.fetch_or(byte, Ordering::Relaxed);
+        let fd = SIGNAL_PIPE_WRITE.load(Ordering::Relaxed);
+        if fd >= 0 {
+            // SAFETY: write is async-signal-safe; the nonblocking pipe may be
+            // full, which only coalesces an already-pending signal kind.
+            unsafe {
+                libc::write(fd, (&byte as *const u8).cast(), 1);
+            }
+        }
     }
 
     fn install_signal_handlers() -> Result<(), String> {
-        install_signal(libc::SIGINT, termination_handler)?;
-        install_signal(libc::SIGTERM, termination_handler)?;
-        install_signal(libc::SIGHUP, termination_handler)?;
-        install_signal(libc::SIGWINCH, resize_handler)
+        install_signal(libc::SIGINT)?;
+        install_signal(libc::SIGTERM)?;
+        install_signal(libc::SIGHUP)?;
+        install_signal(libc::SIGWINCH)
     }
 
-    fn install_signal(
-        signal: libc::c_int,
-        handler: extern "C" fn(libc::c_int),
-    ) -> Result<(), String> {
-        // SAFETY: sigaction is initialized before use; the handlers only touch
-        // lock-free atomics and SA_RESTART is deliberately omitted so a blocking
-        // control read returns EINTR and observes those flags.
+    fn install_signal(signal: libc::c_int) -> Result<(), String> {
+        // SAFETY: sigaction is initialized before use; the handler only writes
+        // one byte to a nonblocking self-pipe.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = handler as usize;
-            action.sa_flags = 0;
+            action.sa_sigaction = signal_handler as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
             if libc::sigaction(signal, &action, std::ptr::null_mut()) == -1 {
                 return Err(format!(
@@ -159,6 +175,97 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    struct SignalPipe {
+        read_fd: libc::c_int,
+        write_fd: libc::c_int,
+        stream_ready: std::cell::Cell<bool>,
+    }
+
+    impl SignalPipe {
+        fn new() -> Result<Self, String> {
+            let mut fds = [-1; 2];
+            // SAFETY: `fds` has space for the two descriptors written by pipe.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+                return Err(format!(
+                    "failed to create signal pipe: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            for fd in fds {
+                // SAFETY: both descriptors were returned by pipe.
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    let flags = libc::fcntl(fd, libc::F_GETFL);
+                    if flags >= 0 {
+                        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+                }
+            }
+            SIGNAL_PENDING.store(0, Ordering::Release);
+            SIGNAL_PIPE_WRITE.store(fds[1], Ordering::Release);
+            Ok(Self {
+                read_fd: fds[0],
+                write_fd: fds[1],
+                stream_ready: std::cell::Cell::new(false),
+            })
+        }
+
+        fn wait(&self, stream: &UnixStream) -> Result<u8, String> {
+            let mut poll_fds = [
+                libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.read_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            loop {
+                // SAFETY: `poll_fds` remains valid for the duration of poll.
+                let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
+                if result >= 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(format!("attached client poll failed: {error}"));
+                }
+            }
+            self.stream_ready
+                .set(poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
+            if poll_fds[1].revents & libc::POLLIN != 0 {
+                let mut bytes = [0u8; 64];
+                loop {
+                    // SAFETY: bytes is writable and the fd is our pipe reader.
+                    let read =
+                        unsafe { libc::read(self.read_fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+                    if read <= 0 {
+                        break;
+                    }
+                }
+            }
+            Ok(SIGNAL_PENDING.swap(0, Ordering::AcqRel))
+        }
+
+        fn stream_ready(&self) -> bool {
+            self.stream_ready.get()
+        }
+    }
+
+    impl Drop for SignalPipe {
+        fn drop(&mut self) {
+            SIGNAL_PIPE_WRITE.store(-1, Ordering::Release);
+            // SAFETY: this object uniquely owns both pipe descriptors.
+            unsafe {
+                libc::close(self.read_fd);
+                libc::close(self.write_fd);
+            }
+        }
     }
 
     pub(crate) fn restore_terminal() {
@@ -178,7 +285,38 @@ mod imp {
             let _ = tty.write_all(&sequence);
         }
 
-        reset_terminal_to_canonical();
+        restore_original_termios();
+    }
+
+    fn capture_original_termios() {
+        if ORIGINAL_TERMIOS.get().is_some() {
+            return;
+        }
+        // SAFETY: tcgetattr initializes the local termios on success.
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut termios) == 0 {
+                let _ = ORIGINAL_TERMIOS.set(termios);
+            }
+        }
+    }
+
+    fn restore_original_termios() {
+        if let Some(termios) = ORIGINAL_TERMIOS.get() {
+            // SAFETY: the saved structure came from tcgetattr for this terminal.
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, termios);
+            }
+        } else {
+            reset_terminal_to_canonical();
+        }
+    }
+
+    /// Restores the terminal state captured before the first attach attempt.
+    /// A shim that wins takeover calls this after its master runtime exits,
+    /// because the transitional canonical state must not become permanent.
+    pub(crate) fn restore_saved_terminal_state() {
+        restore_original_termios();
     }
 
     fn reset_terminal_to_canonical() {
@@ -225,3 +363,6 @@ pub(crate) enum AttachOutcome {
 pub(crate) fn run_thin_client() -> Result<AttachOutcome, String> {
     Ok(AttachOutcome::NoMaster)
 }
+
+#[cfg(not(unix))]
+pub(crate) fn restore_saved_terminal_state() {}

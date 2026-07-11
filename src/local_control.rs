@@ -10,10 +10,10 @@ mod imp {
         time::Duration,
     };
 
-    use std::os::fd::RawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     };
 
@@ -249,6 +249,8 @@ mod imp {
 
     pub struct ControlSocket {
         path: PathBuf,
+        socket_identity: (u64, u64),
+        _leadership: fs::File,
         shutdown: Sender<()>,
         worker: Option<JoinHandle<()>>,
     }
@@ -261,6 +263,9 @@ mod imp {
 
         #[cfg(test)]
         fn spawn_at_path(path: PathBuf, events: EventSender) -> Result<Self, String> {
+            if let Some(parent) = path.parent() {
+                ensure_private_dir(parent)?;
+            }
             Self::spawn_with_config(
                 SocketConfig {
                     path,
@@ -272,7 +277,15 @@ mod imp {
 
         fn spawn_with_config(config: SocketConfig, events: EventSender) -> Result<Self, String> {
             prepare_socket_parent(&config)?;
+            let leadership = acquire_leadership(&config.path)?;
             let listener = bind_listener(&config.path)?;
+            let metadata = fs::metadata(&config.path).map_err(|error| {
+                format!(
+                    "failed to inspect bound socket {}: {error}",
+                    config.path.display()
+                )
+            })?;
+            let socket_identity = (metadata.dev(), metadata.ino());
             listener
                 .set_nonblocking(true)
                 .map_err(|error| format!("failed to make control socket nonblocking: {error}"))?;
@@ -307,6 +320,8 @@ mod imp {
             kvlog::info!("local control socket listening", path = %path.display());
             Ok(Self {
                 path,
+                socket_identity,
+                _leadership: leadership,
                 shutdown: shutdown_tx,
                 worker: Some(worker),
             })
@@ -328,7 +343,10 @@ mod imp {
                 let _ = worker.join();
             }
             match fs::metadata(&self.path) {
-                Ok(metadata) if metadata.file_type().is_socket() => {
+                Ok(metadata)
+                    if metadata.file_type().is_socket()
+                        && (metadata.dev(), metadata.ino()) == self.socket_identity =>
+                {
                     let _ = fs::remove_file(&self.path);
                 }
                 _ => {}
@@ -587,10 +605,74 @@ mod imp {
             .filter(|parent| !parent.as_os_str().is_empty())
         {
             fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to create {}: {error}", parent.display()))
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+            validate_private_dir(parent)
         } else {
             Ok(())
         }
+    }
+
+    fn validate_private_dir(path: &Path) -> Result<(), String> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if !metadata.is_dir() {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+        let uid = current_uid();
+        if metadata.uid() != uid {
+            return Err(format!("{} is not owned by uid {uid}", path.display()));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "{} must not be accessible by group or other users",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn acquire_leadership(path: &Path) -> Result<fs::File, String> {
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| {
+                format!(
+                    "failed to open leadership lock {}: {error}",
+                    lock_path.display()
+                )
+            })?;
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect leadership lock {}: {error}",
+                lock_path.display()
+            )
+        })?;
+        if !metadata.is_file()
+            || metadata.uid() != current_uid()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(format!(
+                "leadership lock {} is not a private owned file",
+                lock_path.display()
+            ));
+        }
+        // SAFETY: flock operates on the live lock descriptor retained by
+        // ControlSocket for the master's entire lifetime.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+            let error = io::Error::last_os_error();
+            return Err(format!(
+                "{LIVE_SOCKET_ERROR}{}: leadership is held ({error})",
+                path.display()
+            ));
+        }
+        Ok(file)
     }
 
     fn ensure_private_dir(path: &Path) -> Result<(), String> {
@@ -674,26 +756,37 @@ mod imp {
             return;
         }
         if let Ok((Request::Attach(hello), mut fds)) = request {
-            let attached = fds.take_pair().and_then(|(stdin, stdout)| {
-                stream
-                    .set_read_timeout(None)
-                    .map_err(|error| format!("failed to clear attach read timeout: {error}"))?;
-                stream
-                    .set_write_timeout(None)
-                    .map_err(|error| format!("failed to clear attach write timeout: {error}"))?;
-                events
-                    .send(crate::app::AppEvent::ClientAttach {
-                        stream,
-                        stdin,
-                        stdout,
-                        hello,
-                    })
-                    .map_err(|_| "chatt master stopped before accepting client".to_string())
-            });
-            if let Err(error) = attached {
-                // The stream may already have moved into the event on success;
-                // error paths before the send retain it and can answer below.
-                kvlog::warn!("client attach failed", error = %error);
+            let (stdin, stdout) = match fds.take_pair() {
+                Ok(pair) => pair,
+                Err(error) => {
+                    let _ = write_attach_ack(&mut stream, Err(&error));
+                    kvlog::warn!("client attach failed", error = %error);
+                    return;
+                }
+            };
+            for result in [
+                stream.set_read_timeout(None),
+                stream.set_write_timeout(None),
+            ] {
+                if let Err(io_error) = result {
+                    let error = format!("failed to clear attach timeout: {io_error}");
+                    let _ = write_attach_ack(&mut stream, Err(&error));
+                    kvlog::warn!("client attach failed", error = %error);
+                    return;
+                }
+            }
+            if let Err(send_error) = events.send(crate::app::AppEvent::ClientAttach {
+                stream,
+                stdin,
+                stdout,
+                hello,
+            }) {
+                let crate::app::AppEvent::ClientAttach { mut stream, .. } = send_error.0 else {
+                    unreachable!("sent attach event")
+                };
+                let error = "chatt master stopped before accepting client";
+                let _ = write_attach_ack(&mut stream, Err(error));
+                kvlog::warn!("client attach failed", error = error);
             }
             return;
         }
@@ -1254,11 +1347,24 @@ mod imp {
         frame.push(OP_ATTACH);
         frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
         frame.extend_from_slice(&body);
-        stream
+        let sent = stream
             .send_with_fd(&frame, &[stdin_fd, stdout_fd])
             .map_err(|error| {
                 AttachConnectError::Failed(format!("failed to send attach: {error}"))
             })?;
+        if sent == 0 {
+            return Err(AttachConnectError::Failed(
+                "failed to send attach: zero-byte sendmsg".to_string(),
+            ));
+        }
+        if sent > frame.len() {
+            return Err(AttachConnectError::Failed(
+                "failed to send attach: sendmsg reported an invalid byte count".to_string(),
+            ));
+        }
+        stream.write_all(&frame[sent..]).map_err(|error| {
+            AttachConnectError::Failed(format!("failed to finish attach frame: {error}"))
+        })?;
         let response = read_response(&mut stream).map_err(AttachConnectError::Failed)?;
         if response.status != STATUS_OK {
             return Err(AttachConnectError::Rejected(response.message));
@@ -1683,6 +1789,41 @@ mod imp {
             assert!(error.contains("already listening"));
             drop(listener);
             let _ = fs::remove_file(&socket_path);
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn leadership_lock_allows_only_one_contender() {
+            let dir = temp_test_dir("leadership-lock");
+            fs::create_dir_all(&dir).unwrap();
+            ensure_private_dir(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+
+            let leader = acquire_leadership(&socket_path).unwrap();
+            let error = acquire_leadership(&socket_path).unwrap_err();
+
+            assert!(error.starts_with(LIVE_SOCKET_ERROR));
+            drop(leader);
+            assert!(acquire_leadership(&socket_path).is_ok());
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn old_owner_does_not_unlink_replacement_socket() {
+            let dir = temp_test_dir("preserve-successor");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let old_path = dir.join("old.sock");
+            let (events_tx, _events_rx) = mpsc::channel();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(events_tx)).unwrap();
+            fs::rename(&socket_path, &old_path).unwrap();
+            let successor = UnixListener::bind(&socket_path).unwrap();
+
+            drop(socket);
+
+            assert!(socket_path.exists());
+            drop(successor);
             let _ = fs::remove_dir_all(dir);
         }
 

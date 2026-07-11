@@ -129,6 +129,17 @@ impl ClientRoomKind {
 /// have applied and catch up through the journal.
 pub(crate) type Revision = u64;
 
+/// Identity of the daemon's current server-scoped room namespace. Numeric
+/// room ids and revisions are meaningful only within one epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionEpoch(u64);
+
+impl SessionEpoch {
+    fn advance(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
 /// A stable key for a journaled notice. Each view maps it to the buffer-local
 /// [`NoticeId`] it got when materializing the notice.
 pub(crate) type NoticeKey = u64;
@@ -695,6 +706,7 @@ impl RoomView {
 /// Scrollback buffers, the composer, and everything else one terminal owns
 /// exclusively live in [`crate::tui::view::ClientView`].
 pub(crate) struct RoomSession {
+    epoch: SessionEpoch,
     pub server_alias: String,
     /// Where this connection persists chat, resolved from the `[history]`
     /// overrides. Disabled when not connected.
@@ -739,6 +751,9 @@ pub(crate) struct RoomSession {
     /// screen at a time; the inner lock lets that screen update form layout
     /// caches while holding only a shared session read guard.
     pub settings: Option<Arc<Mutex<crate::tui::modes::SettingsSession>>>,
+    /// Client holding the daemon-global settings/preview lease.
+    pub(super) settings_owner: Option<crate::client_channel::ClientId>,
+    pub(super) settings_generation: u64,
     muted_users: HashSet<UserId>,
     stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
@@ -1230,6 +1245,7 @@ pub(crate) fn strip_blank_edge_lines(text: &str) -> String {
 impl RoomSession {
     pub(super) fn new(config: &Config) -> Self {
         Self {
+            epoch: SessionEpoch::default(),
             server_alias: String::new(),
             history: HistoryStorage::disabled(),
             local_user_name: String::new(),
@@ -1250,6 +1266,8 @@ impl RoomSession {
             capture_stats: None,
             audio_devices: super::AudioDeviceCatalog::default(),
             settings: None,
+            settings_owner: None,
+            settings_generation: 0,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
@@ -1269,6 +1287,15 @@ impl RoomSession {
     /// The shared state of `room_id`, when materialized.
     pub(crate) fn room(&self, room_id: RoomId) -> Option<&RoomShared> {
         self.rooms.get(&room_id)
+    }
+
+    pub(crate) fn epoch(&self) -> SessionEpoch {
+        self.epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_settings_owner_for_test(&mut self, owner: crate::client_channel::ClientId) {
+        self.settings_owner = Some(owner);
     }
 
     pub(crate) fn muted_user(&self, user_id: UserId) -> bool {
@@ -1314,6 +1341,7 @@ impl RoomSession {
                 self.volume_preview = None;
             }
             ServerContinuity::NewServer => {
+                self.epoch.advance();
                 self.participants.replace_room(Vec::new());
                 self.room_name = "lobby".to_string();
                 self.metas.clear();
@@ -1335,6 +1363,7 @@ impl RoomSession {
     }
 
     pub(crate) fn reset_for_server_list(&mut self) {
+        self.epoch.advance();
         self.participants.replace_room(Vec::new());
         self.server_alias.clear();
         self.history = HistoryStorage::disabled();
@@ -1878,10 +1907,10 @@ impl RoomSession {
         Some((room_id, Some(before), limit))
     }
 
-    pub(crate) fn gap_backfill_request_for_viewed_room(
+    pub(crate) fn gap_backfill_request(
         &mut self,
+        room_id: RoomId,
     ) -> Option<(RoomId, Option<MessageId>, u16)> {
-        let room_id = self.viewed_room?;
         let resident = self
             .rooms
             .get(&room_id)
@@ -1982,7 +2011,7 @@ impl RoomSession {
         let changed = self.merge_history(room_id, messages);
         self.clear_history_gap_if_bridged(room_id, page_oldest);
         let next_backfill = if completion.is_some() {
-            self.gap_backfill_request_for_viewed_room()
+            self.gap_backfill_request(room_id)
         } else {
             None
         };
@@ -2160,12 +2189,12 @@ impl RoomSession {
         }
     }
 
-    /// Rebuilds the viewed room's roster from the room's voice-seen set: every
+    /// Rebuilds the active voice room's rich roster from its voice-seen set: every
     /// user who is, or was during this process, in the room's voice call. A
     /// row's `online` flag mirrors call membership, so users who have left
     /// render as `away`.
     pub(crate) fn rebuild_roster(&mut self) {
-        let Some(room_id) = self.viewed_room else {
+        let Some(room_id) = self.voice_room.or(self.viewed_room) else {
             self.participants.replace_room(Vec::new());
             return;
         };
@@ -2201,13 +2230,13 @@ impl RoomSession {
     }
 
     /// Snapshot of the voice roster belonging to one client's viewed room.
-    /// The primary room keeps live feedback/talking state; other rooms are
-    /// derived from canonical occupancy and voice-seen history.
+    /// The daemon's active voice room keeps live feedback/talking state;
+    /// non-call rooms are derived from canonical occupancy and history.
     pub(crate) fn participant_snapshot(&self, room_id: Option<RoomId>) -> Participants {
         let Some(room_id) = room_id else {
             return Participants::default();
         };
-        if self.viewed_room == Some(room_id) {
+        if self.voice_room.or(self.viewed_room) == Some(room_id) {
             return self.participants.clone();
         }
         let mut participants = Participants::default();
@@ -2417,6 +2446,24 @@ impl RoomSession {
         self.push_notice_with_kind(sender, body, NoticeKind::Info)
     }
 
+    pub(super) fn push_notice_to(
+        &mut self,
+        room_id: RoomId,
+        sender: impl Into<String>,
+        body: impl Into<String>,
+    ) -> bool {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return false;
+        };
+        room.push_notice_record(NoticeRecord {
+            sender: sender.into(),
+            body: body.into(),
+            kind: NoticeKind::Info,
+            scroll_bottom: true,
+        });
+        true
+    }
+
     pub(super) fn push_error_notice(
         &mut self,
         sender: impl Into<String>,
@@ -2521,7 +2568,7 @@ impl RoomSession {
         if voice_room == Some(room_id) {
             self.stream_users.insert(stream_id, user_id);
         }
-        if self.viewed_room == Some(room_id) {
+        if voice_room == Some(room_id) {
             if let Some(mut user) = self.users.get(&user_id).cloned() {
                 user.online = true;
                 self.participants.upsert(RosterSeed {
@@ -2550,7 +2597,7 @@ impl RoomSession {
             meta.voice_users.remove(&user_id);
         }
         self.note_voice_leave(room_id, user_id);
-        if self.viewed_room == Some(room_id) {
+        if self.voice_room.or(self.viewed_room) == Some(room_id) {
             self.participants.voice_stopped(user_id, stream_id);
             // Keep the row but demote it to `away`: the user was in this call,
             // just not anymore.
@@ -2583,7 +2630,8 @@ impl RoomSession {
 
     pub(super) fn peer_transport_changed(&mut self, user_id: UserId, direct: bool) {
         if self
-            .viewed_room
+            .voice_room
+            .or(self.viewed_room)
             .is_some_and(|room_id| self.seen_in_voice(room_id, user_id))
         {
             self.participants.set_peer_transport(user_id, direct);
@@ -2600,7 +2648,8 @@ impl RoomSession {
             user.voice_status = status;
         }
         if self
-            .viewed_room
+            .voice_room
+            .or(self.viewed_room)
             .is_some_and(|room_id| self.seen_in_voice(room_id, user_id))
         {
             self.participants.set_voice_status(user_id, status);
@@ -2689,11 +2738,12 @@ impl RoomSession {
     }
 
     pub(super) fn participant_names(&self) -> Option<String> {
-        if self.participants.entries.is_empty() {
+        let participants = self.participant_snapshot(self.viewed_room);
+        if participants.entries.is_empty() {
             return None;
         }
         Some(
-            self.participants
+            participants
                 .entries
                 .iter()
                 .map(|entry| entry.display_name())
@@ -2946,6 +2996,47 @@ mod tests {
             flags: rpc::control::MessageFlags::default(),
             target: None,
         }
+    }
+
+    #[test]
+    fn session_epoch_discards_equal_id_equal_revision_view_state() {
+        let mut client = test_room();
+        enter(
+            &mut client,
+            vec![user(UserId(1), "alice")],
+            vec![message(1, UserId(1), "server-a")],
+            Some(UserId(1)),
+        );
+        client.view.composer.set_lines("private draft for server a");
+        let old_epoch = client.session.epoch();
+        let old_revision = client.shared(1).revision();
+
+        assert_eq!(
+            client.session.connect_to_server(
+                "server-b".to_string(),
+                HistoryStorage::disabled(),
+                "alice".to_string(),
+            ),
+            ServerContinuity::NewServer
+        );
+        client.session.authenticated(
+            &[room_info(1)],
+            vec![user(UserId(1), "alice")],
+            RoomId(1),
+            None,
+            Some(UserId(1)),
+        );
+        client
+            .session
+            .merge_history(RoomId(1), vec![message(1, UserId(1), "server-b")]);
+        assert_ne!(client.session.epoch(), old_epoch);
+        assert_eq!(client.shared(1).revision(), old_revision);
+
+        client.view.sync_independent(&client.session);
+
+        assert!(client.view.composer.text().is_empty());
+        assert_eq!(client.view.active.chat.len(), 1);
+        assert_eq!(client.view.active.chat.message(0).body, "server-b");
     }
 
     fn message_in(room_id: RoomId, id: u64, sender: UserId, body: &str) -> ChatMessage {

@@ -248,9 +248,10 @@ fn upload_50mb_loopback() {
     let start = Instant::now();
     uploader
         .handle
-        .try_send(NetworkCommand::UploadFile(UploadFileRequest::new(
-            source.clone(),
-        )))
+        .try_send(NetworkCommand::UploadFile {
+            room_id: Some(RoomId(ROOM)),
+            request: UploadFileRequest::new(source.clone()),
+        })
         .expect("upload compressible file");
 
     let received = wait_for(
@@ -304,9 +305,10 @@ fn upload_50mb_loopback() {
     let identity_start = Instant::now();
     uploader
         .handle
-        .try_send(NetworkCommand::UploadFile(UploadFileRequest::new(
-            incompressible_source,
-        )))
+        .try_send(NetworkCommand::UploadFile {
+            room_id: Some(RoomId(ROOM)),
+            request: UploadFileRequest::new(incompressible_source),
+        })
         .expect("upload incompressible file");
     let received = wait_for(
         "receiver identity",
@@ -339,9 +341,10 @@ fn upload_50mb_loopback() {
     std::fs::write(&excluded_source, &excluded).expect("write excluded payload");
     uploader
         .handle
-        .try_send(NetworkCommand::UploadFile(UploadFileRequest::new(
-            excluded_source,
-        )))
+        .try_send(NetworkCommand::UploadFile {
+            room_id: Some(RoomId(ROOM)),
+            request: UploadFileRequest::new(excluded_source),
+        })
         .expect("upload excluded file");
     let received = wait_for(
         "receiver excluded",

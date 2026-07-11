@@ -13,21 +13,23 @@ use crate::{
         commands::{CommandCompletionState, RefCompletionState},
         room::{
             ComposerSubmission, DeleteDenied, DeleteSelection, EditDenied, PendingEdit, RefJump,
-            RoomSession, RoomView, ToggleExpandResult, strip_blank_edge_lines,
+            RoomSession, RoomView, SessionEpoch, ToggleExpandResult, strip_blank_edge_lines,
         },
     },
     chat_buffer::NoticeKind,
     config::{Config, DefaultBindings},
     theme::Theme,
-    tui::{chrome::ChromeState, editor::EditorHighlighter, mode::PendingTransition},
+    tui::{chrome::ChromeState, editor::EditorHighlighter, mode::PendingTransitions},
     ui::vu::MicLevelBallistics,
 };
+
+const MAX_PARKED_ROOM_VIEWS: usize = 32;
 
 /// One terminal's exclusive UI state over the shared session.
 pub(crate) struct ClientView {
     pub theme: Theme,
     pub status: StatusState,
-    pub pending_transition: PendingTransition,
+    pub pending_transition: PendingTransitions,
     pub chrome: ChromeState,
     /// Rows for the server picker, rebuilt from config whenever it changes.
     pub server_catalog: crate::app::ServerCatalog,
@@ -62,6 +64,9 @@ pub(crate) struct ClientView {
     pending_edit: Option<PendingEdit>,
     /// The room the chat panel shows. `None` before any room is known.
     pub viewed_room: Option<RoomId>,
+    /// Epoch of the session whose room ids, revisions, and drafts this view
+    /// contains. A mismatch is a mandatory full view reset.
+    session_epoch: Option<SessionEpoch>,
     /// The viewed room's buffer. Present even before any room is known, so
     /// pre-connect notices have somewhere to land.
     pub(crate) active: RoomView,
@@ -107,7 +112,7 @@ impl ClientView {
         Self {
             theme,
             status: StatusState::new("select a server"),
-            pending_transition: PendingTransition::default(),
+            pending_transition: PendingTransitions::default(),
             chrome: ChromeState::default(),
             server_catalog: crate::app::ServerCatalog::default(),
             mic_muted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -125,6 +130,7 @@ impl ClientView {
             bindings,
             pending_edit: None,
             viewed_room: None,
+            session_epoch: None,
             active: RoomView::detached(max_messages, syntax),
             parked: HashMap::new(),
             pending_clipboard: None,
@@ -138,19 +144,22 @@ impl ClientView {
     /// the session's viewed room when a session-side flow (auth, offline
     /// catalog load) moved it without a view switch. Call before rendering
     /// and before any cursor-addressed operation.
-    pub(crate) fn sync_active(&mut self, session: &RoomSession) {
+    pub(crate) fn sync_active(&mut self, session: &RoomSession) -> bool {
+        let epoch_changed = self.reconcile_session_epoch(session);
         if session.viewed_room != self.viewed_room
             && let Some(room_id) = session.viewed_room
         {
             self.switch_room(room_id, session);
-            return;
+            return epoch_changed;
         }
         self.sync_buffer(session);
+        epoch_changed
     }
 
     /// Synchronizes an attached client's current room without following the
     /// primary view when it switches rooms.
-    pub(crate) fn sync_independent(&mut self, session: &RoomSession) {
+    pub(crate) fn sync_independent(&mut self, session: &RoomSession) -> bool {
+        let epoch_changed = self.reconcile_session_epoch(session);
         if self
             .viewed_room
             .is_some_and(|room_id| session.room_meta(room_id).is_none())
@@ -161,9 +170,10 @@ impl ClientView {
             && let Some(room_id) = session.viewed_room
         {
             self.switch_room(room_id, session);
-            return;
+            return epoch_changed;
         }
         self.sync_buffer(session);
+        epoch_changed
     }
 
     fn sync_buffer(&mut self, session: &RoomSession) {
@@ -179,6 +189,7 @@ impl ClientView {
     /// Switches the chat panel to `room_id`, parking the current buffer and
     /// composer draft and checking out (or building) the target's.
     pub(crate) fn switch_room(&mut self, room_id: RoomId, session: &RoomSession) {
+        self.reconcile_session_epoch(session);
         if self.viewed_room == Some(room_id) {
             self.sync_buffer(session);
             return;
@@ -192,6 +203,11 @@ impl ClientView {
                 RoomView::detached(self.max_messages, self.syntax),
             );
             parked.draft = self.composer.text();
+            if self.parked.len() >= MAX_PARKED_ROOM_VIEWS
+                && let Some(evicted) = self.parked.keys().next().copied()
+            {
+                self.parked.remove(&evicted);
+            }
             self.parked.insert(previous, parked);
         }
         self.active = self
@@ -217,6 +233,20 @@ impl ClientView {
         self.active = RoomView::detached(self.max_messages, self.syntax);
         self.composer.clear();
         self.composer.enter_insert_mode();
+    }
+
+    fn reconcile_session_epoch(&mut self, session: &RoomSession) -> bool {
+        let epoch = session.epoch();
+        if self.session_epoch.is_none() {
+            self.session_epoch = Some(epoch);
+            return false;
+        }
+        if self.session_epoch == Some(epoch) {
+            return false;
+        }
+        self.reset_rooms();
+        self.session_epoch = Some(epoch);
+        true
     }
 
     /// Lands a notice in this view's buffer directly, for notices raised
@@ -634,9 +664,31 @@ impl ClientView {
         if self.max_messages != config.ui.max_messages as usize {
             self.set_max_messages(config.ui.max_messages);
         }
+        if self.bindings != config.ui.default_bindings {
+            self.apply_bindings(config.ui.default_bindings);
+        }
         if self.server_catalog.generation() != server_catalog.generation() {
             self.server_catalog = server_catalog.clone();
         }
+    }
+
+    fn apply_bindings(&mut self, bindings: DefaultBindings) {
+        let editor_bindings = match bindings {
+            DefaultBindings::Standard => editor_bindings::nano(),
+            DefaultBindings::Vim => editor_bindings::vim(editor_bindings::VimOptions::default()),
+        };
+        let text = self.composer.text();
+        let mut composer = Editor::with_bindings(editor_bindings);
+        composer.set_wrap(true);
+        composer.set_height_bounds(1, u16::MAX);
+        composer.set_theme(self.theme.editor_theme());
+        if !text.is_empty() {
+            composer.set_lines(&text);
+        }
+        composer.enter_insert_mode();
+        self.composer_hl = EditorHighlighter::new(&mut composer);
+        self.composer = composer;
+        self.bindings = bindings;
     }
 
     fn participant_index(&self, entries: &[ParticipantState]) -> Option<usize> {

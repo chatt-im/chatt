@@ -53,6 +53,7 @@ pub(crate) enum CoreCommand {
         body: String,
     },
     RunSlash {
+        room_id: Option<RoomId>,
         input: String,
     },
     DeleteMessages {
@@ -108,6 +109,7 @@ pub(crate) enum CoreCommand {
         pending_join: Option<PendingJoin>,
     },
     UploadPastedImage {
+        room_id: Option<RoomId>,
         source: ImagePasteSource,
         raw_name: String,
     },
@@ -132,6 +134,7 @@ mod tests {
         {
             let mut cx = app.view_cx();
             cx.send(CoreCommand::RunSlash {
+                room_id: None,
                 input: "/stats".to_string(),
             });
             cx.send(CoreCommand::Quit);

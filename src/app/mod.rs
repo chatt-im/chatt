@@ -246,7 +246,7 @@ impl StatusState {
         self.expires_at = Some(expires_at);
     }
 
-    fn expire(&mut self, now: Instant) {
+    pub(crate) fn expire(&mut self, now: Instant) {
         if self.expires_at.is_some_and(|expires_at| now >= expires_at) {
             self.text.clear();
             self.expires_at = None;
@@ -335,6 +335,9 @@ pub(crate) struct App {
     command_queue: Vec<command::CoreCommand>,
     issuing_client: crate::client_channel::ClientId,
     primary_channel: Option<Arc<crate::client_channel::ClientChannel>>,
+    client_channels:
+        HashMap<crate::client_channel::ClientId, Arc<crate::client_channel::ClientChannel>>,
+    pairing_owner: Option<crate::client_channel::ClientId>,
     password_prompt_active: bool,
     pub room: CoreRw<RoomSession>,
     /// The primary terminal's exclusive UI state: composer, scrollback
@@ -386,8 +389,10 @@ pub(crate) struct App {
     /// their mute fade-out tail before transport closes.
     pending_voice_teardown_at: Option<Instant>,
     pending_network_commands: VecDeque<NetworkCommand>,
-    pending_dm_open: Option<(RoomId, UserId, crate::client_channel::ClientId)>,
-    pending_dm_clients: HashMap<UserId, crate::client_channel::ClientId>,
+    pending_dm_open: HashMap<(RoomId, UserId), VecDeque<crate::client_channel::ClientId>>,
+    pending_dm_clients: HashMap<UserId, VecDeque<crate::client_channel::ClientId>>,
+    pending_mutation_clients:
+        HashMap<(RoomId, MessageId, bool), VecDeque<crate::client_channel::ClientId>>,
     pending_room_catalog_save: Option<PendingRoomCatalogSave>,
     supervisor: SupervisorState,
     /// Recent audio device events (losses, recoveries, default changes) shown
@@ -1113,6 +1118,8 @@ impl App {
             command_queue: Vec::new(),
             issuing_client: crate::client_channel::ClientId::PRIMARY,
             primary_channel: None,
+            client_channels: HashMap::new(),
+            pairing_owner: None,
             password_prompt_active: false,
             room: CoreRw::new(room),
             view: CoreMutex::new(view),
@@ -1147,8 +1154,9 @@ impl App {
             pending_audio_apply: None,
             pending_voice_teardown_at: None,
             pending_network_commands: VecDeque::new(),
-            pending_dm_open: None,
+            pending_dm_open: HashMap::new(),
             pending_dm_clients: HashMap::new(),
+            pending_mutation_clients: HashMap::new(),
             pending_room_catalog_save: None,
             supervisor: SupervisorState::default(),
             audio_events: AudioEventLog::default(),
@@ -1216,6 +1224,47 @@ impl App {
         self.primary_channel = Some(channel);
     }
 
+    pub(crate) fn register_client_channel(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+        channel: Arc<crate::client_channel::ClientChannel>,
+    ) {
+        self.client_channels.insert(client_id, channel);
+    }
+
+    pub(crate) fn unregister_client_channel(&mut self, client_id: crate::client_channel::ClientId) {
+        self.client_channels.remove(&client_id);
+    }
+
+    fn channel_for(
+        &self,
+        client_id: crate::client_channel::ClientId,
+    ) -> Option<Arc<crate::client_channel::ClientChannel>> {
+        if client_id == crate::client_channel::ClientId::PRIMARY {
+            self.primary_channel.clone()
+        } else {
+            self.client_channels.get(&client_id).cloned()
+        }
+    }
+
+    fn pop_mutation_owner(
+        &mut self,
+        room_id: RoomId,
+        target: MessageId,
+        delete: bool,
+    ) -> Option<crate::client_channel::ClientId> {
+        let key = (room_id, target, delete);
+        let (owner, empty) = {
+            let owners = self.pending_mutation_clients.get_mut(&key)?;
+            let owner = owners.pop_front();
+            (owner, owners.is_empty())
+        };
+        if empty {
+            self.pending_mutation_clients.remove(&key);
+        }
+        owner
+    }
+
     pub(crate) fn shared_view(&self) -> Arc<parking_lot::Mutex<ClientView>> {
         self.view.shared()
     }
@@ -1262,7 +1311,7 @@ impl App {
                 target,
                 body,
             } => self.submit_edit(room_id, target, body),
-            CoreCommand::RunSlash { input } => self.run_slash_command(input),
+            CoreCommand::RunSlash { room_id, input } => self.run_slash_command(room_id, input),
             CoreCommand::DeleteMessages {
                 room_id,
                 targets,
@@ -1357,8 +1406,12 @@ impl App {
                     self.finish_welcome(pending_join);
                 }
             }
-            CoreCommand::UploadPastedImage { source, raw_name } => {
-                if let Err(error) = self.confirm_paste_image_upload(&source, raw_name) {
+            CoreCommand::UploadPastedImage {
+                room_id,
+                source,
+                raw_name,
+            } => {
+                if let Err(error) = self.confirm_paste_image_upload(room_id, &source, raw_name) {
                     self.set_error(error);
                 }
             }
@@ -1375,7 +1428,13 @@ impl App {
     fn handle_settings_op(&mut self, operation: command::SettingsOp) {
         use command::SettingsOp;
 
+        if self.room.settings_owner != Some(self.issuing_client) {
+            self.set_error("settings session is no longer owned by this client");
+            return;
+        }
+
         if matches!(operation, SettingsOp::Finish) {
+            self.room.settings_owner = None;
             if let Some(settings) = self.room.settings.take() {
                 let mut session = settings
                     .lock()
@@ -1563,7 +1622,13 @@ impl App {
             return;
         }
         let message = format!("queued upload {}", request.path.display());
-        self.send_network_command(NetworkCommand::UploadFile(request), true);
+        self.send_network_command(
+            NetworkCommand::UploadFile {
+                room_id: self.room.viewed_room,
+                request,
+            },
+            true,
+        );
         let _ = reply.send(Ok(message));
     }
 
@@ -1987,11 +2052,14 @@ impl App {
                     );
                 } else {
                     self.send_network_command(
-                        NetworkCommand::UploadFile(UploadFileRequest {
-                            path,
-                            name_override: Some(name),
-                            delete_after_open: true,
-                        }),
+                        NetworkCommand::UploadFile {
+                            room_id: self.room.viewed_room,
+                            request: UploadFileRequest {
+                                path,
+                                name_override: Some(name),
+                                delete_after_open: true,
+                            },
+                        },
                         true,
                     );
                     self.report_web_request_result(client, request_id, "upload_finish", true, None);
@@ -2236,8 +2304,9 @@ impl App {
         self.pending_network_commands.clear();
         self.room.network_disconnected = true;
         self.room.udp_unreachable = false;
-        self.pending_dm_open = None;
+        self.pending_dm_open.clear();
         self.pending_dm_clients.clear();
+        self.pending_mutation_clients.clear();
         self.supervisor.network.reset();
         self.supervisor.capture.reset();
         self.supervisor.playback.reset();
@@ -2252,7 +2321,7 @@ impl App {
         self.save_room_catalog();
         self.room.voice_room = None;
         self.requested_voice_room = None;
-        self.pending_dm_open = None;
+        self.pending_dm_open.clear();
         self.pending_dm_clients.clear();
         self.view.cancel_pending_edit();
         self.room.reset_for_disconnect();
@@ -2482,8 +2551,10 @@ impl App {
     }
 
     fn request_gap_backfill_for_viewed_room(&mut self) {
-        let Some((room_id, before, limit)) = self.room.gap_backfill_request_for_viewed_room()
-        else {
+        let Some(viewed_room) = self.room.viewed_room else {
+            return;
+        };
+        let Some((room_id, before, limit)) = self.room.gap_backfill_request(viewed_room) else {
             return;
         };
         if !self.send_network_command(
@@ -2515,6 +2586,10 @@ impl App {
             self.set_error("select a server before editing messages");
             return;
         }
+        self.pending_mutation_clients
+            .entry((room_id, target, false))
+            .or_default()
+            .push_back(self.issuing_client);
         self.send_network_command(
             NetworkCommand::EditChat {
                 room_id,
@@ -2555,6 +2630,7 @@ impl App {
     }
 
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
+        self.pairing_owner = Some(self.issuing_client);
         let alias = unique_server_alias(&self.config, &default_join_alias(&ticket));
         let display_name = default_join_display_name();
         let token = match random_token() {
@@ -2592,6 +2668,7 @@ impl App {
     /// server's public key is trusted on first use, the token is server-issued,
     /// and the server prompts for a password only when it requires one.
     pub(crate) fn start_open_pairing(&mut self, addr: String) {
+        self.pairing_owner = Some(self.issuing_client);
         let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&addr));
         let server = ServerEntry {
             label: alias.clone(),
@@ -2753,6 +2830,8 @@ impl App {
         udp_probe_addr: Option<String>,
         close_prompt_if_idle: bool,
     ) {
+        let close_prompt_if_idle = close_prompt_if_idle
+            && self.pairing_owner == Some(crate::client_channel::ClientId::PRIMARY);
         let Some(mut pair) = self.pending_pair.take() else {
             self.set_status("pairing succeeded");
             if close_prompt_if_idle && self.view.pending_transition.is_empty() {
@@ -2783,6 +2862,7 @@ impl App {
     /// prompt.
     pub(crate) fn cancel_open_pairing(&mut self) {
         self.password_prompt_active = false;
+        self.pairing_owner = None;
         self.pop_mode();
         self.pending_pair.take();
         self.room.join_notice = None;
@@ -3005,23 +3085,32 @@ impl App {
                 if self.room.viewed_room == Some(room_id) {
                     self.request_initial_history_for_viewed_room();
                 }
-                if let Some((pending_room, peer, client_id)) = self.pending_dm_open
-                    && pending_room == room_id
-                {
-                    self.pending_dm_open = None;
-                    self.open_dm_room_for_client(client_id, room_id, peer);
+                let pending: Vec<_> = self
+                    .pending_dm_open
+                    .keys()
+                    .filter(|(pending_room, _)| *pending_room == room_id)
+                    .copied()
+                    .collect();
+                for (pending_room, peer) in pending {
+                    if let Some(clients) = self.pending_dm_open.remove(&(pending_room, peer)) {
+                        for client_id in clients {
+                            self.open_dm_room_for_client(client_id, room_id, peer);
+                        }
+                    }
                 }
                 self.mark_room_catalog_dirty();
             }
             NetworkEvent::DmOpened { room_id, peer } => {
-                let client_id = self
-                    .pending_dm_clients
-                    .remove(&peer)
-                    .unwrap_or(crate::client_channel::ClientId::PRIMARY);
+                let Some(clients) = self.pending_dm_clients.remove(&peer) else {
+                    kvlog::warn!("dm opened without a pending owner", peer = peer.0);
+                    return;
+                };
                 if self.room.room_meta(room_id).is_some() {
-                    self.open_dm_room_for_client(client_id, room_id, peer);
+                    for client_id in clients {
+                        self.open_dm_room_for_client(client_id, room_id, peer);
+                    }
                 } else {
-                    self.pending_dm_open = Some((room_id, peer, client_id));
+                    self.pending_dm_open.insert((room_id, peer), clients);
                 }
             }
             NetworkEvent::HistoryChunk {
@@ -3068,7 +3157,22 @@ impl App {
                     target = target.0,
                     error = message.as_str()
                 );
-                self.set_error(&message);
+                let owner =
+                    self.pop_mutation_owner(room_id, target, kind == ChatMutationKind::Delete);
+                if let Some(owner) = owner {
+                    if owner == crate::client_channel::ClientId::PRIMARY {
+                        self.set_error(message.clone());
+                    } else if let Some(channel) = self.channel_for(owner) {
+                        channel.push(crate::client_channel::ClientEvent::SetError(
+                            message.clone(),
+                        ));
+                    } else {
+                        kvlog::warn!(
+                            "mutation rejection owner is no longer connected",
+                            client_id = owner.0
+                        );
+                    }
+                }
                 if let Some(feed) = &self.web_feed {
                     let operation = match kind {
                         ChatMutationKind::Edit => "edit_message",
@@ -3079,6 +3183,9 @@ impl App {
                 if kind == ChatMutationKind::Delete
                     && self.pending_web_deletes.remove(&(room_id, target))
                 {
+                    if owner.is_none() {
+                        self.set_error(message.clone());
+                    }
                     self.report_web_delete_error(target, &message);
                 }
             }
@@ -3096,6 +3203,9 @@ impl App {
                         let target = message.target.expect("mutation record");
                         self.pending_web_deletes.remove(&(message.room_id, target));
                     }
+                    let target = message.target.expect("mutation record");
+                    let delete = message.flags.deleted();
+                    self.pop_mutation_owner(message.room_id, target, delete);
                     if viewed && let Some(feed) = &self.web_feed {
                         match update.outcome {
                             MutationOutcome::AppliedEdit(folded) => {
@@ -3237,6 +3347,7 @@ impl App {
             } => {
                 if Some(session_id) == self.session_id {
                     self.room.voice_room = Some(room_id);
+                    self.room.rebuild_roster();
                     self.requested_voice_room = None;
                 }
                 let voice_room = self.room.voice_room;
@@ -3284,6 +3395,7 @@ impl App {
                     if self.room.voice_room == Some(room_id) {
                         self.clear_shares_for_voice_room(room_id);
                         self.room.voice_room = None;
+                        self.room.rebuild_roster();
                         self.stop_audio();
                         self.set_status("voice stopped");
                     }
@@ -3481,6 +3593,7 @@ impl App {
                     return;
                 };
                 self.complete_pairing(pair.server, pair.completion);
+                self.pairing_owner = None;
             }
             NetworkEvent::OpenPairingSucceeded {
                 token,
@@ -3490,7 +3603,9 @@ impl App {
             } => {
                 if self.password_prompt_active {
                     self.password_prompt_active = false;
-                    if let Some(channel) = &self.primary_channel {
+                    if let Some(channel) =
+                        self.pairing_owner.and_then(|owner| self.channel_for(owner))
+                    {
                         channel.push(crate::client_channel::ClientEvent::PairingSucceeded);
                     }
                     self.complete_open_pairing_from_password_prompt(
@@ -3499,8 +3614,10 @@ impl App {
                         udp_addr,
                         udp_probe_addr,
                     );
+                    self.pairing_owner = None;
                 } else {
                     self.complete_open_pairing(token, server_public_key, udp_addr, udp_probe_addr);
+                    self.pairing_owner = None;
                 }
             }
             NetworkEvent::OpenPairingNeedsPassword {
@@ -3509,7 +3626,9 @@ impl App {
             } => {
                 if let Err(error) = self.accept_open_pairing_password_challenge(server_public_key) {
                     if self.password_prompt_active {
-                        if let Some(channel) = &self.primary_channel {
+                        if let Some(channel) =
+                            self.pairing_owner.and_then(|owner| self.channel_for(owner))
+                        {
                             channel.push(crate::client_channel::ClientEvent::PairingFailed(
                                 error.clone(),
                             ));
@@ -3519,19 +3638,40 @@ impl App {
                     return;
                 }
                 if self.password_prompt_active {
-                    if let Some(channel) = &self.primary_channel {
+                    if let Some(channel) =
+                        self.pairing_owner.and_then(|owner| self.channel_for(owner))
+                    {
                         channel.push(
                             crate::client_channel::ClientEvent::PairingPasswordChallenge { retry },
                         );
                     }
                 } else {
                     self.password_prompt_active = true;
-                    self.push_mode(Box::new(PasswordPromptMode::new(retry)));
+                    match self.pairing_owner {
+                        Some(owner) if owner != crate::client_channel::ClientId::PRIMARY => {
+                            if let Some(channel) = self.channel_for(owner) {
+                                channel.push(
+                                    crate::client_channel::ClientEvent::OpenPairingPasswordChallenge {
+                                        retry,
+                                    },
+                                );
+                            } else {
+                                kvlog::warn!(
+                                    "pairing prompt owner is no longer connected",
+                                    client_id = owner.0
+                                );
+                            }
+                        }
+                        Some(_) => self.push_mode(Box::new(PasswordPromptMode::new(retry))),
+                        None => kvlog::warn!("pairing password challenge has no owner"),
+                    }
                 }
             }
             NetworkEvent::PairingFailed(error) => {
                 if self.password_prompt_active {
-                    if let Some(channel) = &self.primary_channel {
+                    if let Some(channel) =
+                        self.pairing_owner.and_then(|owner| self.channel_for(owner))
+                    {
                         channel.push(crate::client_channel::ClientEvent::PairingFailed(
                             error.clone(),
                         ));
@@ -3651,6 +3791,10 @@ impl App {
         );
         let mut sent_immediately = true;
         for target in targets {
+            self.pending_mutation_clients
+                .entry((room_id, target, true))
+                .or_default()
+                .push_back(self.issuing_client);
             sent_immediately &=
                 self.send_network_command(NetworkCommand::DeleteChat { room_id, target }, true);
         }
@@ -3761,7 +3905,7 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn take_mode_transition(&mut self) -> Option<ModeTransition> {
-        self.view.pending_transition.take()
+        self.view.pending_transition.pop_front()
     }
 
     pub(crate) fn delete_server(&mut self, label: &str) {
@@ -4035,11 +4179,35 @@ impl App {
             self.refresh_audio_devices();
         }
         self.start_settings_preview_capture();
+        self.room.settings_generation = self.room.settings_generation.wrapping_add(1);
+        self.room.settings_owner = Some(self.issuing_client);
         self.room.settings = Some(Arc::new(std::sync::Mutex::new(SettingsSession::new(
             &self.config,
             &self.room.audio_devices,
         ))));
         self.push_mode(Box::new(SettingsMode::new()));
+    }
+
+    /// Revokes core-owned leases for a terminal on every retirement path. UI
+    /// teardown is best-effort; preview resources cannot depend on it.
+    pub(crate) fn retire_client(&mut self, client_id: crate::client_channel::ClientId) {
+        self.unregister_client_channel(client_id);
+        if self.pairing_owner == Some(client_id) {
+            self.pairing_owner = None;
+            self.password_prompt_active = false;
+            self.pending_pair.take();
+        }
+        if self.room.settings_owner != Some(client_id) {
+            return;
+        }
+        self.room.settings_owner = None;
+        let Some(settings) = self.room.settings.take() else {
+            return;
+        };
+        let mut session = settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.finish_settings_session(&mut session);
     }
 
     pub(crate) fn close_settings(&mut self, session: &mut SettingsSession) {
@@ -5413,10 +5581,10 @@ impl App {
                 return;
             }
         };
-        self.run_slash_command(input);
+        self.run_slash_command(self.view.viewed_room, input);
     }
 
-    fn run_slash_command(&mut self, input: String) {
+    fn run_slash_command(&mut self, room_id: Option<RoomId>, input: String) {
         match input.as_str() {
             "/quit" => self.set_status("use Ctrl-C to quit"),
             "/mute" => self.set_mute(true),
@@ -5429,7 +5597,7 @@ impl App {
             "/audio-reset" => self.audio_manual_reset(),
             "/stats" => self.toggle_lobby_details(),
             "/clear" => self.view.clear_chat(),
-            "/help" => self.show_command_help(),
+            "/help" => self.show_command_help(room_id),
             "/config" | "/settings" => self.open_settings(),
             "/servers" if self.network.is_some() => self.pop_mode(),
             "/servers" => self.open_server_select(),
@@ -5442,7 +5610,10 @@ impl App {
             command if command.starts_with("/room ") => self.switch_room_command(command),
             "/dm" => self.set_error("usage: /dm user"),
             command if command.starts_with("/dm ") => self.open_dm_command(command),
-            "/voice" => self.join_voice_command(None),
+            "/voice" => match room_id {
+                Some(room_id) => self.join_voice_room(room_id),
+                None => self.set_error("no room selected"),
+            },
             command if command.starts_with("/voice ") => {
                 let name = command.trim_start_matches("/voice ").trim().to_string();
                 self.join_voice_command(Some(&name));
@@ -5450,7 +5621,9 @@ impl App {
             "/voice-leave" => self.leave_voice_command(),
             "/video" => self.show_video_status(),
             "/upload" => self.set_error("usage: /upload file_path/filename.ext"),
-            command if command.starts_with("/upload ") => self.upload_file_command(command),
+            command if command.starts_with("/upload ") => {
+                self.upload_file_command(room_id, command)
+            }
             "/upload-rate" => self.set_error("usage: /upload-rate 200K|off"),
             command if command.starts_with("/upload-rate ") => {
                 self.set_upload_rate_command(command)
@@ -5499,7 +5672,10 @@ impl App {
             return;
         }
         if self.send_network_command(NetworkCommand::OpenDm(user_id), true) {
-            self.pending_dm_clients.insert(user_id, self.issuing_client);
+            self.pending_dm_clients
+                .entry(user_id)
+                .or_default()
+                .push_back(self.issuing_client);
         }
         self.set_status(format!(
             "opening dm with {}",
@@ -5577,7 +5753,7 @@ impl App {
         self.set_status("leaving voice");
     }
 
-    fn upload_file_command(&mut self, command: &str) {
+    fn upload_file_command(&mut self, room_id: Option<RoomId>, command: &str) {
         let path = command.trim_start_matches("/upload ").trim();
         if path.is_empty() {
             self.set_error("usage: /upload file_path/filename.ext");
@@ -5585,7 +5761,10 @@ impl App {
         }
         if self.network.is_some() {
             self.send_network_command(
-                NetworkCommand::UploadFile(UploadFileRequest::new(std::path::PathBuf::from(path))),
+                NetworkCommand::UploadFile {
+                    room_id,
+                    request: UploadFileRequest::new(std::path::PathBuf::from(path)),
+                },
                 true,
             );
             self.set_status(format!("queued upload {}", path));
@@ -5622,6 +5801,7 @@ impl App {
     /// with a message when the dialog should stay open (no server, bad name).
     pub(crate) fn confirm_paste_image_upload(
         &mut self,
+        room_id: Option<RoomId>,
         source: &crate::clipboard_paste::ImagePasteSource,
         raw_name: String,
     ) -> Result<(), String> {
@@ -5637,13 +5817,17 @@ impl App {
             name_override: Some(name.clone()),
             delete_after_open: source.is_staged(),
         };
-        self.send_network_command(NetworkCommand::UploadFile(request), true);
+        self.send_network_command(NetworkCommand::UploadFile { room_id, request }, true);
         self.set_status(format!("queued upload {name}"));
         Ok(())
     }
 
-    fn show_command_help(&mut self) {
-        self.push_notice("help", slash_command_help());
+    fn show_command_help(&mut self, room_id: Option<RoomId>) {
+        let body = slash_command_help();
+        if !room_id.is_some_and(|room_id| self.room.push_notice_to(room_id, "help", body.clone())) {
+            self.view
+                .push_local_notice("help", body, crate::chat_buffer::NoticeKind::Info);
+        }
         self.set_status("slash commands listed");
     }
 
@@ -6823,7 +7007,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SendChat { .. } => "send_chat",
         NetworkCommand::EditChat { .. } => "edit_chat",
         NetworkCommand::DeleteChat { .. } => "delete_chat",
-        NetworkCommand::UploadFile(_) => "upload_file",
+        NetworkCommand::UploadFile { .. } => "upload_file",
         NetworkCommand::CancelTransfer { .. } => "cancel_transfer",
         NetworkCommand::SetActiveRoom(_) => "set_active_room",
         NetworkCommand::JoinVoice(_) => "join_voice",
@@ -6951,7 +7135,7 @@ mod tests {
         );
         assert!(matches!(
             network_rx.recv().unwrap(),
-            NetworkCommand::UploadFile(request) if request.path == path
+            NetworkCommand::UploadFile { request, .. } if request.path == path
         ));
     }
 
@@ -7567,6 +7751,10 @@ mod tests {
             app.user_id,
         );
         let dm_id = RoomId(0x8000_0001);
+        app.pending_dm_clients
+            .entry(UserId(2))
+            .or_default()
+            .push_back(crate::client_channel::ClientId::PRIMARY);
 
         app.handle_network_event(NetworkEvent::DmOpened {
             room_id: dm_id,
@@ -7574,8 +7762,10 @@ mod tests {
         });
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
         assert_eq!(
-            app.pending_dm_open,
-            Some((dm_id, UserId(2), crate::client_channel::ClientId::PRIMARY))
+            app.pending_dm_open
+                .get(&(dm_id, UserId(2)))
+                .and_then(|clients| clients.front()),
+            Some(&crate::client_channel::ClientId::PRIMARY)
         );
 
         app.handle_network_event(NetworkEvent::RoomUpserted(dm_room_info(
@@ -7584,7 +7774,7 @@ mod tests {
             UserId(2),
         )));
 
-        assert_eq!(app.pending_dm_open, None);
+        assert!(app.pending_dm_open.is_empty());
         assert_eq!(app.room.viewed_room, Some(dm_id));
         assert_eq!(app.view.status.text(), "dm with bob");
     }
@@ -7636,6 +7826,52 @@ mod tests {
             }
             _ => panic!("expected targeted client room event"),
         }
+    }
+
+    #[test]
+    fn one_dm_result_routes_to_all_concurrent_requesters() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[test_room_info(1)],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        let clients = [
+            crate::client_channel::ClientId(7),
+            crate::client_channel::ClientId(8),
+        ];
+        for client in clients {
+            app.handle_client_command(client, command::CoreCommand::OpenDm(UserId(2)));
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(NetworkCommand::OpenDm(UserId(2)))
+            ));
+        }
+        let dm_id = RoomId(0x8000_0001);
+        app.handle_network_event(NetworkEvent::DmOpened {
+            room_id: dm_id,
+            peer: UserId(2),
+        });
+        app.handle_network_event(NetworkEvent::RoomUpserted(dm_room_info(
+            dm_id.0,
+            UserId(1),
+            UserId(2),
+        )));
+
+        let mut routed = Vec::new();
+        while let Some(AppEvent::ClientViewRoom { client_id, .. }) = app.next_event() {
+            routed.push(client_id);
+        }
+        routed.sort_by_key(|client| client.0);
+        assert_eq!(routed, clients);
     }
 
     #[test]
@@ -8142,6 +8378,25 @@ mod tests {
     }
 
     #[test]
+    fn retiring_settings_owner_releases_global_lease() {
+        let mut app = test_app();
+        app.allow_settings_preview_capture = false;
+        let owner = crate::client_channel::ClientId(41);
+        app.handle_client_command(owner, command::CoreCommand::OpenSettings);
+        assert_eq!(app.room.settings_owner, Some(owner));
+        assert!(app.room.settings.is_some());
+
+        app.retire_client(owner);
+
+        assert_eq!(app.room.settings_owner, None);
+        assert!(app.room.settings.is_none());
+        let _ = app.take_mode_transition();
+        let successor = crate::client_channel::ClientId(42);
+        app.handle_client_command(successor, command::CoreCommand::OpenSettings);
+        assert_eq!(app.room.settings_owner, Some(successor));
+    }
+
+    #[test]
     fn mouse_wheel_moves_open_settings_device_picker() {
         let mut app = test_app();
         let form = FormState::new(
@@ -8623,6 +8878,46 @@ mod tests {
         });
         assert!(!app.pending_web_deletes.contains(&(RoomId(1), MessageId(7))));
         assert_eq!(app.view.status.text(), "message is too old");
+    }
+
+    #[test]
+    fn mutation_rejection_is_delivered_to_the_requesting_terminal() {
+        let mut app = test_app();
+        let (network_tx, network_rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(network_tx));
+        enter_test_room(&mut app);
+        let owner = crate::client_channel::ClientId(77);
+        let channel = Arc::new(crate::client_channel::ClientChannel::new().unwrap());
+        app.register_client_channel(owner, channel.clone());
+        app.handle_client_command(
+            owner,
+            command::CoreCommand::DeleteMessages {
+                room_id: RoomId(1),
+                targets: vec![MessageId(9)],
+                skipped: 0,
+            },
+        );
+        assert!(matches!(
+            network_rx.try_recv(),
+            Ok(NetworkCommand::DeleteChat {
+                room_id: RoomId(1),
+                target: MessageId(9),
+            })
+        ));
+        app.set_status("primary steady");
+
+        app.handle_network_event(NetworkEvent::ChatMutationRejected {
+            room_id: RoomId(1),
+            target: MessageId(9),
+            kind: ChatMutationKind::Delete,
+            message: "message is too old".to_string(),
+        });
+
+        assert_eq!(app.view.status.text(), "primary steady");
+        assert!(matches!(
+            channel.drain_events().as_slice(),
+            [crate::client_channel::ClientEvent::SetError(error)] if error == "message is too old"
+        ));
     }
 
     #[test]
