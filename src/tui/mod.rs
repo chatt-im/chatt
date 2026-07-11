@@ -2,6 +2,7 @@ pub(crate) mod chrome;
 pub(crate) mod client_thread;
 pub(crate) mod editor;
 pub(crate) mod form;
+pub(crate) mod history_search;
 pub(crate) mod mode;
 pub(crate) mod mode_stack {
     pub(crate) use super::mode::ModeStack;
