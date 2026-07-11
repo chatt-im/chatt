@@ -4,7 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use extui::{AnsiColor, Buffer, Cell, CursorShape, Ellipsis, HAlign, Rect, Style, vt::Modifier};
+use extui::{
+    AnsiColor, Buffer, Cell, CursorShape, DisplayRect, Ellipsis, HAlign, Rect, Style, vt::Modifier,
+};
 use extui_bindings::LayerId;
 use extui_editor::Mode as EditorMode;
 use rpc::ids::FileTransferId;
@@ -585,30 +587,16 @@ fn draw_room_list_item(
     };
     area.with(base).fill(buf);
 
-    let mut row = area;
+    let mut row = area.with(Ellipsis(true)).with(HAlign::Right);
     if item.voice {
-        draw_status_segment_right(&mut row, buf, base.patch(theme.good), " V ");
+        row = row.with(base.patch(theme.good)).text(buf, " V ");
     }
     if item.unread > 0 {
-        draw_status_segment_right(
-            &mut row,
-            buf,
-            base.patch(theme.warn) | Modifier::BOLD,
-            &format!(" {} ", item.unread),
-        );
+        row = row
+            .with(base.patch(theme.warn) | Modifier::BOLD)
+            .fmt(buf, format_args!(" {} ", item.unread));
     } else if item.behind_head {
-        draw_status_segment_right(&mut row, buf, base.patch(theme.warn), " • ");
-    }
-
-    let marker_width = row.w.min(2);
-    if marker_width > 0 {
-        row.take_left(marker_width as i32)
-            .with(base.patch(if item.viewed {
-                theme.good
-            } else {
-                theme.subtle
-            }))
-            .text(buf, if selected { ">" } else { " " });
+        row = row.with(base.patch(theme.warn)).text(buf, " • ");
     }
 
     let name_style = if item.viewed {
@@ -618,8 +606,14 @@ fn draw_room_list_item(
     } else {
         base.patch(theme.muted)
     };
-    row.with(name_style)
-        .with(Ellipsis(true))
+    row.with(HAlign::Left)
+        .with(base.patch(if item.viewed {
+            theme.good
+        } else {
+            theme.subtle
+        }))
+        .text(buf, if selected { "> " } else { "  " })
+        .with(name_style)
         .text(buf, &item.name);
 }
 
@@ -694,33 +688,31 @@ fn draw_room_select_item(
         theme.background
     };
     buf.clear_rect(area, base);
-    let mut row = area;
-    row.take_left(2)
+    let mut row = area
+        .with(Ellipsis(true))
         .with(base.patch(if selected { theme.good } else { theme.subtle }))
-        .text(buf, if selected { ">" } else { " " });
+        .text(buf, if selected { "> " } else { "  " })
+        .with(HAlign::Right);
     if item.voice {
-        draw_status_segment_right(&mut row, buf, base.patch(theme.good), " voice ");
+        row = row.with(base.patch(theme.good)).text(buf, " voice ");
     }
     if item.unread > 0 {
-        draw_status_segment_right(
-            &mut row,
-            buf,
-            base.patch(theme.warn) | Modifier::BOLD,
-            &format!(" {} ", item.unread),
-        );
+        row = row
+            .with(base.patch(theme.warn) | Modifier::BOLD)
+            .fmt(buf, format_args!(" {} ", item.unread));
     } else if item.behind_head {
-        draw_status_segment_right(&mut row, buf, base.patch(theme.warn), " • ");
+        row = row.with(base.patch(theme.warn)).text(buf, " • ");
     }
     if item.viewed {
-        draw_status_segment_right(&mut row, buf, base.patch(theme.accent), " viewing ");
+        row = row.with(base.patch(theme.accent)).text(buf, " viewing ");
     }
     let name_style = if item.viewed {
         base.patch(theme.text | Modifier::BOLD)
     } else {
         base.patch(theme.text)
     };
-    row.with(name_style)
-        .with(Ellipsis(true))
+    row.with(HAlign::Left)
+        .with(name_style)
         .text(buf, &item.name);
 }
 
@@ -1131,9 +1123,6 @@ fn draw_top_bar(
     buf: &mut Buffer,
     capture: Option<&StatsSnapshot>,
 ) {
-    if area.is_empty() {
-        return;
-    }
     let theme = app.view.theme;
     area.with(theme.status_fill).fill(buf);
 
@@ -1142,28 +1131,18 @@ fn draw_top_bar(
     } else {
         app.room.server_alias.as_str()
     };
-    let mut left = area;
-    draw_status_segment(
-        &mut left,
-        buf,
-        theme.status_section | Modifier::BOLD,
-        &format!(" {server} "),
-    );
+    let mut left = area
+        .with(Ellipsis(true))
+        .with(theme.status_section | Modifier::BOLD)
+        .fmt(buf, format_args!(" {server} "));
     if let Some((label, style)) = connection_status_label(app) {
-        draw_status_segment(
-            &mut left,
-            buf,
-            style | Modifier::BOLD,
-            &format!(" {label} "),
-        );
+        left = left
+            .with(style | Modifier::BOLD)
+            .fmt(buf, format_args!(" {label} "));
     }
     if !app.room.local_user_name.trim().is_empty() {
-        draw_status_segment(
-            &mut left,
-            buf,
-            theme.status_fill.patch(theme.muted),
-            &format!(" {} ", app.room.local_user_name),
-        );
+        left.with(theme.status_fill.patch(theme.muted))
+            .fmt(buf, format_args!(" {} ", app.room.local_user_name));
     }
 
     let mut right = area;
@@ -1201,28 +1180,25 @@ fn draw_video_status_block(row: &mut Rect, app: &RenderState<'_>, buf: &mut Buff
         ),
         ScreencastPhase::Idle => return Rect::EMPTY,
     };
-    draw_status_segment_right(row, buf, style | Modifier::BOLD, &label)
+    row.with(Ellipsis(true))
+        .with(HAlign::Right)
+        .with(style | Modifier::BOLD)
+        .text(buf, &label);
+    row.take_right(label.len().min(row.w as usize) as i32)
 }
 
 fn draw_top_bar_voice_buttons(row: &mut Rect, app: &mut RenderState<'_>, buf: &mut Buffer) {
-    app.view.chrome.top_bar.deafen = draw_status_segment_right(
-        row,
-        buf,
-        top_bar_voice_button_style(app, LocalVoiceMode::Deafened),
-        " DEAF ",
-    );
-    app.view.chrome.top_bar.mute = draw_status_segment_right(
-        row,
-        buf,
-        top_bar_voice_button_style(app, LocalVoiceMode::Muted),
-        " MUTE ",
-    );
-    app.view.chrome.top_bar.live = draw_status_segment_right(
-        row,
-        buf,
-        top_bar_voice_button_style(app, LocalVoiceMode::Live),
-        " LIVE ",
-    );
+    row.with(Ellipsis(true))
+        .with(HAlign::Right)
+        .with(top_bar_voice_button_style(app, LocalVoiceMode::Deafened))
+        .text(buf, " DEAF ")
+        .with(top_bar_voice_button_style(app, LocalVoiceMode::Muted))
+        .text(buf, " MUTE ")
+        .with(top_bar_voice_button_style(app, LocalVoiceMode::Live))
+        .text(buf, " LIVE ");
+    app.view.chrome.top_bar.deafen = row.take_right(6);
+    app.view.chrome.top_bar.mute = row.take_right(6);
+    app.view.chrome.top_bar.live = row.take_right(6);
 }
 
 fn top_bar_voice_button_style(app: &RenderState<'_>, button: LocalVoiceMode) -> Style {
@@ -1279,8 +1255,10 @@ fn draw_lobby_bar(
             ChatPanelFocus::Lobby,
             lobby_focused && lobby_list_focus == LobbyListFocus::Rooms,
         );
-        let mut row = rooms_bar;
-        draw_status_segment(&mut row, buf, label, " Rooms ");
+        rooms_bar
+            .with(Ellipsis(true))
+            .with(label)
+            .text(buf, " Rooms ");
     }
 
     bar_rect_for(area, divider_rect).with(fill).fill(buf);
@@ -1297,8 +1275,12 @@ fn draw_lobby_bar(
         ChatPanelFocus::Lobby,
         lobby_focused && lobby_list_focus == LobbyListFocus::Users,
     );
+    lobby_bar
+        .with(Ellipsis(true))
+        .with(label)
+        .text(buf, " Call ");
     let mut row = lobby_bar;
-    draw_status_segment(&mut row, buf, label, " Call ");
+    row.take_left(6);
     let (button_label, button_style) = if app.room.voice_room.is_some() {
         (
             " LEAVE ",
@@ -1310,8 +1292,12 @@ fn draw_lobby_bar(
             top_bar_active_button_style(app.view.theme, app.view.theme.good),
         )
     };
+    row.with(Ellipsis(true))
+        .with(HAlign::Right)
+        .with(button_style | Modifier::BOLD)
+        .text(buf, button_label);
     app.view.chrome.lobby_bar.call_button =
-        draw_status_segment_right(&mut row, buf, button_style | Modifier::BOLD, button_label);
+        row.take_right(button_label.len().min(row.w as usize) as i32);
     draw_lobby_audio_widget(row, app, fill, buf);
 }
 
@@ -1341,8 +1327,6 @@ fn draw_lobby_audio_widget(
     let theme = app.view.theme;
     let mic = app.room.capture_health.clone();
     let spk = app.room.playback_health.clone();
-    let mut right = remaining;
-
     let mut trouble = Vec::new();
     if let Some(text) = audio_health_status_text("mic", mic.state) {
         trouble.push(text);
@@ -1354,18 +1338,20 @@ fn draw_lobby_audio_widget(
         return;
     }
 
-    app.view.chrome.lobby_bar.audio_reset = draw_status_segment_right(
-        &mut right,
-        buf,
-        theme.status_section.patch(theme.warn) | Modifier::BOLD,
-        " [reset] ",
-    );
-    app.view.chrome.lobby_bar.audio_widget = draw_status_segment_right(
-        &mut right,
-        buf,
-        fill.patch(theme.warn),
-        &format!(" {} ", trouble.join(" | ")),
-    );
+    let status = format!(" {} ", trouble.join(" | "));
+    remaining
+        .with(Ellipsis(true))
+        .with(HAlign::Right)
+        .with(theme.status_section.patch(theme.warn) | Modifier::BOLD)
+        .text(buf, " [reset] ")
+        .with(fill.patch(theme.warn))
+        .text(buf, &status);
+
+    let mut right = remaining;
+    app.view.chrome.lobby_bar.audio_reset = right.take_right(9);
+    // This is informational rather than interactive; retaining the available
+    // region avoids measuring the same status string a second time for metadata.
+    app.view.chrome.lobby_bar.audio_widget = right;
 }
 
 fn audio_health_status_text(prefix: &str, state: AudioHealthState) -> Option<String> {
@@ -1392,15 +1378,10 @@ fn draw_chat_log_bar(
     let focused = focus == ChatPanelFocus::ChatLog;
     let (fill, label, _) = section_bar_styles(app.view.theme, ChatPanelFocus::ChatLog, focused);
     area.with(fill).fill(buf);
-    let mut row = area;
-    draw_status_segment(&mut row, buf, label, " Chat ");
+    let row = area.with(Ellipsis(true)).with(label).text(buf, " Chat ");
     if let Some(query) = search_query {
-        draw_status_segment(
-            &mut row,
-            buf,
-            fill.patch(app.view.theme.accent),
-            &format!(" /{query} "),
-        );
+        row.with(fill.patch(app.view.theme.accent))
+            .fmt(buf, format_args!(" /{query} "));
     }
 }
 
@@ -1422,14 +1403,12 @@ fn draw_compose_bar(
         label = app.view.theme.mode_style(mode) | Modifier::BOLD;
     }
     area.with(fill).fill(buf);
-    let mut row = area;
-    draw_status_segment(&mut row, buf, label, &format!(" {status_label} "));
-    draw_status_segment(
-        &mut row,
-        buf,
-        detail,
-        &format!(" {} ", composer_mode_label(app)),
-    );
+    let row = area
+        .with(Ellipsis(true))
+        .with(label)
+        .fmt(buf, format_args!(" {status_label} "))
+        .with(detail)
+        .fmt(buf, format_args!(" {} ", composer_mode_label(app)));
     draw_status_text_right(row, app, buf, fill);
 }
 
@@ -2011,17 +1990,16 @@ fn draw_status(
     label: &'static str,
     _capture: Option<&StatsSnapshot>,
 ) {
-    if area.is_empty() {
-        return;
-    }
     let theme = &app.view.theme;
     area.with(theme.status_fill).fill(buf);
-    let mut row = area;
-    draw_status_segment(&mut row, buf, theme.mode_style(mode), &format!(" {label} "));
+    let row = area
+        .with(Ellipsis(true))
+        .with(theme.mode_style(mode))
+        .fmt(buf, format_args!(" {label} "));
     draw_status_text_right(row, app, buf, theme.status_fill);
 }
 
-fn draw_status_text_right(area: Rect, app: &RenderState<'_>, buf: &mut Buffer, fill: Style) {
+fn draw_status_text_right(row: DisplayRect, app: &RenderState<'_>, buf: &mut Buffer, fill: Style) {
     let theme = &app.view.theme;
     let right_style = match app.view.status.kind() {
         StatusKind::Info => fill.patch(theme.muted),
@@ -2036,7 +2014,7 @@ fn draw_status_text_right(area: Rect, app: &RenderState<'_>, buf: &mut Buffer, f
     } else {
         app.view.status.text().to_string()
     };
-    area.with(HAlign::Right)
+    row.with(HAlign::Right)
         .with(right_style)
         .with(Ellipsis(true))
         .text(buf, &format!(" {} ", status_text));
@@ -2319,26 +2297,6 @@ fn key_preview_key_style() -> Style {
 
 fn key_preview_label_style() -> Style {
     Style::default().with_fg_ansi(AnsiColor::Grey[14])
-}
-
-fn draw_status_segment(row: &mut Rect, buf: &mut Buffer, style: Style, text: &str) -> Rect {
-    if row.is_empty() {
-        return Rect::EMPTY;
-    }
-    let width = UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16;
-    let area = row.take_left(width as i32);
-    area.with(style).with(Ellipsis(true)).text(buf, text);
-    area
-}
-
-fn draw_status_segment_right(row: &mut Rect, buf: &mut Buffer, style: Style, text: &str) -> Rect {
-    if row.is_empty() {
-        return Rect::EMPTY;
-    }
-    let width = UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16;
-    let area = row.take_right(width as i32);
-    area.with(style).with(Ellipsis(true)).text(buf, text);
-    area
 }
 
 fn draw_composer_border(area: Rect, theme: Theme, glyph: &str, buf: &mut Buffer) {
