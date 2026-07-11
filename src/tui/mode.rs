@@ -8,7 +8,7 @@ use extui_bindings::LayerId;
 
 use crate::{
     app::{RoomSession, command::CoreCommand},
-    client_channel::ClientEvent,
+    client_channel::{BaseScreen, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent},
     config::Config,
     theme,
     tui::{Action, view::ClientView},
@@ -29,6 +29,7 @@ pub(crate) struct ViewCx<'a> {
     pub(crate) session: &'a RoomSession,
     pub(crate) config: &'a Config,
     pub(crate) commands: &'a mut Vec<CoreCommand>,
+    pub(crate) navigation: &'a mut VecDeque<ModeTransition>,
 }
 
 #[allow(dead_code)]
@@ -50,7 +51,7 @@ impl ViewCx<'_> {
     }
 
     pub(crate) fn request_transition(&mut self, transition: ModeTransition) {
-        self.view.pending_transition.request(transition);
+        self.navigation.push_back(transition);
     }
 }
 
@@ -118,7 +119,7 @@ pub(crate) trait AppMode: Send {
         let _ = (cx, text);
     }
 
-    fn process_client_event(&mut self, event: ClientEvent) {
+    fn process_client_event(&mut self, event: TerminalEvent) {
         let _ = event;
     }
 
@@ -136,32 +137,10 @@ pub(crate) enum ModeTransition {
     Pop,
 }
 
-/// Ordered navigation requests waiting for the render-owned mode stack.
-///
-/// Producers run on both sides of the core/render boundary and may complete in
-/// one runtime batch. A FIFO queue preserves every request until the renderer
-/// applies it, so independently produced transitions cannot collide or replace
-/// one another.
-#[derive(Default)]
-pub(crate) struct PendingTransitions(VecDeque<ModeTransition>);
-
-impl PendingTransitions {
-    pub(crate) fn request(&mut self, transition: ModeTransition) {
-        self.0.push_back(transition);
-    }
-
-    pub(crate) fn pop_front(&mut self) -> Option<ModeTransition> {
-        self.0.pop_front()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
 /// Owns navigation invariants and lifecycle for all screens and overlays.
 pub(crate) struct ModeStack {
     modes: Vec<Box<dyn AppMode>>,
+    pending: VecDeque<ModeTransition>,
 }
 
 impl ModeStack {
@@ -172,12 +151,18 @@ impl ModeStack {
             root.on_enter(&mut cx);
         }
         app.drain_core_commands();
-        Self { modes: vec![root] }
+        Self {
+            modes: vec![root],
+            pending: VecDeque::new(),
+        }
     }
 
     pub(crate) fn new_with_cx(mut root: Box<dyn AppMode>, cx: &mut ViewCx<'_>) -> Self {
         root.on_enter(cx);
-        Self { modes: vec![root] }
+        Self {
+            modes: vec![root],
+            pending: VecDeque::new(),
+        }
     }
 
     pub(crate) fn active_mut(&mut self) -> &mut dyn AppMode {
@@ -187,7 +172,27 @@ impl ModeStack {
             .expect("mode stack always has a root")
     }
 
-    pub(crate) fn process_client_event(&mut self, event: ClientEvent) {
+    pub(crate) fn process_terminal_event(&mut self, cx: &mut ViewCx<'_>, event: TerminalEvent) {
+        if let TerminalEvent::Navigation(event) = event {
+            let transition = match event {
+                NavigationEvent::ResetBase(base) => ModeTransition::Set(base.into_mode()),
+                NavigationEvent::OpenScreen(screen) => ModeTransition::Push(screen.into_mode()),
+                NavigationEvent::ReplaceScreen(screen) => {
+                    ModeTransition::Replace(screen.into_mode())
+                }
+                NavigationEvent::CloseScreen => ModeTransition::Pop,
+                NavigationEvent::ShowOverlay(overlay) => {
+                    ModeTransition::Push(overlay.into_mode(&cx.view.theme))
+                }
+                NavigationEvent::ReplaceOverlay(overlay) => {
+                    ModeTransition::Replace(overlay.into_mode(&cx.view.theme))
+                }
+                NavigationEvent::CloseOverlay => ModeTransition::Pop,
+            };
+            self.apply_transition(cx, transition);
+            self.apply_pending_cx(cx);
+            return;
+        }
         self.active_mut().process_client_event(event);
     }
 
@@ -225,7 +230,11 @@ impl ModeStack {
     }
 
     pub(crate) fn apply_pending_cx(&mut self, cx: &mut ViewCx<'_>) {
-        while let Some(transition) = cx.view.pending_transition.pop_front() {
+        loop {
+            self.pending.append(cx.navigation);
+            let Some(transition) = self.pending.pop_front() else {
+                break;
+            };
             self.apply_transition(cx, transition);
         }
     }
@@ -308,6 +317,50 @@ impl ModeStack {
             .last()
             .expect("mode stack always has a root")
             .presentation(&cx)
+    }
+}
+
+impl BaseScreen {
+    fn into_mode(self) -> Box<dyn AppMode> {
+        use crate::tui::modes::{RoomMode, ServerListMode};
+        match self {
+            Self::Room => Box::new(RoomMode::default()),
+            Self::Servers { query: Some(query) } => Box::new(ServerListMode::with_query(query)),
+            Self::Servers { query: None } => Box::new(ServerListMode::new()),
+        }
+    }
+}
+
+impl ScreenSpec {
+    fn into_mode(self) -> Box<dyn AppMode> {
+        use crate::tui::{
+            modes::{RoomSwitchMode, ServerEditMode, SettingsMode},
+            room_settings::RoomSettingsMode,
+            user_list::UserListMode,
+        };
+        match self {
+            Self::Settings => Box::new(SettingsMode::new()),
+            Self::ServerEditor(draft) => Box::new(ServerEditMode::new(draft)),
+            Self::RoomSwitcher => Box::new(RoomSwitchMode::new()),
+            Self::UserList => Box::new(UserListMode::new()),
+            Self::RoomSettings(draft) => Box::new(RoomSettingsMode::new(draft)),
+        }
+    }
+}
+
+impl OverlaySpec {
+    fn into_mode(self, theme: &crate::theme::Theme) -> Box<dyn AppMode> {
+        use crate::tui::overlay::{
+            DialogMode, NativeEncryptionWarningMode, PasswordPromptMode, PasteImageUploadMode,
+        };
+        match self {
+            Self::UserVolume(dialog) => Box::new(DialogMode::new(dialog)),
+            Self::NativeEncryptionWarning { label, generation } => {
+                Box::new(NativeEncryptionWarningMode::new(label, generation))
+            }
+            Self::PairingPassword { retry } => Box::new(PasswordPromptMode::new(retry)),
+            Self::PasteUpload(image) => Box::new(PasteImageUploadMode::new(image, theme)),
+        }
     }
 }
 
@@ -396,7 +449,7 @@ mod tests {
         stack.apply_pending(&mut app);
 
         assert_eq!(stack.depth(), 1);
-        assert!(app.view.pending_transition.is_empty());
+        assert!(app.test_navigation.is_empty());
     }
 
     #[test]
@@ -433,7 +486,46 @@ mod tests {
         stack.apply_pending(&mut app);
 
         assert_eq!(stack.depth(), 1);
-        assert!(app.view.pending_transition.is_empty());
+        assert!(app.test_navigation.is_empty());
+    }
+
+    #[test]
+    fn batched_base_reset_then_native_warning_keeps_warning_active() {
+        let mut app = app();
+        let mut stack = ModeStack::new(Box::new(ServerListMode::new()), &mut app);
+        {
+            let mut cx = app.view_cx();
+            stack.process_terminal_event(
+                &mut cx,
+                TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
+                    query: None,
+                })),
+            );
+            stack.process_terminal_event(
+                &mut cx,
+                TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                    OverlaySpec::NativeEncryptionWarning {
+                        label: "legacy".to_string(),
+                        generation: 17,
+                    },
+                )),
+            );
+        }
+
+        assert_eq!(stack.depth(), 2);
+        assert!(stack.overlay_active(&mut app));
+
+        {
+            let mut cx = app.view_cx();
+            stack.process_input_cx(
+                &mut cx,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            );
+        }
+        assert!(matches!(
+            app.take_queued_core_command(),
+            Some(CoreCommand::CancelNativeEncryption { generation: 17 })
+        ));
     }
 
     #[test]

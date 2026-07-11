@@ -91,8 +91,13 @@ pub(crate) enum CoreCommand {
     Settings(SettingsOp),
     PlaySoundboard(usize),
     ToggleVideo,
-    AcceptNativeEncryption(String),
-    CancelNativeEncryption,
+    AcceptNativeEncryption {
+        label: String,
+        generation: u64,
+    },
+    CancelNativeEncryption {
+        generation: u64,
+    },
     Connect {
         alias: String,
     },

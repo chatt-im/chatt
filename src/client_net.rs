@@ -55,7 +55,7 @@ use rpc::{
 #[cfg(test)]
 use rpc::evented::ReadPumpOutcome;
 
-use crate::app::EventSender;
+use crate::app::NetworkEventSender;
 use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
     VoicePayload as AudioVoicePayload,
@@ -755,7 +755,7 @@ pub struct NetworkClient {
 }
 
 impl NetworkClient {
-    pub fn spawn(config: ClientConfig, events: EventSender) -> Result<Self, String> {
+    pub fn spawn(config: ClientConfig, events: NetworkEventSender) -> Result<Self, String> {
         kvlog::info!(
             "network client spawning",
             display_name = config.display_name.as_str(),
@@ -836,7 +836,7 @@ impl Drop for NetworkClient {
 pub fn spawn_pair_once(
     config: ClientConfig,
     pairing_code: String,
-    events: EventSender,
+    events: NetworkEventSender,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("chatt-pair".to_string())
@@ -939,7 +939,7 @@ pub fn spawn_open_pair_once(
     config: ClientConfig,
     password: String,
     existing_token: String,
-    events: EventSender,
+    events: NetworkEventSender,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("chatt-open-pair".to_string())
@@ -973,7 +973,7 @@ pub fn spawn_open_pair_once(
 
 fn run_worker(
     config: ClientConfig,
-    events: EventSender,
+    events: NetworkEventSender,
     commands: Receiver<NetworkCommand>,
     mut poll: Poll,
 ) {
@@ -1018,7 +1018,7 @@ fn run_worker(
 
 fn run_worker_inner(
     config: &ClientConfig,
-    events: &EventSender,
+    events: &NetworkEventSender,
     commands: &Receiver<NetworkCommand>,
     poll: &mut Poll,
 ) -> SessionEnd {
@@ -1367,7 +1367,7 @@ impl RetryWait {
 }
 
 fn schedule_reconnect(
-    events: &EventSender,
+    events: &NetworkEventSender,
     commands: &Receiver<NetworkCommand>,
     reconnect: &mut ReconnectSchedule,
     reason: &str,
@@ -1578,7 +1578,7 @@ struct P2pVoiceRoute {
 
 struct WorkerState {
     config: ClientConfig,
-    events: EventSender,
+    events: NetworkEventSender,
     tcp: TcpStream,
     udp: UdpSocket,
     udp_local_addr: SocketAddr,
@@ -5929,7 +5929,7 @@ fn read_upload_source(upload: &mut OutgoingUpload, limit: usize) -> io::Result<V
     Ok(data)
 }
 
-fn write_upload_local_copy(events: &EventSender, upload: &mut OutgoingUpload, data: &[u8]) {
+fn write_upload_local_copy(events: &NetworkEventSender, upload: &mut OutgoingUpload, data: &[u8]) {
     match upload.local_copy.as_mut() {
         Some(UploadLocalCopy::Disk { path, file, .. }) => {
             if let Err(error) = file.write_all(data) {
@@ -6327,7 +6327,7 @@ fn audio_pop_should_log_packet(flags: u8, payload_kind: &str) -> bool {
 }
 
 fn dispatch_voice_packet_to(
-    events: &EventSender,
+    events: &NetworkEventSender,
     playback_sink: Option<&LivePlaybackSink>,
     pending_playback_packets: &mut VecDeque<RemoteVoicePacket>,
     packet: RemoteVoicePacket,
@@ -7168,7 +7168,7 @@ mod tests {
     #[test]
     fn voice_dispatch_buffers_audio_until_sink_attaches() {
         let (tx, rx) = mpsc::channel();
-        let events = EventSender(tx);
+        let events = NetworkEventSender::for_test(tx);
         let mut pending = VecDeque::new();
         dispatch_voice_packet_to(
             &events,
@@ -7197,7 +7197,7 @@ mod tests {
     #[test]
     fn voice_dispatch_uses_sink_when_attached() {
         let (tx, rx) = mpsc::channel();
-        let events = EventSender(tx);
+        let events = NetworkEventSender::for_test(tx);
         let mut pending = VecDeque::new();
         let sink = LivePlaybackSink::for_test();
         dispatch_voice_packet_to(
@@ -7624,7 +7624,7 @@ mod tests {
             image_prefix: Vec::new(),
         };
         let (tx, _rx) = std::sync::mpsc::channel();
-        let events = EventSender(tx);
+        let events = NetworkEventSender::for_test(tx);
 
         write_upload_local_copy(&events, &mut upload, &raw);
         upload.body.feed(&raw).unwrap();

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     sync::{
         Mutex,
@@ -8,6 +9,11 @@ use std::{
 
 use extui::event::polling::Waker;
 
+use crate::{
+    app::{RoomSettingsDraft, ServerEditDraft, UserVolumeDialog},
+    clipboard_paste::ImagePaste,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ClientId(pub(crate) u32);
 
@@ -15,10 +21,40 @@ impl ClientId {
     pub(crate) const PRIMARY: Self = Self(0);
 }
 
-/// Events whose state belongs to an open render-thread mode (the pairing
-/// password prompt); everything else reaches a terminal through its view.
-#[derive(Debug)]
-pub(crate) enum ClientEvent {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BaseScreen {
+    Room,
+    Servers { query: Option<String> },
+}
+
+pub(crate) enum ScreenSpec {
+    Settings,
+    ServerEditor(ServerEditDraft),
+    RoomSwitcher,
+    UserList,
+    RoomSettings(RoomSettingsDraft),
+}
+
+pub(crate) enum OverlaySpec {
+    UserVolume(UserVolumeDialog),
+    NativeEncryptionWarning { label: String, generation: u64 },
+    PairingPassword { retry: bool },
+    PasteUpload(ImagePaste),
+}
+
+pub(crate) enum NavigationEvent {
+    ResetBase(BaseScreen),
+    OpenScreen(ScreenSpec),
+    ReplaceScreen(ScreenSpec),
+    CloseScreen,
+    ShowOverlay(OverlaySpec),
+    ReplaceOverlay(OverlaySpec),
+    CloseOverlay,
+}
+
+/// Ordered, data-only effects published by the core to one terminal.
+pub(crate) enum TerminalEvent {
+    Navigation(NavigationEvent),
     PairingPasswordChallenge { retry: bool },
     PairingFailed(String),
 }
@@ -36,7 +72,7 @@ pub(crate) struct ClientChannel {
     terminate: AtomicBool,
     handoff: AtomicBool,
     resize_generation: AtomicU64,
-    events: Mutex<Vec<ClientEvent>>,
+    events: Mutex<VecDeque<TerminalEvent>>,
 }
 
 impl ClientChannel {
@@ -46,7 +82,7 @@ impl ClientChannel {
             terminate: AtomicBool::new(false),
             handoff: AtomicBool::new(false),
             resize_generation: AtomicU64::new(0),
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -69,15 +105,15 @@ impl ClientChannel {
         self.wake();
     }
 
-    pub(crate) fn push(&self, event: ClientEvent) {
+    pub(crate) fn push(&self, event: TerminalEvent) {
         self.events
             .lock()
             .expect("client event mutex poisoned")
-            .push(event);
+            .push_back(event);
         self.wake();
     }
 
-    pub(crate) fn drain_events(&self) -> Vec<ClientEvent> {
+    pub(crate) fn drain_events(&self) -> VecDeque<TerminalEvent> {
         std::mem::take(&mut *self.events.lock().expect("client event mutex poisoned"))
     }
 

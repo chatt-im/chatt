@@ -20,7 +20,7 @@ use crate::{
     chat_buffer::NoticeKind,
     config::{Config, DefaultBindings},
     theme::Theme,
-    tui::{chrome::ChromeState, editor::EditorHighlighter, mode::PendingTransitions},
+    tui::{chrome::ChromeState, editor::EditorHighlighter},
     ui::vu::MicLevelBallistics,
 };
 
@@ -30,7 +30,6 @@ const MAX_PARKED_ROOM_VIEWS: usize = 32;
 pub(crate) struct ClientView {
     pub theme: Theme,
     pub status: StatusState,
-    pub pending_transition: PendingTransitions,
     pub chrome: ChromeState,
     /// Rows for the server picker, rebuilt from config whenever it changes.
     pub server_catalog: crate::app::ServerCatalog,
@@ -115,7 +114,6 @@ impl ClientView {
         Self {
             theme,
             status: StatusState::new("select a server"),
-            pending_transition: PendingTransitions::default(),
             chrome: ChromeState::default(),
             server_catalog: crate::app::ServerCatalog::default(),
             mic_muted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -171,22 +169,21 @@ impl ClientView {
     /// the session's viewed room when a session-side flow (auth, offline
     /// catalog load) moved it without a view switch. Call before rendering
     /// and before any cursor-addressed operation.
-    pub(crate) fn sync_active(&mut self, session: &RoomSession) -> bool {
-        let epoch_changed = self.reconcile_session_epoch(session);
+    pub(crate) fn sync_active(&mut self, session: &RoomSession) {
+        self.reconcile_session_epoch(session);
         if session.viewed_room != self.viewed_room
             && let Some(room_id) = session.viewed_room
         {
             self.switch_room(room_id, session);
-            return epoch_changed;
+            return;
         }
         self.sync_buffer(session);
-        epoch_changed
     }
 
     /// Synchronizes an attached client's current room without following the
     /// primary view when it switches rooms.
-    pub(crate) fn sync_independent(&mut self, session: &RoomSession) -> bool {
-        let epoch_changed = self.reconcile_session_epoch(session);
+    pub(crate) fn sync_independent(&mut self, session: &RoomSession) {
+        self.reconcile_session_epoch(session);
         if self
             .viewed_room
             .is_some_and(|room_id| session.room_meta(room_id).is_none())
@@ -197,10 +194,9 @@ impl ClientView {
             && let Some(room_id) = session.viewed_room
         {
             self.switch_room(room_id, session);
-            return epoch_changed;
+            return;
         }
         self.sync_buffer(session);
-        epoch_changed
     }
 
     fn sync_buffer(&mut self, session: &RoomSession) {

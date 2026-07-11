@@ -29,28 +29,23 @@ use rpc::{
 };
 
 use crate::{
+    client_channel::{BaseScreen, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent},
     client_net::{
         NetworkClient, NetworkCommand, NetworkEvent, TerminalVerb, TransferDirection,
         UploadFileRequest, spawn_open_pair_once, spawn_pair_once,
     },
     config::{self, Config, ServerEntry, SoundboardClip, ThemeSelection, validate_server_entry},
     local_control, settings,
-    tui::{
-        mode::{AppMode, ModeTransition, ViewCx},
-        modes::{
-            RoomMode, RoomSwitchMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession,
-        },
-        overlay::{
-            DialogMode, NativeEncryptionWarningMode, PasswordPromptMode, PasteImageUploadMode,
-        },
-        view::ClientView,
-    },
+    tui::{modes::SettingsSession, view::ClientView},
     ui::settings::{
         DeviceAction, DeviceSide, FieldId, FieldIntent, SettingsButton, SettingsOutput,
         capture_device_id, playback_device_id,
     },
     ui::welcome::WelcomeDraft,
 };
+
+#[cfg(test)]
+use crate::tui::mode::ViewCx;
 
 #[cfg(test)]
 use crate::{bindings::BindCommand, tui::Action};
@@ -342,6 +337,19 @@ pub(crate) struct ClientHandle {
     pub(crate) view: Arc<parking_lot::Mutex<ClientView>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Audience {
+    Client(crate::client_channel::ClientId),
+    All,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionAttempt {
+    generation: u64,
+    owner: crate::client_channel::ClientId,
+    server_label: String,
+}
+
 pub(crate) struct App {
     pub config: CoreRw<Config>,
     events: AppEvents,
@@ -355,12 +363,19 @@ pub(crate) struct App {
     /// Last generation copied into every currently attached terminal view.
     synced_daemon_config_generation: u64,
     pairing_owner: Option<crate::client_channel::ClientId>,
+    connection_attempt: Option<ConnectionAttempt>,
+    next_connection_generation: u64,
+    active_network_generation: Option<u64>,
     password_prompt_active: bool,
     pub room: CoreRw<RoomSession>,
     /// The primary terminal's exclusive UI state: composer, scrollback
     /// buffers, pending edit, clipboard queue. Splits off `room` so attached
     /// clients can each own one.
     pub view: CoreMutex<ClientView>,
+    #[cfg(test)]
+    pub(crate) test_navigation: VecDeque<crate::tui::mode::ModeTransition>,
+    #[cfg(test)]
+    test_terminal_events: VecDeque<TerminalEvent>,
     pub network: Option<NetworkClient>,
     pub control_socket: Option<local_control::ControlSocket>,
     pub session_id: Option<SessionId>,
@@ -693,6 +708,10 @@ pub(crate) struct ScreencastProgress {
 /// application event channel.
 pub(crate) enum AppEvent {
     Network(NetworkEvent),
+    NetworkFor {
+        generation: u64,
+        event: NetworkEvent,
+    },
     AudioDeviceRefresh(AudioDeviceRefresh),
     AudioDeviceProbe(AudioDeviceProbeEvent),
     Soundboard(SoundboardEvent),
@@ -1028,12 +1047,49 @@ fn spawn_web_feed(
 #[derive(Clone)]
 pub(crate) struct EventSender(pub(crate) Sender<AppEvent>);
 
+#[derive(Clone)]
+pub(crate) struct NetworkEventSender {
+    tx: Sender<AppEvent>,
+    generation: Option<u64>,
+}
+
 impl EventSender {
     pub(crate) fn send<E: Into<AppEvent>>(
         &self,
         event: E,
     ) -> Result<(), mpsc::SendError<AppEvent>> {
         self.0.send(event.into())
+    }
+
+    fn for_network(&self, generation: u64) -> NetworkEventSender {
+        NetworkEventSender {
+            tx: self.0.clone(),
+            generation: Some(generation),
+        }
+    }
+
+    fn for_unscoped_network(&self) -> NetworkEventSender {
+        NetworkEventSender {
+            tx: self.0.clone(),
+            generation: None,
+        }
+    }
+}
+
+impl NetworkEventSender {
+    #[cfg(test)]
+    pub(crate) fn for_test(tx: Sender<AppEvent>) -> Self {
+        Self {
+            tx,
+            generation: None,
+        }
+    }
+
+    pub(crate) fn send(&self, event: NetworkEvent) -> Result<(), mpsc::SendError<AppEvent>> {
+        match self.generation {
+            Some(generation) => self.tx.send(AppEvent::NetworkFor { generation, event }),
+            None => self.tx.send(AppEvent::Network(event)),
+        }
     }
 }
 
@@ -1133,9 +1189,16 @@ impl App {
             daemon_config_generation: 0,
             synced_daemon_config_generation: 0,
             pairing_owner: None,
+            connection_attempt: None,
+            next_connection_generation: 0,
+            active_network_generation: None,
             password_prompt_active: false,
             room: CoreRw::new(room),
             view: CoreMutex::new(view),
+            #[cfg(test)]
+            test_navigation: VecDeque::new(),
+            #[cfg(test)]
+            test_terminal_events: VecDeque::new(),
             network: None,
             control_socket,
             session_id: None,
@@ -1206,7 +1269,11 @@ impl App {
 
     pub(crate) fn finish_welcome(&mut self, pending_join: Option<PendingJoin>) {
         self.pending_after_welcome = pending_join;
-        self.request_mode_transition(ModeTransition::Set(self.base_mode()));
+        let base = self.base_screen();
+        self.send_terminal_event(
+            Audience::Client(self.issuing_client),
+            TerminalEvent::Navigation(NavigationEvent::ResetBase(base)),
+        );
     }
 
     pub(crate) fn request_quit(&mut self) {
@@ -1215,13 +1282,14 @@ impl App {
 
     /// Builds an in-process view context over disjoint App fields, queueing
     /// commands into [`Self::drain_core_commands`]'s queue.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn view_cx(&mut self) -> ViewCx<'_> {
         ViewCx {
             view: &mut self.view,
             session: &self.room,
             config: &self.config,
             commands: &mut self.command_queue,
+            navigation: &mut self.test_navigation,
         }
     }
 
@@ -1278,6 +1346,55 @@ impl App {
         }
     }
 
+    pub(crate) fn send_terminal_event(&mut self, audience: Audience, event: TerminalEvent) {
+        match audience {
+            Audience::Client(client_id) => {
+                if let Some(channel) = self.channel_for(client_id) {
+                    channel.push(event);
+                } else {
+                    #[cfg(test)]
+                    self.test_terminal_events.push_back(event);
+                }
+            }
+            Audience::All => {
+                if let TerminalEvent::Navigation(NavigationEvent::ResetBase(base)) = event {
+                    self.broadcast_base(base);
+                } else {
+                    panic!("only base-route events may currently be broadcast")
+                }
+            }
+        }
+    }
+
+    fn broadcast_base(&mut self, base: BaseScreen) {
+        let primary = TerminalEvent::Navigation(NavigationEvent::ResetBase(base.clone()));
+        if let Some(channel) = self.primary_channel.clone() {
+            channel.push(primary);
+        } else {
+            #[cfg(test)]
+            self.test_terminal_events.push_back(primary);
+        }
+        for handle in self.clients.values() {
+            handle
+                .channel
+                .push(TerminalEvent::Navigation(NavigationEvent::ResetBase(
+                    base.clone(),
+                )));
+        }
+    }
+
+    fn navigate_all(&mut self, base: BaseScreen) {
+        self.send_terminal_event(
+            Audience::All,
+            TerminalEvent::Navigation(NavigationEvent::ResetBase(base)),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_terminal_event(&mut self) -> Option<TerminalEvent> {
+        self.test_terminal_events.pop_front()
+    }
+
     fn pop_mutation_owner(
         &mut self,
         room_id: RoomId,
@@ -1329,6 +1446,11 @@ impl App {
                 self.handle_core_command(command);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_queued_core_command(&mut self) -> Option<command::CoreCommand> {
+        (!self.command_queue.is_empty()).then(|| self.command_queue.remove(0))
     }
 
     #[allow(dead_code)]
@@ -1393,9 +1515,11 @@ impl App {
             }
             CoreCommand::ApplyVolume { event, mut dialog } => {
                 if self.apply_volume_event(event, &mut dialog) {
-                    self.pop_mode();
+                    self.navigate_owner(NavigationEvent::CloseOverlay);
                 } else {
-                    self.replace_mode(Box::new(DialogMode::new(dialog)));
+                    self.navigate_owner(NavigationEvent::ReplaceOverlay(OverlaySpec::UserVolume(
+                        dialog,
+                    )));
                 }
             }
             CoreCommand::CancelTransfer(transfer_id) => self.cancel_transfer(transfer_id),
@@ -1404,29 +1528,29 @@ impl App {
             CoreCommand::Settings(operation) => self.handle_settings_op(operation),
             CoreCommand::PlaySoundboard(slot) => self.trigger_soundboard_slot(slot),
             CoreCommand::ToggleVideo => self.activate_top_bar_video(),
-            CoreCommand::AcceptNativeEncryption(label) => {
-                self.accept_native_encryption_warning(&label);
+            CoreCommand::AcceptNativeEncryption { label, generation } => {
+                self.accept_native_encryption_warning(&label, generation);
             }
-            CoreCommand::CancelNativeEncryption => self.cancel_native_encryption_warning(),
+            CoreCommand::CancelNativeEncryption { generation } => {
+                self.cancel_native_encryption_warning(generation)
+            }
             CoreCommand::Connect { alias } => {
-                if self.start_network(&alias) {
-                    self.push_mode(Box::new(RoomMode::default()));
-                }
+                self.start_connection(&alias, self.issuing_client);
             }
             CoreCommand::DeleteServer { label } => self.delete_server(&label),
             CoreCommand::SaveServerEdit {
                 draft,
                 join_after_save,
             } => {
-                if !self.save_server_edit_with(&draft, join_after_save)
-                    && self.view.pending_transition.is_empty()
-                {
-                    self.replace_mode(Box::new(ServerEditMode::new(draft)));
+                if !self.save_server_edit_with(&draft, join_after_save) {
+                    self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(
+                        draft,
+                    )));
                 }
             }
             CoreCommand::SaveRoomSettings(draft) => {
-                if !self.save_room_settings(&draft) && self.view.pending_transition.is_empty() {
-                    self.replace_mode(Box::new(crate::tui::room_settings::RoomSettingsMode::new(
+                if !self.save_room_settings(&draft) {
+                    self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::RoomSettings(
                         draft,
                     )));
                 }
@@ -1555,8 +1679,8 @@ impl App {
             return;
         };
         self.start_pending_join(pending);
-        if self.network.is_some() && self.view.pending_transition.is_empty() {
-            self.request_mode_transition(ModeTransition::Set(Box::new(RoomMode::default())));
+        if self.network.is_some() {
+            self.navigate_owner(NavigationEvent::ResetBase(BaseScreen::Room));
         }
     }
 
@@ -1674,6 +1798,13 @@ impl App {
     pub(crate) fn handle_app_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Network(event) => self.handle_network_event(event),
+            AppEvent::NetworkFor { generation, event } => {
+                if self.active_network_generation == Some(generation) {
+                    self.handle_network_event(event);
+                } else {
+                    kvlog::debug!("ignored stale network event", generation);
+                }
+            }
             AppEvent::AudioDeviceRefresh(refresh) => self.handle_audio_device_refresh(refresh),
             AppEvent::AudioDeviceProbe(probe) => self.handle_audio_device_probe(probe.result),
             AppEvent::Soundboard(event) => self.handle_soundboard_event(event),
@@ -2323,7 +2454,9 @@ impl App {
     }
 
     pub(crate) fn open_server_select(&mut self) {
-        self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
+        self.navigate_owner(NavigationEvent::ResetBase(BaseScreen::Servers {
+            query: None,
+        }));
         self.rebuild_server_items();
         if self.config.servers.is_empty() {
             self.set_status("no servers configured; run chatt pair JOIN_STRING");
@@ -2336,7 +2469,9 @@ impl App {
         let Some((server_label, draft)) = self.server_edit_draft(label) else {
             return;
         };
-        self.replace_mode(Box::new(ServerEditMode::new(draft)));
+        self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(
+            draft,
+        )));
         self.set_status(format!("editing server {server_label}"));
     }
 
@@ -2358,9 +2493,15 @@ impl App {
             }
         };
         self.disconnect_network();
+        let owner = self
+            .connection_attempt
+            .as_ref()
+            .filter(|attempt| attempt.server_label == alias)
+            .map_or(self.issuing_client, |attempt| attempt.owner);
+        let generation = self.begin_connection_attempt(alias, owner);
         let network = match NetworkClient::spawn(
             server.client_config(&self.config, self.download_store.clone()),
-            self.events.sender(),
+            self.events.sender().for_network(generation),
         ) {
             Ok(network) => network,
             Err(error) => {
@@ -2396,6 +2537,7 @@ impl App {
         );
         self.room.active_server_label = Some(server.label.clone());
         self.network = Some(network);
+        self.active_network_generation = Some(generation);
         self.room.network_selected = true;
         self.room.network_disconnected = false;
         self.supervisor.network.reset();
@@ -2407,7 +2549,40 @@ impl App {
         true
     }
 
+    fn begin_connection_attempt(
+        &mut self,
+        alias: &str,
+        owner: crate::client_channel::ClientId,
+    ) -> u64 {
+        self.next_connection_generation = self.next_connection_generation.wrapping_add(1).max(1);
+        let generation = self.next_connection_generation;
+        self.connection_attempt = Some(ConnectionAttempt {
+            generation,
+            owner,
+            server_label: alias.to_string(),
+        });
+        generation
+    }
+
+    fn start_connection(&mut self, alias: &str, owner: crate::client_channel::ClientId) -> bool {
+        // Seed ownership before spawning; `start_network` assigns the fresh
+        // generation for this particular worker.
+        self.connection_attempt = Some(ConnectionAttempt {
+            generation: 0,
+            owner,
+            server_label: alias.to_string(),
+        });
+        if self.start_network(alias) {
+            self.navigate_all(BaseScreen::Room);
+            true
+        } else {
+            self.connection_attempt = None;
+            false
+        }
+    }
+
     fn disconnect_network(&mut self) {
+        self.active_network_generation = None;
         self.stop_audio();
         self.stop_all_shares();
         self.active_tcp_addr = None;
@@ -2540,12 +2715,12 @@ impl App {
     }
 
     pub(crate) fn open_room_switcher(&mut self) {
-        self.push_mode(Box::new(RoomSwitchMode::new()));
+        self.navigate_owner(NavigationEvent::OpenScreen(ScreenSpec::RoomSwitcher));
     }
 
     #[allow(dead_code)] // Removed after all modes dispatch through ViewCx.
     pub(crate) fn open_user_list(&mut self) {
-        self.push_mode(Box::new(crate::tui::user_list::UserListMode::new()));
+        self.navigate_owner(NavigationEvent::OpenScreen(ScreenSpec::UserList));
     }
 
     pub(crate) fn open_room_settings(&mut self) {
@@ -2570,9 +2745,7 @@ impl App {
             room_id,
             self.room.room_name.clone(),
         );
-        self.push_mode(Box::new(crate::tui::room_settings::RoomSettingsMode::new(
-            draft,
-        )));
+        self.navigate_owner(NavigationEvent::OpenScreen(ScreenSpec::RoomSettings(draft)));
     }
 
     pub(crate) fn save_room_settings(&mut self, draft: &RoomSettingsDraft) -> bool {
@@ -2610,7 +2783,7 @@ impl App {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 self.push_file_policy();
-                self.pop_mode();
+                self.navigate_owner(NavigationEvent::CloseScreen);
                 if history_changed && self.network.is_some() {
                     self.set_status("room settings saved; persistence changes apply on reconnect");
                 } else {
@@ -2776,7 +2949,7 @@ impl App {
         spawn_pair_once(
             server.client_config(&self.config, self.download_store.clone()),
             ticket.pairing_code,
-            self.events.sender(),
+            self.events.sender().for_unscoped_network(),
         );
         self.pending_pair = Some(PendingPair {
             server,
@@ -2806,7 +2979,7 @@ impl App {
             server.client_config(&self.config, self.download_store.clone()),
             String::new(),
             String::new(),
-            self.events.sender(),
+            self.events.sender().for_unscoped_network(),
         );
         self.pending_pair = Some(PendingPair {
             server,
@@ -2875,9 +3048,9 @@ impl App {
     /// Opens the server picker with `query` pre-applied so the list starts filtered
     /// to the servers a `chatt join` specifier could mean.
     fn open_filtered_server_select(&mut self, query: &str) {
-        self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::with_query(
-            query.to_string(),
-        ))));
+        self.navigate_owner(NavigationEvent::ResetBase(BaseScreen::Servers {
+            query: Some(query.to_string()),
+        }));
         self.rebuild_server_items();
     }
 
@@ -2898,7 +3071,7 @@ impl App {
             client_config,
             password,
             existing_token,
-            self.events.sender(),
+            self.events.sender().for_unscoped_network(),
         );
         self.set_status(format!("pairing {alias}"));
     }
@@ -2954,8 +3127,8 @@ impl App {
     ) {
         let Some(mut pair) = self.pending_pair.take() else {
             self.set_status("pairing succeeded");
-            if close_prompt_if_idle && self.view.pending_transition.is_empty() {
-                self.pop_mode();
+            if close_prompt_if_idle {
+                self.navigate_owner(NavigationEvent::CloseOverlay);
             }
             return;
         };
@@ -2965,16 +3138,16 @@ impl App {
         pair.server.udp_probe_addr = udp_probe_addr;
         if let Err(error) = validate_server_entry(&pair.server) {
             self.set_error(error);
-            if close_prompt_if_idle && self.view.pending_transition.is_empty() {
-                self.pop_mode();
+            if close_prompt_if_idle {
+                self.navigate_owner(NavigationEvent::CloseOverlay);
             }
             return;
         }
         let close_after_reconnect =
             close_prompt_if_idle && matches!(pair.completion, PairCompletion::Reconnect { .. });
         self.complete_pairing(pair.server, pair.completion);
-        if close_after_reconnect && self.view.pending_transition.is_empty() {
-            self.pop_mode();
+        if close_after_reconnect {
+            self.navigate_owner(NavigationEvent::CloseOverlay);
         }
     }
 
@@ -2983,7 +3156,7 @@ impl App {
     pub(crate) fn cancel_open_pairing(&mut self) {
         self.password_prompt_active = false;
         self.pairing_owner = None;
-        self.pop_mode();
+        self.navigate_owner(NavigationEvent::CloseOverlay);
         self.pending_pair.take();
         self.room.join_notice = None;
         self.set_status("pairing canceled");
@@ -3011,7 +3184,7 @@ impl App {
             client_config,
             String::new(),
             existing_token.clone(),
-            self.events.sender(),
+            self.events.sender().for_unscoped_network(),
         );
         self.pending_pair = Some(PendingPair {
             server,
@@ -3689,19 +3862,28 @@ impl App {
                     false,
                 );
                 self.disconnect_network();
-                self.open_server_select();
+                self.navigate_all(BaseScreen::Servers { query: None });
                 self.push_network_notice("auth", &message);
                 self.set_error(auth_failure_status(&message));
             }
             NetworkEvent::NativeEncryptionRequired => {
-                let Some(label) = self.room.active_server_label.clone() else {
+                let Some(attempt) = self.connection_attempt.clone() else {
                     self.disconnect_network();
-                    self.open_server_select();
+                    self.navigate_all(BaseScreen::Servers { query: None });
                     self.set_error("server is not using native encryption");
                     return;
                 };
                 self.disconnect_network();
-                self.push_mode(Box::new(NativeEncryptionWarningMode::new(label)));
+                self.navigate_all(BaseScreen::Servers { query: None });
+                self.send_terminal_event(
+                    Audience::Client(attempt.owner),
+                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                        OverlaySpec::NativeEncryptionWarning {
+                            label: attempt.server_label,
+                            generation: attempt.generation,
+                        },
+                    )),
+                );
                 self.set_error("server is not using native encryption");
             }
             NetworkEvent::PairingSucceeded => {
@@ -3751,7 +3933,7 @@ impl App {
                         if let Some(channel) =
                             self.pairing_owner.and_then(|owner| self.channel_for(owner))
                         {
-                            channel.push(crate::client_channel::ClientEvent::PairingFailed(
+                            channel.push(crate::client_channel::TerminalEvent::PairingFailed(
                                 error.clone(),
                             ));
                         }
@@ -3764,23 +3946,26 @@ impl App {
                         self.pairing_owner.and_then(|owner| self.channel_for(owner))
                     {
                         channel.push(
-                            crate::client_channel::ClientEvent::PairingPasswordChallenge { retry },
+                            crate::client_channel::TerminalEvent::PairingPasswordChallenge {
+                                retry,
+                            },
                         );
                     }
                 } else {
                     self.password_prompt_active = true;
                     match self.pairing_owner {
                         Some(owner) => {
-                            let opened = self.with_client_view(owner, |view| {
-                                view.pending_transition
-                                    .request(ModeTransition::Push(Box::new(
-                                        PasswordPromptMode::new(retry),
-                                    )));
-                            });
-                            if !opened {
+                            if self.channel_for(owner).is_none() {
                                 kvlog::warn!(
                                     "pairing prompt owner is no longer connected",
                                     client_id = owner.0
+                                );
+                            } else {
+                                self.send_terminal_event(
+                                    Audience::Client(owner),
+                                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                                        OverlaySpec::PairingPassword { retry },
+                                    )),
                                 );
                             }
                         }
@@ -3793,7 +3978,7 @@ impl App {
                     if let Some(channel) =
                         self.pairing_owner.and_then(|owner| self.channel_for(owner))
                     {
-                        channel.push(crate::client_channel::ClientEvent::PairingFailed(
+                        channel.push(crate::client_channel::TerminalEvent::PairingFailed(
                             error.clone(),
                         ));
                     }
@@ -4000,36 +4185,44 @@ impl App {
         }
     }
 
-    /// Builds the fallback base mode used if the stack is ever popped empty.
-    pub(crate) fn base_mode(&self) -> Box<dyn AppMode> {
+    pub(crate) fn base_screen(&self) -> BaseScreen {
         if self.network.is_some() || !self.room.server_alias.is_empty() {
-            Box::new(RoomMode::default())
+            BaseScreen::Room
         } else {
-            Box::new(ServerListMode::new())
+            BaseScreen::Servers { query: None }
         }
     }
 
-    /// Requests pushing `mode` as an overlay on top of the current stack.
-    pub(crate) fn push_mode(&mut self, mode: Box<dyn AppMode>) {
-        self.request_mode_transition(ModeTransition::Push(mode));
-    }
-
-    pub(crate) fn replace_mode(&mut self, mode: Box<dyn AppMode>) {
-        self.request_mode_transition(ModeTransition::Replace(mode));
-    }
-
-    /// Requests popping the active mode off the stack.
-    pub(crate) fn pop_mode(&mut self) {
-        self.request_mode_transition(ModeTransition::Pop);
-    }
-
-    pub(crate) fn request_mode_transition(&mut self, transition: ModeTransition) {
-        self.view.pending_transition.request(transition);
+    fn navigate_owner(&mut self, event: NavigationEvent) {
+        self.send_terminal_event(
+            Audience::Client(self.issuing_client),
+            TerminalEvent::Navigation(event),
+        );
     }
 
     #[cfg(test)]
-    pub(crate) fn take_mode_transition(&mut self) -> Option<ModeTransition> {
-        self.view.pending_transition.pop_front()
+    pub(crate) fn base_mode(&self) -> Box<dyn crate::tui::mode::AppMode> {
+        match self.base_screen() {
+            BaseScreen::Room => Box::new(crate::tui::modes::RoomMode::default()),
+            BaseScreen::Servers { query: Some(query) } => {
+                Box::new(crate::tui::modes::ServerListMode::with_query(query))
+            }
+            BaseScreen::Servers { query: None } => {
+                Box::new(crate::tui::modes::ServerListMode::new())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_mode(&mut self, mode: Box<dyn crate::tui::mode::AppMode>) {
+        self.test_navigation
+            .push_back(crate::tui::mode::ModeTransition::Push(mode));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pop_mode(&mut self) {
+        self.test_navigation
+            .push_back(crate::tui::mode::ModeTransition::Pop);
     }
 
     pub(crate) fn delete_server(&mut self, label: &str) {
@@ -4055,7 +4248,16 @@ impl App {
         }
     }
 
-    pub(crate) fn accept_native_encryption_warning(&mut self, label: &str) {
+    pub(crate) fn accept_native_encryption_warning(&mut self, label: &str, generation: u64) {
+        let Some(attempt) = self.connection_attempt.as_ref() else {
+            return;
+        };
+        if attempt.generation != generation
+            || attempt.owner != self.issuing_client
+            || attempt.server_label != label
+        {
+            return;
+        }
         let Some(server) = self
             .config
             .servers
@@ -4065,7 +4267,7 @@ impl App {
             self.set_error(format!("server {label} is not configured"));
             self.room.reset_for_server_list();
             self.view.reset_rooms();
-            self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
+            self.navigate_all(BaseScreen::Servers { query: None });
             return;
         };
         server.require_native_encryption = false;
@@ -4075,9 +4277,7 @@ impl App {
                 self.config.config_path = Some(path.clone());
                 self.rebuild_server_items();
                 if self.start_network(label) {
-                    self.request_mode_transition(ModeTransition::Set(
-                        Box::new(RoomMode::default()),
-                    ));
+                    self.navigate_all(BaseScreen::Room);
                     self.set_status(format!(
                         "native encryption disabled for {label}; config saved to {}",
                         path.display()
@@ -4085,21 +4285,25 @@ impl App {
                 } else {
                     self.room.reset_for_server_list();
                     self.view.reset_rooms();
-                    self.request_mode_transition(ModeTransition::Set(Box::new(
-                        ServerListMode::new(),
-                    )));
+                    self.navigate_all(BaseScreen::Servers { query: None });
                 }
             }
             Err(error) => self.set_error(error),
         }
     }
 
-    pub(crate) fn cancel_native_encryption_warning(&mut self) {
+    pub(crate) fn cancel_native_encryption_warning(&mut self, generation: u64) {
+        if !self.connection_attempt.as_ref().is_some_and(|attempt| {
+            attempt.generation == generation && attempt.owner == self.issuing_client
+        }) {
+            return;
+        }
+        self.connection_attempt = None;
         self.disconnect_network();
         self.room.reset_for_server_list();
         self.view.reset_rooms();
         self.rebuild_server_items();
-        self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
+        self.navigate_all(BaseScreen::Servers { query: None });
         self.set_status("connection canceled");
     }
 
@@ -4163,12 +4367,12 @@ impl App {
                 }
                 if join_after_save {
                     if self.start_network(&label) {
-                        self.replace_mode(Box::new(RoomMode::default()));
+                        self.navigate_all(BaseScreen::Room);
                         return true;
                     }
                     return false;
                 } else {
-                    self.pop_mode();
+                    self.navigate_owner(NavigationEvent::CloseScreen);
                     if history_changed
                         && self.network.is_some()
                         && self.room.active_server_label.as_deref() == Some(label.as_str())
@@ -4309,7 +4513,7 @@ impl App {
             &self.config,
             &self.room.audio_devices,
         ))));
-        self.push_mode(Box::new(SettingsMode::new()));
+        self.navigate_owner(NavigationEvent::OpenScreen(ScreenSpec::Settings));
     }
 
     /// Revokes core-owned leases for a terminal on every retirement path. UI
@@ -4337,7 +4541,7 @@ impl App {
 
     pub(crate) fn close_settings(&mut self, session: &mut SettingsSession) {
         self.commit_settings_form_text(session);
-        self.pop_mode();
+        self.navigate_owner(NavigationEvent::CloseScreen);
     }
 
     pub(crate) fn finish_settings_session(&mut self, session: &mut SettingsSession) {
@@ -5474,7 +5678,9 @@ impl App {
         let value_db = self.config.user_volume_db(&self.room.server_alias, user_id);
         self.room.begin_volume_preview(user_id, value_db);
         let dialog = UserVolumeDialog::new(user_id, name.clone(), value_db, &self.view.theme);
-        self.push_mode(Box::new(DialogMode::new(dialog)));
+        self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::UserVolume(
+            dialog,
+        )));
         self.set_status(format!("adjusting local volume for {name}"));
     }
 
@@ -5745,7 +5951,9 @@ impl App {
             "/clear" => self.view.clear_chat(),
             "/help" => self.show_command_help(room_id),
             "/config" | "/settings" => self.open_settings(),
-            "/servers" if self.network.is_some() => self.pop_mode(),
+            "/servers" if self.network.is_some() => {
+                self.navigate_owner(NavigationEvent::CloseScreen)
+            }
             "/servers" => self.open_server_select(),
             "/soundboard" => self.show_soundboard(),
             "/users" => self.show_users(),
@@ -5935,8 +6143,9 @@ impl App {
     /// Opens the filename confirmation dialog for a pasted image or file.
     #[allow(dead_code)] // Removed after all modes dispatch through ViewCx.
     pub(crate) fn open_paste_image_dialog(&mut self, image: crate::clipboard_paste::ImagePaste) {
-        let dialog = PasteImageUploadMode::new(image, &self.view.theme);
-        self.push_mode(Box::new(dialog));
+        self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::PasteUpload(
+            image,
+        )));
     }
 
     /// Validates the chosen name and queues the pasted upload. Returns `Err`
@@ -7184,7 +7393,14 @@ fn auth_failure_status(detail: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{settings::SettingsDraft, tui::form::FormState};
+    use crate::{
+        settings::SettingsDraft,
+        tui::{
+            form::FormState,
+            mode::AppMode,
+            modes::{RoomMode, ServerListMode, SettingsMode},
+        },
+    };
     use extui::{
         Buffer, Rect, Style,
         event::{KeyModifiers, MouseButton},
@@ -7212,6 +7428,59 @@ mod tests {
         assert_eq!(status.kind(), StatusKind::Error);
         status.expire(Instant::now() + STATUS_LIFETIME);
         assert_eq!(status.text(), "");
+    }
+
+    #[test]
+    fn native_encryption_rejection_orders_base_reset_before_owner_warning() {
+        let mut app = test_app();
+        let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("channel"));
+        app.set_primary_channel(channel.clone());
+        app.connection_attempt = Some(ConnectionAttempt {
+            generation: 9,
+            owner: crate::client_channel::ClientId::PRIMARY,
+            server_label: "legacy".to_string(),
+        });
+
+        app.handle_network_event(NetworkEvent::NativeEncryptionRequired);
+
+        let mut events = channel.drain_events();
+        assert!(matches!(
+            events.pop_front(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ResetBase(
+                BaseScreen::Servers { query: None }
+            )))
+        ));
+        assert!(matches!(
+            events.pop_front(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                OverlaySpec::NativeEncryptionWarning {
+                    label,
+                    generation: 9
+                }
+            ))) if label == "legacy"
+        ));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn stale_connection_generation_cannot_publish_navigation() {
+        let mut app = test_app();
+        let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("channel"));
+        app.set_primary_channel(channel.clone());
+        app.connection_attempt = Some(ConnectionAttempt {
+            generation: 2,
+            owner: crate::client_channel::ClientId::PRIMARY,
+            server_label: "new".to_string(),
+        });
+        app.active_network_generation = Some(2);
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation: 1,
+            event: NetworkEvent::NativeEncryptionRequired,
+        });
+
+        assert!(channel.drain_events().is_empty());
+        assert_eq!(app.connection_attempt.as_ref().unwrap().generation, 2);
     }
 
     fn attach_test_client(
@@ -7479,7 +7748,8 @@ mod tests {
     fn remote_pairing_challenge_opens_prompt_on_owning_view() {
         let mut app = test_app();
         let owner = crate::client_channel::ClientId(6);
-        let view = attach_test_client(&mut app, owner);
+        let _view = attach_test_client(&mut app, owner);
+        let channel = app.channel_for(owner).expect("attached channel");
         app.pending_pair = Some(pending_open_pair("public"));
         app.pairing_owner = Some(owner);
         let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -7492,10 +7762,12 @@ mod tests {
             .into(),
         );
 
-        assert!(app.view.pending_transition.is_empty());
+        assert!(app.test_navigation.is_empty());
         assert!(matches!(
-            view.lock().pending_transition.pop_front(),
-            Some(ModeTransition::Push(_))
+            channel.drain_events().pop_front(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                OverlaySpec::PairingPassword { retry: false }
+            )))
         ));
     }
 
@@ -7509,7 +7781,8 @@ mod tests {
         let mut app = test_app();
         app.config.config_path = Some(path.clone());
         let owner = crate::client_channel::ClientId(6);
-        let view = attach_test_client(&mut app, owner);
+        let _view = attach_test_client(&mut app, owner);
+        let channel = app.channel_for(owner).expect("attached channel");
         app.pending_pair = Some(pending_open_pair("public"));
         app.pairing_owner = Some(owner);
         app.password_prompt_active = true;
@@ -7525,15 +7798,13 @@ mod tests {
             .into(),
         );
 
-        let mut transitions = Vec::new();
-        while let Some(transition) = view.lock().pending_transition.pop_front() {
-            transitions.push(transition);
-        }
         assert!(matches!(
-            transitions.as_slice(),
-            [ModeTransition::Replace(_)]
+            channel.drain_events().pop_front(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(
+                ScreenSpec::ServerEditor(_)
+            )))
         ));
-        assert!(app.view.pending_transition.is_empty());
+        assert!(app.test_navigation.is_empty());
         assert_eq!(app.pairing_owner, None);
         assert!(!app.password_prompt_active);
         let _ = std::fs::remove_file(path);
@@ -7558,8 +7829,8 @@ mod tests {
         }
         assert_ne!(app.view.status.text(), "bad password");
         assert!(matches!(
-            channel.drain_events().as_slice(),
-            [crate::client_channel::ClientEvent::PairingFailed(error)] if error == "bad password"
+            channel.drain_events().pop_front(),
+            Some(crate::client_channel::TerminalEvent::PairingFailed(error)) if error == "bad password"
         ));
     }
 
@@ -7606,13 +7877,11 @@ mod tests {
             .into(),
         );
 
-        let mut transitions = Vec::new();
-        while let Some(transition) = app.take_mode_transition() {
-            transitions.push(transition);
-        }
         assert!(matches!(
-            transitions.as_slice(),
-            [ModeTransition::Replace(_)]
+            app.take_terminal_event(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(
+                ScreenSpec::ServerEditor(_)
+            )))
         ));
         let _ = std::fs::remove_file(path);
     }
@@ -7694,6 +7963,10 @@ mod tests {
         }
 
         fn apply(&mut self) {
+            while let Some(event) = self.app.take_terminal_event() {
+                let mut cx = self.app.view_cx();
+                self.stack.process_terminal_event(&mut cx, event);
+            }
             self.stack.apply_pending(&mut self.app);
         }
 
@@ -9816,8 +10089,10 @@ mod tests {
         assert!(app.pending_pair.is_none());
         assert_eq!(app.view.status.kind(), StatusKind::Error);
         assert!(matches!(
-            app.take_mode_transition(),
-            Some(ModeTransition::Set(_))
+            app.take_terminal_event(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ResetBase(
+                BaseScreen::Servers { .. }
+            )))
         ));
     }
 }
