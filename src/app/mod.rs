@@ -7,6 +7,7 @@ pub(crate) mod participants;
 pub(crate) mod room;
 pub(crate) mod room_settings;
 pub(crate) mod server;
+mod shared;
 
 use hashbrown::{HashMap, HashSet};
 use std::{
@@ -35,7 +36,7 @@ use crate::{
     config::{self, Config, ServerEntry, SoundboardClip, ThemeSelection, validate_server_entry},
     local_control, settings,
     tui::{
-        mode::{AppMode, ModeTransition, ViewCx},
+        mode::{AppMode, CommandSink, ModeTransition, ViewCx},
         modes::{
             RoomMode, RoomSwitchMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession,
         },
@@ -68,6 +69,7 @@ use audio_supervisor::{
     AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, RebuildCause,
 };
 use commands::slash_command_help;
+use shared::{CoreMutex, CoreRw};
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
@@ -327,15 +329,17 @@ impl AudioDeviceCatalog {
 }
 
 pub(crate) struct App {
-    pub config: Config,
+    pub config: CoreRw<Config>,
     events: AppEvents,
     #[allow(dead_code)] // Used as modes move to ViewCx incrementally.
     command_queue: Vec<command::CoreCommand>,
-    pub room: RoomSession,
+    primary_channel: Option<Arc<crate::client_channel::ClientChannel>>,
+    password_prompt_active: bool,
+    pub room: CoreRw<RoomSession>,
     /// The primary terminal's exclusive UI state: composer, scrollback
     /// buffers, pending edit, clipboard queue. Splits off `room` so attached
     /// clients can each own one.
-    pub view: ClientView,
+    pub view: CoreMutex<ClientView>,
     pub network: Option<NetworkClient>,
     pub control_socket: Option<local_control::ControlSocket>,
     pub session_id: Option<SessionId>,
@@ -1026,6 +1030,10 @@ impl AppEvents {
             Err(error @ mpsc::TryRecvError::Disconnected) => Err(error),
         }
     }
+
+    fn wait(&self, timeout: Duration) -> Option<AppEvent> {
+        self.rx.recv_timeout(timeout).ok()
+    }
 }
 
 /// A join requested on the command line, to be started once the app is running.
@@ -1087,8 +1095,10 @@ impl App {
         let mut app = Self {
             events,
             command_queue: Vec::new(),
-            room,
-            view,
+            primary_channel: None,
+            password_prompt_active: false,
+            room: CoreRw::new(room),
+            view: CoreMutex::new(view),
             network: None,
             control_socket,
             session_id: None,
@@ -1133,7 +1143,7 @@ impl App {
             subscribers: HashMap::new(),
             video_transport: None,
             active_tcp_addr: None,
-            config,
+            config: CoreRw::new(config),
         };
         // The view reads the shared mute switches; hand it the real handles.
         app.view.mic_muted = app.mic_muted.clone();
@@ -1173,8 +1183,42 @@ impl App {
             view: &mut self.view,
             session: &self.room,
             config: &self.config,
-            commands: &mut self.command_queue,
+            commands: CommandSink::Local(&mut self.command_queue),
         }
+    }
+
+    pub(crate) fn shared_session(&self) -> Arc<parking_lot::RwLock<RoomSession>> {
+        self.room.shared()
+    }
+
+    pub(crate) fn set_primary_channel(
+        &mut self,
+        channel: Arc<crate::client_channel::ClientChannel>,
+    ) {
+        self.primary_channel = Some(channel);
+    }
+
+    pub(crate) fn shared_view(&self) -> Arc<parking_lot::Mutex<ClientView>> {
+        self.view.shared()
+    }
+
+    pub(crate) fn shared_config(&self) -> Arc<parking_lot::RwLock<Config>> {
+        self.config.shared()
+    }
+
+    /// Opens the shared state to render threads. No core method may run until
+    /// [`Self::acquire_core_state`] has reacquired the guards.
+    pub(crate) fn release_core_state(&mut self) {
+        self.view.release();
+        self.config.release();
+        self.room.release();
+    }
+
+    /// Reacquires guards in the global lock order used by the render threads.
+    pub(crate) fn acquire_core_state(&mut self) {
+        self.room.acquire();
+        self.config.acquire();
+        self.view.acquire();
     }
 
     /// Runs every command produced by one UI dispatch. A handler may enqueue
@@ -1426,6 +1470,19 @@ impl App {
             }
             Err(mpsc::TryRecvError::Empty) => None,
         }
+    }
+
+    pub(crate) fn wait_event(&self, timeout: Duration) -> Option<AppEvent> {
+        self.events.wait(timeout)
+    }
+
+    pub(crate) fn handle_client_command(
+        &mut self,
+        _client_id: crate::client_channel::ClientId,
+        command: command::CoreCommand,
+    ) {
+        self.handle_core_command(command);
+        self.drain_core_commands();
     }
 
     pub(crate) fn handle_app_event(&mut self, event: AppEvent) {
@@ -2670,6 +2727,7 @@ impl App {
     /// Cancels an in-progress open pairing when the user dismisses the password
     /// prompt.
     pub(crate) fn cancel_open_pairing(&mut self) {
+        self.password_prompt_active = false;
         self.pop_mode();
         self.pending_pair.take();
         self.room.join_notice = None;
@@ -3123,13 +3181,14 @@ impl App {
                     self.room.voice_room = Some(room_id);
                     self.requested_voice_room = None;
                 }
+                let voice_room = self.room.voice_room;
                 let notice = self.room.voice_started(
                     room_id,
                     session_id,
                     user_id,
                     stream_id,
                     self.session_id,
-                    self.room.voice_room,
+                    voice_room,
                 );
                 if self.room.voice_room == Some(room_id) {
                     if let Some(playback) = &self.playback {
@@ -3370,18 +3429,58 @@ impl App {
                 server_public_key,
                 udp_addr,
                 udp_probe_addr,
-            } => self.complete_open_pairing(token, server_public_key, udp_addr, udp_probe_addr),
+            } => {
+                if self.password_prompt_active {
+                    self.password_prompt_active = false;
+                    if let Some(channel) = &self.primary_channel {
+                        channel.push(crate::client_channel::ClientEvent::PairingSucceeded);
+                    }
+                    self.complete_open_pairing_from_password_prompt(
+                        token,
+                        server_public_key,
+                        udp_addr,
+                        udp_probe_addr,
+                    );
+                } else {
+                    self.complete_open_pairing(token, server_public_key, udp_addr, udp_probe_addr);
+                }
+            }
             NetworkEvent::OpenPairingNeedsPassword {
                 retry,
                 server_public_key,
             } => {
                 if let Err(error) = self.accept_open_pairing_password_challenge(server_public_key) {
+                    if self.password_prompt_active {
+                        if let Some(channel) = &self.primary_channel {
+                            channel.push(crate::client_channel::ClientEvent::PairingFailed(
+                                error.clone(),
+                            ));
+                        }
+                    }
                     self.set_error(error);
                     return;
                 }
-                self.push_mode(Box::new(PasswordPromptMode::new(retry)));
+                if self.password_prompt_active {
+                    if let Some(channel) = &self.primary_channel {
+                        channel.push(
+                            crate::client_channel::ClientEvent::PairingPasswordChallenge { retry },
+                        );
+                    }
+                } else {
+                    self.password_prompt_active = true;
+                    self.push_mode(Box::new(PasswordPromptMode::new(retry)));
+                }
             }
             NetworkEvent::PairingFailed(error) => {
+                if self.password_prompt_active {
+                    if let Some(channel) = &self.primary_channel {
+                        channel.push(crate::client_channel::ClientEvent::PairingFailed(
+                            error.clone(),
+                        ));
+                    }
+                    self.set_error(error);
+                    return;
+                }
                 self.pending_pair.take();
                 self.set_error(error);
             }
@@ -3602,6 +3701,7 @@ impl App {
         self.view.pending_transition.request(transition);
     }
 
+    #[cfg(test)]
     pub(crate) fn take_mode_transition(&mut self) -> Option<ModeTransition> {
         self.view.pending_transition.take()
     }

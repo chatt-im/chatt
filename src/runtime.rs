@@ -1,22 +1,24 @@
 use std::{
     io::{self, Write},
-    panic,
-    sync::Once,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    panic::{self, AssertUnwindSafe},
+    sync::{Arc, Once, mpsc},
+    thread,
+    time::Duration,
 };
+
+use extui::event::polling::{self, GlobalWakerConfig};
 
 use crate::{
-    app::{App, PendingJoin},
+    app::{App, PendingJoin, command::CoreCommand},
+    client_channel::{ClientChannel, ClientId},
     config::Config,
-    tui::{Action, mode_stack::ModeStack, modes::WelcomeMode},
-};
-use extui::{
-    Buffer, Terminal, TerminalFlags,
-    event::{self, Event, Events, polling::GlobalWakerConfig},
-    vt,
+    tui::{
+        client_thread::{ClientThread, InitialMode},
+        modes::WelcomeMode,
+    },
 };
 
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const CORE_INTERVAL: Duration = Duration::from_millis(50);
 static PANIC_HOOK: Once = Once::new();
 
 pub(crate) fn run_app(
@@ -39,104 +41,93 @@ fn run_app_inner(
     show_welcome: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     install_panic_hook();
+    polling::initialize_global_waker(GlobalWakerConfig {
+        resize: true,
+        termination: true,
+    })?;
+
     let startup_pending = if show_welcome {
         None
     } else {
         pending_join.take()
     };
     let mut app = App::new(config, startup_pending)?;
-    event::polling::initialize_global_waker(GlobalWakerConfig {
-        resize: true,
-        termination: true,
-    })?;
-
-    let flags = TerminalFlags::RAW_MODE
-        | TerminalFlags::ALT_SCREEN
-        | TerminalFlags::HIDE_CURSOR
-        | TerminalFlags::MOUSE_CAPTURE
-        | TerminalFlags::EXTENDED_KEYBOARD_INPUTS
-        | TerminalFlags::BRACKETED_PASTE;
-    let mut terminal = Terminal::open(flags)?;
-
-    // Batch startup terminal queries into one buffer and dispatch with a single
-    // write. The cursor-style reply arrives as Event::CursorStyleReport and is
-    // stored for restore on exit.
-    let mut startup_queries = Vec::new();
-    startup_queries.extend_from_slice(vt::QUERY_CURSOR_STYLE);
-    terminal.write_all(&startup_queries)?;
-
-    let (w, h) = terminal.size()?;
-    let mut buffer = Buffer::new(w, h);
-    buffer.set_rgb_supported(true);
-    let mut events = Events::default();
-    let mut clipboard = crate::clipboard::Clipboard::new();
-    let mut url_opener = crate::url_open::UrlOpener::new(app.config.url_open.clone());
-    let stdin = std::io::stdin();
-
-    let root_mode: Box<dyn crate::tui::mode::AppMode> = if show_welcome {
-        Box::new(WelcomeMode::new(&app, pending_join))
+    let initial_mode = if show_welcome {
+        InitialMode::Welcome(WelcomeMode::new(&app, pending_join))
+    } else if app.network.is_some() || !app.room.server_alias.is_empty() {
+        InitialMode::Room
     } else {
-        app.base_mode()
+        InitialMode::Servers
     };
-    let mut mode_stack = ModeStack::new(root_mode, &mut app);
 
+    let channel = Arc::new(ClientChannel::new()?);
+    app.set_primary_channel(channel.clone());
+    let session = app.shared_session();
+    let view = app.shared_view();
+    let config = app.shared_config();
+    let (command_tx, command_rx) = mpsc::channel::<(ClientId, CoreCommand)>();
+    app.release_core_state();
+
+    let render_channel = channel.clone();
+    let render_commands = command_tx.clone();
+    let render_thread = thread::Builder::new()
+        .name("chatt-tui-0".to_string())
+        .spawn(move || {
+            let client = ClientThread {
+                id: ClientId::PRIMARY,
+                stdin_fd: 0,
+                stdout_fd: 1,
+                channel: render_channel,
+                session,
+                view,
+                config,
+                commands: render_commands.clone(),
+                initial_mode,
+            };
+            let result = panic::catch_unwind(AssertUnwindSafe(|| client.run()));
+            let _ = render_commands.send((ClientId::PRIMARY, CoreCommand::Quit));
+            result
+        })?;
+
+    let mut resize_count = polling::resize_count();
     loop {
+        // The wait happens with all shared state open to the render thread.
+        let first_event = app.wait_event(CORE_INTERVAL);
+        app.acquire_core_state();
+
+        if let Some(event) = first_event {
+            app.handle_app_event(event);
+        }
         while let Some(event) = app.next_event() {
-            mode_stack.process_app_event(&mut app, event);
-            mode_stack.apply_pending(&mut app);
+            app.handle_app_event(event);
+        }
+        while let Ok((client_id, command)) = command_rx.try_recv() {
+            app.handle_client_command(client_id, command);
         }
         app.tick();
-        mode_stack.apply_pending(&mut app);
-        // Catch the primary view's buffer up to the shared session before
-        // painting; every session mutation above lands here.
-        app.view.sync_active(&app.room);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as u64)
-            .unwrap_or(0);
-        mode_stack.render(&mut app, &mut buffer, now_ms);
-        buffer.render(&mut terminal);
 
-        if event::poll(&stdin, Some(POLL_INTERVAL))?.is_readable() {
-            events.read_from(&stdin)?;
-        }
+        let quit = app.take_quit_requested() || polling::termination_requested();
+        let current_resize = polling::resize_count();
+        let resized = current_resize != resize_count;
+        resize_count = current_resize;
+        app.release_core_state();
 
-        while let Some(event) = events.next(terminal.is_raw()) {
-            match event {
-                Event::Key(key) => {
-                    let action = mode_stack.process_input(&mut app, key);
-                    if matches!(action, Action::Quit) {
-                        return Ok(());
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    let action = mode_stack.process_mouse(&mut app, mouse);
-                    if matches!(action, Action::Quit) {
-                        return Ok(());
-                    }
-                }
-                Event::Paste(text) => mode_stack.process_paste(&mut app, text),
-                Event::Resized => {
-                    let (new_w, new_h) = terminal.size()?;
-                    buffer.resize(new_w, new_h);
-                }
-                Event::CursorStyleReport(shape) => {
-                    terminal.set_restore_cursor_style(Some(shape));
-                }
-                _ => {}
-            }
-            mode_stack.apply_pending(&mut app);
-            if app.take_quit_requested() {
-                return Ok(());
-            }
+        if resized {
+            channel.resize();
+        } else {
+            channel.wake();
         }
+        if quit {
+            break;
+        }
+    }
 
-        if let Some(text) = app.view.take_pending_clipboard() {
-            clipboard.copy(&mut terminal, &text);
-        }
-        if let Some(url) = app.view.take_pending_url_open() {
-            url_opener.open(&url);
-        }
+    channel.terminate();
+    match render_thread.join() {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Ok(Ok(Err(error))) => Err(error.into()),
+        Ok(Err(_panic)) | Err(_panic) => Err("terminal render thread panicked".into()),
     }
 }
 
