@@ -44,7 +44,7 @@ mod imp {
         };
         let signals = SignalPipe::new()?;
         install_signal_handlers()?;
-        let outcome = client_loop(&mut stream, &signals);
+        let outcome = client_loop(&mut stream, &signals, [0, 1]);
         match outcome {
             Ok((outcome, true)) => {
                 reset_terminal_to_canonical();
@@ -64,18 +64,20 @@ mod imp {
     fn client_loop(
         stream: &mut UnixStream,
         signal_pipe: &SignalPipe,
+        terminal_fds: [libc::c_int; 2],
     ) -> Result<(AttachOutcome, bool), String> {
-        let mut terminating = false;
         loop {
-            let signals = signal_pipe.wait(stream)?;
+            let signals = signal_pipe.wait(stream, terminal_fds)?;
+            if signals & SIGNAL_TERMINATE != 0 || signal_pipe.terminal_disconnected() {
+                // Closing this socket is itself a detach signal to the daemon.
+                // Do not perform even a best-effort write here: a full socket
+                // buffer would make local termination depend on daemon progress.
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return Ok((AttachOutcome::UserQuit, false));
+            }
             if signals & SIGNAL_RESIZE != 0 {
                 write_frame(stream, CLIENT_RESIZE, &[])
                     .map_err(|error| format!("failed to forward resize: {error}"))?;
-            }
-            if signals & SIGNAL_TERMINATE != 0 && !terminating {
-                terminating = true;
-                write_frame(stream, CLIENT_TERMINATE, &[])
-                    .map_err(|error| format!("failed to request detach: {error}"))?;
             }
 
             if !signal_pipe.stream_ready() {
@@ -181,6 +183,7 @@ mod imp {
         read_fd: libc::c_int,
         write_fd: libc::c_int,
         stream_ready: std::cell::Cell<bool>,
+        terminal_disconnected: std::cell::Cell<bool>,
     }
 
     impl SignalPipe {
@@ -209,10 +212,11 @@ mod imp {
                 read_fd: fds[0],
                 write_fd: fds[1],
                 stream_ready: std::cell::Cell::new(false),
+                terminal_disconnected: std::cell::Cell::new(false),
             })
         }
 
-        fn wait(&self, stream: &UnixStream) -> Result<u8, String> {
+        fn wait(&self, stream: &UnixStream, terminal_fds: [libc::c_int; 2]) -> Result<u8, String> {
             let mut poll_fds = [
                 libc::pollfd {
                     fd: stream.as_raw_fd(),
@@ -222,6 +226,21 @@ mod imp {
                 libc::pollfd {
                     fd: self.read_fd,
                     events: libc::POLLIN,
+                    revents: 0,
+                },
+                // Hangup and error conditions are reported even when no event
+                // bits are requested. The daemon owns duplicates of these
+                // descriptors, so the attach shim must watch its copies too:
+                // some terminal emulators close the PTY without delivering a
+                // usable SIGHUP to this process.
+                libc::pollfd {
+                    fd: terminal_fds[0],
+                    events: 0,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: terminal_fds[1],
+                    events: 0,
                     revents: 0,
                 },
             ];
@@ -238,6 +257,11 @@ mod imp {
             }
             self.stream_ready
                 .set(poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
+            let terminal_failure = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+            self.terminal_disconnected.set(
+                poll_fds[2].revents & terminal_failure != 0
+                    || poll_fds[3].revents & terminal_failure != 0,
+            );
             if poll_fds[1].revents & libc::POLLIN != 0 {
                 let mut bytes = [0u8; 64];
                 loop {
@@ -254,6 +278,10 @@ mod imp {
 
         fn stream_ready(&self) -> bool {
             self.stream_ready.get()
+        }
+
+        fn terminal_disconnected(&self) -> bool {
+            self.terminal_disconnected.get()
         }
     }
 
@@ -344,6 +372,54 @@ mod imp {
                 read_frame(&mut right).expect("read"),
                 (CLIENT_RESIZE, b"size".to_vec())
             );
+        }
+
+        #[test]
+        fn pty_hangup_terminates_without_daemon_ack() {
+            use portable_pty::{PtySize, native_pty_system};
+
+            let (mut stream, mut peer) = UnixStream::pair().expect("socket pair");
+            let signals = SignalPipe::new().expect("signal pipe");
+            let pair = native_pty_system()
+                .openpty(PtySize::default())
+                .expect("PTY pair");
+            let tty_name = pair.master.tty_name().expect("PTY slave name");
+            let mut terminal = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tty_name)
+                .expect("open PTY slave for shim");
+            let daemon_terminal = terminal
+                .try_clone()
+                .expect("duplicate PTY slave for daemon");
+            let mut master_writer = pair.master.take_writer().expect("PTY master writer");
+            master_writer.write_all(b"input").expect("write PTY input");
+            terminal.write_all(b"output").expect("write PTY output");
+            let mut hangup_only = libc::pollfd {
+                fd: terminal.as_raw_fd(),
+                events: 0,
+                revents: 0,
+            };
+            // Normal terminal traffic must not wake the hangup-only watcher.
+            assert_eq!(unsafe { libc::poll(&mut hangup_only, 1, 0) }, 0);
+            assert_eq!(hangup_only.revents, 0);
+
+            // Closing the PTY master models the terminal emulator disappearing
+            // while both the shim and daemon still own slave descriptors.
+            drop(master_writer);
+            drop(pair.master);
+
+            assert_eq!(
+                client_loop(
+                    &mut stream,
+                    &signals,
+                    [terminal.as_raw_fd(), terminal.as_raw_fd()],
+                ),
+                Ok((AttachOutcome::UserQuit, false))
+            );
+            let mut byte = [0];
+            assert_eq!(peer.read(&mut byte).expect("control socket EOF"), 0);
+            drop(daemon_terminal);
         }
     }
 }
