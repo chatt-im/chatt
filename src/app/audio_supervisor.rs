@@ -246,6 +246,17 @@ impl AudioStreamSupervisor {
     /// Returns the cause when a rebuild should run now. The caller must
     /// report the outcome through [`Self::on_rebuild_ok`] or
     /// [`Self::on_rebuild_failed`].
+    /// When [`Self::take_due_rebuild`] next has work, for tick scheduling.
+    pub(crate) fn due_at(&self) -> Option<Instant> {
+        match self.phase() {
+            RecoveryPhase::Healthy => None,
+            RecoveryPhase::RebuildPending { due, .. } | RecoveryPhase::BackoffRetry { due } => {
+                Some(due)
+            }
+            RecoveryPhase::WaitingForDevice { next_probe } => Some(next_probe),
+        }
+    }
+
     pub(crate) fn take_due_rebuild(&mut self, now: Instant) -> Option<RebuildCause> {
         let cause = match self.phase() {
             RecoveryPhase::Healthy => return None,
