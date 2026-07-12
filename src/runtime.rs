@@ -36,28 +36,40 @@ struct RemoteClient {
     control_thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+enum RemoteShutdown {
+    Close,
+    Detach,
+    Handoff,
+}
+
 pub(crate) fn run_app(
     config: Config,
     pending_join: Option<PendingJoin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_app_inner(config, pending_join, false)
+    run_app_inner(config, pending_join, false, false)
 }
 
 pub(crate) fn run_app_with_welcome(
     config: Config,
     pending_join: Option<PendingJoin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_app_inner(config, pending_join, true)
+    run_app_inner(config, pending_join, true, false)
+}
+
+pub(crate) fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    run_app_inner(config, None, false, true)
 }
 
 fn run_app_inner(
     config: Config,
     mut pending_join: Option<PendingJoin>,
     show_welcome: bool,
+    headless: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     install_panic_hook();
     polling::initialize_global_waker(GlobalWakerConfig {
-        resize: true,
+        resize: !headless,
         termination: true,
     })?;
 
@@ -67,58 +79,65 @@ fn run_app_inner(
         pending_join.take()
     };
     let mut app = App::new(config, startup_pending)?;
-    let initial_mode = if show_welcome {
-        InitialMode::Welcome(WelcomeMode::new(&app, pending_join))
-    } else if app.network.is_some() || !app.room.server_alias.is_empty() {
-        InitialMode::Room
-    } else {
-        InitialMode::Servers
-    };
-
-    let channel = Arc::new(ClientChannel::new()?);
-    app.set_primary_channel(channel.clone());
-    // Bind the initial view to the current epoch before the render thread
-    // starts, so the first sync is not mistaken for a server transition (in
-    // particular while the welcome mode is active).
-    app.view.sync_active(&app.room);
-    let session = app.shared_session();
-    let view = app.shared_view();
-    let config = app.shared_config();
     let event_sender = app.event_sender();
-    app.release_core_state();
+    let mut channel = None;
+    let mut render_thread = None;
+    if headless {
+        app.release_core_state();
+    } else {
+        let initial_mode = if show_welcome {
+            InitialMode::Welcome(WelcomeMode::new(&app, pending_join))
+        } else if app.network.is_some() || !app.room.server_alias.is_empty() {
+            InitialMode::Room
+        } else {
+            InitialMode::Servers
+        };
+        let primary_channel = Arc::new(ClientChannel::new()?);
+        app.set_primary_channel(primary_channel.clone());
+        // Bind the initial view to the current epoch before the render thread
+        // starts, so the first sync is not mistaken for a server transition.
+        app.view.sync_active(&app.room);
+        let session = app.shared_session();
+        let view = app.shared_view();
+        let config = app.shared_config();
+        app.release_core_state();
 
-    let render_channel = channel.clone();
-    let render_events = event_sender.clone();
-    let render_thread = match thread::Builder::new()
-        .name("chatt-tui-0".to_string())
-        .spawn(move || {
-            let client = ClientThread {
-                id: ClientId::PRIMARY,
-                stdin_fd: 0,
-                stdout_fd: 1,
-                channel: render_channel,
-                session,
-                view,
-                config,
-                events: render_events.clone(),
-                initial_mode,
-                follow_primary_view: true,
-            };
-            let result = panic::catch_unwind(AssertUnwindSafe(|| client.run()));
-            let _ = render_events.send(AppEvent::ClientCommand {
-                client_id: ClientId::PRIMARY,
-                command: CoreCommand::Quit,
-            });
-            result
-        }) {
-        Ok(thread) => thread,
-        Err(error) => {
-            app.acquire_core_state();
-            return Err(error.into());
-        }
-    };
+        let render_channel = primary_channel.clone();
+        let render_events = event_sender.clone();
+        render_thread = Some(
+            match thread::Builder::new()
+                .name("chatt-tui-0".to_string())
+                .spawn(move || {
+                    let client = ClientThread {
+                        id: ClientId::PRIMARY,
+                        stdin_fd: 0,
+                        stdout_fd: 1,
+                        channel: render_channel,
+                        session,
+                        view,
+                        config,
+                        events: render_events.clone(),
+                        initial_mode,
+                        follow_primary_view: true,
+                    };
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| client.run()));
+                    let _ = render_events.send(AppEvent::ClientCommand {
+                        client_id: ClientId::PRIMARY,
+                        command: CoreCommand::Quit,
+                    });
+                    result
+                }) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    app.acquire_core_state();
+                    return Err(error.into());
+                }
+            },
+        );
+        channel = Some(primary_channel);
+    }
 
-    let mut resize_count = polling::resize_count();
+    let mut resize_count = (!headless).then(polling::resize_count);
     let mut next_client_id = 1u64;
     let mut clients = HashMap::<ClientId, RemoteClient>::new();
     loop {
@@ -151,16 +170,21 @@ fn run_app_inner(
         }
         dirty |= app.tick();
 
-        let quit = app.take_quit_requested() || polling::termination_requested();
-        let current_resize = polling::resize_count();
-        let resized = current_resize != resize_count;
-        resize_count = current_resize;
+        let quit = (!headless && app.take_quit_requested()) || polling::termination_requested();
+        let resized = resize_count.as_mut().is_some_and(|previous| {
+            let current = polling::resize_count();
+            let resized = current != *previous;
+            *previous = current;
+            resized
+        });
         app.release_core_state();
 
-        if resized {
-            channel.resize();
-        } else if dirty {
-            channel.wake();
+        if let Some(channel) = &channel {
+            if resized {
+                channel.resize();
+            } else if dirty {
+                channel.wake();
+            }
         }
         if dirty {
             for client in clients.values() {
@@ -172,22 +196,29 @@ fn run_app_inner(
         }
     }
 
-    // Relinquish the accept path and leadership before telling shims to race
-    // for a successor. They can no longer reconnect to this drained runtime.
+    // Relinquish the accept path and leadership before notifying clients. They
+    // can no longer reconnect to this drained runtime.
     drop(app.control_socket.take());
-    channel.terminate();
-    for (_, client) in clients.drain() {
-        shutdown_remote(client, true);
+    if let Some(channel) = &channel {
+        channel.terminate();
     }
-    let render_result = render_thread.join();
+    let shutdown = if headless {
+        RemoteShutdown::Detach
+    } else {
+        RemoteShutdown::Handoff
+    };
+    for (_, client) in clients.drain() {
+        shutdown_remote(client, shutdown);
+    }
+    let render_result = render_thread.map(JoinHandle::join);
     // App::drop persists the room catalog and tears down audio through the
     // core wrappers, so restore their guards before returning from runtime.
     app.acquire_core_state();
     match render_result {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(error))) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Ok(Ok(Err(error))) => Err(error.into()),
-        Ok(Err(payload)) | Err(payload) => Err(format!(
+        None | Some(Ok(Ok(Ok(())))) => Ok(()),
+        Some(Ok(Ok(Err(error)))) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Some(Ok(Ok(Err(error)))) => Err(error.into()),
+        Some(Ok(Err(payload))) | Some(Err(payload)) => Err(format!(
             "terminal render thread panicked: {}",
             panic_payload_message(payload.as_ref())
         )
@@ -265,7 +296,7 @@ fn handle_runtime_event(
         AppEvent::ClientExited(id) => {
             app.retire_client(id);
             if let Some(client) = clients.remove(&id) {
-                shutdown_remote(client, false);
+                shutdown_remote(client, RemoteShutdown::Close);
                 kvlog::info!("terminal client detached", client_id = id.0);
             }
         }
@@ -399,16 +430,21 @@ fn remote_control_loop(
     }
 }
 
-fn shutdown_remote(mut client: RemoteClient, master_shutdown: bool) {
+fn shutdown_remote(mut client: RemoteClient, shutdown: RemoteShutdown) {
     let _ = client
         .control
         .lock()
         .set_write_timeout(Some(REMOTE_SHUTDOWN_TIMEOUT));
-    if master_shutdown {
-        let _ = attach::write_frame(&mut client.control.lock(), attach::MASTER_SHUTDOWN, &[]);
-        client.channel.handoff();
-    } else {
-        client.channel.terminate();
+    match shutdown {
+        RemoteShutdown::Close => client.channel.terminate(),
+        RemoteShutdown::Detach => {
+            let _ = attach::write_frame(&mut client.control.lock(), attach::TERMINATE_ACK, &[]);
+            client.channel.terminate();
+        }
+        RemoteShutdown::Handoff => {
+            let _ = attach::write_frame(&mut client.control.lock(), attach::MASTER_SHUTDOWN, &[]);
+            client.channel.handoff();
+        }
     }
     let _ = client.control.lock().shutdown(std::net::Shutdown::Both);
     if let Some(thread) = client.render_thread.take() {
@@ -464,7 +500,58 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
-    use super::panic_payload_message;
+    use std::{os::unix::net::UnixStream, sync::Arc};
+
+    use super::{RemoteClient, RemoteShutdown, panic_payload_message, shutdown_remote};
+    use crate::{attach, client_channel::ClientChannel};
+    use parking_lot::Mutex;
+
+    fn remote_client() -> (RemoteClient, UnixStream, Arc<ClientChannel>) {
+        let (control, peer) = UnixStream::pair().unwrap();
+        let channel = Arc::new(ClientChannel::new().unwrap());
+        (
+            RemoteClient {
+                channel: channel.clone(),
+                control: Arc::new(Mutex::new(control)),
+                render_thread: None,
+                control_thread: None,
+            },
+            peer,
+            channel,
+        )
+    }
+
+    #[test]
+    fn daemon_shutdown_detaches_without_requesting_handoff() {
+        let (client, mut peer, channel) = remote_client();
+
+        shutdown_remote(client, RemoteShutdown::Detach);
+
+        assert_eq!(
+            attach::read_frame(&mut peer).unwrap(),
+            (attach::TERMINATE_ACK, vec![])
+        );
+        let mut resize = 0;
+        let actions = channel.actions(&mut resize);
+        assert!(actions.terminate);
+        assert!(!actions.handoff);
+    }
+
+    #[test]
+    fn interactive_shutdown_still_requests_handoff() {
+        let (client, mut peer, channel) = remote_client();
+
+        shutdown_remote(client, RemoteShutdown::Handoff);
+
+        assert_eq!(
+            attach::read_frame(&mut peer).unwrap(),
+            (attach::MASTER_SHUTDOWN, vec![])
+        );
+        let mut resize = 0;
+        let actions = channel.actions(&mut resize);
+        assert!(actions.handoff);
+        assert!(!actions.terminate);
+    }
 
     #[test]
     fn panic_payload_message_preserves_string_payloads() {

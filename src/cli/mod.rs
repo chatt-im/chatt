@@ -50,6 +50,18 @@ without a subcommand to launch the interactive client.",
     ],
     subs: &[
         Command {
+            name: "daemon",
+            aliases: &[],
+            about: "Run the chatt master without a terminal UI.",
+            long_about: "Runs the shared chatt core in the foreground without opening a terminal \
+UI. The daemon owns server, audio, web, and local-control state while other \
+`chatt` processes attach as terminal clients.",
+            args: &[],
+            flags: &[],
+            subs: &[],
+            examples: &[],
+        },
+        Command {
             name: "pair",
             aliases: &[],
             about: "Pair with a server from an invite ticket or a public address.",
@@ -407,6 +419,7 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = matches.value_of("config");
 
     match matches.subcommand() {
+        Some(("daemon", _)) => run_daemon_app(config_path),
         Some(("pair", sub)) => {
             let target = sub.value_of("join_string").unwrap_or_default().trim();
             let pending = if target.starts_with(rpc::control::JOIN_STRING_PREFIX) {
@@ -537,6 +550,23 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         _ => run_interactive_app(config_path, None),
+    }
+}
+
+fn run_daemon_app(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    match Config::load_for_app(config_path)? {
+        AppConfigLoad::Existing(config) => runtime::run_daemon(config),
+        AppConfigLoad::Missing(config) => {
+            let path = config
+                .config_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "the client config path".to_string());
+            Err(format!(
+                "client config {path} does not exist; run chatt once to complete setup before starting the daemon"
+            )
+            .into())
+        }
     }
 }
 
@@ -971,6 +1001,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_daemon_with_global_config() {
+        for tokens in [
+            ["chatt", "--config", "dev.toml", "daemon"],
+            ["chatt", "daemon", "--config", "dev.toml"],
+        ] {
+            let matches = run_matches(&tokens);
+            assert_eq!(matches.value_of("config"), Some("dev.toml"));
+            assert_eq!(matches.subcommand().unwrap().0, "daemon");
+        }
+    }
+
+    #[test]
+    fn daemon_requires_an_existing_config() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chatt-daemon-missing-{}-{unique}.toml",
+            std::process::id()
+        ));
+
+        let error = run_daemon_app(path.to_str()).unwrap_err().to_string();
+
+        assert!(error.contains("does not exist"));
+        assert!(error.contains("run chatt once"));
+    }
+
+    #[test]
     fn join_with_ticket_redirects_to_pair_without_launching() {
         let matches = run_matches(&["chatt", "join", "tcj1_example"]);
         let err = dispatch(&matches).expect_err("a ticket is not a join target");
@@ -1178,6 +1237,10 @@ mod tests {
         assert!(matches!(
             command::parse(&ROOT, &argv(&["chatt", "-h"])),
             Ok(Parsed::Help(_))
+        ));
+        assert!(matches!(
+            command::parse(&ROOT, &argv(&["chatt", "daemon", "--help"])),
+            Ok(Parsed::Help(text)) if text.contains("without opening a terminal UI")
         ));
         assert!(matches!(
             command::parse(&ROOT, &argv(&["chatt", "help", "upload"])),
