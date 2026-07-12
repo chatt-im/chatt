@@ -149,7 +149,7 @@ fn run_app_inner(
                 &event_sender,
             );
         }
-        app.tick();
+        dirty |= app.tick();
 
         let quit = app.take_quit_requested() || polling::termination_requested();
         let current_resize = polling::resize_count();

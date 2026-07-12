@@ -2696,9 +2696,9 @@ impl RoomSession {
         raw_active: bool,
         now: std::time::Instant,
         release_hold: std::time::Duration,
-    ) {
+    ) -> bool {
         self.participants
-            .update_talking_display(user_id, raw_active, now, release_hold);
+            .update_talking_display(user_id, raw_active, now, release_hold)
     }
 
     pub(super) fn local_voice_stream_ready(&self, local_user: Option<UserId>) -> bool {
