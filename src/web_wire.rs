@@ -596,6 +596,22 @@ mod tests {
     }
 
     #[test]
+    fn fence_after_prose_preserves_both_fragments() {
+        let fragments = split_fragments("Hello ```rust\nlet x = 4;\n```", &|_| None);
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0], Fragment::text("<p>Hello </p>"));
+        let Fragment::Code {
+            lang, text, spans, ..
+        } = &fragments[1]
+        else {
+            panic!("expected code fragment, got {:?}", fragments[1]);
+        };
+        assert_eq!(lang, "rust");
+        assert_eq!(text, "let x = 4;");
+        assert!(!spans.is_empty());
+    }
+
+    #[test]
     fn unclosed_fence_is_rendered_as_prose() {
         let fragments = split_fragments("```\nline one\nline two", &|_| None);
         assert_eq!(fragments.len(), 1);
