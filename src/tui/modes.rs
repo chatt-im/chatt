@@ -1161,11 +1161,24 @@ impl AppMode for SettingsMode {
     }
 }
 
+/// The chat state a frame was painted from. When the next frame's anchor
+/// matches in everything but `top`, the visible rows merely shifted and the
+/// renderer scrolls the chat rect instead of rewriting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChatScrollAnchor {
+    pub room: Option<rpc::ids::RoomId>,
+    pub width: u16,
+    pub rect: Rect,
+    pub top: usize,
+    pub epoch: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct RoomLayout {
     pub chat_width: u16,
     pub chat_height: u16,
     pub chat_rect: Rect,
+    pub chat_scroll_anchor: Option<ChatScrollAnchor>,
     pub visible_chat_lines: Vec<VisibleLine>,
     pub top_bar_rect: Rect,
     pub key_preview_rect: Rect,
@@ -1195,6 +1208,7 @@ impl Default for RoomLayout {
             chat_width: 80,
             chat_height: 0,
             chat_rect: Rect::EMPTY,
+            chat_scroll_anchor: None,
             visible_chat_lines: Vec::new(),
             top_bar_rect: Rect::EMPTY,
             key_preview_rect: Rect::EMPTY,
@@ -1226,6 +1240,7 @@ impl RoomLayout {
     pub(crate) fn clear_chat(&mut self) {
         self.chat_height = 0;
         self.chat_rect = Rect::EMPTY;
+        self.chat_scroll_anchor = None;
         self.visible_chat_lines.clear();
     }
 
@@ -1234,6 +1249,14 @@ impl RoomLayout {
         self.visible_chat_lines.get(index).copied()
     }
 }
+
+/// Sections a chat-log scroll or cursor move can touch: the log itself, the
+/// key preview a completed chord clears, and the compose bar where handlers
+/// surface status text. Handlers narrow to this only when chat focus did not
+/// change, since a focus change restyles the section bars.
+const CHAT_SCROLL_DIRTY: DirtySections = DirtySections::CHAT
+    .union(DirtySections::KEY_PREVIEW)
+    .union(DirtySections::COMPOSE_BAR);
 
 /// Moves the composer cursor to the text boundary nearest a terminal click.
 /// Frame and gutter coordinates clamp onto the closest editor edge.
@@ -1866,12 +1889,20 @@ impl RoomMode {
                 });
             }
             extui::event::MouseEventKind::ScrollUp if in_chat => {
+                let was_focused = self.focus == ChatPanelFocus::ChatLog;
                 self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
                 self.scroll_chat_up(cx, 5);
+                if was_focused {
+                    cx.narrow_dirty(CHAT_SCROLL_DIRTY);
+                }
             }
             extui::event::MouseEventKind::ScrollDown if in_chat => {
+                let was_focused = self.focus == ChatPanelFocus::ChatLog;
                 self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
                 cx.view.active.chat.scroll_down(5);
+                if was_focused {
+                    cx.narrow_dirty(CHAT_SCROLL_DIRTY);
+                }
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_chat => {
                 self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
@@ -2207,6 +2238,7 @@ impl RoomMode {
 
     fn select_chat_top(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus == ChatPanelFocus::ChatLog {
+            cx.narrow_dirty(CHAT_SCROLL_DIRTY);
             cx.view
                 .active
                 .chat
@@ -2227,6 +2259,7 @@ impl RoomMode {
 
     fn select_chat_bottom(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus == ChatPanelFocus::ChatLog {
+            cx.narrow_dirty(CHAT_SCROLL_DIRTY);
             cx.view.active.chat.bottom();
             cx.view.active.chat.cursor_to_last(self.layout.chat_width);
             self.keep_chat_cursor_visible(cx);
@@ -2265,6 +2298,7 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
+        cx.narrow_dirty(CHAT_SCROLL_DIRTY);
         if cx
             .view
             .active
@@ -2358,7 +2392,10 @@ impl RoomMode {
 
     fn scroll_focused_panel(&mut self, cx: &mut ViewCx<'_>, direction: isize) {
         match self.focus {
-            ChatPanelFocus::ChatLog => self.move_chat_cursor(cx, direction),
+            ChatPanelFocus::ChatLog => {
+                self.move_chat_cursor(cx, direction);
+                cx.narrow_dirty(CHAT_SCROLL_DIRTY);
+            }
             ChatPanelFocus::Lobby => match self.lobby_list_focus {
                 LobbyListFocus::Rooms => self.move_room_view_with_focus(cx, direction),
                 LobbyListFocus::Users => self.move_user_selection_with_focus(cx, direction),
@@ -2376,6 +2413,7 @@ impl RoomMode {
         } else {
             cx.view.active.chat.scroll_down(rows as usize);
         }
+        cx.narrow_dirty(CHAT_SCROLL_DIRTY);
     }
 
     fn chat_half_page_rows(&self) -> usize {
@@ -3119,6 +3157,249 @@ mod tests {
             emitted > 100,
             "geometry change did not trigger a full repaint ({emitted} bytes)"
         );
+    }
+
+    /// Renders one gated frame and returns the emitted bytes, feeding them to
+    /// `term`. `frame_retained` marks the frame as diffing against a retained
+    /// seeded previous frame, as the client loop does from the second room
+    /// frame onward.
+    fn frame_bytes(
+        app: &mut App,
+        room: &mut RoomMode,
+        buffer: &mut Buffer,
+        dirty: DirtySections,
+        frame_retained: bool,
+        term: &mut vt100::Parser,
+    ) -> Vec<u8> {
+        app.view.sync_active(&app.room);
+        {
+            let mut cx = app.view_cx();
+            cx.frame_retained = frame_retained;
+            AppMode::render(room, &mut cx, buffer, 0, dirty);
+        }
+        app.drain_core_commands();
+        buffer.render_internal();
+        let bytes = buffer.write_buffer().to_vec();
+        term.process(&bytes);
+        buffer.buf.clear();
+        bytes
+    }
+
+    /// The DECSTBM sequence [`queue_chat_scroll`] produces for the chat rows.
+    fn chat_scroll_escape(room: &RoomMode) -> Vec<u8> {
+        let chat = room.layout.chat_rect;
+        format!("\x1b[{};{}r", chat.y + 1, chat.y + chat.h).into_bytes()
+    }
+
+    fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
+        bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
+    /// Renders the app state fresh (full redraw into a new mode and buffer)
+    /// and asserts `gated_term` matches it cell-for-cell. Blank cells compare
+    /// by background only: an explicit space write, an \x1b[K erase, and a
+    /// never-touched cell legitimately disagree on the invisible foreground
+    /// and on whether the cell holds " " or "".
+    fn assert_matches_full_redraw(app: &mut App, gated_term: &vt100::Parser) {
+        let mut room = RoomMode::new();
+        let mut buffer = Buffer::new(80, 24);
+        let mut term = vt100::Parser::new(24, 80, 0);
+        render_room_sections(app, &mut room, &mut buffer, DirtySections::ALL);
+        buffer.render_internal();
+        term.process(buffer.write_buffer());
+        let visual = |cell: &vt100::Cell| {
+            let text = cell.contents().to_owned();
+            let (text, fg) = if text.trim().is_empty() {
+                (String::new(), vt100::Color::Default)
+            } else {
+                (text, cell.fgcolor())
+            };
+            (text, fg, cell.bgcolor())
+        };
+        for row in 0..24 {
+            for column in 0..80 {
+                let gated_cell = gated_term.screen().cell(row, column).unwrap();
+                let reference_cell = term.screen().cell(row, column).unwrap();
+                assert_eq!(
+                    visual(gated_cell),
+                    visual(reference_cell),
+                    "gated frame diverged from full redraw at ({column},{row}): gated row {:?} vs reference row {:?}",
+                    gated_term.screen().contents_between(row, 0, row, 80),
+                    term.screen().contents_between(row, 0, row, 80)
+                );
+            }
+        }
+    }
+
+    /// Seeds a room whose chat overflows the viewport (alternating senders,
+    /// so each message carries a heading row) and paints the first full frame.
+    fn scrolled_room_fixture(
+        app: &mut App,
+        room: &mut RoomMode,
+        buffer: &mut Buffer,
+        term: &mut vt100::Parser,
+    ) -> usize {
+        for id in 1..=20u64 {
+            push_room_message(app, 100 + id, UserId(1 + id % 2), 0, format!("message {id}"));
+        }
+        buffer.set_swap(extui::Swap::Retained);
+        frame_bytes(app, room, buffer, DirtySections::ALL, false, term).len()
+    }
+
+    #[test]
+    fn chat_scroll_frame_emits_region_scroll_and_matches_full_redraw() {
+        let mut app = test_app();
+        let mut room = RoomMode::new();
+        let mut buffer = Buffer::new(80, 24);
+        let mut term = vt100::Parser::new(24, 80, 0);
+        let full = scrolled_room_fixture(&mut app, &mut room, &mut buffer, &mut term);
+
+        app.view
+            .active
+            .chat
+            .scroll_up(3, room.layout.chat_width, room.layout.chat_height);
+        let bytes = frame_bytes(
+            &mut app,
+            &mut room,
+            &mut buffer,
+            DirtySections::CHAT,
+            true,
+            &mut term,
+        );
+
+        let escape = chat_scroll_escape(&room);
+        assert!(
+            bytes_contain(&bytes, &escape),
+            "expected chat scroll region escape {:?} in frame",
+            String::from_utf8_lossy(&escape)
+        );
+        assert!(
+            bytes.len() < full,
+            "scrolled frame ({}) should emit less than the full repaint ({full})",
+            bytes.len()
+        );
+        assert_matches_full_redraw(&mut app, &term);
+    }
+
+    #[test]
+    fn append_while_pinned_scrolls_chat_region() {
+        let mut app = test_app();
+        let mut room = RoomMode::new();
+        let mut buffer = Buffer::new(80, 24);
+        let mut term = vt100::Parser::new(24, 80, 0);
+        scrolled_room_fixture(&mut app, &mut room, &mut buffer, &mut term);
+
+        push_room_message(&mut app, 200, UserId(1), 0, "fresh tail message");
+        // Runtime events wake every section, so the follow-bottom scroll must
+        // engage even on an all-dirty retained frame.
+        let bytes = frame_bytes(
+            &mut app,
+            &mut room,
+            &mut buffer,
+            DirtySections::ALL,
+            true,
+            &mut term,
+        );
+
+        assert!(
+            bytes_contain(&bytes, &chat_scroll_escape(&room)),
+            "append while pinned did not scroll the chat region"
+        );
+        assert_matches_full_redraw(&mut app, &term);
+    }
+
+    #[test]
+    fn chat_scroll_skips_region_without_retained_frame() {
+        let mut app = test_app();
+        let mut room = RoomMode::new();
+        let mut buffer = Buffer::new(80, 24);
+        let mut term = vt100::Parser::new(24, 80, 0);
+        scrolled_room_fixture(&mut app, &mut room, &mut buffer, &mut term);
+
+        app.view
+            .active
+            .chat
+            .scroll_up(3, room.layout.chat_width, room.layout.chat_height);
+        let bytes = frame_bytes(
+            &mut app,
+            &mut room,
+            &mut buffer,
+            DirtySections::CHAT,
+            false,
+            &mut term,
+        );
+
+        assert!(
+            !bytes_contain(&bytes, &chat_scroll_escape(&room)),
+            "a non-retained frame must not emit a region scroll"
+        );
+        assert_matches_full_redraw(&mut app, &term);
+    }
+
+    #[test]
+    fn history_prepend_skips_region_scroll() {
+        let mut app = test_app();
+        let mut room = RoomMode::new();
+        let mut buffer = Buffer::new(80, 24);
+        let mut term = vt100::Parser::new(24, 80, 0);
+        scrolled_room_fixture(&mut app, &mut room, &mut buffer, &mut term);
+
+        app.view.active.chat.prepend_chat(vec![(
+            ChatMessage {
+                message_id: MessageId(1),
+                room_id: RoomId(1),
+                sender: UserId(9),
+                sender_name: "user9".to_string(),
+                timestamp_ms: 0,
+                body: "older history".to_string(),
+                file_transfer_id: None,
+                flags: rpc::control::MessageFlags::default(),
+                target: None,
+            },
+            false,
+        )]);
+        let bytes = frame_bytes(
+            &mut app,
+            &mut room,
+            &mut buffer,
+            DirtySections::CHAT,
+            true,
+            &mut term,
+        );
+
+        assert!(
+            !bytes_contain(&bytes, &chat_scroll_escape(&room)),
+            "a prepend shifts every row and must repaint, not scroll"
+        );
+        assert_matches_full_redraw(&mut app, &term);
+    }
+
+    #[test]
+    fn chat_jump_to_top_skips_region_scroll() {
+        let mut app = test_app();
+        let mut room = RoomMode::new();
+        let mut buffer = Buffer::new(80, 24);
+        let mut term = vt100::Parser::new(24, 80, 0);
+        scrolled_room_fixture(&mut app, &mut room, &mut buffer, &mut term);
+
+        app.view
+            .active
+            .chat
+            .top(room.layout.chat_width, room.layout.chat_height);
+        let bytes = frame_bytes(
+            &mut app,
+            &mut room,
+            &mut buffer,
+            DirtySections::CHAT,
+            true,
+            &mut term,
+        );
+
+        assert!(
+            !bytes_contain(&bytes, &chat_scroll_escape(&room)),
+            "a whole-viewport jump must repaint, not scroll"
+        );
+        assert_matches_full_redraw(&mut app, &term);
     }
 
     fn push_room_message(

@@ -36,6 +36,10 @@ pub(crate) struct ViewCx<'a> {
     /// [`DirtySections::ALL`] so unaudited paths stay safe; only dispatch
     /// paths audited to touch a known section set narrow it.
     pub(crate) dirty_hint: DirtySections,
+    /// This render frame diffs against a retained, seeded previous frame, so
+    /// scroll-region optimizations may queue terminal scrolls. `false` on
+    /// input-dispatch contexts, which never render.
+    pub(crate) frame_retained: bool,
 }
 
 #[allow(dead_code)]

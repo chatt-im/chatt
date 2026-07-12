@@ -32,7 +32,7 @@ use crate::{
         editor::composer_visual_position,
         history_search::HistorySearch,
         mode::ViewCx,
-        modes::{LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
+        modes::{ChatScrollAnchor, LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
         view::ClientView,
         widgets::{ScrollbarId, ScrollbarLayout, ScrollbarState, draw_scrollbar},
     },
@@ -44,6 +44,7 @@ pub(crate) struct RenderState<'a> {
     pub(crate) view: &'a mut ClientView,
     pub(crate) room: &'a RoomSession,
     pub(crate) config: &'a Config,
+    pub(crate) frame_retained: bool,
 }
 
 impl<'a> RenderState<'a> {
@@ -52,6 +53,7 @@ impl<'a> RenderState<'a> {
             view: &mut *cx.view,
             room: cx.session,
             config: cx.config,
+            frame_retained: cx.frame_retained,
         }
     }
 
@@ -1668,6 +1670,41 @@ fn panel_mode_style(theme: Theme, panel: ChatPanelFocus) -> Style {
     }
 }
 
+/// Queues a terminal scroll of the chat rows when the visible window merely
+/// shifted since the painted frame: same room, geometry, and layout epoch,
+/// with only the viewport top moved. The subsequent full redraw then diffs
+/// against the shifted previous grid, emitting only the newly exposed rows.
+/// Requires the chat rect to span the full terminal width, which the room
+/// layout guarantees (the lobby stacks above the chat, not beside it).
+fn queue_chat_scroll(
+    area: Rect,
+    app: &mut RenderState<'_>,
+    layout: &mut RoomLayout,
+    content_width: u16,
+    buf: &mut Buffer,
+) {
+    let anchor = ChatScrollAnchor {
+        room: app.view.viewed_room,
+        width: content_width,
+        rect: area,
+        top: app.view.active.chat.viewport_top(content_width, area.h),
+        epoch: app.view.active.chat.layout_epoch(),
+    };
+    if app.frame_retained
+        && let Some(prev) = layout.chat_scroll_anchor
+        && prev.room == anchor.room
+        && prev.width == anchor.width
+        && prev.rect == anchor.rect
+        && prev.epoch == anchor.epoch
+    {
+        let delta = anchor.top as i64 - prev.top as i64;
+        if delta != 0 && delta.unsigned_abs() < u64::from(area.h.min(i16::MAX as u16)) {
+            buf.scroll_region(area.y, area.y + area.h, delta as i16);
+        }
+    }
+    layout.chat_scroll_anchor = Some(anchor);
+}
+
 fn draw_chat(
     area: Rect,
     app: &mut RenderState<'_>,
@@ -1694,6 +1731,7 @@ fn draw_chat(
     layout.chat_height = area.h;
     layout.chat_rect = area;
     if app.view.active.chat.is_empty() {
+        layout.chat_scroll_anchor = None;
         layout.visible_chat_lines.clear();
         area.with(app.view.theme.subtle)
             .with(HAlign::Center)
@@ -1702,6 +1740,7 @@ fn draw_chat(
     }
     // Clamp a stale cursor (eviction, collapse) before styling against it.
     app.view.active.chat.ensure_cursor(content_width);
+    queue_chat_scroll(area, app, layout, content_width, buf);
     app.view.active.chat.visible_lines_into(
         content_width,
         area.h,
