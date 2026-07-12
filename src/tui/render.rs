@@ -431,10 +431,11 @@ pub(crate) fn draw_room_screen(
             .map(|stats| stats.snapshot());
         let capture = match capture {
             Some(mut snapshot) => {
-                let (rms, peak) =
-                    app.view
-                        .mic_level_ballistics
-                        .smooth(snapshot.rms, snapshot.peak, Instant::now());
+                let (rms, peak) = app.view.mic_level_ballistics.smooth(
+                    snapshot.rms,
+                    snapshot.peak,
+                    Instant::now(),
+                );
                 snapshot.rms = rms;
                 snapshot.peak = peak;
                 Some(snapshot)

@@ -47,7 +47,13 @@ impl DialogMode {
 }
 
 impl AppMode for DialogMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         let app = crate::tui::render::RenderState::new(cx);
         if let Some(dialog) = self.dialog.as_mut() {
             dialog.render(buf.rect(), buf, &app.view.theme);
@@ -184,7 +190,13 @@ impl ConfirmMode {
 }
 
 impl AppMode for ConfirmMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         let app = crate::tui::render::RenderState::new(cx);
         let theme = &app.view.theme;
         let area = buf.rect();
@@ -363,7 +375,13 @@ impl NativeEncryptionWarningMode {
 }
 
 impl AppMode for NativeEncryptionWarningMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         let mut app = crate::tui::render::RenderState::new(cx);
         let theme = &app.view.theme;
         let area = buf.rect();
@@ -557,7 +575,13 @@ impl PasswordPromptMode {
 }
 
 impl AppMode for PasswordPromptMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         let mut app = crate::tui::render::RenderState::new(cx);
         let theme = &app.view.theme;
         let area = buf.rect();
@@ -958,7 +982,13 @@ impl PasteImageUploadMode {
 }
 
 impl AppMode for PasteImageUploadMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         let mut app = crate::tui::render::RenderState::new(cx);
         let theme = &app.view.theme;
         let area = buf.rect();

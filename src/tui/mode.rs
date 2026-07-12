@@ -431,7 +431,14 @@ mod tests {
     struct OverlayMode;
 
     impl AppMode for OverlayMode {
-        fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {}
+        fn render(
+            &mut self,
+            _cx: &mut ViewCx<'_>,
+            _buf: &mut Buffer,
+            _now_ms: u64,
+            _dirty: DirtySections,
+        ) {
+        }
 
         fn process_input(&mut self, _cx: &mut ViewCx<'_>, _key: KeyEvent) -> Action {
             Action::Continue
@@ -475,7 +482,13 @@ mod tests {
     }
 
     impl AppMode for RecordingMode {
-        fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+        fn render(
+            &mut self,
+            _cx: &mut ViewCx<'_>,
+            _buf: &mut Buffer,
+            _now_ms: u64,
+            _dirty: DirtySections,
+        ) {
             self.rendered
                 .lock()
                 .expect("render log mutex")

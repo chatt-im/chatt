@@ -217,7 +217,13 @@ impl WelcomeMode {
 }
 
 impl AppMode for WelcomeMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_welcome_screen(
@@ -564,7 +570,13 @@ impl Default for ServerListMode {
 }
 
 impl AppMode for ServerListMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         self.select.refresh(cx.view.server_catalog.items());
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
@@ -698,7 +710,13 @@ impl RoomSwitchMode {
 }
 
 impl AppMode for RoomSwitchMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         self.refresh_cx(cx);
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
@@ -772,7 +790,13 @@ impl ServerEditMode {
 }
 
 impl AppMode for ServerEditMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         if let Some(draft) = self.draft.as_mut() {
             let mut render = crate::tui::render::RenderState::new(cx);
             crate::tui::render::draw_server_edit_overlay(&mut render, draft, buf);
@@ -1120,7 +1144,13 @@ impl SettingsMode {
 }
 
 impl AppMode for SettingsMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
         let Some(settings) = cx.session.settings.clone() else {
             return;
         };
@@ -2559,13 +2589,7 @@ impl RoomMode {
 }
 
 impl AppMode for RoomMode {
-    fn render(
-        &mut self,
-        cx: &mut ViewCx<'_>,
-        buf: &mut Buffer,
-        now_ms: u64,
-        dirty: DirtySections,
-    ) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64, dirty: DirtySections) {
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_room_screen(
@@ -3039,7 +3063,10 @@ mod tests {
         // matches the previous frame, so only the style reset and cursor
         // bookkeeping are emitted.
         let idle = gated_frame(&mut app, &mut room, &mut buffer, DirtySections::EMPTY, None);
-        assert!(idle < 32, "idle frame re-emitted section content ({idle} bytes)");
+        assert!(
+            idle < 32,
+            "idle frame re-emitted section content ({idle} bytes)"
+        );
     }
 
     #[test]
@@ -3240,7 +3267,13 @@ mod tests {
         term: &mut vt100::Parser,
     ) -> usize {
         for id in 1..=20u64 {
-            push_room_message(app, 100 + id, UserId(1 + id % 2), 0, format!("message {id}"));
+            push_room_message(
+                app,
+                100 + id,
+                UserId(1 + id % 2),
+                0,
+                format!("message {id}"),
+            );
         }
         buffer.set_swap(extui::Swap::Retained);
         frame_bytes(app, room, buffer, DirtySections::ALL, false, term).len()
