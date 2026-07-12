@@ -61,7 +61,7 @@ mod imp {
         }
     }
 
-    fn client_loop(
+    pub(crate) fn client_loop(
         stream: &mut UnixStream,
         signal_pipe: &SignalPipe,
         terminal_fds: [libc::c_int; 2],
@@ -179,7 +179,27 @@ mod imp {
         Ok(())
     }
 
-    struct SignalPipe {
+    /// Builds the hangup watch for one terminal descriptor. The daemon owns
+    /// duplicates of these descriptors, so the attach shim must watch its
+    /// copies too: some terminal emulators close the PTY without delivering a
+    /// usable SIGHUP to this process.
+    ///
+    /// POLLHUP is requested explicitly even though POSIX documents it as
+    /// ignored in `events` (hangup is always reported), which is how Linux
+    /// behaves. XNU's kqueue-backed poll instead attaches no filter to a
+    /// descriptor whose `events` is empty, such an entry can never report
+    /// anything, and uses a requested POLLHUP to register the read filter
+    /// whose EV_EOF maps back to POLLHUP. Requesting it is therefore a no-op
+    /// on Linux and the only way this watch ever fires on macOS.
+    fn terminal_watch_pollfd(fd: libc::c_int) -> libc::pollfd {
+        libc::pollfd {
+            fd,
+            events: libc::POLLHUP,
+            revents: 0,
+        }
+    }
+
+    pub(crate) struct SignalPipe {
         read_fd: libc::c_int,
         write_fd: libc::c_int,
         stream_ready: std::cell::Cell<bool>,
@@ -187,7 +207,7 @@ mod imp {
     }
 
     impl SignalPipe {
-        fn new() -> Result<Self, String> {
+        pub(crate) fn new() -> Result<Self, String> {
             let mut fds = [-1; 2];
             // SAFETY: `fds` has space for the two descriptors written by pipe.
             if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
@@ -228,21 +248,8 @@ mod imp {
                     events: libc::POLLIN,
                     revents: 0,
                 },
-                // Hangup and error conditions are reported even when no event
-                // bits are requested. The daemon owns duplicates of these
-                // descriptors, so the attach shim must watch its copies too:
-                // some terminal emulators close the PTY without delivering a
-                // usable SIGHUP to this process.
-                libc::pollfd {
-                    fd: terminal_fds[0],
-                    events: 0,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: terminal_fds[1],
-                    events: 0,
-                    revents: 0,
-                },
+                terminal_watch_pollfd(terminal_fds[0]),
+                terminal_watch_pollfd(terminal_fds[1]),
             ];
             loop {
                 // SAFETY: `poll_fds` remains valid for the duration of poll.
@@ -395,11 +402,7 @@ mod imp {
             let mut master_writer = pair.master.take_writer().expect("PTY master writer");
             master_writer.write_all(b"input").expect("write PTY input");
             terminal.write_all(b"output").expect("write PTY output");
-            let mut hangup_only = libc::pollfd {
-                fd: terminal.as_raw_fd(),
-                events: 0,
-                revents: 0,
-            };
+            let mut hangup_only = terminal_watch_pollfd(terminal.as_raw_fd());
             // Normal terminal traffic must not wake the hangup-only watcher.
             assert_eq!(unsafe { libc::poll(&mut hangup_only, 1, 0) }, 0);
             assert_eq!(hangup_only.revents, 0);
