@@ -1329,6 +1329,7 @@ impl App {
             commands: &mut self.command_queue,
             navigation: &mut self.test_navigation,
             dirty_hint: DirtySections::ALL,
+            frame_retained: false,
         }
     }
 

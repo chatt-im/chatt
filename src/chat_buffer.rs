@@ -285,6 +285,12 @@ pub struct VirtualChatBuffer {
     room_id: Option<rpc::ids::RoomId>,
     next_notice_id: u64,
     layout_index: LayoutIndex,
+    /// Advances on any mutation that can move existing rendered rows: edits,
+    /// removals, prepends, eviction, collapse toggles, reflow. Pure tail
+    /// appends leave it stable, so an unchanged epoch plus a viewport-top
+    /// delta means the visible rows merely shifted and the renderer may
+    /// scroll them instead of rewriting.
+    layout_epoch: u64,
 }
 
 impl VirtualChatBuffer {
@@ -302,6 +308,7 @@ impl VirtualChatBuffer {
             room_id: None,
             next_notice_id: 1,
             layout_index: LayoutIndex::default(),
+            layout_epoch: 0,
         }
     }
 
@@ -332,6 +339,7 @@ impl VirtualChatBuffer {
             entry.layout.invalidate();
         }
         self.layout_index.invalidate();
+        self.bump_layout_epoch();
     }
 
     fn build_entry(&self, message: ChatMessage, local: bool) -> ChatEntry {
@@ -368,6 +376,7 @@ impl VirtualChatBuffer {
         self.messages[index] = entry;
         self.bump_reindex_revision();
         self.layout_index.invalidate();
+        self.bump_layout_epoch();
         true
     }
 
@@ -433,6 +442,7 @@ impl VirtualChatBuffer {
             anchor.message += count;
         }
         self.layout_index.invalidate();
+        self.bump_layout_epoch();
         self.trim_front();
     }
 
@@ -460,6 +470,7 @@ impl VirtualChatBuffer {
             anchor.message += 1;
         }
         self.layout_index.invalidate();
+        self.bump_layout_epoch();
         self.trim_front();
     }
 
@@ -480,6 +491,7 @@ impl VirtualChatBuffer {
         }
         if changed {
             self.layout_index.invalidate();
+            self.bump_layout_epoch();
         }
     }
 
@@ -562,6 +574,7 @@ impl VirtualChatBuffer {
             cursor.message -= 1;
         }
         self.layout_index.invalidate();
+        self.bump_layout_epoch();
     }
 
     fn build_ref_spans(&self, body: &str, ranges: Vec<Range<u32>>) -> Vec<MsgRefSpan> {
@@ -633,6 +646,7 @@ impl VirtualChatBuffer {
         self.room_id = None;
         self.next_notice_id = 1;
         self.layout_index.clear();
+        self.bump_layout_epoch();
     }
 
     pub fn len(&self) -> usize {
@@ -662,6 +676,14 @@ impl VirtualChatBuffer {
     fn bump_reindex_revision(&mut self) {
         self.bump_revision();
         self.reindex_revision = self.reindex_revision.wrapping_add(1);
+    }
+
+    pub(crate) fn layout_epoch(&self) -> u64 {
+        self.layout_epoch
+    }
+
+    fn bump_layout_epoch(&mut self) {
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
     }
 
     pub fn line(&self, message: usize, line: usize) -> &[Segment] {
@@ -1035,6 +1057,7 @@ impl VirtualChatBuffer {
         self.anchor = None;
         self.dragging = false;
         self.layout_index.invalidate();
+        self.bump_layout_epoch();
         self.clamp_positions(width);
     }
 
@@ -1123,6 +1146,7 @@ impl VirtualChatBuffer {
         }
         // Collapsing under the cursor or anchor pulls them into the preview.
         self.clamp_positions(width);
+        self.bump_layout_epoch();
         true
     }
 
@@ -1145,6 +1169,21 @@ impl VirtualChatBuffer {
     pub fn is_expanded(&self, message: usize) -> bool {
         let entry = &self.messages[message];
         entry.layout.lines() > COLLAPSE_LIMIT && entry.expanded
+    }
+
+    /// Returns the absolute row index of the viewport's top line at the given
+    /// dimensions, applying the same scroll clamp as
+    /// [`Self::visible_lines_into`] so a subsequent call computes the
+    /// identical window.
+    pub fn viewport_top(&mut self, width: u16, height: u16) -> usize {
+        let target = height as usize;
+        if self.messages.is_empty() || target == 0 {
+            return 0;
+        }
+        self.ensure_layout_index(width.max(1));
+        let total = self.layout_index.total_rows();
+        self.scroll_offset = self.scroll_offset.min(total.saturating_sub(target));
+        total.saturating_sub(self.scroll_offset.saturating_add(target))
     }
 
     pub fn visible_lines_into(
@@ -1571,6 +1610,7 @@ impl VirtualChatBuffer {
                 && self.layout_index.rows.len() == self.layout_index.blocks.len();
             self.messages.drain(0..excess);
             self.bump_reindex_revision();
+            self.bump_layout_epoch();
             self.scroll_offset = self.scroll_offset.saturating_sub(excess);
             let anchor_evicted = self.anchor.is_some_and(|anchor| anchor.message < excess);
             let cursor_evicted = self.cursor.is_some_and(|cursor| cursor.message < excess);
@@ -4173,5 +4213,114 @@ mod tests {
         assert!(buf.layout_index.valid);
         assert_eq!(buf.layout_index.full_rebuilds, rebuilds);
         assert_eq!(total, buf.visible_lines(40, 10_000, 0).len());
+    }
+
+    #[test]
+    fn layout_epoch_stable_across_tail_appends() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        let epoch = buf.layout_epoch();
+        for id in 1..6 {
+            buf.push_chat(chat_message(id, id * 1_000, "appended"), false);
+        }
+        buf.push_notice("net", "joined");
+        assert_eq!(buf.layout_epoch(), epoch);
+    }
+
+    #[test]
+    fn layout_epoch_bumps_when_existing_rows_shift() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for id in 10..15 {
+            buf.push_chat(chat_message(id, id * 1_000, "resident"), false);
+        }
+
+        let epoch = buf.layout_epoch();
+        buf.prepend_chat(vec![(chat_message(1, 1_000, "older"), false)]);
+        assert_ne!(buf.layout_epoch(), epoch, "prepend");
+
+        let epoch = buf.layout_epoch();
+        assert!(buf.edit_message(12, chat_message(12, 12_000, "edited")));
+        assert_ne!(buf.layout_epoch(), epoch, "edit");
+
+        let epoch = buf.layout_epoch();
+        buf.insert_chat(chat_message(2, 2_000, "straggler"), false);
+        assert_ne!(buf.layout_epoch(), epoch, "insert");
+
+        let epoch = buf.layout_epoch();
+        assert!(buf.remove_message(13));
+        assert_ne!(buf.layout_epoch(), epoch, "remove");
+
+        let epoch = buf.layout_epoch();
+        buf.on_reflow(30);
+        assert_ne!(buf.layout_epoch(), epoch, "reflow");
+
+        let epoch = buf.layout_epoch();
+        buf.clear();
+        assert_ne!(buf.layout_epoch(), epoch, "clear");
+    }
+
+    #[test]
+    fn layout_epoch_bumps_when_capacity_eviction_shifts_rows() {
+        let mut buf = VirtualChatBuffer::new(3, SyntaxTheme::default());
+        for id in 1..=3 {
+            buf.push_chat(chat_message(id, id * 1_000, "resident"), false);
+        }
+        let epoch = buf.layout_epoch();
+        buf.push_chat(chat_message(4, 4_000, "evicts the oldest"), false);
+        assert_ne!(buf.layout_epoch(), epoch);
+    }
+
+    #[test]
+    fn layout_epoch_bumps_only_on_effective_expand_toggle() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        let long_body = (0..COLLAPSE_LIMIT + 2)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        buf.push_chat(chat_message(1, 1_000, &long_body), false);
+        buf.push_chat(chat_message(2, 2_000, "short"), false);
+
+        let epoch = buf.layout_epoch();
+        assert!(buf.toggle_expand(0, 40));
+        assert_ne!(buf.layout_epoch(), epoch);
+
+        let epoch = buf.layout_epoch();
+        assert!(!buf.toggle_expand(1, 40));
+        assert_eq!(buf.layout_epoch(), epoch);
+    }
+
+    #[test]
+    fn viewport_top_matches_visible_window_and_clamps() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        assert_eq!(buf.viewport_top(40, 5), 0, "empty buffer");
+        for id in 1..=10 {
+            buf.push_chat(chat_message(id, id * 1_000, "m"), false);
+        }
+        let top = buf.viewport_top(40, 5);
+        assert_eq!(top, buf.max_scroll(40, 5), "pinned to the bottom");
+
+        buf.scroll_up(2, 40, 5);
+        assert_eq!(buf.viewport_top(40, 5), top - 2);
+
+        buf.scroll_up(1_000, 40, 5);
+        assert_eq!(buf.viewport_top(40, 5), 0, "clamped at the oldest line");
+
+        assert_eq!(buf.viewport_top(40, 10_000), 0, "window taller than content");
+        assert_eq!(buf.viewport_top(40, 0), 0);
+    }
+
+    #[test]
+    fn viewport_top_advances_by_appended_rows_while_pinned() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for id in 1..=10 {
+            buf.push_chat(chat_message(id, id * 1_000, "m"), false);
+        }
+        buf.bottom();
+        let top = buf.viewport_top(40, 5);
+
+        buf.push_chat(chat_message(11, 11_000, "new"), false);
+
+        let new_top = buf.viewport_top(40, 5);
+        assert!(new_top > top, "append while pinned shifts the window down");
+        assert_eq!(new_top, buf.max_scroll(40, 5));
     }
 }

@@ -127,6 +127,7 @@ impl ClientThread {
                 commands: &mut queued,
                 navigation: &mut local_navigation,
                 dirty_hint: DirtySections::ALL,
+                frame_retained: false,
             };
             ModeStack::new_with_cx(root, &mut cx)
         };
@@ -195,6 +196,7 @@ impl ClientThread {
                     commands: &mut queued,
                     navigation: &mut local_navigation,
                     dirty_hint: DirtySections::ALL,
+                    frame_retained: false,
                 };
                 mode_stack.apply_pending_cx(&mut cx);
                 for event in client_events {
@@ -223,6 +225,7 @@ impl ClientThread {
                     if !retained_seeded {
                         dirty = DirtySections::ALL;
                     }
+                    cx.frame_retained = retained_seeded;
                     buffer.set_swap(Swap::Retained);
                 } else {
                     // Non-room screens draw immediate-mode frames and rely on
@@ -264,6 +267,7 @@ impl ClientThread {
                         commands: &mut queued,
                         navigation: &mut local_navigation,
                         dirty_hint: DirtySections::ALL,
+                        frame_retained: false,
                     };
                     let (action, event_dirty) = match event {
                         Event::Key(key) => {
