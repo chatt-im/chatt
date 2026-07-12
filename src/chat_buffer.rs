@@ -4304,7 +4304,11 @@ mod tests {
         buf.scroll_up(1_000, 40, 5);
         assert_eq!(buf.viewport_top(40, 5), 0, "clamped at the oldest line");
 
-        assert_eq!(buf.viewport_top(40, 10_000), 0, "window taller than content");
+        assert_eq!(
+            buf.viewport_top(40, 10_000),
+            0,
+            "window taller than content"
+        );
         assert_eq!(buf.viewport_top(40, 0), 0);
     }
 

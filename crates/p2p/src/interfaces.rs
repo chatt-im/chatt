@@ -54,6 +54,36 @@ impl InterfaceSnapshot {
     pub fn interfaces(&self) -> &[LocalInterface] {
         &self.interfaces
     }
+
+    pub fn host_candidates_with_metadata(
+        &self,
+        socket_id: u32,
+        generation: u64,
+        port: u16,
+        include_loopback: bool,
+        next_id: &mut u32,
+        prefer_ipv6: bool,
+    ) -> Vec<Candidate> {
+        let mut candidates = Vec::new();
+        for interface in &self.interfaces {
+            if !interface.usable_for_host_candidate(include_loopback) {
+                continue;
+            }
+            let id = *next_id;
+            *next_id = next_id.wrapping_add(1).max(1);
+            candidates.push(Candidate::with_metadata(
+                id,
+                socket_id,
+                generation,
+                CandidateKind::Host,
+                SocketAddr::new(interface.addr, port),
+                None,
+                true,
+                prefer_ipv6,
+            ));
+        }
+        candidates
+    }
 }
 
 pub fn host_candidates(
@@ -72,25 +102,14 @@ pub fn host_candidates_with_metadata(
     next_id: &mut u32,
     prefer_ipv6: bool,
 ) -> io::Result<Vec<Candidate>> {
-    let mut candidates = Vec::new();
-    for interface in discover_interfaces()? {
-        if !interface.usable_for_host_candidate(include_loopback) {
-            continue;
-        }
-        let id = *next_id;
-        *next_id = next_id.wrapping_add(1).max(1);
-        candidates.push(Candidate::with_metadata(
-            id,
-            socket_id,
-            generation,
-            CandidateKind::Host,
-            SocketAddr::new(interface.addr, port),
-            None,
-            true,
-            prefer_ipv6,
-        ));
-    }
-    Ok(candidates)
+    Ok(InterfaceSnapshot::capture()?.host_candidates_with_metadata(
+        socket_id,
+        generation,
+        port,
+        include_loopback,
+        next_id,
+        prefer_ipv6,
+    ))
 }
 
 pub fn is_virtual_interface_name(name: &str) -> bool {
@@ -254,5 +273,50 @@ mod tests {
         .unwrap();
 
         assert!(after.changed_from(&before));
+    }
+
+    #[test]
+    fn snapshot_builds_host_candidates_without_rediscovery() {
+        let snapshot = InterfaceSnapshot::from_interfaces(vec![
+            LocalInterface {
+                index: 1,
+                name: "eth0".to_string(),
+                addr: "192.168.1.2".parse().unwrap(),
+                is_up: true,
+                is_loopback: false,
+                is_virtual: false,
+            },
+            LocalInterface {
+                index: 2,
+                name: "lo".to_string(),
+                addr: "127.0.0.1".parse().unwrap(),
+                is_up: true,
+                is_loopback: true,
+                is_virtual: false,
+            },
+            LocalInterface {
+                index: 3,
+                name: "tun0".to_string(),
+                addr: "10.8.0.2".parse().unwrap(),
+                is_up: true,
+                is_loopback: false,
+                is_virtual: true,
+            },
+        ])
+        .unwrap();
+        let mut next_id = 7;
+
+        let candidates =
+            snapshot.host_candidates_with_metadata(3, 11, 5000, false, &mut next_id, false);
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.id, 7);
+        assert_eq!(candidate.socket_id, 3);
+        assert_eq!(candidate.generation, 11);
+        assert_eq!(candidate.kind, CandidateKind::Host);
+        assert_eq!(candidate.addr, "192.168.1.2:5000".parse().unwrap());
+        assert!(candidate.verified);
+        assert_eq!(next_id, 8);
     }
 }

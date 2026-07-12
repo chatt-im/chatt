@@ -17,7 +17,7 @@ use std::{
 use chatt_p2p::{
     Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole,
     NatClassifier, NatKind, ReflexiveObservation, RestartPortPolicy, StunAuth, TraversalAgent,
-    interfaces::{InterfaceSnapshot, host_candidates_with_metadata},
+    interfaces::InterfaceSnapshot,
     socket::{UdpSocketOptions, bind_udp_socket, is_ignorable_udp_error},
     stun::{StunMessage, is_stun_message},
 };
@@ -1141,8 +1141,7 @@ fn run_worker_inner(
         awaiting_udp_bound: false,
         udp_bind_attempts: 0,
         udp_reported_unreachable: false,
-        interface_snapshot: InterfaceSnapshot::capture().ok(),
-        next_interface_poll: Instant::now() + INTERFACE_POLL_INTERVAL,
+        interface_monitor: InterfaceMonitor::new(Instant::now()),
         next_file_transfer: 1,
         outgoing_uploads: VecDeque::new(),
         upload_throttle: UploadThrottle::new(config.upload_rate_bytes),
@@ -1665,8 +1664,7 @@ struct WorkerState {
     /// Whether a [`NetworkEvent::MediaConnectivity`] failure has already been
     /// announced for the current outage, so the failure edge fires once.
     udp_reported_unreachable: bool,
-    interface_snapshot: Option<InterfaceSnapshot>,
-    next_interface_poll: Instant,
+    interface_monitor: InterfaceMonitor,
     next_file_transfer: u64,
     outgoing_uploads: VecDeque<OutgoingUpload>,
     upload_throttle: UploadThrottle,
@@ -1677,6 +1675,71 @@ struct WorkerState {
     shutdown: bool,
     disconnect_reason: Option<String>,
     auth_failure: Option<(u16, String)>,
+}
+
+#[derive(Debug)]
+struct InterfaceMonitor {
+    snapshot: Option<InterfaceSnapshot>,
+    next_poll: Instant,
+}
+
+impl InterfaceMonitor {
+    fn new(now: Instant) -> Self {
+        Self {
+            snapshot: None,
+            next_poll: now,
+        }
+    }
+
+    fn snapshot(&self) -> Option<&InterfaceSnapshot> {
+        self.snapshot.as_ref()
+    }
+
+    fn deactivate(&mut self, now: Instant) {
+        self.snapshot = None;
+        self.next_poll = now;
+    }
+
+    fn ensure_with<F>(&mut self, now: Instant, capture: F) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<InterfaceSnapshot>,
+    {
+        if self.snapshot.is_none() {
+            let _ = self.refresh_with(now, capture)?;
+        }
+        Ok(())
+    }
+
+    fn poll_with<F>(&mut self, active: bool, now: Instant, capture: F) -> io::Result<Option<bool>>
+    where
+        F: FnOnce() -> io::Result<InterfaceSnapshot>,
+    {
+        if !active {
+            self.deactivate(now);
+            return Ok(None);
+        }
+        self.refresh_with(now, capture)
+    }
+
+    /// Refreshes a due snapshot and reports whether it differs from the
+    /// previous successful capture. A failed capture retains the previous
+    /// baseline and is retried at the normal interval.
+    fn refresh_with<F>(&mut self, now: Instant, capture: F) -> io::Result<Option<bool>>
+    where
+        F: FnOnce() -> io::Result<InterfaceSnapshot>,
+    {
+        if now < self.next_poll {
+            return Ok(None);
+        }
+        self.next_poll = now + INTERFACE_POLL_INTERVAL;
+        let snapshot = capture()?;
+        let changed = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|previous| snapshot.changed_from(previous));
+        self.snapshot = Some(snapshot);
+        Ok(Some(changed))
+    }
 }
 
 #[derive(Debug)]
@@ -4798,21 +4861,19 @@ impl WorkerState {
     }
 
     fn poll_interfaces(&mut self, now: Instant) {
-        if now < self.next_interface_poll {
-            return;
-        }
-        self.next_interface_poll = now + INTERFACE_POLL_INTERVAL;
-        let Ok(snapshot) = InterfaceSnapshot::capture() else {
-            return;
-        };
-        let changed = self
-            .interface_snapshot
-            .as_ref()
-            .is_some_and(|previous| snapshot.changed_from(previous));
-        self.interface_snapshot = Some(snapshot);
-        if changed {
-            kvlog::info!("network interfaces changed; requesting p2p restart");
-            self.request_p2p_restart();
+        match self.interface_monitor.poll_with(
+            self.p2p_enabled && self.voice_room.is_some(),
+            now,
+            InterfaceSnapshot::capture,
+        ) {
+            Ok(Some(true)) => {
+                kvlog::info!("network interfaces changed; requesting p2p restart");
+                self.request_p2p_restart();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                kvlog::warn!("network interface discovery failed", error = %error);
+            }
         }
     }
 
@@ -4938,6 +4999,12 @@ impl WorkerState {
         if self.session_id.is_none() {
             return;
         }
+        if let Err(error) = self
+            .interface_monitor
+            .ensure_with(Instant::now(), InterfaceSnapshot::capture)
+        {
+            kvlog::warn!("host candidate discovery failed", error = %error);
+        }
         let gathered = self.gather_p2p_candidates();
         self.p2p_local_candidates = gathered.local;
         self.p2p_candidates = gathered.published.clone();
@@ -5001,18 +5068,20 @@ impl WorkerState {
     /// back to the interface address for the responder.
     fn gather_p2p_candidates(&self) -> GatheredP2p {
         let mut next_id = 1;
-        let mut candidates = host_candidates_with_metadata(
-            1,
-            self.p2p_generation,
-            self.udp_local_addr.port(),
-            true,
-            &mut next_id,
-            self.prefer_ipv6,
-        )
-        .unwrap_or_else(|error| {
-            kvlog::warn!("host candidate discovery failed", error = %error);
-            Vec::new()
-        });
+        let mut candidates = self
+            .interface_monitor
+            .snapshot()
+            .map(|snapshot| {
+                snapshot.host_candidates_with_metadata(
+                    1,
+                    self.p2p_generation,
+                    self.udp_local_addr.port(),
+                    true,
+                    &mut next_id,
+                    self.prefer_ipv6,
+                )
+            })
+            .unwrap_or_default();
         if candidates.is_empty() {
             let fallback_ip = if self.server_udp_addr.is_ipv4() {
                 "127.0.0.1".parse().unwrap()
@@ -6535,12 +6604,126 @@ fn connection_id_from_p2p_username(username: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chatt_p2p::interfaces::LocalInterface;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn user(id: u64) -> UserId {
         UserId(id)
+    }
+
+    fn interface_snapshot(addr: &str) -> InterfaceSnapshot {
+        InterfaceSnapshot::from_interfaces(vec![LocalInterface {
+            index: 1,
+            name: "eth0".to_string(),
+            addr: addr.parse().unwrap(),
+            is_up: true,
+            is_loopback: false,
+            is_virtual: false,
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn inactive_interface_monitor_does_not_capture() {
+        let now = Instant::now();
+        let mut monitor = InterfaceMonitor::new(now);
+        let mut captures = 0;
+
+        assert_eq!(
+            monitor
+                .poll_with(false, now, || {
+                    captures += 1;
+                    Ok(interface_snapshot("192.168.1.2"))
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(captures, 0);
+        assert!(monitor.snapshot().is_none());
+    }
+
+    #[test]
+    fn candidate_publications_reuse_interface_baseline() {
+        let now = Instant::now();
+        let mut monitor = InterfaceMonitor::new(now);
+        let mut captures = 0;
+
+        monitor
+            .ensure_with(now, || {
+                captures += 1;
+                Ok(interface_snapshot("192.168.1.2"))
+            })
+            .unwrap();
+        monitor
+            .ensure_with(now + INTERFACE_POLL_INTERVAL * 2, || {
+                captures += 1;
+                Ok(interface_snapshot("192.168.1.3"))
+            })
+            .unwrap();
+
+        assert_eq!(captures, 1);
+        assert_eq!(
+            monitor.snapshot().unwrap().interfaces()[0].addr,
+            "192.168.1.2".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn active_interface_monitor_polls_on_interval_and_detects_changes() {
+        let now = Instant::now();
+        let mut monitor = InterfaceMonitor::new(now);
+        let mut captures = 0;
+
+        assert_eq!(
+            monitor
+                .poll_with(true, now, || {
+                    captures += 1;
+                    Ok(interface_snapshot("192.168.1.2"))
+                })
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            monitor
+                .poll_with(true, now + INTERFACE_POLL_INTERVAL / 2, || {
+                    captures += 1;
+                    Ok(interface_snapshot("192.168.1.3"))
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            monitor
+                .poll_with(true, now + INTERFACE_POLL_INTERVAL, || {
+                    captures += 1;
+                    Ok(interface_snapshot("192.168.1.3"))
+                })
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(captures, 2);
+
+        monitor
+            .poll_with(false, now + INTERFACE_POLL_INTERVAL * 2, || {
+                captures += 1;
+                Ok(interface_snapshot("192.168.1.4"))
+            })
+            .unwrap();
+        assert_eq!(captures, 2);
+        assert!(monitor.snapshot().is_none());
+
+        assert_eq!(
+            monitor
+                .poll_with(true, now + INTERFACE_POLL_INTERVAL * 2, || {
+                    captures += 1;
+                    Ok(interface_snapshot("192.168.1.4"))
+                })
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(captures, 3);
     }
 
     fn receiving(dir: &str, limit: u64) -> EffectiveFiles {
