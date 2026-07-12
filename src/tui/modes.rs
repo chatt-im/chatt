@@ -370,8 +370,7 @@ fn maybe_auto_close_markdown_code_fence(editor: &mut Editor, key: KeyEvent) {
     let Some(before_cursor) = text.get(..cursor) else {
         return;
     };
-    let line_start = before_cursor.rfind('\n').map_or(0, |index| index + 1);
-    if &before_cursor[line_start..] != "```" {
+    if !before_cursor.ends_with("```") || before_cursor.ends_with("````") {
         return;
     }
     let Some(after_cursor) = text.get(cursor..) else {
@@ -2825,6 +2824,20 @@ mod tests {
 
         assert_eq!(app.view.composer.text(), "```rust\n```");
         assert_eq!(app.view.composer.cursor_offset(), "```rust".len() as u32);
+    }
+
+    #[test]
+    fn typed_markdown_code_fence_after_prose_auto_closes() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+
+        type_text(&mut room, &mut app, "Hello ```rust");
+
+        assert_eq!(app.view.composer.text(), "Hello ```rust\n```");
+        assert_eq!(
+            app.view.composer.cursor_offset(),
+            "Hello ```rust".len() as u32
+        );
     }
 
     #[test]

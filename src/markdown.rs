@@ -48,8 +48,26 @@ enum ListKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Fence {
-    Bare,
-    WithLanguage(Range<usize>),
+    Bare { start: usize, standalone: bool },
+    WithLanguage { start: usize, lang: Range<usize> },
+}
+
+impl Fence {
+    fn start(&self) -> usize {
+        match self {
+            Self::Bare { start, .. } | Self::WithLanguage { start, .. } => *start,
+        }
+    }
+
+    fn is_standalone_bare(&self) -> bool {
+        matches!(
+            self,
+            Self::Bare {
+                standalone: true,
+                ..
+            }
+        )
+    }
 }
 
 enum LineKind {
@@ -155,17 +173,30 @@ pub fn tokenize(source: &str, out: &mut Vec<Token>) {
         }
 
         if !suppress_blocks && let Some(closing_index) = line.closing_fence {
-            close_paragraph(out, &mut paragraph_end, &mut suppress_blocks, line.start);
-            close_list(out, &mut open_list, line.start);
-            let lang = match &line.kind {
-                LineKind::Fence(Fence::Bare) => None,
-                LineKind::Fence(Fence::WithLanguage(range)) => Some(to_u32_range(range.clone())),
+            let fence = match &line.kind {
+                LineKind::Fence(fence) => fence,
                 _ => unreachable!("only fence openers have a closing fence"),
+            };
+            let fence_start = fence.start();
+            close_list(out, &mut open_list, line.start);
+            if content_start < fence_start {
+                if let Some(previous_end) = paragraph_end {
+                    push(out, TokenKind::HardBreak, previous_end..line.start);
+                } else {
+                    push_empty(out, TokenKind::ParagraphStart, line.start);
+                }
+                tokenize_inline(source, content_start..fence_start, out);
+                paragraph_end = Some(fence_start);
+            }
+            close_paragraph(out, &mut paragraph_end, &mut suppress_blocks, fence_start);
+            let lang = match fence {
+                Fence::Bare { .. } => None,
+                Fence::WithLanguage { lang, .. } => Some(to_u32_range(lang.clone())),
             };
             push(
                 out,
                 TokenKind::CodeBlockStart { lang },
-                content_start..line.content_end,
+                fence_start..line.content_end,
             );
             for code_line in &lines[line_index + 1..closing_index] {
                 let start = code_line.content_at_depth(&prefix_ends, depth);
@@ -289,9 +320,10 @@ fn scan_lines(bytes: &[u8]) -> (Vec<SourceLine>, Vec<usize>) {
     (lines, prefix_ends)
 }
 
-/// Matches every possible fence opener to the next bare fence at the same quote
-/// depth, provided no intervening line leaves that quote. The reverse pass is
-/// linear: lowering the depth truncates candidates from quote scopes that ended.
+/// Matches every possible fence opener to the next standalone bare fence at the
+/// same quote depth, provided no intervening line leaves that quote. The reverse
+/// pass is linear: lowering the depth truncates candidates from quote scopes
+/// that ended.
 fn match_fences(lines: &mut [SourceLine]) {
     let mut next_fence = vec![None];
     for index in (0..lines.len()).rev() {
@@ -304,7 +336,10 @@ fn match_fences(lines: &mut [SourceLine]) {
         if matches!(lines[index].kind, LineKind::Fence(_)) {
             lines[index].closing_fence = next_fence[depth];
         }
-        if matches!(lines[index].kind, LineKind::Fence(Fence::Bare)) {
+        if matches!(
+            &lines[index].kind,
+            LineKind::Fence(fence) if fence.is_standalone_bare()
+        ) {
             next_fence[depth] = Some(index);
         }
     }
@@ -571,13 +606,29 @@ fn find_emphasis_close(
 }
 
 fn fence_opener(bytes: &[u8], pos: usize, content_end: usize) -> Option<Fence> {
-    let line = &bytes[pos..content_end];
-    if line == b"```" {
-        return Some(Fence::Bare);
+    let mut start = pos;
+    while start + 3 <= content_end {
+        if bytes[start..].starts_with(b"```")
+            && (start == pos || bytes[start - 1] != b'`')
+            && (start + 3 == content_end || bytes[start + 3] != b'`')
+        {
+            let lang = &bytes[start + 3..content_end];
+            if lang.is_empty() {
+                return Some(Fence::Bare {
+                    start,
+                    standalone: start == pos,
+                });
+            }
+            if lang.iter().all(|b| b.is_ascii_alphanumeric()) {
+                return Some(Fence::WithLanguage {
+                    start,
+                    lang: start + 3..content_end,
+                });
+            }
+        }
+        start += 1;
     }
-    let lang = line.strip_prefix(b"```")?;
-    (!lang.is_empty() && lang.iter().all(|b| b.is_ascii_alphanumeric()))
-        .then_some(Fence::WithLanguage(pos + 3..content_end))
+    None
 }
 
 fn classify_line(bytes: &[u8], start: usize, end: usize) -> LineKind {
@@ -725,6 +776,22 @@ mod tests {
                 (TokenKind::CodeBlockStart { lang: None }, 0..3),
                 (TokenKind::CodeBlockLine, 4..8),
                 (TokenKind::CodeBlockEnd, 9..12),
+            ]
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_can_follow_prose_on_the_same_line() {
+        let source = "Hello ```rust\nlet x = 4;\n```";
+        assert_eq!(
+            pairs(source),
+            vec![
+                (TokenKind::ParagraphStart, 0..0),
+                (TokenKind::Text, 0..6),
+                (TokenKind::ParagraphEnd, 6..6),
+                (TokenKind::CodeBlockStart { lang: Some(9..13) }, 6..13),
+                (TokenKind::CodeBlockLine, 14..24),
+                (TokenKind::CodeBlockEnd, 25..28),
             ]
         );
     }
