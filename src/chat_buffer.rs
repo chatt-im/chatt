@@ -9,8 +9,6 @@ use crate::highlight::{self, HlClass};
 use crate::markdown::{Token, TokenKind};
 use crate::theme::SyntaxTheme;
 
-const REFLOW_TARGET: usize = 95;
-
 /// Wrapped body lines beyond this collapse a lone message behind an expander.
 const COLLAPSE_LIMIT: usize = 12;
 /// Body lines shown while a long message is collapsed.
@@ -1849,7 +1847,6 @@ impl MessageLayout {
 
     fn layout_next_block(&mut self, text: &str, refs: &[MsgRefSpan]) {
         let avail = (self.wrap_width as usize).max(1);
-        let target = avail.min(REFLOW_TARGET);
 
         if self.cursor >= self.tokens.len() {
             self.complete = true;
@@ -1867,7 +1864,7 @@ impl MessageLayout {
                     self.cursor + 1,
                     end,
                     Style::DEFAULT,
-                    (target, target),
+                    (avail, avail),
                     (0, 0),
                 );
                 self.cursor = end.saturating_add(1);
@@ -1886,14 +1883,14 @@ impl MessageLayout {
                     self.cursor + 1,
                     end,
                     Style::DEFAULT | Modifier::BOLD,
-                    (target, target),
+                    (avail, avail),
                     (0, 0),
                     prefix,
                 );
                 self.cursor = end.saturating_add(1);
             }
             TokenKind::UnorderedListStart | TokenKind::OrderedListStart => {
-                self.cursor = self.layout_list(text, refs, self.cursor + 1, target);
+                self.cursor = self.layout_list(text, refs, self.cursor + 1, avail);
             }
             TokenKind::CodeBlockStart { .. } => {
                 self.cursor = self.layout_code_block(text, self.cursor, avail);
@@ -2701,7 +2698,7 @@ fn token_range(token: &Token) -> Range<usize> {
 }
 
 fn estimate_lines(text: &str, avail: usize) -> usize {
-    let target = avail.min(REFLOW_TARGET).max(1);
+    let target = avail.max(1);
     let mut lines = 0usize;
     for line in text.lines() {
         lines = lines.saturating_add(UnicodeWidthStr::width(line).max(1).div_ceil(target));
@@ -3434,6 +3431,12 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn prose_wraps_at_the_available_terminal_width() {
+        let body = ["word"; 21].join(" ");
+        assert_eq!(rendered_lines(&body, 120), vec![body]);
     }
 
     #[test]
