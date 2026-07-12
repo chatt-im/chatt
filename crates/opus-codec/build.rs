@@ -234,8 +234,14 @@ fn build_bundled_and_link(opts: &BuildOptions) {
         }
 
         let mut simd_groups = vec![
-            (vec!["-msse"], vec![mk_sources("opus/celt_sources.mk", "CELT_SOURCES_SSE")]),
-            (vec!["-msse2"], vec![mk_sources("opus/celt_sources.mk", "CELT_SOURCES_SSE2")]),
+            (
+                vec!["-msse"],
+                vec![mk_sources("opus/celt_sources.mk", "CELT_SOURCES_SSE")],
+            ),
+            (
+                vec!["-msse2"],
+                vec![mk_sources("opus/celt_sources.mk", "CELT_SOURCES_SSE2")],
+            ),
             (
                 vec!["-msse4.1"],
                 vec![
@@ -253,9 +259,15 @@ fn build_bundled_and_link(opts: &BuildOptions) {
             ),
         ];
         if opts.dred_enabled {
-            simd_groups[1].1.push(mk_sources("opus/lpcnet_sources.mk", "DNN_SOURCES_SSE2"));
-            simd_groups[2].1.push(mk_sources("opus/lpcnet_sources.mk", "DNN_SOURCES_SSE4_1"));
-            simd_groups[3].1.push(mk_sources("opus/lpcnet_sources.mk", "DNN_SOURCES_AVX2"));
+            simd_groups[1]
+                .1
+                .push(mk_sources("opus/lpcnet_sources.mk", "DNN_SOURCES_SSE2"));
+            simd_groups[2]
+                .1
+                .push(mk_sources("opus/lpcnet_sources.mk", "DNN_SOURCES_SSE4_1"));
+            simd_groups[3]
+                .1
+                .push(mk_sources("opus/lpcnet_sources.mk", "DNN_SOURCES_AVX2"));
         }
 
         for (flags, source_lists) in simd_groups {
@@ -269,8 +281,14 @@ fn build_bundled_and_link(opts: &BuildOptions) {
             lib.objects(group.compile_intermediates());
         }
     } else if is_aarch64 {
-        lib.files(mk_sources("opus/celt_sources.mk", "CELT_SOURCES_ARM_NEON_INTR"));
-        lib.files(mk_sources("opus/silk_sources.mk", "SILK_SOURCES_ARM_NEON_INTR"));
+        lib.files(mk_sources(
+            "opus/celt_sources.mk",
+            "CELT_SOURCES_ARM_NEON_INTR",
+        ));
+        lib.files(mk_sources(
+            "opus/silk_sources.mk",
+            "SILK_SOURCES_ARM_NEON_INTR",
+        ));
         if opts.dred_enabled {
             lib.files(mk_sources("opus/lpcnet_sources.mk", "DNN_SOURCES_NEON"));
         }

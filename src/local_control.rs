@@ -320,7 +320,7 @@ mod imp {
         }
 
         #[cfg(test)]
-        fn spawn_at_path(path: PathBuf, events: EventSender) -> Result<Self, String> {
+        pub(crate) fn spawn_at_path(path: PathBuf, events: EventSender) -> Result<Self, String> {
             if let Some(parent) = path.parent() {
                 ensure_private_dir(parent)?;
             }
@@ -1354,10 +1354,18 @@ mod imp {
         stdin_fd: RawFd,
         stdout_fd: RawFd,
     ) -> Result<UnixStream, AttachConnectError> {
+        let path = socket_path().map_err(AttachConnectError::Failed)?;
+        connect_attach_to_path(&path, stdin_fd, stdout_fd)
+    }
+
+    pub(crate) fn connect_attach_to_path(
+        path: &Path,
+        stdin_fd: RawFd,
+        stdout_fd: RawFd,
+    ) -> Result<UnixStream, AttachConnectError> {
         use sendfd::SendWithFd;
 
-        let path = socket_path().map_err(AttachConnectError::Failed)?;
-        let mut stream = match UnixStream::connect(&path) {
+        let mut stream = match UnixStream::connect(path) {
             Ok(stream) => stream,
             Err(error)
                 if matches!(
@@ -2033,6 +2041,8 @@ mod imp {
     }
 }
 
+#[cfg(all(unix, test))]
+pub(crate) use imp::connect_attach_to_path;
 #[cfg(unix)]
 pub(crate) use imp::write_attach_ack;
 pub(crate) use imp::{

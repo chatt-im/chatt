@@ -670,7 +670,11 @@ impl RecoveryState {
     }
 
     fn due_at(&self) -> Option<Instant> {
-        if self.exhausted { None } else { self.next_retry_at }
+        if self.exhausted {
+            None
+        } else {
+            self.next_retry_at
+        }
     }
 }
 
@@ -4995,7 +4999,9 @@ impl App {
             self.supervisor.capture.due_at(),
             self.supervisor.playback.due_at(),
             self.supervisor.device_probe.next_at,
-            self.pending_audio_apply.as_ref().map(|pending| pending.deadline),
+            self.pending_audio_apply
+                .as_ref()
+                .map(|pending| pending.deadline),
             self.pending_room_catalog_save
                 .as_ref()
                 .map(|pending| pending.deadline),

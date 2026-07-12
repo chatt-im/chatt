@@ -509,7 +509,9 @@ fn install_panic_hook() {
 mod tests {
     use std::{os::unix::net::UnixStream, sync::Arc};
 
-    use super::{RemoteClient, RemoteShutdown, panic_payload_message, shutdown_remote};
+    use super::{
+        RemoteClient, RemoteShutdown, handle_runtime_event, panic_payload_message, shutdown_remote,
+    };
     use crate::{attach, client_channel::ClientChannel};
     use parking_lot::Mutex;
 
@@ -575,5 +577,179 @@ mod tests {
             panic_payload_message(&17_u32),
             "panic payload was not a string"
         );
+    }
+
+    /// Attaches a second head through the real control socket, PTY, and
+    /// runtime dispatch: the shim sends its terminal descriptors over
+    /// SCM_RIGHTS, the daemon renders the server list into the PTY in raw
+    /// mode, a Ctrl-C typed at the PTY master travels the input path into a
+    /// detach, and teardown restores the terminal. Everything platform
+    /// sensitive in multi-head attach runs for real; only signal handlers and
+    /// the daemon's outer event loop are driven by the test.
+    #[test]
+    fn attached_head_renders_ui_and_detaches_over_real_pty() {
+        use std::collections::HashMap;
+        use std::fs::OpenOptions;
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use portable_pty::{PtySize, native_pty_system};
+
+        use crate::app::{App, AppEvent, EventSender};
+        use crate::attach::{AttachOutcome, SignalPipe, client_loop};
+        use crate::client_channel::DirtySections;
+        use crate::config::Config;
+        use crate::local_control::{ControlSocket, connect_attach_to_path};
+
+        fn local_modes(fd: std::os::fd::RawFd) -> libc::tcflag_t {
+            // SAFETY: tcgetattr initializes the structure on success, which
+            // the assert establishes before c_lflag is read.
+            unsafe {
+                let mut termios: libc::termios = std::mem::zeroed();
+                assert_eq!(libc::tcgetattr(fd, &mut termios), 0);
+                termios.c_lflag
+            }
+        }
+
+        fn replay(output: &Mutex<Vec<u8>>, emulator: &mut vt100::Parser, consumed: &mut usize) {
+            let output = output.lock();
+            emulator.process(&output[*consumed..]);
+            *consumed = output.len();
+        }
+
+        let dir = std::env::temp_dir().join(format!("chatt-attach-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("control.sock");
+
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("PTY pair");
+        let tty_name = pty.master.tty_name().expect("PTY slave name");
+        let terminal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tty_name)
+            .expect("open PTY slave for shim");
+        let terminal_fd = terminal.as_raw_fd();
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut master_reader = pty.master.try_clone_reader().expect("PTY master reader");
+        let collected = output.clone();
+        thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                let Ok(read) = master_reader.read(&mut chunk) else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                collected.lock().extend_from_slice(&chunk[..read]);
+            }
+        });
+        let mut master_writer = pty.master.take_writer().expect("PTY master writer");
+
+        let (events_tx, events_rx) = mpsc::channel();
+        let sender = EventSender(events_tx);
+        let _socket = ControlSocket::spawn_at_path(socket_path.clone(), sender.clone()).unwrap();
+
+        let shim = thread::spawn(move || {
+            let mut stream = connect_attach_to_path(&socket_path, terminal_fd, terminal_fd)
+                .map_err(|error| format!("attach failed: {error:?}"))?;
+            let signals = SignalPipe::new()?;
+            client_loop(&mut stream, &signals, [terminal_fd, terminal_fd])
+        });
+
+        let event = events_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("attach request reaches the daemon");
+        let AppEvent::ClientAttach { hello, .. } = &event else {
+            panic!("expected attach event");
+        };
+        assert_eq!(hello.pid, std::process::id());
+
+        let mut app = App::new(Config::default(), None).expect("test app");
+        let mut clients = HashMap::new();
+        let mut next_client_id = 1;
+        handle_runtime_event(&mut app, event, &mut clients, &mut next_client_id, &sender);
+        assert_eq!(clients.len(), 1, "attach registers one remote client");
+        // Like the runtime loop, waiting happens with the shared state open to
+        // the render thread; holding the core guards would block its setup.
+        app.release_core_state();
+
+        let mut emulator = vt100::Parser::new(24, 80, 0);
+        let mut consumed = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            replay(&output, &mut emulator, &mut consumed);
+            let screen = emulator.screen();
+            if screen.alternate_screen()
+                && screen.contents().contains("No servers are configured yet")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "server list never rendered; screen: {:?}",
+                emulator.screen().contents()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            local_modes(terminal_fd) & (libc::ECHO | libc::ICANON | libc::ISIG),
+            0,
+            "the attached head switches the real terminal to raw mode"
+        );
+
+        master_writer.write_all(b"\x03").expect("type the quit key");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !clients.is_empty() {
+            let event = events_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("daemon event before the teardown deadline");
+            app.acquire_core_state();
+            handle_runtime_event(&mut app, event, &mut clients, &mut next_client_id, &sender);
+            app.release_core_state();
+            for client in clients.values() {
+                client.channel.wake_sections(DirtySections::ALL);
+            }
+        }
+
+        assert_eq!(
+            shim.join().unwrap(),
+            Ok((AttachOutcome::UserQuit, false)),
+            "the shim observes the acked detach"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            replay(&output, &mut emulator, &mut consumed);
+            if !emulator.screen().alternate_screen() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "teardown never left the alternate screen; screen: {:?}",
+                emulator.screen().contents()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            local_modes(terminal_fd) & libc::ECHO,
+            0,
+            "teardown restores cooked terminal modes"
+        );
+
+        drop(terminal);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
