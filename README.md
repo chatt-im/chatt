@@ -13,8 +13,8 @@ not retain chat history.
 Chatt needs Rust 1.87 or newer. Install that with `rustup` or another current
 Rust toolchain source before building. The repository builds the bundled Opus
 codec by default, including DRED support, so Linux builds also need a C
-toolchain, CMake, ALSA development headers, and the tools used by the Opus
-build script.
+toolchain, ALSA development headers, and the tools used by the Opus build
+script.
 
 If you use `rustup`, select a current stable toolchain:
 
@@ -27,13 +27,13 @@ Install build dependencies on Debian/Ubuntu:
 
 ```sh
 sudo apt update
-sudo apt install -y build-essential pkg-config libasound2-dev cmake wget tar ca-certificates git
+sudo apt install -y build-essential pkg-config libasound2-dev wget tar ca-certificates git
 ```
 
 Install build dependencies on Arch Linux:
 
 ```sh
-sudo pacman -Syu --needed base-devel rustup pkgconf alsa-lib cmake wget tar ca-certificates git
+sudo pacman -Syu --needed base-devel rustup pkgconf alsa-lib wget tar ca-certificates git
 ```
 
 Dependency notes:
@@ -50,10 +50,10 @@ Dependency notes:
 - PipeWire support is available as a non-default Cargo feature. Enable it with
   `cargo run -p chatt --features pipewire -- --config chatt.toml`; this path
   needs PipeWire development files discoverable by `pkg-config`.
-- `cmake` and the C toolchain build the bundled `crates/opus-codec` copy of
-  libopus. The default `chatt` build enables the Opus `dred` feature. The DRED
-  model weights it needs are vendored in `crates/opus-codec/opus/dnn`, so the
-  build pulls nothing from the network.
+- The C toolchain builds the bundled `crates/opus-codec` copy of libopus. The
+  default `chatt` build enables the Opus `dred` feature. The DRED model weights
+  it needs are vendored in `crates/opus-codec/opus/dnn`, so the build pulls
+  nothing from the network.
 - The optional RNNoise V2 denoiser uses an external `weights_blob.bin` at build
   time. The blob is intentionally not checked into this repository. Generating
   it from upstream RNNoise requires the usual autotools stack in addition to the

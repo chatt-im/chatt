@@ -48,7 +48,6 @@ test:linux-x86_64:
     - >-
       apt-get install --yes --no-install-recommends
       clang
-      cmake
       ffmpeg
       libasound2-dev
       libclang-dev
@@ -72,7 +71,7 @@ test:macos-arm64:
     RUSTUP_HOME: "$CI_PROJECT_DIR/.rustup"
     RUSTUP_INIT_SKIP_PATH_CHECK: "yes"
   before_script:
-    - brew install cmake ffmpeg
+    - brew install ffmpeg
     - mkdir -p "$CARGO_HOME/bin"
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
     - export PATH="$CARGO_HOME/bin:$PATH"
