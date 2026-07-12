@@ -34,7 +34,10 @@ use crate::{
         NetworkClient, NetworkCommand, NetworkEvent, TerminalVerb, TransferDirection,
         UploadFileRequest, spawn_open_pair_once, spawn_pair_once,
     },
-    config::{self, Config, ServerEntry, SoundboardClip, ThemeSelection, validate_server_entry},
+    config::{
+        self, Config, NotificationSoundMode, ServerEntry, SoundboardClip, ThemeSelection,
+        validate_server_entry,
+    },
     local_control, settings,
     tui::{modes::SettingsSession, view::ClientView},
     ui::settings::{
@@ -404,6 +407,14 @@ pub(crate) struct App {
     /// call playback exists. `None` when loopback is off or reuses the live call
     /// playback. See [`App::set_loopback_enabled`].
     pub loopback_playback: Option<LivePlayback>,
+    /// Lazily started output stream that plays notification sounds outside a
+    /// call when [`NotificationSoundMode::Always`] is configured. Torn down by
+    /// the tick supervisor once [`Self::notification_playback_idle_at`] passes.
+    notification_playback: Option<LivePlayback>,
+    notification_playback_idle_at: Option<Instant>,
+    /// Backoff after a failed lazy start so a broken output device is not
+    /// reopened on every incoming message.
+    notification_playback_retry_at: Option<Instant>,
     /// Shared route the capture encoder thread reads to feed local frames into
     /// the loopback stream. Cloned into the capture packet handler; whether a
     /// sink is installed ([`LoopbackTap::is_active`]) is the enabled state, so no
@@ -587,6 +598,21 @@ const ROOM_CATALOG_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// silence marker before transport is hard-disabled. Sized to comfortably cover
 /// the 60 ms fade and the marker that follows it.
 const VOICE_DEAFEN_GRACE: Duration = Duration::from_millis(120);
+
+/// How long the lazy notification output stream lingers after its last clip
+/// finishes, so notification bursts reuse one stream instead of reopening the
+/// device per sound.
+const NOTIFICATION_STREAM_LINGER: Duration = Duration::from_secs(5);
+/// Cooldown between lazy notification stream start attempts after a failure.
+const NOTIFICATION_START_RETRY: Duration = Duration::from_secs(30);
+
+/// When the lazy notification stream becomes idle: the clip has fully played
+/// at 48 kHz plus [`NOTIFICATION_STREAM_LINGER`].
+fn notification_idle_deadline(now: Instant, clip_samples: usize) -> Instant {
+    let clip =
+        Duration::from_micros(clip_samples as u64 * 1_000_000 / u64::from(audio::SAMPLE_RATE));
+    now + clip + NOTIFICATION_STREAM_LINGER
+}
 
 impl RecoveryState {
     fn schedule(&mut self, now: Instant, reason: impl Into<String>) -> RecoverySchedule {
@@ -1224,6 +1250,9 @@ impl App {
             allow_settings_preview_capture: !soundboard_enabled,
             playback: None,
             loopback_playback: None,
+            notification_playback: None,
+            notification_playback_idle_at: None,
+            notification_playback_retry_at: None,
             loopback_tap: LoopbackTap::default(),
             output_volume_percent_bits,
             soundboard_busy: Arc::new(AtomicBool::new(false)),
@@ -4721,6 +4750,12 @@ impl App {
         if capture || playback {
             self.schedule_audio_apply(capture, playback);
         }
+        // Release the lazy notification stream when a playback restart is due
+        // (don't pin the old output device) or when sounds no longer play
+        // out-of-call; the next notification rebuilds it if needed.
+        if playback || self.config.notifications.sounds != NotificationSoundMode::Always {
+            self.drop_notification_playback();
+        }
         self.mark_settings_dirty(session);
     }
 
@@ -4900,6 +4935,7 @@ impl App {
         dirty |= self.apply_pending_audio_restart();
         self.apply_pending_room_catalog_save(now);
         self.supervise_voice_teardown(now);
+        self.supervise_notification_playback(now);
         dirty |= self.refresh_session_projection();
         dirty |= self.sync_daemon_config_if_changed();
         dirty
@@ -4978,6 +5014,27 @@ impl App {
         // still deafened and the fade tail has been sent.
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.stop_mic_capture();
+    }
+
+    /// Tears down the lazy notification playback stream once its idle deadline
+    /// passes, or early when its worker died so the next notification rebuilds
+    /// it instead of feeding a zombie stream.
+    fn supervise_notification_playback(&mut self, now: Instant) {
+        if self
+            .notification_playback
+            .as_ref()
+            .is_some_and(LivePlayback::worker_finished)
+        {
+            self.drop_notification_playback();
+            return;
+        }
+        let Some(deadline) = self.notification_playback_idle_at else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        self.drop_notification_playback();
     }
 
     fn update_lobby_talking(&mut self, now: Instant) -> bool {
@@ -6367,6 +6424,7 @@ impl App {
             }
             self.set_network_playback_sink(None);
             self.playback.take();
+            self.drop_notification_playback();
             self.publish_voice_status();
             self.set_status("deafened");
         } else {
@@ -7107,6 +7165,9 @@ impl App {
             Ok(playback) => {
                 let fell_back = playback.buffer_fallback();
                 let sink = playback.sink();
+                // The call stream takes over notification duty; never keep two
+                // device streams open.
+                self.drop_notification_playback();
                 self.playback = Some(playback);
                 self.playback_error = None;
                 self.supervisor.playback.on_rebuild_ok(Instant::now());
@@ -7184,7 +7245,10 @@ impl App {
             self.playback.as_ref().and_then(LivePlayback::sink)
         } else {
             self.loopback_playback = None;
-            let playback = self.start_loopback_playback()?;
+            // The loopback stream takes over notification duty; a second
+            // standalone stream on the same device would fight it.
+            self.drop_notification_playback();
+            let playback = self.start_standalone_playback()?;
             let sink = playback.sink();
             self.loopback_playback = Some(playback);
             sink
@@ -7236,9 +7300,10 @@ impl App {
         self.set_error(format!("loopback unavailable: {error}"));
     }
 
-    /// Starts a dedicated playback stream for the loopback monitor, mirroring the
-    /// configured-then-default output fallback used by `start_playback_stream`.
-    fn start_loopback_playback(&self) -> Result<LivePlayback, AudioStartError> {
+    /// Starts a standalone playback stream outside a call (loopback monitor,
+    /// out-of-call notifications), mirroring the configured-then-default output
+    /// fallback used by `start_playback_stream`.
+    fn start_standalone_playback(&self) -> Result<LivePlayback, AudioStartError> {
         let configured_output = self.config.audio.output_device_id.clone();
         let resolved_output = configured_output
             .as_deref()
@@ -7248,7 +7313,7 @@ impl App {
             Ok(playback) => Ok(playback),
             Err(error) if resolved_output.is_some() => {
                 kvlog::warn!(
-                    "loopback output failed, trying default",
+                    "standalone output failed, trying default",
                     error = error.message.as_str()
                 );
                 audio::start_live_playback(self.live_playback_config(None, None))
@@ -7283,24 +7348,94 @@ impl App {
         }
     }
 
-    /// Mixes a notification sound into the live output. The playback stream
-    /// exists only inside a call, so the `Some` guard scopes sounds to in-call.
-    fn play_notification(&self, sound: NotificationSound) {
+    /// Mixes a notification sound into the live output, honoring the configured
+    /// [`NotificationSoundMode`]. In-call sounds ride the call playback stream;
+    /// with `Always` and no call, the clip goes to the loopback monitor stream
+    /// when one is live, otherwise to a lazily started standalone stream that
+    /// the tick supervisor tears down after an idle linger. Deafen always
+    /// suppresses sounds.
+    fn play_notification(&mut self, sound: NotificationSound) {
+        if self.deafened.load(Ordering::Relaxed) {
+            return;
+        }
+        let mode = self.config.notifications.sounds;
+        if mode == NotificationSoundMode::Never {
+            return;
+        }
         if let Some(playback) = &self.playback {
-            let volume_db = self.config.notifications.volume_db(sound);
-            let samples = audio::sound_samples(sound);
-            if volume_db == 0.0 {
-                playback.play_notification(samples);
-            } else {
-                let gain = 10.0_f32.powf(volume_db / 20.0);
-                let scaled: Arc<[f32]> = samples
-                    .iter()
-                    .map(|sample| sample * gain)
-                    .collect::<Vec<_>>()
-                    .into();
-                playback.play_notification(scaled);
+            playback.play_notification(self.notification_clip(sound));
+            return;
+        }
+        if mode != NotificationSoundMode::Always {
+            return;
+        }
+        if let Some(playback) = &self.loopback_playback {
+            playback.play_notification(self.notification_clip(sound));
+            return;
+        }
+        if !self.ensure_notification_playback() {
+            return;
+        }
+        let samples = self.notification_clip(sound);
+        let deadline = notification_idle_deadline(Instant::now(), samples.len());
+        let Some(playback) = &self.notification_playback else {
+            return;
+        };
+        playback.play_notification(samples);
+        self.notification_playback_idle_at = Some(match self.notification_playback_idle_at {
+            Some(existing) => existing.max(deadline),
+            None => deadline,
+        });
+    }
+
+    /// The decoded clip for `sound` with the configured per-sound gain applied.
+    fn notification_clip(&self, sound: NotificationSound) -> Arc<[f32]> {
+        let volume_db = self.config.notifications.volume_db(sound);
+        let samples = audio::sound_samples(sound);
+        if volume_db == 0.0 {
+            return samples;
+        }
+        let gain = 10.0_f32.powf(volume_db / 20.0);
+        samples
+            .iter()
+            .map(|sample| sample * gain)
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    /// Ensures the lazy notification playback stream is running, respecting the
+    /// failure cooldown. Returns whether a stream is available.
+    fn ensure_notification_playback(&mut self) -> bool {
+        if self.notification_playback.is_some() {
+            return true;
+        }
+        let now = Instant::now();
+        if self
+            .notification_playback_retry_at
+            .is_some_and(|at| now < at)
+        {
+            return false;
+        }
+        match self.start_standalone_playback() {
+            Ok(playback) => {
+                self.notification_playback = Some(playback);
+                self.notification_playback_retry_at = None;
+                true
+            }
+            Err(error) => {
+                kvlog::warn!(
+                    "notification playback start failed",
+                    error = error.message.as_str()
+                );
+                self.notification_playback_retry_at = Some(now + NOTIFICATION_START_RETRY);
+                false
             }
         }
+    }
+
+    fn drop_notification_playback(&mut self) {
+        self.notification_playback = None;
+        self.notification_playback_idle_at = None;
     }
 
     fn stop_audio(&mut self) {
@@ -7584,6 +7719,65 @@ mod tests {
             !app.tick(),
             "a stable projection must not cause another wake"
         );
+    }
+
+    #[test]
+    fn notification_suppressed_while_deafened() {
+        let mut app = test_app();
+        app.config.notifications.sounds = NotificationSoundMode::Always;
+        app.deafened.store(true, Ordering::Relaxed);
+
+        app.play_notification(NotificationSound::MessageReceived);
+
+        assert!(app.notification_playback.is_none());
+        assert!(app.notification_playback_retry_at.is_none());
+    }
+
+    #[test]
+    fn notification_out_of_call_needs_always_mode() {
+        for mode in [NotificationSoundMode::Never, NotificationSoundMode::InCalls] {
+            let mut app = test_app();
+            app.config.notifications.sounds = mode;
+
+            app.play_notification(NotificationSound::MessageReceived);
+
+            assert!(app.notification_playback.is_none(), "{mode:?}");
+            assert!(app.notification_playback_retry_at.is_none(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn notification_retry_cooldown_blocks_lazy_start() {
+        let mut app = test_app();
+        app.config.notifications.sounds = NotificationSoundMode::Always;
+        let retry_at = Instant::now() + NOTIFICATION_START_RETRY;
+        app.notification_playback_retry_at = Some(retry_at);
+
+        app.play_notification(NotificationSound::MessageReceived);
+
+        assert!(app.notification_playback.is_none());
+        assert_eq!(app.notification_playback_retry_at, Some(retry_at));
+    }
+
+    #[test]
+    fn notification_idle_deadline_covers_clip_and_linger() {
+        let now = Instant::now();
+        let deadline = notification_idle_deadline(now, 48_000);
+        assert_eq!(
+            deadline - now,
+            Duration::from_secs(1) + NOTIFICATION_STREAM_LINGER
+        );
+    }
+
+    #[test]
+    fn idle_deadline_teardown_clears_state() {
+        let mut app = test_app();
+        app.notification_playback_idle_at = Some(Instant::now());
+
+        app.tick();
+
+        assert!(app.notification_playback.is_none());
+        assert!(app.notification_playback_idle_at.is_none());
     }
 
     #[test]

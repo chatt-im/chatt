@@ -12,8 +12,9 @@ use crate::{
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_TARGET_LATENCY,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_TARGET_LATENCY, DownloadMode, FileConfig,
         FormBindings, HistoryConfig, MAX_NOTIFICATION_VOLUME_DB, MIN_NOTIFICATION_VOLUME_DB,
-        NotificationConfig, P2pConfig, ThemeSelection, UiConfig, WebAutoplay, WebConfig, WebViewer,
-        output_volume_percent_label, parse_output_volume_percent, valid_web_origin,
+        NotificationConfig, NotificationSoundMode, P2pConfig, ThemeSelection, UiConfig,
+        WebAutoplay, WebConfig, WebViewer, output_volume_percent_label,
+        parse_output_volume_percent, valid_web_origin,
     },
     paths,
     ui::select::{FuzzySelect, SelectableItem},
@@ -72,6 +73,7 @@ pub struct SettingsDraft {
     /// Transient add-row buffer for the allowed-origins list field. Never
     /// persisted; a committed value moves into `web_allowed_origins`.
     pub(crate) web_origins_new: String,
+    pub(crate) notification_sounds: NotificationSoundMode,
     pub(crate) message_notification_volume: String,
     pub(crate) peer_join_notification_volume: String,
     pub(crate) peer_leave_notification_volume: String,
@@ -252,6 +254,7 @@ impl SettingsDraft {
             web_autoplay: WebConfig::default().autoplay,
             web_viewer: WebConfig::default().viewer,
             web_origins_new: String::new(),
+            notification_sounds: NotificationConfig::default().sounds,
             message_notification_volume: db_value_text(0.0),
             peer_join_notification_volume: db_value_text(0.0),
             peer_leave_notification_volume: db_value_text(0.0),
@@ -296,6 +299,7 @@ impl SettingsDraft {
     }
 
     pub fn set_notifications_from_config(&mut self, notifications: &NotificationConfig) {
+        self.notification_sounds = notifications.sounds;
         self.message_notification_volume = db_value_text(notifications.message_volume_db);
         self.peer_join_notification_volume = db_value_text(notifications.peer_join_volume_db);
         self.peer_leave_notification_volume = db_value_text(notifications.peer_leave_volume_db);
@@ -395,6 +399,7 @@ impl SettingsDraft {
 
     pub fn to_notifications(&self) -> NotificationConfig {
         NotificationConfig {
+            sounds: self.notification_sounds,
             message_volume_db: self.message_notification_volume_db(),
             peer_join_volume_db: self.peer_join_notification_volume_db(),
             peer_leave_volume_db: self.peer_leave_notification_volume_db(),
@@ -1952,6 +1957,7 @@ mod tests {
         assert_eq!(
             draft.to_notifications(),
             NotificationConfig {
+                sounds: NotificationSoundMode::Always,
                 message_volume_db: -7.25,
                 peer_join_volume_db: 1.5,
                 peer_leave_volume_db: 11.75,
@@ -1960,6 +1966,24 @@ mod tests {
 
         draft.message_notification_volume = "12.1".to_string();
         assert!(draft.settings_text_invalid().is_some());
+    }
+
+    #[test]
+    fn settings_draft_round_trips_notification_sounds() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        assert_eq!(draft.notification_sounds, NotificationSoundMode::Always);
+
+        draft.notification_sounds = NotificationSoundMode::Never;
+        assert_eq!(
+            draft.to_notifications().sounds,
+            NotificationSoundMode::Never
+        );
+
+        draft.set_notifications_from_config(&NotificationConfig {
+            sounds: NotificationSoundMode::InCalls,
+            ..NotificationConfig::default()
+        });
+        assert_eq!(draft.notification_sounds, NotificationSoundMode::InCalls);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use crate::audio::{DenoiseConfig, DredConfig};
 use crate::config::{
     AudioConfig, AudioLatencyConfig, CandidatePrivacy, DEFAULT_MAX_AMPLIFICATION, FileConfig,
-    FormBindings, MAX_NOTIFICATION_VOLUME_DB, MIN_NOTIFICATION_VOLUME_DB, ThemeSelection, UiConfig,
-    WebAutoplay, WebConfig, WebViewer, default_url_open,
+    FormBindings, MAX_NOTIFICATION_VOLUME_DB, MIN_NOTIFICATION_VOLUME_DB, NotificationSoundMode,
+    ThemeSelection, UiConfig, WebAutoplay, WebConfig, WebViewer, default_url_open,
 };
 use crate::{
     audio::{
@@ -742,6 +742,20 @@ fn audio_tab(
     }
 
     form.section("Notifications");
+    if form
+        .choice_value(
+            "Play Sounds",
+            &mut draft.notification_sounds,
+            &NotificationSoundMode::ALL,
+            |mode| mode.label().to_string(),
+        )
+        .is_focus()
+    {
+        form.set_help(
+            "When notification sounds play: never, only during a voice call, or always. Deafen always silences them.",
+        );
+        form.set_default(NotificationSoundMode::default().label());
+    }
     if form
         .adjustable_text(
             "Message Volume",
