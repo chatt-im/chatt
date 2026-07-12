@@ -7,7 +7,7 @@ use std::{
 };
 
 use extui::{
-    Buffer, Terminal, TerminalFlags,
+    Buffer, Swap, Terminal, TerminalFlags,
     event::{self, Event, Events, Polled},
     vt,
 };
@@ -15,7 +15,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::{
     app::{AppEvent, EventSender, RoomSession, command::CoreCommand},
-    client_channel::{ClientChannel, ClientId},
+    client_channel::{ClientChannel, ClientId, DirtySections},
     config::Config,
     tui::{
         Action,
@@ -28,6 +28,25 @@ use crate::{
 
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+fn time_dirty_sections(
+    now_ms: u64,
+    last_chat_minute: &mut Option<u64>,
+    last_user_second: &mut Option<u64>,
+) -> DirtySections {
+    let mut dirty = DirtySections::EMPTY;
+    let minute = now_ms / 60_000;
+    if *last_chat_minute != Some(minute) {
+        *last_chat_minute = Some(minute);
+        dirty |= DirtySections::CHAT;
+    }
+    let second = now_ms / 1_000;
+    if *last_user_second != Some(second) {
+        *last_user_second = Some(second);
+        dirty |= DirtySections::USER_LIST;
+    }
+    dirty
+}
 
 pub(crate) enum InitialMode {
     Welcome(WelcomeMode),
@@ -107,12 +126,22 @@ impl ClientThread {
                 config: &config,
                 commands: &mut queued,
                 navigation: &mut local_navigation,
+                dirty_hint: DirtySections::ALL,
             };
             ModeStack::new_with_cx(root, &mut cx)
         };
         flush_commands(&mut queued, &app_events, id);
 
         let mut resize_generation = 0;
+        // Fine-grained rendering state: the dirty mask accumulated for the
+        // next frame, whether the work grid was seeded from the previous
+        // frame by a Swap::Retained prep, and the last rendered mode-stack
+        // composition and wall-clock time buckets.
+        let mut dirty = DirtySections::ALL;
+        let mut retained_seeded = false;
+        let mut last_composition = None;
+        let mut last_chat_minute = None;
+        let mut last_user_second = None;
         loop {
             let actions = channel.actions(&mut resize_generation);
             if actions.handoff {
@@ -128,14 +157,19 @@ impl ClientThread {
             if actions.resized {
                 let (width, height) = terminal.size()?;
                 buffer.resize(width, height);
+                retained_seeded = false;
+                dirty = DirtySections::ALL;
             }
+            dirty |= channel.take_dirty();
             let client_events = channel.drain_events();
 
             let active_animation = {
                 let session = session.read();
                 let config = config.read();
                 let mut view = view.lock();
-                view.status.expire(std::time::Instant::now());
+                if view.status.expire(std::time::Instant::now()) {
+                    dirty |= DirtySections::COMPOSE_BAR;
+                }
                 if url_open_command != config.url_open {
                     url_open_command = config.url_open.clone();
                     url_opener = crate::url_open::UrlOpener::new(url_open_command.clone());
@@ -151,12 +185,16 @@ impl ClientThread {
                         queued.push(CoreCommand::SetViewedRoom(room_id));
                     }
                 }
+                if view.viewed_room != previous_room {
+                    dirty = DirtySections::ALL;
+                }
                 let mut cx = ViewCx {
                     view: &mut view,
                     session: &session,
                     config: &config,
                     commands: &mut queued,
                     navigation: &mut local_navigation,
+                    dirty_hint: DirtySections::ALL,
                 };
                 mode_stack.apply_pending_cx(&mut cx);
                 for event in client_events {
@@ -166,11 +204,42 @@ impl ClientThread {
                     .duration_since(UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_millis() as u64)
                     .unwrap_or(0);
-                mode_stack.render_cx(&mut cx, &mut buffer, now_ms);
+                // Chat headings have minute granularity. The user list needs
+                // a one-second cadence both for young presence uptimes and to
+                // remove voice feedback at its ten-second freshness boundary.
+                dirty |= time_dirty_sections(now_ms, &mut last_chat_minute, &mut last_user_second);
+                if session.capture_stats.is_some() {
+                    // The VU meter animates at the poll rate.
+                    dirty |= DirtySections::TOP_BAR;
+                }
+                let composition = mode_stack.composition_generation();
+                if last_composition != Some(composition) {
+                    last_composition = Some(composition);
+                    dirty = DirtySections::ALL;
+                }
+                if mode_stack.section_rendering_active() {
+                    // A blank or fresh work grid means skipped sections would
+                    // stay empty rather than keep their content.
+                    if !retained_seeded {
+                        dirty = DirtySections::ALL;
+                    }
+                    buffer.set_swap(Swap::Retained);
+                } else {
+                    // Non-room screens draw immediate-mode frames and rely on
+                    // a blank work grid for everything they leave unpainted.
+                    dirty = DirtySections::ALL;
+                    if retained_seeded {
+                        buffer.blank();
+                    }
+                    buffer.set_swap(Swap::Blank);
+                }
+                mode_stack.render_cx(&mut cx, &mut buffer, now_ms, dirty);
                 session.capture_stats.is_some()
             };
             flush_commands(&mut queued, &app_events, id);
+            retained_seeded = buffer.swap_mode() == Swap::Retained;
             buffer.render(&mut terminal);
+            dirty = DirtySections::EMPTY;
 
             let poll_interval = if active_animation {
                 ACTIVE_POLL_INTERVAL
@@ -194,25 +263,34 @@ impl ClientThread {
                         config: &config,
                         commands: &mut queued,
                         navigation: &mut local_navigation,
+                        dirty_hint: DirtySections::ALL,
                     };
-                    let action = match event {
-                        Event::Key(key) => mode_stack.process_input_cx(&mut cx, key),
-                        Event::Mouse(mouse) => mode_stack.process_mouse_cx(&mut cx, mouse),
+                    let (action, event_dirty) = match event {
+                        Event::Key(key) => {
+                            let action = mode_stack.process_input_cx(&mut cx, key);
+                            (action, cx.dirty_hint)
+                        }
+                        Event::Mouse(mouse) => {
+                            let action = mode_stack.process_mouse_cx(&mut cx, mouse);
+                            (action, cx.dirty_hint)
+                        }
                         Event::Paste(text) => {
                             mode_stack.process_paste_cx(&mut cx, text);
-                            Action::Continue
+                            (Action::Continue, cx.dirty_hint)
                         }
                         Event::Resized => {
                             let (width, height) = terminal.size()?;
                             buffer.resize(width, height);
-                            Action::Continue
+                            retained_seeded = false;
+                            (Action::Continue, DirtySections::ALL)
                         }
                         Event::CursorStyleReport(shape) => {
                             terminal.set_restore_cursor_style(Some(shape));
-                            Action::Continue
+                            (Action::Continue, DirtySections::EMPTY)
                         }
-                        _ => Action::Continue,
+                        _ => (Action::Continue, DirtySections::EMPTY),
                     };
+                    dirty |= event_dirty;
                     mode_stack.apply_pending_cx(&mut cx);
                     action
                 };
@@ -251,6 +329,29 @@ fn flush_commands(queued: &mut Vec<CoreCommand>, events: &EventSender, id: Clien
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_damage_updates_users_each_second_and_chat_each_minute() {
+        let mut chat_minute = None;
+        let mut user_second = None;
+
+        assert_eq!(
+            time_dirty_sections(61_001, &mut chat_minute, &mut user_second),
+            DirtySections::CHAT | DirtySections::USER_LIST
+        );
+        assert_eq!(
+            time_dirty_sections(61_999, &mut chat_minute, &mut user_second),
+            DirtySections::EMPTY
+        );
+        assert_eq!(
+            time_dirty_sections(62_000, &mut chat_minute, &mut user_second),
+            DirtySections::USER_LIST
+        );
+        assert_eq!(
+            time_dirty_sections(120_000, &mut chat_minute, &mut user_second),
+            DirtySections::CHAT | DirtySections::USER_LIST
+        );
+    }
 
     #[test]
     fn flush_commands_transmits_queue_in_order_tagged_with_client_id() {

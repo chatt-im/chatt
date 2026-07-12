@@ -8,7 +8,9 @@ use extui_bindings::LayerId;
 
 use crate::{
     app::{RoomSession, command::CoreCommand},
-    client_channel::{BaseScreen, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent},
+    client_channel::{
+        BaseScreen, DirtySections, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
+    },
     config::Config,
     theme,
     tui::{Action, view::ClientView},
@@ -30,6 +32,10 @@ pub(crate) struct ViewCx<'a> {
     pub(crate) config: &'a Config,
     pub(crate) commands: &'a mut Vec<CoreCommand>,
     pub(crate) navigation: &'a mut VecDeque<ModeTransition>,
+    /// Sections the current input dispatch may have touched. Starts at
+    /// [`DirtySections::ALL`] so unaudited paths stay safe; only dispatch
+    /// paths audited to touch a known section set narrow it.
+    pub(crate) dirty_hint: DirtySections,
 }
 
 #[allow(dead_code)]
@@ -52,6 +58,12 @@ impl ViewCx<'_> {
 
     pub(crate) fn request_transition(&mut self, transition: ModeTransition) {
         self.navigation.push_back(transition);
+    }
+
+    /// Replaces the input dirty hint with an audited section set. Call only
+    /// from dispatch paths whose entire effect on render state is known.
+    pub(crate) fn narrow_dirty(&mut self, sections: DirtySections) {
+        self.dirty_hint = sections;
     }
 }
 
@@ -106,7 +118,18 @@ pub(crate) enum ExitReason {
 /// One dispatch may request at most one transition. The stack applies that
 /// transition only after the borrowed active mode returns.
 pub(crate) trait AppMode: Send {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64);
+    /// Draws the mode. `dirty` names the sections whose inputs changed since
+    /// the last frame; only modes reporting [`Self::section_rendering`] gate
+    /// their drawing on it — every other mode repaints fully and ignores it.
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64, dirty: DirtySections);
+
+    /// Whether this mode redraws only dirty sections and declares the
+    /// rectangles it drew as damage on the buffer. The render thread keeps
+    /// the buffer in [`extui::Swap::Retained`] while such a mode is on top;
+    /// for everything else it reverts to classic blank-and-repaint frames.
+    fn section_rendering(&self) -> bool {
+        false
+    }
 
     fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action;
 
@@ -141,6 +164,9 @@ pub(crate) enum ModeTransition {
 pub(crate) struct ModeStack {
     modes: Vec<Box<dyn AppMode>>,
     pending: VecDeque<ModeTransition>,
+    /// Incremented whenever the stack's composition actually changes, so the
+    /// render thread can detect transitions and force a full repaint.
+    composition_generation: u64,
 }
 
 impl ModeStack {
@@ -154,6 +180,7 @@ impl ModeStack {
         Self {
             modes: vec![root],
             pending: VecDeque::new(),
+            composition_generation: 0,
         }
     }
 
@@ -162,7 +189,21 @@ impl ModeStack {
         Self {
             modes: vec![root],
             pending: VecDeque::new(),
+            composition_generation: 0,
         }
+    }
+
+    /// The current composition generation; changes exactly when a transition
+    /// alters which modes are on the stack.
+    pub(crate) fn composition_generation(&self) -> u64 {
+        self.composition_generation
+    }
+
+    /// Whether the mode on top of the stack draws with section gating.
+    pub(crate) fn section_rendering_active(&self) -> bool {
+        self.modes
+            .last()
+            .is_some_and(|mode| mode.section_rendering())
     }
 
     pub(crate) fn active_mut(&mut self) -> &mut dyn AppMode {
@@ -250,10 +291,12 @@ impl ModeStack {
                 }
                 mode.on_enter(cx);
                 self.modes.push(mode);
+                self.composition_generation += 1;
             }
             ModeTransition::Push(mut mode) => {
                 mode.on_enter(cx);
                 self.modes.push(mode);
+                self.composition_generation += 1;
             }
             ModeTransition::Replace(mut mode) => {
                 if let Some(mut removed) = self.modes.pop() {
@@ -261,10 +304,12 @@ impl ModeStack {
                 }
                 mode.on_enter(cx);
                 self.modes.push(mode);
+                self.composition_generation += 1;
             }
             ModeTransition::Pop if self.modes.len() > 1 => {
                 let mut removed = self.modes.pop().expect("checked non-root mode");
                 removed.on_exit(cx, ExitReason::Popped);
+                self.composition_generation += 1;
             }
             ModeTransition::Pop => {}
         }
@@ -276,19 +321,25 @@ impl ModeStack {
     pub(crate) fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64) {
         {
             let mut cx = app.view_cx();
-            self.render_cx(&mut cx, buf, now_ms);
+            self.render_cx(&mut cx, buf, now_ms, DirtySections::ALL);
         }
         app.drain_core_commands();
     }
 
-    pub(crate) fn render_cx(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64) {
+    pub(crate) fn render_cx(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        now_ms: u64,
+        dirty: DirtySections,
+    ) {
         let start = self
             .modes
             .iter()
             .rposition(|mode| mode.presentation(cx).coverage == Coverage::FullScreen)
             .unwrap_or(0);
         for mode in &mut self.modes[start..] {
-            mode.render(cx, buf, now_ms);
+            mode.render(cx, buf, now_ms, dirty);
         }
     }
 
@@ -376,7 +427,7 @@ mod tests {
     struct OverlayMode;
 
     impl AppMode for OverlayMode {
-        fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64) {}
+        fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {}
 
         fn process_input(&mut self, _cx: &mut ViewCx<'_>, _key: KeyEvent) -> Action {
             Action::Continue
@@ -420,7 +471,7 @@ mod tests {
     }
 
     impl AppMode for RecordingMode {
-        fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64) {
+        fn render(&mut self, _cx: &mut ViewCx<'_>, _buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
             self.rendered
                 .lock()
                 .expect("render log mutex")

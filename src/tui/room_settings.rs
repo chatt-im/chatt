@@ -8,7 +8,9 @@ use extui::{
 
 use crate::{
     app::{RoomSettingsDraft, RoomSettingsEvent, command::CoreCommand},
-    bindings, theme,
+    bindings,
+    client_channel::DirtySections,
+    theme,
     tui::{
         Action,
         mode::{
@@ -59,7 +61,7 @@ impl RoomSettingsMode {
 }
 
 impl AppMode for RoomSettingsMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
         let mut app = crate::tui::render::RenderState::new(cx);
         let area = buf.rect();
         let Some(draft) = self.draft.as_mut() else {

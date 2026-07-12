@@ -29,7 +29,9 @@ use rpc::{
 };
 
 use crate::{
-    client_channel::{BaseScreen, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent},
+    client_channel::{
+        BaseScreen, DirtySections, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
+    },
     client_net::{
         NetworkClient, NetworkCommand, NetworkEvent, TerminalVerb, TransferDirection,
         UploadFileRequest, spawn_open_pair_once, spawn_pair_once,
@@ -1326,6 +1328,7 @@ impl App {
             config: &self.config,
             commands: &mut self.command_queue,
             navigation: &mut self.test_navigation,
+            dirty_hint: DirtySections::ALL,
         }
     }
 
@@ -4923,21 +4926,40 @@ impl App {
         }
     }
 
-    /// Advances scheduled core work and reports whether shared render state
+    /// Advances scheduled core work and reports which room-screen sections
     /// changed. Called once per run-loop iteration from [`crate::runtime`].
     /// Internal watchdog bookkeeping and persistence do not make a tick dirty.
-    pub(crate) fn tick(&mut self) -> bool {
+    ///
+    /// The hot periodic sources map to the sections that render them; rare
+    /// changes escalate to [`DirtySections::ALL`] rather than auditing every
+    /// surface they might touch.
+    pub(crate) fn tick(&mut self) -> DirtySections {
         let now = Instant::now();
-        let mut dirty = self.start_pending_after_welcome();
-        dirty |= self.expire_status(now);
-        dirty |= self.supervise(now);
-        dirty |= self.update_lobby_talking(now);
-        dirty |= self.apply_pending_audio_restart();
+        let mut dirty = DirtySections::EMPTY;
+        if self.start_pending_after_welcome() {
+            dirty |= DirtySections::ALL;
+        }
+        if self.expire_status(now) {
+            dirty |= DirtySections::COMPOSE_BAR;
+        }
+        if self.supervise(now) {
+            dirty |= DirtySections::ALL;
+        }
+        if self.update_lobby_talking(now) {
+            dirty |= DirtySections::USER_LIST;
+        }
+        if self.apply_pending_audio_restart() {
+            dirty |= DirtySections::ALL;
+        }
         self.apply_pending_room_catalog_save(now);
         self.supervise_voice_teardown(now);
         self.supervise_notification_playback(now);
-        dirty |= self.refresh_session_projection();
-        dirty |= self.sync_daemon_config_if_changed();
+        if self.refresh_session_projection() {
+            dirty |= DirtySections::TOP_BAR | DirtySections::LOBBY_BAR | DirtySections::COMPOSE_BAR;
+        }
+        if self.sync_daemon_config_if_changed() {
+            dirty |= DirtySections::ALL;
+        }
         dirty
     }
 
@@ -7704,19 +7726,36 @@ mod tests {
     #[test]
     fn tick_reports_only_render_visible_changes() {
         let mut app = test_app();
-        assert!(!app.tick(), "an idle tick must not wake render threads");
+        assert_eq!(
+            app.tick(),
+            DirtySections::EMPTY,
+            "an idle tick must not wake render threads"
+        );
 
         app.view.status.set("done");
         app.view.status.expires_at = Some(Instant::now());
-        assert!(app.tick(), "status expiration is render-visible");
+        assert_eq!(
+            app.tick(),
+            DirtySections::COMPOSE_BAR,
+            "status expiration renders in the compose bar"
+        );
         assert_eq!(app.view.status.text(), "");
-        assert!(!app.tick(), "the expiration edge is reported only once");
+        assert_eq!(
+            app.tick(),
+            DirtySections::EMPTY,
+            "the expiration edge is reported only once"
+        );
 
         app.room.capture_health.state = AudioHealthState::WaitingForDevice;
-        assert!(app.tick(), "projection changes are render-visible");
+        assert_eq!(
+            app.tick(),
+            DirtySections::TOP_BAR | DirtySections::LOBBY_BAR | DirtySections::COMPOSE_BAR,
+            "projection changes are render-visible"
+        );
         assert_eq!(app.room.capture_health.state, AudioHealthState::Healthy);
-        assert!(
-            !app.tick(),
+        assert_eq!(
+            app.tick(),
+            DirtySections::EMPTY,
             "a stable projection must not cause another wake"
         );
     }

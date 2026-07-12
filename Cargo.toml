@@ -7,13 +7,13 @@ edition = "2024"
 cpal = { path = "crates/cpal", default-features = false }
 libc = "0.2"
 nnnoiseless = { path = "crates/nnnoiseless" }
-extui = { git = "https://github.com/exrok/extui", rev = "97590e91b90e9aa89aadfd13c94b0f11cb5b5336", features = [
+extui = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui", features = [
     "bracketed-paste",
 ] }
-extui-editor = { git = "https://github.com/exrok/extui", rev = "97590e91b90e9aa89aadfd13c94b0f11cb5b5336" }
-extui-bindings = { git = "https://github.com/exrok/extui", rev = "97590e91b90e9aa89aadfd13c94b0f11cb5b5336" }
+extui-editor = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui" }
+extui-bindings = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui" }
 bwrap.path = "crates/bwrap"
-tinyhl = { git = "https://github.com/exrok/extui", rev = "97590e91b90e9aa89aadfd13c94b0f11cb5b5336" }
+tinyhl = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui" }
 unicode-width = "0.2"
 unicode-segmentation = "1"
 opus-codec = { path = "crates/opus-codec", features = ["dred"] }
@@ -73,6 +73,7 @@ embed-web = []
 
 [dev-dependencies]
 portable-pty = "0.9"
+vt100 = "0.16"
 # The dev server, linked only for the in-crate end-to-end upload benchmark
 # (`src/bench_upload.rs`) so it can drive a real server + clients over loopback.
 server = { path = "crates/server" }
