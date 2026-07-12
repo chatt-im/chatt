@@ -95,7 +95,27 @@ impl MdnsSystem {
         }
     }
 
-    /// Registers the bound sockets with the worker's mio poll.
+    /// Returns an inert system with no sockets, for sessions with p2p
+    /// disabled. [`Self::rebind`] arms it if p2p is enabled at runtime.
+    pub fn unbound() -> Self {
+        Self {
+            v4: None,
+            v6: None,
+            v6_scope: 0,
+            v4_token: Token(usize::MAX),
+            v6_token: Token(usize::MAX),
+            local_names: HashMap::new(),
+            active_queries: HashMap::new(),
+        }
+    }
+
+    /// Whether any mDNS socket is currently bound.
+    pub fn is_bound(&self) -> bool {
+        self.v4.is_some() || self.v6.is_some()
+    }
+
+    /// Registers the bound sockets with the worker's mio poll. On an unbound
+    /// system this only records the tokens for a later [`Self::rebind`].
     pub fn register(
         &mut self,
         registry: &Registry,
@@ -111,6 +131,41 @@ impl MdnsSystem {
             registry.register(socket, v6_token, Interest::READABLE)?;
         }
         Ok(())
+    }
+
+    /// Binds fresh sockets and registers them under the tokens recorded by
+    /// [`Self::register`], keeping published names and active queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first registration failure; a family that fails to bind is
+    /// left disabled rather than fatal, matching [`Self::bind`].
+    pub fn rebind(&mut self, registry: &Registry) -> io::Result<()> {
+        let v4 = bind_group_v4();
+        let (v6, v6_scope) = bind_group_v6();
+        self.v4 = v4.map(MioUdpSocket::from_std);
+        self.v6 = v6.map(MioUdpSocket::from_std);
+        self.v6_scope = v6_scope;
+        if let Some(socket) = self.v4.as_mut() {
+            registry.register(socket, self.v4_token, Interest::READABLE)?;
+        }
+        if let Some(socket) = self.v6.as_mut() {
+            registry.register(socket, self.v6_token, Interest::READABLE)?;
+        }
+        Ok(())
+    }
+
+    /// Deregisters and drops the sockets and clears the responder names and
+    /// in-flight queries, so LAN multicast traffic no longer wakes the loop.
+    pub fn shutdown(&mut self, registry: &Registry) {
+        if let Some(mut socket) = self.v4.take() {
+            let _ = registry.deregister(&mut socket);
+        }
+        if let Some(mut socket) = self.v6.take() {
+            let _ = registry.deregister(&mut socket);
+        }
+        self.local_names.clear();
+        self.active_queries.clear();
     }
 
     /// Replaces the responder's name table atomically. Called on each publish

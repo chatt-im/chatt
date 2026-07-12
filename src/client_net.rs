@@ -72,7 +72,16 @@ const UDP: Token = Token(1);
 const WAKE: Token = Token(2);
 const MDNS_V4: Token = Token(3);
 const MDNS_V6: Token = Token(4);
-const POLL_TIMEOUT: Duration = Duration::from_millis(20);
+/// Poll tick while p2p peers exist. The traversal agents' retransmissions,
+/// keepalives, and consent timers, plus direct-path stability and relay
+/// suppression, are polled rather than scheduling their own wakes, so they
+/// need a steady cadence. Voice alone does not arm it: sends are paced by the
+/// command waker and receives by socket readiness.
+const P2P_POLL_TIMEOUT: Duration = Duration::from_millis(20);
+/// Backstop poll timeout while idle. Sockets, the command waker, and the
+/// deadline wakes in [`WorkerState::next_poll_timeout`] drive the loop; this
+/// only bounds how long a missed schedule could sleep.
+const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a direct path must stay healthy before the client stops relaying
 /// voice through the server.
@@ -719,8 +728,8 @@ pub enum NetworkEvent {
 
 /// Sends a [`NetworkCommand`] to the worker and wakes its event loop.
 ///
-/// The worker blocks in [`Poll::poll`] for up to [`POLL_TIMEOUT`] watching only
-/// its sockets, so a queued command would otherwise wait for the next socket
+/// The worker blocks in [`Poll::poll`] watching only its sockets and timer
+/// deadlines, so a queued command would otherwise wait for the next socket
 /// event or the timeout. Waking after the channel send makes the worker drain
 /// outbound voice immediately, which keeps send pacing off the poll cadence.
 #[derive(Clone)]
@@ -1119,7 +1128,11 @@ fn run_worker_inner(
         p2p_enabled,
         candidate_privacy: config.candidate_privacy,
         prefer_ipv6: config.prefer_ipv6,
-        mdns: MdnsSystem::bind(),
+        mdns: if p2p_enabled {
+            MdnsSystem::bind()
+        } else {
+            MdnsSystem::unbound()
+        },
         mdns_pending: HashMap::new(),
         p2p_peers: HashMap::new(),
         p2p_stream_owners: HashMap::new(),
@@ -1266,17 +1279,22 @@ fn run_worker_inner(
             return SessionEnd::Disconnected(error);
         }
         let now = Instant::now();
-        worker.poll_interfaces(now);
+        if worker.p2p_enabled {
+            worker.poll_interfaces(now);
+        }
         if worker.udp_rebind_requested {
+            worker.reconcile_mdns(poll);
             if let Err(error) = worker.rebind_udp_socket(poll) {
                 return SessionEnd::Disconnected(error);
             }
         }
-        worker.poll_p2p(now);
+        if worker.p2p_enabled {
+            worker.poll_p2p(now);
+            worker.poll_mdns(now);
+        }
         worker.poll_udp_bind_retry(now);
         worker.poll_relay_keepalive(now);
         worker.poll_rtt_probe(now);
-        worker.poll_mdns(now);
         poll_timeout = worker.next_poll_timeout(command_drain, now);
         #[cfg(debug_assertions)]
         if poll_timeout != Duration::ZERO {
@@ -1698,6 +1716,10 @@ impl InterfaceMonitor {
     fn deactivate(&mut self, now: Instant) {
         self.snapshot = None;
         self.next_poll = now;
+    }
+
+    fn next_wake(&self, now: Instant) -> Duration {
+        self.next_poll.saturating_duration_since(now)
     }
 
     fn ensure_with<F>(&mut self, now: Instant, capture: F) -> io::Result<()>
@@ -2606,13 +2628,17 @@ impl WorkerState {
     #[inline]
     fn next_poll_timeout(&mut self, command_drain: CommandDrainOutcome, now: Instant) -> Duration {
         self.queue_runnable_io();
-        let mut schedule = PollSchedule::after(POLL_TIMEOUT);
+        let mut schedule = PollSchedule::after(IDLE_POLL_TIMEOUT);
         schedule.include(self.loop_work.wake());
         schedule.include(self.command_wake(command_drain));
         schedule.include(self.bug_report_wake());
         schedule.include(self.receive_wake());
         schedule.include(self.upload_wake());
         schedule.include(self.mdns_wake(now));
+        schedule.include(self.p2p_wake());
+        schedule.include(self.interface_wake(now));
+        schedule.include(self.rtt_probe_wake(now));
+        schedule.include(self.udp_bind_retry_wake(now));
         schedule.timeout()
     }
 
@@ -2701,6 +2727,42 @@ impl WorkerState {
         match self.mdns.next_timeout(now) {
             Some(delay) => WakeIntent::After(delay),
             None => WakeIntent::Idle,
+        }
+    }
+
+    #[inline]
+    fn p2p_wake(&self) -> WakeIntent {
+        if self.p2p_peers.is_empty() {
+            WakeIntent::Idle
+        } else {
+            WakeIntent::After(P2P_POLL_TIMEOUT)
+        }
+    }
+
+    #[inline]
+    fn interface_wake(&self, now: Instant) -> WakeIntent {
+        if self.p2p_enabled && self.voice_room.is_some() {
+            WakeIntent::After(self.interface_monitor.next_wake(now))
+        } else {
+            WakeIntent::Idle
+        }
+    }
+
+    #[inline]
+    fn rtt_probe_wake(&self, now: Instant) -> WakeIntent {
+        let mut wake = self.next_rtt_probe;
+        if let Some(sample_at) = self.server_rtt_last_sample_at {
+            wake = wake.min(sample_at + RTT_STALE_AFTER);
+        }
+        WakeIntent::After(wake.saturating_duration_since(now))
+    }
+
+    #[inline]
+    fn udp_bind_retry_wake(&self, now: Instant) -> WakeIntent {
+        if self.awaiting_udp_bound {
+            WakeIntent::After(self.next_udp_bind_retry.saturating_duration_since(now))
+        } else {
+            WakeIntent::Idle
         }
     }
 
@@ -3169,6 +3231,10 @@ impl WorkerState {
                 } else {
                     self.publish_p2p_disabled();
                     self.reset_voice_peer_state();
+                    // The loop no longer runs poll_interfaces while p2p is
+                    // off, so drop the baseline here to match what the
+                    // active=false path would have done.
+                    self.interface_monitor.deactivate(Instant::now());
                     let _ = self.events.send(NetworkEvent::Status(
                         "P2P disabled; using relay".to_string(),
                     ));
@@ -4886,6 +4952,20 @@ impl WorkerState {
         self.p2p_nat_classifier = NatClassifier::new();
         self.p2p_nat = configured_nat_kind();
         self.udp_rebind_requested = true;
+    }
+
+    /// Aligns the mdns sockets with the p2p toggle: enabling binds and
+    /// registers them, disabling deregisters and drops them so LAN multicast
+    /// no longer wakes the loop. Runs on the same deferred rebind flag as the
+    /// UDP socket because the command handler cannot reach the poll registry.
+    fn reconcile_mdns(&mut self, poll: &Poll) {
+        if self.p2p_enabled && !self.mdns.is_bound() {
+            if let Err(error) = self.mdns.rebind(poll.registry()) {
+                kvlog::warn!("failed to register mdns sockets", error = %error);
+            }
+        } else if !self.p2p_enabled && self.mdns.is_bound() {
+            self.mdns.shutdown(poll.registry());
+        }
     }
 
     fn rebind_udp_socket(&mut self, poll: &mut Poll) -> Result<(), String> {
