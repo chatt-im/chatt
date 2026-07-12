@@ -31,7 +31,7 @@ exclude = [
 [dependencies]
 
 [build-dependencies]
-cmake = { version = "0.1" }
+cc = "1.2"
 bindgen = "0.72.1"
 pkg-config = "0.3.33"
 sha2 = "0.10.9"
