@@ -759,9 +759,37 @@ pub(crate) fn valid_web_origin(value: &str) -> bool {
         && port.is_none_or(|port| !port.is_empty() && port.parse::<u16>().is_ok())
 }
 
+/// When notification sounds are audible. Deafen always suppresses them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum NotificationSoundMode {
+    Never,
+    InCalls,
+    #[default]
+    Always,
+}
+
+impl NotificationSoundMode {
+    pub const ALL: [NotificationSoundMode; 3] = [
+        NotificationSoundMode::Never,
+        NotificationSoundMode::InCalls,
+        NotificationSoundMode::Always,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NotificationSoundMode::Never => "never",
+            NotificationSoundMode::InCalls => "in calls",
+            NotificationSoundMode::Always => "always",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct NotificationConfig {
+    #[toml(default)]
+    pub sounds: NotificationSoundMode,
     #[toml(default)]
     pub message_volume_db: f32,
     #[toml(default)]
@@ -832,6 +860,7 @@ impl RoomOverrides {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
+            sounds: NotificationSoundMode::Always,
             message_volume_db: 0.0,
             peer_join_volume_db: 0.0,
             peer_leave_volume_db: 0.0,
@@ -2940,6 +2969,51 @@ server-public-key = ""
             .to::<Config>();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn notification_sounds_parses_all_modes() {
+        let arena = Arena::new();
+        for (text, expected) in [
+            (
+                "[notifications]\nsounds = \"never\"\n",
+                NotificationSoundMode::Never,
+            ),
+            (
+                "[notifications]\nsounds = \"in-calls\"\n",
+                NotificationSoundMode::InCalls,
+            ),
+            (
+                "[notifications]\nsounds = \"always\"\n",
+                NotificationSoundMode::Always,
+            ),
+        ] {
+            let config = toml_spanner::parse(text, &arena)
+                .unwrap()
+                .to::<Config>()
+                .unwrap();
+            assert_eq!(config.notifications.sounds, expected);
+        }
+    }
+
+    #[test]
+    fn notification_sounds_rejects_other_values() {
+        let arena = Arena::new();
+        let result = toml_spanner::parse("[notifications]\nsounds = \"sometimes\"\n", &arena)
+            .unwrap()
+            .to::<Config>();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn runtime_config_writes_non_default_notification_sounds() {
+        let mut config = Config::default();
+        config.notifications.sounds = NotificationSoundMode::InCalls;
+        let content = render_runtime(&config);
+
+        assert!(content.contains("sounds = \"in-calls\""), "{content}");
+        assert!(!render_runtime(&Config::default()).contains("[notifications]"));
     }
 
     #[test]
