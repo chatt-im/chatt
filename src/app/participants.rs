@@ -311,18 +311,19 @@ impl Participants {
         raw_active: bool,
         now: Instant,
         release_hold: Duration,
-    ) {
+    ) -> bool {
         let Some(entry) = self
             .entries
             .iter_mut()
             .find(|entry| entry.user_id == user_id)
         else {
-            return;
+            return false;
         };
+        let was_talking = entry.talking_display;
         if !entry.online || !entry.voice_active || entry.voice_status.muted {
             entry.talking_display = false;
             entry.last_talking_at = None;
-            return;
+            return was_talking;
         }
         if raw_active {
             entry.talking_display = true;
@@ -332,6 +333,7 @@ impl Participants {
         }) {
             entry.talking_display = false;
         }
+        entry.talking_display != was_talking
     }
 
     pub(crate) fn set_peer_transport(&mut self, user_id: UserId, direct: bool) {
@@ -734,24 +736,36 @@ mod tests {
         participants.replace_room(vec![participant(UserId(1))]);
         let now = Instant::now();
 
-        participants.update_talking_display(UserId(1), true, now, Duration::from_millis(200));
+        assert!(participants.update_talking_display(
+            UserId(1),
+            true,
+            now,
+            Duration::from_millis(200)
+        ));
         assert!(participants.entries[0].talking_display);
 
-        participants.update_talking_display(
+        assert!(!participants.update_talking_display(
             UserId(1),
             false,
             now + Duration::from_millis(199),
             Duration::from_millis(200),
-        );
+        ));
         assert!(participants.entries[0].talking_display);
 
-        participants.update_talking_display(
+        assert!(participants.update_talking_display(
             UserId(1),
             false,
             now + Duration::from_millis(200),
             Duration::from_millis(200),
-        );
+        ));
         assert!(!participants.entries[0].talking_display);
+
+        assert!(!participants.update_talking_display(
+            UserId(1),
+            false,
+            now + Duration::from_millis(201),
+            Duration::from_millis(200),
+        ));
     }
 
     #[test]

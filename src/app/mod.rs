@@ -243,10 +243,13 @@ impl StatusState {
         self.expires_at = Some(expires_at);
     }
 
-    pub(crate) fn expire(&mut self, now: Instant) {
+    pub(crate) fn expire(&mut self, now: Instant) -> bool {
         if self.expires_at.is_some_and(|expires_at| now >= expires_at) {
             self.text.clear();
             self.expires_at = None;
+            true
+        } else {
+            false
         }
     }
 }
@@ -522,7 +525,7 @@ struct DeviceProbeState {
 }
 
 /// One audio direction's health, for the TUI.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AudioSideHealth {
     pub(crate) state: AudioHealthState,
 }
@@ -1687,14 +1690,15 @@ impl App {
         }
     }
 
-    fn start_pending_after_welcome(&mut self) {
+    fn start_pending_after_welcome(&mut self) -> bool {
         let Some(pending) = self.pending_after_welcome.take() else {
-            return;
+            return false;
         };
         self.start_pending_join(pending);
         if self.network.is_some() {
             self.navigate_owner(NavigationEvent::ResetBase(BaseScreen::Room));
         }
+        true
     }
 
     pub(crate) fn next_event(&mut self) -> Option<AppEvent> {
@@ -4884,28 +4888,30 @@ impl App {
         }
     }
 
-    /// Fires a debounced audio restart once its window elapses. Called once per
-    /// run-loop iteration from [`crate::runtime`].
-    pub(crate) fn tick(&mut self) {
+    /// Advances scheduled core work and reports whether shared render state
+    /// changed. Called once per run-loop iteration from [`crate::runtime`].
+    /// Internal watchdog bookkeeping and persistence do not make a tick dirty.
+    pub(crate) fn tick(&mut self) -> bool {
         let now = Instant::now();
-        self.start_pending_after_welcome();
-        self.expire_status(now);
-        self.supervise(now);
-        self.refresh_session_projection();
-        self.update_lobby_talking(now);
-        self.apply_pending_audio_restart();
+        let mut dirty = self.start_pending_after_welcome();
+        dirty |= self.expire_status(now);
+        dirty |= self.supervise(now);
+        dirty |= self.update_lobby_talking(now);
+        dirty |= self.apply_pending_audio_restart();
         self.apply_pending_room_catalog_save(now);
         self.supervise_voice_teardown(now);
-        self.sync_daemon_config_if_changed();
+        dirty |= self.refresh_session_projection();
+        dirty |= self.sync_daemon_config_if_changed();
+        dirty
     }
 
     fn mark_daemon_config_changed(&mut self) {
         self.daemon_config_generation = self.daemon_config_generation.wrapping_add(1);
     }
 
-    fn sync_daemon_config_if_changed(&mut self) {
+    fn sync_daemon_config_if_changed(&mut self) -> bool {
         if self.synced_daemon_config_generation == self.daemon_config_generation {
-            return;
+            return false;
         }
         let theme = self.config.ui.resolve_theme();
         self.view.server_catalog.rebuild(&self.config);
@@ -4919,6 +4925,7 @@ impl App {
                 .sync_daemon_config(&self.config, theme, &server_catalog);
         }
         self.synced_daemon_config_generation = self.daemon_config_generation;
+        true
     }
 
     fn apply_max_messages(&mut self) {
@@ -4930,11 +4937,20 @@ impl App {
 
     /// Projects audio display facts into the shared session so every view
     /// renders them without reaching into core state. Runs once per tick.
-    fn refresh_session_projection(&mut self) {
-        self.room.network_selected = self.network.is_some();
-        self.room.capture_health = self.capture_audio_health();
-        self.room.playback_health = self.playback_audio_health();
-        self.room.capture_stats = self.capture.as_ref().map(|capture| capture.stats());
+    fn refresh_session_projection(&mut self) -> bool {
+        let network_selected = self.network.is_some();
+        let capture_health = self.capture_audio_health();
+        let playback_health = self.playback_audio_health();
+        let capture_stats = self.capture.as_ref().map(|capture| capture.stats());
+        let dirty = self.room.network_selected != network_selected
+            || self.room.capture_health != capture_health
+            || self.room.playback_health != playback_health
+            || self.room.capture_stats.is_some() != capture_stats.is_some();
+        self.room.network_selected = network_selected;
+        self.room.capture_health = capture_health;
+        self.room.playback_health = playback_health;
+        self.room.capture_stats = capture_stats;
+        dirty
     }
 
     fn apply_pending_room_catalog_save(&mut self, now: Instant) {
@@ -4964,7 +4980,7 @@ impl App {
         self.stop_mic_capture();
     }
 
-    fn update_lobby_talking(&mut self, now: Instant) {
+    fn update_lobby_talking(&mut self, now: Instant) -> bool {
         let local_user = self.user_id;
         let local_status = self.local_voice_status();
         let local_raw_active = if local_status.muted {
@@ -5004,24 +5020,27 @@ impl App {
                 (participant.user_id, raw_active)
             })
             .collect::<Vec<_>>();
-        for (user_id, raw_active) in updates {
-            self.room
-                .update_talking_display(user_id, raw_active, now, LOBBY_TALKING_RELEASE);
-        }
+        updates
+            .into_iter()
+            .fold(false, |dirty, (user_id, raw_active)| {
+                self.room
+                    .update_talking_display(user_id, raw_active, now, LOBBY_TALKING_RELEASE)
+                    || dirty
+            })
     }
 
-    fn apply_pending_audio_restart(&mut self) {
+    fn apply_pending_audio_restart(&mut self) -> bool {
         let Some(pending) = &self.pending_audio_apply else {
-            return;
+            return false;
         };
         if Instant::now() < pending.deadline {
-            return;
+            return false;
         }
         let Some(PendingAudioApply {
             capture, playback, ..
         }) = self.pending_audio_apply.take()
         else {
-            return;
+            return false;
         };
         let mut applied = Vec::new();
         if capture {
@@ -5040,6 +5059,7 @@ impl App {
         if !applied.is_empty() {
             self.set_status(format!("audio settings applied ({})", applied.join(", ")));
         }
+        true
     }
 
     /// Health of the capture side for status-bar error reporting.
@@ -5082,12 +5102,13 @@ impl App {
         self.set_status("audio reset: rebuilding streams");
     }
 
-    fn supervise(&mut self, now: Instant) {
-        self.supervise_network(now);
-        self.supervise_control_socket(now);
-        self.supervise_capture(now);
-        self.supervise_playback(now);
+    fn supervise(&mut self, now: Instant) -> bool {
+        let mut dirty = self.supervise_network(now);
+        dirty |= self.supervise_control_socket(now);
+        dirty |= self.supervise_capture(now);
+        dirty |= self.supervise_playback(now);
         self.supervise_device_probe(now);
+        dirty
     }
 
     /// Schedules the background device-identity probe: paused while no stream
@@ -5276,7 +5297,8 @@ impl App {
         }
     }
 
-    fn supervise_network(&mut self, now: Instant) {
+    fn supervise_network(&mut self, now: Instant) -> bool {
+        let mut dirty = false;
         if self
             .network
             .as_ref()
@@ -5290,33 +5312,40 @@ impl App {
             // re-running every tick while recovery is already scheduled.
             self.stop_audio();
             self.reset_room_for_disconnect();
-            self.schedule_network_recovery(now, "network worker stopped");
+            dirty = self.schedule_network_recovery(now, "network worker stopped");
         }
         if let Some(reason) = self.supervisor.network.take_due(now) {
             self.restart_network_worker(&reason);
+            dirty = true;
         }
+        dirty
     }
 
-    fn supervise_control_socket(&mut self, now: Instant) {
+    fn supervise_control_socket(&mut self, now: Instant) -> bool {
+        let mut dirty = false;
         if self
             .control_socket
             .as_ref()
             .is_some_and(local_control::ControlSocket::is_finished)
         {
-            self.schedule_control_socket_recovery(now, "control socket worker stopped");
+            dirty = self.schedule_control_socket_recovery(now, "control socket worker stopped");
         }
         if let Some(reason) = self.supervisor.control_socket.take_due(now) {
             self.restart_control_socket(&reason);
+            dirty = true;
         }
+        dirty
     }
 
-    fn supervise_capture(&mut self, now: Instant) {
+    fn supervise_capture(&mut self, now: Instant) -> bool {
+        let mut dirty = false;
         let apply_owns_restart = self
             .pending_audio_apply
             .as_ref()
             .is_some_and(|pending| pending.capture);
         if !apply_owns_restart && let Some(cause) = self.supervisor.capture.take_due_rebuild(now) {
             self.recover_capture_stream(now, cause);
+            dirty = true;
         }
         let Some(capture) = &self.capture else {
             self.supervisor.capture_watch = CaptureWatch::default();
@@ -5325,7 +5354,7 @@ impl App {
             if !should_run {
                 self.supervisor.capture.reset();
             }
-            return;
+            return dirty;
         };
         let snapshot = capture.stats().snapshot();
         let mut failure = None;
@@ -5384,16 +5413,20 @@ impl App {
 
         if let Some((kind, message)) = failure {
             self.note_capture_failure(now, kind, message);
+            dirty = true;
         }
+        dirty
     }
 
-    fn supervise_playback(&mut self, now: Instant) {
+    fn supervise_playback(&mut self, now: Instant) -> bool {
+        let mut dirty = false;
         let apply_owns_restart = self
             .pending_audio_apply
             .as_ref()
             .is_some_and(|pending| pending.playback);
         if !apply_owns_restart && let Some(cause) = self.supervisor.playback.take_due_rebuild(now) {
             self.recover_playback_stream(now, cause);
+            dirty = true;
         }
         let Some(playback) = &self.playback else {
             self.supervisor.playback_watch = PlaybackWatch::default();
@@ -5402,7 +5435,7 @@ impl App {
             if !should_run {
                 self.supervisor.playback.reset();
             }
-            return;
+            return dirty;
         };
         let snapshot = playback.stats();
         let mut failure = playback_backend_failure(&snapshot, &self.supervisor.playback_watch);
@@ -5419,7 +5452,9 @@ impl App {
 
         if let Some((kind, message)) = failure {
             self.note_playback_failure(now, kind, message);
+            dirty = true;
         }
+        dirty
     }
 
     fn note_capture_failure(&mut self, now: Instant, kind: AudioErrorKind, message: String) {
@@ -5449,7 +5484,7 @@ impl App {
             && (self.settings_preview_capture || self.voice_tx_enabled.load(Ordering::Relaxed))
     }
 
-    fn schedule_network_recovery(&mut self, now: Instant, reason: impl Into<String>) {
+    fn schedule_network_recovery(&mut self, now: Instant, reason: impl Into<String>) -> bool {
         let reason = reason.into();
         match self.supervisor.network.schedule(now, reason.clone()) {
             RecoverySchedule::Scheduled(delay) => {
@@ -5461,8 +5496,9 @@ impl App {
                         delay.as_secs()
                     ));
                 }
+                true
             }
-            RecoverySchedule::Pending => {}
+            RecoverySchedule::Pending => false,
             RecoverySchedule::Exhausted => {
                 self.stop_audio();
                 if let Some(network) = self.network.take() {
@@ -5470,11 +5506,16 @@ impl App {
                 }
                 self.reset_room_for_disconnect();
                 self.set_error(format!("network recovery exhausted: {reason}"));
+                true
             }
         }
     }
 
-    fn schedule_control_socket_recovery(&mut self, now: Instant, reason: impl Into<String>) {
+    fn schedule_control_socket_recovery(
+        &mut self,
+        now: Instant,
+        reason: impl Into<String>,
+    ) -> bool {
         let reason = reason.into();
         match self.supervisor.control_socket.schedule(now, reason.clone()) {
             RecoverySchedule::Scheduled(delay) => {
@@ -5484,11 +5525,13 @@ impl App {
                         delay.as_secs()
                     ));
                 }
+                true
             }
-            RecoverySchedule::Pending => {}
+            RecoverySchedule::Pending => false,
             RecoverySchedule::Exhausted => {
                 self.control_socket.take();
                 self.set_error(format!("file-upload socket down: {reason}"));
+                true
             }
         }
     }
@@ -7312,8 +7355,8 @@ impl App {
         self.view.status.set_error(status);
     }
 
-    fn expire_status(&mut self, now: Instant) {
-        self.view.status.expire(now);
+    fn expire_status(&mut self, now: Instant) -> bool {
+        self.view.status.expire(now)
     }
 }
 
@@ -7508,19 +7551,39 @@ mod tests {
     fn posted_statuses_expire_lazily() {
         let mut status = StatusState::new("idle");
 
-        status.expire(Instant::now() + STATUS_LIFETIME);
+        assert!(!status.expire(Instant::now() + STATUS_LIFETIME));
         assert_eq!(status.text(), "idle", "the baseline status is persistent");
 
         status.set("updated");
-        status.expire(Instant::now());
+        assert!(!status.expire(Instant::now()));
         assert_eq!(status.text(), "updated");
-        status.expire(Instant::now() + STATUS_LIFETIME);
+        assert!(status.expire(Instant::now() + STATUS_LIFETIME));
         assert_eq!(status.text(), "");
 
         status.set_error("failed");
         assert_eq!(status.kind(), StatusKind::Error);
-        status.expire(Instant::now() + STATUS_LIFETIME);
+        assert!(status.expire(Instant::now() + STATUS_LIFETIME));
         assert_eq!(status.text(), "");
+    }
+
+    #[test]
+    fn tick_reports_only_render_visible_changes() {
+        let mut app = test_app();
+        assert!(!app.tick(), "an idle tick must not wake render threads");
+
+        app.view.status.set("done");
+        app.view.status.expires_at = Some(Instant::now());
+        assert!(app.tick(), "status expiration is render-visible");
+        assert_eq!(app.view.status.text(), "");
+        assert!(!app.tick(), "the expiration edge is reported only once");
+
+        app.room.capture_health.state = AudioHealthState::WaitingForDevice;
+        assert!(app.tick(), "projection changes are render-visible");
+        assert_eq!(app.room.capture_health.state, AudioHealthState::Healthy);
+        assert!(
+            !app.tick(),
+            "a stable projection must not cause another wake"
+        );
     }
 
     #[test]
