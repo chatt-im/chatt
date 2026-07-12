@@ -12,6 +12,7 @@ use crate::{
     },
     bindings::{self, BindCommand, Resolved},
     chat_buffer::{Cursor as ChatCursor, LineKind, VisibleLine},
+    client_channel::DirtySections,
     settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft},
     theme,
     tui::{
@@ -216,7 +217,7 @@ impl WelcomeMode {
 }
 
 impl AppMode for WelcomeMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_welcome_screen(
@@ -563,7 +564,7 @@ impl Default for ServerListMode {
 }
 
 impl AppMode for ServerListMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
         self.select.refresh(cx.view.server_catalog.items());
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
@@ -697,7 +698,7 @@ impl RoomSwitchMode {
 }
 
 impl AppMode for RoomSwitchMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
         self.refresh_cx(cx);
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
@@ -771,7 +772,7 @@ impl ServerEditMode {
 }
 
 impl AppMode for ServerEditMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
         if let Some(draft) = self.draft.as_mut() {
             let mut render = crate::tui::render::RenderState::new(cx);
             crate::tui::render::draw_server_edit_overlay(&mut render, draft, buf);
@@ -1119,7 +1120,7 @@ impl SettingsMode {
 }
 
 impl AppMode for SettingsMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
         let Some(settings) = cx.session.settings.clone() else {
             return;
         };
@@ -1166,6 +1167,13 @@ pub(crate) struct RoomLayout {
     pub chat_height: u16,
     pub chat_rect: Rect,
     pub visible_chat_lines: Vec<VisibleLine>,
+    pub top_bar_rect: Rect,
+    pub key_preview_rect: Rect,
+    pub workspace_rect: Rect,
+    /// Lobby rows carved from the workspace top; part of the geometry
+    /// backstop because it moves the lobby/chat split without moving the
+    /// workspace rect itself.
+    pub workspace_room_height: u16,
     pub room_list_rect: Rect,
     pub lobby_divider_rect: Rect,
     pub rooms_scrollbar: Option<ScrollbarLayout>,
@@ -1188,6 +1196,10 @@ impl Default for RoomLayout {
             chat_height: 0,
             chat_rect: Rect::EMPTY,
             visible_chat_lines: Vec::new(),
+            top_bar_rect: Rect::EMPTY,
+            key_preview_rect: Rect::EMPTY,
+            workspace_rect: Rect::EMPTY,
+            workspace_room_height: 0,
             room_list_rect: Rect::EMPTY,
             lobby_divider_rect: Rect::EMPTY,
             rooms_scrollbar: None,
@@ -1204,20 +1216,6 @@ impl Default for RoomLayout {
 }
 
 impl RoomLayout {
-    pub(crate) fn clear_workspace(&mut self) {
-        self.room_list_rect = Rect::EMPTY;
-        self.lobby_divider_rect = Rect::EMPTY;
-        self.rooms_scrollbar = None;
-        self.user_list_rect = Rect::EMPTY;
-        self.room_hits.clear();
-        self.lobby_bar_rect = Rect::EMPTY;
-        self.chat_log_bar_rect = Rect::EMPTY;
-        self.composer_rect = Rect::EMPTY;
-        self.composer_frame_rect = Rect::EMPTY;
-        self.composer_scrollbar = None;
-        self.compose_bar_rect = Rect::EMPTY;
-    }
-
     fn room_hit(&self, column: u16, row: u16) -> Option<rpc::ids::RoomId> {
         self.room_hits
             .iter()
@@ -1657,11 +1655,20 @@ impl RoomMode {
     }
 
     fn process_compose_key(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        // Keys the editor consumes touch only the composer band and the
+        // chrome that tracks the editor mode and pending chords; bound
+        // commands can reach anything, so they stay on the coarse path.
+        const EDITOR_DIRTY: DirtySections = DirtySections::COMPOSER
+            .union(DirtySections::COMPOSE_BAR)
+            .union(DirtySections::KEY_PREVIEW);
+        const CHORD_DIRTY: DirtySections =
+            DirtySections::COMPOSE_BAR.union(DirtySections::KEY_PREVIEW);
         if cx.view.composer.mode() == EditorMode::Insert {
             if key.code == extui::event::KeyCode::Tab
                 && key.modifiers.is_empty()
                 && cx.view.complete_command()
             {
+                cx.narrow_dirty(EDITOR_DIRTY);
                 return Action::Continue;
             }
             if key.code != extui::event::KeyCode::Esc {
@@ -1669,22 +1676,30 @@ impl RoomMode {
                     BindingResolution::Action(command) => {
                         return self.process_action(cx, command);
                     }
-                    BindingResolution::Consumed => return Action::Continue,
+                    BindingResolution::Consumed => {
+                        cx.narrow_dirty(CHORD_DIRTY);
+                        return Action::Continue;
+                    }
                     BindingResolution::Unmatched => {}
                 }
             }
             if cx.view.composer.send_key(&key) {
                 maybe_auto_close_markdown_code_fence(&mut cx.view.composer, key);
             }
+            cx.narrow_dirty(EDITOR_DIRTY);
             return Action::Continue;
         }
 
         match resolve_binding_cx(cx, bindings::COMPOSE_NORMAL_LAYER, key) {
             BindingResolution::Action(command) => return self.process_action(cx, command),
-            BindingResolution::Consumed => return Action::Continue,
+            BindingResolution::Consumed => {
+                cx.narrow_dirty(CHORD_DIRTY);
+                return Action::Continue;
+            }
             BindingResolution::Unmatched => {}
         }
         let _ = cx.view.composer.send_key(&key);
+        cx.narrow_dirty(EDITOR_DIRTY);
         Action::Continue
     }
 
@@ -2506,7 +2521,13 @@ impl RoomMode {
 }
 
 impl AppMode for RoomMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64) {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        now_ms: u64,
+        dirty: DirtySections,
+    ) {
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_room_screen(
@@ -2521,7 +2542,12 @@ impl AppMode for RoomMode {
             self.last_history_search.as_ref(),
             buf,
             now_ms,
+            dirty,
         );
+    }
+
+    fn section_rendering(&self) -> bool {
+        true
     }
 
     fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
@@ -2582,7 +2608,7 @@ macro_rules! app_mode_test_bridge {
                 ) {
                     {
                         let mut cx = app.view_cx();
-                        AppMode::render(self, &mut cx, buf, now_ms);
+                        AppMode::render(self, &mut cx, buf, now_ms, DirtySections::ALL);
                     }
                     app.drain_core_commands();
                 }
@@ -2849,6 +2875,39 @@ mod tests {
         room.render(app, buffer, 0);
     }
 
+    fn render_room_sections(
+        app: &mut App,
+        room: &mut RoomMode,
+        buffer: &mut Buffer,
+        dirty: DirtySections,
+    ) {
+        app.view.sync_active(&app.room);
+        {
+            let mut cx = app.view_cx();
+            AppMode::render(room, &mut cx, buffer, 0, dirty);
+        }
+        app.drain_core_commands();
+    }
+
+    /// Renders one gated frame into a retained buffer and returns the bytes
+    /// it emitted, feeding them to `term` when given.
+    fn gated_frame(
+        app: &mut App,
+        room: &mut RoomMode,
+        buffer: &mut Buffer,
+        dirty: DirtySections,
+        term: Option<&mut vt100::Parser>,
+    ) -> usize {
+        render_room_sections(app, room, buffer, dirty);
+        buffer.render_internal();
+        if let Some(term) = term {
+            term.process(buffer.write_buffer());
+        }
+        let emitted = buffer.write_buffer().len();
+        buffer.buf.clear();
+        emitted
+    }
+
     fn cell_style(buffer: &mut Buffer, column: u16, row: u16) -> Style {
         let grid = buffer.current();
         grid.cells()[(row as usize * grid.width() as usize) + column as usize].style()
@@ -2925,6 +2984,141 @@ mod tests {
         let mut switcher = RoomSwitchMode::new();
         switcher.refresh(&app);
         assert_eq!(switcher.select.filtered_len(), 3);
+    }
+
+    #[test]
+    fn gated_idle_frame_emits_no_section_content() {
+        let mut app = test_app();
+        let mut room = RoomMode::new();
+        push_room_message(&mut app, 1, UserId(1), 0, "hello world");
+        let mut buffer = Buffer::new(80, 24);
+        buffer.set_swap(extui::Swap::Retained);
+
+        let first = gated_frame(&mut app, &mut room, &mut buffer, DirtySections::ALL, None);
+        assert!(first > 100, "the first frame paints the whole screen");
+
+        // Nothing changed and nothing is dirty: the retained seed already
+        // matches the previous frame, so only the style reset and cursor
+        // bookkeeping are emitted.
+        let idle = gated_frame(&mut app, &mut room, &mut buffer, DirtySections::EMPTY, None);
+        assert!(idle < 32, "idle frame re-emitted section content ({idle} bytes)");
+    }
+
+    #[test]
+    fn compose_bar_only_frame_matches_full_redraw() {
+        let mut app = test_app();
+        let mut room = RoomMode::new();
+        push_room_message(&mut app, 1, UserId(1), 0, "hello world");
+        push_room_message(&mut app, 2, UserId(2), 60_000, "second message");
+
+        let mut gated = Buffer::new(80, 24);
+        gated.set_swap(extui::Swap::Retained);
+        let mut gated_term = vt100::Parser::new(24, 80, 0);
+        gated_frame(
+            &mut app,
+            &mut room,
+            &mut gated,
+            DirtySections::ALL,
+            Some(&mut gated_term),
+        );
+
+        app.view.set_status("fresh status text");
+        gated_frame(
+            &mut app,
+            &mut room,
+            &mut gated,
+            DirtySections::COMPOSE_BAR,
+            Some(&mut gated_term),
+        );
+
+        // Reference: a full redraw of the same state into a fresh buffer.
+        let mut reference_room = RoomMode::new();
+        let mut reference = Buffer::new(80, 24);
+        let mut reference_term = vt100::Parser::new(24, 80, 0);
+        render_room_sections(
+            &mut app,
+            &mut reference_room,
+            &mut reference,
+            DirtySections::ALL,
+        );
+        reference.render_internal();
+        reference_term.process(reference.write_buffer());
+
+        // The foreground of a blank cell is invisible and legitimately
+        // differs between an explicit space write and an \x1b[K erase, so
+        // blanks compare by background only (extui's fuzzers do the same).
+        let visual = |cell: &vt100::Cell| {
+            let text = cell.contents().to_owned();
+            let fg = if text.trim().is_empty() {
+                vt100::Color::Default
+            } else {
+                cell.fgcolor()
+            };
+            (text, fg, cell.bgcolor())
+        };
+        for row in 0..24 {
+            for column in 0..80 {
+                let gated_cell = gated_term.screen().cell(row, column).unwrap();
+                let reference_cell = reference_term.screen().cell(row, column).unwrap();
+                assert_eq!(
+                    visual(gated_cell),
+                    visual(reference_cell),
+                    "gated frame diverged from full redraw at ({column},{row}): gated row {:?} vs reference row {:?}",
+                    gated_term.screen().contents_between(row, 0, row, 80),
+                    reference_term.screen().contents_between(row, 0, row, 80)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn skipped_sections_keep_room_layout_state() {
+        let mut app = test_app();
+        let mut room = RoomMode::new();
+        push_room_message(&mut app, 1, UserId(1), 0, "hello world");
+        let mut buffer = Buffer::new(80, 24);
+        buffer.set_swap(extui::Swap::Retained);
+
+        gated_frame(&mut app, &mut room, &mut buffer, DirtySections::ALL, None);
+        let chat_lines = room.layout.visible_chat_lines.len();
+        assert!(chat_lines > 0, "the full frame laid out chat lines");
+        let chat_rect = room.layout.chat_rect;
+        let room_list_rect = room.layout.room_list_rect;
+
+        app.view.set_status("status only");
+        gated_frame(
+            &mut app,
+            &mut room,
+            &mut buffer,
+            DirtySections::COMPOSE_BAR,
+            None,
+        );
+        assert_eq!(
+            room.layout.visible_chat_lines.len(),
+            chat_lines,
+            "a skipped chat kept its laid-out lines for mouse hits"
+        );
+        assert_eq!(room.layout.chat_rect, chat_rect);
+        assert_eq!(room.layout.room_list_rect, room_list_rect);
+    }
+
+    #[test]
+    fn room_height_change_escalates_to_full_repaint() {
+        let mut app = test_app();
+        let mut room = RoomMode::new();
+        push_room_message(&mut app, 1, UserId(1), 0, "hello world");
+        let mut buffer = Buffer::new(80, 24);
+        buffer.set_swap(extui::Swap::Retained);
+        gated_frame(&mut app, &mut room, &mut buffer, DirtySections::ALL, None);
+
+        // The lobby split moved without any dirty section being reported;
+        // the geometry backstop must repaint everything.
+        app.config.ui.room_height += 3;
+        let emitted = gated_frame(&mut app, &mut room, &mut buffer, DirtySections::EMPTY, None);
+        assert!(
+            emitted > 100,
+            "geometry change did not trigger a full repaint ({emitted} bytes)"
+        );
     }
 
     fn push_room_message(

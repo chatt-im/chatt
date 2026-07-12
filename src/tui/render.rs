@@ -24,6 +24,7 @@ use crate::{
     },
     bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind, NoticeKind},
+    client_channel::DirtySections,
     client_net::{TerminalVerb, TransferDirection, format_bytes},
     config::Config,
     theme::{self, Theme},
@@ -313,12 +314,13 @@ pub(crate) fn draw_room_screen(
     last_history_search: Option<&HistorySearch>,
     buf: &mut Buffer,
     now_ms: u64,
+    mut dirty: DirtySections,
 ) {
-    let capture = prepare_screen(app, buf);
-    layout.clear_workspace();
+    // Geometry always runs so section moves are detected; only the draw
+    // calls below are gated. Every drawn section declares its rect as
+    // damage, which is what lets extui skip diffing the untouched rows.
     let mut screen = buf.rect();
     let top_bar_area = screen.take_top(1);
-    draw_top_bar(top_bar_area, app, buf, capture.as_ref());
 
     refresh_key_preview_cache(app, Some(layer));
     let key_preview_height = key_preview_height(app, screen.w);
@@ -350,7 +352,7 @@ pub(crate) fn draw_room_screen(
         None => composer_layout(app, composer_width, max_bottom_rows, composer_padding),
     };
     let mut composer_frame = screen.take_bottom((composer_layout.height + frame_rows) as i32);
-    layout.composer_frame_rect = composer_frame;
+    let composer_frame_full = composer_frame;
     let top_border = if composer_padding {
         composer_frame.take_top(1)
     } else {
@@ -369,16 +371,87 @@ pub(crate) fn draw_room_screen(
     } else if composer_layout.overflow {
         composer_editor_area.take_right(1);
     }
-    layout.composer_rect = if history_search.is_some() {
+    let composer_rect = if history_search.is_some() {
         Rect::EMPTY
     } else {
         composer_editor_area
     };
-    layout.compose_bar_rect = status_area;
     let chat_log_bar_area = screen.take_bottom(1);
+    let workspace_area = screen;
+
+    // Any geometry shift moves sections wholesale, and skipped sections keep
+    // last frame's screen content, so everything must repaint. The lobby row
+    // count is part of the geometry: it splits the workspace internally.
+    let workspace_room_height = app
+        .config
+        .ui
+        .room_height
+        .min(workspace_area.h.saturating_sub(2));
+    if layout.top_bar_rect != top_bar_area
+        || layout.key_preview_rect != key_preview_area
+        || layout.compose_bar_rect != status_area
+        || layout.composer_frame_rect != composer_frame_full
+        || layout.composer_rect != composer_rect
+        || layout.chat_log_bar_rect != chat_log_bar_area
+        || layout.workspace_rect != workspace_area
+        || layout.workspace_room_height != workspace_room_height
+    {
+        dirty = DirtySections::ALL;
+    }
+    layout.top_bar_rect = top_bar_area;
+    layout.key_preview_rect = key_preview_area;
+    layout.compose_bar_rect = status_area;
+    layout.composer_frame_rect = composer_frame_full;
+    layout.composer_rect = composer_rect;
     layout.chat_log_bar_rect = chat_log_bar_area;
+    layout.workspace_rect = workspace_area;
+    layout.workspace_room_height = workspace_room_height;
+
+    // Every section erases its own rect with a `clear`ing background (not
+    // `fill`'s style merge, which would keep the retained grid's stale
+    // glyphs), and the sections tile the screen exactly, so no whole-screen
+    // clear pass is needed even for a full repaint.
+    if dirty.contains(DirtySections::ALL) {
+        buf.damage(buf.rect());
+    } else if dirty.is_empty() {
+        // A clean frame draws nothing; declare that so the diff scans
+        // nothing instead of falling back to the full scan.
+        buf.damage(Rect::EMPTY);
+    }
+
+    if dirty.contains(DirtySections::TOP_BAR) {
+        // The VU ballistics advance only while their section redraws; the
+        // capture-stop frame arrives with TOP_BAR dirty and resets them.
+        let capture = app
+            .room
+            .capture_stats
+            .as_ref()
+            .map(|stats| stats.snapshot());
+        let capture = match capture {
+            Some(mut snapshot) => {
+                let (rms, peak) =
+                    app.view
+                        .mic_level_ballistics
+                        .smooth(snapshot.rms, snapshot.peak, Instant::now());
+                snapshot.rms = rms;
+                snapshot.peak = peak;
+                Some(snapshot)
+            }
+            None => {
+                app.view.mic_level_ballistics.reset();
+                None
+            }
+        };
+        app.view.chrome.top_bar.live = Rect::EMPTY;
+        app.view.chrome.top_bar.mute = Rect::EMPTY;
+        app.view.chrome.top_bar.deafen = Rect::EMPTY;
+        app.view.chrome.top_bar.video = Rect::EMPTY;
+        draw_top_bar(top_bar_area, app, buf, capture.as_ref());
+        buf.damage(top_bar_area);
+    }
+
     draw_workspace(
-        screen,
+        workspace_area,
         app,
         focus,
         lobby_list_focus,
@@ -386,42 +459,61 @@ pub(crate) fn draw_room_screen(
         history_search.as_deref().or(last_history_search),
         buf,
         now_ms,
+        dirty,
     );
-    draw_chat_log_bar(
-        chat_log_bar_area,
-        app,
-        focus,
-        last_history_search.map(HistorySearch::query),
-        buf,
-    );
+    if dirty.contains(DirtySections::CHAT_LOG_BAR) {
+        draw_chat_log_bar(
+            chat_log_bar_area,
+            app,
+            focus,
+            last_history_search.map(HistorySearch::query),
+            buf,
+        );
+        buf.damage(chat_log_bar_area);
+    }
 
-    draw_compose_bar(status_area, app, focus, buf, mode, status_label);
-    draw_composer_border(top_border, app.view.theme, "▀", buf);
-    if let Some(search) = history_search {
-        draw_history_search(composer_area, app, search, composer_padding, buf);
-    } else {
-        debug_assert_eq!(composer_editor_area.w, composer_layout.editor_width);
-        draw_composer(composer_editor_area, app, focus, buf);
+    if dirty.contains(DirtySections::COMPOSE_BAR) {
+        draw_compose_bar(status_area, app, focus, buf, mode, status_label);
+        buf.damage(status_area);
     }
-    draw_composer_border(bottom_border, app.view.theme, "▄", buf);
-    if composer_layout.overflow
-        && let Some(scroll) = composer_scroll_state(&app.view.composer, composer_editor_area)
-    {
-        let frame = layout.composer_frame_rect;
-        let scrollbar_rect = Rect {
-            x: frame.x + frame.w - 1,
-            y: frame.y,
-            w: 1,
-            h: frame.h,
-        };
-        layout.composer_scrollbar = Some(ScrollbarLayout {
-            id: ScrollbarId::Compose,
-            rect: scrollbar_rect,
-            state: scroll,
-        });
-        draw_scrollbar(layout.composer_scrollbar.unwrap(), app.view.theme, buf);
+    if dirty.contains(DirtySections::COMPOSER) {
+        buf.clear_rect(composer_frame_full, app.view.theme.background);
+        // The composer owns the terminal cursor: its editor shows it while
+        // focused and everything else hides it. A skipped composer keeps the
+        // buffer's sticky cursor state from its last draw.
+        buf.hide_cursor();
+        draw_composer_border(top_border, app.view.theme, "▀", buf);
+        if let Some(search) = history_search {
+            draw_history_search(composer_area, app, search, composer_padding, buf);
+        } else {
+            debug_assert_eq!(composer_editor_area.w, composer_layout.editor_width);
+            draw_composer(composer_editor_area, app, focus, buf);
+        }
+        draw_composer_border(bottom_border, app.view.theme, "▄", buf);
+        layout.composer_scrollbar = None;
+        if composer_layout.overflow
+            && let Some(scroll) = composer_scroll_state(&app.view.composer, composer_editor_area)
+        {
+            let frame = layout.composer_frame_rect;
+            let scrollbar_rect = Rect {
+                x: frame.x + frame.w - 1,
+                y: frame.y,
+                w: 1,
+                h: frame.h,
+            };
+            layout.composer_scrollbar = Some(ScrollbarLayout {
+                id: ScrollbarId::Compose,
+                rect: scrollbar_rect,
+                state: scroll,
+            });
+            draw_scrollbar(layout.composer_scrollbar.unwrap(), app.view.theme, buf);
+        }
+        buf.damage(composer_frame_full);
     }
-    draw_key_preview(key_preview_area, app, buf);
+    if dirty.contains(DirtySections::KEY_PREVIEW) {
+        draw_key_preview(key_preview_area, app, buf);
+        buf.damage(key_preview_area);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -488,7 +580,7 @@ fn draw_user_list(
     lobby_list_focus: LobbyListFocus,
     buf: &mut Buffer,
 ) {
-    area.with(app.view.theme.panel_alt).fill(buf);
+    area.with(app.view.theme.panel_alt).clear(buf);
     let mut rows = area;
     let visible = rows.h as usize;
     let participants = app.room.participant_snapshot(app.view.viewed_room);
@@ -560,6 +652,7 @@ fn draw_workspace(
     history_search: Option<&HistorySearch>,
     buf: &mut Buffer,
     now_ms: u64,
+    dirty: DirtySections,
 ) {
     let mut rows = area;
     let room_height = app.config.ui.room_height.min(rows.h.saturating_sub(2));
@@ -569,34 +662,59 @@ fn draw_workspace(
         layout.room_list_rect = rooms_area;
         layout.lobby_divider_rect = divider_area;
         layout.user_list_rect = users_area;
-        draw_room_list(rooms_area, app, focus, lobby_list_focus, layout, buf);
-        let rooms_focused =
-            focus == ChatPanelFocus::Lobby && lobby_list_focus == LobbyListFocus::Rooms;
-        if let Some(scrollbar) = layout.rooms_scrollbar.filter(|_| rooms_focused) {
-            draw_scrollbar(scrollbar, app.view.theme, buf);
-        } else {
-            divider_area.with(app.view.theme.status_fill).fill(buf);
+        if dirty.contains(DirtySections::ROOM_LIST) {
+            buf.clear_rect(divider_area, app.view.theme.background);
+            draw_room_list(rooms_area, app, focus, lobby_list_focus, layout, buf);
+            let rooms_focused =
+                focus == ChatPanelFocus::Lobby && lobby_list_focus == LobbyListFocus::Rooms;
+            if let Some(scrollbar) = layout.rooms_scrollbar.filter(|_| rooms_focused) {
+                draw_scrollbar(scrollbar, app.view.theme, buf);
+            } else {
+                divider_area.with(app.view.theme.status_fill).fill(buf);
+            }
+            buf.damage(rooms_area);
+            buf.damage(divider_area);
         }
-        draw_user_list(users_area, app, focus, lobby_list_focus, buf);
+        if dirty.contains(DirtySections::USER_LIST) {
+            draw_user_list(users_area, app, focus, lobby_list_focus, buf);
+            buf.damage(users_area);
+        }
+    } else {
+        layout.room_list_rect = Rect::EMPTY;
+        layout.lobby_divider_rect = Rect::EMPTY;
+        layout.user_list_rect = Rect::EMPTY;
+        layout.rooms_scrollbar = None;
+        layout.room_hits.clear();
     }
 
     if rows.h > 0 {
         let lobby_bar = rows.take_top(1);
         layout.lobby_bar_rect = lobby_bar;
-        draw_lobby_bar(
-            lobby_bar,
-            app,
-            focus,
-            lobby_list_focus,
-            layout.room_list_rect,
-            layout.lobby_divider_rect,
-            layout.user_list_rect,
-            buf,
-        );
+        if dirty.contains(DirtySections::LOBBY_BAR) {
+            draw_lobby_bar(
+                lobby_bar,
+                app,
+                focus,
+                lobby_list_focus,
+                layout.room_list_rect,
+                layout.lobby_divider_rect,
+                layout.user_list_rect,
+                buf,
+            );
+            buf.damage(lobby_bar);
+        }
+    } else {
+        layout.lobby_bar_rect = Rect::EMPTY;
     }
 
     if rows.h > 0 {
-        draw_chat(rows, app, focus, layout, history_search, buf, now_ms);
+        if dirty.contains(DirtySections::CHAT) {
+            // Transfer buttons are chat click targets; the chat redraw
+            // repopulates them.
+            app.view.chrome.transfer_buttons.clear();
+            draw_chat(rows, app, focus, layout, history_search, buf, now_ms);
+            buf.damage(rows);
+        }
     } else {
         layout.clear_chat();
     }
@@ -630,6 +748,8 @@ fn draw_room_list(
     layout: &mut RoomLayout,
     buf: &mut Buffer,
 ) {
+    layout.room_hits.clear();
+    layout.rooms_scrollbar = None;
     let items = app.room_select_items();
     let visible = area.h as usize;
     app.view.clamp_rooms_offset(items.len(), visible);
@@ -637,7 +757,7 @@ fn draw_room_list(
         return;
     }
     let theme = app.view.theme;
-    area.with(theme.panel_alt).fill(buf);
+    area.with(theme.panel_alt).clear(buf);
 
     if items.is_empty() {
         area.with(theme.panel_alt.patch(theme.muted))
@@ -1219,7 +1339,7 @@ fn draw_top_bar(
     capture: Option<&StatsSnapshot>,
 ) {
     let theme = app.view.theme;
-    area.with(theme.status_fill).fill(buf);
+    area.with(theme.status_fill).clear(buf);
 
     let server = if app.room.server_alias.trim().is_empty() {
         "Server"
@@ -1341,7 +1461,7 @@ fn draw_lobby_bar(
     }
     let lobby_focused = focus == ChatPanelFocus::Lobby;
     let fill = app.view.theme.status_fill;
-    area.with(fill).fill(buf);
+    area.with(fill).clear(buf);
 
     let rooms_bar = bar_rect_for(area, room_list_rect);
     if !rooms_bar.is_empty() {
@@ -1472,7 +1592,7 @@ fn draw_chat_log_bar(
     }
     let focused = focus == ChatPanelFocus::ChatLog;
     let (fill, label, _) = section_bar_styles(app.view.theme, ChatPanelFocus::ChatLog, focused);
-    area.with(fill).fill(buf);
+    area.with(fill).clear(buf);
     let row = area.with(Ellipsis(true)).with(label).text(buf, " Chat ");
     if let Some(query) = search_query {
         row.with(fill.patch(app.view.theme.accent))
@@ -1497,7 +1617,7 @@ fn draw_compose_bar(
     if focused {
         label = app.view.theme.mode_style(mode) | Modifier::BOLD;
     }
-    area.with(fill).fill(buf);
+    area.with(fill).clear(buf);
     let row = area
         .with(Ellipsis(true))
         .with(label)
@@ -1557,7 +1677,7 @@ fn draw_chat(
     buf: &mut Buffer,
     now_ms: u64,
 ) {
-    area.with(app.view.theme.background).fill(buf);
+    area.with(app.view.theme.background).clear(buf);
     if area.is_empty() {
         layout.clear_chat();
         return;
@@ -2297,7 +2417,7 @@ fn draw_key_preview(area: Rect, app: &RenderState<'_>, buf: &mut Buffer) {
 
     let entries = &app.view.chrome.key_preview.cache.entries;
     if entries.is_empty() {
-        area.with(Style::default()).fill(buf);
+        area.with(Style::default()).clear(buf);
         return;
     }
 
@@ -2305,7 +2425,7 @@ fn draw_key_preview(area: Rect, app: &RenderState<'_>, buf: &mut Buffer) {
     let bar_style = key_preview_bar_style();
     let key_style = key_preview_key_style();
     let label_style = key_preview_label_style();
-    area.with(bar_style).fill(buf);
+    area.with(bar_style).clear(buf);
 
     for (row_index, row) in rows.iter().enumerate() {
         let Ok(row_index) = u16::try_from(row_index) else {

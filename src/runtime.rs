@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use crate::{
     app::{App, AppEvent, EventSender, PendingJoin, command::CoreCommand},
     attach,
-    client_channel::{ClientChannel, ClientId},
+    client_channel::{ClientChannel, ClientId, DirtySections},
     config::Config,
     tui::{
         client_thread::{ClientThread, InitialMode},
@@ -143,7 +143,13 @@ fn run_app_inner(
     loop {
         // The wait happens with all shared state open to the render thread.
         let first_event = app.wait_event(CORE_INTERVAL);
-        let mut dirty = first_event.is_some();
+        // Events mutate arbitrary render state, so they invalidate every
+        // section; only tick's audited periodic sources stay fine-grained.
+        let mut dirty = if first_event.is_some() {
+            DirtySections::ALL
+        } else {
+            DirtySections::EMPTY
+        };
         app.acquire_core_state();
 
         if let Some(event) = first_event {
@@ -159,7 +165,7 @@ fn run_app_inner(
             let Some(event) = app.next_event() else {
                 break;
             };
-            dirty = true;
+            dirty = DirtySections::ALL;
             handle_runtime_event(
                 &mut app,
                 event,
@@ -182,14 +188,12 @@ fn run_app_inner(
         if let Some(channel) = &channel {
             if resized {
                 channel.resize();
-            } else if dirty {
-                channel.wake();
+            } else {
+                channel.wake_sections(dirty);
             }
         }
-        if dirty {
-            for client in clients.values() {
-                client.channel.wake();
-            }
+        for client in clients.values() {
+            client.channel.wake_sections(dirty);
         }
         if quit {
             break;

@@ -422,6 +422,36 @@ buf.resize(new_w, new_h);
 buf.scroll(delta: i16);     // positive = up, negative = down
 ```
 
+### Retained mode and damage declarations
+
+By default (`Swap::Blank`) the work buffer is cleared after every render, so a
+frame must repaint everything it wants visible. `buf.set_swap(Swap::Retained)`
+seeds the next frame's work buffer with the rendered frame instead, allowing
+partial overdraw: untouched cells persist on screen and emit nothing.
+
+With retained mode, `buf.damage(rect)` declares which regions were drawn since
+the last render. Damage is tracked per *line*: the first declaration switches
+the frame to a row bitmap and the diff scans only marked rows (columns are
+ignored). Declaring only empty rects means "nothing was drawn" and the diff
+scans nothing, while a render with no declarations at all falls back to the
+full scan, so callers that never declare are unaffected. Whole-grid rewrites —
+`blank()` or a queued scroll — force the frame back to a full scan that later
+declarations cannot narrow. This is a promise, not a hint: every cell written
+must be covered by a declared rect or stale content stays on screen (debug
+builds assert on undeclared writes).
+
+Two gotchas on a retained grid:
+
+- `.fill()` is a style merge (`set_style`): it does not erase glyphs the way a
+  blank frame does. Clear a section with `buf.clear_rect(rect, style)` before
+  redrawing it.
+- When switching back to immediate-mode frames mid-stream (e.g. a screen that
+  relies on the blank grid), call `buf.blank()` to discard the retained seed.
+
+Chatt uses this on the room screen only: `DirtySections` masks flow from the
+core to the render thread, `draw_room_screen` redraws and declares only dirty
+sections, and every other screen stays on classic `Swap::Blank` frames.
+
 ### Low-level drawing (avoid when possible)
 
 These exist but should be avoided in favor of the `DisplayRect` API, which eliminates

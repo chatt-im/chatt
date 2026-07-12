@@ -17,6 +17,7 @@ use crate::{
         room::{UserListRow, UserPresence},
     },
     bindings::{self, BindCommand},
+    client_channel::DirtySections,
     fuzzy::fuzzy_score,
     theme,
     tui::{
@@ -381,7 +382,7 @@ fn row_matches(filter: &str, row: &UserListRow) -> bool {
 }
 
 impl AppMode for UserListMode {
-    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64) {
+    fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, _now_ms: u64, _dirty: DirtySections) {
         self.apply_rows(cx.session.user_list_rows());
         let mut app = crate::tui::render::RenderState::new(cx);
         self.row_hits.clear();
