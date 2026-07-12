@@ -46,7 +46,7 @@ dhat = { version = "0.3", optional = true }
 memchr = "2.8.3"
 
 [features]
-default = ["audio-realtime", "mimalloc-allocator"]
+default = ["audio-realtime", "mimalloc-allocator", "embed-web"]
 pipewire = ["cpal/pipewire"]
 audio-realtime = ["cpal/realtime"]
 audio-realtime-dbus = ["audio-realtime", "cpal/realtime-dbus"]
