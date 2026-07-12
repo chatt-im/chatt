@@ -165,6 +165,19 @@ cargo run -p chatt -- join 192.168.0.1:4000
 the picker filtered to the matches when it is ambiguous, and falls back to open
 pairing when nothing matches but the address is a public `host:port`.
 
+Run the shared client core without a terminal UI:
+
+```sh
+cargo run -p chatt -- daemon
+```
+
+The daemon stays in the foreground and requires an existing client config. A
+later `chatt` invocation attaches its terminal to the daemon; closing that TUI
+leaves the daemon, server connection, audio, and other shared state running. The
+daemon starts disconnected, so an attached TUI must select a server after a cold
+start. SIGINT, SIGTERM, or SIGHUP cleanly stops the daemon and its attached TUI
+clients without electing a replacement master.
+
 Upload a file into an already running client session:
 
 ```sh
