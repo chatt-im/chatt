@@ -1121,6 +1121,15 @@ fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
         );
         form.set_default(WebAutoplay::Disabled.label());
     }
+    if form
+        .checkbox("Readonly", &mut draft.web_readonly)
+        .is_focus()
+    {
+        form.set_help(
+            "View-only browser page. Turning it off enables the browser compose box and uploads. Applies live to connected browsers.",
+        );
+        form.set_default("on");
+    }
 
     if !advanced_section(form, draft) {
         return;
@@ -1145,15 +1154,6 @@ fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
             "In-memory scrollback ceiling per room; the oldest messages are dropped past it.",
         );
         form.set_default(ui_defaults.max_messages.to_string());
-    }
-    if form
-        .checkbox("Web Readonly", &mut draft.web_readonly)
-        .is_focus()
-    {
-        form.set_help(
-            "View-only browser page. Turning it off enables the browser compose box and uploads. Applies live to connected browsers.",
-        );
-        form.set_default("on");
     }
     if form
         .string_list(
@@ -1861,6 +1861,39 @@ mod tests {
         let mut state = FormState::new(buffer_field, config.ui.default_bindings);
         run_logic(&mut state, &mut draft, SettingsTab::Audio, None);
         assert_eq!(state.focus(), buffer_field);
+    }
+
+    #[test]
+    fn web_readonly_is_available_without_advanced_settings() {
+        let config = crate::config::Config::default();
+        let field = field_id_for("Web Log Server", "Readonly");
+        let mut draft = test_draft();
+        assert!(!draft.show_advanced);
+        assert!(draft.web_readonly);
+
+        let mut state = FormState::new(field, config.ui.default_bindings);
+        let theme = Theme::tomorrow_night();
+        let mut input_picker = AudioInputPickerState::default();
+        let mut output_picker = AudioOutputPickerState::default();
+        let output = settings_logic(
+            &mut state,
+            &mut draft,
+            SettingsTab::Interface,
+            &theme,
+            &config.bindings,
+            false,
+            FieldIntent::Activate,
+            None,
+            None,
+            &[],
+            &mut input_picker,
+            &[],
+            &mut output_picker,
+        );
+
+        assert_eq!(state.focus(), field);
+        assert!(!draft.web_readonly);
+        assert!(output.changed);
     }
 
     #[test]

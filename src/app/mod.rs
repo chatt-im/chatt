@@ -257,6 +257,10 @@ impl StatusState {
             false
         }
     }
+
+    pub(crate) fn expires_at(&self) -> Option<Instant> {
+        self.expires_at
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -577,6 +581,14 @@ enum RecoverySchedule {
     Exhausted,
 }
 
+/// Tick cadence while audio streams need liveness polling: stall detection,
+/// stats projection, and talking-indicator decay all read callback counters
+/// that no event announces.
+const TICK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Idle tick backstop. Every other tick obligation schedules a deadline in
+/// [`App::next_tick_timeout`]; this only bounds detection of a worker that
+/// died without sending an event.
+const TICK_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_WINDOW: Duration = Duration::from_secs(30);
 const RECOVERY_MAX_ATTEMPTS: usize = 3;
 const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_millis(750);
@@ -655,6 +667,10 @@ impl RecoveryState {
 
     fn is_pending(&self) -> bool {
         self.next_retry_at.is_some()
+    }
+
+    fn due_at(&self) -> Option<Instant> {
+        if self.exhausted { None } else { self.next_retry_at }
     }
 }
 
@@ -4962,6 +4978,50 @@ impl App {
             dirty |= DirtySections::ALL;
         }
         dirty
+    }
+
+    /// How long the runtime may sleep before the next [`Self::tick`]
+    /// obligation comes due: [`TICK_POLL_INTERVAL`] while audio liveness needs
+    /// polling, otherwise the earliest scheduled deadline, bounded by
+    /// [`TICK_IDLE_INTERVAL`]. Events wake the runtime regardless.
+    pub(crate) fn next_tick_timeout(&self, now: Instant) -> Duration {
+        if self.tick_poll_active() {
+            return TICK_POLL_INTERVAL;
+        }
+        let deadlines = [
+            self.view.status.expires_at(),
+            self.supervisor.network.due_at(),
+            self.supervisor.control_socket.due_at(),
+            self.supervisor.capture.due_at(),
+            self.supervisor.playback.due_at(),
+            self.supervisor.device_probe.next_at,
+            self.pending_audio_apply.as_ref().map(|pending| pending.deadline),
+            self.pending_room_catalog_save
+                .as_ref()
+                .map(|pending| pending.deadline),
+            self.pending_voice_teardown_at,
+            self.notification_playback_idle_at,
+        ];
+        let mut timeout = TICK_IDLE_INTERVAL;
+        for deadline in deadlines.into_iter().flatten() {
+            timeout = timeout.min(deadline.saturating_duration_since(now));
+        }
+        timeout
+    }
+
+    /// Whether any tick source polls state that only changes while audio
+    /// runs, so no deadline can describe when it next needs attention. The
+    /// talking-display check covers the release decay after streams stop.
+    fn tick_poll_active(&self) -> bool {
+        self.capture.is_some()
+            || self.playback.is_some()
+            || self.notification_playback.is_some()
+            || self
+                .room
+                .participants
+                .entries
+                .iter()
+                .any(|entry| entry.talking_display)
     }
 
     fn mark_daemon_config_changed(&mut self) {

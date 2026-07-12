@@ -7,7 +7,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{Arc, Once},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use extui::event::polling::{self, GlobalWakerConfig};
@@ -24,7 +24,6 @@ use crate::{
     },
 };
 
-const CORE_INTERVAL: Duration = Duration::from_millis(50);
 const REMOTE_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const CORE_BATCH_BUDGET: usize = 256;
 static PANIC_HOOK: Once = Once::new();
@@ -140,9 +139,12 @@ fn run_app_inner(
     let mut resize_count = (!headless).then(polling::resize_count);
     let mut next_client_id = 1u64;
     let mut clients = HashMap::<ClientId, RemoteClient>::new();
+    // Zero so the first iteration ticks immediately and derives the real
+    // timeout from app state.
+    let mut wait_timeout = Duration::ZERO;
     loop {
         // The wait happens with all shared state open to the render thread.
-        let first_event = app.wait_event(CORE_INTERVAL);
+        let first_event = app.wait_event(wait_timeout);
         // Events mutate arbitrary render state, so they invalidate every
         // section; only tick's audited periodic sources stay fine-grained.
         let mut dirty = if first_event.is_some() {
@@ -183,6 +185,7 @@ fn run_app_inner(
             *previous = current;
             resized
         });
+        wait_timeout = app.next_tick_timeout(Instant::now());
         app.release_core_state();
 
         if let Some(channel) = &channel {
