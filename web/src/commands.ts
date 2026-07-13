@@ -4,6 +4,7 @@
 // caret. No Solid imports; App.tsx owns the signals.
 
 import type { CandidateItem, CandidateKind, WebCommandInfo } from "./types";
+import { findColonTrigger } from "./emoji/input";
 
 export interface FuzzyMatch {
   score: number;
@@ -77,40 +78,55 @@ export type CompletionContext =
       kind: CandidateKind | "free";
       query: string;
       span: CompletionSpan;
-    };
+    }
+  // A `:shortcode` emoji trigger anywhere in the draft. The record set is
+  // resolved from the query in App.tsx against the loaded emoji database.
+  | { mode: "emoji"; query: string; span: CompletionSpan };
 
 // What the popup should complete for `draft` with the caret at `cursor`, or
-// null when no completion applies. A leading space escapes the slash (the
-// draft is sent as literal chat), mirroring the TUI composer.
+// null when no completion applies. A leading `/` selects command completion
+// (line-anchored); otherwise a `:shortcode` token under the caret selects emoji
+// completion. A leading space escapes the slash (the draft is sent as literal
+// chat), mirroring the TUI composer.
 export function completionContext(
   draft: string,
   cursor: number,
   commands: WebCommandInfo[],
 ): CompletionContext | null {
-  if (!draft.startsWith("/")) return null;
-  const firstBreak = draft.search(/\s/);
-  const tokenEnd = firstBreak === -1 ? draft.length : firstBreak;
-  if (cursor <= tokenEnd) {
+  if (draft.startsWith("/")) {
+    const firstBreak = draft.search(/\s/);
+    const tokenEnd = firstBreak === -1 ? draft.length : firstBreak;
+    if (cursor <= tokenEnd) {
+      return {
+        mode: "command",
+        query: draft.slice(0, cursor),
+        span: { start: 0, end: tokenEnd },
+      };
+    }
+    const name = draft.slice(0, tokenEnd);
+    const command = commands.find((entry) => entry.name === name);
+    if (!command || command.arg === "none") return null;
+    // The whole remainder is the argument: room names may contain spaces and the
+    // dispatch matches the full rest of the line.
+    const argStart = tokenEnd + 1;
+    if (cursor < argStart) return null;
     return {
-      mode: "command",
-      query: draft.slice(0, cursor),
-      span: { start: 0, end: tokenEnd },
+      mode: "argument",
+      command,
+      kind: command.arg === "free" ? "free" : command.arg,
+      query: draft.slice(argStart, cursor),
+      span: { start: argStart, end: draft.length },
     };
   }
-  const name = draft.slice(0, tokenEnd);
-  const command = commands.find((entry) => entry.name === name);
-  if (!command || command.arg === "none") return null;
-  // The whole remainder is the argument: room names may contain spaces and the
-  // dispatch matches the full rest of the line.
-  const argStart = tokenEnd + 1;
-  if (cursor < argStart) return null;
-  return {
-    mode: "argument",
-    command,
-    kind: command.arg === "free" ? "free" : command.arg,
-    query: draft.slice(argStart, cursor),
-    span: { start: argStart, end: draft.length },
-  };
+  const trigger = findColonTrigger(draft, cursor, cursor);
+  if (trigger) {
+    return {
+      mode: "emoji",
+      query: trigger.query,
+      span: { start: trigger.start, end: trigger.end },
+    };
+  }
+  return null;
 }
 
 export const MAX_POPUP_ROWS = 8;
