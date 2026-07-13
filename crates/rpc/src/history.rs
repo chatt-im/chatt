@@ -201,7 +201,11 @@ pub fn decode_chunk_ref(bytes: &[u8]) -> Result<Option<HistoryChunkRef<'_>>, Str
     // reserving megabytes before the first record fails to parse.
     let mut messages = Vec::new();
     for _ in 0..count {
-        messages.push(read_message(&mut cursor)?);
+        let message = read_message(&mut cursor)?;
+        if message.room_id != room_id {
+            return Err("history message room does not match chunk room".to_string());
+        }
+        messages.push(message);
     }
     cursor.finish()?;
     Ok(Some(HistoryChunkRef {
@@ -513,6 +517,17 @@ mod tests {
         let decoded = decode_chunk(&chunk).unwrap().unwrap();
         assert_eq!(decoded.messages[1].target, Some(MessageId(42)));
         assert!(decoded.messages[1].flags.edited());
+    }
+
+    #[test]
+    fn chunks_reject_messages_from_another_room() {
+        let mut message = test_message();
+        message.room_id = RoomId(8);
+        let mut chunk = Vec::new();
+        write_chunk_header(RoomId(7), None, false, true, 1, &mut chunk).unwrap();
+        chunk.extend_from_slice(&encode_message(&message));
+
+        assert!(decode_chunk(&chunk).is_err());
     }
 
     #[test]

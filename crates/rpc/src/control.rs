@@ -226,6 +226,9 @@ pub enum ClientControl {
     DeleteChat {
         room_id: RoomId,
         target: MessageId,
+        /// Encoded [`crate::e2e::DmEnvelope`] authenticating the deletion and
+        /// target in DM rooms; absent in other rooms.
+        envelope: Option<Vec<u8>>,
     },
     /// Publish this user's long-term X25519 identity public key for DM
     /// end-to-end encryption. Sent after every successful authentication;
@@ -820,6 +823,11 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 validate_dm_envelope(envelope)?;
             }
         },
+        ClientControl::DeleteChat { envelope, .. } => {
+            if let Some(envelope) = envelope {
+                validate_dm_envelope(envelope)?;
+            }
+        }
         ClientControl::PublishP2p { candidates, .. } => {
             if candidates.len() > 64 {
                 return Err("too many P2P candidates".to_string());
@@ -1128,9 +1136,17 @@ mod tests {
         let delete = ClientControl::DeleteChat {
             room_id: RoomId(7),
             target: MessageId(42),
+            envelope: Some(vec![1u8; 160]),
         };
         let encoded = encode_client_control(&delete).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), delete);
+
+        let invalid_delete = ClientControl::DeleteChat {
+            room_id: RoomId(7),
+            target: MessageId(42),
+            envelope: Some(Vec::new()),
+        };
+        assert!(encode_client_control(&invalid_delete).is_err());
     }
 
     #[test]

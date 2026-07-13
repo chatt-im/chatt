@@ -1815,7 +1815,14 @@ impl Server {
                     envelope,
                 )
             }
-            (ConnState::Ready, ClientControl::DeleteChat { room_id, target }) => {
+            (
+                ConnState::Ready,
+                ClientControl::DeleteChat {
+                    room_id,
+                    target,
+                    envelope,
+                },
+            ) => {
                 let session_id = self.session_for_token(token)?;
                 self.mutate_chat(
                     session_id,
@@ -1823,7 +1830,7 @@ impl Server {
                     target,
                     MutationKind::Delete,
                     String::new(),
-                    None,
+                    envelope,
                 )
             }
             (ConnState::Ready, ClientControl::PublishE2eKey { public_key }) => {
@@ -3372,9 +3379,7 @@ impl Server {
                 "message is unavailable".to_string(),
             );
         }
-        if kind == MutationKind::Edit
-            && let Some(error) = self.envelope_policy_error(room_id, envelope.is_some())
-        {
+        if let Some(error) = self.envelope_policy_error(room_id, envelope.is_some()) {
             kvlog::warn!(
                 "chat mutation rejected",
                 session_id = session_id.0,
@@ -7259,7 +7264,7 @@ mod tests {
     }
 
     #[test]
-    fn dm_room_rejects_plaintext_chat_and_public_room_rejects_envelope() {
+    fn dm_room_requires_envelopes_for_chat_and_mutations() {
         let mut server = test_server();
         let requester = SessionId(1);
         let mut requester_peer = live_user(&mut server, Token(11), requester, UserId(1));
@@ -7343,6 +7348,44 @@ mod tests {
         };
         assert_eq!(message.target, Some(sealed_target));
         assert_eq!(message.envelope, Some(vec![3u8; 200]));
+
+        server
+            .mutate_chat(
+                requester,
+                dm_room,
+                sealed_target,
+                MutationKind::Delete,
+                String::new(),
+                None,
+            )
+            .unwrap();
+        let ServerControl::ChatMutationRejected { message, .. } =
+            read_until(&mut requester_peer, |control| {
+                matches!(control, ServerControl::ChatMutationRejected { .. })
+            })
+        else {
+            unreachable!();
+        };
+        assert!(message.contains("end-to-end"), "{message}");
+
+        server
+            .mutate_chat(
+                requester,
+                dm_room,
+                sealed_target,
+                MutationKind::Delete,
+                String::new(),
+                Some(vec![4u8; 200]),
+            )
+            .unwrap();
+        let ServerControl::Chat { message } = read_until(
+            &mut peer_peer,
+            |control| matches!(control, ServerControl::Chat { message } if message.flags.deleted()),
+        ) else {
+            unreachable!();
+        };
+        assert_eq!(message.target, Some(sealed_target));
+        assert_eq!(message.envelope, Some(vec![4u8; 200]));
     }
 
     #[test]
