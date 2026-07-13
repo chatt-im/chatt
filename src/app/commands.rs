@@ -267,9 +267,7 @@ pub(crate) fn web_command_gate(first_token: &str) -> Result<(), String> {
         return Err(format!("unknown command: {first_token}"));
     };
     if !command.web {
-        return Err(format!(
-            "{first_token} is not available from the web view"
-        ));
+        return Err(format!("{first_token} is not available from the web view"));
     }
     Ok(())
 }

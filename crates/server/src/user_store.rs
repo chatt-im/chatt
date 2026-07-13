@@ -2,9 +2,9 @@
 //! config.
 //!
 //! The operator's config file is read-only at runtime. Every user record the
-//! server mutates (pairing token hashes, display names, the dynamic user-id
-//! counter) lives in `users.toml` under the storage data dir and is rewritten
-//! atomically on each change.
+//! server mutates for invited users (pairing token hashes and usernames) lives
+//! in `users.toml` under the storage data dir and is rewritten atomically on
+//! each change.
 
 use hashbrown::HashSet;
 use std::{fs, path::PathBuf};
@@ -13,12 +13,13 @@ use rpc::ids::UserId;
 use toml_spanner::Toml;
 
 use crate::config::{
-    FIRST_DYNAMIC_USER_ID, UserConfig, atomic_write_toml, toml_quote_value, validate_secret_hash,
+    FIRST_DYNAMIC_USER_ID, UserConfig, atomic_write_toml, toml_quote_value, valid_username,
+    validate_secret_hash,
 };
 
 const USERS_FILE: &str = "users.toml";
 
-/// Durable registry of paired users and the dynamic user-id counter.
+/// Durable registry of invited/explicit paired users.
 ///
 /// A store without a path (test configs with no data dir) keeps the registry
 /// in memory only.
@@ -26,14 +27,11 @@ const USERS_FILE: &str = "users.toml";
 pub struct UserStore {
     pub(crate) path: Option<PathBuf>,
     pub users: Vec<UserConfig>,
-    next_dynamic_user_id: u64,
 }
 
 #[derive(Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
 struct UsersFile {
-    #[toml(default = FIRST_DYNAMIC_USER_ID)]
-    next_dynamic_user_id: u64,
     #[toml(default)]
     users: Vec<UserConfig>,
 }
@@ -44,7 +42,6 @@ impl UserStore {
         Self {
             path: None,
             users: Vec::new(),
-            next_dynamic_user_id: FIRST_DYNAMIC_USER_ID,
         }
     }
 
@@ -68,7 +65,6 @@ impl UserStore {
                 return Ok(Self {
                     path: Some(path),
                     users: Vec::new(),
-                    next_dynamic_user_id: FIRST_DYNAMIC_USER_ID,
                 });
             }
             Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
@@ -84,7 +80,6 @@ impl UserStore {
         let mut store = Self {
             path: Some(path),
             users: file.users,
-            next_dynamic_user_id: file.next_dynamic_user_id,
         };
         store.normalize();
         store.validate(&source)?;
@@ -105,20 +100,24 @@ impl UserStore {
         username: String,
         token_hash: String,
     ) -> Result<UserConfig, String> {
-        if let Some(user) = self
-            .users
+        if !valid_username(&username) {
+            return Err("username must be 1-64 bytes with no control characters".to_string());
+        }
+        let username = username.trim().to_string();
+        let mut users = self.users.clone();
+        if let Some(user) = users
             .iter_mut()
             .find(|user| user.internal_reference == internal_reference)
         {
             user.username = username;
             user.token_hash = token_hash;
             let user = user.clone();
-            self.save()?;
+            self.save_state(&users)?;
+            self.users = users;
             return Ok(user);
         }
 
-        let id = self
-            .users
+        let id = users
             .iter()
             .map(|user| user.id.0)
             .max()
@@ -135,8 +134,9 @@ impl UserStore {
             username,
             token_hash,
         };
-        self.users.push(user.clone());
-        self.save()?;
+        users.push(user.clone());
+        self.save_state(&users)?;
+        self.users = users;
         Ok(user)
     }
 
@@ -150,34 +150,22 @@ impl UserStore {
         user_id: UserId,
         username: String,
     ) -> Result<UserConfig, String> {
-        let Some(user) = self.users.iter_mut().find(|user| user.id == user_id) else {
+        if !valid_username(&username) {
+            return Err("username must be 1-64 bytes with no control characters".to_string());
+        }
+        let username = username.trim().to_string();
+        let mut users = self.users.clone();
+        let Some(user) = users.iter_mut().find(|user| user.id == user_id) else {
             return Err(format!("no user with id {user_id}"));
         };
         user.username = username;
         let user = user.clone();
-        self.save()?;
+        self.save_state(&users)?;
+        self.users = users;
         Ok(user)
     }
 
-    /// Reserves the next dynamic user id, persisting the advanced counter so
-    /// ids never repeat across restarts. The in-memory counter stays advanced
-    /// even when the write fails, so ids can only skip, never repeat.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the counter is exhausted or the registry write
-    /// fails.
-    pub fn allocate_dynamic_user_id(&mut self) -> Result<UserId, String> {
-        let id = self.next_dynamic_user_id;
-        let next = id
-            .checked_add(1)
-            .ok_or_else(|| "no dynamic user ids are available".to_string())?;
-        self.next_dynamic_user_id = next;
-        self.save()?;
-        Ok(UserId(id))
-    }
-
-    fn save(&self) -> Result<(), String> {
+    fn save_state(&self, users: &[UserConfig]) -> Result<(), String> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -185,17 +173,13 @@ impl UserStore {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
         }
-        atomic_write_toml(path, &self.snapshot())
+        atomic_write_toml(path, &Self::snapshot(users))
     }
 
-    fn snapshot(&self) -> String {
+    fn snapshot(users: &[UserConfig]) -> String {
         let mut out = String::new();
         out.push_str("# chatt server user registry. Managed by the server; do not edit.\n\n");
-        out.push_str(&format!(
-            "next-dynamic-user-id = {}\n",
-            self.next_dynamic_user_id
-        ));
-        for user in &self.users {
+        for user in users {
             out.push_str("\n[[users]]\n");
             out.push_str(&format!("id = {}\n", user.id.0));
             out.push_str(&format!(
@@ -225,11 +209,6 @@ impl UserStore {
     }
 
     fn validate(&self, source: &str) -> Result<(), String> {
-        if self.next_dynamic_user_id < FIRST_DYNAMIC_USER_ID {
-            return Err(format!(
-                "{source}: next-dynamic-user-id must be at least {FIRST_DYNAMIC_USER_ID}"
-            ));
-        }
         let mut user_ids = HashSet::new();
         let mut internal_reference_names = HashSet::new();
         let mut usernames = HashSet::new();
@@ -246,9 +225,9 @@ impl UserStore {
             if user.internal_reference.is_empty() {
                 return Err(format!("{source}: user name must not be empty"));
             }
-            if user.username.len() > 64 {
+            if !valid_username(&user.username) {
                 return Err(format!(
-                    "{source}: user {} display-name exceeds 64 bytes",
+                    "{source}: user {} username must be 1-64 bytes with no control characters",
                     user.internal_reference
                 ));
             }
@@ -264,10 +243,7 @@ impl UserStore {
             // Usernames must be unique server-wide, compared case-insensitively,
             // to match the runtime uniqueness the registry enforces.
             if !user.username.is_empty() && !usernames.insert(user.username.trim().to_lowercase()) {
-                return Err(format!(
-                    "{source}: duplicate username {}",
-                    user.username
-                ));
+                return Err(format!("{source}: duplicate username {}", user.username));
             }
             if !user.token_hash.trim().is_empty() {
                 validate_secret_hash(
@@ -337,24 +313,22 @@ mod tests {
     }
 
     #[test]
-    fn control_character_names_round_trip_through_the_registry() {
+    fn control_character_username_is_rejected() {
         let dir = temp_data_dir("control");
         let mut store = UserStore::open(Some(dir.clone())).unwrap();
 
         let username = "x\u{1}y\u{7f}z";
         let internal_reference = "dana\u{2}";
-        store
+        let error = store
             .mark_user_paired(
                 internal_reference,
                 username.to_string(),
                 hash_secret("dana-client-generated-token-with-at-least-32-bytes"),
             )
-            .unwrap();
-
-        let reloaded = UserStore::open(Some(dir.clone())).unwrap();
+            .unwrap_err();
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(reloaded.users[0].internal_reference, internal_reference);
-        assert_eq!(reloaded.users[0].username, username);
+        assert!(error.contains("control characters"), "{error}");
+        assert!(store.users.is_empty());
     }
 
     #[test]
@@ -441,23 +415,45 @@ mod tests {
     }
 
     #[test]
-    fn allocate_dynamic_user_id_starts_increments_and_persists() {
-        let dir = temp_data_dir("alloc");
-        let mut store = UserStore::open(Some(dir.clone())).unwrap();
+    fn failed_username_save_leaves_the_in_memory_user_unchanged() {
+        let dir = temp_data_dir("rename-failure");
+        fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        fs::write(&blocker, "block").unwrap();
+        let mut store = store_with_users();
+        store.path = Some(blocker.join(USERS_FILE));
 
-        assert_eq!(
-            store.allocate_dynamic_user_id().unwrap(),
-            UserId(FIRST_DYNAMIC_USER_ID)
+        assert!(
+            store
+                .set_user_username(UserId(1), "Renamed".to_string())
+                .is_err()
         );
-        assert_eq!(
-            store.allocate_dynamic_user_id().unwrap(),
-            UserId(FIRST_DYNAMIC_USER_ID + 1)
-        );
-
-        let mut reloaded = UserStore::open(Some(dir.clone())).unwrap();
-        let allocated = reloaded.allocate_dynamic_user_id().unwrap();
+        assert_eq!(store.users[0].username, "Alice");
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(allocated, UserId(FIRST_DYNAMIC_USER_ID + 2));
+    }
+
+    #[test]
+    fn failed_pairing_save_leaves_the_in_memory_user_unchanged() {
+        let dir = temp_data_dir("pair-failure");
+        fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        fs::write(&blocker, "block").unwrap();
+        let mut store = store_with_users();
+        let old_hash = store.users[0].token_hash.clone();
+        store.path = Some(blocker.join(USERS_FILE));
+
+        assert!(
+            store
+                .mark_user_paired(
+                    "alice",
+                    "Renamed".to_string(),
+                    hash_secret("replacement-client-generated-token-with-at-least-32-bytes"),
+                )
+                .is_err()
+        );
+        assert_eq!(store.users[0].username, "Alice");
+        assert_eq!(store.users[0].token_hash, old_hash);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -470,18 +466,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         assert!(error.contains("failed to parse"));
-    }
-
-    #[test]
-    fn open_rejects_counter_below_the_dynamic_range() {
-        let dir = temp_data_dir("counter");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(USERS_FILE), "next-dynamic-user-id = 42\n").unwrap();
-
-        let error = UserStore::open(Some(dir.clone())).unwrap_err();
-        let _ = fs::remove_dir_all(&dir);
-
-        assert!(error.contains("next-dynamic-user-id"));
     }
 
     #[test]

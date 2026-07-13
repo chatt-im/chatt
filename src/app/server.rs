@@ -1,6 +1,9 @@
 use extui::{Buffer, Rect, event::KeyEvent, event::MouseEvent};
 use ring::rand::SecureRandom;
-use rpc::{control::InviteTicket, crypto::encode_hex};
+use rpc::{
+    control::InviteTicket,
+    crypto::{OPEN_PAIR_RECOVERY_PREFIX, encode_hex},
+};
 
 use crate::{
     config::{
@@ -108,8 +111,9 @@ pub(crate) struct ServerEditUpdate {
 
 pub(crate) struct PendingPair {
     pub(crate) server: ServerEntry,
-    /// Open-pairing context: the existing token to preserve identity on re-pair
-    /// (empty on a first join). `None` for invite pairing.
+    /// Open-pairing context: either the existing dynamic token used to preserve
+    /// identity on re-pair, or the client-generated recovery secret for a first
+    /// join. `None` for invite pairing.
     pub(crate) open: Option<String>,
     /// Password used by the latest open-pairing attempt. Retained until pairing
     /// finishes so a username-collision retry does not challenge for it again.
@@ -623,6 +627,10 @@ pub(crate) fn random_token() -> Result<String, String> {
         .fill(&mut bytes)
         .map_err(|_| "failed to generate pairing token".to_string())?;
     Ok(encode_hex(&bytes))
+}
+
+pub(crate) fn random_open_pair_recovery_token() -> Result<String, String> {
+    random_token().map(|token| format!("{OPEN_PAIR_RECOVERY_PREFIX}{token}"))
 }
 
 pub(crate) fn default_join_alias(ticket: &InviteTicket) -> String {

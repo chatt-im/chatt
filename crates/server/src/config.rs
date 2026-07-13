@@ -232,11 +232,18 @@ impl UserConfig {
     }
 }
 
+/// Whether a user-chosen username is valid on the server: non-empty after
+/// trimming, at most 64 bytes, and free of control characters.
+pub(crate) fn valid_username(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty() && name.len() <= 64 && !name.chars().any(char::is_control)
+}
+
 /// The operator's server configuration.
 ///
 /// Parsed once at startup and never rewritten by the server. Everything the
-/// server mutates at runtime (user records, dynamic-id counters, the DM
-/// registry) lives in state files under [`Config::data_dir`].
+/// server mutates at runtime (user records, dynamic usernames, the DM registry)
+/// lives in state files under [`Config::data_dir`].
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, recoverable, warn_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {

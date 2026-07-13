@@ -111,6 +111,7 @@ pub(crate) enum CoreCommand {
         draft: ServerEditDraft,
         join_after_save: bool,
     },
+    CancelServerEdit,
     SaveRoomSettings(RoomSettingsDraft),
     SaveWelcome {
         draft: WelcomeDraft,

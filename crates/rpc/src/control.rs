@@ -95,9 +95,10 @@ pub enum ClientControl {
         receive_files: bool,
         file_receive_limit_bytes: u64,
     },
-    /// Self-service join on a public server. The server allocates (or, when
-    /// `existing_token` is a valid dynamic token, reuses) a user id and issues a
-    /// fresh bearer token. `password` is empty when the server requires none.
+    /// Self-service join on a public server. The server allocates, or reuses when
+    /// `existing_token` is a valid dynamic token or recovery secret, a user id
+    /// and issues a fresh bearer token. `password` is empty when the server
+    /// requires none.
     OpenPair {
         username: String,
         password: String,

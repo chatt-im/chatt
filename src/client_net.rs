@@ -32,11 +32,10 @@ use rpc::{
         ERROR_PAIRING_CODE_MISMATCH, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
         ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, FileContentEncoding, FileMetadata,
-        MAX_FILE_CHUNK_BYTES,
-        MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey, P2pNatKind, P2pPeerInfo,
-        P2pRole, ParticipantVoiceStatus, RoomInfo, ServerControl, UserSummary,
-        decode_server_control, decode_server_hello, encode_client_control, encode_client_hello,
-        max_file_wire_bytes,
+        MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey,
+        P2pNatKind, P2pPeerInfo, P2pRole, ParticipantVoiceStatus, RoomInfo, ServerControl,
+        UserSummary, decode_server_control, decode_server_hello, encode_client_control,
+        encode_client_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, RecordProtection, SessionTransport,
@@ -981,9 +980,7 @@ pub fn spawn_open_pair_once(
                     retry,
                     server_public_key,
                 },
-                OpenPairOutcome::UsernameTaken(message) => {
-                    NetworkEvent::UsernameTaken { message }
-                }
+                OpenPairOutcome::UsernameTaken(message) => NetworkEvent::UsernameTaken { message },
                 OpenPairOutcome::Failed(error) => NetworkEvent::PairingFailed(error),
             };
             let _ = events.send(event);
@@ -1513,8 +1510,9 @@ fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), PairFail
     .map_err(PairFailure::Other)?;
 
     loop {
-        let frame = read_blocking_frame(&mut stream)
-            .map_err(|error| PairFailure::Other(format!("failed to read pairing response: {error}")))?;
+        let frame = read_blocking_frame(&mut stream).map_err(|error| {
+            PairFailure::Other(format!("failed to read pairing response: {error}"))
+        })?;
         let plaintext = control
             .open_next(CHANNEL_CONTROL, &frame)
             .map_err(|error| PairFailure::Other(error.to_string()))?;
