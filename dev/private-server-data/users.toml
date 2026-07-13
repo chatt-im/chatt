@@ -1,7 +1,5 @@
 # chatt server user registry. Managed by the server; do not edit.
 
-next-dynamic-user-id = 4294967296
-
 [[users]]
 id = 1
 name = "alice"

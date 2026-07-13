@@ -719,6 +719,7 @@ fn parse_fields(
                 }
             };
             Ok(ParsedRecord::Message(ChatMessage {
+                envelope: None,
                 message_id: MessageId(id),
                 room_id: RoomId(room),
                 sender: UserId(user),
@@ -1158,6 +1159,7 @@ mod tests {
 
     fn text_message(id: u64, timestamp_ms: u64, body: &str) -> ChatMessage {
         ChatMessage {
+            envelope: None,
             message_id: MessageId(id),
             room_id: RoomId(7),
             sender: UserId(3),

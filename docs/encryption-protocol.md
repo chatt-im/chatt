@@ -20,8 +20,37 @@ useful as the code moves.
   claims still carry a proof of possession under a session-derived bind key, so a
   spoofed datagram cannot hijack a session's media address. P2P is disabled in
   this mode because it would bypass the outer link.
-- The server is trusted in this version. It decrypts messages and media in order
-  to route them, so this is not end-to-end encryption.
+- The server is trusted to route. Public/private room chat, voice, video, and
+  files are decrypted by the server, so they are not end-to-end encrypted.
+- Direct messages are end-to-end encrypted (text, edits, and file transfers).
+  Each user holds a long-term X25519 identity seed; the per-DM root is a
+  static-static X25519 agreement HKDF-bound to both user ids and public keys,
+  with mirrored directional keys. Every message derives a one-shot
+  ChaCha20-Poly1305 key from a fresh 32-byte salt (no counters, so restarts and
+  concurrent sessions can never reuse a nonce), with AAD binding the envelope
+  version, content class, room id, and sender. Chat plaintexts are zero-padded
+  to 160-byte multiples; sealed file streams are Padmé-padded and their chunks
+  are AEAD frames under a random per-transfer content key carried inside the
+  sealed metadata envelope. Peer keys are server-distributed and TOFU-pinned in
+  `client.toml`, bound to the DM room id, user id, and case-folded username.
+  The local identity seed is likewise bound to its authenticated user id. A
+  first-use or `/trust` pin becomes active only after an atomic `0600` config
+  replacement is acknowledged by the network worker. The durable room-id
+  binding remains encryption-required while reconnect room state is rebuilt;
+  reclassifying a pinned DM as public/private fails the connection instead of
+  enabling plaintext fallback. A changed key or substantive username change
+  presents a complete replacement tuple, blocks sending, and quarantines all
+  messages for that DM until `/trust`; former trusted tuples become receive-only
+  for retained history after that decision. DM chat and file sender labels are
+  taken from the authenticated tuple (or local configured identity for an own
+  echo), never from the server's unauthenticated outer display-name field.
+  Ciphertext which races identity lookup is retained in arrival order, bounded
+  to 2 MiB and 1024 controls; overflow or forbidden plaintext/envelope forms
+  fail the connection closed. Deliberately no
+  ratchet: keys are static so server-fetched DM history stays decryptable, and
+  seed compromise exposes all of that user's DM traffic. The server still sees
+  DM routing metadata (participants, timing, size classes, edit/delete
+  targets), and DM voice/video stay transport-encrypted only.
 - The default server config sets `security.chat-history-limit = 0`, so the
   server does not retain chat bodies for future room joins. It still keeps
   transient session, room membership, active upload, and P2P routing state in
@@ -156,6 +185,8 @@ Shared protocol:
   `RecordProtection`; AEAD framing in `TransportCipher`, `seal_with_key`, and
   `open_with_key`; truncated-HMAC setup proofs in `auth_proof`; replay tracking
   in `AntiReplay`.
+- `crates/rpc/src/e2e.rs`: DM pair-key derivation, envelope sealing/opening,
+  content-class and room/sender AAD, and plaintext padding.
 - `crates/rpc/src/media.rs`: the per-session `MediaProtection` codec and its
   `seal_media`/`open_media` (returning `OpenedMedia` with an `AddressProof`),
   the raw-key peer codec `seal_peer_media`/`open_peer_media`, and `parse_header`.
@@ -178,8 +209,10 @@ Server:
 
 Client:
 
-- `src/config.rs`: client TOML fields in `ServerEntry` and runtime persistence
-  in `write_runtime_config`.
+- `src/config.rs`: client TOML fields in `ServerEntry`, durable DM identity
+  tuples, and runtime persistence in `write_runtime_config`.
+- `src/e2e.rs`: pinned-room classification, per-session DM identity state,
+  trust quarantine, authenticated sender labels, and chat envelope policy.
 - `src/cli/mod.rs`: join-string pairing CLI and named-server persistence after
   successful pairing.
 - `src/client_net.rs`: server connection and handshake in
@@ -199,9 +232,9 @@ Client:
   Rust implementation is chosen.
 - Implement session rekeying. Constants exist for rekey timing, but the current
   transport does not perform an in-band rekey.
-- If the server must become untrusted, add end-to-end room/message encryption,
-  client identity keys, device verification, and key transparency. The current
-  trusted-server design intentionally does not provide those properties.
+- If public/private room content must survive server compromise, add group
+  end-to-end encryption. Direct messages already use TOFU-pinned client identity
+  keys, but device verification and key transparency remain future work.
 
 References:
 

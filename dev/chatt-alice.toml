@@ -3,8 +3,13 @@ label = "local"
 username = "Alice"
 token = "alice-dev-token"
 server-public-key = ""
+e2e-identity-seed = "cad2e040ad26d0e0e8ffefa7035b17491a4b11782f9c87747c107c3eccde135f"
 tcp-addr = "127.0.0.1:41000"
 udp-addr = "127.0.0.1:41000"
+
+[[servers.e2e-peer-pins]]
+user-id = 2
+public-key = "238f00a3b615f1750f739035efb3c4bd14d4c89cb6ab279de26ef6580dffb225"
 
 [ui]
 room-height = 4

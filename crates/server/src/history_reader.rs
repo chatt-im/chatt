@@ -217,6 +217,7 @@ mod tests {
 
     fn test_message(id: u64) -> ChatMessage {
         ChatMessage {
+            envelope: None,
             message_id: MessageId(id),
             room_id: ROOM,
             sender: UserId(1),

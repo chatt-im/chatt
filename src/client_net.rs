@@ -33,15 +33,16 @@ use rpc::{
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
         ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, FileContentEncoding, FileMetadata,
         MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey,
-        P2pNatKind, P2pPeerInfo, P2pRole, ParticipantVoiceStatus, RoomInfo, ServerControl,
-        UserSummary, decode_server_control, decode_server_hello, encode_client_control,
-        encode_client_hello, max_file_wire_bytes,
+        P2pNatKind, P2pPeerInfo, P2pRole, ParticipantVoiceStatus, RoomInfo, RoomKind,
+        ServerControl, UserSummary, decode_server_control, decode_server_hello,
+        encode_client_control, encode_client_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, RecordProtection, SessionTransport,
         TransportMode, complete_client_transport_handshake, dev_server_public_key,
         ed25519_public_key_from_hex, encode_hex, generate_client_hello,
     },
+    e2e::DmContentKind,
     evented::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, recv_datagram_with,
         write_queue_to,
@@ -60,7 +61,10 @@ use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
     VoicePayload as AudioVoicePayload,
 };
-use crate::config::{CandidatePrivacy, DownloadTarget, EffectiveFiles};
+use crate::config::{
+    CandidatePrivacy, DownloadTarget, E2ePeerIdentity, E2ePeerPin, EffectiveFiles,
+};
+use crate::e2e::{E2eState, OpenFailure, PeerIdentityOutcome, SealBlocked};
 use crate::file_compression::{
     self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
 };
@@ -82,6 +86,8 @@ const P2P_POLL_TIMEOUT: Duration = Duration::from_millis(20);
 /// deadline wakes in [`WorkerState::next_poll_timeout`] drive the loop; this
 /// only bounds how long a missed schedule could sleep.
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_DEFERRED_E2E_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DEFERRED_E2E_ITEMS: usize = 1024;
 const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a direct path must stay healthy before the client stops relaying
 /// voice through the server.
@@ -315,6 +321,13 @@ pub struct ClientConfig {
     pub username: String,
     pub token: String,
     pub server_public_key: Option<String>,
+    /// Hex-encoded 32-byte X25519 seed for DM end-to-end encryption. `None`
+    /// only for legacy configs the app failed to seed before spawning.
+    pub e2e_identity_seed: Option<String>,
+    /// Authenticated account this local identity seed is pinned to.
+    pub e2e_local_user_id: Option<UserId>,
+    /// Durable DM contact identity tuples and former trusted tuples.
+    pub e2e_peer_pins: Vec<E2ePeerPin>,
     pub require_native_encryption: bool,
     pub file_policy: FilePolicy,
     /// The in-memory download ring buffer shared with the web server, filled
@@ -480,6 +493,21 @@ pub enum NetworkCommand {
     /// The join-time advertisement to the server refreshes on reconnect.
     SetFilePolicy(FilePolicy),
     SetP2pEnabled(bool),
+    /// Re-pins the presented DM identity tuple for a peer whose key or username
+    /// changed, unblocking sends to that DM (`/trust`).
+    TrustPeerIdentity {
+        user_id: UserId,
+    },
+    /// Result of atomically persisting an E2E pin proposal. The worker only
+    /// activates the key after a matching successful acknowledgement.
+    ConfirmE2ePeerPin {
+        pin: E2ePeerPin,
+        persisted: bool,
+    },
+    ConfirmE2eLocalUser {
+        user_id: UserId,
+        persisted: bool,
+    },
     Shutdown,
 }
 
@@ -547,6 +575,10 @@ pub enum NetworkEvent {
         room_id: RoomId,
         peer: UserId,
     },
+    /// First authenticated id observed for the configured local E2E seed.
+    E2eLocalUserId {
+        user_id: UserId,
+    },
     /// One chunk of server-retained history for a room.
     HistoryChunk {
         room_id: RoomId,
@@ -611,6 +643,18 @@ pub enum NetworkEvent {
     Presence {
         user: UserSummary,
         online: bool,
+    },
+    /// A first-use or explicitly trusted DM identity tuple that the main
+    /// thread must write durably before the worker may use it.
+    E2ePeerPinProposed {
+        pin: E2ePeerPin,
+    },
+    /// A peer's served DM identity tuple contradicts the pinned one: sends to
+    /// that DM are blocked until the user runs `/trust`.
+    E2ePeerIdentityChanged {
+        user_id: UserId,
+        pinned: E2ePeerIdentity,
+        presented: E2ePeerIdentity,
     },
     VoiceStarted {
         room_id: RoomId,
@@ -1119,6 +1163,8 @@ fn run_worker_inner(
         video_auth_key,
         session_id: None,
         user_id: None,
+        user_names: HashMap::new(),
+        pending_dm_opens: VecDeque::new(),
         active_room: None,
         voice_room: None,
         active_stream: None,
@@ -1170,6 +1216,13 @@ fn run_worker_inner(
         next_bug_report: 1,
         outgoing_bug_reports: VecDeque::new(),
         incoming_files: HashMap::new(),
+        e2e: E2eState::new(
+            config.e2e_identity_seed.as_deref(),
+            config.e2e_local_user_id,
+            &config.e2e_peer_pins,
+        ),
+        deferred_e2e: VecDeque::new(),
+        deferred_e2e_bytes: 0,
         shutdown: false,
         disconnect_reason: None,
         auth_failure: None,
@@ -1651,6 +1704,8 @@ struct WorkerState {
     server_udp_probe_addr: Option<SocketAddr>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
+    user_names: HashMap<UserId, String>,
+    pending_dm_opens: VecDeque<UserId>,
     /// The room the app is viewing, target for uploads injected outside the
     /// app thread. Set by [`NetworkCommand::SetActiveRoom`].
     active_room: Option<RoomId>,
@@ -1712,9 +1767,57 @@ struct WorkerState {
     next_bug_report: u64,
     outgoing_bug_reports: VecDeque<OutgoingBugReport>,
     incoming_files: HashMap<FileTransferId, IncomingFile>,
+    /// DM end-to-end sealing state: identity seed, room-to-peer map, pinned
+    /// peer keys, and derived pair keys. All sealing and opening happens on
+    /// this thread so only plaintext crosses the event channel.
+    e2e: E2eState,
+    deferred_e2e: VecDeque<DeferredE2eInbound>,
+    deferred_e2e_bytes: usize,
     shutdown: bool,
     disconnect_reason: Option<String>,
     auth_failure: Option<(u16, String)>,
+}
+
+enum DeferredE2eInbound {
+    Chat(ChatMessage),
+    History(history::HistoryChunk),
+    FileOffered {
+        file: FileMetadata,
+        contents: bool,
+    },
+    FileChunk {
+        transfer_id: FileTransferId,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    FileComplete {
+        transfer_id: FileTransferId,
+    },
+    FileCanceled {
+        transfer_id: FileTransferId,
+        reason: String,
+    },
+}
+
+impl DeferredE2eInbound {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Chat(message) => history::encoded_message_len(message),
+            Self::History(chunk) => chunk
+                .messages
+                .iter()
+                .map(history::encoded_message_len)
+                .sum::<usize>()
+                .saturating_add(32),
+            Self::FileOffered { file, .. } => file
+                .sealed_meta
+                .as_ref()
+                .map_or(256, |meta| meta.len().saturating_add(256)),
+            Self::FileChunk { data, .. } => data.len().saturating_add(32),
+            Self::FileComplete { .. } => 16,
+            Self::FileCanceled { reason, .. } => reason.len().saturating_add(16),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2093,6 +2196,28 @@ struct OutgoingUpload {
     /// Intrinsic image size, parsed from the first chunk as it streams.
     dimensions: Option<(u32, u32)>,
     image_prefix: Vec<u8>,
+    /// End-to-end sealing state for DM uploads, `None` outside DM rooms.
+    seal: Option<UploadSeal>,
+}
+
+/// Sealing state for a DM upload: every wire chunk is an AEAD frame under a
+/// fresh per-transfer content key, and the finished stream is zero-padded to
+/// its Padmé length so the server learns only a coarse size class.
+struct UploadSeal {
+    content_key: KeyMaterial,
+    /// The encoding of the sealed payloads, hidden from the server behind
+    /// [`FileContentEncoding::Sealed`].
+    inner_encoding: FileContentEncoding,
+    /// Chunk counter, the AEAD nonce for the next frame.
+    counter: u64,
+    /// Compressed-stream bytes sealed so far, the Padmé input.
+    stream_len: u64,
+    /// Zero bytes still owed to reach the Padmé total, computed once the
+    /// encoder finishes.
+    pad_remaining: Option<u64>,
+    /// The sealed [`rpc::e2e::DmFileMeta`] envelope relayed verbatim by the
+    /// server to recipients.
+    sealed_meta: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -2221,6 +2346,9 @@ enum LocalFileLocation {
 struct PendingLocalFile {
     location: LocalFileLocation,
     dimensions: Option<(u32, u32)>,
+    /// `(name, size, inner encoding)` of a sealed upload, restored over the
+    /// wire placeholder when the acceptance arrives after completion.
+    sealed_real: Option<(String, u64, FileContentEncoding)>,
 }
 
 /// An in-flight bug report streamed to the server as a chunked control
@@ -2244,10 +2372,24 @@ struct IncomingFile {
     complete_received: bool,
     decoder_finished: bool,
     next_status_at: u64,
+    /// Chunk-opening state for sealed DM transfers; `None` for plain ones.
+    /// When set, `metadata` already carries the true (inner) name, size, and
+    /// encoding restored from the sealed metadata envelope.
+    seal: Option<IncomingSeal>,
     /// The memory-ring claim for a [`DownloadTarget::Memory`] transfer, consumed
     /// by [`DownloadStore::insert_reserved`] on finalize and released if the
     /// transfer is dropped, failed, or skipped. `None` for on-disk transfers.
     reservation: Option<Reservation>,
+}
+
+/// Chunk-opening state for a sealed DM download.
+struct IncomingSeal {
+    content_key: KeyMaterial,
+    /// Chunk counter, the AEAD nonce for the next expected frame.
+    counter: u64,
+    /// Wire-size cap computed from the sealed (outer) metadata; the restored
+    /// inner metadata's own bound would not cover frame overhead and padding.
+    wire_bound: u64,
 }
 
 /// Where an in-flight download is being written. Distinguishes the on-disk path
@@ -2800,6 +2942,46 @@ impl WorkerState {
         debug_assert_ne!(self.upload_wake(), WakeIntent::Now);
     }
 
+    /// Prepares an outbound chat payload for its room: DM rooms get the body
+    /// sealed into an envelope, other rooms pass plaintext through. `Err(())`
+    /// means the send was blocked (peer key missing/changed) and the user has
+    /// already been told.
+    fn seal_dm_body(
+        &mut self,
+        room_id: RoomId,
+        kind: DmContentKind,
+        body: String,
+    ) -> Result<(String, Option<Vec<u8>>), ()> {
+        if !self.e2e.requires_e2e(room_id) {
+            return Ok((body, None));
+        }
+        match self.e2e.seal_chat(room_id, kind, &body, unix_now_ms()) {
+            Ok(envelope) => Ok((String::new(), Some(envelope))),
+            Err(blocked) => {
+                let reason = match blocked {
+                    SealBlocked::NoIdentity => {
+                        "cannot send: this connection has no encryption identity".to_string()
+                    }
+                    SealBlocked::PeerKeyMissing => {
+                        "cannot send: this user has not published an encryption key yet".to_string()
+                    }
+                    SealBlocked::PeerIdentityChanged => {
+                        "cannot send: this user's encryption identity changed — /trust <user> to resume"
+                            .to_string()
+                    }
+                    SealBlocked::Crypto => "cannot send: sealing the message failed".to_string(),
+                };
+                kvlog::warn!(
+                    "dm send blocked",
+                    room_id = room_id.0,
+                    error = reason.as_str()
+                );
+                let _ = self.events.send(NetworkEvent::Error(reason));
+                Err(())
+            }
+        }
+    }
+
     fn queue_control(&mut self, control: ClientControl) -> Result<(), String> {
         let payload = encode_client_control(&control)?;
         let encrypted = self
@@ -2892,7 +3074,7 @@ impl WorkerState {
                 continue;
             }
             let control = decode_server_control(&plaintext)?;
-            self.handle_server_control(control);
+            self.handle_server_control(control)?;
             controls_since_file_pump += 1;
             controls_processed += 1;
         }
@@ -3161,7 +3343,15 @@ impl WorkerState {
                     room_id = room_id.0,
                     body_size = body.len()
                 );
-                self.queue_control(ClientControl::SendChat { room_id, body })?;
+                let (body, envelope) = match self.seal_dm_body(room_id, DmContentKind::Text, body) {
+                    Ok(parts) => parts,
+                    Err(()) => return Ok(()),
+                };
+                self.queue_control(ClientControl::SendChat {
+                    room_id,
+                    body,
+                    envelope,
+                })?;
             }
             NetworkCommand::EditChat {
                 room_id,
@@ -3174,10 +3364,15 @@ impl WorkerState {
                     target = target.0,
                     body_size = body.len()
                 );
+                let (body, envelope) = match self.seal_dm_body(room_id, DmContentKind::Edit, body) {
+                    Ok(parts) => parts,
+                    Err(()) => return Ok(()),
+                };
                 self.queue_control(ClientControl::EditChat {
                     room_id,
                     target,
                     body,
+                    envelope,
                 })?;
             }
             NetworkCommand::DeleteChat { room_id, target } => {
@@ -3216,6 +3411,7 @@ impl WorkerState {
             }
             NetworkCommand::OpenDm(user_id) => {
                 self.queue_control(ClientControl::OpenDm { user_id })?;
+                self.pending_dm_opens.push_back(user_id);
             }
             NetworkCommand::SetUploadRate(rate) => {
                 self.upload_throttle.set_rate(rate);
@@ -3230,6 +3426,45 @@ impl WorkerState {
             }
             NetworkCommand::SetFilePolicy(policy) => {
                 self.config.file_policy = policy;
+            }
+            NetworkCommand::TrustPeerIdentity { user_id } => {
+                let Some(pin) = self.e2e.proposed_trust(user_id) else {
+                    let _ = self.events.send(NetworkEvent::Status(
+                        "no pending encryption identity change for that user".to_string(),
+                    ));
+                    return Ok(());
+                };
+                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed { pin });
+            }
+            NetworkCommand::ConfirmE2ePeerPin { pin, persisted } => {
+                if !self.e2e.confirm_pin(&pin, persisted) {
+                    kvlog::info!(
+                        "stale e2e pin acknowledgement ignored",
+                        user_id = pin.user_id,
+                        room_id = pin.room_id
+                    );
+                    return Ok(());
+                }
+                if persisted {
+                    self.drain_deferred_e2e()?;
+                } else {
+                    let _ = self.events.send(NetworkEvent::Error(
+                        "encryption pin was not saved; DM remains blocked".to_string(),
+                    ));
+                }
+            }
+            NetworkCommand::ConfirmE2eLocalUser { user_id, persisted } => {
+                if !self.e2e.confirm_local_user(user_id, persisted) {
+                    return Err("stale local E2E identity acknowledgement".to_string());
+                }
+                if !persisted {
+                    return Err("local E2E account id could not be persisted".to_string());
+                }
+                if let Some(public_key) = self.e2e.public_key() {
+                    self.queue_control(ClientControl::PublishE2eKey {
+                        public_key: public_key.to_vec(),
+                    })?;
+                }
             }
             NetworkCommand::SetP2pEnabled(enabled) => {
                 // P2P would bypass an outer secure link, so it stays off in
@@ -3523,6 +3758,7 @@ impl WorkerState {
         let room_id = room_id
             .or(self.active_room)
             .ok_or_else(|| "no active room for upload".to_string())?;
+        let seal = self.prepare_upload_seal(room_id, &name, size, body.encoding())?;
         Ok(OutgoingUpload {
             transfer_id,
             server_metadata: None,
@@ -3543,7 +3779,65 @@ impl WorkerState {
             local_copy: None,
             dimensions: None,
             image_prefix: Vec::new(),
+            seal,
         })
+    }
+
+    /// Builds the sealing state for an upload into a DM room: a fresh content
+    /// key and the sealed metadata envelope carrying the transfer's real name,
+    /// size, inner encoding, and that key. `None` outside DM rooms.
+    fn prepare_upload_seal(
+        &mut self,
+        room_id: RoomId,
+        name: &str,
+        size: u64,
+        inner_encoding: FileContentEncoding,
+    ) -> Result<Option<UploadSeal>, String> {
+        if !self.e2e.requires_e2e(room_id) {
+            return Ok(None);
+        }
+        let mut content_key = [0u8; KEY_LEN];
+        ring::rand::SystemRandom::new()
+            .fill(&mut content_key)
+            .map_err(|_| "failed to generate a file content key".to_string())?;
+        let file_meta = rpc::e2e::DmFileMeta {
+            original_name: name.to_string(),
+            size,
+            encoding: inner_encoding,
+            content_key: content_key.to_vec(),
+        };
+        let sealed_meta = self
+            .e2e
+            .seal_content(
+                room_id,
+                rpc::e2e::DmContent::FileAnnounce { file: file_meta },
+                unix_now_ms(),
+            )
+            .map_err(|blocked| match blocked {
+                SealBlocked::NoIdentity => {
+                    "cannot send file: this connection has no encryption identity".to_string()
+                }
+                SealBlocked::PeerKeyMissing => {
+                    "cannot send file: this user has not published an encryption key yet"
+                        .to_string()
+                }
+                SealBlocked::PeerIdentityChanged => {
+                    "cannot send file: this user's encryption identity changed — /trust <user> to resume"
+                        .to_string()
+                }
+                SealBlocked::Crypto => "cannot send file: sealing the metadata failed".to_string(),
+            })?;
+        Ok(Some(UploadSeal {
+            content_key: KeyMaterial {
+                id: 1,
+                bytes: content_key,
+            },
+            inner_encoding,
+            counter: 0,
+            stream_len: 0,
+            pad_remaining: None,
+            sealed_meta,
+        }))
     }
 
     fn poll_uploads(&mut self) -> Result<(), String> {
@@ -3621,12 +3915,29 @@ impl WorkerState {
         };
 
         if !upload.started {
+            // Sealed uploads advertise a placeholder name and the Padmé size
+            // class; the real metadata rides only inside the sealed envelope.
+            let (name, size, encoding, sealed_meta) = match &upload.seal {
+                Some(seal) => (
+                    "sealed.bin".to_string(),
+                    rpc::e2e::padme_len(upload.size),
+                    FileContentEncoding::Sealed,
+                    Some(seal.sealed_meta.clone()),
+                ),
+                None => (
+                    upload.name.clone(),
+                    upload.size,
+                    upload.body.encoding(),
+                    None,
+                ),
+            };
             self.queue_control(ClientControl::UploadFileStart {
                 room_id: upload.room_id,
                 transfer_id: upload.transfer_id,
-                name: upload.name.clone(),
-                size: upload.size,
-                encoding: upload.body.encoding(),
+                name,
+                size,
+                encoding,
+                sealed_meta,
             })?;
             upload.started = true;
             // Keep a local copy of the sender's own upload so the uploader's own
@@ -3686,21 +3997,62 @@ impl WorkerState {
 
         let throttle_budget = self.upload_throttle.budget();
         if !upload.body.pending().is_empty() && throttle_budget > 0 {
+            let max_payload = match &upload.seal {
+                Some(_) => MAX_FILE_CHUNK_BYTES - rpc::e2e::DM_CHUNK_OVERHEAD,
+                None => MAX_FILE_CHUNK_BYTES,
+            };
             let send_len = upload
                 .body
                 .pending()
                 .len()
-                .min(MAX_FILE_CHUNK_BYTES)
+                .min(max_payload)
                 .min(throttle_budget as usize);
             let data = upload.body.pending_mut().take(send_len);
+            let data = match &mut upload.seal {
+                None => data,
+                Some(seal) => {
+                    let Some(sender) = self.user_id else {
+                        return self.cancel_outgoing_upload(
+                            upload,
+                            "not authenticated",
+                            UploadAbort::Failure("cannot seal upload before login".to_string()),
+                        );
+                    };
+                    let frame = rpc::e2e::seal_dm_chunk(
+                        &seal.content_key.bytes,
+                        upload.room_id,
+                        sender,
+                        seal.counter,
+                        &data,
+                        0,
+                    );
+                    match frame {
+                        Ok(frame) => {
+                            seal.counter += 1;
+                            seal.stream_len += data.len() as u64;
+                            frame
+                        }
+                        Err(error) => {
+                            return self.cancel_outgoing_upload(
+                                upload,
+                                "sealing failed",
+                                UploadAbort::Failure(format!(
+                                    "failed to seal upload chunk: {error}"
+                                )),
+                            );
+                        }
+                    }
+                }
+            };
             let offset = upload.wire_offset;
+            let wire_len = data.len() as u64;
             self.queue_control(ClientControl::UploadFileChunk {
                 transfer_id: upload.transfer_id,
                 offset,
                 data,
             })?;
             self.upload_throttle.consume(send_len as u64);
-            upload.wire_offset += send_len as u64;
+            upload.wire_offset += wire_len;
             if upload.body.pending().is_empty() {
                 upload.source_read_ahead = 0;
             }
@@ -3814,6 +4166,59 @@ impl WorkerState {
         if !upload.encoder_finished {
             self.outgoing_uploads.push_front(upload);
             return Ok(false);
+        }
+
+        if let Some(seal) = &mut upload.seal {
+            let stream_len = seal.stream_len;
+            let pad_remaining = *seal
+                .pad_remaining
+                .get_or_insert_with(|| rpc::e2e::padme_len(stream_len) - stream_len);
+            if pad_remaining > 0 {
+                let Some(sender) = self.user_id else {
+                    return self.cancel_outgoing_upload(
+                        upload,
+                        "not authenticated",
+                        UploadAbort::Failure("cannot seal upload before login".to_string()),
+                    );
+                };
+                // Padding frames are all-zero filler and bypass the pacing
+                // throttle: charging them would stall completion on a
+                // throttled link with no wake scheduled for it, and they
+                // overshoot the configured rate by at most the Padmé overhead.
+                let pad_len = pad_remaining
+                    .min((MAX_FILE_CHUNK_BYTES - rpc::e2e::DM_CHUNK_OVERHEAD) as u64)
+                    as usize;
+                let frame = rpc::e2e::seal_dm_chunk(
+                    &seal.content_key.bytes,
+                    upload.room_id,
+                    sender,
+                    seal.counter,
+                    &[],
+                    pad_len,
+                );
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        return self.cancel_outgoing_upload(
+                            upload,
+                            "sealing failed",
+                            UploadAbort::Failure(format!("failed to seal padding: {error}")),
+                        );
+                    }
+                };
+                seal.counter += 1;
+                seal.pad_remaining = Some(pad_remaining - pad_len as u64);
+                let offset = upload.wire_offset;
+                let wire_len = frame.len() as u64;
+                self.queue_control(ClientControl::UploadFileChunk {
+                    transfer_id: upload.transfer_id,
+                    offset,
+                    data: frame,
+                })?;
+                upload.wire_offset += wire_len;
+                self.outgoing_uploads.push_front(upload);
+                return Ok(true);
+            }
         }
 
         self.queue_control(ClientControl::UploadFileComplete {
@@ -4002,6 +4407,10 @@ impl WorkerState {
                 PendingLocalFile {
                     location,
                     dimensions: upload.dimensions,
+                    sealed_real: upload
+                        .seal
+                        .as_ref()
+                        .map(|seal| (upload.name.clone(), upload.size, seal.inner_encoding)),
                 },
             );
         }
@@ -4055,7 +4464,53 @@ impl WorkerState {
         });
     }
 
-    fn handle_file_offered(&mut self, file: FileMetadata, contents: bool) {
+    fn handle_file_offered(&mut self, file: FileMetadata, contents: bool) -> Result<(), String> {
+        if !self.file_offer_ready(&file)? {
+            self.defer_e2e(DeferredE2eInbound::FileOffered { file, contents })?;
+            return Ok(());
+        }
+        self.handle_file_offered_ready(file, contents);
+        Ok(())
+    }
+
+    fn file_offer_ready(&mut self, file: &FileMetadata) -> Result<bool, String> {
+        let is_dm = self.e2e.requires_e2e(file.room_id);
+        if is_dm != (file.encoding == FileContentEncoding::Sealed) {
+            return Err(format!(
+                "server sent a file with forbidden encryption form for room {}",
+                file.room_id.0
+            ));
+        }
+        if is_dm {
+            let Some(envelope) = file.sealed_meta.as_deref() else {
+                return Err("sealed DM transfer omitted its metadata envelope".to_string());
+            };
+            match self.e2e.open_envelope(
+                file.room_id,
+                file.sender,
+                DmContentKind::FileAnnounce,
+                envelope,
+                &self.config.username,
+            ) {
+                Ok(_) => {}
+                Err(OpenFailure::NoKeys | OpenFailure::AwaitingTrust) => {
+                    if let Some(peer) = self.e2e.dm_peer(file.room_id) {
+                        let _ = self.queue_control(ClientControl::FetchE2eKey { user_id: peer });
+                    }
+                    return Ok(false);
+                }
+                Err(OpenFailure::Policy) => {
+                    return Err("DM transfer metadata has a forbidden sender".to_string());
+                }
+                Err(OpenFailure::Crypto) => {
+                    return Err("DM transfer metadata failed authentication".to_string());
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn handle_file_offered_ready(&mut self, file: FileMetadata, contents: bool) {
         kvlog::info!(
             "file offered",
             transfer_id = file.transfer_id.0,
@@ -4063,6 +4518,19 @@ impl WorkerState {
             file_size = file.size,
             contents
         );
+        let mut file = file;
+        let seal = match self.unseal_offer(&mut file) {
+            Ok(seal) => seal,
+            Err(reason) => {
+                self.skip_offered_download(&file);
+                let _ = self.events.send(NetworkEvent::Error(format!(
+                    "not receiving {}: {reason}",
+                    file.file_name
+                )));
+                self.end_transfer_skipped(&file, reason);
+                return;
+            }
+        };
         // Take owned copies of the per-room policy so the borrow of `self.config`
         // ends before the `&mut self` skip/label calls below.
         let (target, max_download_bytes) = {
@@ -4140,7 +4608,7 @@ impl WorkerState {
                     return;
                 };
                 let target = SinkTarget::Memory(Vec::with_capacity(file.size as usize));
-                self.begin_incoming(file, target, ReceiveDest::Memory, Some(reservation));
+                self.begin_incoming(file, target, ReceiveDest::Memory, Some(reservation), seal);
             }
             DownloadTarget::Persistent(receive_dir) => {
                 match create_receive_file(
@@ -4157,6 +4625,7 @@ impl WorkerState {
                                 reservation: receive.reservation,
                             },
                             None,
+                            seal,
                         );
                     }
                     Err(error) => {
@@ -4172,6 +4641,49 @@ impl WorkerState {
         }
     }
 
+    /// Opens a sealed offer's metadata envelope and substitutes the true name,
+    /// size, and inner encoding into `file`, so every downstream consumer sees
+    /// the real file. Returns the chunk-opening state; `Ok(None)` for plain
+    /// transfers.
+    fn unseal_offer(&mut self, file: &mut FileMetadata) -> Result<Option<IncomingSeal>, String> {
+        if file.encoding != FileContentEncoding::Sealed {
+            return Ok(None);
+        }
+        let Some(sealed_meta) = file.sealed_meta.take() else {
+            return Err("Sealed transfer without its metadata envelope".to_string());
+        };
+        let plaintext = self
+            .e2e
+            .open_envelope(
+                file.room_id,
+                file.sender,
+                DmContentKind::FileAnnounce,
+                &sealed_meta,
+                &self.config.username,
+            )
+            .map_err(|_| "Could not decrypt the transfer metadata".to_string())?;
+        file.sender_name = plaintext.sender_name;
+        let rpc::e2e::DmContent::FileAnnounce { file: meta } = plaintext.plaintext.content else {
+            return Err("Transfer metadata envelope has the wrong type".to_string());
+        };
+        let Ok(content_key) = <[u8; KEY_LEN]>::try_from(meta.content_key.as_slice()) else {
+            return Err("Transfer content key has the wrong length".to_string());
+        };
+        let wire_bound = max_file_wire_bytes(FileContentEncoding::Sealed, file.size);
+        file.file_name = meta.original_name.clone();
+        file.original_name = meta.original_name;
+        file.size = meta.size;
+        file.encoding = meta.encoding;
+        Ok(Some(IncomingSeal {
+            content_key: KeyMaterial {
+                id: 1,
+                bytes: content_key,
+            },
+            counter: 0,
+            wire_bound,
+        }))
+    }
+
     /// Wraps `target` in an [`IncomingBody`] (applying the zstd decoder for
     /// compressed transfers), registers the [`IncomingFile`], and emits the
     /// initial progress tick. On decoder-init failure the partial destination is
@@ -4182,6 +4694,7 @@ impl WorkerState {
         target: SinkTarget,
         dest: ReceiveDest,
         reservation: Option<Reservation>,
+        seal: Option<IncomingSeal>,
     ) {
         let sink = ReceiveSink::new(target, file.size, is_image_name(&file.file_name));
         let body = match file.encoding {
@@ -4219,6 +4732,18 @@ impl WorkerState {
                 }
                 IncomingBody::Zstd(zstd::stream::zio::Writer::new(sink, decoder))
             }
+            FileContentEncoding::Sealed => {
+                // Sealed offers are rewritten to their inner encoding before
+                // reaching here; a raw Sealed metadata is a protocol violation.
+                cleanup_partial(&dest);
+                self.skip_offered_download(&file);
+                let _ = self.events.send(NetworkEvent::Error(format!(
+                    "cannot receive sealed transfer {} without its metadata",
+                    file.file_name
+                )));
+                self.end_transfer_skipped(&file, "Sealed transfer without metadata".to_string());
+                return;
+            }
         };
         let _ = self.events.send(NetworkEvent::Status(format!(
             "receiving {} from {}",
@@ -4240,6 +4765,7 @@ impl WorkerState {
                 complete_received: false,
                 decoder_finished: false,
                 next_status_at: FILE_PROGRESS_STEP_BYTES,
+                seal,
                 reservation,
             },
         );
@@ -4262,10 +4788,40 @@ impl WorkerState {
             return;
         }
         let end = offset.saturating_add(data.len() as u64);
-        if end > max_file_wire_bytes(incoming.metadata.encoding, incoming.metadata.size) {
+        let wire_bound = match &incoming.seal {
+            Some(seal) => seal.wire_bound,
+            None => max_file_wire_bytes(incoming.metadata.encoding, incoming.metadata.size),
+        };
+        if end > wire_bound {
             self.fail_incoming_file(transfer_id, "file transfer exceeded allowed wire size");
             return;
         }
+        // The server relays upload chunk boundaries 1:1, so for sealed
+        // transfers each relayed chunk is exactly one AEAD frame, opened with
+        // the running counter as its nonce.
+        let data = match &mut incoming.seal {
+            None => data,
+            Some(seal) => {
+                let mut frame = data;
+                let payload = rpc::e2e::open_dm_chunk(
+                    &seal.content_key.bytes,
+                    incoming.metadata.room_id,
+                    incoming.metadata.sender,
+                    seal.counter,
+                    &mut frame,
+                );
+                match payload {
+                    Ok(payload) => {
+                        seal.counter += 1;
+                        payload
+                    }
+                    Err(_) => {
+                        self.fail_incoming_file(transfer_id, "sealed file chunk failed to open");
+                        return;
+                    }
+                }
+            }
+        };
         if incoming.pending_wire_offset > 0 {
             incoming
                 .pending_wire
@@ -4470,17 +5026,24 @@ impl WorkerState {
             at_start = chunk.at_start,
             complete = chunk.complete
         );
+        let mut opened = chunk.clone();
+        for message in &mut opened.messages {
+            if !self.open_chat_message(message)? {
+                self.defer_e2e(DeferredE2eInbound::History(chunk))?;
+                return Ok(true);
+            }
+        }
         let _ = self.events.send(NetworkEvent::HistoryChunk {
-            room_id: chunk.room_id,
-            before: chunk.before,
-            messages: chunk.messages,
-            at_start: chunk.at_start,
-            complete: chunk.complete,
+            room_id: opened.room_id,
+            before: opened.before,
+            messages: opened.messages,
+            at_start: opened.at_start,
+            complete: opened.complete,
         });
         Ok(true)
     }
 
-    fn handle_server_control(&mut self, control: ServerControl) {
+    fn handle_server_control(&mut self, control: ServerControl) -> Result<(), String> {
         kvlog::info!(
             "server control handling",
             kind = server_control_kind(&control)
@@ -4505,6 +5068,36 @@ impl WorkerState {
                     room_count = rooms.len(),
                     user_count = users.len()
                 );
+                let local_id_is_new = self.e2e.set_local_user(user_id)?;
+                if local_id_is_new {
+                    let _ = self.events.send(NetworkEvent::E2eLocalUserId { user_id });
+                }
+                self.user_names.clear();
+                let mut folded_names = HashSet::new();
+                for user in &users {
+                    if !folded_names.insert(user.username.to_ascii_lowercase()) {
+                        return Err("server directory contains duplicate usernames".to_string());
+                    }
+                    self.user_names.insert(user.user_id, user.username.clone());
+                }
+                // Fetch every DM peer's key, not just unknown ones: a key that
+                // changed while this client was offline must trip the pin
+                // check now rather than on the first undecryptable message.
+                let mut dm_peers: Vec<UserId> = Vec::new();
+                for room in &rooms {
+                    let username = match dm_peer_for_local(room, user_id) {
+                        Some(peer) => self.user_names.get(&peer).cloned().ok_or_else(|| {
+                            format!("DM peer {} is absent from directory", peer.0)
+                        })?,
+                        None => String::new(),
+                    };
+                    self.e2e.note_room(room, &username)?;
+                    if let Some(peer) = self.e2e.dm_peer(room.room_id)
+                        && !dm_peers.contains(&peer)
+                    {
+                        dm_peers.push(peer);
+                    }
+                }
                 let _ = self.events.send(NetworkEvent::Authenticated {
                     session_id,
                     user_id,
@@ -4515,6 +5108,14 @@ impl WorkerState {
                     video_auth_key: self.video_auth_key,
                 });
                 self.bind_udp();
+                if !local_id_is_new && let Some(public_key) = self.e2e.public_key() {
+                    let _ = self.queue_control(ClientControl::PublishE2eKey {
+                        public_key: public_key.to_vec(),
+                    });
+                }
+                for user_id in dm_peers {
+                    let _ = self.queue_control(ClientControl::FetchE2eKey { user_id });
+                }
             }
             ServerControl::OpenPaired { .. } => {
                 kvlog::warn!("unexpected open-paired on established session; ignoring");
@@ -4527,7 +5128,12 @@ impl WorkerState {
                     user_id = message.sender.0,
                     body_size = message.body.len()
                 );
-                let _ = self.events.send(NetworkEvent::Chat(message));
+                let mut message = message;
+                if self.open_chat_message(&mut message)? {
+                    let _ = self.events.send(NetworkEvent::Chat(message));
+                } else {
+                    self.defer_e2e(DeferredE2eInbound::Chat(message))?;
+                }
             }
             ServerControl::ChatMutationRejected {
                 room_id,
@@ -4736,7 +5342,7 @@ impl WorkerState {
                 );
             }
             ServerControl::FileOffered { file, contents } => {
-                self.handle_file_offered(file, contents);
+                self.handle_file_offered(file, contents)?;
             }
             ServerControl::UploadFileAccepted {
                 client_transfer_id,
@@ -4749,16 +5355,35 @@ impl WorkerState {
                 offset,
                 data,
             } => {
-                self.handle_file_chunk(transfer_id, offset, data);
+                if self.deferred_file_transfer(transfer_id) {
+                    self.defer_e2e(DeferredE2eInbound::FileChunk {
+                        transfer_id,
+                        offset,
+                        data,
+                    })?;
+                } else {
+                    self.handle_file_chunk(transfer_id, offset, data);
+                }
             }
             ServerControl::FileComplete { transfer_id } => {
-                self.handle_file_complete(transfer_id);
+                if self.deferred_file_transfer(transfer_id) {
+                    self.defer_e2e(DeferredE2eInbound::FileComplete { transfer_id })?;
+                } else {
+                    self.handle_file_complete(transfer_id);
+                }
             }
             ServerControl::FileCanceled {
                 transfer_id,
                 reason,
             } => {
-                self.handle_file_canceled(transfer_id, &reason);
+                if self.deferred_file_transfer(transfer_id) {
+                    self.defer_e2e(DeferredE2eInbound::FileCanceled {
+                        transfer_id,
+                        reason,
+                    })?;
+                } else {
+                    self.handle_file_canceled(transfer_id, &reason);
+                }
             }
             ServerControl::ShareStarted {
                 room_id,
@@ -4842,9 +5467,29 @@ impl WorkerState {
                     room_id = room.room_id.0,
                     name = room.name.as_str()
                 );
+                let local_id = self
+                    .user_id
+                    .ok_or_else(|| "room update arrived before authentication".to_string())?;
+                let username =
+                    match dm_peer_for_local(&room, local_id) {
+                        Some(peer) => self.user_names.get(&peer).cloned().ok_or_else(|| {
+                            format!("DM peer {} is absent from directory", peer.0)
+                        })?,
+                        None => String::new(),
+                    };
+                if let Some(user_id) = self.e2e.note_room(&room, &username)? {
+                    let _ = self.queue_control(ClientControl::FetchE2eKey { user_id });
+                }
                 let _ = self.events.send(NetworkEvent::RoomUpserted(room));
             }
             ServerControl::DmOpened { room_id, peer } => {
+                if self.pending_dm_opens.pop_front() != Some(peer) {
+                    return Err(format!(
+                        "unsolicited or mismatched DM open response for user {}",
+                        peer.0
+                    ));
+                }
+                self.e2e.confirm_dm(room_id, peer)?;
                 let _ = self.events.send(NetworkEvent::DmOpened { room_id, peer });
             }
             ServerControl::Presence { user, online } => {
@@ -4854,16 +5499,195 @@ impl WorkerState {
                     username = user.username.as_str(),
                     online
                 );
+                let identity = self.e2e.handle_peer_username(user.user_id, &user.username);
                 if !online {
                     self.room_server_rtts.remove(&user.user_id);
                 }
+                self.user_names.insert(user.user_id, user.username.clone());
+                let user_id = user.user_id;
                 let _ = self.events.send(NetworkEvent::Presence { user, online });
+                self.handle_peer_identity_outcome(user_id, identity)?;
             }
             ServerControl::UploadDeclined {
                 client_transfer_id,
                 reason,
             } => self.handle_upload_declined(client_transfer_id, &reason),
+            ServerControl::E2eKey {
+                user_id,
+                public_key,
+            } => {
+                let outcome = self.e2e.handle_peer_key(user_id, public_key.as_deref());
+                self.handle_peer_identity_outcome(user_id, outcome)?;
+            }
         }
+        Ok(())
+    }
+
+    fn handle_peer_identity_outcome(
+        &mut self,
+        user_id: UserId,
+        outcome: PeerIdentityOutcome,
+    ) -> Result<(), String> {
+        match outcome {
+            PeerIdentityOutcome::Proposed { pin } => {
+                kvlog::info!("peer e2e identity proposed", user_id = user_id.0);
+                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed { pin });
+            }
+            PeerIdentityOutcome::Changed { pinned, presented } => {
+                kvlog::warn!("peer e2e identity changed", user_id = user_id.0);
+                let _ = self.events.send(NetworkEvent::E2ePeerIdentityChanged {
+                    user_id,
+                    pinned,
+                    presented,
+                });
+            }
+            PeerIdentityOutcome::Unchanged => self.drain_deferred_e2e()?,
+            PeerIdentityOutcome::Rejected => {}
+        }
+        Ok(())
+    }
+
+    /// Opens a DM envelope. `Ok(false)` means the original encrypted message
+    /// must be retained until a key/trust transition; malformed or forbidden
+    /// wire forms fail the connection instead of reaching app history.
+    fn open_chat_message(&mut self, message: &mut ChatMessage) -> Result<bool, String> {
+        let Err(failure) = self.e2e.open_message(message, &self.config.username) else {
+            return Ok(true);
+        };
+        kvlog::warn!(
+            "dm envelope failed to open",
+            room_id = message.room_id.0,
+            message_id = message.message_id.0,
+            sender = message.sender.0,
+            failure = match failure {
+                OpenFailure::NoKeys => "no keys",
+                OpenFailure::AwaitingTrust => "awaiting trust",
+                OpenFailure::Policy => "policy",
+                OpenFailure::Crypto => "authentication",
+            }
+        );
+        match failure {
+            OpenFailure::NoKeys | OpenFailure::AwaitingTrust => {
+                if failure == OpenFailure::NoKeys
+                    && let Some(user_id) = self.e2e.dm_peer(message.room_id)
+                {
+                    let _ = self.queue_control(ClientControl::FetchE2eKey { user_id });
+                }
+                Ok(false)
+            }
+            OpenFailure::Policy => Err(format!(
+                "server sent a forbidden plaintext/envelope form for room {}",
+                message.room_id.0
+            )),
+            OpenFailure::Crypto => Err(format!(
+                "server sent an unauthentic DM envelope for room {}",
+                message.room_id.0
+            )),
+        }
+    }
+
+    fn defer_e2e(&mut self, item: DeferredE2eInbound) -> Result<(), String> {
+        self.defer_e2e_at(item, false)
+    }
+
+    fn defer_e2e_front(&mut self, item: DeferredE2eInbound) -> Result<(), String> {
+        self.defer_e2e_at(item, true)
+    }
+
+    fn defer_e2e_at(&mut self, item: DeferredE2eInbound, front: bool) -> Result<(), String> {
+        let retained = item.retained_bytes();
+        let next_bytes = self
+            .deferred_e2e_bytes
+            .checked_add(retained)
+            .ok_or_else(|| "deferred E2E byte count overflowed".to_string())?;
+        if self.deferred_e2e.len() >= MAX_DEFERRED_E2E_ITEMS || next_bytes > MAX_DEFERRED_E2E_BYTES
+        {
+            return Err(
+                "too much encrypted DM data arrived while keys were unavailable".to_string(),
+            );
+        }
+        self.deferred_e2e_bytes = next_bytes;
+        if front {
+            self.deferred_e2e.push_front(item);
+        } else {
+            self.deferred_e2e.push_back(item);
+        }
+        Ok(())
+    }
+
+    fn deferred_file_transfer(&self, transfer_id: FileTransferId) -> bool {
+        self.deferred_e2e.iter().any(|item| {
+            matches!(
+                item,
+                DeferredE2eInbound::FileOffered { file, .. }
+                    if file.transfer_id == transfer_id
+            )
+        })
+    }
+
+    fn drain_deferred_e2e(&mut self) -> Result<(), String> {
+        let count = self.deferred_e2e.len();
+        for _ in 0..count {
+            let Some(item) = self.deferred_e2e.pop_front() else {
+                break;
+            };
+            self.deferred_e2e_bytes = self
+                .deferred_e2e_bytes
+                .saturating_sub(item.retained_bytes());
+            match item {
+                DeferredE2eInbound::Chat(mut message) => {
+                    if self.open_chat_message(&mut message)? {
+                        let _ = self.events.send(NetworkEvent::Chat(message));
+                    } else {
+                        self.defer_e2e_front(DeferredE2eInbound::Chat(message))?;
+                        break;
+                    }
+                }
+                DeferredE2eInbound::History(chunk) => {
+                    let mut opened = chunk.clone();
+                    let mut ready = true;
+                    for message in &mut opened.messages {
+                        if !self.open_chat_message(message)? {
+                            ready = false;
+                            break;
+                        }
+                    }
+                    if ready {
+                        let _ = self.events.send(NetworkEvent::HistoryChunk {
+                            room_id: opened.room_id,
+                            before: opened.before,
+                            messages: opened.messages,
+                            at_start: opened.at_start,
+                            complete: opened.complete,
+                        });
+                    } else {
+                        self.defer_e2e_front(DeferredE2eInbound::History(chunk))?;
+                        break;
+                    }
+                }
+                DeferredE2eInbound::FileOffered { file, contents } => {
+                    if self.file_offer_ready(&file)? {
+                        self.handle_file_offered_ready(file, contents);
+                    } else {
+                        self.defer_e2e_front(DeferredE2eInbound::FileOffered { file, contents })?;
+                        break;
+                    }
+                }
+                DeferredE2eInbound::FileChunk {
+                    transfer_id,
+                    offset,
+                    data,
+                } => self.handle_file_chunk(transfer_id, offset, data),
+                DeferredE2eInbound::FileComplete { transfer_id } => {
+                    self.handle_file_complete(transfer_id);
+                }
+                DeferredE2eInbound::FileCanceled {
+                    transfer_id,
+                    reason,
+                } => self.handle_file_canceled(transfer_id, &reason),
+            }
+        }
+        Ok(())
     }
 
     /// Handles the server telling us our upload lost its last recipient: cancel
@@ -6036,12 +6860,40 @@ fn correlate_upload_accepted(
         .iter_mut()
         .find(|upload| upload.transfer_id == client_transfer_id)
     {
+        let mut metadata = metadata;
+        if let Some(seal) = &upload.seal {
+            unseal_own_metadata(
+                &mut metadata,
+                &upload.name,
+                upload.size,
+                seal.inner_encoding,
+            );
+        }
         upload.server_metadata = Some(metadata);
         return None;
     }
-    pending
-        .remove(&client_transfer_id)
-        .map(|local| (metadata, local))
+    pending.remove(&client_transfer_id).map(|local| {
+        let mut metadata = metadata;
+        if let Some((name, size, inner_encoding)) = &local.sealed_real {
+            unseal_own_metadata(&mut metadata, name, *size, *inner_encoding);
+        }
+        (metadata, local)
+    })
+}
+
+/// Restores the uploader's real file metadata over the sealed wire placeholder
+/// so the sender's own views (file line, web log) show the true file.
+fn unseal_own_metadata(
+    metadata: &mut FileMetadata,
+    name: &str,
+    size: u64,
+    inner_encoding: FileContentEncoding,
+) {
+    metadata.file_name = name.to_string();
+    metadata.original_name = name.to_string();
+    metadata.size = size;
+    metadata.encoding = inner_encoding;
+    metadata.sealed_meta = None;
 }
 
 fn compressed_upload_source_read_ahead_is_limited(
@@ -6154,8 +7006,29 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SetUploadRate(_) => "set_upload_rate",
         NetworkCommand::SetFilePolicy(_) => "set_file_policy",
         NetworkCommand::SetP2pEnabled(_) => "set_p2p_enabled",
+        NetworkCommand::TrustPeerIdentity { .. } => "trust_peer_identity",
+        NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
+        NetworkCommand::ConfirmE2eLocalUser { .. } => "confirm_e2e_local_user",
         NetworkCommand::Shutdown => "shutdown",
     }
+}
+
+fn dm_peer_for_local(room: &RoomInfo, local: UserId) -> Option<UserId> {
+    let RoomKind::Dm { user_a, user_b } = room.kind else {
+        return None;
+    };
+    match (user_a == local, user_b == local) {
+        (true, false) => Some(user_b),
+        (false, true) => Some(user_a),
+        _ => None,
+    }
+}
+
+/// Wall-clock UNIX milliseconds, stamped inside sealed DM payloads.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// Records an outstanding RTT probe, evicting the oldest entry once the queue
@@ -6266,6 +7139,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
         ServerControl::UploadDeclined { .. } => "upload_declined",
+        ServerControl::E2eKey { .. } => "e2e_key",
     }
 }
 
@@ -7628,7 +8502,9 @@ mod tests {
             image,
         );
         let body = match encoding {
-            FileContentEncoding::Identity => IncomingBody::Identity(sink),
+            FileContentEncoding::Identity | FileContentEncoding::Sealed => {
+                IncomingBody::Identity(sink)
+            }
             FileContentEncoding::Zstd => {
                 let mut decoder = zstd::stream::raw::Decoder::new().unwrap();
                 decoder
@@ -7638,7 +8514,9 @@ mod tests {
             }
         };
         IncomingFile {
+            seal: None,
             metadata: FileMetadata {
+                sealed_meta: None,
                 transfer_id: FileTransferId(1),
                 room_id: RoomId(1),
                 sender: UserId(1),
@@ -7726,6 +8604,63 @@ mod tests {
     }
 
     #[test]
+    fn sealed_dm_chunks_stay_within_max_chunk_bytes() {
+        let content_key = vec![5u8; KEY_LEN];
+        let payload = vec![7u8; MAX_FILE_CHUNK_BYTES - rpc::e2e::DM_CHUNK_OVERHEAD];
+        let frame =
+            rpc::e2e::seal_dm_chunk(&content_key, RoomId(4), UserId(7), 0, &payload, 0).unwrap();
+        assert_eq!(frame.len(), MAX_FILE_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn sealed_zstd_file_round_trips_through_seal_and_open() {
+        let data = b"sealed dm transfer\n".repeat(60_000);
+        let encoded = encode_test_stream(&data, 8192, 4096);
+        let content_key = vec![9u8; KEY_LEN];
+        let room = RoomId(4);
+        let sender = UserId(7);
+        let max_payload = MAX_FILE_CHUNK_BYTES - rpc::e2e::DM_CHUNK_OVERHEAD;
+
+        let mut frames = Vec::new();
+        for chunk in encoded.chunks(max_payload) {
+            let counter = frames.len() as u64;
+            frames.push(
+                rpc::e2e::seal_dm_chunk(&content_key, room, sender, counter, chunk, 0).unwrap(),
+            );
+        }
+        let mut pad = rpc::e2e::padme_len(encoded.len() as u64) - encoded.len() as u64;
+        while pad > 0 {
+            let pad_len = pad.min(max_payload as u64) as usize;
+            let counter = frames.len() as u64;
+            frames.push(
+                rpc::e2e::seal_dm_chunk(&content_key, room, sender, counter, &[], pad_len).unwrap(),
+            );
+            pad -= pad_len as u64;
+        }
+
+        let mut wire = Vec::new();
+        for (index, frame) in frames.into_iter().enumerate() {
+            let mut frame = frame;
+            let payload =
+                rpc::e2e::open_dm_chunk(&content_key, room, sender, index as u64, &mut frame)
+                    .unwrap();
+            wire.extend_from_slice(&payload);
+        }
+        assert_eq!(wire, encoded, "padding frames must open to empty payloads");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("received.bin");
+        let mut incoming =
+            incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
+        pump_test_input(&mut incoming, &wire, 313, 64 * 1024).unwrap();
+        let (_, location, _, _, _) = incoming.finalize().unwrap();
+        let FinalizedLocation::Disk { path, .. } = location else {
+            panic!("disk transfer should finalize to a disk path");
+        };
+        assert_eq!(fs::read(path).unwrap(), data);
+    }
+
+    #[test]
     fn zstd_finish_rejects_truncation_and_checksum_corruption() {
         let data = b"checksum-protected contents".repeat(10_000);
         let encoded = encode_test_stream(&data, 4096, 1024);
@@ -7787,7 +8722,7 @@ mod tests {
 
         for encoding in [FileContentEncoding::Identity, FileContentEncoding::Zstd] {
             let wire = match encoding {
-                FileContentEncoding::Identity => png.clone(),
+                FileContentEncoding::Identity | FileContentEncoding::Sealed => png.clone(),
                 FileContentEncoding::Zstd => encode_test_stream(&png, 777, 333),
             };
             let dir = tempfile::tempdir().unwrap();
@@ -7849,6 +8784,7 @@ mod tests {
         let mut prefix = vec![0; prefix_len];
         file.read_exact(&mut prefix).unwrap();
         let mut upload = OutgoingUpload {
+            seal: None,
             transfer_id: FileTransferId(1),
             server_metadata: None,
             room_id: RoomId(1),
@@ -7886,6 +8822,7 @@ mod tests {
         let local_path = dir.path().join("local.bin");
         fs::write(&source_path, &raw).unwrap();
         let mut upload = OutgoingUpload {
+            seal: None,
             transfer_id: FileTransferId(1),
             server_metadata: None,
             room_id: RoomId(1),
@@ -7935,6 +8872,7 @@ mod tests {
         let source_path = dir.path().join("source.bin");
         fs::write(&source_path, b"source").unwrap();
         let mut upload = OutgoingUpload {
+            seal: None,
             transfer_id: FileTransferId(1),
             server_metadata: None,
             room_id: RoomId(1),
@@ -8003,6 +8941,7 @@ mod tests {
 
     fn accepted_file_metadata() -> FileMetadata {
         FileMetadata {
+            sealed_meta: None,
             transfer_id: FileTransferId(20),
             room_id: RoomId(1),
             sender: UserId(3),
@@ -8022,6 +8961,7 @@ mod tests {
         let file = File::create(&path).expect("create");
         let client_id = FileTransferId(7);
         let mut outgoing = VecDeque::from([OutgoingUpload {
+            seal: None,
             transfer_id: client_id,
             server_metadata: None,
             room_id: RoomId(1),
@@ -8065,6 +9005,7 @@ mod tests {
         pending.insert(
             client_id,
             PendingLocalFile {
+                sealed_real: None,
                 location: LocalFileLocation::Disk("report.pdf".to_string()),
                 dimensions: Some((4, 3)),
             },

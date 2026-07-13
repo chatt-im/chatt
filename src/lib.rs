@@ -12,6 +12,7 @@ mod clipboard;
 mod clipboard_paste;
 mod config;
 mod config_diagnostics;
+mod e2e;
 mod file_compression;
 mod fuzzy;
 mod highlight;

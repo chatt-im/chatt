@@ -109,6 +109,9 @@ pub enum ClientControl {
     SendChat {
         room_id: RoomId,
         body: String,
+        /// Encoded [`crate::e2e::DmEnvelope`] replacing `body` in DM rooms;
+        /// exactly one of the two is set.
+        envelope: Option<Vec<u8>>,
     },
     SetVoiceStatus {
         status: ParticipantVoiceStatus,
@@ -124,9 +127,16 @@ pub enum ClientControl {
         room_id: RoomId,
         transfer_id: FileTransferId,
         name: String,
-        /// Original/decompressed byte length.
+        /// Original/decompressed byte length. For
+        /// [`FileContentEncoding::Sealed`] this is the Padmé-padded length, so
+        /// the server never learns the true size.
         size: u64,
         encoding: FileContentEncoding,
+        /// Encoded [`crate::e2e::DmEnvelope`] holding the transfer's real
+        /// metadata and content key; required for
+        /// [`FileContentEncoding::Sealed`], absent otherwise. The server copies
+        /// it verbatim into the announcement message and [`FileMetadata`].
+        sealed_meta: Option<Vec<u8>>,
     },
     UploadFileChunk {
         transfer_id: FileTransferId,
@@ -207,12 +217,27 @@ pub enum ClientControl {
         room_id: RoomId,
         target: MessageId,
         body: String,
+        /// Encoded [`crate::e2e::DmEnvelope`] replacing `body` in DM rooms;
+        /// exactly one of the two is set.
+        envelope: Option<Vec<u8>>,
     },
     /// Delete a recent message the sender authored, of any kind. Bounded like
     /// [`ClientControl::EditChat`].
     DeleteChat {
         room_id: RoomId,
         target: MessageId,
+    },
+    /// Publish this user's long-term X25519 identity public key for DM
+    /// end-to-end encryption. Sent after every successful authentication;
+    /// idempotent, last publish wins. Broadcast to other sessions as
+    /// [`ServerControl::E2eKey`] when it changes.
+    PublishE2eKey {
+        public_key: Vec<u8>,
+    },
+    /// Ask for a user's published identity key. Answered with
+    /// [`ServerControl::E2eKey`].
+    FetchE2eKey {
+        user_id: UserId,
     },
 }
 
@@ -382,6 +407,13 @@ pub enum ServerControl {
         client_transfer_id: FileTransferId,
         reason: String,
     },
+    /// A user's DM identity key: the reply to [`ClientControl::FetchE2eKey`],
+    /// also pushed to every other live session when a key is first published
+    /// or changes. `None` when the user has not published one.
+    E2eKey {
+        user_id: UserId,
+        public_key: Option<Vec<u8>>,
+    },
 }
 
 /// The operation named by [`ServerControl::ChatMutationRejected`].
@@ -512,6 +544,10 @@ pub struct ChatMessage {
     pub flags: MessageFlags,
     /// `Some` marks this record as a mutation of that message id.
     pub target: Option<MessageId>,
+    /// Encoded [`crate::e2e::DmEnvelope`] carrying the sealed content in DM
+    /// rooms; `body` is empty then and receiving clients fill it after opening
+    /// the envelope.
+    pub envelope: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -523,10 +559,15 @@ pub struct FileMetadata {
     pub sender_name: String,
     pub file_name: String,
     pub original_name: String,
-    /// Original/decompressed byte length.
+    /// Original/decompressed byte length. Padmé-padded for
+    /// [`FileContentEncoding::Sealed`] transfers.
     pub size: u64,
     pub encoding: FileContentEncoding,
     pub timestamp_ms: u64,
+    /// Encoded [`crate::e2e::DmEnvelope`] with the transfer's real metadata
+    /// and content key, relayed verbatim from
+    /// [`ClientControl::UploadFileStart`] for sealed transfers.
+    pub sealed_meta: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -534,6 +575,10 @@ pub struct FileMetadata {
 pub enum FileContentEncoding {
     Identity,
     Zstd,
+    /// End-to-end encrypted DM transfer: chunks are AEAD frames sealed by the
+    /// sender, the true name/size/inner-encoding travel only inside
+    /// `sealed_meta`. The server sees a placeholder name and a padded size.
+    Sealed,
 }
 
 /// Maximum relayed byte count allowed for the encoded representation of a file.
@@ -547,6 +592,13 @@ pub fn max_file_wire_bytes(encoding: FileContentEncoding, original_size: u64) ->
         FileContentEncoding::Zstd => original_size
             .saturating_add(original_size / 128)
             .saturating_add(64 * 1024),
+        FileContentEncoding::Sealed => {
+            let stream = max_file_wire_bytes(FileContentEncoding::Zstd, original_size);
+            // Padmé expands the sealed stream by at most 1/8th.
+            let stream = stream.saturating_add(stream / 8);
+            let chunks = stream / (MAX_FILE_CHUNK_BYTES - crate::e2e::DM_CHUNK_OVERHEAD) as u64 + 2;
+            stream.saturating_add(chunks.saturating_mul(crate::e2e::DM_CHUNK_OVERHEAD as u64))
+        }
     }
 }
 
@@ -751,14 +803,23 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             validate_optional_auth_field("password", password)?;
             validate_optional_auth_field("existing token", existing_token)?;
         }
-        ClientControl::SendChat { body, .. } | ClientControl::EditChat { body, .. } => {
-            if body.trim().is_empty() {
-                return Err("chat message is empty".to_string());
+        ClientControl::SendChat { body, envelope, .. }
+        | ClientControl::EditChat { body, envelope, .. } => match envelope {
+            None => {
+                if body.trim().is_empty() {
+                    return Err("chat message is empty".to_string());
+                }
+                if body.len() > MAX_CHAT_BODY_BYTES {
+                    return Err("chat message exceeds maximum length".to_string());
+                }
             }
-            if body.len() > MAX_CHAT_BODY_BYTES {
-                return Err("chat message exceeds maximum length".to_string());
+            Some(envelope) => {
+                if !body.is_empty() {
+                    return Err("chat message carries both text and an envelope".to_string());
+                }
+                validate_dm_envelope(envelope)?;
             }
-        }
+        },
         ClientControl::PublishP2p { candidates, .. } => {
             if candidates.len() > 64 {
                 return Err("too many P2P candidates".to_string());
@@ -769,8 +830,26 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 }
             }
         }
-        ClientControl::UploadFileStart { name, .. } => {
+        ClientControl::UploadFileStart {
+            name,
+            encoding,
+            sealed_meta,
+            ..
+        } => {
             validate_file_name(name)?;
+            match sealed_meta {
+                None => {
+                    if *encoding == FileContentEncoding::Sealed {
+                        return Err("sealed upload is missing its metadata envelope".to_string());
+                    }
+                }
+                Some(sealed_meta) => {
+                    if *encoding != FileContentEncoding::Sealed {
+                        return Err("metadata envelope on an unsealed upload".to_string());
+                    }
+                    validate_dm_envelope(sealed_meta)?;
+                }
+            }
         }
         ClientControl::UploadFileChunk { data, .. } => {
             if data.is_empty() {
@@ -830,7 +909,22 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("share extradata exceeds maximum length".to_string());
             }
         }
+        ClientControl::PublishE2eKey { public_key } => {
+            if public_key.len() != crate::e2e::E2E_PUBLIC_KEY_LEN {
+                return Err("published identity key has the wrong length".to_string());
+            }
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_dm_envelope(envelope: &[u8]) -> Result<(), String> {
+    if envelope.is_empty() {
+        return Err("message envelope is empty".to_string());
+    }
+    if envelope.len() > crate::e2e::MAX_DM_ENVELOPE_BYTES {
+        return Err("message envelope exceeds maximum length".to_string());
     }
     Ok(())
 }
@@ -1012,6 +1106,7 @@ mod tests {
     #[test]
     fn client_control_round_trips() {
         let message = ClientControl::SendChat {
+            envelope: None,
             room_id: RoomId(7),
             body: "hello".to_string(),
         };
@@ -1022,6 +1117,7 @@ mod tests {
     #[test]
     fn mutation_controls_round_trip() {
         let edit = ClientControl::EditChat {
+            envelope: None,
             room_id: RoomId(7),
             target: MessageId(42),
             body: "revised".to_string(),
@@ -1040,6 +1136,7 @@ mod tests {
     #[test]
     fn edit_chat_rejects_empty_and_oversize_body() {
         let empty = ClientControl::EditChat {
+            envelope: None,
             room_id: RoomId(7),
             target: MessageId(42),
             body: "  \n".to_string(),
@@ -1047,11 +1144,102 @@ mod tests {
         assert!(encode_client_control(&empty).is_err());
 
         let oversize = ClientControl::EditChat {
+            envelope: None,
             room_id: RoomId(7),
             target: MessageId(42),
             body: "x".repeat(MAX_CHAT_BODY_BYTES + 1),
         };
         assert!(encode_client_control(&oversize).is_err());
+    }
+
+    #[test]
+    fn rejects_body_and_envelope_together_or_neither() {
+        let both = ClientControl::SendChat {
+            room_id: RoomId(7),
+            body: "hello".to_string(),
+            envelope: Some(vec![1u8; 160]),
+        };
+        assert!(encode_client_control(&both).is_err());
+
+        let neither = ClientControl::SendChat {
+            room_id: RoomId(7),
+            body: String::new(),
+            envelope: None,
+        };
+        assert!(encode_client_control(&neither).is_err());
+
+        let sealed = ClientControl::SendChat {
+            room_id: RoomId(7),
+            body: String::new(),
+            envelope: Some(vec![1u8; 160]),
+        };
+        assert!(encode_client_control(&sealed).is_ok());
+
+        let oversize = ClientControl::SendChat {
+            room_id: RoomId(7),
+            body: String::new(),
+            envelope: Some(vec![1u8; crate::e2e::MAX_DM_ENVELOPE_BYTES + 1]),
+        };
+        assert!(encode_client_control(&oversize).is_err());
+
+        let empty = ClientControl::SendChat {
+            room_id: RoomId(7),
+            body: String::new(),
+            envelope: Some(Vec::new()),
+        };
+        assert!(encode_client_control(&empty).is_err());
+    }
+
+    #[test]
+    fn sealed_upload_start_requires_sealed_meta() {
+        let upload = |encoding, sealed_meta| ClientControl::UploadFileStart {
+            room_id: RoomId(7),
+            transfer_id: FileTransferId(1),
+            name: "sealed.bin".to_string(),
+            size: 4096,
+            encoding,
+            sealed_meta,
+        };
+        assert!(encode_client_control(&upload(FileContentEncoding::Sealed, None)).is_err());
+        assert!(
+            encode_client_control(&upload(FileContentEncoding::Zstd, Some(vec![1u8; 160])))
+                .is_err()
+        );
+        assert!(
+            encode_client_control(&upload(FileContentEncoding::Sealed, Some(vec![1u8; 160])))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn sealed_wire_bound_covers_chunk_overhead_and_padding() {
+        for original in [0u64, 1, 1024, 200_000, 5_000_000] {
+            let stream =
+                crate::e2e::padme_len(max_file_wire_bytes(FileContentEncoding::Zstd, original));
+            let chunk_payload = (MAX_FILE_CHUNK_BYTES - crate::e2e::DM_CHUNK_OVERHEAD) as u64;
+            let chunks = stream.div_ceil(chunk_payload).max(1);
+            let wire = stream + chunks * crate::e2e::DM_CHUNK_OVERHEAD as u64;
+            assert!(
+                wire <= max_file_wire_bytes(FileContentEncoding::Sealed, original),
+                "bound too small for original {original}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_e2e_key_requires_exact_key_length() {
+        assert!(
+            encode_client_control(&ClientControl::PublishE2eKey {
+                public_key: vec![1u8; 31],
+            })
+            .is_err()
+        );
+        assert!(
+            encode_client_control(&ClientControl::PublishE2eKey {
+                public_key: vec![1u8; 32],
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1189,6 +1377,7 @@ mod tests {
     #[test]
     fn rejects_empty_chat() {
         let message = ClientControl::SendChat {
+            envelope: None,
             room_id: RoomId(7),
             body: "  ".to_string(),
         };
@@ -1400,6 +1589,7 @@ mod tests {
     fn file_upload_control_round_trips() {
         for encoding in [FileContentEncoding::Identity, FileContentEncoding::Zstd] {
             let start = ClientControl::UploadFileStart {
+                sealed_meta: None,
                 room_id: RoomId(2),
                 transfer_id: FileTransferId(9),
                 name: "report.bin".to_string(),
@@ -1422,6 +1612,7 @@ mod tests {
             let accepted = ServerControl::UploadFileAccepted {
                 client_transfer_id: FileTransferId(9),
                 file: FileMetadata {
+                    sealed_meta: None,
                     transfer_id: FileTransferId(17),
                     room_id: RoomId(2),
                     sender: UserId(3),

@@ -13,6 +13,7 @@ use std::{
 pub mod config;
 mod config_diagnostics;
 mod history_reader;
+pub mod key_store;
 pub mod local_admin;
 pub mod room_store;
 pub mod user_store;
@@ -57,6 +58,7 @@ use config::{
     Config as ServerConfig, UserConfig, hash_secret, valid_username, value_arg, verify_secret_hash,
 };
 use history_reader::{HistoryReadReply, HistoryReader};
+use key_store::{E2eKeyStore, KeyPublish};
 use local_admin::{AdminCommand, AdminSocket};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
@@ -399,6 +401,8 @@ pub struct Server {
     /// Server-wide username uniqueness index, backed by `usernames.log.bin` for
     /// dynamic users and seeded from `users` for explicit users.
     usernames: UsernameRegistry,
+    /// Published DM identity public keys, persisted under the data dir.
+    e2e_keys: E2eKeyStore,
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
@@ -520,6 +524,8 @@ impl Server {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let usernames = UsernameRegistry::open(config.data_dir(), &users.users)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let e2e_keys = E2eKeyStore::open(config.data_dir())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mut rooms = HashMap::new();
         for room in &config.rooms {
             let access = match &room.members {
@@ -595,6 +601,7 @@ impl Server {
             config,
             users,
             usernames,
+            e2e_keys,
             poll,
             listener,
             udp,
@@ -1778,9 +1785,16 @@ impl Server {
                 | ClientControl::Pair { .. }
                 | ClientControl::OpenPair { .. },
             ) => Err("session is already authenticated".into()),
-            (ConnState::Ready, ClientControl::SendChat { room_id, body }) => {
+            (
+                ConnState::Ready,
+                ClientControl::SendChat {
+                    room_id,
+                    body,
+                    envelope,
+                },
+            ) => {
                 let session_id = self.session_for_token(token)?;
-                self.send_chat(session_id, room_id, body)
+                self.send_chat(session_id, room_id, body, envelope)
             }
             (
                 ConnState::Ready,
@@ -1788,10 +1802,18 @@ impl Server {
                     room_id,
                     target,
                     body,
+                    envelope,
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
-                self.mutate_chat(session_id, room_id, target, MutationKind::Edit, body)
+                self.mutate_chat(
+                    session_id,
+                    room_id,
+                    target,
+                    MutationKind::Edit,
+                    body,
+                    envelope,
+                )
             }
             (ConnState::Ready, ClientControl::DeleteChat { room_id, target }) => {
                 let session_id = self.session_for_token(token)?;
@@ -1801,6 +1823,23 @@ impl Server {
                     target,
                     MutationKind::Delete,
                     String::new(),
+                    None,
+                )
+            }
+            (ConnState::Ready, ClientControl::PublishE2eKey { public_key }) => {
+                let session_id = self.session_for_token(token)?;
+                let result = self.publish_e2e_key(session_id, public_key);
+                self.report_request_outcome(token, result)
+            }
+            (ConnState::Ready, ClientControl::FetchE2eKey { user_id }) => {
+                self.session_for_token(token)?;
+                let public_key = self.e2e_keys.key_for(user_id);
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::E2eKey {
+                        user_id,
+                        public_key,
+                    },
                 )
             }
             (
@@ -1864,10 +1903,19 @@ impl Server {
                     name,
                     size,
                     encoding,
+                    sealed_meta,
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
-                self.start_file_upload(session_id, room_id, transfer_id, name, size, encoding)
+                self.start_file_upload(
+                    session_id,
+                    room_id,
+                    transfer_id,
+                    name,
+                    size,
+                    encoding,
+                    sealed_meta,
+                )
             }
             (
                 ConnState::Ready,
@@ -2742,6 +2790,43 @@ impl Server {
         self.send_control_to_tokens(&tokens, &control);
     }
 
+    /// Records a session user's published DM identity key, broadcasting it to
+    /// every other live session when it is new or changed.
+    fn publish_e2e_key(
+        &mut self,
+        session_id: SessionId,
+        public_key: Vec<u8>,
+    ) -> Result<(), String> {
+        let Some(session) = self.sessions.get(&session_id) else {
+            return Err("unknown session".into());
+        };
+        let user_id = session.user_id;
+        let own_token = session.tcp_token;
+        let Ok(public_key) = <[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>::try_from(public_key) else {
+            return Err("published identity key has the wrong length".into());
+        };
+        if self.e2e_keys.publish(user_id, &public_key)? == KeyPublish::Unchanged {
+            return Ok(());
+        }
+        kvlog::info!(
+            "e2e key published",
+            session_id = session_id.0,
+            user_id = user_id.0
+        );
+        let control = ServerControl::E2eKey {
+            user_id,
+            public_key: Some(public_key.to_vec()),
+        };
+        let tokens: Vec<Token> = self
+            .sessions
+            .values()
+            .map(|candidate| candidate.tcp_token)
+            .filter(|token| *token != own_token && self.clients.contains_key(token))
+            .collect();
+        self.send_control_to_tokens(&tokens, &control);
+        Ok(())
+    }
+
     /// Whether the session's user may access the room. Denials never reveal
     /// whether the room exists: a private room a user cannot see and a missing
     /// room answer identically, so callers must pick failure replies that
@@ -3153,13 +3238,31 @@ impl Server {
             .unwrap_or_default()
     }
 
+    /// Whether the room is a DM, whose messages must be end-to-end sealed.
+    fn room_is_dm(&self, room_id: RoomId) -> bool {
+        self.rooms
+            .get(&room_id)
+            .is_some_and(|room| matches!(room.access, RoomAccess::Dm(..)))
+    }
+
+    /// Enforces the end-to-end policy on an incoming chat payload: DM rooms
+    /// accept only sealed envelopes and other rooms only plaintext.
+    fn envelope_policy_error(&self, room_id: RoomId, has_envelope: bool) -> Option<&'static str> {
+        match (self.room_is_dm(room_id), has_envelope) {
+            (true, false) => Some("direct messages require end-to-end encryption"),
+            (false, true) => Some("sealed envelopes are only accepted in direct messages"),
+            _ => None,
+        }
+    }
+
     fn send_chat(
         &mut self,
         session_id: SessionId,
         room_id: RoomId,
         body: String,
+        envelope: Option<Vec<u8>>,
     ) -> Result<(), String> {
-        let body_size = body.len();
+        let body_size = envelope.as_ref().map_or(body.len(), Vec::len);
         kvlog::info!(
             "chat send requested",
             session_id = session_id.0,
@@ -3186,6 +3289,24 @@ impl Server {
             );
             return Ok(());
         }
+        if let Some(error) = self.envelope_policy_error(room_id, envelope.is_some()) {
+            kvlog::warn!(
+                "chat send rejected",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                error
+            );
+            let token = self
+                .live_token_for_session(session_id)
+                .ok_or_else(|| "chat sender disconnected".to_string())?;
+            return self.send_control_to_token(
+                token,
+                &ServerControl::Error {
+                    code: control::ERROR_REQUEST_REJECTED,
+                    message: error.to_string(),
+                },
+            );
+        }
         let message = ChatMessage {
             message_id: self.store.allocate_message_id(room_id),
             room_id,
@@ -3196,6 +3317,7 @@ impl Server {
             file_transfer_id: None,
             flags: MessageFlags::default(),
             target: None,
+            envelope,
         };
         let history_len = self.store.append(room_id, &message);
         kvlog::info!(
@@ -3222,6 +3344,7 @@ impl Server {
         target: MessageId,
         kind: MutationKind,
         body: String,
+        envelope: Option<Vec<u8>>,
     ) -> Result<(), String> {
         let (sender, sender_name) = match self.sessions.get(&session_id) {
             Some(session) => (session.user_id, session.username.clone()),
@@ -3248,6 +3371,18 @@ impl Server {
                 kind,
                 "message is unavailable".to_string(),
             );
+        }
+        if kind == MutationKind::Edit
+            && let Some(error) = self.envelope_policy_error(room_id, envelope.is_some())
+        {
+            kvlog::warn!(
+                "chat mutation rejected",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                target = target.0,
+                error
+            );
+            return self.reject_chat_mutation(session_id, room_id, target, kind, error.to_string());
         }
         if let Err(denied) = self.store.validate_mutation(room_id, target, sender, kind) {
             kvlog::warn!(
@@ -3301,6 +3436,7 @@ impl Server {
             file_transfer_id: None,
             flags,
             target: Some(target),
+            envelope,
         };
         let history_len = self.store.append(room_id, &message);
         kvlog::info!(
@@ -3350,6 +3486,7 @@ impl Server {
         name: String,
         original_size: u64,
         encoding: FileContentEncoding,
+        sealed_meta: Option<Vec<u8>>,
     ) -> Result<(), String> {
         kvlog::info!(
             "file upload start requested",
@@ -3361,6 +3498,18 @@ impl Server {
         );
         if original_size > self.file_size_limit_bytes {
             return Err("file exceeds server maximum length".into());
+        }
+        if sealed_meta.is_some() != (encoding == FileContentEncoding::Sealed) {
+            return Err("sealed metadata does not match the upload encoding".into());
+        }
+        if (encoding == FileContentEncoding::Sealed) != self.room_is_dm(room_id) {
+            return Err(match encoding {
+                FileContentEncoding::Sealed => {
+                    "sealed uploads are only accepted in direct messages"
+                }
+                _ => "direct message uploads require end-to-end encryption",
+            }
+            .into());
         }
         let key = (session_id, client_transfer_id);
         if self.active_uploads.contains_key(&key) {
@@ -3426,22 +3575,28 @@ impl Server {
             size: original_size,
             encoding,
             timestamp_ms,
+            sealed_meta: sealed_meta.clone(),
         };
 
+        let body = match &sealed_meta {
+            Some(_) => String::new(),
+            None => format!(
+                "sent file `{}` ({})",
+                file_name,
+                format_bytes(original_size)
+            ),
+        };
         let message = ChatMessage {
             message_id: self.store.allocate_message_id(room_id),
             room_id,
             sender,
             sender_name,
             timestamp_ms,
-            body: format!(
-                "sent file `{}` ({})",
-                file_name,
-                format_bytes(original_size)
-            ),
+            body,
             file_transfer_id: Some(server_transfer_id),
             flags: MessageFlags::default(),
             target: None,
+            envelope: sealed_meta,
         };
         // The upload is registered before anything durable or visible
         // happens, so an uploader torn down by any of the sends below is
@@ -5508,7 +5663,9 @@ fn upload_completion_is_valid(
 ) -> bool {
     match encoding {
         FileContentEncoding::Identity => wire_received == original_size,
-        FileContentEncoding::Zstd => original_size == 0 || wire_received != 0,
+        FileContentEncoding::Zstd | FileContentEncoding::Sealed => {
+            original_size == 0 || wire_received != 0
+        }
     }
 }
 
@@ -5525,6 +5682,7 @@ fn file_content_encoding_name(encoding: FileContentEncoding) -> &'static str {
     match encoding {
         FileContentEncoding::Identity => "identity",
         FileContentEncoding::Zstd => "zstd",
+        FileContentEncoding::Sealed => "sealed",
     }
 }
 
@@ -5898,6 +6056,8 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::SkipFile { .. } => "skip_file",
         ClientControl::EditChat { .. } => "edit_chat",
         ClientControl::DeleteChat { .. } => "delete_chat",
+        ClientControl::PublishE2eKey { .. } => "publish_e2e_key",
+        ClientControl::FetchE2eKey { .. } => "fetch_e2e_key",
     }
 }
 
@@ -5939,6 +6099,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
         ServerControl::UploadDeclined { .. } => "upload_declined",
+        ServerControl::E2eKey { .. } => "e2e_key",
     }
 }
 
@@ -6707,7 +6868,7 @@ mod tests {
         let mut reader_peer = live_user(&mut server, Token(22), reader, UserId(2));
 
         server
-            .send_chat(sender, RoomId(1), "hello everyone".to_string())
+            .send_chat(sender, RoomId(1), "hello everyone".to_string(), None)
             .unwrap();
 
         for peer in [&mut sender_peer, &mut reader_peer] {
@@ -6735,7 +6896,7 @@ mod tests {
         let mut reader_peer = live_user(&mut server, Token(22), reader, UserId(2));
 
         server
-            .send_chat(sender, RoomId(1), "original".to_string())
+            .send_chat(sender, RoomId(1), "original".to_string(), None)
             .unwrap();
         let target = server.store.head(RoomId(1)).expect("stored chat message");
         server
@@ -6745,6 +6906,7 @@ mod tests {
                 target,
                 MutationKind::Edit,
                 "revised".to_string(),
+                None,
             )
             .unwrap();
         for peer in [&mut sender_peer, &mut reader_peer] {
@@ -6768,6 +6930,7 @@ mod tests {
                 target,
                 MutationKind::Edit,
                 "hijacked".to_string(),
+                None,
             )
             .unwrap();
         assert_no_control(&mut sender_peer);
@@ -6791,6 +6954,7 @@ mod tests {
                 target,
                 MutationKind::Delete,
                 String::new(),
+                None,
             )
             .unwrap();
         let rejected = read_until(&mut reader_peer, |control| {
@@ -6813,6 +6977,7 @@ mod tests {
                 target,
                 MutationKind::Delete,
                 String::new(),
+                None,
             )
             .unwrap();
         let control = read_until(
@@ -6835,7 +7000,7 @@ mod tests {
         let mut reader_peer = live_user(&mut server, Token(22), reader, UserId(2));
 
         server
-            .send_chat(sender, RoomId(1), "original".to_string())
+            .send_chat(sender, RoomId(1), "original".to_string(), None)
             .unwrap();
         let target = server.store.head(RoomId(1)).expect("recent chat message");
         server
@@ -6845,6 +7010,7 @@ mod tests {
                 target,
                 MutationKind::Edit,
                 "foreign edit".to_string(),
+                None,
             )
             .unwrap();
 
@@ -6873,7 +7039,7 @@ mod tests {
         let mut outsider_peer = live_user(&mut server, Token(22), outsider, UserId(2));
 
         server
-            .send_chat(outsider, secret, "let me in".to_string())
+            .send_chat(outsider, secret, "let me in".to_string(), None)
             .unwrap();
         let denied = read_until(&mut outsider_peer, |control| {
             matches!(control, ServerControl::Error { .. })
@@ -6907,7 +7073,7 @@ mod tests {
         let mut outsider_peer = live_user(&mut server, Token(22), outsider, UserId(2));
 
         server
-            .send_chat(member, secret, "members only".to_string())
+            .send_chat(member, secret, "members only".to_string(), None)
             .unwrap();
 
         let control = read_until(&mut member_peer, |control| {
@@ -7031,6 +7197,236 @@ mod tests {
     }
 
     #[test]
+    fn publish_e2e_key_broadcasts_to_other_sessions() {
+        let mut server = test_server();
+        let publisher = SessionId(1);
+        let mut publisher_peer = live_user(&mut server, Token(11), publisher, UserId(1));
+        let mut reader_peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
+
+        server.publish_e2e_key(publisher, vec![7u8; 32]).unwrap();
+
+        let control = read_until(&mut reader_peer, |control| {
+            matches!(control, ServerControl::E2eKey { .. })
+        });
+        let ServerControl::E2eKey {
+            user_id,
+            public_key,
+        } = control
+        else {
+            unreachable!();
+        };
+        assert_eq!(user_id, UserId(1));
+        assert_eq!(public_key, Some(vec![7u8; 32]));
+        assert_no_control(&mut publisher_peer);
+
+        server.publish_e2e_key(publisher, vec![7u8; 32]).unwrap();
+        assert_no_control(&mut reader_peer);
+
+        assert!(server.publish_e2e_key(publisher, vec![7u8; 31]).is_err());
+    }
+
+    #[test]
+    fn fetch_e2e_key_returns_published_key_and_none_for_unknown() {
+        let mut server = test_server();
+        let publisher = SessionId(1);
+        let _peer = live_user(&mut server, Token(11), publisher, UserId(1));
+
+        server.publish_e2e_key(publisher, vec![9u8; 32]).unwrap();
+
+        assert_eq!(server.e2e_keys.key_for(UserId(1)), Some(vec![9u8; 32]));
+        assert_eq!(server.e2e_keys.key_for(UserId(2)), None);
+    }
+
+    #[test]
+    fn e2e_key_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("chatt-e2e-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = test_server();
+        server.config.storage.data_dir = Some(dir.display().to_string());
+        server.e2e_keys = E2eKeyStore::open(server.config.data_dir()).unwrap();
+        let publisher = SessionId(1);
+        let _peer = live_user(&mut server, Token(11), publisher, UserId(1));
+        server.publish_e2e_key(publisher, vec![5u8; 32]).unwrap();
+        let mut config = server.config.clone();
+        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
+        drop(server);
+
+        let restarted = Server::bind(config).expect("restarted server");
+
+        assert_eq!(restarted.e2e_keys.key_for(UserId(1)), Some(vec![5u8; 32]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dm_room_rejects_plaintext_chat_and_public_room_rejects_envelope() {
+        let mut server = test_server();
+        let requester = SessionId(1);
+        let mut requester_peer = live_user(&mut server, Token(11), requester, UserId(1));
+        let mut peer_peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
+        server.open_dm(requester, UserId(2));
+        let dm_room = server
+            .store
+            .dm_room_for(UserId(1), UserId(2))
+            .expect("dm registered");
+
+        server
+            .send_chat(requester, dm_room, "plaintext".to_string(), None)
+            .unwrap();
+        let ServerControl::Error { message, .. } = read_until(&mut requester_peer, |control| {
+            matches!(control, ServerControl::Error { .. })
+        }) else {
+            unreachable!();
+        };
+        assert!(message.contains("end-to-end"), "{message}");
+
+        server
+            .send_chat(requester, RoomId(1), String::new(), Some(vec![2u8; 200]))
+            .unwrap();
+        let ServerControl::Error { message, .. } = read_until(&mut requester_peer, |control| {
+            matches!(control, ServerControl::Error { .. })
+        }) else {
+            unreachable!();
+        };
+        assert!(
+            message.contains("only accepted in direct messages"),
+            "{message}"
+        );
+
+        server
+            .send_chat(requester, dm_room, String::new(), Some(vec![2u8; 200]))
+            .unwrap();
+        let mut sealed_target = MessageId(0);
+        for peer in [&mut requester_peer, &mut peer_peer] {
+            let ServerControl::Chat { message } = read_until(peer, |control| {
+                matches!(control, ServerControl::Chat { .. })
+            }) else {
+                unreachable!();
+            };
+            assert!(message.body.is_empty());
+            assert_eq!(message.envelope, Some(vec![2u8; 200]));
+            sealed_target = message.message_id;
+        }
+
+        server
+            .mutate_chat(
+                requester,
+                dm_room,
+                sealed_target,
+                MutationKind::Edit,
+                String::new(),
+                None,
+            )
+            .unwrap();
+        let control = read_until(&mut requester_peer, |control| {
+            matches!(control, ServerControl::ChatMutationRejected { .. })
+        });
+        let ServerControl::ChatMutationRejected { message, .. } = control else {
+            unreachable!();
+        };
+        assert!(message.contains("end-to-end"), "{message}");
+
+        server
+            .mutate_chat(
+                requester,
+                dm_room,
+                sealed_target,
+                MutationKind::Edit,
+                String::new(),
+                Some(vec![3u8; 200]),
+            )
+            .unwrap();
+        let ServerControl::Chat { message } = read_until(&mut peer_peer, |control| {
+            matches!(control, ServerControl::Chat { .. })
+        }) else {
+            unreachable!();
+        };
+        assert_eq!(message.target, Some(sealed_target));
+        assert_eq!(message.envelope, Some(vec![3u8; 200]));
+    }
+
+    #[test]
+    fn sealed_dm_upload_relays_sealed_meta_and_envelope_in_announcement() {
+        let mut server = test_server();
+        let uploader = SessionId(1);
+        let recipient = SessionId(2);
+        let mut uploader_peer = live_user(&mut server, Token(11), uploader, UserId(1));
+        let mut recipient_peer = live_receiver(&mut server, Token(22), recipient, UserId(2));
+        server.open_dm(uploader, UserId(2));
+        let dm_room = server
+            .store
+            .dm_room_for(UserId(1), UserId(2))
+            .expect("dm registered");
+        let sealed_meta = vec![9u8; 180];
+
+        assert!(
+            server
+                .start_file_upload(
+                    uploader,
+                    dm_room,
+                    FileTransferId(1),
+                    "plain.bin".to_string(),
+                    4,
+                    FileContentEncoding::Zstd,
+                    None,
+                )
+                .is_err(),
+            "unsealed uploads must be refused in DM rooms"
+        );
+        assert!(
+            server
+                .start_file_upload(
+                    uploader,
+                    RoomId(1),
+                    FileTransferId(2),
+                    "sealed.bin".to_string(),
+                    4096,
+                    FileContentEncoding::Sealed,
+                    Some(sealed_meta.clone()),
+                )
+                .is_err(),
+            "sealed uploads must be refused outside DM rooms"
+        );
+
+        server
+            .start_file_upload(
+                uploader,
+                dm_room,
+                FileTransferId(3),
+                "sealed.bin".to_string(),
+                4096,
+                FileContentEncoding::Sealed,
+                Some(sealed_meta.clone()),
+            )
+            .unwrap();
+
+        let control = read_until(&mut uploader_peer, |control| {
+            matches!(control, ServerControl::UploadFileAccepted { .. })
+        });
+        let ServerControl::UploadFileAccepted { file, .. } = control else {
+            unreachable!();
+        };
+        assert_eq!(file.sealed_meta, Some(sealed_meta.clone()));
+
+        let ServerControl::Chat { message } = read_until(&mut recipient_peer, |control| {
+            matches!(control, ServerControl::Chat { .. })
+        }) else {
+            unreachable!();
+        };
+        assert!(message.body.is_empty());
+        assert_eq!(message.envelope, Some(sealed_meta.clone()));
+        assert!(message.file_transfer_id.is_some());
+
+        let ServerControl::FileOffered { file, .. } = read_until(&mut recipient_peer, |control| {
+            matches!(control, ServerControl::FileOffered { .. })
+        }) else {
+            unreachable!();
+        };
+        assert_eq!(file.sealed_meta, Some(sealed_meta));
+        assert_eq!(file.encoding, FileContentEncoding::Sealed);
+    }
+
+    #[test]
     fn history_fetch_paginates_backwards() {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
@@ -7043,7 +7439,7 @@ mod tests {
         let mut peer = live_user(&mut server, Token(11), session, UserId(1));
         for index in 0..9 {
             server
-                .send_chat(session, RoomId(1), format!("message {index}"))
+                .send_chat(session, RoomId(1), format!("message {index}"), None)
                 .unwrap();
         }
 
@@ -7084,7 +7480,9 @@ mod tests {
             .insert(session, test_session(UserId(1), Token(11), None));
         let body = "x".repeat(rpc::control::MAX_CHAT_BODY_BYTES);
         for _ in 0..80 {
-            server.send_chat(session, RoomId(1), body.clone()).unwrap();
+            server
+                .send_chat(session, RoomId(1), body.clone(), None)
+                .unwrap();
         }
         let mut peer = live_user(&mut server, Token(11), session, UserId(1));
 
@@ -7179,7 +7577,7 @@ mod tests {
         let mut peer = live_user(&mut server, Token(11), session, UserId(1));
         for index in 0..30 {
             server
-                .send_chat(session, RoomId(1), format!("message {index}"))
+                .send_chat(session, RoomId(1), format!("message {index}"), None)
                 .unwrap();
         }
 
@@ -7236,7 +7634,7 @@ mod tests {
 
         server.join_voice(talker, room_a);
         server
-            .send_chat(talker, room_b, "reading elsewhere".to_string())
+            .send_chat(talker, room_b, "reading elsewhere".to_string(), None)
             .unwrap();
 
         let session = server.sessions.get(&talker).expect("session exists");
@@ -8459,6 +8857,7 @@ mod tests {
             "report.pdf".to_string(),
             128,
             FileContentEncoding::Identity,
+            None,
         );
 
         assert!(result.is_ok());
@@ -8492,6 +8891,7 @@ mod tests {
                 "report.pdf".to_string(),
                 4,
                 FileContentEncoding::Identity,
+                None,
             )
             .unwrap();
         assert!(server.reserved_file_names.contains("report.pdf"));
@@ -8515,6 +8915,7 @@ mod tests {
                 "report.pdf".to_string(),
                 4,
                 FileContentEncoding::Identity,
+                None,
             )
             .unwrap();
         let upload = server
@@ -8542,6 +8943,7 @@ mod tests {
                 "report.pdf".to_string(),
                 4,
                 FileContentEncoding::Identity,
+                None,
             )
             .unwrap();
         assert!(server.reserved_file_names.contains("report.pdf"));
@@ -8571,6 +8973,7 @@ mod tests {
                 "report.pdf".to_string(),
                 8,
                 FileContentEncoding::Identity,
+                None,
             )
             .unwrap();
         let key = (uploader, FileTransferId(1));
@@ -8632,6 +9035,7 @@ mod tests {
                 "report.pdf".to_string(),
                 8,
                 FileContentEncoding::Identity,
+                None,
             )
             .unwrap();
         let key = (uploader, FileTransferId(1));
@@ -8690,6 +9094,7 @@ mod tests {
                 "report.pdf".to_string(),
                 8,
                 FileContentEncoding::Identity,
+                None,
             )
             .unwrap();
         let key = (uploader, FileTransferId(1));
@@ -8720,6 +9125,7 @@ mod tests {
                 "report.pdf".to_string(),
                 8,
                 FileContentEncoding::Identity,
+                None,
             )
             .unwrap();
         let key = (uploader, FileTransferId(1));
@@ -8751,6 +9157,7 @@ mod tests {
                     format!("file-{index}.bin"),
                     4,
                     FileContentEncoding::Identity,
+                    None,
                 )
                 .unwrap();
         }
@@ -8762,6 +9169,7 @@ mod tests {
             "file-extra.bin".to_string(),
             4,
             FileContentEncoding::Identity,
+            None,
         );
 
         assert!(result.is_err());
