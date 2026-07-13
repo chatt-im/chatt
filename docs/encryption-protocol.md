@@ -22,7 +22,8 @@ useful as the code moves.
   this mode because it would bypass the outer link.
 - The server is trusted to route. Public/private room chat, voice, video, and
   files are decrypted by the server, so they are not end-to-end encrypted.
-- Direct messages are end-to-end encrypted (text, edits, and file transfers).
+- Direct messages are end-to-end encrypted (text, edits, deletions, and file
+  transfers).
   Each user holds a long-term X25519 identity seed; the per-DM root is a
   static-static X25519 agreement HKDF-bound to both user ids and public keys,
   with mirrored directional keys. Every message derives a one-shot
@@ -44,13 +45,17 @@ useful as the code moves.
   for retained history after that decision. DM chat and file sender labels are
   taken from the authenticated tuple (or local configured identity for an own
   echo), never from the server's unauthenticated outer display-name field.
+  Edit and deletion targets remain visible for server-side ownership checks,
+  but are duplicated inside the authenticated plaintext; clients reject a
+  mutation if the server-visible target differs from the sealed target.
   Ciphertext which races identity lookup is retained in arrival order, bounded
   to 2 MiB and 1024 controls; overflow or forbidden plaintext/envelope forms
   fail the connection closed. Deliberately no
   ratchet: keys are static so server-fetched DM history stays decryptable, and
   seed compromise exposes all of that user's DM traffic. The server still sees
   DM routing metadata (participants, timing, size classes, edit/delete
-  targets), and DM voice/video stay transport-encrypted only.
+  targets), can replay an exact sender envelope within the same
+  room/sender/content class, and DM voice/video stay transport-encrypted only.
 - The default server config sets `security.chat-history-limit = 0`, so the
   server does not retain chat bodies for future room joins. It still keeps
   transient session, room membership, active upload, and P2P routing state in

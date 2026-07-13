@@ -4180,6 +4180,9 @@ impl App {
                     presented.username, pinned.username, presented.username
                 ));
             }
+            NetworkEvent::E2ePeerIdentityVerified { user_id } => {
+                self.room.set_e2e_identity_changed(user_id, false);
+            }
             NetworkEvent::VoiceStarted {
                 room_id,
                 session_id,
@@ -8249,6 +8252,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::E2eLocalUserId { .. } => "e2e_local_user_id",
         NetworkEvent::E2ePeerPinProposed { .. } => "e2e_peer_pin_proposed",
         NetworkEvent::E2ePeerIdentityChanged { .. } => "e2e_peer_identity_changed",
+        NetworkEvent::E2ePeerIdentityVerified { .. } => "e2e_peer_identity_verified",
         NetworkEvent::VoiceStarted { .. } => "voice_started",
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
         NetworkEvent::PeerTransport { .. } => "peer_transport",
@@ -9490,6 +9494,43 @@ mod tests {
             rx.try_recv().unwrap(),
             NetworkCommand::TrustPeerIdentity { user_id: UserId(2) }
         ));
+    }
+
+    #[test]
+    fn restored_e2e_peer_identity_clears_changed_state() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[dm_room_info(0x8000_0001, UserId(1), UserId(2))],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(0x8000_0001),
+            None,
+            app.user_id,
+        );
+
+        app.handle_network_event(NetworkEvent::E2ePeerIdentityChanged {
+            user_id: UserId(2),
+            pinned: crate::config::E2ePeerIdentity {
+                room_id: 0x8000_0001,
+                user_id: 2,
+                username: "bob".to_string(),
+                public_key: "11".repeat(32),
+            },
+            presented: crate::config::E2ePeerIdentity {
+                room_id: 0x8000_0001,
+                user_id: 2,
+                username: "robert".to_string(),
+                public_key: "11".repeat(32),
+            },
+        });
+        assert!(app.room.e2e_identity_changed(UserId(2)));
+
+        app.handle_network_event(NetworkEvent::E2ePeerIdentityVerified { user_id: UserId(2) });
+
+        assert!(!app.room.e2e_identity_changed(UserId(2)));
     }
 
     #[test]

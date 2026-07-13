@@ -22,7 +22,7 @@ use crate::crypto::{
     CryptoError, KEY_LEN, KeyMaterial, TAG_LEN, expand_key, open_in_place_with_aad,
     seal_in_place_append_tag,
 };
-use crate::ids::{RoomId, UserId};
+use crate::ids::{MessageId, RoomId, UserId};
 
 pub const E2E_PUBLIC_KEY_LEN: usize = 32;
 pub const E2E_SEED_LEN: usize = 32;
@@ -135,7 +135,8 @@ pub struct DmPlaintext {
 #[jsony(Binary, version)]
 pub enum DmContent {
     Text { body: String },
-    Edit { body: String },
+    Edit { target: MessageId, body: String },
+    Delete { target: MessageId },
     FileAnnounce { file: DmFileMeta },
 }
 
@@ -155,12 +156,14 @@ pub struct DmFileMeta {
     pub content_key: Vec<u8>,
 }
 
-/// The envelope class bound into the AAD, so the server cannot re-deliver an
-/// edit as a fresh message or a file announcement as text.
+/// The envelope class bound into the AAD, so the server cannot re-deliver a
+/// mutation as a fresh message, change an edit into a delete, or present a file
+/// announcement as text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmContentKind {
     Text,
     Edit,
+    Delete,
     FileAnnounce,
 }
 
@@ -169,7 +172,8 @@ impl DmContentKind {
         match self {
             DmContentKind::Text => 0,
             DmContentKind::Edit => 1,
-            DmContentKind::FileAnnounce => 2,
+            DmContentKind::Delete => 2,
+            DmContentKind::FileAnnounce => 3,
         }
     }
 }
@@ -179,6 +183,7 @@ impl DmContent {
         match self {
             DmContent::Text { .. } => DmContentKind::Text,
             DmContent::Edit { .. } => DmContentKind::Edit,
+            DmContent::Delete { .. } => DmContentKind::Delete,
             DmContent::FileAnnounce { .. } => DmContentKind::FileAnnounce,
         }
     }
@@ -461,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn dm_envelope_round_trips_text_edit_and_file_announce() {
+    fn dm_envelope_round_trips_text_mutations_and_file_announce() {
         let (alice, bob) = test_pair();
         let rng = SystemRandom::new();
         let contents = [
@@ -469,7 +474,11 @@ mod tests {
                 body: "hello there".to_string(),
             },
             DmContent::Edit {
+                target: MessageId(41),
                 body: "hello, there".to_string(),
+            },
+            DmContent::Delete {
+                target: MessageId(42),
             },
             DmContent::FileAnnounce {
                 file: DmFileMeta {

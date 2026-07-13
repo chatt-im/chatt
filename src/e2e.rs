@@ -13,7 +13,7 @@ use rpc::e2e::{
     DmContent, DmContentKind, DmPairKeys, DmPlaintext, E2E_PUBLIC_KEY_LEN, E2E_SEED_LEN,
     dm_pair_keys, e2e_public_key, open_dm_envelope, seal_dm_envelope,
 };
-use rpc::ids::{RoomId, UserId};
+use rpc::ids::{MessageId, RoomId, UserId};
 
 use crate::config::{E2ePeerIdentity, E2ePeerPin};
 
@@ -317,7 +317,7 @@ impl E2eState {
             if let Some(presented) = room.presented.as_mut() {
                 presented.identity.username = username.to_string();
             }
-            return if room.trust_pending {
+            return if room.trust_pending || !room.verified_this_session {
                 PeerIdentityOutcome::Rejected
             } else {
                 PeerIdentityOutcome::Unchanged
@@ -412,16 +412,25 @@ impl E2eState {
         &self,
         room_id: RoomId,
         kind: DmContentKind,
+        target: Option<MessageId>,
         body: &str,
         sent_at_ms: u64,
     ) -> Result<Vec<u8>, SealBlocked> {
         let content = match kind {
             DmContentKind::Edit => DmContent::Edit {
+                target: target.ok_or(SealBlocked::Crypto)?,
                 body: body.to_string(),
             },
-            _ => DmContent::Text {
+            DmContentKind::Delete if body.is_empty() => DmContent::Delete {
+                target: target.ok_or(SealBlocked::Crypto)?,
+            },
+            DmContentKind::Delete => return Err(SealBlocked::Crypto),
+            DmContentKind::Text if target.is_none() => DmContent::Text {
                 body: body.to_string(),
             },
+            DmContentKind::Text | DmContentKind::FileAnnounce => {
+                return Err(SealBlocked::Crypto);
+            }
         };
         self.seal_content(room_id, content, sent_at_ms)
     }
@@ -567,29 +576,6 @@ impl E2eState {
     ) -> Result<(), OpenFailure> {
         let is_dm = self.requires_e2e(message.room_id);
         let Some(envelope) = message.envelope.take() else {
-            if is_dm
-                && message.target.is_some()
-                && message.flags.deleted()
-                && message.body.is_empty()
-                && let Some(room) = self.rooms.get(&message.room_id)
-            {
-                let sender_name = if Some(message.sender) == self.my_id {
-                    Some(own_username)
-                } else {
-                    room.trusted
-                        .iter()
-                        .find(|identity| identity.identity.user_id == message.sender.0)
-                        .map(|identity| identity.identity.username.as_str())
-                        .or_else(|| (message.sender == room.peer).then_some(room.username.as_str()))
-                };
-                let Some(sender_name) = sender_name else {
-                    return Err(OpenFailure::Policy);
-                };
-                // Deletes intentionally expose their target and carry no DM
-                // content, as documented by the protocol's metadata limits.
-                message.sender_name = sender_name.to_string();
-                return Ok(());
-            }
             return if is_dm {
                 Err(OpenFailure::Policy)
             } else {
@@ -600,7 +586,9 @@ impl E2eState {
             message.envelope = Some(envelope);
             return Err(OpenFailure::Policy);
         }
-        let kind = if message.target.is_some() {
+        let kind = if message.target.is_some() && message.flags.deleted() {
+            DmContentKind::Delete
+        } else if message.target.is_some() && message.flags.edited() {
             DmContentKind::Edit
         } else if message.file_transfer_id.is_some() {
             DmContentKind::FileAnnounce
@@ -630,15 +618,22 @@ impl E2eState {
                 sender_ms = plaintext.sent_at_ms
             );
         }
-        message.sender_name = opened.sender_name;
-        message.body = match plaintext.content {
-            DmContent::Text { body } | DmContent::Edit { body } => body,
+        let body = match plaintext.content {
+            DmContent::Text { body } => body,
+            DmContent::Edit { target, body } if message.target == Some(target) => body,
+            DmContent::Delete { target } if message.target == Some(target) => String::new(),
             DmContent::FileAnnounce { file } => format!(
                 "sent file `{}` ({})",
                 file.original_name,
                 crate::client_net::format_bytes(file.size)
             ),
+            DmContent::Edit { .. } | DmContent::Delete { .. } => {
+                message.envelope = Some(envelope);
+                return Err(OpenFailure::Crypto);
+            }
         };
+        message.sender_name = opened.sender_name;
+        message.body = body;
         Ok(())
     }
 
@@ -820,13 +815,13 @@ mod tests {
             panic!();
         };
         assert_eq!(
-            alice.seal_chat(RoomId(9), DmContentKind::Text, "hi", 1),
+            alice.seal_chat(RoomId(9), DmContentKind::Text, None, "hi", 1),
             Err(SealBlocked::PeerKeyMissing)
         );
         assert!(alice.confirm_pin(&pin, true));
         assert!(
             alice
-                .seal_chat(RoomId(9), DmContentKind::Text, "hi", 1)
+                .seal_chat(RoomId(9), DmContentKind::Text, None, "hi", 1)
                 .is_ok()
         );
     }
@@ -835,7 +830,7 @@ mod tests {
     fn key_change_quarantines_all_plaintext_then_retains_old_history() {
         let (mut alice, bob) = linked_pair();
         let old = bob
-            .seal_chat(RoomId(9), DmContentKind::Text, "old", 1_000)
+            .seal_chat(RoomId(9), DmContentKind::Text, None, "old", 1_000)
             .unwrap();
         let replacement = e2e_public_key(&[3; E2E_SEED_LEN]);
         assert!(matches!(
@@ -849,7 +844,7 @@ mod tests {
         );
         assert!(old_message.envelope.is_some());
         assert_eq!(
-            alice.seal_chat(RoomId(9), DmContentKind::Text, "hi", 1),
+            alice.seal_chat(RoomId(9), DmContentKind::Text, None, "hi", 1),
             Err(SealBlocked::PeerIdentityChanged)
         );
 
@@ -863,7 +858,7 @@ mod tests {
             &alice.public_key().unwrap(),
         );
         let replacement_message = replacement_bob
-            .seal_chat(RoomId(9), DmContentKind::Text, "untrusted", 1_000)
+            .seal_chat(RoomId(9), DmContentKind::Text, None, "untrusted", 1_000)
             .unwrap();
         let mut message = text_message(RoomId(9), UserId(2), Some(replacement_message));
         assert_eq!(
@@ -895,7 +890,7 @@ mod tests {
         assert!(reconnect.requires_e2e(RoomId(9)));
         assert!(reconnect.note_room(&public(RoomId(9)), "").is_err());
         assert_eq!(
-            reconnect.seal_chat(RoomId(9), DmContentKind::Text, "secret", 1),
+            reconnect.seal_chat(RoomId(9), DmContentKind::Text, None, "secret", 1),
             Err(SealBlocked::PeerKeyMissing)
         );
         let mut plaintext = text_message(RoomId(9), UserId(2), None);
@@ -912,7 +907,7 @@ mod tests {
     fn username_change_quarantines_until_complete_tuple_is_persisted() {
         let (mut alice, bob) = linked_pair();
         let envelope = bob
-            .seal_chat(RoomId(9), DmContentKind::Text, "before rename", 1_000)
+            .seal_chat(RoomId(9), DmContentKind::Text, None, "before rename", 1_000)
             .unwrap();
         let PeerIdentityOutcome::Changed { pinned, presented } =
             alice.handle_peer_username(UserId(2), "robert")
@@ -923,7 +918,7 @@ mod tests {
         assert_eq!(presented.username, "robert");
         assert_eq!(pinned.public_key, presented.public_key);
         assert_eq!(
-            alice.seal_chat(RoomId(9), DmContentKind::Text, "blocked", 1),
+            alice.seal_chat(RoomId(9), DmContentKind::Text, None, "blocked", 1),
             Err(SealBlocked::PeerIdentityChanged)
         );
         let mut message = text_message(RoomId(9), UserId(2), Some(envelope));
@@ -941,7 +936,7 @@ mod tests {
         assert_eq!(message.sender_name, "robert");
         assert!(
             alice
-                .seal_chat(RoomId(9), DmContentKind::Text, "resumed", 1)
+                .seal_chat(RoomId(9), DmContentKind::Text, None, "resumed", 1)
                 .is_ok()
         );
     }
@@ -964,7 +959,7 @@ mod tests {
         ));
         assert!(!alice.confirm_pin(&stale, true));
         assert_eq!(
-            alice.seal_chat(RoomId(9), DmContentKind::Text, "blocked", 1),
+            alice.seal_chat(RoomId(9), DmContentKind::Text, None, "blocked", 1),
             Err(SealBlocked::PeerKeyMissing)
         );
         let current = alice.proposed_trust(UserId(2)).unwrap();
@@ -981,7 +976,7 @@ mod tests {
         );
         assert!(
             alice
-                .seal_chat(RoomId(9), DmContentKind::Text, "still trusted", 1)
+                .seal_chat(RoomId(9), DmContentKind::Text, None, "still trusted", 1,)
                 .is_ok()
         );
     }
@@ -1000,7 +995,7 @@ mod tests {
         assert!(alice.proposed_trust(UserId(2)).is_none());
         assert!(
             alice
-                .seal_chat(RoomId(9), DmContentKind::Text, "still trusted", 1)
+                .seal_chat(RoomId(9), DmContentKind::Text, None, "still trusted", 1,)
                 .is_ok()
         );
     }
@@ -1030,7 +1025,7 @@ mod tests {
             .unwrap();
         accept_first(&mut bob, UserId(1), &alice.public_key().unwrap());
         let envelope = bob
-            .seal_chat(RoomId(9), DmContentKind::Text, "must wait", 1_000)
+            .seal_chat(RoomId(9), DmContentKind::Text, None, "must wait", 1_000)
             .unwrap();
         let mut message = text_message(RoomId(9), UserId(2), Some(envelope));
         // Even before the served-key response arrives, the authenticated room
@@ -1068,6 +1063,77 @@ mod tests {
         assert_eq!(
             alice.open_message(&mut wrong_sender, "alice"),
             Err(OpenFailure::Policy)
+        );
+    }
+
+    #[test]
+    fn dm_mutations_authenticate_kind_and_target() {
+        let (alice, bob) = linked_pair();
+        let target = MessageId(17);
+
+        let edit_envelope = bob
+            .seal_chat(
+                RoomId(9),
+                DmContentKind::Edit,
+                Some(target),
+                "revised",
+                1_000,
+            )
+            .unwrap();
+        let mut edit = text_message(RoomId(9), UserId(2), Some(edit_envelope.clone()));
+        edit.target = Some(target);
+        edit.flags.set_edited();
+        alice.open_message(&mut edit, "alice").unwrap();
+        assert_eq!(edit.body, "revised");
+
+        let mut retargeted = text_message(RoomId(9), UserId(2), Some(edit_envelope));
+        retargeted.target = Some(MessageId(18));
+        retargeted.flags.set_edited();
+        assert_eq!(
+            alice.open_message(&mut retargeted, "alice"),
+            Err(OpenFailure::Crypto)
+        );
+        assert!(retargeted.envelope.is_some());
+
+        let delete_envelope = bob
+            .seal_chat(RoomId(9), DmContentKind::Delete, Some(target), "", 1_000)
+            .unwrap();
+        let mut delete = text_message(RoomId(9), UserId(2), Some(delete_envelope));
+        delete.target = Some(target);
+        delete.flags.set_deleted();
+        alice.open_message(&mut delete, "alice").unwrap();
+        assert!(delete.body.is_empty());
+
+        let mut plaintext_delete = text_message(RoomId(9), UserId(2), None);
+        plaintext_delete.target = Some(target);
+        plaintext_delete.flags.set_deleted();
+        assert_eq!(
+            alice.open_message(&mut plaintext_delete, "alice"),
+            Err(OpenFailure::Policy)
+        );
+    }
+
+    #[test]
+    fn matching_username_does_not_verify_peer_before_key() {
+        let (alice, _) = linked_pair();
+        let pins = alice.stored_pins.clone();
+        let mut reconnect = E2eState::new(
+            Some(&encode_hex(&[1; E2E_SEED_LEN])),
+            Some(UserId(1)),
+            &pins,
+        );
+        reconnect.set_local_user(UserId(1)).unwrap();
+        reconnect
+            .note_room(&dm(RoomId(9), UserId(1), UserId(2)), "bob")
+            .unwrap();
+
+        assert_eq!(
+            reconnect.handle_peer_username(UserId(2), "BOB"),
+            PeerIdentityOutcome::Rejected
+        );
+        assert_eq!(
+            reconnect.seal_chat(RoomId(9), DmContentKind::Text, None, "blocked", 1),
+            Err(SealBlocked::PeerKeyMissing)
         );
     }
 

@@ -646,7 +646,8 @@ Current status:
   one. Revocation is global, by disabling `public` or bumping `password-epoch`.
 - The server is trusted to route, and public/private rooms are not end-to-end
   encrypted.
-- Direct messages (text and files) are end-to-end encrypted: each client holds
+- Direct messages (text, edits, deletions, and files) are end-to-end encrypted:
+  each client holds
   a long-term X25519 identity (`e2e-identity-seed` in `client.toml`, generated
   on first connect), a per-DM key is derived by static-static Diffie-Hellman,
   and every message is sealed with a one-shot ChaCha20-Poly1305 key. The server
@@ -662,13 +663,16 @@ Current status:
   pin also keeps its room id encryption-required across reconnects, so a server
   cannot downgrade that room to public/private and trigger plaintext fallback.
   Authenticated DM sender labels come from the trusted identity tuple, not the
-  server's outer display-name field. Messages that race identity lookup are held
-  as ciphertext in a bounded queue. A DM plaintext, a DM file without a sealed
-  envelope, or a remapped/unsolicited DM response is rejected. There is no
+  server's outer display-name field. Visible edit/delete targets are also sealed
+  into the authenticated plaintext, so clients reject server retargeting.
+  Messages that race identity lookup are held as ciphertext in a bounded queue.
+  A DM plaintext, a DM file without a sealed envelope, or a
+  remapped/unsolicited DM response is rejected. There is no
   forward secrecy by design (static keys keep server-fetched history
   decryptable): a leaked seed exposes that user's past and future DM traffic.
-  The server still sees who messages whom, timing, edit/delete targets, and DM
-  voice/video, which remain transport-encrypted only.
+  The server still sees who messages whom, timing, edit/delete targets, can
+  replay an exact sender envelope within the same room/sender/content class,
+  and sees DM voice/video, which remain transport-encrypted only.
 - The current handshake uses X25519 and Ed25519. It is not yet
   quantum-resistant; the documented next step is a hybrid X25519 + ML-KEM
   handshake and post-quantum or hybrid server authentication.

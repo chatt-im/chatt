@@ -656,6 +656,11 @@ pub enum NetworkEvent {
         pinned: E2ePeerIdentity,
         presented: E2ePeerIdentity,
     },
+    /// The peer's currently served DM identity tuple matches the durable pin.
+    /// Clears any stale identity-change warning in the UI.
+    E2ePeerIdentityVerified {
+        user_id: UserId,
+    },
     VoiceStarted {
         room_id: RoomId,
         session_id: SessionId,
@@ -2950,12 +2955,16 @@ impl WorkerState {
         &mut self,
         room_id: RoomId,
         kind: DmContentKind,
+        target: Option<MessageId>,
         body: String,
     ) -> Result<(String, Option<Vec<u8>>), ()> {
         if !self.e2e.requires_e2e(room_id) {
             return Ok((body, None));
         }
-        match self.e2e.seal_chat(room_id, kind, &body, unix_now_ms()) {
+        match self
+            .e2e
+            .seal_chat(room_id, kind, target, &body, unix_now_ms())
+        {
             Ok(envelope) => Ok((String::new(), Some(envelope))),
             Err(blocked) => {
                 let reason = match blocked {
@@ -3343,10 +3352,11 @@ impl WorkerState {
                     room_id = room_id.0,
                     body_size = body.len()
                 );
-                let (body, envelope) = match self.seal_dm_body(room_id, DmContentKind::Text, body) {
-                    Ok(parts) => parts,
-                    Err(()) => return Ok(()),
-                };
+                let (body, envelope) =
+                    match self.seal_dm_body(room_id, DmContentKind::Text, None, body) {
+                        Ok(parts) => parts,
+                        Err(()) => return Ok(()),
+                    };
                 self.queue_control(ClientControl::SendChat {
                     room_id,
                     body,
@@ -3364,10 +3374,11 @@ impl WorkerState {
                     target = target.0,
                     body_size = body.len()
                 );
-                let (body, envelope) = match self.seal_dm_body(room_id, DmContentKind::Edit, body) {
-                    Ok(parts) => parts,
-                    Err(()) => return Ok(()),
-                };
+                let (body, envelope) =
+                    match self.seal_dm_body(room_id, DmContentKind::Edit, Some(target), body) {
+                        Ok(parts) => parts,
+                        Err(()) => return Ok(()),
+                    };
                 self.queue_control(ClientControl::EditChat {
                     room_id,
                     target,
@@ -3381,7 +3392,20 @@ impl WorkerState {
                     room_id = room_id.0,
                     target = target.0
                 );
-                self.queue_control(ClientControl::DeleteChat { room_id, target })?;
+                let (_, envelope) = match self.seal_dm_body(
+                    room_id,
+                    DmContentKind::Delete,
+                    Some(target),
+                    String::new(),
+                ) {
+                    Ok(parts) => parts,
+                    Err(()) => return Ok(()),
+                };
+                self.queue_control(ClientControl::DeleteChat {
+                    room_id,
+                    target,
+                    envelope,
+                })?;
             }
             NetworkCommand::UploadFile { room_id, request } => {
                 self.queue_file_upload(room_id, request);
@@ -5541,7 +5565,12 @@ impl WorkerState {
                     presented,
                 });
             }
-            PeerIdentityOutcome::Unchanged => self.drain_deferred_e2e()?,
+            PeerIdentityOutcome::Unchanged => {
+                let _ = self
+                    .events
+                    .send(NetworkEvent::E2ePeerIdentityVerified { user_id });
+                self.drain_deferred_e2e()?;
+            }
             PeerIdentityOutcome::Rejected => {}
         }
         Ok(())
