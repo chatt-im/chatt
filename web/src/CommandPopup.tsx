@@ -6,10 +6,12 @@
 import { For, createEffect } from "solid-js";
 import { segmentByIndices } from "./commands";
 import type { CandidateRow, CommandRow } from "./commands";
+import { applyEmojiTone, type EmojiRecord } from "./emoji/database";
 
 export type PopupRow =
   | { kind: "command"; row: CommandRow }
   | { kind: "candidate"; row: CandidateRow }
+  | { kind: "emoji"; record: EmojiRecord; tone: number }
   | { kind: "hint"; text: string };
 
 function Highlighted(props: { text: string; indices: number[] }) {
@@ -56,6 +58,14 @@ export default function CommandPopup(props: {
                 </span>
                 <span class="command-option-usage">{row.row.command.usage}</span>
                 <span class="command-option-desc">{row.row.command.description}</span>
+              </>
+            ) : row.kind === "emoji" ? (
+              <>
+                <span class="command-option-emoji" aria-hidden="true">
+                  {applyEmojiTone(row.record, row.tone)}
+                </span>
+                <span class="command-option-name">{row.record.label}</span>
+                <code class="command-option-desc">:{row.record.shortcode}:</code>
               </>
             ) : (
               <>

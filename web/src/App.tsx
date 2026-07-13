@@ -1,6 +1,7 @@
 import {
   batch,
   createMemo,
+  createResource,
   createSignal,
   createEffect,
   onCleanup,
@@ -8,6 +9,7 @@ import {
   untrack,
   For,
   Show,
+  Suspense,
 } from "solid-js";
 import {
   Virtualizer,
@@ -31,8 +33,19 @@ import {
   completionContext,
   filterCandidates,
   filterCommands,
+  MAX_POPUP_ROWS,
 } from "./commands";
 import CommandPopup, { type PopupRow } from "./CommandPopup";
+import EmojiPicker from "./emoji/LazyEmojiPicker";
+import {
+  applyEmojiTone,
+  loadEmojiDatabase,
+  searchEmoji,
+  type EmojiRecord,
+} from "./emoji/database";
+import { findCompletedShortcode } from "./emoji/input";
+import { isLargeEmojiMessage } from "./emoji/message";
+import { loadRecent, updateRecent } from "./emoji/recent";
 import ScreenShare from "./ScreenShare";
 import { ScreenShareDecoder, parseFrame } from "./video-decode";
 import { renderInline } from "./highlight";
@@ -698,6 +711,7 @@ function estimateMessageRowSize(
 
   let height = group.continuation ? 2 : 31;
   height += estimateFragmentsHeight(message.fragments, layout);
+  if (isLargeEmojiMessage(message.body)) height += ESTIMATE_TEXT_LINE_HEIGHT;
 
   if (message.attachment) {
     height += estimateAttachmentHeight(message.attachment, layout);
@@ -1157,6 +1171,7 @@ function MessageRow(props: {
         "is-group-collapsed": props.group.collapsed,
         "is-system": !!props.message.system,
         "is-system-error": props.message.system === "error",
+        "is-large-emoji": isLargeEmojiMessage(props.message.body),
       }}
       data-ts={props.message.timestamp_ms}
       data-mid={props.message.message_id}
@@ -1537,7 +1552,7 @@ export default function App() {
   const [candidateCache, setCandidateCache] = createSignal<
     Partial<Record<CandidateKind, CandidateItem[]>>
   >({});
-  const [composerCursor, setComposerCursor] = createSignal(0);
+  const [composerCursor, setComposerCursor] = createSignal(draft().length);
   const [completionSelected, setCompletionSelected] = createSignal(0);
   // The draft the popup was dismissed for; any edit reopens it.
   const [completionDismissed, setCompletionDismissed] = createSignal<string | null>(null);
@@ -1545,11 +1560,57 @@ export default function App() {
   // with feed ids.
   let systemRowId = -1;
 
-  const completionCtx = createMemo(() =>
-    editing() || !connected()
-      ? null
-      : completionContext(draft(), composerCursor(), commandList())
+  // Emoji completion + picker. The binary database is fetched once, lazily, the
+  // first time the composer needs it (focus, a `:` trigger, or opening the
+  // picker); `tone` and recents persist in localStorage across sessions.
+  const [emojiLoadRequested, setEmojiLoadRequested] = createSignal(false);
+  const [emojiDb] = createResource(emojiLoadRequested, (requested) =>
+    requested ? loadEmojiDatabase() : undefined
   );
+  const [emojiTone, setEmojiTone] = createSignal(loadEmojiTone());
+  const [emojiRecent, setEmojiRecent] = createSignal<EmojiRecord[]>([]);
+  const [pickerOpen, setPickerOpen] = createSignal(false);
+  // The selection the picker replaces, captured before its toggle steals focus.
+  let emojiInsertRange = { start: draft().length, end: draft().length };
+  let emojiPickerEl: HTMLDivElement | undefined;
+  let emojiButtonEl: HTMLButtonElement | undefined;
+
+  createEffect(() => {
+    const db = emojiDb();
+    if (db) setEmojiRecent(loadRecent(db));
+  });
+
+  createEffect(() => {
+    if (!pickerOpen()) return;
+    const dismiss = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (!emojiPickerEl?.contains(target) && !emojiButtonEl?.contains(target)) {
+        setPickerOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setPickerOpen(false);
+      queueMicrotask(() => composerTextEl?.focus({ preventScroll: true }));
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", closeOnEscape);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", closeOnEscape);
+    });
+  });
+
+  const completionCtx = createMemo(() => {
+    const ctx = completionContext(draft(), composerCursor(), commandList());
+    if (!ctx) return null;
+    // Emoji is plain local text, so it stays available while editing or offline;
+    // slash commands need a live, non-editing session to dispatch.
+    if (ctx.mode === "emoji") return ctx;
+    return editing() || !connected() ? null : ctx;
+  });
   const completionRows = createMemo<PopupRow[]>(() => {
     const ctx = completionCtx();
     if (!ctx) return [];
@@ -1557,6 +1618,19 @@ export default function App() {
       return filterCommands(commandList(), ctx.query).map(
         (row) => ({ kind: "command", row }) as PopupRow
       );
+    }
+    if (ctx.mode === "emoji") {
+      const db = emojiDb();
+      if (!db) return [];
+      const tone = emojiTone();
+      // An empty query offers recents, falling back to the Smileys group.
+      const records = ctx.query
+        ? searchEmoji(db, ctx.query, MAX_POPUP_ROWS)
+        : (emojiRecent().length ? emojiRecent() : db.byGroup.get(0) ?? []).slice(
+            0,
+            MAX_POPUP_ROWS
+          );
+      return records.map((record) => ({ kind: "emoji", record, tone }) as PopupRow);
     }
     if (ctx.kind === "free") {
       if (ctx.query.length > 0) return [];
@@ -1566,6 +1640,12 @@ export default function App() {
     return filterCandidates(items, ctx.query).map(
       (row) => ({ kind: "candidate", row }) as PopupRow
     );
+  });
+
+  // Preload the database as soon as a `:` trigger appears so the first
+  // suggestion list is not blank.
+  createEffect(() => {
+    if (completionCtx()?.mode === "emoji") setEmojiLoadRequested(true);
   });
   const completionOpen = () =>
     completionRows().length > 0 && completionDismissed() !== draft() && !submitting();
@@ -1590,6 +1670,14 @@ export default function App() {
     setComposerCursor(event.currentTarget.selectionStart ?? 0);
   }
 
+  function rememberEmojiInsertRange() {
+    const length = draft().length;
+    emojiInsertRange = {
+      start: composerTextEl?.selectionStart ?? length,
+      end: composerTextEl?.selectionEnd ?? length,
+    };
+  }
+
   // Applies the selected popup row to the draft. Returns false when there is
   // nothing to change (hint row, or the token already matches exactly), which
   // lets Enter fall through to submit.
@@ -1597,19 +1685,93 @@ export default function App() {
     const ctx = completionCtx();
     const row = completionRows()[index];
     if (!ctx || !row || row.kind === "hint") return false;
-    const target = row.kind === "command" ? row.row.command.name : row.row.item.value;
-    const current = draft().slice(ctx.span.start, ctx.span.end);
-    if (current === target) return false;
-    const insert =
-      row.kind === "command" && row.row.command.arg !== "none" ? `${target} ` : target;
+    let insert: string;
+    if (row.kind === "emoji") {
+      insert = applyEmojiTone(row.record, row.tone);
+      setEmojiRecent((current) => updateRecent(current, row.record));
+    } else {
+      const target = row.kind === "command" ? row.row.command.name : row.row.item.value;
+      const current = draft().slice(ctx.span.start, ctx.span.end);
+      if (current === target) return false;
+      insert =
+        row.kind === "command" && row.row.command.arg !== "none" ? `${target} ` : target;
+    }
     const { next, cursor } = acceptReplacement(draft(), ctx, insert);
-    setDraft(next);
-    setComposerCursor(cursor);
+    batch(() => {
+      setDraft(next);
+      setComposerCursor(cursor);
+    });
     queueMicrotask(() => {
       composerTextEl?.setSelectionRange(cursor, cursor);
       resizeComposer();
     });
     return true;
+  }
+
+  function loadEmojiTone(): number {
+    try {
+      const tone = Number(localStorage.getItem("tiny-emoji.tone") ?? 0);
+      return Number.isInteger(tone) && tone >= 1 && tone <= 5 ? tone : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function setPreferredTone(tone: number) {
+    const normalized = Number.isInteger(tone) && tone >= 1 && tone <= 5 ? tone : 0;
+    setEmojiTone(normalized);
+    try {
+      localStorage.setItem("tiny-emoji.tone", String(normalized));
+    } catch {
+      // Storage can be disabled; the in-memory tone remains authoritative.
+    }
+  }
+
+  // Auto-expands a fully typed `:shortcode:` to its glyph the moment the closing
+  // colon lands, so a memorized code needs no popup interaction.
+  function maybeExpandShortcode(value: string, caret: number) {
+    if (value.charCodeAt(caret - 1) !== 0x3a) return;
+    const db = emojiDb();
+    if (!db) {
+      setEmojiLoadRequested(true);
+      return;
+    }
+    const done = findCompletedShortcode(value, caret);
+    const record = done ? db.byShortcode.get(done.shortcode) : undefined;
+    if (!done || !record) return;
+    const glyph = applyEmojiTone(record, emojiTone());
+    const next = value.slice(0, done.start) + glyph + value.slice(done.end);
+    const cursor = done.start + glyph.length;
+    batch(() => {
+      setDraft(next);
+      setComposerCursor(cursor);
+      setEmojiRecent((current) => updateRecent(current, record));
+    });
+    queueMicrotask(() => {
+      composerTextEl?.setSelectionRange(cursor, cursor);
+      resizeComposer();
+    });
+  }
+
+  // Inserts a picker selection at the caret remembered before the button took
+  // focus, then restores focus to the composer.
+  function insertPickedEmoji(record: EmojiRecord) {
+    const glyph = applyEmojiTone(record, emojiTone());
+    const value = draft();
+    const start = Math.min(emojiInsertRange.start, value.length);
+    const end = Math.max(start, Math.min(emojiInsertRange.end, value.length));
+    const cursor = start + glyph.length;
+    batch(() => {
+      setDraft(value.slice(0, start) + glyph + value.slice(end));
+      setComposerCursor(cursor);
+      setEmojiRecent((current) => updateRecent(current, record));
+      setPickerOpen(false);
+    });
+    queueMicrotask(() => {
+      composerTextEl?.focus({ preventScroll: true });
+      composerTextEl?.setSelectionRange(cursor, cursor);
+      resizeComposer();
+    });
   }
 
   // A per-connection counter naming each upload so its chunk frames route to the
@@ -2687,6 +2849,7 @@ export default function App() {
 
   async function submitCompose() {
     if (!connected() || submitting()) return;
+    setPickerOpen(false);
     setComposeError(null);
     const edit = editing();
     if (edit) {
@@ -2789,6 +2952,12 @@ export default function App() {
         event.preventDefault();
         return;
       }
+    }
+    if (event.key === "Escape" && pickerOpen()) {
+      event.preventDefault();
+      setPickerOpen(false);
+      composerTextEl?.focus({ preventScroll: true });
+      return;
     }
     if (event.key === "Escape" && editing()) {
       event.preventDefault();
@@ -3792,6 +3961,26 @@ export default function App() {
                   onAccept={acceptCompletion}
                 />
               </Show>
+              <Show when={pickerOpen()}>
+                <div ref={emojiPickerEl} class="emoji-picker-anchor">
+                  <Suspense fallback={<div class="emoji-loading">Loading emoji…</div>}>
+                    <Show
+                      when={emojiDb()}
+                      fallback={<div class="emoji-loading">Loading emoji…</div>}
+                    >
+                      {(db) => (
+                        <EmojiPicker
+                          database={db()}
+                          recent={emojiRecent()}
+                          tone={emojiTone()}
+                          onToneChange={setPreferredTone}
+                          onSelect={insertPickedEmoji}
+                        />
+                      )}
+                    </Show>
+                  </Suspense>
+                </div>
+              </Show>
               <div class="composer-input-row">
                 <Show when={!editing()}>
                   <button
@@ -3814,13 +4003,22 @@ export default function App() {
                   placeholder={editing() ? "Edit message…" : "Write a message…"}
                   value={draft()}
                   onInput={(event) => {
-                    setDraft(event.currentTarget.value);
-                    syncComposerCursor(event);
+                    const value = event.currentTarget.value;
+                    const caret = event.currentTarget.selectionStart ?? value.length;
+                    setDraft(value);
+                    setComposerCursor(caret);
                     resizeComposer();
+                    maybeExpandShortcode(value, caret);
+                  }}
+                  onFocus={(event) => {
+                    setEmojiLoadRequested(true);
+                    syncComposerCursor(event);
                   }}
                   onKeyDown={onComposeKeyDown}
                   onKeyUp={syncComposerCursor}
                   onClick={syncComposerCursor}
+                  onSelect={syncComposerCursor}
+                  onCompositionEnd={syncComposerCursor}
                   onPaste={onComposePaste}
                 />
                 <input
@@ -3831,6 +4029,25 @@ export default function App() {
                   tabIndex={-1}
                   onChange={onComposeFileInput}
                 />
+                <button
+                  ref={emojiButtonEl}
+                  class="composer-attach composer-emoji"
+                  type="button"
+                  aria-label="Choose emoji"
+                  aria-haspopup="dialog"
+                  aria-expanded={pickerOpen()}
+                  title="Emoji"
+                  disabled={submitting()}
+                  onPointerEnter={() => setEmojiLoadRequested(true)}
+                  onPointerDown={rememberEmojiInsertRange}
+                  onClick={() => {
+                    setEmojiLoadRequested(true);
+                    setCompletionDismissed(draft());
+                    setPickerOpen((open) => !open);
+                  }}
+                >
+                  <Icon name="smile" />
+                </button>
               </div>
             </section>
           </Show>
