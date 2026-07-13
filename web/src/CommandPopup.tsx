@@ -3,16 +3,16 @@
 // and reports hover/click. Matched characters render as separate text-node
 // spans (never innerHTML: user and room names are peer-authored).
 
-import { For, createEffect } from "solid-js";
+import { For, Show, createEffect } from "solid-js";
 import { segmentByIndices } from "./commands";
 import type { CandidateRow, CommandRow } from "./commands";
 import { applyEmojiTone, type EmojiRecord } from "./emoji/database";
+import { optionDomId } from "./composer/assist";
 
-export type PopupRow =
-  | { kind: "command"; row: CommandRow }
-  | { kind: "candidate"; row: CandidateRow }
-  | { kind: "emoji"; record: EmojiRecord; tone: number }
-  | { kind: "hint"; text: string };
+export type PopupOption =
+  | { id: string; kind: "command"; row: CommandRow }
+  | { id: string; kind: "candidate"; row: CandidateRow }
+  | { id: string; kind: "emoji"; record: EmojiRecord; tone: number };
 
 function Highlighted(props: { text: string; indices: number[] }) {
   return (
@@ -25,31 +25,34 @@ function Highlighted(props: { text: string; indices: number[] }) {
 }
 
 export default function CommandPopup(props: {
-  rows: PopupRow[];
-  selected: number;
-  onHover: (index: number) => void;
-  onAccept: (index: number) => void;
+  options: PopupOption[];
+  activeOptionId: string | null;
+  hint: string | null;
+  onHover: (id: string) => void;
+  onAccept: (id: string) => void;
 }) {
   let listEl: HTMLDivElement | undefined;
 
   createEffect(() => {
-    const selected = listEl?.children[props.selected];
+    const selected = props.activeOptionId
+      ? Array.from(listEl?.children ?? []).find(
+          (child) => child instanceof HTMLElement
+            && child.dataset.optionId === props.activeOptionId,
+        )
+      : undefined;
     selected?.scrollIntoView({ block: "nearest" });
   });
 
   return (
     <div
       class="command-popup"
-      role="listbox"
+      role={props.options.length ? "listbox" : undefined}
       id="command-popup"
       ref={listEl}
       onMouseDown={(event) => event.preventDefault()}
     >
-      <For each={props.rows}>
-        {(row, index) => {
-          if (row.kind === "hint") {
-            return <div class="command-option-hint">{row.text}</div>;
-          }
+      <For each={props.options}>
+        {(row) => {
           const content =
             row.kind === "command" ? (
               <>
@@ -79,18 +82,23 @@ export default function CommandPopup(props: {
             );
           return (
             <div
+              id={optionDomId(row.id)}
+              data-option-id={row.id}
               class="command-option"
               role="option"
-              aria-selected={index() === props.selected}
-              classList={{ "is-selected": index() === props.selected }}
-              onMouseMove={() => props.onHover(index())}
-              onClick={() => props.onAccept(index())}
+              aria-selected={row.id === props.activeOptionId}
+              classList={{ "is-selected": row.id === props.activeOptionId }}
+              onMouseMove={() => props.onHover(row.id)}
+              onClick={() => props.onAccept(row.id)}
             >
               {content}
             </div>
           );
         }}
       </For>
+      <Show when={props.hint}>
+        {(hint) => <div class="command-option-hint" role="note">{hint()}</div>}
+      </Show>
     </div>
   );
 }

@@ -5,6 +5,7 @@
 
 import type { CandidateItem, CandidateKind, WebCommandInfo } from "./types";
 import { findColonTrigger } from "./emoji/input";
+import type { TextSelection } from "./composer/editor";
 
 export interface FuzzyMatch {
   score: number;
@@ -90,9 +91,13 @@ export type CompletionContext =
 // chat), mirroring the TUI composer.
 export function completionContext(
   draft: string,
-  cursor: number,
+  selection: TextSelection,
   commands: WebCommandInfo[],
 ): CompletionContext | null {
+  const { start: cursor, end } = selection;
+  if (!Number.isInteger(cursor) || !Number.isInteger(end)
+    || cursor < 0 || end < 0 || cursor > draft.length || end > draft.length
+    || cursor !== end) return null;
   if (draft.startsWith("/")) {
     const firstBreak = draft.search(/\s/);
     const tokenEnd = firstBreak === -1 ? draft.length : firstBreak;
@@ -118,7 +123,7 @@ export function completionContext(
       span: { start: argStart, end: draft.length },
     };
   }
-  const trigger = findColonTrigger(draft, cursor, cursor);
+  const trigger = findColonTrigger(draft, cursor, end);
   if (trigger) {
     return {
       mode: "emoji",

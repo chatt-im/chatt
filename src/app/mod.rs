@@ -926,9 +926,10 @@ fn command_output_envelope(lines: &[WebCommandLine]) -> String {
 
 /// The `command_candidates` envelope answering an autocomplete candidates
 /// request.
-fn command_candidates_envelope(kind: &str, items: &[CandidateItem]) -> String {
+fn command_candidates_envelope(request_id: u64, kind: &str, items: &[CandidateItem]) -> String {
     jsony::object! {
         type: "command_candidates",
+        request_id: request_id,
         kind: kind,
         items: [
             for item in items;
@@ -2452,9 +2453,11 @@ impl App {
                 request_id,
                 body,
             } => self.run_web_command(client, request_id, body),
-            crate::web_server::WebRequest::CommandCandidates { client, kind } => {
-                self.send_command_candidates(client, kind)
-            }
+            crate::web_server::WebRequest::CommandCandidates {
+                client,
+                request_id,
+                kind,
+            } => self.send_command_candidates(client, request_id, kind),
         }
     }
 
@@ -2495,7 +2498,12 @@ impl App {
     }
 
     /// Answers the web autocomplete's request for argument candidates.
-    fn send_command_candidates(&mut self, client: u64, kind: crate::web_server::CandidateKind) {
+    fn send_command_candidates(
+        &mut self,
+        client: u64,
+        request_id: u64,
+        kind: crate::web_server::CandidateKind,
+    ) {
         let items: Vec<CandidateItem> = match kind {
             crate::web_server::CandidateKind::User => self
                 .room
@@ -2528,7 +2536,10 @@ impl App {
                 .collect(),
         };
         if let Some(feed) = &self.web_feed {
-            feed.send_command_reply(client, command_candidates_envelope(kind.wire_name(), &items));
+            feed.send_command_reply(
+                client,
+                command_candidates_envelope(request_id, kind.wire_name(), &items),
+            );
         }
     }
 

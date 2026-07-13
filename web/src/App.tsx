@@ -10,6 +10,7 @@ import {
   For,
   Show,
   Suspense,
+  ErrorBoundary,
 } from "solid-js";
 import {
   Virtualizer,
@@ -35,7 +36,24 @@ import {
   filterCommands,
   MAX_POPUP_ROWS,
 } from "./commands";
-import CommandPopup, { type PopupRow } from "./CommandPopup";
+import CommandPopup, { type PopupOption } from "./CommandPopup";
+import {
+  CLOSED_ASSIST,
+  completionEnterOption,
+  completionContextKey,
+  completionTabOption,
+  createEditorState,
+  engageOption,
+  moveCompletion,
+  openCompletion,
+  openEmojiPicker,
+  optionDomId,
+  pickerRange,
+  reconcileCompletion,
+  updateEditor,
+  type TextSelection,
+} from "./composer/assist";
+import { CandidateRequestTracker } from "./composer/candidates";
 import EmojiPicker from "./emoji/LazyEmojiPicker";
 import {
   applyEmojiTone,
@@ -1530,7 +1548,24 @@ export default function App() {
   // The compose box is hidden until the client reports a writable feed in its
   // `config` envelope, so a read-only view never shows controls it cannot use.
   const [readonly, setReadonly] = createSignal(true);
-  const [draft, setDraft] = createSignal(loadSessionDraft());
+  const [editor, setEditor] = createSignal(createEditorState(loadSessionDraft()));
+  const draft = () => editor().value;
+  const [assist, setAssist] = createSignal(CLOSED_ASSIST);
+
+  function commitEditor(value: string, selection: TextSelection, preserveAssist = false) {
+    let textChanged = false;
+    setEditor((current) => {
+      textChanged = value !== current.value;
+      return updateEditor(current, value, selection);
+    });
+    if (textChanged && !preserveAssist && assist().kind === "emoji-picker") {
+      setAssist(CLOSED_ASSIST);
+    }
+  }
+
+  function replaceDraft(value: string, cursor = value.length) {
+    commitEditor(value, { start: cursor, end: cursor });
+  }
   // Files dragged onto the composer, held until the message is submitted.
   const [queued, setQueued] = createSignal<File[]>([]);
   const [editing, setEditing] = createSignal<PendingWebEdit | null>(null);
@@ -1552,10 +1587,8 @@ export default function App() {
   const [candidateCache, setCandidateCache] = createSignal<
     Partial<Record<CandidateKind, CandidateItem[]>>
   >({});
-  const [composerCursor, setComposerCursor] = createSignal(draft().length);
-  const [completionSelected, setCompletionSelected] = createSignal(0);
-  // The draft the popup was dismissed for; any edit reopens it.
-  const [completionDismissed, setCompletionDismissed] = createSignal<string | null>(null);
+  const [candidateGeneration, setCandidateGeneration] = createSignal(0);
+  const candidateRequests = new CandidateRequestTracker();
   // Client-only ids for synthesized system rows, negative to never collide
   // with feed ids.
   let systemRowId = -1;
@@ -1564,14 +1597,12 @@ export default function App() {
   // first time the composer needs it (focus, a `:` trigger, or opening the
   // picker); `tone` and recents persist in localStorage across sessions.
   const [emojiLoadRequested, setEmojiLoadRequested] = createSignal(false);
-  const [emojiDb] = createResource(emojiLoadRequested, (requested) =>
+  const [emojiDb, { refetch: refetchEmojiDb }] = createResource(emojiLoadRequested, (requested) =>
     requested ? loadEmojiDatabase() : undefined
   );
   const [emojiTone, setEmojiTone] = createSignal(loadEmojiTone());
   const [emojiRecent, setEmojiRecent] = createSignal<EmojiRecord[]>([]);
-  const [pickerOpen, setPickerOpen] = createSignal(false);
-  // The selection the picker replaces, captured before its toggle steals focus.
-  let emojiInsertRange = { start: draft().length, end: draft().length };
+  const pickerOpen = () => assist().kind === "emoji-picker";
   let emojiPickerEl: HTMLDivElement | undefined;
   let emojiButtonEl: HTMLButtonElement | undefined;
 
@@ -1586,13 +1617,13 @@ export default function App() {
       const target = event.target;
       if (!(target instanceof Node)) return;
       if (!emojiPickerEl?.contains(target) && !emojiButtonEl?.contains(target)) {
-        setPickerOpen(false);
+        setAssist(CLOSED_ASSIST);
       }
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
-      setPickerOpen(false);
+      setAssist(CLOSED_ASSIST);
       queueMicrotask(() => composerTextEl?.focus({ preventScroll: true }));
     };
     document.addEventListener("pointerdown", dismiss);
@@ -1604,24 +1635,38 @@ export default function App() {
   });
 
   const completionCtx = createMemo(() => {
-    const ctx = completionContext(draft(), composerCursor(), commandList());
+    const snapshot = editor();
+    const ctx = completionContext(snapshot.value, snapshot.selection, commandList());
     if (!ctx) return null;
     // Emoji is plain local text, so it stays available while editing or offline;
     // slash commands need a live, non-editing session to dispatch.
     if (ctx.mode === "emoji") return ctx;
-    return editing() || !connected() ? null : ctx;
+    return editing() || readonly() || !connected() ? null : ctx;
   });
-  const completionRows = createMemo<PopupRow[]>(() => {
+  const completionView = createMemo<{
+    context: NonNullable<ReturnType<typeof completionContext>>;
+    contextKey: string;
+    options: PopupOption[];
+    hint: string | null;
+  } | null>(() => {
     const ctx = completionCtx();
-    if (!ctx) return [];
+    if (!ctx) return null;
+    const contextKey = completionContextKey(ctx);
     if (ctx.mode === "command") {
-      return filterCommands(commandList(), ctx.query).map(
-        (row) => ({ kind: "command", row }) as PopupRow
-      );
+      return {
+        context: ctx,
+        contextKey,
+        options: filterCommands(commandList(), ctx.query).map((row) => ({
+          id: `command:${row.command.name}`,
+          kind: "command" as const,
+          row,
+        })),
+        hint: null,
+      };
     }
     if (ctx.mode === "emoji") {
       const db = emojiDb();
-      if (!db) return [];
+      if (!db) return { context: ctx, contextKey, options: [], hint: null };
       const tone = emojiTone();
       // An empty query offers recents, falling back to the Smileys group.
       const records = ctx.query
@@ -1630,16 +1675,37 @@ export default function App() {
             0,
             MAX_POPUP_ROWS
           );
-      return records.map((record) => ({ kind: "emoji", record, tone }) as PopupRow);
+      return {
+        context: ctx,
+        contextKey,
+        options: records.map((record) => ({
+          id: `emoji:${record.id}`,
+          kind: "emoji" as const,
+          record,
+          tone,
+        })),
+        hint: null,
+      };
     }
     if (ctx.kind === "free") {
-      if (ctx.query.length > 0) return [];
-      return [{ kind: "hint", text: ctx.command.placeholder ?? ctx.command.usage }];
+      return {
+        context: ctx,
+        contextKey,
+        options: [],
+        hint: ctx.query.length > 0 ? null : ctx.command.placeholder ?? ctx.command.usage,
+      };
     }
     const items = candidateCache()[ctx.kind] ?? [];
-    return filterCandidates(items, ctx.query).map(
-      (row) => ({ kind: "candidate", row }) as PopupRow
-    );
+    return {
+      context: ctx,
+      contextKey,
+      options: filterCandidates(items, ctx.query).map((row) => ({
+        id: `candidate:${ctx.kind}:${row.item.value}:${row.item.detail ?? ""}`,
+        kind: "candidate" as const,
+        row,
+      })),
+      hint: null,
+    };
   });
 
   // Preload the database as soon as a `:` trigger appears so the first
@@ -1647,60 +1713,89 @@ export default function App() {
   createEffect(() => {
     if (completionCtx()?.mode === "emoji") setEmojiLoadRequested(true);
   });
-  const completionOpen = () =>
-    completionRows().length > 0 && completionDismissed() !== draft() && !submitting();
+  const completionOpen = () => {
+    const state = assist();
+    const view = completionView();
+    return state.kind === "completion"
+      && view?.contextKey === state.contextKey
+      && (view.options.length > 0 || view.hint !== null)
+      && !submitting();
+  };
+  const activeCompletionOptionId = () => {
+    const state = assist();
+    return state.kind === "completion" ? state.activeOptionId : null;
+  };
 
   // Refetch candidates on each entry into an argument kind (not per keystroke);
   // the cache serves the previous list while the response is in flight.
-  createEffect<CandidateKind | null>((previous) => {
+  createEffect<string | null>((previous) => {
+    const generation = candidateGeneration();
     const ctx = completionCtx();
     const kind = ctx?.mode === "argument" && ctx.kind !== "free" ? ctx.kind : null;
-    if (kind && kind !== previous) {
-      untrack(() => sendJson({ type: "command_candidates", kind }));
+    const requestKey = kind ? `${generation}:${kind}` : null;
+    if (kind && requestKey !== previous) {
+      const requestId = candidateRequests.begin(kind);
+      untrack(() => sendJson({ type: "command_candidates", request_id: requestId, kind }));
     }
-    return kind;
+    return requestKey;
   }, null);
 
   createEffect(() => {
-    completionRows();
-    setCompletionSelected(0);
+    const view = completionView();
+    const ids = view?.options.map((option) => option.id) ?? [];
+    setAssist((current) => reconcileCompletion(current, view?.contextKey ?? null, ids));
   });
 
-  function syncComposerCursor(event: { currentTarget: HTMLTextAreaElement }) {
-    setComposerCursor(event.currentTarget.selectionStart ?? 0);
+  function openCompletionForCurrentEditor() {
+    const view = completionView();
+    if (!view) {
+      if (assist().kind === "completion") setAssist(CLOSED_ASSIST);
+      return;
+    }
+    setAssist((current) => {
+      if (current.kind === "completion" && current.contextKey === view.contextKey) {
+        return reconcileCompletion(current, view.contextKey, view.options.map((option) => option.id));
+      }
+      return openCompletion(view.contextKey);
+    });
   }
 
-  function rememberEmojiInsertRange() {
-    const length = draft().length;
-    emojiInsertRange = {
-      start: composerTextEl?.selectionStart ?? length,
-      end: composerTextEl?.selectionEnd ?? length,
-    };
+  function syncComposerEditor(event: { currentTarget: HTMLTextAreaElement }, open = true) {
+    const target = event.currentTarget;
+    commitEditor(target.value, {
+      start: target.selectionStart ?? target.value.length,
+      end: target.selectionEnd ?? target.value.length,
+    });
+    if (open) openCompletionForCurrentEditor();
   }
 
-  // Applies the selected popup row to the draft. Returns false when there is
-  // nothing to change (hint row, or the token already matches exactly), which
-  // lets Enter fall through to submit.
-  function acceptCompletion(index: number): boolean {
-    const ctx = completionCtx();
-    const row = completionRows()[index];
-    if (!ctx || !row || row.kind === "hint") return false;
+  // Applies an option only when it still belongs to the displayed context.
+  // Acceptance always terminates that session; commands with arguments start
+  // a fresh, explicit argument-completion session.
+  function acceptCompletion(optionId: string): boolean {
+    const state = assist();
+    const view = completionView();
+    if (state.kind !== "completion" || !view || state.contextKey !== view.contextKey) return false;
+    const row = view.options.find((option) => option.id === optionId);
+    if (!row) return false;
+    const ctx = view.context;
     let insert: string;
     if (row.kind === "emoji") {
       insert = applyEmojiTone(row.record, row.tone);
       setEmojiRecent((current) => updateRecent(current, row.record));
     } else {
       const target = row.kind === "command" ? row.row.command.name : row.row.item.value;
-      const current = draft().slice(ctx.span.start, ctx.span.end);
-      if (current === target) return false;
       insert =
         row.kind === "command" && row.row.command.arg !== "none" ? `${target} ` : target;
     }
     const { next, cursor } = acceptReplacement(draft(), ctx, insert);
     batch(() => {
-      setDraft(next);
-      setComposerCursor(cursor);
+      commitEditor(next, { start: cursor, end: cursor }, true);
+      setAssist(CLOSED_ASSIST);
     });
+    if (row.kind === "command" && row.row.command.arg !== "none") {
+      openCompletionForCurrentEditor();
+    }
     queueMicrotask(() => {
       composerTextEl?.setSelectionRange(cursor, cursor);
       resizeComposer();
@@ -1743,8 +1838,8 @@ export default function App() {
     const next = value.slice(0, done.start) + glyph + value.slice(done.end);
     const cursor = done.start + glyph.length;
     batch(() => {
-      setDraft(next);
-      setComposerCursor(cursor);
+      commitEditor(next, { start: cursor, end: cursor }, true);
+      setAssist(CLOSED_ASSIST);
       setEmojiRecent((current) => updateRecent(current, record));
     });
     queueMicrotask(() => {
@@ -1753,19 +1848,27 @@ export default function App() {
     });
   }
 
-  // Inserts a picker selection at the caret remembered before the button took
-  // focus, then restores focus to the composer.
+  // Inserts only into the editor revision from which the picker was opened.
+  // A programmatic draft change invalidates the range rather than clamping a
+  // stale location into unrelated text.
   function insertPickedEmoji(record: EmojiRecord) {
+    const snapshot = editor();
+    const range = pickerRange(assist(), snapshot);
+    if (!range) {
+      setAssist(CLOSED_ASSIST);
+      queueMicrotask(() => composerTextEl?.focus({ preventScroll: true }));
+      return;
+    }
     const glyph = applyEmojiTone(record, emojiTone());
-    const value = draft();
-    const start = Math.min(emojiInsertRange.start, value.length);
-    const end = Math.max(start, Math.min(emojiInsertRange.end, value.length));
-    const cursor = start + glyph.length;
+    const cursor = range.start + glyph.length;
     batch(() => {
-      setDraft(value.slice(0, start) + glyph + value.slice(end));
-      setComposerCursor(cursor);
+      commitEditor(
+        snapshot.value.slice(0, range.start) + glyph + snapshot.value.slice(range.end),
+        { start: cursor, end: cursor },
+        true,
+      );
       setEmojiRecent((current) => updateRecent(current, record));
-      setPickerOpen(false);
+      setAssist(CLOSED_ASSIST);
     });
     queueMicrotask(() => {
       composerTextEl?.focus({ preventScroll: true });
@@ -1785,6 +1888,9 @@ export default function App() {
 
   createEffect(() => {
     const value = draft();
+    // Editing temporarily replaces the visible editor value. Persist only the
+    // parked compose draft, which is restored when editing ends.
+    if (editing()) return;
     try {
       if (value) sessionStorage.setItem(DRAFT_STORAGE_KEY, value);
       else sessionStorage.removeItem(DRAFT_STORAGE_KEY);
@@ -2351,10 +2457,13 @@ export default function App() {
   // quote button.
   function quoteRef(refCode: string) {
     const code = `@@${refCode} `;
-    setDraft((prev) =>
-      prev.length > 0 && !prev.endsWith(" ") ? `${prev} ${code}` : prev + code
-    );
-    composerTextEl?.focus();
+    const previous = draft();
+    const next = previous.length > 0 && !previous.endsWith(" ")
+      ? `${previous} ${code}`
+      : previous + code;
+    replaceDraft(next);
+    composerTextEl?.focus({ preventScroll: true });
+    composerTextEl?.setSelectionRange(next.length, next.length);
     resizeComposer();
   }
 
@@ -2610,7 +2719,8 @@ export default function App() {
   function restoreParkedComposer(edit: PendingWebEdit) {
     batch(() => {
       setEditing(null);
-      setDraft(edit.parkedDraft);
+      replaceDraft(edit.parkedDraft);
+      setAssist(CLOSED_ASSIST);
       setQueued(edit.parkedFiles);
       setDragActive(false);
     });
@@ -2634,7 +2744,8 @@ export default function App() {
         parkedDraft,
         parkedFiles,
       });
-      setDraft(message.body);
+      replaceDraft(message.body);
+      setAssist(CLOSED_ASSIST);
       setQueued([]);
       setDragActive(false);
     });
@@ -2848,8 +2959,8 @@ export default function App() {
   }
 
   async function submitCompose() {
+    setAssist(CLOSED_ASSIST);
     if (!connected() || submitting()) return;
-    setPickerOpen(false);
     setComposeError(null);
     const edit = editing();
     if (edit) {
@@ -2887,8 +2998,7 @@ export default function App() {
           request_id: requestId,
           body: raw.trim(),
         }));
-        setDraft("");
-        setCompletionDismissed(null);
+        replaceDraft("", 0);
         queueMicrotask(resizeComposer);
       } catch (error) {
         setComposeError(error instanceof Error ? error.message : String(error));
@@ -2909,7 +3019,7 @@ export default function App() {
           request_id: requestId,
           body,
         }));
-        setDraft("");
+        replaceDraft("", 0);
         queueMicrotask(resizeComposer);
       }
       if (files.length > 0) await sendQueuedFiles(files);
@@ -2924,39 +3034,46 @@ export default function App() {
   }
 
   function onComposeKeyDown(event: KeyboardEvent) {
-    if (completionOpen() && !event.isComposing && event.keyCode !== 229) {
+    const composing = event.isComposing || event.keyCode === 229;
+    if (completionOpen() && !composing) {
+      const view = completionView()!;
+      const state = assist();
+      const optionIds = view.options.map((option) => option.id);
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-        event.preventDefault();
-        const rows = completionRows().length;
-        const delta = event.key === "ArrowDown" ? 1 : -1;
-        setCompletionSelected((index) => (index + delta + rows) % rows);
-        return;
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setCompletionDismissed(draft());
-        return;
+        if (optionIds.length > 0) {
+          event.preventDefault();
+          setAssist((current) => moveCompletion(
+            current,
+            optionIds,
+            event.key === "ArrowDown" ? 1 : -1,
+          ));
+          return;
+        }
       }
       if (event.key === "Tab" && !event.shiftKey) {
-        event.preventDefault();
-        acceptCompletion(completionSelected());
-        return;
+        const optionId = completionTabOption(state, optionIds);
+        if (optionId && acceptCompletion(optionId)) {
+          event.preventDefault();
+          return;
+        }
       }
-      // Enter accepts a differing selection; an exactly-typed token falls
-      // through to submit. Shift+Enter keeps inserting a newline.
+      // Passive suggestions never change the chat composer's primary Enter
+      // action. Arrow/hover engagement opts into accepting the active option.
       if (
         event.key === "Enter" &&
         !event.shiftKey &&
-        acceptCompletion(completionSelected())
+        completionEnterOption(state) !== null &&
+        acceptCompletion(completionEnterOption(state)!)
       ) {
         event.preventDefault();
         return;
       }
     }
-    if (event.key === "Escape" && pickerOpen()) {
+    if (event.key === "Escape" && assist().kind !== "closed") {
+      const wasPickerOpen = pickerOpen();
       event.preventDefault();
-      setPickerOpen(false);
-      composerTextEl?.focus({ preventScroll: true });
+      setAssist(CLOSED_ASSIST);
+      if (wasPickerOpen) composerTextEl?.focus({ preventScroll: true });
       return;
     }
     if (event.key === "Escape" && editing()) {
@@ -2967,8 +3084,7 @@ export default function App() {
     if (
       event.key === "Enter" &&
       !event.shiftKey &&
-      !event.isComposing &&
-      event.keyCode !== 229
+      !composing
     ) {
       event.preventDefault();
       submitCompose();
@@ -3550,6 +3666,10 @@ export default function App() {
           return next;
         });
       } else if (env.type === "config") {
+        setAssist(CLOSED_ASSIST);
+        candidateRequests.invalidate();
+        setCandidateCache({});
+        setCandidateGeneration((generation) => generation + 1);
         if (env.readonly) {
           cancelEdit();
           closeDeleteConfirmation(false);
@@ -3561,7 +3681,9 @@ export default function App() {
         setCommandList(env.commands);
         document.title = `Chatt | ${env.room_name}`;
       } else if (env.type === "command_candidates") {
-        setCandidateCache((prev) => ({ ...prev, [env.kind]: env.items }));
+        if (candidateRequests.accept(env.kind, env.request_id)) {
+          setCandidateCache((prev) => ({ ...prev, [env.kind]: env.items }));
+        }
       } else if (env.type === "command_output") {
         // Slash-command output renders as local-only system rows. They never
         // reach Rust and the next room sync replaces them wholesale;
@@ -3586,6 +3708,10 @@ export default function App() {
         setMessages((prev) => [...prev, ...rows]);
         pin();
       } else if (env.type === "room") {
+        setAssist(CLOSED_ASSIST);
+        candidateRequests.invalidate();
+        setCandidateCache({});
+        setCandidateGeneration((generation) => generation + 1);
         document.title = `Chatt | ${env.name}`;
       } else if (env.type === "request_result") {
         const pending = pendingRequests.get(env.request_id);
@@ -3628,6 +3754,10 @@ export default function App() {
         was_clean: event.wasClean,
       });
       setConnected(false);
+      setAssist(CLOSED_ASSIST);
+      candidateRequests.invalidate();
+      setCandidateCache({});
+      setCandidateGeneration((generation) => generation + 1);
       closeDeleteConfirmation(false);
       loadingOlder = false;
       topPagingArmed = true;
@@ -3953,32 +4083,45 @@ export default function App() {
               <Show when={!connected()}>
                 <div class="composer-offline" role="status">Offline — your draft is retained; sending is disabled.</div>
               </Show>
-              <Show when={completionOpen()}>
-                <CommandPopup
-                  rows={completionRows()}
-                  selected={completionSelected()}
-                  onHover={setCompletionSelected}
-                  onAccept={acceptCompletion}
-                />
+              <Show when={completionOpen() ? completionView() : null}>
+                {(view) => (
+                  <CommandPopup
+                    options={view().options}
+                    activeOptionId={activeCompletionOptionId()}
+                    hint={view().hint}
+                    onHover={(id) => setAssist((current) => engageOption(current, id))}
+                    onAccept={acceptCompletion}
+                  />
+                )}
               </Show>
               <Show when={pickerOpen()}>
                 <div ref={emojiPickerEl} class="emoji-picker-anchor">
-                  <Suspense fallback={<div class="emoji-loading">Loading emoji…</div>}>
-                    <Show
-                      when={emojiDb()}
-                      fallback={<div class="emoji-loading">Loading emoji…</div>}
-                    >
-                      {(db) => (
-                        <EmojiPicker
-                          database={db()}
-                          recent={emojiRecent()}
-                          tone={emojiTone()}
-                          onToneChange={setPreferredTone}
-                          onSelect={insertPickedEmoji}
-                        />
-                      )}
-                    </Show>
-                  </Suspense>
+                  <ErrorBoundary fallback={(_error, reset) => (
+                    <div class="emoji-loading" role="alert">
+                      <span>Could not load emoji.</span>
+                      <button class="emoji-retry" type="button" onClick={() => {
+                        reset();
+                        void refetchEmojiDb();
+                      }}>Retry</button>
+                    </div>
+                  )}>
+                    <Suspense fallback={<div class="emoji-loading">Loading emoji…</div>}>
+                      <Show
+                        when={emojiDb()}
+                        fallback={<div class="emoji-loading">Loading emoji…</div>}
+                      >
+                        {(db) => (
+                          <EmojiPicker
+                            database={db()}
+                            recent={emojiRecent()}
+                            tone={emojiTone()}
+                            onToneChange={setPreferredTone}
+                            onSelect={insertPickedEmoji}
+                          />
+                        )}
+                      </Show>
+                    </Suspense>
+                  </ErrorBoundary>
                 </div>
               </Show>
               <div class="composer-input-row">
@@ -4002,23 +4145,41 @@ export default function App() {
                   rows={1}
                   placeholder={editing() ? "Edit message…" : "Write a message…"}
                   value={draft()}
+                  role="combobox"
+                  aria-autocomplete="list"
+                  aria-expanded={completionOpen()}
+                  aria-controls={completionOpen() && completionView()!.options.length
+                    ? "command-popup"
+                    : undefined}
+                  aria-activedescendant={completionOpen() && activeCompletionOptionId()
+                    ? optionDomId(activeCompletionOptionId()!)
+                    : undefined}
                   onInput={(event) => {
                     const value = event.currentTarget.value;
                     const caret = event.currentTarget.selectionStart ?? value.length;
-                    setDraft(value);
-                    setComposerCursor(caret);
+                    syncComposerEditor(event, false);
                     resizeComposer();
                     maybeExpandShortcode(value, caret);
+                    openCompletionForCurrentEditor();
                   }}
                   onFocus={(event) => {
                     setEmojiLoadRequested(true);
-                    syncComposerCursor(event);
+                    // Focus may be restored by the browser after a refresh.
+                    // Only an editor activity event opens a transient session.
+                    syncComposerEditor(event, false);
                   }}
                   onKeyDown={onComposeKeyDown}
-                  onKeyUp={syncComposerCursor}
-                  onClick={syncComposerCursor}
-                  onSelect={syncComposerCursor}
-                  onCompositionEnd={syncComposerCursor}
+                  // Keyboard caret moves (arrows/Home/End) collapse the
+                  // selection and never fire `select`, so sync here to keep the
+                  // captured range fresh for the emoji picker. Navigation must
+                  // not spawn a completion session, hence open=false.
+                  onKeyUp={(event) => syncComposerEditor(event, false)}
+                  onClick={syncComposerEditor}
+                  onSelect={syncComposerEditor}
+                  onCompositionEnd={syncComposerEditor}
+                  onBlur={() => {
+                    if (assist().kind === "completion") setAssist(CLOSED_ASSIST);
+                  }}
                   onPaste={onComposePaste}
                 />
                 <input
@@ -4039,11 +4200,11 @@ export default function App() {
                   title="Emoji"
                   disabled={submitting()}
                   onPointerEnter={() => setEmojiLoadRequested(true)}
-                  onPointerDown={rememberEmojiInsertRange}
                   onClick={() => {
                     setEmojiLoadRequested(true);
-                    setCompletionDismissed(draft());
-                    setPickerOpen((open) => !open);
+                    setAssist((current) => current.kind === "emoji-picker"
+                      ? CLOSED_ASSIST
+                      : openEmojiPicker(editor()));
                   }}
                 >
                   <Icon name="smile" />

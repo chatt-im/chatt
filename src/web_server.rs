@@ -552,6 +552,7 @@ pub enum WebRequest {
     /// A request for the argument candidates the autocomplete popup offers.
     CommandCandidates {
         client: u64,
+        request_id: u64,
         kind: CandidateKind,
     },
 }
@@ -616,7 +617,10 @@ enum ClientRequest {
     /// Asks for the argument candidates the autocomplete popup offers. Answered
     /// with a targeted `command_candidates` envelope. Ignored when read-only.
     #[jsony(rename = "command_candidates")]
-    CommandCandidates { kind: CandidateKind },
+    CommandCandidates {
+        request_id: u64,
+        kind: CandidateKind,
+    },
 }
 
 /// The argument domain a `command_candidates` request asks about.
@@ -1230,7 +1234,7 @@ fn run(
                             let _ = server.send_websocket_text(id, payload);
                         }
                     }
-                    Ok(ClientRequest::CommandCandidates { kind }) if !readonly => {
+                    Ok(ClientRequest::CommandCandidates { request_id, kind }) if !readonly => {
                         kvlog::debug!(
                             "websocket request",
                             ws_id = id.get(),
@@ -1239,6 +1243,7 @@ fn run(
                         );
                         let _ = web_requests.send(WebRequest::CommandCandidates {
                             client: id.get(),
+                            request_id,
                             kind,
                         });
                     }
@@ -3659,11 +3664,15 @@ Sec-WebSocket-Version: 13\r\n\
             }
         );
 
-        write_ws_text(&mut stream, r#"{"type":"command_candidates","kind":"room"}"#);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"command_candidates","request_id":22,"kind":"room"}"#,
+        );
         assert_eq!(
             web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             WebRequest::CommandCandidates {
                 client: 1,
+                request_id: 22,
                 kind: CandidateKind::Room
             }
         );
