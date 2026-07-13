@@ -9,3 +9,4 @@ libc = "0.2"
 mio = { version = "1.2.1", features = ["os-poll"] }
 ring = "0.17.14"
 toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }

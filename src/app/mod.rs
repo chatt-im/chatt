@@ -2731,6 +2731,13 @@ impl App {
                 return false;
             }
         };
+        let server = match self.ensure_e2e_identity(server) {
+            Ok(server) => server,
+            Err(error) => {
+                self.set_error(error);
+                return false;
+            }
+        };
         self.disconnect_network();
         let owner = self
             .connection_attempt
@@ -2782,6 +2789,107 @@ impl App {
         self.set_status("connecting");
         if let Err(error) = local_control::write_last_server_hint(&server.label) {
             kvlog::warn!("failed to update last-server hint", error = %error);
+        }
+        true
+    }
+
+    /// Guarantees the server entry carries a DM identity seed, generating and
+    /// persisting one on first connect.
+    fn ensure_e2e_identity(&mut self, mut server: ServerEntry) -> Result<ServerEntry, String> {
+        use ring::rand::SecureRandom;
+        if !server.e2e_identity_seed.trim().is_empty() {
+            return Ok(server);
+        }
+        let mut seed = [0u8; rpc::e2e::E2E_SEED_LEN];
+        ring::rand::SystemRandom::new()
+            .fill(&mut seed)
+            .map_err(|_| "failed to generate encryption identity".to_string())?;
+        let seed = rpc::crypto::encode_hex(&seed);
+        server.e2e_identity_seed = seed.clone();
+        if let Some(entry) = self
+            .config
+            .servers
+            .iter_mut()
+            .find(|entry| entry.label == server.label)
+        {
+            entry.e2e_identity_seed = seed;
+        }
+        self.config
+            .save_runtime()
+            .map_err(|error| format!("failed to persist encryption identity: {error}"))?;
+        Ok(server)
+    }
+
+    /// Persists a complete DM identity snapshot. The network worker activates
+    /// it only after the acknowledgement sent by the event handler.
+    fn persist_e2e_pin(&mut self, pin: crate::config::E2ePeerPin) -> bool {
+        let Some(label) = self.room.active_server_label.clone() else {
+            return false;
+        };
+        let Some(entry) = self
+            .config
+            .servers
+            .iter_mut()
+            .find(|entry| entry.label == label)
+        else {
+            return false;
+        };
+        let previous = entry.e2e_peer_pins.clone();
+        let folded_username = pin.username.trim().to_lowercase();
+        entry.e2e_peer_pins.retain(|stored| {
+            stored.room_id != pin.room_id
+                && stored.user_id != pin.user_id
+                && stored.username.trim().to_lowercase() != folded_username
+        });
+        entry.e2e_peer_pins.push(pin);
+        if let Err(error) = self.config.save_runtime() {
+            if let Some(entry) = self
+                .config
+                .servers
+                .iter_mut()
+                .find(|entry| entry.label == label)
+            {
+                entry.e2e_peer_pins = previous;
+            }
+            kvlog::warn!("failed to persist e2e pin", error = error.as_str());
+            self.set_error(format!("failed to persist encryption pin: {error}"));
+            return false;
+        }
+        true
+    }
+
+    fn persist_e2e_local_user(&mut self, user_id: UserId) -> bool {
+        let Some(label) = self.room.active_server_label.clone() else {
+            return false;
+        };
+        let Some(entry) = self
+            .config
+            .servers
+            .iter_mut()
+            .find(|entry| entry.label == label)
+        else {
+            return false;
+        };
+        if entry.e2e_local_user_id == user_id.0 {
+            return true;
+        }
+        let previous = entry.e2e_local_user_id;
+        entry.e2e_local_user_id = user_id.0;
+        if let Err(error) = self.config.save_runtime() {
+            if let Some(entry) = self
+                .config
+                .servers
+                .iter_mut()
+                .find(|entry| entry.label == label)
+            {
+                entry.e2e_local_user_id = previous;
+            }
+            kvlog::warn!(
+                "failed to persist local e2e user id",
+                error = error.as_str()
+            );
+            self.set_error(format!("failed to persist encryption account id: {error}"));
+            return false;
         }
         true
     }
@@ -3735,6 +3843,7 @@ impl App {
                 ));
                 self.room.network_disconnected = false;
                 self.room.udp_unreachable = false;
+                self.room.clear_e2e_identity_changes();
                 self.last_network_notice = None;
                 let catalog = crate::room_catalog::load(self.room.history_storage().catalog_dir());
                 let known = self.room.authenticated(
@@ -4028,6 +4137,48 @@ impl App {
                         if online { "joined" } else { "left" }
                     ));
                 }
+            }
+            NetworkEvent::E2eLocalUserId { user_id } => {
+                let persisted = self.persist_e2e_local_user(user_id);
+                self.send_network_command(
+                    NetworkCommand::ConfirmE2eLocalUser { user_id, persisted },
+                    true,
+                );
+            }
+            NetworkEvent::E2ePeerPinProposed { pin } => {
+                let user_id = UserId(pin.user_id);
+                let persisted = self.persist_e2e_pin(pin.clone());
+                self.send_network_command(
+                    NetworkCommand::ConfirmE2ePeerPin { pin, persisted },
+                    true,
+                );
+                if persisted {
+                    self.room.set_e2e_identity_changed(user_id, false);
+                    self.set_status(format!(
+                        "pinned encryption identity for {}",
+                        self.room.username_of(user_id)
+                    ));
+                }
+            }
+            NetworkEvent::E2ePeerIdentityChanged {
+                user_id,
+                pinned,
+                presented,
+            } => {
+                kvlog::warn!(
+                    "peer e2e identity changed",
+                    user_id = user_id.0,
+                    pinned_username = pinned.username.as_str(),
+                    presented_username = presented.username.as_str(),
+                    pinned_key = pinned.public_key.as_str(),
+                    presented_key = presented.public_key.as_str()
+                );
+                self.room.set_e2e_identity_changed(user_id, true);
+                self.set_error(format!(
+                    "encryption identity for {} CHANGED (previously {}) — messages are blocked; \
+                     verify out of band, then /trust {} to accept the new identity",
+                    presented.username, pinned.username, presented.username
+                ));
             }
             NetworkEvent::VoiceStarted {
                 room_id,
@@ -6622,6 +6773,8 @@ impl App {
             command if command.starts_with("/room ") => self.switch_room_command(command),
             "/dm" => self.set_error("usage: /dm user"),
             command if command.starts_with("/dm ") => self.open_dm_command(command),
+            "/trust" => self.set_error("usage: /trust user"),
+            command if command.starts_with("/trust ") => self.trust_command(command),
             "/voice" => match room_id {
                 Some(room_id) => self.join_voice_room(room_id),
                 None => self.set_error("no room selected"),
@@ -6676,6 +6829,26 @@ impl App {
             return;
         };
         self.open_dm_with(user_id);
+    }
+
+    /// Accepts a DM peer's changed encryption identity: the worker re-pins the
+    /// presented tuple and unblocks sends, answering with
+    /// [`NetworkEvent::E2ePeerPinProposed`] for durable persistence.
+    fn trust_command(&mut self, command: &str) {
+        let name = command.trim_start_matches("/trust ").trim();
+        if name.is_empty() {
+            self.set_error("usage: /trust user");
+            return;
+        }
+        let Some(user_id) = self.room.user_id_by_name(name) else {
+            self.set_error(format!("no user named {name}"));
+            return;
+        };
+        if !self.room.e2e_identity_changed(user_id) {
+            self.set_status(format!("no pending encryption identity change for {name}"));
+            return;
+        }
+        self.send_network_command(NetworkCommand::TrustPeerIdentity { user_id }, true);
     }
 
     /// Asks the server for the DM room with `user_id`; the view switches when
@@ -8073,6 +8246,9 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::TransferEnded { .. } => "transfer_ended",
         NetworkEvent::TransferComplete { .. } => "transfer_complete",
         NetworkEvent::Presence { .. } => "presence",
+        NetworkEvent::E2eLocalUserId { .. } => "e2e_local_user_id",
+        NetworkEvent::E2ePeerPinProposed { .. } => "e2e_peer_pin_proposed",
+        NetworkEvent::E2ePeerIdentityChanged { .. } => "e2e_peer_identity_changed",
         NetworkEvent::VoiceStarted { .. } => "voice_started",
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
         NetworkEvent::PeerTransport { .. } => "peer_transport",
@@ -8126,6 +8302,9 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SetUploadRate(_) => "set_upload_rate",
         NetworkCommand::SetFilePolicy(_) => "set_file_policy",
         NetworkCommand::SetP2pEnabled(_) => "set_p2p_enabled",
+        NetworkCommand::TrustPeerIdentity { .. } => "trust_peer_identity",
+        NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
+        NetworkCommand::ConfirmE2eLocalUser { .. } => "confirm_e2e_local_user",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -9264,6 +9443,56 @@ mod tests {
     }
 
     #[test]
+    fn renamed_e2e_peer_is_quarantined_and_trusted_by_new_name() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[dm_room_info(0x8000_0001, UserId(1), UserId(2))],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(0x8000_0001),
+            None,
+            app.user_id,
+        );
+
+        app.handle_network_event(NetworkEvent::Presence {
+            user: user_summary(UserId(2), "robert"),
+            online: true,
+        });
+        app.handle_network_event(NetworkEvent::E2ePeerIdentityChanged {
+            user_id: UserId(2),
+            pinned: crate::config::E2ePeerIdentity {
+                room_id: 0x8000_0001,
+                user_id: 2,
+                username: "bob".to_string(),
+                public_key: "11".repeat(32),
+            },
+            presented: crate::config::E2ePeerIdentity {
+                room_id: 0x8000_0001,
+                user_id: 2,
+                username: "robert".to_string(),
+                public_key: "11".repeat(32),
+            },
+        });
+
+        assert_eq!(app.room.username_of(UserId(2)), "robert");
+        assert!(app.room.e2e_identity_changed(UserId(2)));
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert!(app.view.status.text().contains("previously bob"));
+
+        app.view.composer.set_lines("/trust robert");
+        app.submit_input();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            NetworkCommand::TrustPeerIdentity { user_id: UserId(2) }
+        ));
+    }
+
+    #[test]
     fn dm_opened_waits_for_room_upsert_when_room_is_unknown() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
@@ -9780,6 +10009,7 @@ mod tests {
         );
         let transfer_id = rpc::ids::FileTransferId(9);
         let metadata = rpc::control::FileMetadata {
+            sealed_meta: None,
             transfer_id,
             room_id: RoomId(2),
             sender: UserId(2),
@@ -9812,6 +10042,7 @@ mod tests {
         assert!(app.room.begin_history_fetch(RoomId(1)));
         let messages = (6..=20)
             .map(|id| rpc::control::ChatMessage {
+                envelope: None,
                 message_id: rpc::ids::MessageId(id),
                 room_id: RoomId(1),
                 sender: UserId(2),
@@ -10511,6 +10742,7 @@ mod tests {
         for (id, sender) in [(1, UserId(1)), (2, UserId(2)), (3, UserId(1))] {
             app.room.chat_received(
                 rpc::control::ChatMessage {
+                    envelope: None,
                     message_id: MessageId(id),
                     room_id: RoomId(1),
                     sender,
@@ -10571,6 +10803,7 @@ mod tests {
         enter_test_room(&mut app);
         app.room.chat_received(
             rpc::control::ChatMessage {
+                envelope: None,
                 message_id: MessageId(7),
                 room_id: RoomId(1),
                 sender: UserId(1),

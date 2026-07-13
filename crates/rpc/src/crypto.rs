@@ -541,7 +541,7 @@ impl hkdf::KeyType for HkdfLen {
     }
 }
 
-fn expand_key(prk: &hkdf::Prk, label: &'static [u8]) -> [u8; KEY_LEN] {
+pub(crate) fn expand_key(prk: &hkdf::Prk, label: &'static [u8]) -> [u8; KEY_LEN] {
     let info = [label];
     let okm = prk.expand(&info, HkdfLen(KEY_LEN)).unwrap();
     let mut out = [0u8; KEY_LEN];

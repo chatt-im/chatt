@@ -2058,17 +2058,29 @@ mod tests {
 
     #[test]
     fn placeholder_names_the_viewed_room() {
-        assert_eq!(composer_placeholder(Some("den")), "Message #den");
+        assert_eq!(composer_placeholder(Some("den"), None), "Message #den");
     }
 
     #[test]
     fn placeholder_addresses_dm_rooms_without_hash() {
-        assert_eq!(composer_placeholder(Some("@zoe")), "Message @zoe");
+        assert_eq!(composer_placeholder(Some("@zoe"), None), "Message @zoe");
     }
 
     #[test]
     fn placeholder_without_viewed_room_degrades_cleanly() {
-        assert_eq!(composer_placeholder(None), "Message");
+        assert_eq!(composer_placeholder(None, None), "Message");
+    }
+
+    #[test]
+    fn placeholder_advertises_dm_e2e_state() {
+        assert_eq!(
+            composer_placeholder(Some("@zoe"), Some(E2eHint::Sealed)),
+            "Message @zoe [e2e]"
+        );
+        assert_eq!(
+            composer_placeholder(Some("@zoe"), Some(E2eHint::IdentityChanged)),
+            "Message @zoe [e2e — identity changed, /trust to resume]"
+        );
     }
 
     #[test]
@@ -2877,14 +2889,30 @@ fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, b
         buf.hide_cursor();
     }
     if app.view.composer.text_len() == 0 {
-        let room_name = app
-            .view
-            .viewed_room
-            .and_then(|room_id| app.room.room_name_of(room_id));
+        let viewed = app.view.viewed_room;
+        let room_name = viewed.and_then(|room_id| app.room.room_name_of(room_id));
+        let e2e = viewed
+            .and_then(|room_id| app.room.dm_peer_of(room_id))
+            .map(|peer| {
+                if app.room.e2e_identity_changed(peer) {
+                    E2eHint::IdentityChanged
+                } else {
+                    E2eHint::Sealed
+                }
+            });
         area.with(app.view.theme.subtle.without_bg())
             .with(Ellipsis(true))
-            .text(buf, &composer_placeholder(room_name));
+            .text(buf, &composer_placeholder(room_name, e2e));
     }
+}
+
+/// The end-to-end state a DM composer advertises in its empty-state hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum E2eHint {
+    /// Messages to this room are sealed.
+    Sealed,
+    /// The peer's identity tuple changed; sends are blocked until `/trust`.
+    IdentityChanged,
 }
 
 /// Recovers the editor's private visual-row scroll offset after rendering.
@@ -2930,12 +2958,20 @@ fn draw_composer_scrollbar(area: Rect, state: ScrollbarState, theme: Theme, buf:
 }
 
 /// The composer's empty-state hint, naming the issuing view's room so each
-/// attached terminal labels the room it actually shows.
-fn composer_placeholder(room_name: Option<&str>) -> String {
-    match room_name {
+/// attached terminal labels the room it actually shows. DM rooms advertise
+/// their end-to-end state.
+fn composer_placeholder(room_name: Option<&str>, e2e: Option<E2eHint>) -> String {
+    let hint = match room_name {
         Some(name) if name.starts_with('@') => format!("Message {name}"),
         Some(name) => format!("Message #{name}"),
         None => "Message".to_string(),
+    };
+    match e2e {
+        None => hint,
+        Some(E2eHint::Sealed) => format!("{hint} [e2e]"),
+        Some(E2eHint::IdentityChanged) => {
+            format!("{hint} [e2e — identity changed, /trust to resume]")
+        }
     }
 }
 

@@ -103,6 +103,9 @@ fn client_config(
         username: name.to_string(),
         token: token.to_string(),
         server_public_key: None,
+        e2e_identity_seed: None,
+        e2e_local_user_id: None,
+        e2e_peer_pins: Vec::new(),
         require_native_encryption: true,
         file_policy: FilePolicy {
             default: EffectiveFiles {

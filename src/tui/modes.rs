@@ -3395,6 +3395,7 @@ mod tests {
 
         app.view.active.chat.prepend_chat(vec![(
             ChatMessage {
+                envelope: None,
                 message_id: MessageId(1),
                 room_id: RoomId(1),
                 sender: UserId(9),
@@ -3461,6 +3462,7 @@ mod tests {
         enter_room_one(app);
         app.room.chat_received(
             ChatMessage {
+                envelope: None,
                 message_id: MessageId(message_id),
                 room_id: RoomId(1),
                 sender,
@@ -3480,6 +3482,7 @@ mod tests {
         enter_room_one(app);
         app.room.chat_received(
             ChatMessage {
+                envelope: None,
                 message_id: MessageId(message_id),
                 room_id: RoomId(1),
                 sender: UserId(2),

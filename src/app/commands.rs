@@ -187,6 +187,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         web: false,
     },
     SlashCommand {
+        name: "/trust",
+        usage: "/trust user",
+        description: "accept a DM peer's changed encryption identity",
+        arg: SlashArg::User,
+        web: false,
+    },
+    SlashCommand {
         name: "/undeafen",
         usage: "/undeafen",
         description: "resume playback and microphone send",
@@ -566,6 +573,7 @@ mod tests {
         for (i, (sender, body)) in messages.iter().enumerate() {
             chat.push_chat(
                 ChatMessage {
+                    envelope: None,
                     message_id: MessageId(i as u64 + 1),
                     room_id: RoomId(1),
                     sender: UserId(1),

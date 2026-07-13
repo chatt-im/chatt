@@ -2764,6 +2764,7 @@ mod tests {
 
     fn chat_message(id: u64, timestamp_ms: u64, body: &str) -> ChatMessage {
         ChatMessage {
+            envelope: None,
             message_id: rpc::ids::MessageId(id),
             room_id: rpc::ids::RoomId(1),
             sender: rpc::ids::UserId(2),

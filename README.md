@@ -4,9 +4,10 @@ Chatt is a Rust terminal chat client and local development server with
 server-selected TCP/UDP transport encryption, file relay, and P2P media
 candidate exchange.
 
-The server is trusted in the current design. It decrypts traffic to route chat,
-files, voice, and P2P setup messages, but the default server configuration does
-not retain chat history.
+The server is trusted to route in the current design. It decrypts public and
+private room chat, files, voice, and P2P setup messages, but direct-message text
+and files are end-to-end encrypted. The default server configuration does not
+retain chat history.
 
 ## Native Dependencies
 
@@ -643,7 +644,31 @@ Current status:
   counter and the password epoch. A token is a ChaCha20-Poly1305 sealed blob
   keyed from `server-identity-seed`, so only the issuing server can mint or read
   one. Revocation is global, by disabling `public` or bumping `password-epoch`.
-- The server is trusted and not end-to-end encrypted.
+- The server is trusted to route, and public/private rooms are not end-to-end
+  encrypted.
+- Direct messages (text and files) are end-to-end encrypted: each client holds
+  a long-term X25519 identity (`e2e-identity-seed` in `client.toml`, generated
+  on first connect), a per-DM key is derived by static-static Diffie-Hellman,
+  and every message is sealed with a one-shot ChaCha20-Poly1305 key. The server
+  relays and stores only ciphertext for DM content; the DM composer shows
+  `[e2e]`. Chat plaintexts are padded to 160-byte multiples and file transfers
+  to their Padmé length, so the server sees only coarse size classes plus a
+  placeholder file name. Peer identity keys are distributed by the server and
+  pinned on first use together with the DM room id, user id, and username. Pin
+  updates are activated only after an atomic owner-only config write. If any
+  part of that identity changes, sending and all inbound plaintext for that DM
+  are blocked until you verify out of band and run `/trust user`; old trusted
+  keys remain available for retained history after that decision. A durable DM
+  pin also keeps its room id encryption-required across reconnects, so a server
+  cannot downgrade that room to public/private and trigger plaintext fallback.
+  Authenticated DM sender labels come from the trusted identity tuple, not the
+  server's outer display-name field. Messages that race identity lookup are held
+  as ciphertext in a bounded queue. A DM plaintext, a DM file without a sealed
+  envelope, or a remapped/unsolicited DM response is rejected. There is no
+  forward secrecy by design (static keys keep server-fetched history
+  decryptable): a leaked seed exposes that user's past and future DM traffic.
+  The server still sees who messages whom, timing, edit/delete targets, and DM
+  voice/video, which remain transport-encrypted only.
 - The current handshake uses X25519 and Ed25519. It is not yet
   quantum-resistant; the documented next step is a hybrid X25519 + ML-KEM
   handshake and post-quantum or hybrid server authentication.

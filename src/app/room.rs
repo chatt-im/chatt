@@ -755,6 +755,10 @@ pub(crate) struct RoomSession {
     pub(super) settings_owner: Option<crate::client_channel::ClientId>,
     pub(super) settings_generation: u64,
     muted_users: HashSet<UserId>,
+    /// DM peers whose served encryption key contradicts the pinned one; sends
+    /// to them are blocked until `/trust`. Cleared on re-auth and re-populated
+    /// by the worker's key checks.
+    e2e_changed_peers: HashSet<UserId>,
     stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
     /// Catalog facts for every known room, viewed or not.
@@ -1270,6 +1274,7 @@ impl RoomSession {
             settings_owner: None,
             settings_generation: 0,
             muted_users: HashSet::new(),
+            e2e_changed_peers: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
             metas: BTreeMap::new(),
@@ -2143,6 +2148,34 @@ impl RoomSession {
         } else {
             user_a
         }
+    }
+
+    /// The DM peer of `room_id`, `None` for non-DM rooms.
+    pub(crate) fn dm_peer_of(&self, room_id: RoomId) -> Option<UserId> {
+        match self.metas.get(&room_id)?.kind {
+            ClientRoomKind::Dm { user_a, user_b } => Some(self.dm_peer(user_a, user_b)),
+            _ => None,
+        }
+    }
+
+    /// Marks or clears a DM peer's pending encryption-identity change.
+    pub(crate) fn set_e2e_identity_changed(&mut self, peer: UserId, changed: bool) {
+        if changed {
+            self.e2e_changed_peers.insert(peer);
+        } else {
+            self.e2e_changed_peers.remove(&peer);
+        }
+    }
+
+    /// Whether sends to this DM peer are blocked on an unacknowledged identity change.
+    pub(crate) fn e2e_identity_changed(&self, peer: UserId) -> bool {
+        self.e2e_changed_peers.contains(&peer)
+    }
+
+    /// Forgets all pending identity changes; the worker re-reports any that
+    /// persist after re-authentication.
+    pub(crate) fn clear_e2e_identity_changes(&mut self) {
+        self.e2e_changed_peers.clear();
     }
 
     pub(crate) fn username_of(&self, user_id: UserId) -> String {
@@ -3031,6 +3064,7 @@ mod tests {
 
     fn message(id: u64, sender: UserId, body: &str) -> ChatMessage {
         ChatMessage {
+            envelope: None,
             message_id: MessageId(id),
             room_id: RoomId(1),
             sender,

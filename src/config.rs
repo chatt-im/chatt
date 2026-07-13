@@ -2,7 +2,8 @@ use extui::{AnsiColor, Color, Rgb};
 use hashbrown::HashSet;
 use rpc::ids::{RoomId, UserId};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::{fs, time::Duration};
 
 use toml_spanner::Toml;
@@ -58,6 +59,17 @@ pub struct ServerEntry {
     pub token: String,
     #[toml(default)]
     pub server_public_key: String,
+    /// Hex-encoded 32-byte X25519 seed for DM end-to-end encryption, generated
+    /// on first connect. Same trust domain as the plaintext bearer `token`.
+    #[toml(default, ToToml skip_if = String::is_empty)]
+    pub e2e_identity_seed: String,
+    /// Authenticated user id this identity seed belongs to. A different id is
+    /// an identity change, not a reconnect detail.
+    #[toml(default, ToToml skip_if = is_zero_u64)]
+    pub e2e_local_user_id: u64,
+    /// TOFU-pinned DM identity tuples of peers on this server.
+    #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
+    pub e2e_peer_pins: Vec<E2ePeerPin>,
     #[toml(default = true, ToToml skip_if = |value: &bool| *value)]
     pub require_native_encryption: bool,
     #[toml(default, style = Header, ToToml skip_if = FileOverrides::is_empty)]
@@ -78,12 +90,42 @@ impl Default for ServerEntry {
             username: "Alice".to_string(),
             token: "alice-dev-token".to_string(),
             server_public_key: String::new(),
+            e2e_identity_seed: String::new(),
+            e2e_local_user_id: 0,
+            e2e_peer_pins: Vec::new(),
             require_native_encryption: true,
             files: FileOverrides::default(),
             history: HistoryOverrides::default(),
             rooms: Vec::new(),
         }
     }
+}
+
+/// One formerly-trusted DM identity tuple. Old tuples remain usable only for
+/// opening retained history; sends always use the current tuple.
+#[derive(Clone, Debug, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct E2ePeerIdentity {
+    pub room_id: u32,
+    pub user_id: u64,
+    pub username: String,
+    pub public_key: String,
+}
+
+/// A TOFU-pinned DM identity tuple for one contact, stored per server entry.
+/// Binding the key to the room, stable user id, and case-insensitive username
+/// prevents a later-compromised server from silently remapping an existing DM.
+#[derive(Clone, Debug, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct E2ePeerPin {
+    #[toml(default)]
+    pub room_id: u32,
+    pub user_id: u64,
+    #[toml(default)]
+    pub username: String,
+    pub public_key: String,
+    #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
+    pub previous: Vec<E2ePeerIdentity>,
 }
 
 impl ServerEntry {
@@ -99,6 +141,10 @@ impl ServerEntry {
             username: self.effective_username(),
             token: self.token.clone(),
             server_public_key: non_empty_string(&self.server_public_key),
+            e2e_identity_seed: non_empty_string(&self.e2e_identity_seed),
+            e2e_local_user_id: (self.e2e_local_user_id != 0)
+                .then_some(UserId(self.e2e_local_user_id)),
+            e2e_peer_pins: self.e2e_peer_pins.clone(),
             require_native_encryption: self.require_native_encryption,
             file_policy: config.file_policy(self),
             download_store,
@@ -2045,8 +2091,7 @@ impl Config {
         let output = self
             .runtime_toml(&content)
             .map_err(|err| format!("failed to serialize {}: {err}", path.display()))?;
-        fs::write(&path, output)
-            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+        atomic_write_private(&path, output.as_bytes())?;
         Ok(path)
     }
 
@@ -2065,6 +2110,68 @@ impl Config {
             .format(self)
             .map_err(|err| err.to_string())
     }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Replaces a sensitive config without ever truncating the live file. The
+/// temporary and final files are owner-only even under a permissive umask.
+fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid config path {}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temp_path = parent.join(format!(".{file_name}.tmp"));
+
+    let write_temp = || -> Result<(), String> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|err| format!("failed to create {}: {err}", temp_path.display()))?;
+        file.write_all(contents)
+            .map_err(|err| format!("failed to write {}: {err}", temp_path.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("failed to sync {}: {err}", temp_path.display()))?;
+        Ok(())
+    };
+
+    if let Err(error) = write_temp() {
+        if temp_path.exists() {
+            fs::remove_file(&temp_path).map_err(|remove_error| {
+                format!("{error}; failed to remove stale temp file: {remove_error}")
+            })?;
+            write_temp()?;
+        } else {
+            return Err(error);
+        }
+    }
+    fs::rename(&temp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        format!("failed to replace {}: {err}", path.display())
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("failed to secure {}: {err}", path.display()))?;
+    }
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| format!("failed to sync {}: {err}", parent.display()))?;
+    Ok(())
 }
 
 pub fn snap_user_volume_db(volume_db: f32) -> f32 {
@@ -3624,6 +3731,69 @@ server-public-key = ""
         };
         assert!(error.contains("\x1b["), "expected ANSI-styled diagnostics");
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_config_round_trips_bound_e2e_identity_history() {
+        let mut config = Config::default();
+        let mut server = ServerEntry::default();
+        server.e2e_local_user_id = 7;
+        server.e2e_peer_pins.push(E2ePeerPin {
+            room_id: 11,
+            user_id: 9,
+            username: "Bob".to_string(),
+            public_key: "22".repeat(32),
+            previous: vec![E2ePeerIdentity {
+                room_id: 11,
+                user_id: 9,
+                username: "Robert".to_string(),
+                public_key: "33".repeat(32),
+            }],
+        });
+        config.servers.push(server);
+
+        let rendered = render_runtime(&config);
+        let arena = Arena::new();
+        let mut document = toml_spanner::parse(&rendered, &arena).unwrap();
+        let parsed: Config = document.to().unwrap();
+
+        assert_eq!(parsed.servers[0].e2e_local_user_id, 7);
+        assert_eq!(parsed.servers[0].e2e_peer_pins[0].room_id, 11);
+        assert_eq!(
+            parsed.servers[0].e2e_peer_pins[0].previous[0].username,
+            "Robert"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_save_is_atomic_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-private-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.toml");
+        fs::write(&path, DEFAULT_CONFIG).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut config = Config::default();
+        config.config_path = Some(path.clone());
+
+        config.save_runtime().unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!dir.join(".client.toml.tmp").exists());
+        Config::collect(Some(path.to_str().unwrap())).unwrap();
         let _ = fs::remove_dir_all(dir);
     }
 }
