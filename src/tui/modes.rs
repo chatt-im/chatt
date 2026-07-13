@@ -756,7 +756,10 @@ impl ServerEditMode {
     fn handle_event(&mut self, cx: &mut ViewCx<'_>, event: ServerEditEvent) {
         match event {
             ServerEditEvent::Consumed => {}
-            ServerEditEvent::Cancel => cx.request_transition(ModeTransition::Pop),
+            ServerEditEvent::Cancel => {
+                cx.send(CoreCommand::CancelServerEdit);
+                cx.request_transition(ModeTransition::Pop);
+            }
             ServerEditEvent::Save { join_after_save } => {
                 if let Some(draft) = self.draft.take() {
                     cx.send(CoreCommand::SaveServerEdit {

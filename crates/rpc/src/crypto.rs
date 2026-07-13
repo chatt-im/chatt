@@ -23,6 +23,10 @@ pub const CHANNEL_VIDEO: u8 = 3;
 /// Prefix marking an opaque dynamic-user bearer token, distinguishing it from an
 /// explicit user's plaintext token during authentication.
 pub const DYNAMIC_TOKEN_PREFIX: &str = "tct1_";
+/// Prefix marking a client-generated open-pair recovery secret. The server
+/// deterministically derives a dynamic user id from this secret so retrying a
+/// request whose response was lost recovers the same identity.
+pub const OPEN_PAIR_RECOVERY_PREFIX: &str = "tcr1_";
 /// AEAD channel byte domain-separating dynamic token sealing from transport frames.
 const TOKEN_CHANNEL: u8 = 0;
 pub const REKEY_AFTER_TIME_SECS: u64 = 120;
@@ -979,6 +983,40 @@ pub fn verify_dynamic_token(
     jsony::from_binary(&plaintext).map_err(|_| CryptoError::InvalidEncoding)
 }
 
+/// Derives a stable dynamic user id from a client-generated recovery secret.
+/// The server seed keys the derivation, so clients cannot target another known
+/// user id. New derived ids occupy the upper half of the `u64` range.
+pub fn dynamic_user_id_from_recovery_token(
+    seed_hex: &str,
+    token: &str,
+) -> Result<UserId, CryptoError> {
+    let secret = token
+        .strip_prefix(OPEN_PAIR_RECOVERY_PREFIX)
+        .ok_or(CryptoError::InvalidEncoding)?;
+    let secret = decode_hex(secret)?;
+    if secret.len() < KEY_LEN {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    dynamic_user_id_from_pairing_secret(seed_hex, &secret)
+}
+
+/// Derives a stable dynamic user id from client-held pairing material. This is
+/// also used when an authentic but stale dynamic token must become a fresh
+/// identity on a passwordless server.
+pub fn dynamic_user_id_from_pairing_secret(
+    seed_hex: &str,
+    secret: &[u8],
+) -> Result<UserId, CryptoError> {
+    let seed = decode_fixed_hex::<KEY_LEN>(seed_hex)?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &seed);
+    let mut input = b"chatt open-pair recovery id v1".to_vec();
+    input.extend_from_slice(secret);
+    let tag = hmac::sign(&key, &input);
+    let mut id = u64::from_le_bytes(tag.as_ref()[..8].try_into().expect("8-byte id"));
+    id |= 1 << 63;
+    Ok(UserId(id))
+}
+
 /// Computes the STUN `MESSAGE-INTEGRITY-SHA256` value for a message prefix.
 ///
 /// `key` is the shared per-pair STUN key and `message_prefix` is the STUN
@@ -1127,6 +1165,21 @@ mod tests {
         let token = issue_dynamic_token(&seed, &claims).unwrap();
         assert!(token.starts_with(DYNAMIC_TOKEN_PREFIX));
         assert_eq!(verify_dynamic_token(&seed, &token).unwrap(), claims);
+    }
+
+    #[test]
+    fn open_pair_recovery_token_derives_a_stable_server_specific_user_id() {
+        let seed = dev_server_seed_hex();
+        let other_seed = encode_hex(&[0x11u8; KEY_LEN]);
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}{}", "ab".repeat(KEY_LEN));
+
+        let first = dynamic_user_id_from_recovery_token(&seed, &token).unwrap();
+        let second = dynamic_user_id_from_recovery_token(&seed, &token).unwrap();
+        let other = dynamic_user_id_from_recovery_token(&other_seed, &token).unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert_ne!(first.0 & (1 << 63), 0);
     }
 
     #[test]

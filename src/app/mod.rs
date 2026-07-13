@@ -28,6 +28,7 @@ use rpc::{
         ChatMutationKind, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, InviteTicket,
         ParticipantVoiceStatus,
     },
+    crypto::OPEN_PAIR_RECOVERY_PREFIX,
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
 };
 
@@ -82,8 +83,8 @@ pub(crate) use room::{
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
     PairCompletion, PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem,
-    alias_from_tcp_addr, default_join_alias, default_join_username, random_token,
-    server_entry_from_invite, unique_server_alias,
+    alias_from_tcp_addr, default_join_alias, default_join_username,
+    random_open_pair_recovery_token, random_token, server_entry_from_invite, unique_server_alias,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1665,6 +1666,7 @@ impl App {
                     )));
                 }
             }
+            CoreCommand::CancelServerEdit => self.cancel_server_edit(),
             CoreCommand::SaveRoomSettings(draft) => {
                 if !self.save_room_settings(&draft) {
                     self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::RoomSettings(
@@ -2800,6 +2802,12 @@ impl App {
     }
 
     fn start_connection(&mut self, alias: &str, owner: crate::client_channel::ClientId) -> bool {
+        if let Ok(server) = self.config.server(alias).cloned()
+            && server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX)
+        {
+            self.resume_provisional_open_pairing(server, owner);
+            return true;
+        }
         // Seed ownership before spawning; `start_network` assigns the fresh
         // generation for this particular worker.
         self.connection_attempt = Some(ConnectionAttempt {
@@ -3205,25 +3213,38 @@ impl App {
         self.username_retry = None;
         self.pairing_owner = Some(self.issuing_client);
         let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&addr));
+        let recovery_token = match random_open_pair_recovery_token() {
+            Ok(token) => token,
+            Err(error) => {
+                self.pairing_owner = None;
+                self.set_error(error);
+                return;
+            }
+        };
         let server = ServerEntry {
             label: alias.clone(),
             tcp_addr: addr,
             udp_addr: String::new(),
             udp_probe_addr: None,
             username: default_join_username(),
-            token: String::new(),
+            token: recovery_token.clone(),
             server_public_key: String::new(),
             ..ServerEntry::default()
         };
+        if let Err(error) = self.persist_provisional_open_pair(&server) {
+            self.pairing_owner = None;
+            self.set_error(error);
+            return;
+        }
         spawn_open_pair_once(
             server.client_config(&self.config, self.download_store.clone()),
             String::new(),
-            String::new(),
+            recovery_token.clone(),
             self.events.sender().for_unscoped_network(),
         );
         self.pending_pair = Some(PendingPair {
             server,
-            open: Some(String::new()),
+            open: Some(recovery_token),
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
@@ -3236,7 +3257,7 @@ impl App {
     fn start_named_join(&mut self, specifier: String) {
         match self.resolve_join(&specifier) {
             JoinResolution::Connect(label) => {
-                self.start_network(&label);
+                self.start_connection(&label, self.issuing_client);
             }
             JoinResolution::Filter => {
                 self.open_filtered_server_select(&specifier);
@@ -3253,6 +3274,50 @@ impl App {
                 self.set_error(format!("no server matching '{specifier}'"));
             }
         }
+    }
+
+    /// Saves the client-generated recovery secret before the server can commit
+    /// its corresponding username claim. A later process can resume pairing by
+    /// selecting this provisional server entry.
+    fn persist_provisional_open_pair(&mut self, server: &ServerEntry) -> Result<(), String> {
+        let previous = self.config.servers.clone();
+        self.config.upsert_server(server.clone());
+        match self.config.save_runtime() {
+            Ok(path) => {
+                self.config.config_path = Some(path);
+                self.rebuild_server_items();
+                Ok(())
+            }
+            Err(error) => {
+                self.config.servers = previous;
+                Err(error)
+            }
+        }
+    }
+
+    fn resume_provisional_open_pairing(
+        &mut self,
+        server: ServerEntry,
+        owner: crate::client_channel::ClientId,
+    ) {
+        self.username_retry = None;
+        self.pairing_owner = Some(owner);
+        let recovery_token = server.token.clone();
+        let alias = server.label.clone();
+        spawn_open_pair_once(
+            server.client_config(&self.config, self.download_store.clone()),
+            String::new(),
+            recovery_token.clone(),
+            self.events.sender().for_unscoped_network(),
+        );
+        self.pending_pair = Some(PendingPair {
+            server,
+            open: Some(recovery_token),
+            open_password: String::new(),
+            pairing_code: None,
+            completion: PairCompletion::OpenEditor,
+        });
+        self.set_status(format!("resuming pairing {alias}"));
     }
 
     /// Decides what a `chatt join` specifier means against the configured servers.
@@ -3337,6 +3402,14 @@ impl App {
         };
         if pair.server.server_public_key.is_empty() {
             pair.server.server_public_key = server_public_key;
+            let provisional = pair
+                .server
+                .token
+                .starts_with(OPEN_PAIR_RECOVERY_PREFIX)
+                .then(|| pair.server.clone());
+            if let Some(server) = provisional {
+                self.persist_provisional_open_pair(&server)?;
+            }
             return Ok(());
         }
         if pair.server.server_public_key != server_public_key {
@@ -3406,9 +3479,40 @@ impl App {
         self.password_prompt_active = false;
         self.pairing_owner = None;
         self.navigate_owner(NavigationEvent::CloseOverlay);
-        self.pending_pair.take();
+        if let Some(pending) = self.pending_pair.take() {
+            self.discard_provisional_open_pair(&pending);
+        }
         self.room.join_notice = None;
         self.set_status("pairing canceled");
+    }
+
+    fn cancel_server_edit(&mut self) {
+        if self.username_retry.is_none() || self.pairing_owner != Some(self.issuing_client) {
+            return;
+        }
+        self.password_prompt_active = false;
+        self.pairing_owner = None;
+        if let Some(pending) = self.username_retry.take() {
+            self.discard_provisional_open_pair(&pending);
+        }
+    }
+
+    fn discard_provisional_open_pair(&mut self, pending: &PendingPair) {
+        if !pending.server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX) {
+            return;
+        }
+        let previous = self.config.servers.clone();
+        self.config
+            .servers
+            .retain(|server| server.label != pending.server.label);
+        if self.config.config_path.is_some()
+            && let Err(error) = self.config.save_runtime()
+        {
+            self.config.servers = previous;
+            self.set_error(error);
+            return;
+        }
+        self.rebuild_server_items();
     }
 
     fn start_stale_token_repair(&mut self, reason: &str) -> bool {
@@ -3453,6 +3557,7 @@ impl App {
     /// username was taken, with the cursor on the Username field. The pairing
     /// context is retained so Save & Join retries the same pairing.
     fn begin_username_retry(&mut self, pending: PendingPair) {
+        self.password_prompt_active = false;
         let draft = ServerEditDraft::from_server_focused(&pending.server, &self.config, "Username");
         self.username_retry = Some(pending);
         self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(
@@ -3465,6 +3570,13 @@ impl App {
     /// (and any other fields) the user edited in the reopened form.
     fn retry_username_pairing(&mut self, mut pending: PendingPair, server: ServerEntry) -> bool {
         self.pairing_owner = Some(self.issuing_client);
+        if server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX)
+            && let Err(error) = self.persist_provisional_open_pair(&server)
+        {
+            self.username_retry = Some(pending);
+            self.set_error(error);
+            return false;
+        }
         let client_config = server.client_config(&self.config, self.download_store.clone());
         let events = self.events.sender().for_unscoped_network();
         let pairing_code = pending.pairing_code.clone();
@@ -4146,20 +4258,21 @@ impl App {
                     return;
                 }
                 if code == ERROR_USERNAME_TAKEN {
-                    let label = self
-                        .connection_attempt
-                        .as_ref()
-                        .map(|attempt| attempt.server_label.clone());
+                    let attempt = self.connection_attempt.clone();
                     self.fail_screencast_if_running(
                         format!("screen share stopped: {message}"),
                         false,
                     );
                     self.disconnect_network();
-                    match label {
-                        Some(label) => self.replace_with_server_edit_focused(&label, "Username"),
-                        None => self.navigate_all(BaseScreen::Servers { query: None }),
+                    self.navigate_all(BaseScreen::Servers { query: None });
+                    if let Some(attempt) = attempt {
+                        self.run_as_client(attempt.owner, |app| {
+                            app.replace_with_server_edit_focused(&attempt.server_label, "Username");
+                            app.set_error("username already in use; choose another");
+                        });
+                    } else {
+                        self.set_error("username already in use; choose another");
                     }
-                    self.set_error("username already in use; choose another");
                     return;
                 }
                 self.fail_screencast_if_running(
@@ -4297,11 +4410,11 @@ impl App {
                 self.pairing_owner = None;
             }
             NetworkEvent::UsernameTaken { message } => {
+                self.password_prompt_active = false;
                 self.run_as_pairing_owner(|app| match app.pending_pair.take() {
                     Some(pending) => app.begin_username_retry(pending),
                     None => app.set_error(message),
                 });
-                self.pairing_owner = None;
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.room.network_disconnected = true;
@@ -4626,22 +4739,24 @@ impl App {
         draft: &ServerEditDraft,
         join_after_save: bool,
     ) -> bool {
-        // A pairing the server rejected for a taken username is retried here
-        // rather than saved: the server is not yet paired, so there is nothing to
-        // persist until the pairing succeeds.
-        if let Some(pending) = self.username_retry.take() {
-            if pending.server.label == draft.original_label() {
-                let server = match draft.to_update() {
-                    Ok(update) => update.server,
-                    Err(error) => {
-                        self.set_error(error);
-                        self.username_retry = Some(pending);
-                        return false;
-                    }
-                };
-                return self.retry_username_pairing(pending, server);
+        // A pairing the server rejected for a taken username is retried here.
+        // The provisional recovery entry is updated before the retry; the final
+        // bearer token replaces it only after pairing succeeds.
+        if self.pairing_owner == Some(self.issuing_client) {
+            if let Some(pending) = self.username_retry.take() {
+                if pending.server.label == draft.original_label() {
+                    let server = match draft.to_update() {
+                        Ok(update) => update.server,
+                        Err(error) => {
+                            self.set_error(error);
+                            self.username_retry = Some(pending);
+                            return false;
+                        }
+                    };
+                    return self.retry_username_pairing(pending, server);
+                }
+                self.username_retry = Some(pending);
             }
-            self.username_retry = Some(pending);
         }
         let update = match draft.to_update() {
             Ok(update) => update,
@@ -4856,6 +4971,9 @@ impl App {
             self.pairing_owner = None;
             self.password_prompt_active = false;
             self.pending_pair.take();
+            if let Some(pending) = self.username_retry.take() {
+                self.discard_provisional_open_pair(&pending);
+            }
         }
         if self.room.settings_owner != Some(client_id) {
             return;
@@ -8406,6 +8524,62 @@ mod tests {
     }
 
     #[test]
+    fn username_rejection_clears_password_prompt_state_before_opening_editor() {
+        let mut app = test_app();
+        app.pending_pair = Some(pending_open_pair("public"));
+        app.pairing_owner = Some(crate::client_channel::ClientId::PRIMARY);
+        app.password_prompt_active = true;
+
+        app.handle_app_event(
+            NetworkEvent::UsernameTaken {
+                message: "username already in use".to_string(),
+            }
+            .into(),
+        );
+
+        assert!(!app.password_prompt_active);
+        assert!(app.pending_pair.is_none());
+        assert!(app.username_retry.is_some());
+        assert_eq!(
+            app.pairing_owner,
+            Some(crate::client_channel::ClientId::PRIMARY)
+        );
+    }
+
+    #[test]
+    fn canceling_username_retry_discards_provisional_recovery_secret() {
+        let mut app = test_app();
+        let mut pending = pending_open_pair("public");
+        pending.server.token = format!("{OPEN_PAIR_RECOVERY_PREFIX}{}", "ab".repeat(32));
+        pending.open = Some(pending.server.token.clone());
+        app.config.servers.push(pending.server.clone());
+        app.username_retry = Some(pending);
+        app.pairing_owner = Some(crate::client_channel::ClientId::PRIMARY);
+
+        app.cancel_server_edit();
+
+        assert!(app.username_retry.is_none());
+        assert!(app.config.servers.is_empty());
+        assert_eq!(app.pairing_owner, None);
+    }
+
+    #[test]
+    fn unrelated_terminal_cannot_cancel_an_owned_username_retry() {
+        let mut app = test_app();
+        app.username_retry = Some(pending_open_pair("public"));
+        app.pairing_owner = Some(crate::client_channel::ClientId::PRIMARY);
+        app.issuing_client = crate::client_channel::ClientId(6);
+
+        app.cancel_server_edit();
+
+        assert!(app.username_retry.is_some());
+        assert_eq!(
+            app.pairing_owner,
+            Some(crate::client_channel::ClientId::PRIMARY)
+        );
+    }
+
+    #[test]
     fn stale_dynamic_token_auth_failure_starts_repair_pairing() {
         let mut app = test_app();
         app.config.servers.push(ServerEntry {
@@ -8499,6 +8673,46 @@ mod tests {
                 OverlaySpec::PairingPassword { retry: false }
             )))
         ));
+    }
+
+    #[test]
+    fn remote_auth_username_collision_opens_editor_on_connection_owner() {
+        let mut app = test_app();
+        let owner = crate::client_channel::ClientId(6);
+        let view = attach_test_client(&mut app, owner);
+        let channel = app.channel_for(owner).expect("attached channel");
+        app.config.servers.push(ServerEntry {
+            label: "public".to_string(),
+            username: "Zoe".to_string(),
+            ..ServerEntry::default()
+        });
+        app.connection_attempt = Some(ConnectionAttempt {
+            generation: 1,
+            owner,
+            server_label: "public".to_string(),
+        });
+
+        app.handle_app_event(
+            NetworkEvent::AuthFailed {
+                code: ERROR_USERNAME_TAKEN,
+                message: "username already in use".to_string(),
+            }
+            .into(),
+        );
+
+        let events = channel.drain_events();
+        assert!(events.into_iter().any(|event| matches!(
+            event,
+            TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(_)))
+        )));
+        assert_eq!(
+            view.lock().status.text(),
+            "username already in use; choose another"
+        );
+        assert_ne!(
+            app.view.status.text(),
+            "username already in use; choose another"
+        );
     }
 
     #[test]
@@ -11002,13 +11216,28 @@ mod tests {
     #[test]
     fn join_no_match_pairable_address_falls_back_to_pairing() {
         let mut app = app_with_servers(&[("lab", "10.0.0.1:4000")]);
+        let path =
+            std::env::temp_dir().join(format!("chatt-pair-recovery-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        app.config.config_path = Some(path.clone());
         assert_eq!(
             app.resolve_join("192.168.0.1:4000"),
             JoinResolution::Pair("192.168.0.1:4000".to_string())
         );
         app.start_named_join("192.168.0.1:4000".to_string());
-        assert!(app.pending_pair.is_some());
+        let pending = app.pending_pair.as_ref().expect("pairing started");
+        assert!(pending.server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX));
+        assert_eq!(
+            app.config.server(&pending.server.label).unwrap().token,
+            pending.server.token
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(&pending.server.token)
+        );
         assert!(app.room.join_notice.is_some());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

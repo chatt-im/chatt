@@ -2227,6 +2227,9 @@ pub fn validate_username(username: &str) -> Result<(), String> {
     if username.len() > 64 {
         return Err("username exceeds 64 bytes".to_string());
     }
+    if username.chars().any(char::is_control) {
+        return Err("username must not contain control characters".to_string());
+    }
     Ok(())
 }
 
@@ -2289,6 +2292,12 @@ fn is_reserved_theme_palette_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn username_validation_rejects_control_characters() {
+        assert!(validate_username("Alice").is_ok());
+        assert!(validate_username("bad\u{1}name").is_err());
+    }
 
     /// Runs semantic validation and returns the error messages, joined.
     fn validation_errors(config: &Config) -> String {

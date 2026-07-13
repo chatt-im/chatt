@@ -30,17 +30,17 @@ use rpc::{
         ERROR_BUG_REPORT_REJECTED, ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST,
         ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED,
         ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, FileContentEncoding,
-        FileMetadata,
-        InviteTicket, MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES, MAX_FILE_CHUNK_BYTES,
-        MessageFlags, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind,
-        ServerControl, UserSummary, decode_client_control, decode_client_hello,
+        FileMetadata, InviteTicket, MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
+        MAX_FILE_CHUNK_BYTES, MessageFlags, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole,
+        RoomInfo, RoomKind, ServerControl, UserSummary, decode_client_control, decode_client_hello,
         encode_invite_ticket, encode_server_control, encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims,
-        KEY_LEN, KeyMaterial, RecordProtection, SessionTransport, TransportMode, VideoKeyRole,
-        derive_video_keys, encode_hex, issue_dynamic_token, respond_to_client_hello,
-        verify_dynamic_token,
+        KEY_LEN, KeyMaterial, OPEN_PAIR_RECOVERY_PREFIX, RecordProtection, SessionTransport,
+        TransportMode, VideoKeyRole, derive_video_keys, dynamic_user_id_from_pairing_secret,
+        dynamic_user_id_from_recovery_token, encode_hex, issue_dynamic_token,
+        respond_to_client_hello, verify_dynamic_token,
     },
     evented::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
@@ -53,7 +53,9 @@ use rpc::{
     video::{self, SharedVideoFrame, VideoAck, VideoHello, VideoRecordReader, VideoRole},
 };
 
-use config::{Config as ServerConfig, UserConfig, hash_secret, value_arg, verify_secret_hash};
+use config::{
+    Config as ServerConfig, UserConfig, hash_secret, valid_username, value_arg, verify_secret_hash,
+};
 use history_reader::{HistoryReadReply, HistoryReader};
 use local_admin::{AdminCommand, AdminSocket};
 use room_store::{MutationKind, RoomStore};
@@ -2004,18 +2006,32 @@ impl Server {
             );
         };
         let username = username.trim();
-        let user = if !valid_username(username) || username == user.username {
+        if !valid_username(username) {
+            kvlog::warn!(
+                "authenticate rejected",
+                token = token.0,
+                user_id = user.id.0,
+                reason = "invalid_username"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_PAIRING_INVALID_REQUEST,
+                "authentication failed: username must be 1-64 bytes with no control characters"
+                    .to_string(),
+            );
+        }
+        if !self.usernames.is_available(username, Some(user.id)) {
+            kvlog::warn!(
+                "authenticate rejected",
+                token = token.0,
+                user_id = user.id.0,
+                reason = "username_taken"
+            );
+            return self.reject_username_taken(token);
+        }
+        let user = if username == user.username {
             user
         } else {
-            if !self.usernames.is_available(username, Some(user.id)) {
-                kvlog::warn!(
-                    "authenticate rejected",
-                    token = token.0,
-                    user_id = user.id.0,
-                    reason = "username_taken"
-                );
-                return self.reject_username_taken(token);
-            }
             match self.users.set_user_username(user.id, username.to_string()) {
                 Ok(updated) => {
                     self.usernames.set_explicit(updated.id, &updated.username);
@@ -2291,8 +2307,8 @@ impl Server {
     }
 
     /// Self-service join on a public server. Verifies the password, allocates (or
-    /// reuses, when `existing_token` still decodes) a dynamic user id, and issues
-    /// a fresh bearer token bound to the current password epoch.
+    /// recovers from `existing_token`) a dynamic user id, and issues a fresh
+    /// bearer token bound to the current password epoch.
     fn open_pair_client(
         &mut self,
         token: Token,
@@ -2353,15 +2369,42 @@ impl Server {
         }
         let seed = self.config.security.server_identity_seed.clone();
         let current_epoch = self.config.password_epoch();
-        let existing_user_id = (!existing_token.is_empty())
+        let verified_claims = (!existing_token.is_empty())
             .then(|| verify_dynamic_token(&seed, existing_token).ok())
             .flatten()
+            .filter(|claims| is_dynamic_user_id(claims.user_id));
+        let token_user_id = verified_claims
             .filter(|claims| claims.password_epoch == current_epoch || current_password_verified)
-            .map(|claims| claims.user_id)
-            .filter(|user_id| is_dynamic_user_id(*user_id));
-        // Reject a taken username before allocating an id, so a rejected attempt
-        // never burns a dynamic id. A reused-token id may keep its own name.
-        if !self.usernames.is_available(username, existing_user_id) {
+            .map(|claims| claims.user_id);
+        let stale_recovery_user_id = verified_claims
+            .filter(|claims| claims.password_epoch != current_epoch && !current_password_verified)
+            .and_then(|_| {
+                dynamic_user_id_from_pairing_secret(&seed, existing_token.as_bytes()).ok()
+            });
+        let recovery_user_id = existing_token
+            .starts_with(OPEN_PAIR_RECOVERY_PREFIX)
+            .then(|| dynamic_user_id_from_recovery_token(&seed, existing_token).ok())
+            .flatten();
+        if existing_token.starts_with(OPEN_PAIR_RECOVERY_PREFIX) && recovery_user_id.is_none() {
+            return self.reject_auth(
+                token,
+                ERROR_PAIRING_INVALID_REQUEST,
+                "open pairing failed: recovery token is invalid".to_string(),
+            );
+        }
+        let existing_user_id = token_user_id
+            .or(recovery_user_id)
+            .or(stale_recovery_user_id);
+        let Some(user_id) = existing_user_id else {
+            return self.reject_auth(
+                token,
+                ERROR_PAIRING_INVALID_REQUEST,
+                "open pairing failed: a recovery token is required".to_string(),
+            );
+        };
+        // Reject a taken username before charging the allocation rate limit. A
+        // recovered or returning user id may keep its own name.
+        if !self.usernames.is_available(username, Some(user_id)) {
             kvlog::warn!(
                 "open pair rejected",
                 token = token.0,
@@ -2369,31 +2412,11 @@ impl Server {
             );
             return self.reject_username_taken(token);
         }
-        let user_id = match existing_user_id {
-            Some(user_id) => user_id,
-            None => {
-                if !self.check_open_pair_allocation_rate(token)? {
-                    return Ok(());
-                }
-                match self.users.allocate_dynamic_user_id() {
-                    Ok(user_id) => user_id,
-                    Err(error) => {
-                        kvlog::error!(
-                            "open pair rejected",
-                            token = token.0,
-                            reason = "state_write_failed",
-                            error = error.as_str()
-                        );
-                        return self.reject_auth(
-                            token,
-                            control::ERROR_INTERNAL,
-                            "open pairing failed: the server could not persist state; retry later"
-                                .to_string(),
-                        );
-                    }
-                }
+        if token_user_id.is_none() && !self.usernames.contains_user(user_id) {
+            if !self.check_open_pair_allocation_rate(token)? {
+                return Ok(());
             }
-        };
+        }
         let issued = issue_dynamic_token(
             &seed,
             &DynamicTokenClaims {
@@ -5644,13 +5667,6 @@ fn subscriber_within_limit(write_buf_len: usize) -> bool {
     write_buf_len <= VIDEO_SUBSCRIBER_HIGH_WATER
 }
 
-/// Whether a client-supplied display name is acceptable: non-empty after
-/// trimming, at most 64 bytes, and free of control characters, which must
-/// never reach the persisted user registry.
-fn valid_username(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64 && !name.chars().any(char::is_control)
-}
-
 fn is_dynamic_user_id(user_id: UserId) -> bool {
     user_id.0 >= config::FIRST_DYNAMIC_USER_ID
 }
@@ -8854,10 +8870,39 @@ mod tests {
         assert!(server.sessions.is_empty());
     }
 
+    #[test]
+    fn authenticate_rejects_invalid_username_instead_of_using_the_stored_one() {
+        let mut server = test_server();
+        let token_secret = "alice-client-generated-token-with-at-least-32-bytes";
+        server.users.users = vec![UserConfig {
+            id: UserId(7),
+            internal_reference: "alice-internal".to_string(),
+            username: "Alice".to_string(),
+            token_hash: hash_secret(token_secret),
+        }];
+        server.usernames = UsernameRegistry::in_memory(&server.users.users);
+        let (conn, mut peer) = test_live_client();
+        server.clients.insert(Token(1), conn);
+
+        server
+            .authenticate_client(Token(1), "bad\u{1}name", token_secret, true, 0)
+            .unwrap();
+
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+            panic!("expected invalid-username error");
+        };
+        assert_eq!(code, ERROR_PAIRING_INVALID_REQUEST);
+        assert!(server.sessions.is_empty());
+    }
+
     fn open_pair_test_server() -> Server {
         let mut server = test_server();
         server.config.security.public = true;
         server
+    }
+
+    fn open_pair_recovery(tag: u64) -> String {
+        format!("{OPEN_PAIR_RECOVERY_PREFIX}{tag:064x}")
     }
 
     fn session_for(server: &Server, token: Token) -> Option<&Session> {
@@ -8872,11 +8917,40 @@ mod tests {
         let mut server = open_pair_test_server();
 
         let _peer = seed_session_client(&mut server, Token(1));
-        let _ = server.open_pair_client(Token(1), "Zoe", "", "", true, 0);
+        let recovery = open_pair_recovery(1);
+        let _ = server.open_pair_client(Token(1), "Zoe", "", &recovery, true, 0);
 
         let session = session_for(&server, Token(1)).expect("session established");
-        assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID));
+        assert_eq!(
+            session.user_id,
+            dynamic_user_id_from_recovery_token(
+                &server.config.security.server_identity_seed,
+                &recovery,
+            )
+            .unwrap()
+        );
         assert_eq!(session.username, "Zoe");
+    }
+
+    #[test]
+    fn open_pair_recovery_token_reclaims_identity_after_a_lost_response() {
+        let mut server = open_pair_test_server();
+        let recovery = open_pair_recovery(2);
+
+        let _lost_response = seed_session_client(&mut server, Token(1));
+        server
+            .open_pair_client(Token(1), "Zoe", "", &recovery, true, 0)
+            .unwrap();
+        let first_id = session_for(&server, Token(1)).unwrap().user_id;
+
+        let _retry_response = seed_session_client(&mut server, Token(2));
+        server
+            .open_pair_client(Token(2), "Zoe", "", &recovery, true, 0)
+            .unwrap();
+        let retry = session_for(&server, Token(2)).expect("retry session established");
+
+        assert_eq!(retry.user_id, first_id);
+        assert_eq!(server.usernames.owner_of("Zoe"), Some(first_id));
     }
 
     #[test]
@@ -8884,16 +8958,18 @@ mod tests {
         let mut server = open_pair_test_server();
         // First user claims "Zoe".
         let _peer = seed_session_client(&mut server, Token(1));
+        let first_recovery = open_pair_recovery(3);
         server
-            .open_pair_client(Token(1), "Zoe", "", "", true, 0)
+            .open_pair_client(Token(1), "Zoe", "", &first_recovery, true, 0)
             .unwrap();
         assert!(session_for(&server, Token(1)).is_some());
 
         // A different fresh connection cannot take it, even by a case variant.
         let (conn, mut peer) = test_live_client();
         server.clients.insert(Token(2), conn);
+        let second_recovery = open_pair_recovery(4);
         server
-            .open_pair_client(Token(2), "zoe", "", "", true, 0)
+            .open_pair_client(Token(2), "zoe", "", &second_recovery, true, 0)
             .unwrap();
         let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
             panic!("expected username-taken error");
@@ -8952,8 +9028,9 @@ mod tests {
 
         let (conn, mut peer) = test_live_client();
         server.clients.insert(Token(2), conn);
+        let recovery = open_pair_recovery(5);
         server
-            .open_pair_client(Token(2), "alice", "", "", true, 0)
+            .open_pair_client(Token(2), "alice", "", &recovery, true, 0)
             .unwrap();
         let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
             panic!("expected username-taken error");
@@ -9018,7 +9095,8 @@ mod tests {
         assert!(session_for(&server, Token(2)).is_none());
 
         let _peer = seed_session_client(&mut server, Token(3));
-        let _ = server.open_pair_client(Token(3), "Zoe", "hunter2", "", true, 0);
+        let recovery = open_pair_recovery(6);
+        let _ = server.open_pair_client(Token(3), "Zoe", "hunter2", &recovery, true, 0);
         assert!(session_for(&server, Token(3)).is_some());
     }
 
@@ -9062,7 +9140,9 @@ mod tests {
         let _ = server.open_pair_client(Token(1), "Zoe", "", &existing, true, 0);
 
         let session = session_for(&server, Token(1)).expect("session established");
-        assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID));
+        let expected = dynamic_user_id_from_pairing_secret(&seed, existing.as_bytes()).unwrap();
+        assert_eq!(session.user_id, expected);
+        assert_ne!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID + 5));
     }
 
     #[test]
@@ -9114,8 +9194,9 @@ mod tests {
         let (conn, _peer) = test_live_client();
         server.clients.insert(token, conn);
 
+        let recovery = open_pair_recovery(7);
         server
-            .open_pair_client(token, "Zoe", "", "", true, 0)
+            .open_pair_client(token, "Zoe", "", &recovery, true, 0)
             .unwrap();
 
         let session = session_for(&server, token).expect("session established");
@@ -9237,8 +9318,9 @@ mod tests {
             let (conn, peer) = test_live_client();
             server.clients.insert(token, conn);
             // Each allocation is a distinct user, so each needs a distinct name.
+            let recovery = open_pair_recovery(100 + index as u64);
             server
-                .open_pair_client(token, &format!("Zoe{index}"), "", "", true, 0)
+                .open_pair_client(token, &format!("Zoe{index}"), "", &recovery, true, 0)
                 .unwrap();
             assert!(session_for(&server, token).is_some());
             peers.push(peer);
@@ -9248,8 +9330,9 @@ mod tests {
         server.clients.insert(blocked, conn);
         peers.push(peer);
 
+        let recovery = open_pair_recovery(999);
         server
-            .open_pair_client(blocked, "Zoe", "", "", true, 0)
+            .open_pair_client(blocked, "Zoe", "", &recovery, true, 0)
             .unwrap();
 
         assert!(session_for(&server, blocked).is_none());
