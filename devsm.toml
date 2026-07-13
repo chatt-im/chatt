@@ -1,5 +1,8 @@
 [service.server]
 profiles = ["private", "pop", "public", "plaintext"]
+require = [
+  { if.profile = "public", then = { resource = "public-server-data" }, or_else = { if.profile = "plaintext", then = { resource = "plaintext-server-data" }, or_else = { resource = "private-server-data" } } },
+]
 sh = '''
 rm -f /tmp/chatt-server.kvlog
 cargo run $CARGO_FLAGS -p server -- --logfile /tmp/chatt-server.kvlog serve $CHATT_SERVER_CONFIG
@@ -94,6 +97,24 @@ else
 fi
 '''
 info = "Run the Carol prerecorded-audio soundboard client; trailing args run a chatt subcommand against it"
+
+[action.reset-server-data]
+require = [
+  { resource = "private-server-data" },
+  { resource = "public-server-data" },
+  { resource = "plaintext-server-data" },
+]
+sh = '''
+set -eu
+
+git restore --source=HEAD -- 'dev/*-server-data/users.toml'
+for data_dir in dev/*-server-data; do
+  find "$data_dir" -depth -mindepth 1 ! -path "$data_dir/users.toml" -delete
+done
+
+echo "Reset test server data; retained users.toml fixtures"
+'''
+info = "Reset all test server data while retaining the configured users"
 
 [test.cargo]
 cmd = ["cargo", "nextest", "run", "--workspace", {var = "args"}]
