@@ -111,10 +111,30 @@ pub(crate) struct PendingPair {
     /// Open-pairing context: the existing token to preserve identity on re-pair
     /// (empty on a first join). `None` for invite pairing.
     pub(crate) open: Option<String>,
+    /// Password used by the latest open-pairing attempt. Retained until pairing
+    /// finishes so a username-collision retry does not challenge for it again.
+    /// Empty before a password is submitted and unused for invite pairing.
+    pub(crate) open_password: String,
     /// Invite pairing code, retained so a rejected attempt (e.g. the username was
     /// taken) can be retried with a new username. `None` for open pairing.
     pub(crate) pairing_code: Option<String>,
     pub(crate) completion: PairCompletion,
+}
+
+impl PendingPair {
+    /// Returns the password and existing token for an open-pair attempt.
+    /// Supplying a password replaces the retained value; omitting it reuses the
+    /// latest value for a retry that changed only the username.
+    pub(super) fn open_pair_credentials(
+        &mut self,
+        password: Option<String>,
+    ) -> Option<(String, String)> {
+        let existing_token = self.open.clone()?;
+        if let Some(password) = password {
+            self.open_password = password;
+        }
+        Some((self.open_password.clone(), existing_token))
+    }
 }
 
 pub(crate) enum PairCompletion {
@@ -753,6 +773,26 @@ mod tests {
             history: HistoryOverrides::default(),
         }];
         server
+    }
+
+    #[test]
+    fn open_pair_credentials_reuse_the_submitted_password() {
+        let mut pending = PendingPair {
+            server: ServerEntry::default(),
+            open: Some("existing-token".to_string()),
+            open_password: String::new(),
+            pairing_code: None,
+            completion: PairCompletion::OpenEditor,
+        };
+
+        assert_eq!(
+            pending.open_pair_credentials(Some("hunter2".to_string())),
+            Some(("hunter2".to_string(), "existing-token".to_string()))
+        );
+        assert_eq!(
+            pending.open_pair_credentials(None),
+            Some(("hunter2".to_string(), "existing-token".to_string()))
+        );
     }
 
     #[test]

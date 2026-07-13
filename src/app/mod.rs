@@ -3191,6 +3191,7 @@ impl App {
         self.pending_pair = Some(PendingPair {
             server,
             open: None,
+            open_password: String::new(),
             pairing_code: Some(pairing_code),
             completion: PairCompletion::OpenEditor,
         });
@@ -3223,6 +3224,7 @@ impl App {
         self.pending_pair = Some(PendingPair {
             server,
             open: Some(String::new()),
+            open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
         });
@@ -3297,16 +3299,23 @@ impl App {
     /// Re-runs the open-pairing worker with a user-entered password, preserving
     /// the pending server and its existing token.
     pub(crate) fn submit_open_pair_password(&mut self, password: String) {
-        let Some(pending) = self.pending_pair.as_ref() else {
-            return;
+        let (password, existing_token, alias, client_config) = {
+            let Some(pending) = self.pending_pair.as_mut() else {
+                return;
+            };
+            let Some((password, existing_token)) = pending.open_pair_credentials(Some(password))
+            else {
+                return;
+            };
+            (
+                password,
+                existing_token,
+                pending.server.label.clone(),
+                pending
+                    .server
+                    .client_config(&self.config, self.download_store.clone()),
+            )
         };
-        let Some(existing_token) = pending.open.clone() else {
-            return;
-        };
-        let alias = pending.server.label.clone();
-        let client_config = pending
-            .server
-            .client_config(&self.config, self.download_store.clone());
         spawn_open_pair_once(
             client_config,
             password,
@@ -3429,6 +3438,7 @@ impl App {
         self.pending_pair = Some(PendingPair {
             server,
             open: Some(existing_token),
+            open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::Reconnect {
                 label: label.clone(),
@@ -3457,14 +3467,16 @@ impl App {
         self.pairing_owner = Some(self.issuing_client);
         let client_config = server.client_config(&self.config, self.download_store.clone());
         let events = self.events.sender().for_unscoped_network();
-        let _ = match &pending.pairing_code {
-            Some(code) => spawn_pair_once(client_config, code.clone(), events),
-            None => spawn_open_pair_once(
-                client_config,
-                String::new(),
-                pending.open.clone().unwrap_or_default(),
-                events,
-            ),
+        let pairing_code = pending.pairing_code.clone();
+        let _ = match pairing_code {
+            Some(code) => spawn_pair_once(client_config, code, events),
+            None => {
+                let Some((password, existing_token)) = pending.open_pair_credentials(None) else {
+                    self.set_error("pairing retry context is incomplete");
+                    return false;
+                };
+                spawn_open_pair_once(client_config, password, existing_token, events)
+            }
         };
         let alias = server.label.clone();
         pending.server = server;
@@ -8318,6 +8330,7 @@ mod tests {
                 ..ServerEntry::default()
             },
             open: Some(String::new()),
+            open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
         }
