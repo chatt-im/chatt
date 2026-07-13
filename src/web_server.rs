@@ -462,6 +462,12 @@ enum WebFeed {
         client: u64,
         payload: String,
     },
+    /// A `command_output` or `command_candidates` envelope routed only to the
+    /// tab that issued the command. Transient, not retained.
+    CommandReply {
+        client: u64,
+        payload: String,
+    },
     /// A `file_progress` envelope for an in-flight transfer. Transient: browsers
     /// merge it into the matching placeholder message and it is not retained, so a
     /// browser that connects mid-transfer simply sees the file once it lands.
@@ -536,6 +542,18 @@ pub enum WebRequest {
         request_id: u64,
         transfer_id: u64,
     },
+    /// A slash command composed in the browser; output returns to the issuing
+    /// tab as a `command_output` envelope.
+    RunCommand {
+        client: u64,
+        request_id: u64,
+        body: String,
+    },
+    /// A request for the argument candidates the autocomplete popup offers.
+    CommandCandidates {
+        client: u64,
+        kind: CandidateKind,
+    },
 }
 
 /// A request a browser sends over the WebSocket as a JSON text frame.
@@ -591,6 +609,36 @@ enum ClientRequest {
     /// when read-only.
     #[jsony(rename = "abort_transfer")]
     AbortTransfer { request_id: u64, transfer_id: u64 },
+    /// A slash command composed in the browser; captured output returns as a
+    /// `command_output` envelope. Ignored when read-only.
+    #[jsony(rename = "run_command")]
+    RunCommand { request_id: u64, body: String },
+    /// Asks for the argument candidates the autocomplete popup offers. Answered
+    /// with a targeted `command_candidates` envelope. Ignored when read-only.
+    #[jsony(rename = "command_candidates")]
+    CommandCandidates { kind: CandidateKind },
+}
+
+/// The argument domain a `command_candidates` request asks about.
+#[derive(Jsony, Clone, Copy, Debug, PartialEq, Eq)]
+#[jsony(Json)]
+pub enum CandidateKind {
+    #[jsony(rename = "user")]
+    User,
+    #[jsony(rename = "room")]
+    Room,
+    #[jsony(rename = "sound")]
+    Sound,
+}
+
+impl CandidateKind {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            CandidateKind::User => "user",
+            CandidateKind::Room => "room",
+            CandidateKind::Sound => "sound",
+        }
+    }
 }
 
 /// A cloneable handle the app uses to push messages to the web view.
@@ -653,6 +701,12 @@ impl WebFeedSender {
 
     pub fn send_request_result(&self, client: u64, payload: String) {
         let _ = self.tx.send(WebFeed::RequestResult { client, payload });
+        self.wake.wake();
+    }
+
+    /// Sends slash-command output or argument candidates to the issuing tab.
+    pub fn send_command_reply(&self, client: u64, payload: String) {
+        let _ = self.tx.send(WebFeed::CommandReply { client, payload });
         self.wake.wake();
     }
 
@@ -1152,6 +1206,42 @@ fn run(
                             let _ = server.send_websocket_text(id, payload);
                         }
                     }
+                    Ok(ClientRequest::RunCommand { request_id, body }) if !readonly => {
+                        kvlog::info!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "run_command",
+                            body_len = body.len()
+                        );
+                        if web_requests
+                            .send(WebRequest::RunCommand {
+                                client: id.get(),
+                                request_id,
+                                body,
+                            })
+                            .is_err()
+                        {
+                            let payload = request_result_envelope(
+                                request_id,
+                                "run_command",
+                                false,
+                                Some("the local client is unavailable"),
+                            );
+                            let _ = server.send_websocket_text(id, payload);
+                        }
+                    }
+                    Ok(ClientRequest::CommandCandidates { kind }) if !readonly => {
+                        kvlog::debug!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "command_candidates",
+                            candidates = kind.wire_name()
+                        );
+                        let _ = web_requests.send(WebRequest::CommandCandidates {
+                            client: id.get(),
+                            kind,
+                        });
+                    }
                     Ok(ClientRequest::EditMessage {
                         request_id,
                         target,
@@ -1617,7 +1707,8 @@ fn run(
                     }
                 }
                 Ok(WebFeed::ShareError { client, payload })
-                | Ok(WebFeed::RequestResult { client, payload }) => {
+                | Ok(WebFeed::RequestResult { client, payload })
+                | Ok(WebFeed::CommandReply { client, payload }) => {
                     if let Some(client) = clients.iter().copied().find(|id| id.get() == client) {
                         let _ = server.send_websocket_text(client, &payload);
                     }
@@ -1757,6 +1848,16 @@ fn config_envelope(
         viewer: viewer.wire_name(),
         max_upload_bytes: max_upload_bytes,
         room_name: room_name,
+        commands: [
+            for command in crate::app::commands::web_commands();
+            {
+                name: command.name,
+                usage: command.usage,
+                description: command.description,
+                arg: command.arg.wire_kind(),
+                placeholder: command.arg.placeholder(),
+            }
+        ],
     }
 }
 
@@ -1795,6 +1896,8 @@ fn client_request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::UploadFinish { .. } => "upload_finish",
         ClientRequest::UploadCancel { .. } => "upload_cancel",
         ClientRequest::AbortTransfer { .. } => "abort_transfer",
+        ClientRequest::RunCommand { .. } => "run_command",
+        ClientRequest::CommandCandidates { .. } => "command_candidates",
     }
 }
 
@@ -3271,6 +3374,13 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(text.contains("\"autoplay\":\"with-audio\""), "{text}");
         assert!(text.contains("\"room_name\":\"lobby\""), "{text}");
         assert!(text.contains("\"viewer\":\"tab\""), "{text}");
+        assert!(text.contains("\"commands\""), "{text}");
+        assert!(text.contains("\"/whoami\""), "{text}");
+        assert!(
+            text.contains("\"name\":\"/dm\",\"usage\":\"/dm user\""),
+            "{text}"
+        );
+        assert!(!text.contains("\"/clear\""), "{text}");
     }
 
     #[test]
@@ -3514,6 +3624,74 @@ Sec-WebSocket-Version: 13\r\n\
         );
 
         // A read-only feed drops the write, so nothing reaches the app.
+        assert!(web_rx.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn run_command_and_candidates_forward_when_writable() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: false,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            100,
+            web_tx,
+            false,
+        )
+        .unwrap();
+
+        let mut stream = open_ready_ws(sender.local_addr());
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"run_command","request_id":21,"body":"/whoami"}"#,
+        );
+        assert_eq!(
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WebRequest::RunCommand {
+                client: 1,
+                request_id: 21,
+                body: "/whoami".to_string()
+            }
+        );
+
+        write_ws_text(&mut stream, r#"{"type":"command_candidates","kind":"room"}"#);
+        assert_eq!(
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WebRequest::CommandCandidates {
+                client: 1,
+                kind: CandidateKind::Room
+            }
+        );
+    }
+
+    #[test]
+    fn run_command_ignored_when_readonly() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
+
+        let mut stream = open_ready_ws(sender.local_addr());
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"run_command","request_id":21,"body":"/mute"}"#,
+        );
         assert!(web_rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 

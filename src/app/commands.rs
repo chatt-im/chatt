@@ -3,11 +3,46 @@ use extui_editor::{Editor, InlineCompletion, Mode as EditorMode, Span};
 
 use crate::chat_buffer::VirtualChatBuffer;
 
+/// The argument a slash command accepts, driving web autocomplete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlashArg {
+    None,
+    User,
+    Room,
+    Sound,
+    FreeText(&'static str),
+}
+
+impl SlashArg {
+    /// The wire name the web view keys its argument completion on.
+    pub(crate) fn wire_kind(self) -> &'static str {
+        match self {
+            SlashArg::None => "none",
+            SlashArg::User => "user",
+            SlashArg::Room => "room",
+            SlashArg::Sound => "sound",
+            SlashArg::FreeText(_) => "free",
+        }
+    }
+
+    /// The free-text placeholder hint, if any.
+    pub(crate) fn placeholder(self) -> Option<&'static str> {
+        match self {
+            SlashArg::FreeText(placeholder) => Some(placeholder),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SlashCommand {
     pub(crate) name: &'static str,
     pub(crate) usage: &'static str,
     pub(crate) description: &'static str,
+    pub(crate) arg: SlashArg,
+    /// Whether the command is exposed to the web view; TUI-only commands
+    /// (overlays, local view manipulation) stay false.
+    pub(crate) web: bool,
 }
 
 pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
@@ -15,148 +50,229 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/audio",
         usage: "/audio",
         description: "show receive and playback diagnostics",
+        arg: SlashArg::None,
+        web: true,
     },
     SlashCommand {
         name: "/audio-reset",
         usage: "/audio-reset",
         description: "rebuild audio streams and re-scan devices",
+        arg: SlashArg::None,
+        web: true,
     },
     SlashCommand {
         name: "/clear",
         usage: "/clear",
         description: "clear the local chat view",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/config",
         usage: "/config",
         description: "open settings",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/deafen",
         usage: "/deafen",
         description: "stop playback and mute microphone send",
+        arg: SlashArg::None,
+        web: true,
     },
     SlashCommand {
         name: "/deafened",
         usage: "/deafened",
         description: "show deafen status",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/dm",
         usage: "/dm user",
         description: "open a direct message room with a user",
+        arg: SlashArg::User,
+        web: true,
     },
     SlashCommand {
         name: "/help",
         usage: "/help",
         description: "show this command list",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/mute",
         usage: "/mute",
         description: "mute microphone send",
+        arg: SlashArg::None,
+        web: true,
     },
     SlashCommand {
         name: "/muted",
         usage: "/muted",
         description: "show microphone mute status",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/quit",
         usage: "/quit",
         description: "show the quit key hint",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/report-bug",
         usage: "/report-bug what went wrong",
         description: "send recent logs and diagnostics to the server",
+        arg: SlashArg::FreeText("what went wrong"),
+        web: true,
     },
     SlashCommand {
         name: "/room",
         usage: "/room name",
         description: "switch the viewed room by name",
+        arg: SlashArg::Room,
+        web: true,
     },
     SlashCommand {
         name: "/room-settings",
         usage: "/room-settings",
         description: "open per-room download and persistence overrides",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/rooms",
         usage: "/rooms",
         description: "open the room switcher",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/servers",
         usage: "/servers",
         description: "open the server list",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/settings",
         usage: "/settings",
         description: "open settings",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/sound",
         usage: "/sound N|name",
         description: "play a soundboard clip",
+        arg: SlashArg::Sound,
+        web: true,
     },
     SlashCommand {
         name: "/soundboard",
         usage: "/soundboard",
         description: "list soundboard clips",
+        arg: SlashArg::None,
+        web: true,
     },
     SlashCommand {
         name: "/stats",
         usage: "/stats",
         description: "toggle detailed lobby voice stats",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/undeafen",
         usage: "/undeafen",
         description: "resume playback and microphone send",
+        arg: SlashArg::None,
+        web: true,
     },
     SlashCommand {
         name: "/unmute",
         usage: "/unmute",
         description: "unmute microphone send",
+        arg: SlashArg::None,
+        web: true,
     },
     SlashCommand {
         name: "/upload",
         usage: "/upload path/to/file.ext",
         description: "relay a file to room members",
+        arg: SlashArg::FreeText("path/to/file.ext"),
+        web: false,
     },
     SlashCommand {
         name: "/upload-rate",
         usage: "/upload-rate 200K|off",
         description: "throttle upload speed (bytes/s, K/M suffix, off)",
+        arg: SlashArg::FreeText("200K|off"),
+        web: true,
     },
     SlashCommand {
         name: "/users",
         usage: "/users",
         description: "show known room users",
+        arg: SlashArg::None,
+        web: false,
     },
     SlashCommand {
         name: "/video",
         usage: "/video",
         description: "show screen-share diagnostics",
+        arg: SlashArg::None,
+        web: true,
     },
     SlashCommand {
         name: "/voice",
         usage: "/voice [room]",
         description: "join a room's voice call (default: the viewed room)",
+        arg: SlashArg::Room,
+        web: true,
     },
     SlashCommand {
         name: "/voice-leave",
         usage: "/voice-leave",
         description: "leave the voice call",
+        arg: SlashArg::None,
+        web: true,
     },
     SlashCommand {
         name: "/whoami",
         usage: "/whoami",
         description: "show the current authenticated user",
+        arg: SlashArg::None,
+        web: true,
     },
 ];
+
+/// Looks up a command by its exact `/name` token.
+pub(crate) fn find_command(name: &str) -> Option<&'static SlashCommand> {
+    SLASH_COMMANDS.iter().find(|command| command.name == name)
+}
+
+/// The commands exposed to the web view.
+pub(crate) fn web_commands() -> impl Iterator<Item = &'static SlashCommand> {
+    SLASH_COMMANDS.iter().filter(|command| command.web)
+}
+
+/// Checks that `first_token` names a web-capable command.
+pub(crate) fn web_command_gate(first_token: &str) -> Result<(), String> {
+    let Some(command) = find_command(first_token) else {
+        return Err(format!("unknown command: {first_token}"));
+    };
+    if !command.web {
+        return Err(format!(
+            "{first_token} is not available from the web view"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 pub(crate) struct CommandCompletionState {
@@ -518,6 +634,56 @@ mod tests {
         for text in [first, second] {
             let code = text.strip_prefix("@@").unwrap();
             assert!(rpc::msgref::MessageRef::decode(code).is_some());
+        }
+    }
+
+    #[test]
+    fn web_gate_allows_curated_commands() {
+        let curated = [
+            "/mute",
+            "/unmute",
+            "/deafen",
+            "/undeafen",
+            "/voice",
+            "/voice-leave",
+            "/sound",
+            "/soundboard",
+            "/room",
+            "/dm",
+            "/upload-rate",
+            "/report-bug",
+            "/whoami",
+            "/audio",
+            "/audio-reset",
+            "/video",
+        ];
+        for name in curated {
+            assert_eq!(web_command_gate(name), Ok(()), "{name} must pass the gate");
+        }
+        assert_eq!(web_commands().count(), curated.len());
+    }
+
+    #[test]
+    fn web_gate_rejects_tui_only_and_unknown_commands() {
+        assert_eq!(
+            web_command_gate("/clear"),
+            Err("/clear is not available from the web view".to_string())
+        );
+        assert_eq!(
+            web_command_gate("/settings"),
+            Err("/settings is not available from the web view".to_string())
+        );
+        assert_eq!(
+            web_command_gate("/nope"),
+            Err("unknown command: /nope".to_string())
+        );
+    }
+
+    #[test]
+    fn web_commands_all_carry_usage_and_description() {
+        for command in web_commands() {
+            assert!(command.usage.starts_with(command.name), "{}", command.name);
+            assert!(!command.description.is_empty(), "{}", command.name);
         }
     }
 

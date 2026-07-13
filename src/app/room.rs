@@ -2168,6 +2168,27 @@ impl RoomSession {
         matches.next().is_none().then_some(first.user_id)
     }
 
+    /// Display names of every known user, the domain [`Self::user_id_by_name`]
+    /// resolves `/dm` arguments against.
+    pub(crate) fn user_name_candidates(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .users
+            .values()
+            .map(|user| user.display_name.clone())
+            .filter(|name| !name.is_empty())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Display names of every known room, the domain [`Self::find_room_by_name`]
+    /// resolves `/room` and `/voice` arguments against.
+    pub(crate) fn room_name_candidates(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.metas.values().map(|meta| meta.name.clone()).collect();
+        names.sort();
+        names
+    }
+
     /// Records that `user_id` is in `room_id`'s voice call now, adding them to
     /// the room's voice-seen set and clearing any prior leave timestamp.
     fn note_voice_join(&mut self, room_id: RoomId, user_id: UserId) {
