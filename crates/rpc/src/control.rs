@@ -23,6 +23,9 @@ pub const ERROR_AUTH_REJECTED: u16 = 401;
 pub const ERROR_PAIRING_NOT_ACTIVE: u16 = 410;
 pub const ERROR_PAIRING_CODE_MISMATCH: u16 = 409;
 pub const ERROR_PAIRING_INVALID_REQUEST: u16 = 422;
+/// The requested username is already registered to another user on this server.
+/// The client should re-prompt for a different username.
+pub const ERROR_USERNAME_TAKEN: u16 = 455;
 /// Open pairing was attempted against a server that does not allow it.
 pub const ERROR_PUBLIC_DISABLED: u16 = 403;
 /// Open pairing requires a password and none was supplied.
@@ -80,13 +83,13 @@ pub struct ServerHello {
 #[jsony(Binary, version)]
 pub enum ClientControl {
     Authenticate {
-        display_name: String,
+        username: String,
         token: String,
         receive_files: bool,
         file_receive_limit_bytes: u64,
     },
     Pair {
-        display_name: String,
+        username: String,
         pairing_code: String,
         token: String,
         receive_files: bool,
@@ -96,7 +99,7 @@ pub enum ClientControl {
     /// `existing_token` is a valid dynamic token, reuses) a user id and issues a
     /// fresh bearer token. `password` is empty when the server requires none.
     OpenPair {
-        display_name: String,
+        username: String,
         password: String,
         existing_token: String,
         receive_files: bool,
@@ -419,8 +422,7 @@ pub enum RoomKind {
 #[jsony(Binary, version)]
 pub struct UserSummary {
     pub user_id: UserId,
-    pub display_name: String,
-    pub identifier: String,
+    pub username: String,
     pub online: bool,
     /// Server wall-clock (UNIX ms) the user's current session connected; 0
     /// when offline.
@@ -723,12 +725,12 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             validate_auth_field("token", token)?;
         }
         ClientControl::Pair {
-            display_name,
+            username,
             pairing_code,
             token,
             ..
         } => {
-            validate_auth_field("display name", display_name)?;
+            validate_auth_field("display name", username)?;
             validate_auth_field("pairing code", pairing_code)?;
             validate_auth_field("token", token)?;
             if pairing_code.len() < MIN_PAIRING_SECRET_BYTES {
@@ -739,12 +741,12 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             }
         }
         ClientControl::OpenPair {
-            display_name,
+            username,
             password,
             existing_token,
             ..
         } => {
-            validate_auth_field("display name", display_name)?;
+            validate_auth_field("display name", username)?;
             validate_optional_auth_field("password", password)?;
             validate_optional_auth_field("existing token", existing_token)?;
         }
@@ -1054,7 +1056,7 @@ mod tests {
     #[test]
     fn authenticate_control_round_trips_without_user() {
         let message = ClientControl::Authenticate {
-            display_name: "Alice".to_string(),
+            username: "Alice".to_string(),
             token: "client-generated-token-with-at-least-32-bytes".to_string(),
             receive_files: true,
             file_receive_limit_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
@@ -1068,8 +1070,7 @@ mod tests {
         let message = ServerControl::Presence {
             user: UserSummary {
                 user_id: UserId(5),
-                display_name: "Alice".to_string(),
-                identifier: "alice-internal".to_string(),
+                username: "Alice".to_string(),
                 online: true,
                 connected_at_ms: 1_700_000_000_000,
                 voice_status: ParticipantVoiceStatus {
@@ -1196,7 +1197,7 @@ mod tests {
     #[test]
     fn pair_control_requires_strong_one_time_and_session_secrets() {
         let weak = ClientControl::Pair {
-            display_name: "Alice".to_string(),
+            username: "Alice".to_string(),
             pairing_code: "short".to_string(),
             token: "also-short".to_string(),
             receive_files: true,
@@ -1205,7 +1206,7 @@ mod tests {
         assert!(encode_client_control(&weak).is_err());
 
         let strong = ClientControl::Pair {
-            display_name: "Alice".to_string(),
+            username: "Alice".to_string(),
             pairing_code: "pair-alice-please-change".to_string(),
             token: "client-generated-token-with-at-least-32-bytes".to_string(),
             receive_files: true,
@@ -1217,7 +1218,7 @@ mod tests {
     #[test]
     fn open_pair_allows_empty_optional_password_and_existing_token() {
         let control = ClientControl::OpenPair {
-            display_name: "Alice".to_string(),
+            username: "Alice".to_string(),
             password: String::new(),
             existing_token: String::new(),
             receive_files: true,
@@ -1233,7 +1234,7 @@ mod tests {
     fn open_pair_caps_optional_auth_fields() {
         let long = "x".repeat(MAX_AUTH_FIELD_BYTES + 1);
         let password = ClientControl::OpenPair {
-            display_name: "Alice".to_string(),
+            username: "Alice".to_string(),
             password: long.clone(),
             existing_token: String::new(),
             receive_files: true,
@@ -1242,7 +1243,7 @@ mod tests {
         assert!(encode_client_control(&password).is_err());
 
         let existing = ClientControl::OpenPair {
-            display_name: "Alice".to_string(),
+            username: "Alice".to_string(),
             password: String::new(),
             existing_token: long,
             receive_files: true,
@@ -1286,8 +1287,7 @@ mod tests {
             }],
             users: vec![UserSummary {
                 user_id: UserId(4_294_967_296),
-                display_name: "Zoe".to_string(),
-                identifier: "4294967296".to_string(),
+                username: "Zoe".to_string(),
                 online: true,
                 connected_at_ms: 1_700_000_000_000,
                 voice_status: ParticipantVoiceStatus::default(),

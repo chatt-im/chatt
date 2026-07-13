@@ -211,9 +211,17 @@ pub struct StorageConfig {
 #[toml(FromToml, rename_all = "kebab-case")]
 pub struct UserConfig {
     pub id: UserId,
-    pub name: String,
-    #[toml(default)]
-    pub display_name: String,
+    /// Should ONLY be used in configs, never appear on the RPC boundary and never be used
+    /// for identity during runtime accept, during config loading where it's converted to the
+    /// the UserId. Persisted under the `name` key.
+    #[toml(rename = "name")]
+    pub internal_reference: String,
+
+    /// User chosen username, must be unique in the server. For display purposes only, true identifer is still UserID.
+    /// Persisted under the `display-name` key (the wire/storage rename is deferred).
+    #[toml(default, rename = "display-name")]
+    pub username: String,
+
     #[toml(default)]
     pub token_hash: String,
 }

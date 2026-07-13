@@ -111,6 +111,9 @@ pub(crate) struct PendingPair {
     /// Open-pairing context: the existing token to preserve identity on re-pair
     /// (empty on a first join). `None` for invite pairing.
     pub(crate) open: Option<String>,
+    /// Invite pairing code, retained so a rejected attempt (e.g. the username was
+    /// taken) can be retried with a new username. `None` for open pairing.
+    pub(crate) pairing_code: Option<String>,
     pub(crate) completion: PairCompletion,
 }
 
@@ -144,6 +147,19 @@ impl ServerEditDraft {
             rooms: server.rooms.clone(),
             form: form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, "Label"),
         }
+    }
+
+    /// Like [`Self::from_server`] but opens the form with the cursor on `field`
+    /// (a label inside [`SERVER_SECTION`]), used to send a rejected connect back
+    /// to the offending field.
+    pub(crate) fn from_server_focused(server: &ServerEntry, config: &Config, field: &str) -> Self {
+        let mut draft = Self::from_server(server, config);
+        draft.form = form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, field);
+        draft
+    }
+
+    pub(crate) fn original_label(&self) -> &str {
+        &self.original_label
     }
 
     pub(crate) fn title(&self) -> String {
@@ -699,7 +715,7 @@ pub(crate) fn title_case_ascii(value: &str) -> String {
 /// display name from the operating system account name in title case. It falls
 /// back to `User` when that name is unavailable. The display name is editable
 /// afterward in settings.
-pub(crate) fn default_join_display_name() -> String {
+pub(crate) fn default_join_username() -> String {
     let raw = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default();

@@ -24,7 +24,10 @@ use std::{
 
 use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use rpc::{
-    control::{ChatMutationKind, ERROR_TOKEN_STALE_EPOCH, InviteTicket, ParticipantVoiceStatus},
+    control::{
+        ChatMutationKind, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, InviteTicket,
+        ParticipantVoiceStatus,
+    },
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
 };
 
@@ -79,7 +82,7 @@ pub(crate) use room::{
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
     PairCompletion, PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem,
-    alias_from_tcp_addr, default_join_alias, default_join_display_name, random_token,
+    alias_from_tcp_addr, default_join_alias, default_join_username, random_token,
     server_entry_from_invite, unique_server_alias,
 };
 
@@ -398,6 +401,10 @@ pub(crate) struct App {
     voice_left: bool,
 
     pub pending_pair: Option<PendingPair>,
+    /// A pairing attempt whose username the server rejected as taken. Retained so
+    /// the reopened server-edit form's Save & Join can retry the same pairing
+    /// with the edited username instead of a plain connect.
+    username_retry: Option<PendingPair>,
     pub mic_muted: Arc<AtomicBool>,
     pub deafened: Arc<AtomicBool>,
     pub voice_tx_enabled: Arc<AtomicBool>,
@@ -1309,6 +1316,7 @@ impl App {
             requested_voice_room: None,
             voice_left: false,
             pending_pair: None,
+            username_retry: None,
             mic_muted: Arc::new(AtomicBool::new(false)),
             deafened: Arc::new(AtomicBool::new(false)),
             voice_tx_enabled: Arc::new(AtomicBool::new(false)),
@@ -2507,7 +2515,7 @@ impl App {
         let items: Vec<CandidateItem> = match kind {
             crate::web_server::CandidateKind::User => self
                 .room
-                .user_name_candidates()
+                .username_candidates()
                 .into_iter()
                 .map(|value| CandidateItem {
                     value,
@@ -2689,6 +2697,20 @@ impl App {
         self.set_status(format!("editing server {server_label}"));
     }
 
+    /// Opens the server-edit form for `label` with the cursor on `field`, used to
+    /// send a rejected connect straight back to the offending input.
+    pub(crate) fn replace_with_server_edit_focused(&mut self, label: &str, field: &str) {
+        let Ok(server) = self.config.server(label).cloned() else {
+            self.set_error(format!("server {label} is not configured"));
+            return;
+        };
+        let draft = ServerEditDraft::from_server_focused(&server, &self.config, field);
+        self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(
+            draft,
+        )));
+        self.set_status(format!("editing server {}", server.label));
+    }
+
     fn server_edit_draft(&mut self, label: &str) -> Option<(String, ServerEditDraft)> {
         let Ok(server) = self.config.server(label).cloned() else {
             self.set_error(format!("server {label} is not configured"));
@@ -2699,6 +2721,7 @@ impl App {
     }
 
     pub(crate) fn start_network(&mut self, alias: &str) -> bool {
+        self.username_retry = None;
         let server = match self.config.server(alias) {
             Ok(server) => server.clone(),
             Err(error) => {
@@ -2724,11 +2747,9 @@ impl App {
             }
         };
         let storage = crate::room_history::HistoryStorage::resolve(&self.config, &server);
-        let continuity = self.room.connect_to_server(
-            server.label.clone(),
-            storage,
-            server.effective_display_name(),
-        );
+        let continuity =
+            self.room
+                .connect_to_server(server.label.clone(), storage, server.effective_username());
         if continuity == room::ServerContinuity::NewServer {
             self.view.reset_rooms();
             let catalog_dir = self.room.history_storage().catalog_dir();
@@ -3139,9 +3160,10 @@ impl App {
     }
 
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
+        self.username_retry = None;
         self.pairing_owner = Some(self.issuing_client);
         let alias = unique_server_alias(&self.config, &default_join_alias(&ticket));
-        let display_name = default_join_display_name();
+        let username = default_join_username();
         let token = match random_token() {
             Ok(token) => token,
             Err(error) => {
@@ -3149,7 +3171,7 @@ impl App {
                 return;
             }
         };
-        let server = match server_entry_from_invite(&ticket, alias.clone(), display_name, token) {
+        let server = match server_entry_from_invite(&ticket, alias.clone(), username, token) {
             Ok(server) => server,
             Err(error) => {
                 self.set_error(error);
@@ -3160,6 +3182,7 @@ impl App {
             self.set_error(error);
             return;
         }
+        let pairing_code = ticket.pairing_code.clone();
         spawn_pair_once(
             server.client_config(&self.config, self.download_store.clone()),
             ticket.pairing_code,
@@ -3168,6 +3191,7 @@ impl App {
         self.pending_pair = Some(PendingPair {
             server,
             open: None,
+            pairing_code: Some(pairing_code),
             completion: PairCompletion::OpenEditor,
         });
         self.set_status(format!("pairing {alias}"));
@@ -3177,6 +3201,7 @@ impl App {
     /// server's public key is trusted on first use, the token is server-issued,
     /// and the server prompts for a password only when it requires one.
     pub(crate) fn start_open_pairing(&mut self, addr: String) {
+        self.username_retry = None;
         self.pairing_owner = Some(self.issuing_client);
         let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&addr));
         let server = ServerEntry {
@@ -3184,7 +3209,7 @@ impl App {
             tcp_addr: addr,
             udp_addr: String::new(),
             udp_probe_addr: None,
-            username: default_join_display_name(),
+            username: default_join_username(),
             token: String::new(),
             server_public_key: String::new(),
             ..ServerEntry::default()
@@ -3198,6 +3223,7 @@ impl App {
         self.pending_pair = Some(PendingPair {
             server,
             open: Some(String::new()),
+            pairing_code: None,
             completion: PairCompletion::OpenEditor,
         });
         self.set_status(format!("pairing {alias}"));
@@ -3403,6 +3429,7 @@ impl App {
         self.pending_pair = Some(PendingPair {
             server,
             open: Some(existing_token),
+            pairing_code: None,
             completion: PairCompletion::Reconnect {
                 label: label.clone(),
             },
@@ -3412,6 +3439,41 @@ impl App {
     }
 
     /// Persists a freshly paired server and applies the caller's post-save action.
+    /// Reopens the server-edit form for a pairing the server rejected because the
+    /// username was taken, with the cursor on the Username field. The pairing
+    /// context is retained so Save & Join retries the same pairing.
+    fn begin_username_retry(&mut self, pending: PendingPair) {
+        let draft = ServerEditDraft::from_server_focused(&pending.server, &self.config, "Username");
+        self.username_retry = Some(pending);
+        self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(
+            draft,
+        )));
+        self.set_error("username already in use; choose another");
+    }
+
+    /// Re-runs a pairing attempt whose username was rejected, using the username
+    /// (and any other fields) the user edited in the reopened form.
+    fn retry_username_pairing(&mut self, mut pending: PendingPair, server: ServerEntry) -> bool {
+        self.pairing_owner = Some(self.issuing_client);
+        let client_config = server.client_config(&self.config, self.download_store.clone());
+        let events = self.events.sender().for_unscoped_network();
+        let _ = match &pending.pairing_code {
+            Some(code) => spawn_pair_once(client_config, code.clone(), events),
+            None => spawn_open_pair_once(
+                client_config,
+                String::new(),
+                pending.open.clone().unwrap_or_default(),
+                events,
+            ),
+        };
+        let alias = server.label.clone();
+        pending.server = server;
+        self.pending_pair = Some(pending);
+        self.navigate_all(BaseScreen::Servers { query: None });
+        self.set_status(format!("pairing {alias}"));
+        true
+    }
+
     fn complete_pairing(&mut self, server: ServerEntry, completion: PairCompletion) {
         let alias = server.label.clone();
         self.config.upsert_server(server);
@@ -3583,7 +3645,7 @@ impl App {
                     self.publish_voice_status();
                 }
                 self.mark_room_catalog_dirty();
-                self.set_status(format!("authenticated as {}", self.room.local_user_name));
+                self.set_status(format!("authenticated as {}", self.room.local_username));
                 self.flush_pending_network_commands();
             }
             NetworkEvent::RoomUpserted(info) => {
@@ -3838,7 +3900,7 @@ impl App {
                     });
                     self.set_status(format!(
                         "{} {}",
-                        notice.display_name,
+                        notice.username,
                         if online { "joined" } else { "left" }
                     ));
                 }
@@ -3879,7 +3941,7 @@ impl App {
                     }
                     self.mark_room_catalog_dirty();
                 } else if self.room.voice_room == Some(room_id) {
-                    self.set_status(format!("{} voice ready", notice.display_name));
+                    self.set_status(format!("{} voice ready", notice.username));
                 }
             }
             NetworkEvent::VoiceStopped {
@@ -3908,7 +3970,7 @@ impl App {
                         playback.stop_stream(stream_id.0);
                     }
                     if self.room.voice_room == Some(room_id) {
-                        self.set_status(format!("{} left voice", notice.display_name));
+                        self.set_status(format!("{} left voice", notice.username));
                     }
                 }
             }
@@ -3978,7 +4040,7 @@ impl App {
                 // local share needs no view secret or subscriber connection.
                 let sender = self
                     .user_id
-                    .map(|user_id| self.room.participants.display_name_for(user_id).to_string())
+                    .map(|user_id| self.room.participants.username_for(user_id).to_string())
                     .unwrap_or_else(|| "you".to_string());
                 self.room.available_shares.insert(
                     stream_id,
@@ -4069,6 +4131,23 @@ impl App {
             NetworkEvent::AuthFailed { code, message } => {
                 kvlog::warn!("app auth failed", code, error = message.as_str());
                 if code == ERROR_TOKEN_STALE_EPOCH && self.start_stale_token_repair(&message) {
+                    return;
+                }
+                if code == ERROR_USERNAME_TAKEN {
+                    let label = self
+                        .connection_attempt
+                        .as_ref()
+                        .map(|attempt| attempt.server_label.clone());
+                    self.fail_screencast_if_running(
+                        format!("screen share stopped: {message}"),
+                        false,
+                    );
+                    self.disconnect_network();
+                    match label {
+                        Some(label) => self.replace_with_server_edit_focused(&label, "Username"),
+                        None => self.navigate_all(BaseScreen::Servers { query: None }),
+                    }
+                    self.set_error("username already in use; choose another");
                     return;
                 }
                 self.fail_screencast_if_running(
@@ -4202,6 +4281,13 @@ impl App {
                 self.run_as_pairing_owner(|app| {
                     app.pending_pair.take();
                     app.set_error(error);
+                });
+                self.pairing_owner = None;
+            }
+            NetworkEvent::UsernameTaken { message } => {
+                self.run_as_pairing_owner(|app| match app.pending_pair.take() {
+                    Some(pending) => app.begin_username_retry(pending),
+                    None => app.set_error(message),
                 });
                 self.pairing_owner = None;
             }
@@ -4528,6 +4614,23 @@ impl App {
         draft: &ServerEditDraft,
         join_after_save: bool,
     ) -> bool {
+        // A pairing the server rejected for a taken username is retried here
+        // rather than saved: the server is not yet paired, so there is nothing to
+        // persist until the pairing succeeds.
+        if let Some(pending) = self.username_retry.take() {
+            if pending.server.label == draft.original_label() {
+                let server = match draft.to_update() {
+                    Ok(update) => update.server,
+                    Err(error) => {
+                        self.set_error(error);
+                        self.username_retry = Some(pending);
+                        return false;
+                    }
+                };
+                return self.retry_username_pairing(pending, server);
+            }
+            self.username_retry = Some(pending);
+        }
         let update = match draft.to_update() {
             Ok(update) => update,
             Err(error) => {
@@ -6100,7 +6203,7 @@ impl App {
             }
         };
         let user_id = selected.user_id;
-        let name = selected.display_name;
+        let name = selected.username;
         let value_db = self.config.user_volume_db(&self.room.server_alias, user_id);
         self.room.begin_volume_preview(user_id, value_db);
         let dialog = UserVolumeDialog::new(user_id, name.clone(), value_db, &self.view.theme);
@@ -6115,7 +6218,7 @@ impl App {
             self.set_status("select another user to mute");
             return;
         }
-        let name = self.room.display_name_of(user_id);
+        let name = self.room.username_of(user_id);
         let muted = self.room.toggle_user_mute(user_id);
         self.apply_user_audio_control(user_id);
         self.set_status(format!(
@@ -6142,19 +6245,19 @@ impl App {
             UserVolumeEvent::Invalid(error) => self.set_error(error),
             UserVolumeEvent::Cancel {
                 user_id,
-                user_name,
+                username,
                 original_db,
             } => {
                 self.config
                     .set_user_volume_db(&self.room.server_alias, user_id, original_db);
                 self.apply_user_audio_control_with_volume(user_id, original_db);
                 self.room.clear_volume_preview();
-                self.set_status(format!("canceled local volume for {user_name}"));
+                self.set_status(format!("canceled local volume for {username}"));
                 return true;
             }
             UserVolumeEvent::Save {
                 user_id,
-                user_name,
+                username,
                 value_db,
             } => {
                 self.config
@@ -6167,7 +6270,7 @@ impl App {
                         self.set_status(format!(
                             "saved local volume {}dB for {} to {}",
                             format_signed_db(value_db),
-                            user_name,
+                            username,
                             path.display()
                         ));
                         return true;
@@ -6460,7 +6563,7 @@ impl App {
         }
         self.set_status(format!(
             "opening dm with {}",
-            self.room.display_name_of(user_id)
+            self.room.username_of(user_id)
         ));
     }
 
@@ -6470,7 +6573,7 @@ impl App {
         room_id: RoomId,
         peer: UserId,
     ) {
-        let status = format!("dm with {}", self.room.display_name_of(peer));
+        let status = format!("dm with {}", self.room.username_of(peer));
         self.run_as_client(client_id, |app| {
             if app.set_viewed_room(room_id) {
                 app.set_status(status);
@@ -6963,11 +7066,11 @@ impl App {
         self.set_status(match self.user_id {
             Some(user_id) => format!(
                 "signed in as {} on {} (user {})",
-                self.room.local_user_name, self.room.server_alias, user_id.0
+                self.room.local_username, self.room.server_alias, user_id.0
             ),
             None => format!(
                 "connecting as {} on {}",
-                self.room.local_user_name, self.room.server_alias
+                self.room.local_username, self.room.server_alias
             ),
         });
     }
@@ -7856,6 +7959,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::AuthFailed { .. } => "auth_failed",
         NetworkEvent::PairingSucceeded => "pairing_succeeded",
         NetworkEvent::PairingFailed(_) => "pairing_failed",
+        NetworkEvent::UsernameTaken { .. } => "username_taken",
         NetworkEvent::OpenPairingSucceeded { .. } => "open_pairing_succeeded",
         NetworkEvent::OpenPairingNeedsPassword { .. } => "open_pairing_needs_password",
         NetworkEvent::NativeEncryptionRequired => "native_encryption_required",
@@ -8214,6 +8318,7 @@ mod tests {
                 ..ServerEntry::default()
             },
             open: Some(String::new()),
+            pairing_code: None,
             completion: PairCompletion::OpenEditor,
         }
     }
@@ -8498,11 +8603,10 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    fn user_summary(user_id: UserId, display_name: &str) -> rpc::control::UserSummary {
+    fn user_summary(user_id: UserId, username: &str) -> rpc::control::UserSummary {
         rpc::control::UserSummary {
             user_id,
-            display_name: display_name.to_string(),
-            identifier: display_name.to_string(),
+            username: username.to_string(),
             online: true,
             connected_at_ms: 0,
             voice_status: ParticipantVoiceStatus::default(),
@@ -10509,7 +10613,7 @@ mod tests {
         let mut app = test_app();
         let mut room = RoomMode::default();
         app.room.server_alias = "local".to_string();
-        app.room.local_user_name = "alice".to_string();
+        app.room.local_username = "alice".to_string();
         app.room.room_name = "lobby".to_string();
 
         let mut buffer = Buffer::new(80, 24);

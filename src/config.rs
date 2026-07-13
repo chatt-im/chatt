@@ -96,7 +96,7 @@ impl ServerEntry {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.effective_udp_addr(),
             udp_probe_addr: self.udp_probe_addr.clone(),
-            display_name: self.effective_display_name(),
+            username: self.effective_username(),
             token: self.token.clone(),
             server_public_key: non_empty_string(&self.server_public_key),
             require_native_encryption: self.require_native_encryption,
@@ -110,7 +110,7 @@ impl ServerEntry {
         }
     }
 
-    pub fn effective_display_name(&self) -> String {
+    pub fn effective_username(&self) -> String {
         self.username.trim().to_string()
     }
 
@@ -1651,7 +1651,7 @@ impl Config {
     fn normalize(&mut self) {
         for server in &mut self.servers {
             server.label = server.label.trim().to_string();
-            server.username = server.effective_display_name();
+            server.username = server.effective_username();
             normalize_file_overrides(&mut server.files);
             normalize_history_overrides(&mut server.history);
             for room in &mut server.rooms {

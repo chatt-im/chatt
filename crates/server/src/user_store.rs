@@ -101,12 +101,16 @@ impl UserStore {
     /// registry write fails.
     pub fn mark_user_paired(
         &mut self,
-        user_name: &str,
-        display_name: String,
+        internal_reference: &str,
+        username: String,
         token_hash: String,
     ) -> Result<UserConfig, String> {
-        if let Some(user) = self.users.iter_mut().find(|user| user.name == user_name) {
-            user.display_name = display_name;
+        if let Some(user) = self
+            .users
+            .iter_mut()
+            .find(|user| user.internal_reference == internal_reference)
+        {
+            user.username = username;
             user.token_hash = token_hash;
             let user = user.clone();
             self.save()?;
@@ -127,8 +131,8 @@ impl UserStore {
         }
         let user = UserConfig {
             id,
-            name: user_name.to_string(),
-            display_name,
+            internal_reference: internal_reference.to_string(),
+            username,
             token_hash,
         };
         self.users.push(user.clone());
@@ -136,21 +140,20 @@ impl UserStore {
         Ok(user)
     }
 
-    /// Updates a user's display name and persists the registry.
+    /// Updates a user's username and persists the registry.
     ///
     /// # Errors
     ///
-    /// Returns an error when no user has `user_name` or the registry write
-    /// fails.
-    pub fn set_user_display_name(
+    /// Returns an error when no user has `user_id` or the registry write fails.
+    pub fn set_user_username(
         &mut self,
-        user_name: &str,
-        display_name: String,
+        user_id: UserId,
+        username: String,
     ) -> Result<UserConfig, String> {
-        let Some(user) = self.users.iter_mut().find(|user| user.name == user_name) else {
-            return Err(format!("no user named '{user_name}'"));
+        let Some(user) = self.users.iter_mut().find(|user| user.id == user_id) else {
+            return Err(format!("no user with id {user_id}"));
         };
-        user.display_name = display_name;
+        user.username = username;
         let user = user.clone();
         self.save()?;
         Ok(user)
@@ -195,10 +198,13 @@ impl UserStore {
         for user in &self.users {
             out.push_str("\n[[users]]\n");
             out.push_str(&format!("id = {}\n", user.id.0));
-            out.push_str(&format!("name = \"{}\"\n", toml_quote_value(&user.name)));
+            out.push_str(&format!(
+                "name = \"{}\"\n",
+                toml_quote_value(&user.internal_reference)
+            ));
             out.push_str(&format!(
                 "display-name = \"{}\"\n",
-                toml_quote_value(&user.display_name)
+                toml_quote_value(&user.username)
             ));
             out.push_str(&format!(
                 "token-hash = \"{}\"\n",
@@ -210,10 +216,10 @@ impl UserStore {
 
     fn normalize(&mut self) {
         for user in &mut self.users {
-            user.name = user.name.trim().to_string();
-            user.display_name = user.display_name.trim().to_string();
-            if user.display_name.is_empty() {
-                user.display_name = user.name.clone();
+            user.internal_reference = user.internal_reference.trim().to_string();
+            user.username = user.username.trim().to_string();
+            if user.username.is_empty() {
+                user.username = user.internal_reference.clone();
             }
         }
     }
@@ -225,7 +231,8 @@ impl UserStore {
             ));
         }
         let mut user_ids = HashSet::new();
-        let mut user_names = HashSet::new();
+        let mut internal_reference_names = HashSet::new();
+        let mut usernames = HashSet::new();
         for user in &self.users {
             if user.id == UserId(0) {
                 return Err(format!("{source}: user id must be non-zero"));
@@ -233,28 +240,39 @@ impl UserStore {
             if user.id.0 >= FIRST_DYNAMIC_USER_ID {
                 return Err(format!(
                     "{source}: user {} id must be below {FIRST_DYNAMIC_USER_ID}; higher ids are reserved for dynamic users",
-                    user.name
+                    user.internal_reference
                 ));
             }
-            if user.name.is_empty() {
+            if user.internal_reference.is_empty() {
                 return Err(format!("{source}: user name must not be empty"));
             }
-            if user.display_name.len() > 64 {
+            if user.username.len() > 64 {
                 return Err(format!(
                     "{source}: user {} display-name exceeds 64 bytes",
-                    user.name
+                    user.internal_reference
                 ));
             }
             if !user_ids.insert(user.id) {
                 return Err(format!("{source}: duplicate user id {}", user.id));
             }
-            if !user_names.insert(user.name.as_str()) {
-                return Err(format!("{source}: duplicate user name {}", user.name));
+            if !internal_reference_names.insert(user.internal_reference.as_str()) {
+                return Err(format!(
+                    "{source}: duplicate user name {}",
+                    user.internal_reference
+                ));
+            }
+            // Usernames must be unique server-wide, compared case-insensitively,
+            // to match the runtime uniqueness the registry enforces.
+            if !user.username.is_empty() && !usernames.insert(user.username.trim().to_lowercase()) {
+                return Err(format!(
+                    "{source}: duplicate username {}",
+                    user.username
+                ));
             }
             if !user.token_hash.trim().is_empty() {
                 validate_secret_hash(
                     source,
-                    &format!("user {} token-hash", user.name),
+                    &format!("user {} token-hash", user.internal_reference),
                     &user.token_hash,
                 )?;
             }
@@ -283,14 +301,14 @@ mod tests {
         store.users = vec![
             UserConfig {
                 id: UserId(1),
-                name: "alice".to_string(),
-                display_name: "Alice".to_string(),
+                internal_reference: "alice".to_string(),
+                username: "Alice".to_string(),
                 token_hash: hash_secret("alice-client-generated-token-with-at-least-32-bytes"),
             },
             UserConfig {
                 id: UserId(2),
-                name: "bob".to_string(),
-                display_name: "Bob".to_string(),
+                internal_reference: "bob".to_string(),
+                username: "Bob".to_string(),
                 token_hash: hash_secret("bob-client-generated-token-with-at-least-32-bytes"),
             },
         ];
@@ -307,14 +325,14 @@ mod tests {
             .mark_user_paired("alice", "Alice Example".to_string(), token_hash.clone())
             .unwrap();
         assert_eq!(user.id, UserId(1));
-        assert_eq!(user.display_name, "Alice Example");
+        assert_eq!(user.username, "Alice Example");
         assert_eq!(user.token_hash, token_hash);
 
         let reloaded = UserStore::open(Some(dir.clone())).unwrap();
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(reloaded.users.len(), 1);
-        assert_eq!(reloaded.users[0].name, "alice");
-        assert_eq!(reloaded.users[0].display_name, "Alice Example");
+        assert_eq!(reloaded.users[0].internal_reference, "alice");
+        assert_eq!(reloaded.users[0].username, "Alice Example");
         assert_eq!(reloaded.users[0].token_hash, token_hash);
     }
 
@@ -323,20 +341,20 @@ mod tests {
         let dir = temp_data_dir("control");
         let mut store = UserStore::open(Some(dir.clone())).unwrap();
 
-        let display_name = "x\u{1}y\u{7f}z";
-        let user_name = "dana\u{2}";
+        let username = "x\u{1}y\u{7f}z";
+        let internal_reference = "dana\u{2}";
         store
             .mark_user_paired(
-                user_name,
-                display_name.to_string(),
+                internal_reference,
+                username.to_string(),
                 hash_secret("dana-client-generated-token-with-at-least-32-bytes"),
             )
             .unwrap();
 
         let reloaded = UserStore::open(Some(dir.clone())).unwrap();
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(reloaded.users[0].name, user_name);
-        assert_eq!(reloaded.users[0].display_name, display_name);
+        assert_eq!(reloaded.users[0].internal_reference, internal_reference);
+        assert_eq!(reloaded.users[0].username, username);
     }
 
     #[test]
@@ -350,7 +368,7 @@ mod tests {
 
         assert_eq!(user.id, UserId(1));
         assert_eq!(store.users.len(), 2);
-        assert_eq!(store.users[0].display_name, "Alice Two");
+        assert_eq!(store.users[0].username, "Alice Two");
         assert_eq!(store.users[0].token_hash, token_hash);
     }
 
@@ -367,7 +385,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(user.id, UserId(3));
-        assert_eq!(user.name, "carol");
+        assert_eq!(user.internal_reference, "carol");
         assert_eq!(store.users.len(), 3);
     }
 
@@ -376,8 +394,8 @@ mod tests {
         let mut store = UserStore::in_memory();
         store.users = vec![UserConfig {
             id: UserId(FIRST_DYNAMIC_USER_ID - 1),
-            name: "last".to_string(),
-            display_name: "Last".to_string(),
+            internal_reference: "last".to_string(),
+            username: "Last".to_string(),
             token_hash: hash_secret("last-client-generated-token-with-at-least-32-bytes"),
         }];
 
@@ -393,31 +411,31 @@ mod tests {
     }
 
     #[test]
-    fn set_user_display_name_updates_and_persists() {
+    fn set_user_username_updates_and_persists() {
         let dir = temp_data_dir("rename");
         let mut store = UserStore::open(Some(dir.clone())).unwrap();
         let token_hash = hash_secret("alice-client-generated-token-with-at-least-32-bytes");
-        store
+        let alice = store
             .mark_user_paired("alice", "Alice".to_string(), token_hash.clone())
             .unwrap();
 
         let user = store
-            .set_user_display_name("alice", "Alice Renamed".to_string())
+            .set_user_username(alice.id, "Alice Renamed".to_string())
             .unwrap();
-        assert_eq!(user.display_name, "Alice Renamed");
+        assert_eq!(user.username, "Alice Renamed");
         assert_eq!(user.token_hash, token_hash);
 
         let reloaded = UserStore::open(Some(dir.clone())).unwrap();
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(reloaded.users[0].display_name, "Alice Renamed");
+        assert_eq!(reloaded.users[0].username, "Alice Renamed");
     }
 
     #[test]
-    fn set_user_display_name_rejects_unknown_user() {
+    fn set_user_username_rejects_unknown_user() {
         let mut store = UserStore::in_memory();
         assert!(
             store
-                .set_user_display_name("nobody", "Ghost".to_string())
+                .set_user_username(UserId(999), "Ghost".to_string())
                 .is_err()
         );
     }
@@ -496,6 +514,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         assert!(error.contains("duplicate user name"));
+    }
+
+    #[test]
+    fn open_rejects_duplicate_usernames_case_insensitively() {
+        let dir = temp_data_dir("dup-username");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(USERS_FILE),
+            "[[users]]\nid = 1\nname = \"a\"\ndisplay-name = \"Alice\"\n\n\
+             [[users]]\nid = 2\nname = \"b\"\ndisplay-name = \"alice\"\n",
+        )
+        .unwrap();
+
+        let error = UserStore::open(Some(dir.clone())).unwrap_err();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(error.contains("duplicate username"), "{error}");
     }
 
     #[test]

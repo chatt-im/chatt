@@ -16,6 +16,7 @@ mod history_reader;
 pub mod local_admin;
 pub mod room_store;
 pub mod user_store;
+mod username_registry;
 
 use mio::{
     Events, Interest, Poll, Token, Waker,
@@ -28,7 +29,8 @@ use rpc::{
         self, ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
         ERROR_BUG_REPORT_REJECTED, ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST,
         ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED,
-        ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata,
+        ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, FileContentEncoding,
+        FileMetadata,
         InviteTicket, MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES, MAX_FILE_CHUNK_BYTES,
         MessageFlags, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind,
         ServerControl, UserSummary, decode_client_control, decode_client_hello,
@@ -56,6 +58,7 @@ use history_reader::{HistoryReadReply, HistoryReader};
 use local_admin::{AdminCommand, AdminSocket};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
+use username_registry::UsernameRegistry;
 
 #[cfg(test)]
 use rpc::evented::ReadPumpOutcome;
@@ -391,6 +394,9 @@ pub struct Server {
     /// The server-managed user registry, persisted under the data dir. Public
     /// so harnesses (`bench_upload`) can seed users directly.
     pub users: UserStore,
+    /// Server-wide username uniqueness index, backed by `usernames.log.bin` for
+    /// dynamic users and seeded from `users` for explicit users.
+    usernames: UsernameRegistry,
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
@@ -510,6 +516,8 @@ impl Server {
 
         let users = UserStore::open(config.data_dir())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let usernames = UsernameRegistry::open(config.data_dir(), &users.users)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mut rooms = HashMap::new();
         for room in &config.rooms {
             let access = match &room.members {
@@ -518,7 +526,16 @@ impl Server {
                     members
                         .iter()
                         .filter_map(|member| {
-                            let user = users.users.iter().find(|user| user.name == *member);
+                            // A member is either a numeric user id or an
+                            // internal_reference handle; both resolve to a UserId,
+                            // which is the only identity the room ACL keeps.
+                            if let Ok(id) = member.parse::<u64>() {
+                                return Some(UserId(id));
+                            }
+                            let user = users
+                                .users
+                                .iter()
+                                .find(|user| user.internal_reference == *member);
                             if user.is_none() {
                                 kvlog::warn!(
                                     "private room member does not match any registered user; ignored until that user pairs",
@@ -575,6 +592,7 @@ impl Server {
         Ok(Self {
             config,
             users,
+            usernames,
             poll,
             listener,
             udp,
@@ -1404,7 +1422,7 @@ impl Server {
         let (user_id, sender_name, in_voice) = match self.sessions.get(&session_id) {
             Some(session) => (
                 session.user_id,
-                session.display_name.clone(),
+                session.username.clone(),
                 session.voice_room == Some(room_id),
             ),
             None => return Err("unknown session".to_string()),
@@ -1705,14 +1723,14 @@ impl Server {
             (
                 ConnState::AwaitAuth,
                 ClientControl::Authenticate {
-                    display_name,
+                    username,
                     token: auth_token,
                     receive_files,
                     file_receive_limit_bytes,
                 },
             ) => self.authenticate_client(
                 token,
-                &display_name,
+                &username,
                 &auth_token,
                 receive_files,
                 file_receive_limit_bytes,
@@ -1720,7 +1738,7 @@ impl Server {
             (
                 ConnState::AwaitAuth,
                 ClientControl::Pair {
-                    display_name,
+                    username,
                     pairing_code,
                     token: new_token,
                     receive_files,
@@ -1728,7 +1746,7 @@ impl Server {
                 },
             ) => self.pair_client(
                 token,
-                &display_name,
+                &username,
                 &pairing_code,
                 &new_token,
                 receive_files,
@@ -1737,7 +1755,7 @@ impl Server {
             (
                 ConnState::AwaitAuth,
                 ClientControl::OpenPair {
-                    display_name,
+                    username,
                     password,
                     existing_token,
                     receive_files,
@@ -1745,7 +1763,7 @@ impl Server {
                 },
             ) => self.open_pair_client(
                 token,
-                &display_name,
+                &username,
                 &password,
                 &existing_token,
                 receive_files,
@@ -1949,7 +1967,7 @@ impl Server {
     fn authenticate_client(
         &mut self,
         token: Token,
-        display_name: &str,
+        username: &str,
         auth_token: &str,
         receive_files: bool,
         file_receive_limit_bytes: u64,
@@ -1958,7 +1976,7 @@ impl Server {
         if auth_token.starts_with(DYNAMIC_TOKEN_PREFIX) {
             return self.authenticate_dynamic(
                 token,
-                display_name,
+                username,
                 auth_token,
                 receive_files,
                 file_receive_limit_bytes,
@@ -1985,20 +2003,28 @@ impl Server {
                 "authentication failed: the token is not valid for this server".to_string(),
             );
         };
-        let user_name = user.name.clone();
-        let display_name = display_name.trim();
-        let user = if !valid_display_name(display_name) || display_name == user.display_name {
+        let username = username.trim();
+        let user = if !valid_username(username) || username == user.username {
             user
         } else {
-            match self
-                .users
-                .set_user_display_name(&user_name, display_name.to_string())
-            {
-                Ok(user) => user,
+            if !self.usernames.is_available(username, Some(user.id)) {
+                kvlog::warn!(
+                    "authenticate rejected",
+                    token = token.0,
+                    user_id = user.id.0,
+                    reason = "username_taken"
+                );
+                return self.reject_username_taken(token);
+            }
+            match self.users.set_user_username(user.id, username.to_string()) {
+                Ok(updated) => {
+                    self.usernames.set_explicit(updated.id, &updated.username);
+                    updated
+                }
                 Err(error) => {
                     kvlog::warn!(
-                        "display name update failed",
-                        user = user_name.as_str(),
+                        "username update failed",
+                        user_id = user.id.0,
                         error = error.as_str()
                     );
                     user
@@ -2018,17 +2044,17 @@ impl Server {
     /// Builds a transient [`UserConfig`] for a dynamic (open-paired) user, whose
     /// details are never stored server-side. The user id doubles as the internal
     /// identifier since there is no username.
-    fn dynamic_user(user_id: UserId, display_name: &str) -> UserConfig {
-        let display_name = display_name.trim();
-        let display_name = if valid_display_name(display_name) {
-            display_name.to_string()
+    fn dynamic_user(user_id: UserId, username: &str) -> UserConfig {
+        let username = username.trim();
+        let username = if valid_username(username) {
+            username.to_string()
         } else {
             user_id.to_string()
         };
         UserConfig {
             id: user_id,
-            name: user_id.to_string(),
-            display_name,
+            internal_reference: user_id.to_string(),
+            username,
             token_hash: String::new(),
         }
     }
@@ -2036,7 +2062,7 @@ impl Server {
     fn pair_client(
         &mut self,
         token: Token,
-        display_name: &str,
+        username: &str,
         pairing_code: &str,
         new_token: &str,
         receive_files: bool,
@@ -2061,18 +2087,18 @@ impl Server {
                 "pairing failed: no active invite matches this join string; the invite may have expired, been replaced, or already been used. Ask the admin to issue a new one".to_string(),
             );
         };
-        let display_name = display_name.trim();
-        if !valid_display_name(display_name) {
+        let username = username.trim();
+        if !valid_username(username) {
             kvlog::warn!(
                 "pairing rejected",
                 token = token.0,
                 user = user_name.as_str(),
-                reason = "invalid_display_name"
+                reason = "invalid_username"
             );
             return self.reject_auth(
                 token,
                 ERROR_PAIRING_INVALID_REQUEST,
-                "pairing failed: display name must be 1-64 bytes with no control characters"
+                "pairing failed: username must be 1-64 bytes with no control characters"
                     .to_string(),
             );
         }
@@ -2082,7 +2108,7 @@ impl Server {
             .users
             .users
             .iter()
-            .any(|user| user.name != user_name && user.token_hash == token_hash)
+            .any(|user| user.internal_reference != user_name && user.token_hash == token_hash)
         {
             kvlog::warn!(
                 "pairing rejected",
@@ -2096,34 +2122,51 @@ impl Server {
                 "pairing failed: the generated token is already in use; retry pairing".to_string(),
             );
         }
-        let user =
-            match self
-                .users
-                .mark_user_paired(&user_name, display_name.to_string(), token_hash)
-            {
-                Ok(user) => user,
-                Err(error) => {
-                    kvlog::error!(
-                        "pairing rejected",
-                        token = token.0,
-                        user = user_name.as_str(),
-                        reason = "state_write_failed",
-                        error = error.as_str()
-                    );
-                    return self.reject_auth(
-                        token,
-                        control::ERROR_INTERNAL,
-                        "pairing failed: the server could not persist the pairing; retry pairing"
-                            .to_string(),
-                    );
-                }
-            };
+        // Claimant is this invite's existing record, if it already paired once,
+        // so re-pairing with the same username is allowed.
+        let claimant = self
+            .users
+            .users
+            .iter()
+            .find(|user| user.internal_reference == user_name)
+            .map(|user| user.id);
+        if !self.usernames.is_available(username, claimant) {
+            kvlog::warn!(
+                "pairing rejected",
+                token = token.0,
+                user = user_name.as_str(),
+                reason = "username_taken"
+            );
+            return self.reject_username_taken(token);
+        }
+        let user = match self
+            .users
+            .mark_user_paired(&user_name, username.to_string(), token_hash)
+        {
+            Ok(user) => user,
+            Err(error) => {
+                kvlog::error!(
+                    "pairing rejected",
+                    token = token.0,
+                    user = user_name.as_str(),
+                    reason = "state_write_failed",
+                    error = error.as_str()
+                );
+                return self.reject_auth(
+                    token,
+                    control::ERROR_INTERNAL,
+                    "pairing failed: the server could not persist the pairing; retry pairing"
+                        .to_string(),
+                );
+            }
+        };
         self.invites.remove(&user_name);
+        self.usernames.set_explicit(user.id, &user.username);
         kvlog::info!(
             "pairing accepted",
             token = token.0,
             user_id = user.id.0,
-            user = user.name.as_str()
+            user = user.internal_reference.as_str()
         );
         self.establish_session(
             token,
@@ -2141,7 +2184,7 @@ impl Server {
     fn authenticate_dynamic(
         &mut self,
         token: Token,
-        display_name: &str,
+        username: &str,
         auth_token: &str,
         receive_files: bool,
         file_receive_limit_bytes: u64,
@@ -2198,7 +2241,45 @@ impl Server {
                     .to_string(),
             );
         }
-        let user = Self::dynamic_user(claims.user_id, display_name);
+        let username = username.trim();
+        if !valid_username(username) {
+            kvlog::warn!(
+                "authenticate rejected",
+                token = token.0,
+                user_id = claims.user_id.0,
+                reason = "invalid_username"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_PAIRING_INVALID_REQUEST,
+                "authentication failed: username must be 1-64 bytes with no control characters"
+                    .to_string(),
+            );
+        }
+        if !self.usernames.is_available(username, Some(claims.user_id)) {
+            kvlog::warn!(
+                "authenticate rejected",
+                token = token.0,
+                user_id = claims.user_id.0,
+                reason = "username_taken"
+            );
+            return self.reject_username_taken(token);
+        }
+        if let Err(error) = self.usernames.claim_dynamic(claims.user_id, username) {
+            kvlog::error!(
+                "authenticate rejected",
+                token = token.0,
+                user_id = claims.user_id.0,
+                reason = "state_write_failed",
+                error = error.as_str()
+            );
+            return self.reject_auth(
+                token,
+                control::ERROR_INTERNAL,
+                "authentication failed: the server could not persist state; retry".to_string(),
+            );
+        }
+        let user = Self::dynamic_user(claims.user_id, username);
         self.establish_session(
             token,
             &user,
@@ -2215,7 +2296,7 @@ impl Server {
     fn open_pair_client(
         &mut self,
         token: Token,
-        display_name: &str,
+        username: &str,
         password: &str,
         existing_token: &str,
         receive_files: bool,
@@ -2261,12 +2342,12 @@ impl Server {
             }
             current_password_verified = true;
         }
-        let display_name = display_name.trim();
-        if !valid_display_name(display_name) {
+        let username = username.trim();
+        if !valid_username(username) {
             return self.reject_auth(
                 token,
                 ERROR_PAIRING_INVALID_REQUEST,
-                "open pairing failed: display name must be 1-64 bytes with no control characters"
+                "open pairing failed: username must be 1-64 bytes with no control characters"
                     .to_string(),
             );
         }
@@ -2278,6 +2359,16 @@ impl Server {
             .filter(|claims| claims.password_epoch == current_epoch || current_password_verified)
             .map(|claims| claims.user_id)
             .filter(|user_id| is_dynamic_user_id(*user_id));
+        // Reject a taken username before allocating an id, so a rejected attempt
+        // never burns a dynamic id. A reused-token id may keep its own name.
+        if !self.usernames.is_available(username, existing_user_id) {
+            kvlog::warn!(
+                "open pair rejected",
+                token = token.0,
+                reason = "username_taken"
+            );
+            return self.reject_username_taken(token);
+        }
         let user_id = match existing_user_id {
             Some(user_id) => user_id,
             None => {
@@ -2311,8 +2402,22 @@ impl Server {
             },
         )
         .map_err(|error| error.to_string())?;
+        if let Err(error) = self.usernames.claim_dynamic(user_id, username) {
+            kvlog::error!(
+                "open pair rejected",
+                token = token.0,
+                user_id = user_id.0,
+                reason = "state_write_failed",
+                error = error.as_str()
+            );
+            return self.reject_auth(
+                token,
+                control::ERROR_INTERNAL,
+                "open pairing failed: the server could not persist state; retry later".to_string(),
+            );
+        }
         kvlog::info!("open pair accepted", token = token.0, user_id = user_id.0);
-        let user = Self::dynamic_user(user_id, display_name);
+        let user = Self::dynamic_user(user_id, username);
         self.establish_session(
             token,
             &user,
@@ -2392,6 +2497,14 @@ impl Server {
         });
     }
 
+    fn reject_username_taken(&mut self, token: Token) -> Result<(), String> {
+        self.reject_auth(
+            token,
+            ERROR_USERNAME_TAKEN,
+            "username already in use; choose another".to_string(),
+        )
+    }
+
     fn reject_auth(&mut self, token: Token, code: u16, message: String) -> Result<(), String> {
         self.send_control_to_token(token, &ServerControl::Error { code, message })?;
         if let Some(client) = self.clients.get_mut(&token) {
@@ -2418,8 +2531,7 @@ impl Server {
 
         let session_id = SessionId(self.next_session);
         self.next_session += 1;
-        let display_name = user.display_name.clone();
-        let identifier = user.name.clone();
+        let username = user.username.clone();
 
         let transport = self
             .clients
@@ -2431,8 +2543,7 @@ impl Server {
             session_id,
             Session {
                 user_id,
-                display_name: display_name.clone(),
-                identifier: identifier.clone(),
+                username: username.clone(),
                 tcp_token: token,
                 voice_room: None,
                 udp_addr: None,
@@ -2463,7 +2574,6 @@ impl Server {
             token = token.0,
             session_id = session_id.0,
             user_id = user_id.0,
-            user = identifier.as_str(),
             receive_files,
             file_receive_limit_bytes
         );
@@ -2560,8 +2670,7 @@ impl Server {
                     .find(|session| session.user_id == user.id && session.announced);
                 UserSummary {
                     user_id: user.id,
-                    display_name: user.display_name.clone(),
-                    identifier: user.name.clone(),
+                    username: user.username.clone(),
                     online: session.is_some(),
                     connected_at_ms: session.map(|s| s.connected_at_ms).unwrap_or(0),
                     voice_status: session.map(|s| s.voice_status).unwrap_or_default(),
@@ -2581,8 +2690,7 @@ impl Server {
     fn session_user_summary(session: &Session, online: bool) -> UserSummary {
         UserSummary {
             user_id: session.user_id,
-            display_name: session.display_name.clone(),
-            identifier: session.identifier.clone(),
+            username: session.username.clone(),
             online,
             connected_at_ms: if online { session.connected_at_ms } else { 0 },
             voice_status: if online {
@@ -3036,7 +3144,7 @@ impl Server {
             body_size
         );
         let (sender, sender_name) = match self.sessions.get(&session_id) {
-            Some(session) => (session.user_id, session.display_name.clone()),
+            Some(session) => (session.user_id, session.username.clone()),
             None => {
                 kvlog::warn!(
                     "chat send rejected",
@@ -3093,7 +3201,7 @@ impl Server {
         body: String,
     ) -> Result<(), String> {
         let (sender, sender_name) = match self.sessions.get(&session_id) {
-            Some(session) => (session.user_id, session.display_name.clone()),
+            Some(session) => (session.user_id, session.username.clone()),
             None => {
                 kvlog::warn!(
                     "chat mutation rejected",
@@ -3244,7 +3352,7 @@ impl Server {
             return Err("too many concurrent file uploads".into());
         }
         let (sender, sender_name) = match self.sessions.get(&session_id) {
-            Some(session) => (session.user_id, session.display_name.clone()),
+            Some(session) => (session.user_id, session.username.clone()),
             None => return Err("unknown session".into()),
         };
         if !self.check_room_access(session_id, room_id) {
@@ -4917,12 +5025,12 @@ impl Server {
         let Some(dir) = self.config.security.bug_report_dir.clone() else {
             return Err("bug reports are not enabled on this server".into());
         };
-        let display_name = self
+        let username = self
             .sessions
             .get(&session_id)
-            .map(|session| session.display_name.clone())
+            .map(|session| session.username.clone())
             .unwrap_or_default();
-        let saved = write_bug_report(&dir, &display_name, report_id, &report)?;
+        let saved = write_bug_report(&dir, &username, report_id, &report)?;
         kvlog::info!(
             "bug report saved",
             session_id = session_id.0,
@@ -4939,7 +5047,7 @@ impl Server {
 /// (`.json`). Returns the logs path.
 fn write_bug_report(
     dir: &str,
-    display_name: &str,
+    username: &str,
     report_id: BugReportId,
     report: &ServerBugReport,
 ) -> Result<String, String> {
@@ -4951,10 +5059,10 @@ fn write_bug_report(
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs())
         .unwrap_or(0);
-    let user = sanitize_file_name(if display_name.trim().is_empty() {
+    let user = sanitize_file_name(if username.trim().is_empty() {
         "anon"
     } else {
-        display_name
+        username
     });
     let base = format!("{timestamp}-{user}-{}", report_id.0);
 
@@ -5288,8 +5396,7 @@ impl VideoConn {
 
 struct Session {
     user_id: UserId,
-    display_name: String,
-    identifier: String,
+    username: String,
     tcp_token: Token,
     /// The room whose voice call this session is in, independent of which
     /// room's chat the client is reading.
@@ -5540,7 +5647,7 @@ fn subscriber_within_limit(write_buf_len: usize) -> bool {
 /// Whether a client-supplied display name is acceptable: non-empty after
 /// trimming, at most 64 bytes, and free of control characters, which must
 /// never reach the persisted user registry.
-fn valid_display_name(name: &str) -> bool {
+fn valid_username(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && !name.chars().any(char::is_control)
 }
 
@@ -5879,8 +5986,7 @@ mod tests {
     fn test_session(user_id: UserId, token: Token, voice_room: Option<RoomId>) -> Session {
         Session {
             user_id,
-            display_name: format!("user-{}", user_id.0),
-            identifier: format!("user-{}", user_id.0),
+            username: format!("user-{}", user_id.0),
             tcp_token: token,
             voice_room,
             udp_addr: None,
@@ -6149,14 +6255,14 @@ mod tests {
         let mut server = test_server();
         let alice = UserConfig {
             id: UserId(1),
-            name: "alice".to_string(),
-            display_name: "Alice".to_string(),
+            internal_reference: "alice".to_string(),
+            username: "Alice".to_string(),
             token_hash: String::new(),
         };
         let bob = UserConfig {
             id: UserId(2),
-            name: "bob".to_string(),
-            display_name: "Bob".to_string(),
+            internal_reference: "bob".to_string(),
+            username: "Bob".to_string(),
             token_hash: String::new(),
         };
         let (conn, _alice_peer) = test_live_client();
@@ -6192,8 +6298,8 @@ mod tests {
         server.media_route_to_session.insert(77, SessionId(999));
         let carol = UserConfig {
             id: UserId(3),
-            name: "carol".to_string(),
-            display_name: "Carol".to_string(),
+            internal_reference: "carol".to_string(),
+            username: "Carol".to_string(),
             token_hash: String::new(),
         };
         let (conn, _carol_peer) = test_live_client();
@@ -6455,8 +6561,8 @@ mod tests {
         let mut server = test_server();
         server.users.users.push(UserConfig {
             id: UserId(9),
-            name: "bob".to_string(),
-            display_name: "Bob".to_string(),
+            internal_reference: "bob".to_string(),
+            username: "Bob".to_string(),
             token_hash: String::new(),
         });
         let mut configured = test_session(UserId(9), Token(11), None);
@@ -8714,8 +8820,8 @@ mod tests {
         let token_secret = "alice-client-generated-token-with-at-least-32-bytes";
         server.users.users = vec![UserConfig {
             id: UserId(7),
-            name: "alice-internal".to_string(),
-            display_name: "Alice".to_string(),
+            internal_reference: "alice-internal".to_string(),
+            username: "Alice".to_string(),
             token_hash: hash_secret(token_secret),
         }];
 
@@ -8729,8 +8835,7 @@ mod tests {
             .values()
             .find(|session| session.tcp_token == Token(1))
             .expect("session established by token");
-        assert_eq!(session.identifier, "alice-internal");
-        assert_eq!(session.display_name, "Alice");
+        assert_eq!(session.username, "Alice");
         assert_eq!(session.user_id, UserId(7));
     }
 
@@ -8739,8 +8844,8 @@ mod tests {
         let mut server = test_server();
         server.users.users = vec![UserConfig {
             id: UserId(7),
-            name: "alice-internal".to_string(),
-            display_name: "Alice".to_string(),
+            internal_reference: "alice-internal".to_string(),
+            username: "Alice".to_string(),
             token_hash: hash_secret("alice-client-generated-token-with-at-least-32-bytes"),
         }];
 
@@ -8771,11 +8876,124 @@ mod tests {
 
         let session = session_for(&server, Token(1)).expect("session established");
         assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID));
-        assert_eq!(session.display_name, "Zoe");
-        assert_eq!(
-            session.identifier,
-            config::FIRST_DYNAMIC_USER_ID.to_string()
+        assert_eq!(session.username, "Zoe");
+    }
+
+    #[test]
+    fn open_pair_rejects_a_taken_username() {
+        let mut server = open_pair_test_server();
+        // First user claims "Zoe".
+        let _peer = seed_session_client(&mut server, Token(1));
+        server
+            .open_pair_client(Token(1), "Zoe", "", "", true, 0)
+            .unwrap();
+        assert!(session_for(&server, Token(1)).is_some());
+
+        // A different fresh connection cannot take it, even by a case variant.
+        let (conn, mut peer) = test_live_client();
+        server.clients.insert(Token(2), conn);
+        server
+            .open_pair_client(Token(2), "zoe", "", "", true, 0)
+            .unwrap();
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+            panic!("expected username-taken error");
+        };
+        assert_eq!(code, ERROR_USERNAME_TAKEN);
+        assert!(session_for(&server, Token(2)).is_none());
+    }
+
+    #[test]
+    fn open_pair_lets_a_returning_user_keep_and_change_its_username() {
+        let mut server = open_pair_test_server();
+        let seed = server.config.security.server_identity_seed.clone();
+        let id = UserId(config::FIRST_DYNAMIC_USER_ID + 5);
+        let existing = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id: id,
+                password_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let _peer = seed_session_client(&mut server, Token(1));
+        server
+            .open_pair_client(Token(1), "Zoe", "", &existing, true, 0)
+            .unwrap();
+        assert_eq!(session_for(&server, Token(1)).unwrap().user_id, id);
+
+        // Reconnecting with the same name is fine: the id owns it.
+        let _peer2 = seed_session_client(&mut server, Token(2));
+        server
+            .open_pair_client(Token(2), "Zoe", "", &existing, true, 0)
+            .unwrap();
+        assert!(session_for(&server, Token(2)).is_some());
+
+        // Renaming to a free name works and frees the old one.
+        let _peer3 = seed_session_client(&mut server, Token(3));
+        server
+            .open_pair_client(Token(3), "Zabette", "", &existing, true, 0)
+            .unwrap();
+        assert_eq!(session_for(&server, Token(3)).unwrap().username, "Zabette");
+        assert_eq!(server.usernames.owner_of("zoe"), None);
+        assert_eq!(server.usernames.owner_of("zabette"), Some(id));
+    }
+
+    #[test]
+    fn open_pair_rejects_a_username_owned_by_an_explicit_user() {
+        let mut server = open_pair_test_server();
+        server.users.users = vec![UserConfig {
+            id: UserId(1),
+            internal_reference: "a".to_string(),
+            username: "Alice".to_string(),
+            token_hash: String::new(),
+        }];
+        server.usernames = UsernameRegistry::in_memory(&server.users.users);
+
+        let (conn, mut peer) = test_live_client();
+        server.clients.insert(Token(2), conn);
+        server
+            .open_pair_client(Token(2), "alice", "", "", true, 0)
+            .unwrap();
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+            panic!("expected username-taken error");
+        };
+        assert_eq!(code, ERROR_USERNAME_TAKEN);
+        assert!(session_for(&server, Token(2)).is_none());
+    }
+
+    #[test]
+    fn pairing_rejects_a_username_taken_by_another_user() {
+        let mut server = test_server();
+        server.users.users = vec![UserConfig {
+            id: UserId(1),
+            internal_reference: "zed".to_string(),
+            username: "Zoe".to_string(),
+            token_hash: String::new(),
+        }];
+        server.usernames = UsernameRegistry::in_memory(&server.users.users);
+
+        let code = "pairing-code-secret-1234567890";
+        server.invites.insert(
+            "dana".to_string(),
+            InviteState {
+                pairing_code_hash: hash_secret(code),
+                expires_at: std::time::Instant::now() + INVITE_TTL,
+            },
         );
+
+        let (conn, mut peer) = test_live_client();
+        server.clients.insert(Token(2), conn);
+        let new_token = "dana-client-generated-token-with-at-least-32-bytes";
+        server
+            .pair_client(Token(2), "zoe", code, new_token, true, 0)
+            .unwrap();
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+            panic!("expected username-taken error");
+        };
+        assert_eq!(code, ERROR_USERNAME_TAKEN);
+        // The invite survives so the user can retry with another username.
+        assert!(!server.invites.is_empty());
     }
 
     #[test]
@@ -9018,8 +9236,9 @@ mod tests {
             let token = Token(100 + index);
             let (conn, peer) = test_live_client();
             server.clients.insert(token, conn);
+            // Each allocation is a distinct user, so each needs a distinct name.
             server
-                .open_pair_client(token, "Zoe", "", "", true, 0)
+                .open_pair_client(token, &format!("Zoe{index}"), "", "", true, 0)
                 .unwrap();
             assert!(session_for(&server, token).is_some());
             peers.push(peer);
@@ -9094,8 +9313,8 @@ mod tests {
         let mut server = test_server();
         server.users.users = vec![UserConfig {
             id: UserId(3),
-            name: "dana".to_string(),
-            display_name: "old".to_string(),
+            internal_reference: "dana".to_string(),
+            username: "old".to_string(),
             token_hash: String::new(),
         }];
         let code = "pairing-code-secret-1234567890";
@@ -9116,17 +9335,11 @@ mod tests {
             .users
             .users
             .iter()
-            .find(|user| user.name == "dana")
+            .find(|user| user.internal_reference == "dana")
             .expect("user exists");
         assert!(verify_secret_hash(&user.token_hash, new_token));
-        assert_eq!(user.display_name, "Dana");
+        assert_eq!(user.username, "Dana");
         assert!(server.invites.is_empty());
-        assert!(
-            server
-                .sessions
-                .values()
-                .any(|session| session.identifier == "dana")
-        );
     }
 
     /// A monotonic route-id source for [`test_live_client`], so distinct test
@@ -9237,8 +9450,8 @@ mod tests {
         let mut server = test_server();
         server.users.users = vec![UserConfig {
             id: UserId(4),
-            name: "gwen".to_string(),
-            display_name: "old".to_string(),
+            internal_reference: "gwen".to_string(),
+            username: "old".to_string(),
             token_hash: String::new(),
         }];
         let code = "pairing-code-secret-2468013579";
@@ -9262,7 +9475,7 @@ mod tests {
         let session = server
             .sessions
             .values()
-            .find(|session| session.identifier == "gwen")
+            .find(|session| session.username == "Gwen")
             .expect("pairing session exists");
         assert_eq!(session.voice_room, None);
         assert!(!session.announced);
@@ -9283,14 +9496,14 @@ mod tests {
         server.users.users = vec![
             UserConfig {
                 id: UserId(1),
-                name: "erin".to_string(),
-                display_name: "Erin".to_string(),
+                internal_reference: "erin".to_string(),
+                username: "Erin".to_string(),
                 token_hash: hash_secret(new_token),
             },
             UserConfig {
                 id: UserId(2),
-                name: "frank".to_string(),
-                display_name: "old".to_string(),
+                internal_reference: "frank".to_string(),
+                username: "old".to_string(),
                 token_hash: String::new(),
             },
         ];
@@ -9311,7 +9524,7 @@ mod tests {
             .users
             .users
             .iter()
-            .find(|user| user.name == "frank")
+            .find(|user| user.internal_reference == "frank")
             .expect("frank exists");
         assert!(frank.token_hash.is_empty());
         assert!(!server.invites.is_empty());
@@ -9319,7 +9532,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_rejects_control_character_display_name() {
+    fn pairing_rejects_control_character_username() {
         let mut server = test_server();
         let code = "pairing-code-secret-5544332211";
         server.invites.insert(
@@ -9445,7 +9658,7 @@ mod tests {
             server
                 .sessions
                 .values()
-                .any(|session| session.identifier == "hana")
+                .any(|session| session.username == "Hana")
         );
     }
 

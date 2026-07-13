@@ -1403,6 +1403,7 @@ mod tests {
                 ..ServerEntry::default()
             },
             open: Some(String::new()),
+            pairing_code: None,
             completion: PairCompletion::OpenEditor,
         }
     }

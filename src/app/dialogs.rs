@@ -18,12 +18,12 @@ pub(crate) enum UserVolumeEvent {
     },
     Cancel {
         user_id: UserId,
-        user_name: String,
+        username: String,
         original_db: f32,
     },
     Save {
         user_id: UserId,
-        user_name: String,
+        username: String,
         value_db: f32,
     },
     Invalid(String),
@@ -62,13 +62,13 @@ impl UserVolumeDialog {
         match key.code {
             KeyCode::Esc => UserVolumeEvent::Cancel {
                 user_id: self.user_id,
-                user_name: self.user_name.clone(),
+                username: self.user_name.clone(),
                 original_db: self.original_db,
             },
             KeyCode::Enter => match self.commit_editor() {
                 Ok(value_db) => UserVolumeEvent::Save {
                     user_id: self.user_id,
-                    user_name: self.user_name.clone(),
+                    username: self.user_name.clone(),
                     value_db,
                 },
                 Err(error) => UserVolumeEvent::Invalid(error),
