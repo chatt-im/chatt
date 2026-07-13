@@ -711,7 +711,7 @@ pub(crate) struct RoomSession {
     /// Where this connection persists chat, resolved from the `[history]`
     /// overrides. Disabled when not connected.
     history: HistoryStorage,
-    pub local_user_name: String,
+    pub local_username: String,
     pub room_name: String,
     pub participants: Participants,
     attached_views: HashMap<crate::client_channel::ClientId, RoomId>,
@@ -998,7 +998,7 @@ impl MessageLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SelectedRoomUser {
     pub(crate) user_id: UserId,
-    pub(crate) display_name: String,
+    pub(crate) username: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1018,37 +1018,37 @@ impl UserSelectionError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RoomChatUpdate {
-    pub(crate) local: bool,
+    pub local: bool,
     /// Whether the message was new to the room rather than a replayed frame
     /// dropped by dedup. Notifications and feed pushes key off this.
-    pub(crate) fresh: bool,
-    pub(crate) read_advanced: bool,
+    pub fresh: bool,
+    pub read_advanced: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RoomMutationUpdate {
-    pub(crate) outcome: MutationOutcome,
-    pub(crate) read_advanced: bool,
+    pub outcome: MutationOutcome,
+    pub read_advanced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParticipantNotice {
-    pub(crate) display_name: String,
-    pub(crate) local: bool,
-    pub(crate) relevant: bool,
+    pub username: String,
+    pub local: bool,
+    pub relevant: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HistoryChunkUpdate {
-    pub(crate) changed: bool,
-    pub(crate) read_advanced: bool,
-    pub(crate) next_backfill: Option<(RoomId, Option<MessageId>, u16)>,
+    pub changed: bool,
+    pub read_advanced: bool,
+    pub next_backfill: Option<(RoomId, Option<MessageId>, u16)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VoiceNotice {
-    pub(crate) display_name: String,
-    pub(crate) local: bool,
+    pub username: String,
+    pub local: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1249,7 +1249,7 @@ impl RoomSession {
             epoch: SessionEpoch::default(),
             server_alias: String::new(),
             history: HistoryStorage::disabled(),
-            local_user_name: String::new(),
+            local_username: String::new(),
             room_name: "servers".to_string(),
             participants: Participants::default(),
             attached_views: HashMap::new(),
@@ -1323,7 +1323,7 @@ impl RoomSession {
         &mut self,
         server_alias: String,
         history: HistoryStorage,
-        local_user_name: String,
+        local_username: String,
     ) -> ServerContinuity {
         let continuity = if !history.history_id().is_empty()
             && self.history.history_id() == history.history_id()
@@ -1334,7 +1334,7 @@ impl RoomSession {
         };
         self.server_alias = server_alias;
         self.history = history;
-        self.local_user_name = local_user_name;
+        self.local_username = local_username;
 
         match continuity {
             ServerContinuity::SameServer => {
@@ -1368,7 +1368,7 @@ impl RoomSession {
         self.participants.replace_room(Vec::new());
         self.server_alias.clear();
         self.history = HistoryStorage::disabled();
-        self.local_user_name.clear();
+        self.local_username.clear();
         self.room_name = "servers".to_string();
         self.metas.clear();
         self.rooms.clear();
@@ -1752,8 +1752,7 @@ impl RoomSession {
                     if !peer_name.is_empty() {
                         self.users.entry(*peer).or_insert_with(|| UserSummary {
                             user_id: *peer,
-                            display_name: peer_name.clone(),
-                            identifier: String::new(),
+                            username: peer_name.clone(),
                             online: false,
                             connected_at_ms: 0,
                             voice_status: ParticipantVoiceStatus::default(),
@@ -1806,7 +1805,7 @@ impl RoomSession {
                     ClientRoomKind::Private { .. } => CatalogRoomKind::Private,
                     ClientRoomKind::Dm { user_a, user_b } => {
                         let peer = self.dm_peer(*user_a, *user_b);
-                        let mut peer_name = self.display_name_of(peer);
+                        let mut peer_name = self.username_of(peer);
                         if peer_name.is_empty()
                             && let Some(archived_name) = meta.name.strip_prefix('@')
                         {
@@ -2129,7 +2128,7 @@ impl RoomSession {
             return wire_name.to_string();
         };
         let peer = self.dm_peer(*user_a, *user_b);
-        let name = self.display_name_of(peer);
+        let name = self.username_of(peer);
         if name.is_empty() {
             wire_name.to_string()
         } else {
@@ -2146,35 +2145,37 @@ impl RoomSession {
         }
     }
 
-    pub(crate) fn display_name_of(&self, user_id: UserId) -> String {
+    pub(crate) fn username_of(&self, user_id: UserId) -> String {
         self.users
             .get(&user_id)
-            .map(|user| user.display_name.clone())
+            .map(|user| user.username.clone())
             .unwrap_or_default()
     }
 
     pub(crate) fn user_id_by_name(&self, name: &str) -> Option<UserId> {
         let lowered = name.to_lowercase();
-        if let Some(user) = self.users.values().find(|user| {
-            user.display_name.to_lowercase() == lowered || user.identifier.to_lowercase() == lowered
-        }) {
+        if let Some(user) = self
+            .users
+            .values()
+            .find(|user| user.username.to_lowercase() == lowered)
+        {
             return Some(user.user_id);
         }
         let mut matches = self
             .users
             .values()
-            .filter(|user| user.display_name.to_lowercase().starts_with(&lowered));
+            .filter(|user| user.username.to_lowercase().starts_with(&lowered));
         let first = matches.next()?;
         matches.next().is_none().then_some(first.user_id)
     }
 
     /// Display names of every known user, the domain [`Self::user_id_by_name`]
     /// resolves `/dm` arguments against.
-    pub(crate) fn user_name_candidates(&self) -> Vec<String> {
+    pub(crate) fn username_candidates(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .users
             .values()
-            .map(|user| user.display_name.clone())
+            .map(|user| user.username.clone())
             .filter(|name| !name.is_empty())
             .collect();
         names.sort();
@@ -2313,7 +2314,7 @@ impl RoomSession {
                 };
                 UserListRow {
                     user_id: user.user_id,
-                    name: user.display_name.clone(),
+                    name: user.username.clone(),
                     presence,
                     is_local: Some(user.user_id) == self.local_user,
                 }
@@ -2550,7 +2551,7 @@ impl RoomSession {
     ) -> ParticipantNotice {
         let mut user = user;
         user.online = online;
-        let display_name = user.display_name.clone();
+        let username = user.username.clone();
         let local = Some(user.user_id) == local_user;
         let user_id = user.user_id;
         let relevant = self
@@ -2575,7 +2576,7 @@ impl RoomSession {
                     return None;
                 }
                 let peer = self.dm_peer(user_a, user_b);
-                let name = self.display_name_of(peer);
+                let name = self.username_of(peer);
                 (!name.is_empty()).then_some((*room_id, format!("@{name}")))
             })
             .collect::<Vec<_>>();
@@ -2588,7 +2589,7 @@ impl RoomSession {
             }
         }
         ParticipantNotice {
-            display_name,
+            username,
             local,
             relevant,
         }
@@ -2625,7 +2626,7 @@ impl RoomSession {
             self.participants.voice_started(user_id, stream_id);
         }
         VoiceNotice {
-            display_name: self.display_name_of(user_id),
+            username: self.username_of(user_id),
             local: Some(session_id) == local_session,
         }
     }
@@ -2660,7 +2661,7 @@ impl RoomSession {
         }
         self.stream_users.remove(&stream_id);
         VoiceNotice {
-            display_name: self.display_name_of(user_id),
+            username: self.username_of(user_id),
             local: Some(session_id) == local_session,
         }
     }
@@ -2734,7 +2735,7 @@ impl RoomSession {
     fn selected_user(&self) -> Option<(UserId, String)> {
         self.participants
             .selected()
-            .map(|entry| (entry.user_id, entry.display_name().to_string()))
+            .map(|entry| (entry.user_id, entry.username().to_string()))
     }
 
     pub(crate) fn selected_remote_user(
@@ -2749,7 +2750,7 @@ impl RoomSession {
         }
         Ok(SelectedRoomUser {
             user_id,
-            display_name: name,
+            username: name,
         })
     }
 
@@ -2791,7 +2792,7 @@ impl RoomSession {
             participants
                 .entries
                 .iter()
-                .map(|entry| entry.display_name())
+                .map(|entry| entry.username())
                 .collect::<Vec<_>>()
                 .join(", "),
         )
@@ -2963,11 +2964,10 @@ mod tests {
         }
     }
 
-    fn user(user_id: UserId, name: &str) -> UserSummary {
+    fn user(user_id: UserId, username: &str) -> UserSummary {
         UserSummary {
             user_id,
-            display_name: name.to_string(),
-            identifier: name.to_string(),
+            username: username.to_string(),
             online: true,
             connected_at_ms: 0,
             voice_status: ParticipantVoiceStatus::default(),
@@ -3661,7 +3661,7 @@ mod tests {
         );
 
         assert_eq!(room.participants.entries.len(), 1);
-        assert_eq!(room.participants.entries[0].display_name(), "bob");
+        assert_eq!(room.participants.entries[0].username(), "bob");
         assert!(room.participants.entries[0].online);
     }
 
@@ -3741,7 +3741,7 @@ mod tests {
         );
 
         assert_eq!(room.participants.entries.len(), 1);
-        assert_eq!(room.participants.entries[0].display_name(), "bob");
+        assert_eq!(room.participants.entries[0].username(), "bob");
         assert!(!room.participants.entries[0].online);
         assert!(!room.participants.entries[0].voice_active);
         assert!(room.participants.entries[0].presence_since.is_some());
@@ -4516,7 +4516,7 @@ mod tests {
         );
 
         assert_eq!(room.server_alias, "renamed");
-        assert_eq!(room.local_user_name, "alice-new");
+        assert_eq!(room.local_username, "alice-new");
         assert_eq!(room.viewed_room, Some(RoomId(1)));
         assert_eq!(room.room_name, "room-1");
         assert_eq!(room.local_user, Some(UserId(1)));
@@ -5249,7 +5249,7 @@ mod tests {
             .selected_remote_user(Some(UserId(1)))
             .expect("remote selection");
         assert_eq!(selected.user_id, UserId(2));
-        assert_eq!(selected.display_name, "bob");
+        assert_eq!(selected.username, "bob");
     }
 
     #[test]

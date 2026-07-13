@@ -1582,12 +1582,12 @@ impl RoomMode {
             return;
         }
         let user_id = selected.user_id;
-        let display_name = selected.display_name().to_string();
+        let username = selected.username().to_string();
         let value_db = cx.config.user_volume_db(&cx.session.server_alias, user_id);
         cx.send(CoreCommand::BeginVolumePreview { user_id, value_db });
-        let dialog = UserVolumeDialog::new(user_id, display_name.clone(), value_db, &cx.view.theme);
+        let dialog = UserVolumeDialog::new(user_id, username.clone(), value_db, &cx.view.theme);
         cx.request_transition(ModeTransition::Push(Box::new(DialogMode::new(dialog))));
-        cx.set_status(format!("adjusting local volume for {display_name}"));
+        cx.set_status(format!("adjusting local volume for {username}"));
     }
 
     fn cycle_room(&self, cx: &mut ViewCx<'_>, delta: isize) {
@@ -3519,11 +3519,10 @@ mod tests {
         );
     }
 
-    fn participant(user_id: UserId, display_name: &str) -> rpc::control::UserSummary {
+    fn participant(user_id: UserId, username: &str) -> rpc::control::UserSummary {
         rpc::control::UserSummary {
             user_id,
-            display_name: display_name.to_string(),
-            identifier: display_name.to_string(),
+            username: username.to_string(),
             online: true,
             connected_at_ms: 0,
             voice_status: ParticipantVoiceStatus::default(),

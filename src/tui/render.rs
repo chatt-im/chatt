@@ -633,7 +633,7 @@ fn draw_user_list(
             buf,
             &format!(
                 "{marker}   {:<16} {:<7} {:<5} {:<16} {}",
-                participant.display_name(),
+                participant.username(),
                 state,
                 uptime,
                 voice,
@@ -1358,9 +1358,9 @@ fn draw_top_bar(
             .with(style | Modifier::BOLD)
             .fmt(buf, format_args!(" {label} "));
     }
-    if !app.room.local_user_name.trim().is_empty() {
+    if !app.room.local_username.trim().is_empty() {
         left.with(theme.status_fill.patch(theme.muted))
-            .fmt(buf, format_args!(" {} ", app.room.local_user_name));
+            .fmt(buf, format_args!(" {} ", app.room.local_username));
     }
 
     let mut right = area;

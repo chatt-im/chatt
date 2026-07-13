@@ -2099,7 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_alsa_ids_are_not_grouped_by_display_name() {
+    fn explicit_alsa_ids_are_not_grouped_by_username() {
         let items = audio_output_items(&[
             device_with_id(Some("alsa:plughw:CARD=2,DEV=0"), "ALC897 Analog", true),
             device_with_id(Some("alsa:hw:CARD=2,DEV=0"), "ALC897 Analog", true),

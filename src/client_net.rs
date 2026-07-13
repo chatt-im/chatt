@@ -31,7 +31,8 @@ use rpc::{
         ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
         ERROR_PAIRING_CODE_MISMATCH, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
-        ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata, MAX_FILE_CHUNK_BYTES,
+        ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, FileContentEncoding, FileMetadata,
+        MAX_FILE_CHUNK_BYTES,
         MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey, P2pNatKind, P2pPeerInfo,
         P2pRole, ParticipantVoiceStatus, RoomInfo, ServerControl, UserSummary,
         decode_server_control, decode_server_hello, encode_client_control, encode_client_hello,
@@ -312,7 +313,7 @@ pub struct ClientConfig {
     pub tcp_addr: String,
     pub udp_addr: String,
     pub udp_probe_addr: Option<String>,
-    pub display_name: String,
+    pub username: String,
     pub token: String,
     pub server_public_key: Option<String>,
     pub require_native_encryption: bool,
@@ -693,6 +694,11 @@ pub enum NetworkEvent {
     },
     PairingSucceeded,
     PairingFailed(String),
+    /// A pairing/open-pairing attempt was rejected because the chosen username is
+    /// already registered on the server. The user should pick another.
+    UsernameTaken {
+        message: String,
+    },
     /// Open pairing succeeded. Carries the issued bearer token and the server's
     /// trusted-on-first-use Ed25519 public key (hex), both to be persisted.
     OpenPairingSucceeded {
@@ -767,7 +773,7 @@ impl NetworkClient {
     pub fn spawn(config: ClientConfig, events: NetworkEventSender) -> Result<Self, String> {
         kvlog::info!(
             "network client spawning",
-            display_name = config.display_name.as_str(),
+            username = config.username.as_str(),
             tcp_addr = %config.tcp_addr,
             udp_addr = %config.udp_addr
         );
@@ -851,10 +857,10 @@ pub fn spawn_pair_once(
         .name("chatt-pair".to_string())
         .stack_size(256 * 1024)
         .spawn(move || {
-            let result = pair_once(&config, pairing_code);
-            let event = match result {
+            let event = match pair_once(&config, pairing_code) {
                 Ok(()) => NetworkEvent::PairingSucceeded,
-                Err(error) => NetworkEvent::PairingFailed(error),
+                Err(PairFailure::UsernameTaken(message)) => NetworkEvent::UsernameTaken { message },
+                Err(PairFailure::Other(error)) => NetworkEvent::PairingFailed(error),
             };
             let _ = events.send(event);
         })
@@ -872,6 +878,7 @@ enum OpenPairOutcome {
         retry: bool,
         server_public_key: String,
     },
+    UsernameTaken(String),
     Failed(String),
 }
 
@@ -889,7 +896,7 @@ fn open_pair_once(
     };
     let mut control = transport.control_record();
     let request = ClientControl::OpenPair {
-        display_name: config.display_name.clone(),
+        username: config.username.clone(),
         password,
         existing_token,
         receive_files: config.file_policy.receives_any(),
@@ -935,6 +942,7 @@ fn open_pair_once(
                         retry: true,
                         server_public_key: encode_hex(&trusted),
                     },
+                    ERROR_USERNAME_TAKEN => OpenPairOutcome::UsernameTaken(message),
                     _ => OpenPairOutcome::Failed(message),
                 };
             }
@@ -973,6 +981,9 @@ pub fn spawn_open_pair_once(
                     retry,
                     server_public_key,
                 },
+                OpenPairOutcome::UsernameTaken(message) => {
+                    NetworkEvent::UsernameTaken { message }
+                }
                 OpenPairOutcome::Failed(error) => NetworkEvent::PairingFailed(error),
             };
             let _ = events.send(event);
@@ -988,7 +999,7 @@ fn run_worker(
 ) {
     kvlog::info!(
         "network worker starting",
-        display_name = config.display_name.as_str(),
+        username = config.username.as_str(),
         tcp_addr = %config.tcp_addr,
         udp_addr = %config.udp_addr
     );
@@ -1191,7 +1202,7 @@ fn run_worker_inner(
     }
 
     let auth_control = ClientControl::Authenticate {
-        display_name: worker.config.display_name.clone(),
+        username: worker.config.username.clone(),
         token: worker.config.token.clone(),
         receive_files: worker.config.file_policy.receives_any(),
         file_receive_limit_bytes: worker.config.file_policy.advertised_limit(),
@@ -1201,7 +1212,7 @@ fn run_worker_inner(
     }
     kvlog::info!(
         "auth control queued",
-        display_name = worker.config.display_name.as_str()
+        username = worker.config.username.as_str()
     );
     let _ = worker.events.send(NetworkEvent::Connected);
 
@@ -1439,7 +1450,7 @@ fn connect_and_handshake(
     kvlog::info!(
         "tcp connecting",
         tcp_addr = %config.tcp_addr,
-        display_name = config.display_name.as_str()
+        username = config.username.as_str()
     );
     let mut stream = StdTcpStream::connect(config.tcp_addr.as_str())
         .map_err(|error| format!("failed to connect to server: {error}"))?;
@@ -1477,30 +1488,43 @@ fn connect_and_handshake(
     Ok((stream, transport, trusted_key))
 }
 
-fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), String> {
-    let (mut stream, transport, _trusted) = connect_and_handshake(config, false)?;
+/// Why an invite pairing attempt failed. `UsernameTaken` is separated so the app
+/// can send the user back to the username field; everything else is `Other`.
+enum PairFailure {
+    UsernameTaken(String),
+    Other(String),
+}
+
+fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), PairFailure> {
+    let (mut stream, transport, _trusted) =
+        connect_and_handshake(config, false).map_err(PairFailure::Other)?;
     let mut control = transport.control_record();
     write_blocking_control(
         &mut stream,
         &mut control,
         ClientControl::Pair {
-            display_name: config.display_name.clone(),
+            username: config.username.clone(),
             pairing_code,
             token: config.token.clone(),
             receive_files: config.file_policy.receives_any(),
             file_receive_limit_bytes: config.file_policy.advertised_limit(),
         },
-    )?;
+    )
+    .map_err(PairFailure::Other)?;
 
     loop {
         let frame = read_blocking_frame(&mut stream)
-            .map_err(|error| format!("failed to read pairing response: {error}"))?;
+            .map_err(|error| PairFailure::Other(format!("failed to read pairing response: {error}")))?;
         let plaintext = control
             .open_next(CHANNEL_CONTROL, &frame)
-            .map_err(|error| error.to_string())?;
-        match decode_server_control(&plaintext)? {
+            .map_err(|error| PairFailure::Other(error.to_string()))?;
+        match decode_server_control(&plaintext).map_err(PairFailure::Other)? {
             ServerControl::Authenticated { .. } => return Ok(()),
-            ServerControl::Error { message, .. } => return Err(message),
+            ServerControl::Error {
+                code: ERROR_USERNAME_TAKEN,
+                message,
+            } => return Err(PairFailure::UsernameTaken(message)),
+            ServerControl::Error { message, .. } => return Err(PairFailure::Other(message)),
             _ => {}
         }
     }
@@ -3431,7 +3455,7 @@ impl WorkerState {
                 format_bytes(limit)
             ));
         }
-        let name = upload_display_name(name_override, &path)?;
+        let name = upload_username(name_override, &path)?;
         let mut file = open_upload_source(&path, delete_after_open)
             .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
         let mut source_prefix = Vec::new();
@@ -4829,7 +4853,7 @@ impl WorkerState {
                 kvlog::info!(
                     "client presence received",
                     user_id = user.user_id.0,
-                    display_name = user.display_name.as_str(),
+                    username = user.username.as_str(),
                     online
                 );
                 if !online {
@@ -6256,6 +6280,7 @@ fn is_auth_failure_code(code: u16) -> bool {
             | ERROR_PAIRING_INVALID_REQUEST
             | ERROR_PUBLIC_DISABLED
             | ERROR_TOKEN_STALE_EPOCH
+            | ERROR_USERNAME_TAKEN
     )
 }
 
@@ -6315,7 +6340,7 @@ fn cleanup_partial(dest: &ReceiveDest) {
 /// Resolves the sanitized upload name from an optional override, falling back
 /// to the source path's file name. Returns an error when the name is unusable
 /// or exceeds the protocol limit.
-fn upload_display_name(name_override: Option<String>, path: &Path) -> Result<String, String> {
+fn upload_username(name_override: Option<String>, path: &Path) -> Result<String, String> {
     let raw = match name_override {
         Some(name) => name,
         None => path
@@ -7250,6 +7275,11 @@ mod tests {
     }
 
     #[test]
+    fn username_taken_is_an_auth_failure() {
+        assert!(is_auth_failure_code(ERROR_USERNAME_TAKEN));
+    }
+
+    #[test]
     fn command_drain_stops_at_iteration_limit() {
         let (tx, rx) = mpsc::channel();
         tx.send(NetworkCommand::Shutdown).unwrap();
@@ -8064,20 +8094,20 @@ mod tests {
     }
 
     #[test]
-    fn upload_display_name_prefers_override() {
+    fn upload_username_prefers_override() {
         let path = PathBuf::from("/tmp/staged-abc.png");
         assert_eq!(
-            upload_display_name(Some("holiday.png".to_string()), &path).unwrap(),
+            upload_username(Some("holiday.png".to_string()), &path).unwrap(),
             "holiday.png"
         );
-        assert_eq!(upload_display_name(None, &path).unwrap(), "staged-abc.png");
+        assert_eq!(upload_username(None, &path).unwrap(), "staged-abc.png");
     }
 
     #[test]
-    fn upload_display_name_rejects_overlong_name() {
+    fn upload_username_rejects_overlong_name() {
         let path = PathBuf::from("/tmp/x.png");
         let long = "a".repeat(MAX_FILE_NAME_BYTES + 1);
-        assert!(upload_display_name(Some(long), &path).is_err());
+        assert!(upload_username(Some(long), &path).is_err());
     }
 
     #[test]

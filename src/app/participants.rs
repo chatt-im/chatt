@@ -22,8 +22,7 @@ pub(crate) struct RosterSeed {
 #[derive(Clone, Debug)]
 pub(crate) struct ParticipantState {
     pub(crate) user_id: UserId,
-    pub(crate) name: Option<String>,
-    pub(crate) identifier: Option<String>,
+    pub(crate) username: Option<String>,
     pub(crate) online: bool,
     pub(crate) voice_active: bool,
     pub(crate) voice_status: ParticipantVoiceStatus,
@@ -57,8 +56,8 @@ pub(crate) struct ParticipantState {
 }
 
 impl ParticipantState {
-    pub(crate) fn display_name(&self) -> &str {
-        self.name.as_deref().unwrap_or(UNKNOWN_NAME)
+    pub(crate) fn username(&self) -> &str {
+        self.username.as_deref().unwrap_or(UNKNOWN_NAME)
     }
 
     /// A bare online, in-voice roster row with no feedback, for rendering tests in
@@ -67,8 +66,7 @@ impl ParticipantState {
     pub(crate) fn for_test(user_id: UserId) -> Self {
         ParticipantState {
             user_id,
-            name: None,
-            identifier: None,
+            username: None,
             online: true,
             voice_active: true,
             voice_status: ParticipantVoiceStatus::default(),
@@ -204,8 +202,7 @@ impl Participants {
             .find(|entry| entry.user_id == user.user_id)
         {
             let was_online = existing.online;
-            existing.name = Some(user.display_name);
-            existing.identifier = Some(user.identifier);
+            existing.username = Some(user.username);
             existing.online = online;
             existing.voice_active = in_call;
             existing.voice_status = user.voice_status.normalized();
@@ -238,8 +235,7 @@ impl Participants {
             };
             self.entries.push(ParticipantState {
                 user_id: user.user_id,
-                name: Some(user.display_name),
-                identifier: Some(user.identifier),
+                username: Some(user.username),
                 online,
                 voice_active: in_call,
                 voice_status,
@@ -395,11 +391,11 @@ impl Participants {
         }
     }
 
-    pub(crate) fn display_name_for(&self, user_id: UserId) -> &str {
+    pub(crate) fn username_for(&self, user_id: UserId) -> &str {
         self.entries
             .iter()
             .find(|entry| entry.user_id == user_id)
-            .map_or(UNKNOWN_NAME, |entry| entry.display_name())
+            .map_or(UNKNOWN_NAME, |entry| entry.username())
     }
 
     fn ensure_user(&mut self, user_id: UserId) -> &mut ParticipantState {
@@ -412,8 +408,7 @@ impl Participants {
         }
         self.entries.push(ParticipantState {
             user_id,
-            name: None,
-            identifier: None,
+            username: None,
             online: true,
             voice_active: false,
             voice_status: ParticipantVoiceStatus::default(),
@@ -441,7 +436,7 @@ impl Participants {
                 .cmp(&a.online)
                 .then_with(|| b.voice_active.cmp(&a.voice_active))
                 .then_with(|| b.p2p_direct.cmp(&a.p2p_direct))
-                .then_with(|| a.display_name().cmp(b.display_name()))
+                .then_with(|| a.username().cmp(b.username()))
         });
     }
 
@@ -497,8 +492,7 @@ mod tests {
         RosterSeed {
             user: UserSummary {
                 user_id,
-                display_name: format!("user-{}", user_id.0),
-                identifier: format!("id-{}", user_id.0),
+                username: format!("user-{}", user_id.0),
                 online: true,
                 connected_at_ms: 0,
                 voice_status: ParticipantVoiceStatus::default(),
@@ -772,21 +766,21 @@ mod tests {
     fn voice_before_roster_does_not_fabricate_id_name() {
         let mut participants = Participants::default();
         participants.voice_started(UserId(7), StreamId(1));
-        assert_eq!(participants.entries[0].name, None);
-        assert_eq!(participants.entries[0].display_name(), UNKNOWN_NAME);
+        assert_eq!(participants.entries[0].username, None);
+        assert_eq!(participants.entries[0].username(), UNKNOWN_NAME);
 
         participants.upsert(participant(UserId(7)));
-        assert_eq!(participants.entries[0].display_name(), "user-7");
+        assert_eq!(participants.entries[0].username(), "user-7");
     }
 
     #[test]
     fn authoritative_name_starting_with_user_is_preserved() {
         let mut participants = Participants::default();
         let mut info = participant(UserId(3));
-        info.user.display_name = "user friend".to_string();
+        info.user.username = "user friend".to_string();
         participants.upsert(info);
         participants.voice_started(UserId(3), StreamId(9));
-        assert_eq!(participants.entries[0].display_name(), "user friend");
+        assert_eq!(participants.entries[0].username(), "user friend");
     }
 
     #[test]

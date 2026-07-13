@@ -77,14 +77,14 @@ fn server_users() -> Vec<UserConfig> {
     vec![
         UserConfig {
             id: UserId(1),
-            name: "uploader".to_string(),
-            display_name: "Uploader".to_string(),
+            internal_reference: "uploader".to_string(),
+            username: "Uploader".to_string(),
             token_hash: hash_secret(UPLOAD_TOKEN),
         },
         UserConfig {
             id: UserId(2),
-            name: "receiver".to_string(),
-            display_name: "Receiver".to_string(),
+            internal_reference: "receiver".to_string(),
+            username: "Receiver".to_string(),
             token_hash: hash_secret(RECEIVE_TOKEN),
         },
     ]
@@ -100,7 +100,7 @@ fn client_config(
         tcp_addr: addrs.tcp.clone(),
         udp_addr: addrs.udp.clone(),
         udp_probe_addr: None,
-        display_name: name.to_string(),
+        username: name.to_string(),
         token: token.to_string(),
         server_public_key: None,
         require_native_encryption: true,
