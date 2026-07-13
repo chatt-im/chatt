@@ -169,6 +169,11 @@ export function loadEmojiDatabase(): Promise<EmojiDatabase> {
       return response.arrayBuffer()
     })
     .then(decodeEmojiDatabase)
+    .catch((error) => {
+      // A transient fetch failure must not poison every later picker attempt.
+      databasePromise = undefined
+      throw error
+    })
   return databasePromise
 }
 

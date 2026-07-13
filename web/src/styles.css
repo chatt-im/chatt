@@ -1706,6 +1706,21 @@ body {
   font-size: 13px;
 }
 
+.emoji-retry {
+  margin-left: var(--space);
+  border: 1px solid var(--border);
+  border-radius: 0;
+  padding: 2px var(--space);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.emoji-retry:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 2px;
+}
+
 .emoji-picker-anchor {
   display: contents;
 }

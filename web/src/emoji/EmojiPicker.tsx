@@ -83,13 +83,13 @@ export default function EmojiPicker(props: EmojiPickerProps) {
   }
 
   function onSearchKeyDown(event: KeyboardEvent) {
-    if (!query().trim() || !items().length) return
+    if (!items().length || event.isComposing || event.keyCode === 229) return
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault()
       moveActive(event.key === 'ArrowDown' ? 1 : -1)
       return
     }
-    if (event.key === 'Enter' && !event.isComposing) {
+    if (event.key === 'Enter') {
       event.preventDefault()
       props.onSelect(items()[active()]!)
     }
@@ -103,10 +103,13 @@ export default function EmojiPicker(props: EmojiPickerProps) {
           ref={searchInput}
           class="emoji-search"
           type="search"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-expanded="true"
           placeholder="Search emoji"
           aria-label="Search emoji"
           aria-controls="emoji-picker-grid"
-          aria-activedescendant={query().trim() && items()[active()] ? `emoji-option-${items()[active()]!.id}` : undefined}
+          aria-activedescendant={items()[active()] ? `emoji-option-${items()[active()]!.id}` : undefined}
           value={query()}
           onInput={(event) => {
             setQuery(event.currentTarget.value)
@@ -169,10 +172,10 @@ export default function EmojiPicker(props: EmojiPickerProps) {
                 <button
                   id={`emoji-option-${item.id}`}
                   class="emoji-cell"
-                  classList={{ 'is-selected': !!query().trim() && itemIndex() === active() }}
+                  classList={{ 'is-selected': itemIndex() === active() }}
                   type="button"
                   role="gridcell"
-                  aria-selected={!!query().trim() && itemIndex() === active()}
+                  aria-selected={itemIndex() === active()}
                   aria-label={`${item.label}, :${item.shortcode}:`}
                   title={`:${item.shortcode}:`}
                   onMouseEnter={() => setHovered(item)}

@@ -159,7 +159,7 @@ export type ServerEnvelope =
   // Captured output of a `run_command`, shown as ephemeral system rows.
   | { type: "command_output"; lines: CommandOutputLine[] }
   // Argument candidates answering a `command_candidates` request.
-  | { type: "command_candidates"; kind: CandidateKind; items: CandidateItem[] }
+  | { type: "command_candidates"; request_id: number; kind: CandidateKind; items: CandidateItem[] }
   // A deletion request was rejected by the local client or room server.
   | { type: "delete_error"; target: number; message: string }
   | {
@@ -197,4 +197,4 @@ export type ClientRequest =
   | { type: "upload_cancel"; request_id: number; upload_id: number }
   | { type: "abort_transfer"; request_id: number; transfer_id: number }
   | { type: "run_command"; request_id: number; body: string }
-  | { type: "command_candidates"; kind: CandidateKind };
+  | { type: "command_candidates"; request_id: number; kind: CandidateKind };
