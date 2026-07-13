@@ -1610,6 +1610,7 @@ body {
 
 /* One flat compose region pinned below the chat log when the feed is writable. */
 .composer {
+  position: relative;
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
@@ -1617,6 +1618,80 @@ body {
   padding: var(--space) var(--space-lg) 10px;
   border-top: 1px solid var(--border);
   background: var(--bg-elevated);
+}
+
+/* The slash-command autocomplete popup, anchored above the composer. */
+.command-popup {
+  position: absolute;
+  bottom: 100%;
+  left: var(--space-lg);
+  right: var(--space-lg);
+  margin-bottom: 4px;
+  z-index: 10;
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+}
+
+.command-option {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space);
+  padding: 4px var(--space);
+  cursor: pointer;
+}
+
+.command-option.is-selected {
+  background: var(--accent);
+}
+
+.command-option-name {
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.command-option-usage,
+.command-option-detail {
+  color: var(--text-dim);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.command-option-desc {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-option-match {
+  color: var(--text-sender);
+  font-weight: 700;
+}
+
+.command-option-hint {
+  padding: 4px var(--space);
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+/* Ephemeral slash-command output rows in the feed. */
+.message.is-system .message-system-text {
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.message.is-system .message-sender {
+  color: var(--text-dim);
+}
+
+.message.is-system-error .message-system-text {
+  color: var(--warn);
 }
 
 /* A dashed accent border signals the composer is a drop target while dragging. */

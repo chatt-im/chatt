@@ -455,6 +455,9 @@ pub(crate) struct App {
     /// Web-originated deletes awaiting either a mutation echo or an explicit
     /// server rejection, keyed by room because ids are room-local.
     pending_web_deletes: HashSet<(RoomId, MessageId)>,
+    /// While a web-originated slash command runs, status and notice output is
+    /// teed here (the TUI still shows it) and returned to the issuing browser.
+    web_command_capture: Option<Vec<WebCommandLine>>,
     /// The in-memory download ring buffer, shared with the network worker and
     /// the web server. Held app-wide so it survives web-server respawns.
     download_store: crate::receive_store::DownloadStore,
@@ -893,6 +896,50 @@ fn share_ended_envelope(stream_id: StreamId) -> String {
     jsony::object! { type: "share_ended", stream_id: stream_id.0 }
 }
 
+/// One captured line of slash-command output, shown as a system row in the web
+/// feed.
+#[derive(Debug, PartialEq, Eq)]
+struct WebCommandLine {
+    error: bool,
+    text: String,
+}
+
+/// An argument-completion candidate offered to the web autocomplete popup.
+struct CandidateItem {
+    value: String,
+    detail: Option<String>,
+}
+
+/// The `command_output` envelope carrying a web command's captured output.
+fn command_output_envelope(lines: &[WebCommandLine]) -> String {
+    jsony::object! {
+        type: "command_output",
+        lines: [
+            for line in lines;
+            {
+                error: line.error,
+                text: line.text.as_str(),
+            }
+        ],
+    }
+}
+
+/// The `command_candidates` envelope answering an autocomplete candidates
+/// request.
+fn command_candidates_envelope(kind: &str, items: &[CandidateItem]) -> String {
+    jsony::object! {
+        type: "command_candidates",
+        kind: kind,
+        items: [
+            for item in items;
+            {
+                value: item.value.as_str(),
+                detail: item.detail.as_deref(),
+            }
+        ],
+    }
+}
+
 /// Parses an `/upload-rate` argument into bytes per second. Accepts `off`/`none`
 /// (unlimited, `0`), a plain byte count, or a count with a `K`/`M`/`G` suffix
 /// (powers of 1024).
@@ -1296,6 +1343,7 @@ impl App {
             audio_events: AudioEventLog::default(),
             web_feed,
             pending_web_deletes: HashSet::new(),
+            web_command_capture: None,
             download_store,
             screencast: None,
             cached_screencast_start: None,
@@ -2399,6 +2447,88 @@ impl App {
                 self.cancel_transfer(FileTransferId(transfer_id));
                 self.report_web_request_result(client, request_id, "abort_transfer", true, None);
             }
+            crate::web_server::WebRequest::RunCommand {
+                client,
+                request_id,
+                body,
+            } => self.run_web_command(client, request_id, body),
+            crate::web_server::WebRequest::CommandCandidates { client, kind } => {
+                self.send_command_candidates(client, kind)
+            }
+        }
+    }
+
+    /// Runs a browser-composed slash command through the shared dispatch,
+    /// returning its status/notice output to the issuing tab.
+    fn run_web_command(&mut self, client: u64, request_id: u64, body: String) {
+        match self.run_web_command_captured(body) {
+            Err(message) => {
+                self.report_web_request_result(
+                    client,
+                    request_id,
+                    "run_command",
+                    false,
+                    Some(&message),
+                );
+            }
+            Ok(lines) => {
+                self.report_web_request_result(client, request_id, "run_command", true, None);
+                if lines.is_empty() {
+                    return;
+                }
+                if let Some(feed) = &self.web_feed {
+                    feed.send_command_reply(client, command_output_envelope(&lines));
+                }
+            }
+        }
+    }
+
+    /// Gates and dispatches a web slash command, teeing its output. `Err` is a
+    /// gating failure (unknown or TUI-only command); the command did not run.
+    fn run_web_command_captured(&mut self, body: String) -> Result<Vec<WebCommandLine>, String> {
+        let body = body.trim().to_string();
+        let first_token = body.split_whitespace().next().unwrap_or("");
+        commands::web_command_gate(first_token)?;
+        self.web_command_capture = Some(Vec::new());
+        self.run_slash_command(self.room.viewed_room, body);
+        Ok(self.web_command_capture.take().unwrap_or_default())
+    }
+
+    /// Answers the web autocomplete's request for argument candidates.
+    fn send_command_candidates(&mut self, client: u64, kind: crate::web_server::CandidateKind) {
+        let items: Vec<CandidateItem> = match kind {
+            crate::web_server::CandidateKind::User => self
+                .room
+                .user_name_candidates()
+                .into_iter()
+                .map(|value| CandidateItem {
+                    value,
+                    detail: None,
+                })
+                .collect(),
+            crate::web_server::CandidateKind::Room => self
+                .room
+                .room_name_candidates()
+                .into_iter()
+                .map(|value| CandidateItem {
+                    value,
+                    detail: None,
+                })
+                .collect(),
+            crate::web_server::CandidateKind::Sound => self
+                .config
+                .soundboard
+                .clips
+                .iter()
+                .enumerate()
+                .map(|(index, clip)| CandidateItem {
+                    value: clip.name.clone(),
+                    detail: Some(format!("slot {}", index + 1)),
+                })
+                .collect(),
+        };
+        if let Some(feed) = &self.web_feed {
+            feed.send_command_reply(client, command_candidates_envelope(kind.wire_name(), &items));
         }
     }
 
@@ -4243,6 +4373,7 @@ impl App {
     pub(crate) fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
         let sender = sender.into();
         let body = body.into();
+        self.capture_web_command_line(false, &body);
         if !self.room.push_notice(sender.clone(), body.clone()) {
             self.view
                 .push_local_notice(sender, body, crate::chat_buffer::NoticeKind::Info);
@@ -4252,6 +4383,7 @@ impl App {
     pub(crate) fn push_error_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
         let sender = sender.into();
         let body = body.into();
+        self.capture_web_command_line(true, &body);
         if !self.room.push_error_notice(sender.clone(), body.clone()) {
             self.view
                 .push_local_notice(sender, body, crate::chat_buffer::NoticeKind::Error);
@@ -7566,6 +7698,8 @@ impl App {
     }
 
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
+        let status = status.into();
+        self.capture_web_command_line(false, &status);
         self.view.status.set(status);
     }
 
@@ -7576,7 +7710,18 @@ impl App {
     }
 
     pub(crate) fn set_error(&mut self, status: impl Into<String>) {
+        let status = status.into();
+        self.capture_web_command_line(true, &status);
         self.view.status.set_error(status);
+    }
+
+    fn capture_web_command_line(&mut self, error: bool, text: &str) {
+        if let Some(capture) = &mut self.web_command_capture {
+            capture.push(WebCommandLine {
+                error,
+                text: text.to_string(),
+            });
+        }
     }
 
     fn expire_status(&mut self, now: Instant) -> bool {
@@ -10135,6 +10280,50 @@ mod tests {
         });
         assert!(!app.pending_web_deletes.contains(&(RoomId(1), MessageId(7))));
         assert_eq!(app.view.status.text(), "message is too old");
+    }
+
+    #[test]
+    fn web_command_rejects_tui_only_and_unknown_commands() {
+        let mut app = test_app();
+        assert_eq!(
+            app.run_web_command_captured("/clear".to_string()),
+            Err("/clear is not available from the web view".to_string())
+        );
+        assert_eq!(
+            app.run_web_command_captured("/nope".to_string()),
+            Err("unknown command: /nope".to_string())
+        );
+        assert!(app.web_command_capture.is_none());
+    }
+
+    #[test]
+    fn web_command_captures_status_output() {
+        let mut app = test_app();
+        let lines = app
+            .run_web_command_captured("/whoami".to_string())
+            .expect("/whoami passes the web gate");
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].error);
+        assert!(
+            lines[0].text.contains("connecting as"),
+            "unexpected output {:?}",
+            lines[0].text
+        );
+        assert!(
+            app.web_command_capture.is_none(),
+            "capture must not outlive the command"
+        );
+    }
+
+    #[test]
+    fn web_command_error_lines_are_marked() {
+        let mut app = test_app();
+        let lines = app
+            .run_web_command_captured("/room nope".to_string())
+            .expect("gating passes; the failure is command-internal");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].error);
+        assert_eq!(lines[0].text, "no room named nope");
     }
 
     #[test]

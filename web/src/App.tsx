@@ -5,6 +5,7 @@ import {
   createEffect,
   onCleanup,
   onMount,
+  untrack,
   For,
   Show,
 } from "solid-js";
@@ -21,7 +22,17 @@ import type {
   ShareInfo,
   Fragment,
   TransferDirection,
+  WebCommandInfo,
+  CandidateItem,
+  CandidateKind,
 } from "./types";
+import {
+  acceptReplacement,
+  completionContext,
+  filterCandidates,
+  filterCommands,
+} from "./commands";
+import CommandPopup, { type PopupRow } from "./CommandPopup";
 import ScreenShare from "./ScreenShare";
 import { ScreenShareDecoder, parseFrame } from "./video-decode";
 import { renderInline } from "./highlight";
@@ -1144,6 +1155,8 @@ function MessageRow(props: {
       classList={{
         "is-continuation": continuation(),
         "is-group-collapsed": props.group.collapsed,
+        "is-system": !!props.message.system,
+        "is-system-error": props.message.system === "error",
       }}
       data-ts={props.message.timestamp_ms}
       data-mid={props.message.message_id}
@@ -1209,7 +1222,12 @@ function MessageRow(props: {
         />
       </button>
       <Show when={!props.group.collapsed}>
-        <MessageBody fragments={props.message.fragments} />
+        <Show
+          when={!props.message.system}
+          fallback={<div class="message-system-text">{props.message.body}</div>}
+        >
+          <MessageBody fragments={props.message.fragments} />
+        </Show>
         <Show when={props.message.attachment}>
           <Attachment
             message={props.message}
@@ -1512,6 +1530,88 @@ export default function App() {
     sent: number;
     cancelled: boolean;
   } | null>(null);
+  // Slash-command autocomplete: the web-capable command list arrives in the
+  // config envelope; argument candidates are fetched when the popup enters
+  // argument mode and cached per kind for instant filtering.
+  const [commandList, setCommandList] = createSignal<WebCommandInfo[]>([]);
+  const [candidateCache, setCandidateCache] = createSignal<
+    Partial<Record<CandidateKind, CandidateItem[]>>
+  >({});
+  const [composerCursor, setComposerCursor] = createSignal(0);
+  const [completionSelected, setCompletionSelected] = createSignal(0);
+  // The draft the popup was dismissed for; any edit reopens it.
+  const [completionDismissed, setCompletionDismissed] = createSignal<string | null>(null);
+  // Client-only ids for synthesized system rows, negative to never collide
+  // with feed ids.
+  let systemRowId = -1;
+
+  const completionCtx = createMemo(() =>
+    editing() || !connected()
+      ? null
+      : completionContext(draft(), composerCursor(), commandList())
+  );
+  const completionRows = createMemo<PopupRow[]>(() => {
+    const ctx = completionCtx();
+    if (!ctx) return [];
+    if (ctx.mode === "command") {
+      return filterCommands(commandList(), ctx.query).map(
+        (row) => ({ kind: "command", row }) as PopupRow
+      );
+    }
+    if (ctx.kind === "free") {
+      if (ctx.query.length > 0) return [];
+      return [{ kind: "hint", text: ctx.command.placeholder ?? ctx.command.usage }];
+    }
+    const items = candidateCache()[ctx.kind] ?? [];
+    return filterCandidates(items, ctx.query).map(
+      (row) => ({ kind: "candidate", row }) as PopupRow
+    );
+  });
+  const completionOpen = () =>
+    completionRows().length > 0 && completionDismissed() !== draft() && !submitting();
+
+  // Refetch candidates on each entry into an argument kind (not per keystroke);
+  // the cache serves the previous list while the response is in flight.
+  createEffect<CandidateKind | null>((previous) => {
+    const ctx = completionCtx();
+    const kind = ctx?.mode === "argument" && ctx.kind !== "free" ? ctx.kind : null;
+    if (kind && kind !== previous) {
+      untrack(() => sendJson({ type: "command_candidates", kind }));
+    }
+    return kind;
+  }, null);
+
+  createEffect(() => {
+    completionRows();
+    setCompletionSelected(0);
+  });
+
+  function syncComposerCursor(event: { currentTarget: HTMLTextAreaElement }) {
+    setComposerCursor(event.currentTarget.selectionStart ?? 0);
+  }
+
+  // Applies the selected popup row to the draft. Returns false when there is
+  // nothing to change (hint row, or the token already matches exactly), which
+  // lets Enter fall through to submit.
+  function acceptCompletion(index: number): boolean {
+    const ctx = completionCtx();
+    const row = completionRows()[index];
+    if (!ctx || !row || row.kind === "hint") return false;
+    const target = row.kind === "command" ? row.row.command.name : row.row.item.value;
+    const current = draft().slice(ctx.span.start, ctx.span.end);
+    if (current === target) return false;
+    const insert =
+      row.kind === "command" && row.row.command.arg !== "none" ? `${target} ` : target;
+    const { next, cursor } = acceptReplacement(draft(), ctx, insert);
+    setDraft(next);
+    setComposerCursor(cursor);
+    queueMicrotask(() => {
+      composerTextEl?.setSelectionRange(cursor, cursor);
+      resizeComposer();
+    });
+    return true;
+  }
+
   // A per-connection counter naming each upload so its chunk frames route to the
   // right server-side file.
   let nextUploadId = 1;
@@ -2613,7 +2713,29 @@ export default function App() {
       return;
     }
 
-    const body = draft().trim();
+    // A draft starting with "/" is a slash command; a leading space escapes it
+    // and the trim below sends it as literal chat, mirroring the TUI composer.
+    const raw = draft();
+    if (raw.startsWith("/")) {
+      setSubmitting(true);
+      try {
+        await sendRequest((requestId) => ({
+          type: "run_command",
+          request_id: requestId,
+          body: raw.trim(),
+        }));
+        setDraft("");
+        setCompletionDismissed(null);
+        queueMicrotask(resizeComposer);
+      } catch (error) {
+        setComposeError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
+    const body = raw.trim();
     const files = queued();
     if (!body && files.length === 0) return;
     setSubmitting(true);
@@ -2639,6 +2761,35 @@ export default function App() {
   }
 
   function onComposeKeyDown(event: KeyboardEvent) {
+    if (completionOpen() && !event.isComposing && event.keyCode !== 229) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const rows = completionRows().length;
+        const delta = event.key === "ArrowDown" ? 1 : -1;
+        setCompletionSelected((index) => (index + delta + rows) % rows);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setCompletionDismissed(draft());
+        return;
+      }
+      if (event.key === "Tab" && !event.shiftKey) {
+        event.preventDefault();
+        acceptCompletion(completionSelected());
+        return;
+      }
+      // Enter accepts a differing selection; an exactly-typed token falls
+      // through to submit. Shift+Enter keeps inserting a newline.
+      if (
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        acceptCompletion(completionSelected())
+      ) {
+        event.preventDefault();
+        return;
+      }
+    }
     if (event.key === "Escape" && editing()) {
       event.preventDefault();
       cancelEdit();
@@ -3238,7 +3389,33 @@ export default function App() {
         setAutoplay(env.autoplay);
         setViewer(env.viewer);
         setMaxUploadBytes(env.max_upload_bytes);
+        setCommandList(env.commands);
         document.title = `Chatt | ${env.room_name}`;
+      } else if (env.type === "command_candidates") {
+        setCandidateCache((prev) => ({ ...prev, [env.kind]: env.items }));
+      } else if (env.type === "command_output") {
+        // Slash-command output renders as local-only system rows. They never
+        // reach Rust and the next room sync replaces them wholesale;
+        // message_id 0 with a null file_id keeps every upsert, edit, and
+        // delete path away from them.
+        const rows = env.lines.map(
+          (line): WebMessage => ({
+            id: systemRowId--,
+            sender: "chatt",
+            body: line.text,
+            local: true,
+            edited: false,
+            timestamp_ms: Date.now(),
+            attachment: null,
+            file_id: null,
+            message_id: 0,
+            ref_code: "",
+            fragments: [],
+            system: line.error ? "error" : "info",
+          })
+        );
+        setMessages((prev) => [...prev, ...rows]);
+        pin();
       } else if (env.type === "room") {
         document.title = `Chatt | ${env.name}`;
       } else if (env.type === "request_result") {
@@ -3607,6 +3784,14 @@ export default function App() {
               <Show when={!connected()}>
                 <div class="composer-offline" role="status">Offline — your draft is retained; sending is disabled.</div>
               </Show>
+              <Show when={completionOpen()}>
+                <CommandPopup
+                  rows={completionRows()}
+                  selected={completionSelected()}
+                  onHover={setCompletionSelected}
+                  onAccept={acceptCompletion}
+                />
+              </Show>
               <div class="composer-input-row">
                 <Show when={!editing()}>
                   <button
@@ -3630,9 +3815,12 @@ export default function App() {
                   value={draft()}
                   onInput={(event) => {
                     setDraft(event.currentTarget.value);
+                    syncComposerCursor(event);
                     resizeComposer();
                   }}
                   onKeyDown={onComposeKeyDown}
+                  onKeyUp={syncComposerCursor}
+                  onClick={syncComposerCursor}
                   onPaste={onComposePaste}
                 />
                 <input

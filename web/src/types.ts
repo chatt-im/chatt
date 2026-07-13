@@ -70,8 +70,39 @@ export interface WebMessage {
   // Client-only playback intent attached to a newly received video. History
   // sync messages omit it so reconnecting does not autoplay old media.
   autoplay?: AutoplayMode;
+  // Client-synthesized ephemeral system row carrying slash-command output.
+  // Never sent by Rust; the next room sync clears these naturally.
+  system?: "info" | "error";
   // The body pre-split into prose and code fragments.
   fragments: Fragment[];
+}
+
+// The argument domain a slash command completes from. "free" arguments show a
+// placeholder hint instead of fetched candidates.
+export type CandidateKind = "user" | "room" | "sound";
+export type CommandArgKind = "none" | CandidateKind | "free";
+
+// One web-capable slash command, served by Rust in the config envelope so the
+// command list cannot drift from the client's dispatch.
+export interface WebCommandInfo {
+  name: string;
+  usage: string;
+  description: string;
+  arg: CommandArgKind;
+  placeholder: string | null;
+}
+
+// One argument-completion candidate, e.g. a user name or a soundboard clip
+// (whose `detail` carries its slot number).
+export interface CandidateItem {
+  value: string;
+  detail: string | null;
+}
+
+// One line of captured slash-command output, rendered as a system row.
+export interface CommandOutputLine {
+  error: boolean;
+  text: string;
 }
 
 // One JSON object per WebSocket text frame. Chat sync/message/older frames are
@@ -122,8 +153,13 @@ export type ServerEnvelope =
       viewer: ViewerMode;
       max_upload_bytes: number;
       room_name: string;
+      commands: WebCommandInfo[];
     }
   | { type: "room"; name: string }
+  // Captured output of a `run_command`, shown as ephemeral system rows.
+  | { type: "command_output"; lines: CommandOutputLine[] }
+  // Argument candidates answering a `command_candidates` request.
+  | { type: "command_candidates"; kind: CandidateKind; items: CandidateItem[] }
   // A deletion request was rejected by the local client or room server.
   | { type: "delete_error"; target: number; message: string }
   | {
@@ -159,4 +195,6 @@ export type ClientRequest =
   | { type: "upload_start"; request_id: number; upload_id: number; name: string; size: number }
   | { type: "upload_finish"; request_id: number; upload_id: number }
   | { type: "upload_cancel"; request_id: number; upload_id: number }
-  | { type: "abort_transfer"; request_id: number; transfer_id: number };
+  | { type: "abort_transfer"; request_id: number; transfer_id: number }
+  | { type: "run_command"; request_id: number; body: string }
+  | { type: "command_candidates"; kind: CandidateKind };
