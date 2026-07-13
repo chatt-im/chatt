@@ -790,6 +790,15 @@ mod imp {
     }
 
     fn handle_connection(mut stream: UnixStream, events: &EventSender) {
+        // The listener must be nonblocking for the worker waker, and Darwin
+        // propagates that status to sockets returned by accept. Every control
+        // protocol path below uses blocking framed I/O (bounded by timeouts
+        // until an attach is handed to the runtime), so normalize the accepted
+        // stream before the client has necessarily written its first byte.
+        if let Err(error) = stream.set_nonblocking(false) {
+            kvlog::warn!("failed to make local control connection blocking", error = %error);
+            return;
+        }
         let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
         let _ = stream.set_write_timeout(Some(STREAM_TIMEOUT));
         let request = read_request_with_fds(&mut stream);
@@ -1551,6 +1560,40 @@ mod imp {
                 // descriptor; it does not transfer or reuse the raw value.
                 assert_eq!(unsafe { libc::fcntl(*fd, libc::F_GETFD) }, -1);
             }
+        }
+
+        #[test]
+        fn attach_dispatch_makes_control_stream_blocking() {
+            let hello = ClientHello {
+                version: 1,
+                pid: std::process::id(),
+                ui_overrides: None,
+            };
+            let body = jsony::to_binary(&hello);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(MAGIC);
+            frame.push(OP_ATTACH);
+            frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&body);
+
+            let (writer, reader) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let stdin = fs::File::open("/dev/null").unwrap();
+            let stdout = fs::File::open("/dev/null").unwrap();
+            writer
+                .send_with_fd(&frame, &[stdin.as_raw_fd(), stdout.as_raw_fd()])
+                .unwrap();
+            let (events_tx, events_rx) = mpsc::channel();
+
+            handle_connection(reader, &EventSender(events_tx));
+
+            let crate::app::AppEvent::ClientAttach { stream, .. } = events_rx.try_recv().unwrap()
+            else {
+                panic!("expected attach event");
+            };
+            let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(flags, -1);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
         }
 
         #[test]
