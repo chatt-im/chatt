@@ -2661,7 +2661,7 @@ mod tests {
                     public_key: "11".repeat(32),
                     accepted: accepted_identity(),
                 },
-                local_verification_text: "chatt-e2e:v1:test".to_string(),
+                local_verification_text: "chatt-e2e:v2:test".to_string(),
                 pasted_verification_text: String::new(),
                 result: None,
                 error: None,

@@ -39,3 +39,27 @@ pub struct FileTransferId(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
 pub struct BugReportId(pub u64);
+
+/// Stable identifier for one sender-created chat, mutation, or file event.
+///
+/// Unlike [`MessageId`], this value is generated before an event is sealed and
+/// is therefore covered by the sender's authentication. Server message ids are
+/// only ordering and pagination cursors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
+#[jsony(Binary)]
+pub struct EventId(pub [u8; 16]);
+
+/// Random identifier for one independently keyed client installation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
+#[jsony(Binary)]
+pub struct DeviceId(pub [u8; 16]);
+
+/// Stable end-to-end identity for one account on one server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
+#[jsony(Binary)]
+pub struct AccountId(pub [u8; 32]);
+
+/// Hash checkpoint anchoring an append-only account key ledger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
+#[jsony(Binary)]
+pub struct LedgerHash(pub [u8; 32]);

@@ -364,6 +364,8 @@ token = "alice-dev-token"
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
 room-id = 1
+# Set only while enrolling a new installation into an existing E2E account:
+# e2e-recovery-code = "<64 hex digits from /devices recovery>"
 ```
 
 `active-server` selects one `[[servers]]` entry. `label` is the local name for
@@ -371,6 +373,13 @@ that server. `token` is the secret that identifies the client to the server, so
 there is no separate user field. `username` is the name shown in chat.
 `server-public-key` is pinned from the server invite; if it is empty, the client
 falls back to the compiled development server key.
+
+Each installation creates independent DM signing and delivery keys in an
+owner-only local identity store. Use `/devices recovery` on an authorized
+installation to display the high-entropy enrollment code, set
+`e2e-recovery-code` on the new installation for its first connection, then
+clear the config field. `/devices` lists authorized device ids and
+`/devices revoke <device-id>` publishes a terminal signed revocation.
 
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.

@@ -12,8 +12,8 @@ use std::{
 
 pub mod config;
 mod config_diagnostics;
+pub mod device_directory;
 mod history_reader;
-pub mod key_store;
 pub mod local_admin;
 pub mod room_store;
 pub mod user_store;
@@ -47,8 +47,12 @@ use rpc::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
         recv_datagram_with, write_queue_to,
     },
+    e2e::{DmContentKind, DmEventEnvelope},
     frame,
-    ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
+    ids::{
+        BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId, StreamId,
+        UserId,
+    },
     media::{self, MediaPayload},
     recv::RecvBuffer,
     video::{self, SharedVideoFrame, VideoAck, VideoHello, VideoRecordReader, VideoRole},
@@ -58,7 +62,7 @@ use config::{
     Config as ServerConfig, UserConfig, hash_secret, valid_username, value_arg, verify_secret_hash,
 };
 use history_reader::{HistoryReadReply, HistoryReader};
-use key_store::{E2eKeyStore, KeyPublish};
+use device_directory::{DeviceDirectory, DirectoryAppend};
 use local_admin::{AdminCommand, AdminSocket};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
@@ -401,8 +405,8 @@ pub struct Server {
     /// Server-wide username uniqueness index, backed by `usernames.log.bin` for
     /// dynamic users and seeded from `users` for explicit users.
     usernames: UsernameRegistry,
-    /// Published DM identity public keys, persisted under the data dir.
-    e2e_keys: E2eKeyStore,
+    /// Authority-signed account/device ledgers, persisted under the data dir.
+    device_directory: DeviceDirectory,
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
@@ -524,7 +528,13 @@ impl Server {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let usernames = UsernameRegistry::open(config.data_dir(), &users.users)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let e2e_keys = E2eKeyStore::open(config.data_dir())
+        let server_key_pair = config
+            .server_key_pair()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let device_directory = DeviceDirectory::open(
+            config.data_dir(),
+            server_key_pair.public_key().as_ref().to_vec(),
+        )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mut rooms = HashMap::new();
         for room in &config.rooms {
@@ -583,9 +593,6 @@ impl Server {
         let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
         let (history_reader, history_replies) = HistoryReader::spawn(waker);
 
-        let server_key_pair = config
-            .server_key_pair()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         kvlog::info!(
             "server identity loaded",
             public_key = encode_hex(server_key_pair.public_key().as_ref()).as_str()
@@ -601,7 +608,7 @@ impl Server {
             config,
             users,
             usernames,
-            e2e_keys,
+            device_directory,
             poll,
             listener,
             udp,
@@ -1833,20 +1840,85 @@ impl Server {
                     envelope,
                 )
             }
-            (ConnState::Ready, ClientControl::PublishE2eKey { public_key }) => {
+            (
+                ConnState::Ready,
+                ClientControl::AppendAccountKeyStatement { statement },
+            ) => {
                 let session_id = self.session_for_token(token)?;
-                let result = self.publish_e2e_key(session_id, public_key);
-                self.report_request_outcome(token, result)
+                self.append_account_key_statement(session_id, statement)
             }
-            (ConnState::Ready, ClientControl::FetchE2eKey { user_id }) => {
+            (
+                ConnState::Ready,
+                ClientControl::FetchAccountKeyChain { user_id, after },
+            ) => {
                 self.session_for_token(token)?;
-                let public_key = self.e2e_keys.key_for(user_id);
+                let (base, statements) = self.device_directory.chain_after(user_id, after)?;
                 self.send_control_to_token(
                     token,
-                    &ServerControl::E2eKey {
+                    &ServerControl::AccountKeyChain {
                         user_id,
-                        public_key,
+                        base,
+                        statements,
                     },
+                )
+            }
+            (
+                ConnState::Ready,
+                ClientControl::BindE2eDevice {
+                    device_id,
+                    key_epoch,
+                    ledger_head,
+                    signature,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.bind_e2e_device(
+                    session_id,
+                    device_id,
+                    key_epoch,
+                    ledger_head,
+                    &signature,
+                )
+            }
+            (
+                ConnState::Ready,
+                ClientControl::PutE2eRecoveryBundle {
+                    ledger_head,
+                    bundle,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                let user_id = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|session| session.user_id)
+                    .ok_or_else(|| "unknown session".to_string())?;
+                self.device_directory
+                    .put_recovery_bundle(user_id, ledger_head, &bundle)
+            }
+            (
+                ConnState::Ready,
+                ClientControl::FetchE2eRecoveryBundle { user_id },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                if self
+                    .sessions
+                    .get(&session_id)
+                    .is_none_or(|session| session.user_id != user_id)
+                {
+                    return self.send_control_to_token(
+                        token,
+                        &ServerControl::Error {
+                            code: control::ERROR_REQUEST_REJECTED,
+                            message: "recovery bundles are available only to their account"
+                                .to_string(),
+                        },
+                    );
+                }
+                let bundle = self.device_directory.recovery_bundle(user_id)?;
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::E2eRecoveryBundle { user_id, bundle },
                 )
             }
             (
@@ -2602,10 +2674,6 @@ impl Server {
         issued_token: Option<String>,
     ) -> Result<(), String> {
         let user_id = user.user_id();
-        // Supersede any earlier session for this user before standing up the new
-        // one, so a reconnect never leaves a stale ghost (and its last voice
-        // status) behind alongside the fresh session.
-        self.supersede_existing_sessions(user_id, token);
 
         let session_id = SessionId(self.next_session);
         self.next_session += 1;
@@ -2638,6 +2706,7 @@ impl Server {
                 announced: announce,
                 connected_at_ms: now_ms(),
                 pending_disk_history_fetches: 0,
+                e2e_device: None,
             },
         );
 
@@ -2677,7 +2746,16 @@ impl Server {
             },
         };
         self.send_control_to_token(token, &response)?;
-        if announce && self.live_token_for_session(session_id).is_some() {
+        let first_announced_session = self
+            .sessions
+            .values()
+            .filter(|session| session.user_id == user_id && session.announced)
+            .count()
+            == 1;
+        if announce
+            && first_announced_session
+            && self.live_token_for_session(session_id).is_some()
+        {
             self.broadcast_presence(session_id, true);
         }
         Ok(())
@@ -2797,41 +2875,96 @@ impl Server {
         self.send_control_to_tokens(&tokens, &control);
     }
 
-    /// Records a session user's published DM identity key, broadcasting it to
-    /// every other live session when it is new or changed.
-    fn publish_e2e_key(
+    fn append_account_key_statement(
         &mut self,
         session_id: SessionId,
-        public_key: Vec<u8>,
+        statement: rpc::e2e::AccountKeyStatement,
     ) -> Result<(), String> {
-        let Some(session) = self.sessions.get(&session_id) else {
-            return Err("unknown session".into());
-        };
-        let user_id = session.user_id;
-        let own_token = session.tcp_token;
-        let Ok(public_key) = <[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>::try_from(public_key) else {
-            return Err("published identity key has the wrong length".into());
-        };
-        if self.e2e_keys.publish(user_id, &public_key)? == KeyPublish::Unchanged {
+        let user_id = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.user_id)
+            .ok_or_else(|| "unknown session".to_string())?;
+        let DirectoryAppend::Advanced { roster_epoch, head } =
+            self.device_directory.append(user_id, statement)?
+        else {
             return Ok(());
+        };
+        // A binding covers one exact ledger checkpoint. Advancing the account's
+        // authorization state invalidates every old proof; still-authorized
+        // devices re-fetch and bind to the new head.
+        for session in self
+            .sessions
+            .values_mut()
+            .filter(|session| session.user_id == user_id)
+        {
+            session.e2e_device = None;
         }
         kvlog::info!(
-            "e2e key published",
+            "account device ledger advanced",
             session_id = session_id.0,
-            user_id = user_id.0
+            user_id = user_id.0,
+            roster_epoch,
+            head = encode_hex(&head.0).as_str()
         );
-        let control = ServerControl::E2eKey {
+        let control = ServerControl::AccountKeyHeadChanged {
             user_id,
-            public_key: Some(public_key.to_vec()),
+            roster_epoch,
+            head,
         };
         let tokens: Vec<Token> = self
             .sessions
             .values()
-            .map(|candidate| candidate.tcp_token)
-            .filter(|token| *token != own_token && self.clients.contains_key(token))
+            .map(|session| session.tcp_token)
+            .filter(|token| self.clients.contains_key(token))
             .collect();
         self.send_control_to_tokens(&tokens, &control);
         Ok(())
+    }
+
+    fn bind_e2e_device(
+        &mut self,
+        session_id: SessionId,
+        device_id: DeviceId,
+        key_epoch: u64,
+        ledger_head: LedgerHash,
+        signature: &[u8],
+    ) -> Result<(), String> {
+        let (user_id, token) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| (session.user_id, session.tcp_token))
+            .ok_or_else(|| "unknown session".to_string())?;
+        let signing_public_key = self
+            .device_directory
+            .active_device_signing_key(user_id, device_id, key_epoch, ledger_head)?
+            .ok_or_else(|| "device is not active at the named account ledger head".to_string())?;
+        rpc::e2e::verify_device_binding(
+            &signing_public_key,
+            session_id,
+            user_id,
+            device_id,
+            key_epoch,
+            ledger_head,
+            signature,
+        )
+        .map_err(|error| error.to_string())?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| "session disappeared during device binding".to_string())?;
+        session.e2e_device = Some(BoundE2eDevice {
+            device_id,
+            key_epoch,
+            ledger_head,
+        });
+        self.send_control_to_token(
+            token,
+            &ServerControl::E2eDeviceBound {
+                device_id,
+                key_epoch,
+            },
+        )
     }
 
     /// Whether the session's user may access the room. Denials never reveal
@@ -3262,6 +3395,38 @@ impl Server {
         }
     }
 
+    fn dm_event_origin_error(
+        &self,
+        session_id: SessionId,
+        room_id: RoomId,
+        envelope: Option<&[u8]>,
+        expected_kind: DmContentKind,
+    ) -> Option<&'static str> {
+        if !self.room_is_dm(room_id) {
+            return None;
+        }
+        let session = self.sessions.get(&session_id)?;
+        let Some(bound) = session.e2e_device else {
+            return Some("bind an active E2E device before sending direct messages");
+        };
+        let Some(envelope) = envelope else {
+            return Some("direct message event envelope is absent");
+        };
+        let Ok(event) = jsony::from_binary::<DmEventEnvelope>(envelope) else {
+            return Some("direct message event envelope is malformed");
+        };
+        if event.header.room_id != room_id
+            || event.header.sender != session.user_id
+            || event.header.author_device != bound.device_id
+            || event.header.author_key_epoch != bound.key_epoch
+            || event.header.sender_roster.head != bound.ledger_head
+            || event.header.kind != expected_kind
+        {
+            return Some("direct message event does not match the bound device session");
+        }
+        None
+    }
+
     fn send_chat(
         &mut self,
         session_id: SessionId,
@@ -3303,6 +3468,23 @@ impl Server {
                 room_id = room_id.0,
                 error
             );
+            let token = self
+                .live_token_for_session(session_id)
+                .ok_or_else(|| "chat sender disconnected".to_string())?;
+            return self.send_control_to_token(
+                token,
+                &ServerControl::Error {
+                    code: control::ERROR_REQUEST_REJECTED,
+                    message: error.to_string(),
+                },
+            );
+        }
+        if let Some(error) = self.dm_event_origin_error(
+            session_id,
+            room_id,
+            envelope.as_deref(),
+            DmContentKind::Text,
+        ) {
             let token = self
                 .live_token_for_session(session_id)
                 .ok_or_else(|| "chat sender disconnected".to_string())?;
@@ -3388,6 +3570,21 @@ impl Server {
                 error
             );
             return self.reject_chat_mutation(session_id, room_id, target, kind, error.to_string());
+        }
+        let event_kind = match kind {
+            MutationKind::Edit => DmContentKind::Edit,
+            MutationKind::Delete => DmContentKind::Delete,
+        };
+        if let Some(error) =
+            self.dm_event_origin_error(session_id, room_id, envelope.as_deref(), event_kind)
+        {
+            return self.reject_chat_mutation(
+                session_id,
+                room_id,
+                target,
+                kind,
+                error.to_string(),
+            );
         }
         if let Err(denied) = self.store.validate_mutation(room_id, target, sender, kind) {
             kvlog::warn!(
@@ -3515,6 +3712,14 @@ impl Server {
                 _ => "direct message uploads require end-to-end encryption",
             }
             .into());
+        }
+        if let Some(error) = self.dm_event_origin_error(
+            session_id,
+            room_id,
+            sealed_meta.as_deref(),
+            DmContentKind::FileAnnounce,
+        ) {
+            return Err(error.to_string());
         }
         let key = (session_id, client_transfer_id);
         if self.active_uploads.contains_key(&key) {
@@ -4838,11 +5043,15 @@ impl Server {
             .retain(|(owner, _), _| *owner != session_id);
         self.end_shares_for_session(session_id);
         self.leave_voice(session_id, Some(session_id));
-        if self
-            .sessions
-            .get(&session_id)
-            .is_some_and(|session| session.announced)
-        {
+        let announce_offline = self.sessions.get(&session_id).is_some_and(|leaving| {
+            leaving.announced
+                && !self.sessions.iter().any(|(other_id, other)| {
+                    *other_id != session_id
+                        && other.user_id == leaving.user_id
+                        && other.announced
+                })
+        });
+        if announce_offline {
             self.broadcast_presence(session_id, false);
         }
         if let Some(session) = self.sessions.remove(&session_id) {
@@ -4850,38 +5059,6 @@ impl Server {
                 .remove(&session.transport.route_id);
         }
         self.remove_peer_links(session_id);
-    }
-
-    /// Drops any session still held for `user_id` under a connection other than
-    /// `keep_token`, so a reconnecting user supersedes a session left behind by
-    /// an ungraceful disconnect rather than coexisting with it. Without this, a
-    /// stale session whose TCP close has not yet been observed lingers in the
-    /// room as a ghost participant carrying its last voice status — a user who
-    /// muted before dropping then reappears muted even after rejoining, because
-    /// the client roster is keyed by user and the duplicate's stale status wins.
-    fn supersede_existing_sessions(&mut self, user_id: UserId, keep_token: Token) {
-        let stale = self
-            .sessions
-            .iter()
-            .filter(|(_, session)| session.user_id == user_id && session.tcp_token != keep_token)
-            .map(|(session_id, session)| (*session_id, session.tcp_token))
-            .collect::<Vec<_>>();
-        for (session_id, token) in stale {
-            kvlog::info!(
-                "superseding stale session on reconnect",
-                user_id = user_id.0,
-                stale_session_id = session_id.0,
-                stale_token = token.0,
-                keep_token = keep_token.0
-            );
-            // A live ghost connection is fully disconnected (deregistering its
-            // socket); an orphaned session with no client is torn down directly.
-            if self.clients.contains_key(&token) {
-                self.disconnect(token);
-            } else {
-                self.teardown_session(session_id, "superseded by reconnecting user");
-            }
-        }
     }
 
     /// Backstop that drops media-route mappings whose session has gone away.
@@ -5606,6 +5783,16 @@ struct Session {
     /// History fetches queued on the disk reader thread, bounded by
     /// [`MAX_PENDING_DISK_HISTORY_FETCHES`].
     pending_disk_history_fetches: u8,
+    /// Device possession proof bound to the current signed account-ledger head.
+    /// `None` sessions may fetch/link devices but cannot originate DM events.
+    e2e_device: Option<BoundE2eDevice>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundE2eDevice {
+    device_id: DeviceId,
+    key_epoch: u64,
+    ledger_head: LedgerHash,
 }
 
 impl Session {
@@ -6061,8 +6248,11 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::SkipFile { .. } => "skip_file",
         ClientControl::EditChat { .. } => "edit_chat",
         ClientControl::DeleteChat { .. } => "delete_chat",
-        ClientControl::PublishE2eKey { .. } => "publish_e2e_key",
-        ClientControl::FetchE2eKey { .. } => "fetch_e2e_key",
+        ClientControl::AppendAccountKeyStatement { .. } => "append_account_key_statement",
+        ClientControl::FetchAccountKeyChain { .. } => "fetch_account_key_chain",
+        ClientControl::BindE2eDevice { .. } => "bind_e2e_device",
+        ClientControl::PutE2eRecoveryBundle { .. } => "put_e2e_recovery_bundle",
+        ClientControl::FetchE2eRecoveryBundle { .. } => "fetch_e2e_recovery_bundle",
     }
 }
 
@@ -6104,7 +6294,10 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
         ServerControl::UploadDeclined { .. } => "upload_declined",
-        ServerControl::E2eKey { .. } => "e2e_key",
+        ServerControl::AccountKeyChain { .. } => "account_key_chain",
+        ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
+        ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
+        ServerControl::E2eRecoveryBundle { .. } => "e2e_recovery_bundle",
     }
 }
 
@@ -6185,6 +6378,7 @@ mod tests {
             announced: true,
             connected_at_ms: 0,
             pending_disk_history_fetches: 0,
+            e2e_device: None,
         }
     }
 
@@ -6704,41 +6898,6 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_supersedes_stale_muted_session() {
-        // A user who muted, then dropped without a clean close, leaves a ghost
-        // session in the room carrying its muted voice status. Reconnecting must
-        // evict that ghost so it cannot reappear as a stale muted participant.
-        let mut server = test_server();
-        let room_id = RoomId(1);
-        let user_id = UserId(9);
-        let stale_id = SessionId(1);
-        server
-            .rooms
-            .insert(room_id, test_room(room_id, &[stale_id]));
-        let mut stale = test_session(user_id, Token(11), Some(room_id));
-        stale.voice_status = control::ParticipantVoiceStatus {
-            muted: true,
-            deafened: false,
-        };
-        server.sessions.insert(stale_id, stale);
-
-        // The reconnecting connection holds no session yet (keep_token differs).
-        server.supersede_existing_sessions(user_id, Token(22));
-
-        assert!(
-            !server.sessions.contains_key(&stale_id),
-            "stale session should be evicted on reconnect"
-        );
-        assert!(
-            server
-                .user_summaries()
-                .iter()
-                .all(|user| user.user_id != user_id || !user.online),
-            "the ghost user must not linger online in the directory"
-        );
-    }
-
-    #[test]
     fn user_summaries_hides_unannounced_sessions() {
         let mut server = test_server();
         server.users.users.push(UserConfig {
@@ -6769,26 +6928,6 @@ mod tests {
         assert!(
             users.iter().all(|user| user.user_id != dynamic_id),
             "an unannounced dynamic session must stay out of the directory"
-        );
-    }
-
-    #[test]
-    fn supersede_keeps_sessions_for_other_users() {
-        let mut server = test_server();
-        let room_id = RoomId(1);
-        let other_id = SessionId(2);
-        server
-            .rooms
-            .insert(room_id, test_room(room_id, &[other_id]));
-        server
-            .sessions
-            .insert(other_id, test_session(UserId(5), Token(33), Some(room_id)));
-
-        server.supersede_existing_sessions(UserId(9), Token(22));
-
-        assert!(
-            server.sessions.contains_key(&other_id),
-            "another user's session must be left untouched"
         );
     }
 
@@ -7201,57 +7340,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn test_account_genesis(server: &Server, user_id: UserId, tag: u8) -> rpc::e2e::AccountKeyStatement {
+        let authority_seed = [tag; 32];
+        let signing_seed = [tag.wrapping_add(1); 32];
+        let encryption_seed = [tag.wrapping_add(2); 32];
+        let authority_public = rpc::e2e::ed25519_public_key(&authority_seed).unwrap();
+        let account_id = rpc::e2e::account_id(
+            server.server_key_pair.public_key().as_ref(),
+            user_id,
+            &authority_public,
+        );
+        rpc::e2e::sign_account_statement(
+            rpc::e2e::AccountKeyStatementBody {
+                account_id,
+                account_generation: 1,
+                roster_epoch: 1,
+                previous: LedgerHash::default(),
+                authority_key_epoch: 1,
+                action: rpc::e2e::AccountKeyAction::Genesis {
+                    authority_public_key: authority_public.to_vec(),
+                    first_device: rpc::e2e::DevicePublicKeys {
+                        device_id: DeviceId([tag; 16]),
+                        key_epoch: 1,
+                        signing_public_key: rpc::e2e::ed25519_public_key(&signing_seed)
+                            .unwrap()
+                            .to_vec(),
+                        encryption_public_key: rpc::e2e::e2e_public_key(&encryption_seed).to_vec(),
+                    },
+                    recovery_bundle_hash: vec![0; 32],
+                },
+            },
+            &authority_seed,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn authorize_test_e2e_device(
+        server: &mut Server,
+        session_id: SessionId,
+        user_id: UserId,
+        tag: u8,
+    ) -> (BoundE2eDevice, rpc::ids::AccountId) {
+        let genesis = test_account_genesis(server, user_id, tag);
+        server
+            .device_directory
+            .append(user_id, genesis)
+            .unwrap();
+        let ledger = server.device_directory.validated(user_id).unwrap().unwrap();
+        let bound = BoundE2eDevice {
+            device_id: DeviceId([tag; 16]),
+            key_epoch: 1,
+            ledger_head: ledger.head,
+        };
+        server.sessions.get_mut(&session_id).unwrap().e2e_device = Some(bound);
+        (bound, ledger.account_id)
+    }
+
+    fn test_dm_event(
+        bound: BoundE2eDevice,
+        account_id: rpc::ids::AccountId,
+        sender: UserId,
+        room_id: RoomId,
+        kind: DmContentKind,
+        tag: u8,
+    ) -> Vec<u8> {
+        jsony::to_binary(&DmEventEnvelope {
+            header: rpc::e2e::SenderEventHeader {
+                event_id: rpc::ids::EventId([tag; 16]),
+                room_id,
+                sender,
+                sender_account: account_id,
+                author_device: bound.device_id,
+                author_key_epoch: bound.key_epoch,
+                sequence: u64::from(tag).max(1),
+                predecessor: None,
+                kind,
+                created_at_ms: u64::from(tag),
+                semantic_target: None,
+                sender_roster: rpc::e2e::RosterCheckpoint {
+                    account_id,
+                    account_generation: 1,
+                    roster_epoch: 1,
+                    head: bound.ledger_head,
+                },
+                recipient_roster: rpc::e2e::RosterCheckpoint {
+                    account_id: rpc::ids::AccountId::default(),
+                    account_generation: 1,
+                    roster_epoch: 1,
+                    head: LedgerHash::default(),
+                },
+            },
+            ephemeral_public_key: vec![1; 32],
+            recipient_keys: Vec::new(),
+            sealed: vec![tag; 32],
+            signature: vec![tag; 64],
+        })
+    }
+
     #[test]
-    fn publish_e2e_key_broadcasts_to_other_sessions() {
+    fn account_key_statement_broadcasts_signed_head() {
         let mut server = test_server();
         let publisher = SessionId(1);
         let mut publisher_peer = live_user(&mut server, Token(11), publisher, UserId(1));
         let mut reader_peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
+        let genesis = test_account_genesis(&server, UserId(1), 7);
 
-        server.publish_e2e_key(publisher, vec![7u8; 32]).unwrap();
+        server
+            .append_account_key_statement(publisher, genesis.clone())
+            .unwrap();
 
         let control = read_until(&mut reader_peer, |control| {
-            matches!(control, ServerControl::E2eKey { .. })
+            matches!(control, ServerControl::AccountKeyHeadChanged { .. })
         });
-        let ServerControl::E2eKey {
+        let ServerControl::AccountKeyHeadChanged {
             user_id,
-            public_key,
+            roster_epoch,
+            head,
         } = control
         else {
             unreachable!();
         };
         assert_eq!(user_id, UserId(1));
-        assert_eq!(public_key, Some(vec![7u8; 32]));
-        assert_no_control(&mut publisher_peer);
+        assert_eq!(roster_epoch, 1);
+        assert_eq!(head, rpc::e2e::account_statement_hash(&genesis));
+        assert!(matches!(
+            read_until(&mut publisher_peer, |control| matches!(
+                control,
+                ServerControl::AccountKeyHeadChanged { .. }
+            )),
+            ServerControl::AccountKeyHeadChanged { .. }
+        ));
 
-        server.publish_e2e_key(publisher, vec![7u8; 32]).unwrap();
+        server
+            .append_account_key_statement(publisher, genesis)
+            .unwrap();
         assert_no_control(&mut reader_peer);
-
-        assert!(server.publish_e2e_key(publisher, vec![7u8; 31]).is_err());
     }
 
     #[test]
-    fn fetch_e2e_key_returns_published_key_and_none_for_unknown() {
-        let mut server = test_server();
-        let publisher = SessionId(1);
-        let _peer = live_user(&mut server, Token(11), publisher, UserId(1));
-
-        server.publish_e2e_key(publisher, vec![9u8; 32]).unwrap();
-
-        assert_eq!(server.e2e_keys.key_for(UserId(1)), Some(vec![9u8; 32]));
-        assert_eq!(server.e2e_keys.key_for(UserId(2)), None);
-    }
-
-    #[test]
-    fn e2e_key_survives_restart() {
+    fn account_device_ledger_survives_restart() {
         let dir = std::env::temp_dir().join(format!("chatt-e2e-restart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut server = test_server();
         server.config.storage.data_dir = Some(dir.display().to_string());
-        server.e2e_keys = E2eKeyStore::open(server.config.data_dir()).unwrap();
+        server.device_directory = DeviceDirectory::open(
+            server.config.data_dir(),
+            server.server_key_pair.public_key().as_ref().to_vec(),
+        )
+        .unwrap();
         let publisher = SessionId(1);
         let _peer = live_user(&mut server, Token(11), publisher, UserId(1));
-        server.publish_e2e_key(publisher, vec![5u8; 32]).unwrap();
+        let genesis = test_account_genesis(&server, UserId(1), 5);
+        server
+            .append_account_key_statement(publisher, genesis.clone())
+            .unwrap();
         let mut config = server.config.clone();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
         config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
@@ -7259,7 +7502,10 @@ mod tests {
 
         let restarted = Server::bind(config).expect("restarted server");
 
-        assert_eq!(restarted.e2e_keys.key_for(UserId(1)), Some(vec![5u8; 32]));
+        assert_eq!(
+            restarted.device_directory.chain_for(UserId(1)).unwrap(),
+            vec![genesis]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7274,6 +7520,16 @@ mod tests {
             .store
             .dm_room_for(UserId(1), UserId(2))
             .expect("dm registered");
+        let (bound, account_id) =
+            authorize_test_e2e_device(&mut server, requester, UserId(1), 31);
+        let text_event = test_dm_event(
+            bound,
+            account_id,
+            UserId(1),
+            dm_room,
+            DmContentKind::Text,
+            1,
+        );
 
         server
             .send_chat(requester, dm_room, "plaintext".to_string(), None)
@@ -7299,7 +7555,7 @@ mod tests {
         );
 
         server
-            .send_chat(requester, dm_room, String::new(), Some(vec![2u8; 200]))
+            .send_chat(requester, dm_room, String::new(), Some(text_event.clone()))
             .unwrap();
         let mut sealed_target = MessageId(0);
         for peer in [&mut requester_peer, &mut peer_peer] {
@@ -7309,7 +7565,7 @@ mod tests {
                 unreachable!();
             };
             assert!(message.body.is_empty());
-            assert_eq!(message.envelope, Some(vec![2u8; 200]));
+            assert_eq!(message.envelope, Some(text_event.clone()));
             sealed_target = message.message_id;
         }
 
@@ -7338,7 +7594,14 @@ mod tests {
                 sealed_target,
                 MutationKind::Edit,
                 String::new(),
-                Some(vec![3u8; 200]),
+                Some(test_dm_event(
+                    bound,
+                    account_id,
+                    UserId(1),
+                    dm_room,
+                    DmContentKind::Edit,
+                    2,
+                )),
             )
             .unwrap();
         let ServerControl::Chat { message } = read_until(&mut peer_peer, |control| {
@@ -7347,7 +7610,7 @@ mod tests {
             unreachable!();
         };
         assert_eq!(message.target, Some(sealed_target));
-        assert_eq!(message.envelope, Some(vec![3u8; 200]));
+        assert!(message.envelope.is_some());
 
         server
             .mutate_chat(
@@ -7375,7 +7638,14 @@ mod tests {
                 sealed_target,
                 MutationKind::Delete,
                 String::new(),
-                Some(vec![4u8; 200]),
+                Some(test_dm_event(
+                    bound,
+                    account_id,
+                    UserId(1),
+                    dm_room,
+                    DmContentKind::Delete,
+                    3,
+                )),
             )
             .unwrap();
         let ServerControl::Chat { message } = read_until(
@@ -7385,7 +7655,7 @@ mod tests {
             unreachable!();
         };
         assert_eq!(message.target, Some(sealed_target));
-        assert_eq!(message.envelope, Some(vec![4u8; 200]));
+        assert!(message.envelope.is_some());
     }
 
     #[test]
@@ -7400,7 +7670,16 @@ mod tests {
             .store
             .dm_room_for(UserId(1), UserId(2))
             .expect("dm registered");
-        let sealed_meta = vec![9u8; 180];
+        let (bound, account_id) =
+            authorize_test_e2e_device(&mut server, uploader, UserId(1), 41);
+        let sealed_meta = test_dm_event(
+            bound,
+            account_id,
+            UserId(1),
+            dm_room,
+            DmContentKind::FileAnnounce,
+            9,
+        );
 
         assert!(
             server

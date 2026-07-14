@@ -48,7 +48,10 @@ use rpc::{
         write_queue_to,
     },
     frame, history,
-    ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
+    ids::{
+        AccountId, BugReportId, DeviceId, EventId, FileTransferId, MessageId, RoomId, SessionId,
+        StreamId, UserId,
+    },
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
     recv::RecvBuffer,
 };
@@ -324,13 +327,12 @@ pub struct ClientConfig {
     pub username: String,
     pub token: String,
     pub server_public_key: Option<String>,
-    /// Hex-encoded 32-byte X25519 seed for DM end-to-end encryption. `None`
-    /// only for legacy configs the app failed to seed before spawning.
-    pub e2e_identity_seed: Option<String>,
-    /// Authenticated account this local identity seed is pinned to.
-    pub e2e_local_user_id: Option<UserId>,
     /// Durable DM contact identity tuples and former trusted tuples.
     pub e2e_peer_pins: Vec<E2ePeerPin>,
+    /// Optional one-time high-entropy code copied from an existing device.
+    /// It is used only when this installation must join an existing account
+    /// ledger and is never transmitted to the server.
+    pub e2e_recovery_code: Option<String>,
     pub require_native_encryption: bool,
     pub file_policy: FilePolicy,
     /// The in-memory download ring buffer shared with the web server, filled
@@ -516,10 +518,14 @@ pub enum NetworkCommand {
         pin: E2ePeerPin,
         persisted: bool,
     },
-    ConfirmE2eLocalUser {
-        user_id: UserId,
-        persisted: bool,
+    /// Authority-signs a terminal revocation. All sessions on the account are
+    /// unbound until they validate the advanced ledger; the revoked device can
+    /// never become active again.
+    RevokeE2eDevice {
+        device_id: DeviceId,
     },
+    ShowE2eRecoveryCode,
+    ListE2eDevices,
     Shutdown,
 }
 
@@ -587,9 +593,14 @@ pub enum NetworkEvent {
         room_id: RoomId,
         peer: UserId,
     },
-    /// First authenticated id observed for the configured local E2E seed.
-    E2eLocalUserId {
-        user_id: UserId,
+    /// Shown once when a new account identity is created. This high-entropy
+    /// code can enroll another installation without revealing the account
+    /// authority to the server.
+    E2eRecoveryCode {
+        code: String,
+    },
+    E2eAccountIdentity {
+        account_id: AccountId,
     },
     /// One chunk of server-retained history for a room.
     HistoryChunk {
@@ -1108,6 +1119,11 @@ fn run_worker_inner(
         Err(error) => return SessionEnd::ConnectFailed(error),
     };
     let transport_mode = transport.mode;
+    let server_public_key = match pinned_server_public_key(config, false) {
+        Ok(Some(key)) => key,
+        Ok(None) => unreachable!("ordinary connections always pin a server key"),
+        Err(error) => return SessionEnd::ConnectFailed(error),
+    };
     if transport_mode == TransportMode::ExternalSecureLink && config.require_native_encryption {
         let _ = events.send(NetworkEvent::NativeEncryptionRequired);
         return SessionEnd::Shutdown;
@@ -1181,6 +1197,7 @@ fn run_worker_inner(
         media,
         transport_mode,
         video_auth_key,
+        server_public_key,
         session_id: None,
         user_id: None,
         user_names: HashMap::new(),
@@ -1238,10 +1255,11 @@ fn run_worker_inner(
         incoming_files: HashMap::new(),
         skipped_untrusted_files: HashSet::new(),
         e2e: E2eState::new(
-            config.e2e_identity_seed.as_deref(),
-            config.e2e_local_user_id,
+            None,
+            None,
             &config.e2e_peer_pins,
         ),
+        e2e_bound: false,
         deferred_e2e: HashMap::new(),
         deferred_e2e_bytes: 0,
         deferred_e2e_items: 0,
@@ -1722,6 +1740,10 @@ struct WorkerState {
     transport_mode: TransportMode,
     /// Session-authentication key for external-link video connection setup.
     video_auth_key: [u8; KEY_LEN],
+    /// Server identity is part of every account id and local identity-store
+    /// namespace, preventing credentials or ledgers crossing server trust
+    /// domains.
+    server_public_key: [u8; 32],
     server_udp_addr: SocketAddr,
     server_udp_probe_addr: Option<SocketAddr>,
     session_id: Option<SessionId>,
@@ -1790,10 +1812,11 @@ struct WorkerState {
     outgoing_bug_reports: VecDeque<OutgoingBugReport>,
     incoming_files: HashMap<FileTransferId, IncomingFile>,
     skipped_untrusted_files: HashSet<FileTransferId>,
-    /// DM end-to-end sealing state: identity seed, room-to-peer map, pinned
-    /// peer keys, and derived pair keys. All sealing and opening happens on
-    /// this thread so only plaintext crosses the event channel.
+    /// Account/device ledgers, independent local keys, replay journal, DM room
+    /// mapping, and account-level verification state. All sealing and opening
+    /// happens on this thread so only plaintext crosses the event channel.
     e2e: E2eState,
+    e2e_bound: bool,
     deferred_e2e: HashMap<RoomId, DeferredE2eRoom>,
     deferred_e2e_bytes: usize,
     deferred_e2e_items: usize,
@@ -1821,6 +1844,7 @@ struct DeferredE2eRoom {
 enum OpenChat {
     Ready(Option<MessageProvenance>),
     Deferred,
+    Discarded,
 }
 
 impl DeferredE2eInbound {
@@ -2241,6 +2265,7 @@ struct OutgoingUpload {
 /// its Padmé length so the server learns only a coarse size class.
 struct UploadSeal {
     content_key: KeyMaterial,
+    event_id: EventId,
     /// The encoding of the sealed payloads, hidden from the server behind
     /// [`FileContentEncoding::Sealed`].
     inner_encoding: FileContentEncoding,
@@ -2421,6 +2446,7 @@ struct IncomingFile {
 /// Chunk-opening state for a sealed DM download.
 struct IncomingSeal {
     content_key: KeyMaterial,
+    event_id: EventId,
     /// Chunk counter, the AEAD nonce for the next expected frame.
     counter: u64,
     /// Wire-size cap computed from the sealed (outer) metadata; the restored
@@ -2992,6 +3018,12 @@ impl WorkerState {
         if !self.e2e.requires_e2e(room_id) {
             return Ok((body, None));
         }
+        if !self.e2e_bound {
+            let _ = self.events.send(NetworkEvent::Error(
+                "cannot send: the active E2E device roster is still being verified".to_string(),
+            ));
+            return Err(());
+        }
         match self
             .e2e
             .seal_chat(room_id, kind, target, &body, unix_now_ms())
@@ -3532,18 +3564,22 @@ impl WorkerState {
                     ));
                 }
             }
-            NetworkCommand::ConfirmE2eLocalUser { user_id, persisted } => {
-                if !self.e2e.confirm_local_user(user_id, persisted) {
-                    return Err("stale local E2E identity acknowledgement".to_string());
-                }
-                if !persisted {
-                    return Err("local E2E account id could not be persisted".to_string());
-                }
-                if let Some(public_key) = self.e2e.public_key() {
-                    self.queue_control(ClientControl::PublishE2eKey {
-                        public_key: public_key.to_vec(),
-                    })?;
-                }
+            NetworkCommand::RevokeE2eDevice { device_id } => {
+                let statement = self.e2e.revoke_device_statement(device_id)?;
+                self.queue_control(ClientControl::AppendAccountKeyStatement { statement })?;
+            }
+            NetworkCommand::ShowE2eRecoveryCode => {
+                let code = self
+                    .e2e
+                    .recovery_code()
+                    .ok_or_else(|| "local E2E recovery code is unavailable".to_string())?;
+                let _ = self.events.send(NetworkEvent::E2eRecoveryCode { code });
+            }
+            NetworkCommand::ListE2eDevices => {
+                let devices = self.e2e.device_descriptions()?.join("; ");
+                let _ = self
+                    .events
+                    .send(NetworkEvent::Error(format!("E2E account devices: {devices}")));
             }
             NetworkCommand::SetP2pEnabled(enabled) => {
                 // P2P would bypass an outer secure link, so it stays off in
@@ -3875,6 +3911,12 @@ impl WorkerState {
         if !self.e2e.requires_e2e(room_id) {
             return Ok(None);
         }
+        if !self.e2e_bound {
+            return Err(
+                "cannot send file: the active E2E device roster is still being verified"
+                    .to_string(),
+            );
+        }
         let mut content_key = [0u8; KEY_LEN];
         ring::rand::SystemRandom::new()
             .fill(&mut content_key)
@@ -3902,11 +3944,14 @@ impl WorkerState {
                 }
                 SealBlocked::Crypto => "cannot send file: sealing the metadata failed".to_string(),
             })?;
+        let event: rpc::e2e::DmEventEnvelope = jsony::from_binary(&sealed_meta)
+            .map_err(|_| "sealed file announcement is not a device event".to_string())?;
         Ok(Some(UploadSeal {
             content_key: KeyMaterial {
                 id: 1,
                 bytes: content_key,
             },
+            event_id: event.header.event_id,
             inner_encoding,
             counter: 0,
             stream_len: 0,
@@ -4097,6 +4142,7 @@ impl WorkerState {
                         &seal.content_key.bytes,
                         upload.room_id,
                         sender,
+                        seal.event_id,
                         seal.counter,
                         &data,
                         0,
@@ -4267,6 +4313,7 @@ impl WorkerState {
                     &seal.content_key.bytes,
                     upload.room_id,
                     sender,
+                    seal.event_id,
                     seal.counter,
                     &[],
                     pad_len,
@@ -4574,11 +4621,15 @@ impl WorkerState {
                 DmContentKind::FileAnnounce,
                 envelope,
                 &self.config.username,
+                true,
             ) {
                 Ok(_) => {}
                 Err(OpenFailure::NoKeys | OpenFailure::AwaitingTrust) => {
                     if let Some(peer) = self.e2e.dm_peer(file.room_id) {
-                        let _ = self.queue_control(ClientControl::FetchE2eKey { user_id: peer });
+                        let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
+                            user_id: peer,
+                            after: self.e2e.account_chain_after(peer),
+                        });
                     }
                     return Ok(false);
                 }
@@ -4587,6 +4638,9 @@ impl WorkerState {
                 }
                 Err(OpenFailure::Crypto) => {
                     return Err("DM transfer metadata failed authentication".to_string());
+                }
+                Err(OpenFailure::Replay) => {
+                    return Err("DM transfer metadata was replayed".to_string());
                 }
             }
         }
@@ -4750,7 +4804,7 @@ impl WorkerState {
         let Some(sealed_meta) = file.sealed_meta.take() else {
             return Err("Sealed transfer without its metadata envelope".to_string());
         };
-        let plaintext = self
+        let opened = self
             .e2e
             .open_envelope(
                 file.room_id,
@@ -4758,25 +4812,38 @@ impl WorkerState {
                 DmContentKind::FileAnnounce,
                 &sealed_meta,
                 &self.config.username,
+                true,
             )
             .map_err(|_| "Could not decrypt the transfer metadata".to_string())?;
-        file.sender_name = plaintext.sender_name;
-        let rpc::e2e::DmContent::FileAnnounce { file: meta } = plaintext.plaintext.content else {
+        self.e2e
+            .record_opened_event(&opened, &sealed_meta, true)
+            .map_err(|_| "Transfer metadata event was replayed or reordered".to_string())?;
+        let event_id = opened
+            .event
+            .ok_or_else(|| "Transfer metadata omitted its sender event id".to_string())?
+            .event_id;
+        let rpc::e2e::DmContent::FileAnnounce { file: meta } = &opened.plaintext.content else {
             return Err("Transfer metadata envelope has the wrong type".to_string());
         };
         let Ok(content_key) = <[u8; KEY_LEN]>::try_from(meta.content_key.as_slice()) else {
             return Err("Transfer content key has the wrong length".to_string());
         };
         let wire_bound = max_file_wire_bytes(FileContentEncoding::Sealed, file.size);
+        file.sender_name.clone_from(&opened.sender_name);
+        file.timestamp_ms = opened.plaintext.sent_at_ms;
         file.file_name = meta.original_name.clone();
-        file.original_name = meta.original_name;
+        file.original_name.clone_from(&meta.original_name);
         file.size = meta.size;
         file.encoding = meta.encoding;
+        self.e2e
+            .mark_opened_event_applied(&opened)
+            .map_err(|_| "Could not persist the transfer replay checkpoint".to_string())?;
         Ok(Some(IncomingSeal {
             content_key: KeyMaterial {
                 id: 1,
                 bytes: content_key,
             },
+            event_id,
             counter: 0,
             wire_bound,
         }))
@@ -4905,6 +4972,7 @@ impl WorkerState {
                     &seal.content_key.bytes,
                     incoming.metadata.room_id,
                     incoming.metadata.sender,
+                    seal.event_id,
                     seal.counter,
                     &mut frame,
                 );
@@ -5126,7 +5194,7 @@ impl WorkerState {
         );
         let mut opened = Vec::with_capacity(chunk.messages.len());
         for mut message in chunk.messages.iter().cloned() {
-            match self.open_chat_message(&mut message)? {
+            match self.open_chat_message(&mut message, false)? {
                 OpenChat::Ready(provenance) => opened.push(AuthenticatedChat {
                     message,
                     provenance,
@@ -5135,6 +5203,7 @@ impl WorkerState {
                     self.defer_e2e(DeferredE2eInbound::History(chunk))?;
                     return Ok(true);
                 }
+                OpenChat::Discarded => {}
             }
         }
         let _ = self.events.send(NetworkEvent::HistoryChunk {
@@ -5172,10 +5241,10 @@ impl WorkerState {
                     room_count = rooms.len(),
                     user_count = users.len()
                 );
-                let local_id_is_new = self.e2e.set_local_user(user_id)?;
-                if local_id_is_new {
-                    let _ = self.events.send(NetworkEvent::E2eLocalUserId { user_id });
-                }
+                let local_device_is_new = self
+                    .e2e
+                    .initialize_device(&self.server_public_key, user_id)?;
+                self.e2e_bound = false;
                 self.user_names.clear();
                 let mut folded_names = HashSet::new();
                 for user in &users {
@@ -5221,13 +5290,23 @@ impl WorkerState {
                     }
                 }
                 self.bind_udp();
-                if !local_id_is_new && let Some(public_key) = self.e2e.public_key() {
-                    let _ = self.queue_control(ClientControl::PublishE2eKey {
-                        public_key: public_key.to_vec(),
-                    });
+                if local_device_is_new {
+                    let _ = self.events.send(NetworkEvent::Status(
+                        "created a new encrypted account device identity".to_string(),
+                    ));
+                    if let Some(code) = self.e2e.recovery_code() {
+                        let _ = self.events.send(NetworkEvent::E2eRecoveryCode { code });
+                    }
                 }
+                let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
+                    user_id,
+                    after: self.e2e.account_chain_after(user_id),
+                });
                 for (user_id, _, _) in dm_peers {
-                    let _ = self.queue_control(ClientControl::FetchE2eKey { user_id });
+                    let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
+                        user_id,
+                        after: self.e2e.account_chain_after(user_id),
+                    });
                 }
             }
             ServerControl::OpenPaired { .. } => {
@@ -5242,7 +5321,7 @@ impl WorkerState {
                     body_size = message.body.len()
                 );
                 let mut message = message;
-                match self.open_chat_message(&mut message)? {
+                match self.open_chat_message(&mut message, true)? {
                     OpenChat::Ready(provenance) => {
                         let _ = self.events.send(NetworkEvent::Chat(AuthenticatedChat {
                             message,
@@ -5252,6 +5331,7 @@ impl WorkerState {
                     OpenChat::Deferred => {
                         self.defer_e2e(DeferredE2eInbound::Chat(message))?;
                     }
+                    OpenChat::Discarded => {}
                 }
             }
             ServerControl::ChatMutationRejected {
@@ -5593,7 +5673,10 @@ impl WorkerState {
                         user_id,
                         username: username.clone(),
                     });
-                    let _ = self.queue_control(ClientControl::FetchE2eKey { user_id });
+                    let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
+                        user_id,
+                        after: self.e2e.account_chain_after(user_id),
+                    });
                 }
                 let _ = self.events.send(NetworkEvent::RoomUpserted(room));
             }
@@ -5627,12 +5710,120 @@ impl WorkerState {
                 client_transfer_id,
                 reason,
             } => self.handle_upload_declined(client_transfer_id, &reason),
-            ServerControl::E2eKey {
+            ServerControl::AccountKeyChain {
                 user_id,
-                public_key,
+                base,
+                statements,
             } => {
-                let outcome = self.e2e.handle_peer_key(user_id, public_key.as_deref());
-                self.handle_peer_identity_outcome(user_id, outcome)?;
+                let local_user = self
+                    .user_id
+                    .ok_or_else(|| "account ledger arrived before authentication".to_string())?;
+                let recovery_candidate = (user_id == local_user
+                    && base.is_none()
+                    && self.config.e2e_recovery_code.is_some())
+                    .then(|| statements.clone());
+                let ledger = match self.e2e.apply_account_chain(user_id, base, statements) {
+                    Ok(ledger) => ledger,
+                    Err(error) => {
+                        let Some(candidate) = recovery_candidate else {
+                            return Err(error);
+                        };
+                        self.e2e.stage_recovery_chain(candidate)?;
+                        self.queue_control(ClientControl::FetchE2eRecoveryBundle {
+                            user_id: local_user,
+                        })?;
+                        return Ok(());
+                    }
+                };
+                if user_id == local_user {
+                    let Some(ledger) = ledger else {
+                        let genesis = self
+                            .e2e
+                            .own_genesis()
+                            .ok_or_else(|| "local account genesis is unavailable".to_string())?;
+                        self.queue_control(ClientControl::AppendAccountKeyStatement {
+                            statement: genesis,
+                        })?;
+                        return Ok(());
+                    };
+                    let _ = self.events.send(NetworkEvent::E2eAccountIdentity {
+                        account_id: ledger.account_id,
+                    });
+                    let session_id = self
+                        .session_id
+                        .ok_or_else(|| "account ledger arrived before session id".to_string())?;
+                    let (device_id, key_epoch, ledger_head, signature) =
+                        self.e2e.device_binding(session_id)?;
+                    self.queue_control(ClientControl::BindE2eDevice {
+                        device_id,
+                        key_epoch,
+                        ledger_head,
+                        signature,
+                    })?;
+                    if let Some((ledger_head, bundle)) = self.e2e.recovery_bundle() {
+                        self.queue_control(ClientControl::PutE2eRecoveryBundle {
+                            ledger_head,
+                            bundle,
+                        })?;
+                    }
+                } else {
+                    let outcome = match ledger {
+                        Some(ledger) => self
+                            .e2e
+                            .handle_peer_key(user_id, Some(&ledger.account_id.0)),
+                        None => self.e2e.handle_peer_key(user_id, None),
+                    };
+                    self.handle_peer_identity_outcome(user_id, outcome)?;
+                }
+            }
+            ServerControl::AccountKeyHeadChanged {
+                user_id,
+                roster_epoch,
+                head,
+            } => {
+                if Some(user_id) == self.user_id {
+                    self.e2e_bound = false;
+                }
+                if let Some(current) = self.e2e.account_ledger(user_id) {
+                    if current.head == head {
+                        return Ok(());
+                    }
+                    if roster_epoch <= current.roster_epoch {
+                        return Err("account directory announced a rollback or same-epoch fork"
+                            .to_string());
+                    }
+                }
+                self.queue_control(ClientControl::FetchAccountKeyChain {
+                    user_id,
+                    after: self.e2e.account_chain_after(user_id),
+                })?;
+            }
+            ServerControl::E2eDeviceBound {
+                device_id,
+                key_epoch,
+            } => {
+                let (expected_device, expected_epoch, _, _) = self.e2e.device_binding(
+                    self.session_id
+                        .ok_or_else(|| "device binding arrived before authentication".to_string())?,
+                )?;
+                if device_id != expected_device || key_epoch != expected_epoch {
+                    return Err("server confirmed the wrong E2E device binding".to_string());
+                }
+                self.e2e_bound = true;
+            }
+            ServerControl::E2eRecoveryBundle { user_id, bundle } => {
+                if Some(user_id) != self.user_id {
+                    return Err("server returned another account's recovery bundle".to_string());
+                }
+                let bundle = bundle.ok_or_else(|| {
+                    "existing encrypted account has no recovery bundle".to_string()
+                })?;
+                let recovery_code = self.config.e2e_recovery_code.as_deref().ok_or_else(|| {
+                    "server returned a recovery bundle when no device link was requested"
+                        .to_string()
+                })?;
+                let statement = self.e2e.finish_recovery_link(recovery_code, bundle)?;
+                self.queue_control(ClientControl::AppendAccountKeyStatement { statement })?;
             }
         }
         Ok(())
@@ -5706,8 +5897,15 @@ impl WorkerState {
     /// Opens a chat record and returns its client-authenticated key provenance.
     /// `Deferred` is reserved for the short ordering window before a peer key
     /// response arrives; malformed or forbidden forms fail the connection.
-    fn open_chat_message(&mut self, message: &mut ChatMessage) -> Result<OpenChat, String> {
-        let failure = match self.e2e.open_message(message, &self.config.username) {
+    fn open_chat_message(
+        &mut self,
+        message: &mut ChatMessage,
+        live: bool,
+    ) -> Result<OpenChat, String> {
+        let failure = match self
+            .e2e
+            .open_message_with_replay(message, &self.config.username, live)
+        {
             Ok(provenance) => return Ok(OpenChat::Ready(provenance)),
             Err(failure) => failure,
         };
@@ -5721,6 +5919,7 @@ impl WorkerState {
                 OpenFailure::AwaitingTrust => "awaiting trust",
                 OpenFailure::Policy => "policy",
                 OpenFailure::Crypto => "authentication",
+                OpenFailure::Replay => "replay",
             }
         );
         match failure {
@@ -5728,10 +5927,14 @@ impl WorkerState {
                 if failure == OpenFailure::NoKeys
                     && let Some(user_id) = self.e2e.dm_peer(message.room_id)
                 {
-                    let _ = self.queue_control(ClientControl::FetchE2eKey { user_id });
+                    let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
+                        user_id,
+                        after: self.e2e.account_chain_after(user_id),
+                    });
                 }
                 Ok(OpenChat::Deferred)
             }
+            OpenFailure::Replay => Ok(OpenChat::Discarded),
             OpenFailure::Policy => Err(format!(
                 "server sent a forbidden plaintext/envelope form for room {}",
                 message.room_id.0
@@ -5779,7 +5982,7 @@ impl WorkerState {
             let logical_items = item.logical_items();
             match item {
                 DeferredE2eInbound::Chat(mut message) => {
-                    match self.open_chat_message(&mut message)? {
+                    match self.open_chat_message(&mut message, true)? {
                         OpenChat::Ready(provenance) => {
                             let _ = self.events.send(NetworkEvent::Chat(AuthenticatedChat {
                                 message,
@@ -5790,13 +5993,14 @@ impl WorkerState {
                             room.items.push_front(DeferredE2eInbound::Chat(message));
                             break;
                         }
+                        OpenChat::Discarded => {}
                     }
                 }
                 DeferredE2eInbound::History(chunk) => {
                     let mut opened = Vec::with_capacity(chunk.messages.len());
                     let mut ready = true;
                     for mut message in chunk.messages.iter().cloned() {
-                        match self.open_chat_message(&mut message)? {
+                        match self.open_chat_message(&mut message, false)? {
                             OpenChat::Ready(provenance) => opened.push(AuthenticatedChat {
                                 message,
                                 provenance,
@@ -5805,6 +6009,7 @@ impl WorkerState {
                                 ready = false;
                                 break;
                             }
+                            OpenChat::Discarded => {}
                         }
                     }
                     if ready {
@@ -7176,7 +7381,9 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::VerifyPeerIdentity { .. } => "verify_peer_identity",
         NetworkCommand::ForgetPeerIdentity { .. } => "forget_peer_identity",
         NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
-        NetworkCommand::ConfirmE2eLocalUser { .. } => "confirm_e2e_local_user",
+        NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
+        NetworkCommand::ShowE2eRecoveryCode => "show_e2e_recovery_code",
+        NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -7307,7 +7514,10 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
         ServerControl::UploadDeclined { .. } => "upload_declined",
-        ServerControl::E2eKey { .. } => "e2e_key",
+        ServerControl::AccountKeyChain { .. } => "account_key_chain",
+        ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
+        ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
+        ServerControl::E2eRecoveryBundle { .. } => "e2e_recovery_bundle",
     }
 }
 
@@ -8775,8 +8985,16 @@ mod tests {
     fn sealed_dm_chunks_stay_within_max_chunk_bytes() {
         let content_key = vec![5u8; KEY_LEN];
         let payload = vec![7u8; MAX_FILE_CHUNK_BYTES - rpc::e2e::DM_CHUNK_OVERHEAD];
-        let frame =
-            rpc::e2e::seal_dm_chunk(&content_key, RoomId(4), UserId(7), 0, &payload, 0).unwrap();
+        let frame = rpc::e2e::seal_dm_chunk(
+            &content_key,
+            RoomId(4),
+            UserId(7),
+            EventId([1; 16]),
+            0,
+            &payload,
+            0,
+        )
+        .unwrap();
         assert_eq!(frame.len(), MAX_FILE_CHUNK_BYTES);
     }
 
@@ -8787,13 +9005,23 @@ mod tests {
         let content_key = vec![9u8; KEY_LEN];
         let room = RoomId(4);
         let sender = UserId(7);
+        let event_id = EventId([2; 16]);
         let max_payload = MAX_FILE_CHUNK_BYTES - rpc::e2e::DM_CHUNK_OVERHEAD;
 
         let mut frames = Vec::new();
         for chunk in encoded.chunks(max_payload) {
             let counter = frames.len() as u64;
             frames.push(
-                rpc::e2e::seal_dm_chunk(&content_key, room, sender, counter, chunk, 0).unwrap(),
+                rpc::e2e::seal_dm_chunk(
+                    &content_key,
+                    room,
+                    sender,
+                    event_id,
+                    counter,
+                    chunk,
+                    0,
+                )
+                .unwrap(),
             );
         }
         let mut pad = rpc::e2e::padme_len(encoded.len() as u64) - encoded.len() as u64;
@@ -8801,7 +9029,16 @@ mod tests {
             let pad_len = pad.min(max_payload as u64) as usize;
             let counter = frames.len() as u64;
             frames.push(
-                rpc::e2e::seal_dm_chunk(&content_key, room, sender, counter, &[], pad_len).unwrap(),
+                rpc::e2e::seal_dm_chunk(
+                    &content_key,
+                    room,
+                    sender,
+                    event_id,
+                    counter,
+                    &[],
+                    pad_len,
+                )
+                .unwrap(),
             );
             pad -= pad_len as u64;
         }
@@ -8810,8 +9047,15 @@ mod tests {
         for (index, frame) in frames.into_iter().enumerate() {
             let mut frame = frame;
             let payload =
-                rpc::e2e::open_dm_chunk(&content_key, room, sender, index as u64, &mut frame)
-                    .unwrap();
+                rpc::e2e::open_dm_chunk(
+                    &content_key,
+                    room,
+                    sender,
+                    event_id,
+                    index as u64,
+                    &mut frame,
+                )
+                .unwrap();
             wire.extend_from_slice(&payload);
         }
         assert_eq!(wire, encoded, "padding frames must open to empty payloads");
