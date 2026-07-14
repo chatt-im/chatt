@@ -33,7 +33,7 @@ pub(crate) struct RoomMeta {
     pub(crate) kind: ClientRoomKind,
     /// Users currently in this room's voice call.
     pub(crate) voice_users: HashSet<UserId>,
-    /// Latest message id the server reported for the room.
+    /// Highest message id reported or received for the room.
     pub(crate) head: Option<MessageId>,
     /// Highest message id read locally; drives the unread marker.
     pub(crate) last_read: Option<MessageId>,
@@ -1142,12 +1142,21 @@ pub(crate) struct RoomChatUpdate {
     /// dropped by dedup. Notifications and feed pushes key off this.
     pub fresh: bool,
     pub read_advanced: bool,
+    pub message_id_regression: Option<MessageIdRegression>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RoomMutationUpdate {
     pub outcome: MutationOutcome,
     pub read_advanced: bool,
+    pub message_id_regression: Option<MessageIdRegression>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MessageIdRegression {
+    pub room_id: RoomId,
+    pub received: MessageId,
+    pub high_watermark: MessageId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1599,7 +1608,7 @@ impl RoomSession {
                 meta.name = name;
                 meta.kind = kind;
                 meta.voice_users = info.voice_users.iter().copied().collect();
-                meta.head = info.head;
+                meta.head = info.head.max(meta.head).max(meta.last_read);
                 meta.history_before = None;
                 meta.history_at_start = false;
                 meta.history_fetch = HistoryFetchState::Idle;
@@ -2631,6 +2640,21 @@ impl RoomSession {
         let message = &record.message;
         let local = Some(message.sender) == local_user;
         let room_id = message.room_id;
+        let duplicate = self
+            .rooms
+            .get(&room_id)
+            .is_some_and(|room| room.messages.contains(message.message_id.0));
+        if !duplicate
+            && let Some(message_id_regression) =
+                self.message_id_regression(room_id, message.message_id)
+        {
+            return Some(RoomChatUpdate {
+                local,
+                fresh: false,
+                read_advanced: false,
+                message_id_regression: Some(message_id_regression),
+            });
+        }
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.head = Some(message.message_id).max(meta.head);
         }
@@ -2650,6 +2674,7 @@ impl RoomSession {
             local,
             fresh,
             read_advanced,
+            message_id_regression: None,
         })
     }
 
@@ -2678,6 +2703,20 @@ impl RoomSession {
         local_user: Option<UserId>,
     ) -> Option<RoomMutationUpdate> {
         let room_id = record.message.room_id;
+        let duplicate = self
+            .rooms
+            .get(&room_id)
+            .is_some_and(|room| room.seen_mutations.contains(&record.message.message_id.0));
+        if !duplicate
+            && let Some(message_id_regression) =
+                self.message_id_regression(room_id, record.message.message_id)
+        {
+            return Some(RoomMutationUpdate {
+                outcome: MutationOutcome::Ignored,
+                read_advanced: false,
+                message_id_regression: Some(message_id_regression),
+            });
+        }
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.head = Some(record.message.message_id).max(meta.head);
         }
@@ -2692,6 +2731,21 @@ impl RoomSession {
         Some(RoomMutationUpdate {
             outcome,
             read_advanced,
+            message_id_regression: None,
+        })
+    }
+
+    fn message_id_regression(
+        &self,
+        room_id: RoomId,
+        received: MessageId,
+    ) -> Option<MessageIdRegression> {
+        let meta = self.metas.get(&room_id)?;
+        let high_watermark = meta.head.max(meta.last_read)?;
+        (received < high_watermark).then_some(MessageIdRegression {
+            room_id,
+            received,
+            high_watermark,
         })
     }
 
@@ -2815,6 +2869,24 @@ impl RoomSession {
         body: impl Into<String>,
     ) -> bool {
         self.push_notice_with_kind(sender, body, NoticeKind::Error)
+    }
+
+    pub(super) fn push_error_notice_to(
+        &mut self,
+        room_id: RoomId,
+        sender: impl Into<String>,
+        body: impl Into<String>,
+    ) -> bool {
+        let Some(room) = self.room_mut_materializing(room_id) else {
+            return false;
+        };
+        room.push_notice_record(NoticeRecord {
+            sender: sender.into(),
+            body: body.into(),
+            kind: NoticeKind::Error,
+            scroll_bottom: true,
+        });
+        true
     }
 
     fn push_notice_with_kind(
@@ -3794,6 +3866,146 @@ mod tests {
             .expect("known room");
         assert!(!update.fresh);
         assert_eq!(room.room_meta(RoomId(2)).unwrap().unread, 1);
+    }
+
+    #[test]
+    fn live_chat_rejects_message_ids_below_the_room_high_watermark() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(5, UserId(2), "newest")],
+            Some(UserId(1)),
+        );
+
+        let update = room
+            .chat_received(message(4, UserId(2), "late"), Some(UserId(1)))
+            .expect("known room");
+
+        assert!(!update.fresh);
+        assert!(!update.read_advanced);
+        assert_eq!(
+            update.message_id_regression,
+            Some(MessageIdRegression {
+                room_id: RoomId(1),
+                received: MessageId(4),
+                high_watermark: MessageId(5),
+            })
+        );
+        assert_eq!(room.chat().len(), 1);
+        let meta = room.room_meta(RoomId(1)).unwrap();
+        assert_eq!(meta.head, None);
+        assert_eq!(meta.last_read, Some(MessageId(5)));
+        assert_eq!(meta.unread, 0);
+    }
+
+    #[test]
+    fn live_chat_keeps_exact_id_replays_idempotent() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![
+                message(4, UserId(2), "older"),
+                message(5, UserId(2), "newest"),
+            ],
+            Some(UserId(1)),
+        );
+
+        let update = room
+            .chat_received(message(4, UserId(2), "replayed"), Some(UserId(1)))
+            .expect("known room");
+
+        assert!(!update.fresh);
+        assert_eq!(update.message_id_regression, None);
+        assert_eq!(room.chat().len(), 2);
+        assert_eq!(room.chat().message(0).body, "older");
+    }
+
+    #[test]
+    fn live_mutation_rejects_message_ids_below_the_room_high_watermark() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(10, UserId(2), "original")],
+            Some(UserId(1)),
+        );
+        let mut edit = message(9, UserId(2), "late edit");
+        edit.target = Some(MessageId(10));
+        edit.flags.set_edited();
+
+        let update = room
+            .mutation_received(&edit, Some(UserId(1)))
+            .expect("known room");
+
+        assert_eq!(update.outcome, MutationOutcome::Ignored);
+        assert!(!update.read_advanced);
+        assert_eq!(
+            update.message_id_regression,
+            Some(MessageIdRegression {
+                room_id: RoomId(1),
+                received: MessageId(9),
+                high_watermark: MessageId(10),
+            })
+        );
+        assert_eq!(room.chat().message(0).body, "original");
+        assert!(room.shared(1).seen_mutations.is_empty());
+    }
+
+    #[test]
+    fn old_explicit_history_remains_allowed() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(10, UserId(2), "newest")],
+            Some(UserId(1)),
+        );
+
+        let update = room.history_chunk_received(
+            RoomId(1),
+            Some(MessageId(10)),
+            vec![message(1, UserId(2), "old history")],
+            true,
+            true,
+            Some(UserId(1)),
+        );
+
+        assert!(update.changed);
+        assert_eq!(room.chat().len(), 2);
+        assert_eq!(room.chat().message(0).body, "old history");
+    }
+
+    #[test]
+    fn retained_read_watermark_detects_a_reset_server_head() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(10_261, UserId(2), "before reset")],
+            Some(UserId(1)),
+        );
+        let mut reset_info = room_info(1);
+        reset_info.head = Some(MessageId(17));
+        room.upsert_room(&reset_info, Some(UserId(1)));
+
+        let update = room
+            .chat_received(message(18, UserId(2), "after reset"), Some(UserId(1)))
+            .expect("known room");
+
+        assert_eq!(
+            update.message_id_regression,
+            Some(MessageIdRegression {
+                room_id: RoomId(1),
+                received: MessageId(18),
+                high_watermark: MessageId(10_261),
+            })
+        );
+        assert_eq!(room.chat().len(), 1);
+        let meta = room.room_meta(RoomId(1)).unwrap();
+        assert_eq!(meta.head, Some(MessageId(10_261)));
+        assert_eq!(meta.last_read, Some(MessageId(10_261)));
     }
 
     #[test]
