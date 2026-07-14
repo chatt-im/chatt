@@ -127,6 +127,12 @@ pub(crate) enum CoreCommand {
         raw_name: String,
     },
     SubmitPairPassword(String),
+    SubmitDevicePair {
+        pairing_string: String,
+        transfer_password: String,
+        device_name: String,
+        overwrite_existing: bool,
+    },
     CancelPairing,
     AudioManualReset,
     ReportBug(String),

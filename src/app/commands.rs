@@ -48,6 +48,13 @@ pub(crate) struct SlashCommand {
 
 pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
+        name: "/devices",
+        usage: "/devices [link|recovery|revoke DEVICE_ID]",
+        description: "list, link, recover, or revoke account devices",
+        arg: SlashArg::FreeText("link|recovery|revoke DEVICE_ID"),
+        web: false,
+    },
+    SlashCommand {
         name: "/audio",
         usage: "/audio",
         description: "show receive and playback diagnostics",

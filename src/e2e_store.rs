@@ -14,7 +14,7 @@ use std::{
 use jsony::Jsony;
 use ring::{digest, rand::SecureRandom};
 use rpc::{
-    crypto::{KEY_LEN, KeyMaterial, open_in_place_with_aad, seal_in_place_append_tag},
+    crypto::{KEY_LEN, KeyMaterial, seal_in_place_append_tag},
     e2e::{
         ACCOUNT_AUTHORITY_KEY_LEN, AccountKeyAction, AccountKeyStatement,
         AccountKeyStatementBody, DevicePublicKeys, E2E_SEED_LEN, DEVICE_SIGNING_KEY_LEN,
@@ -23,6 +23,7 @@ use rpc::{
     },
     ids::{AccountId, DeviceId, EventId, LedgerHash, RoomId, UserId},
 };
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const STORE_VERSION: u16 = 1;
 const RECOVERY_AAD_LABEL: &[u8] = b"chatt account recovery bundle v1";
@@ -74,6 +75,7 @@ struct IdentityFile {
     recovery_secret: Vec<u8>,
     recovery_bundle: Vec<u8>,
     device_id: DeviceId,
+    device_name: String,
     device_key_epoch: u64,
     device_signing_seed: Vec<u8>,
     device_encryption_seed: Vec<u8>,
@@ -83,6 +85,14 @@ struct IdentityFile {
     sender_chains: Vec<StoredSenderChain>,
     replay_heads: Vec<StoredReplayHead>,
     seen_events: Vec<StoredSeenEvent>,
+}
+
+#[derive(Jsony, Zeroize, ZeroizeOnDrop)]
+#[jsony(Binary, version)]
+struct EnrollmentAuthority {
+    authority_seed: Vec<u8>,
+    recovery_secret: Vec<u8>,
+    recovery_bundle: Vec<u8>,
 }
 
 pub(crate) struct LocalE2eIdentity {
@@ -105,9 +115,127 @@ pub(crate) enum ReplayObservation {
 }
 
 impl LocalE2eIdentity {
+    pub(crate) fn enrollment_authority(&self) -> Vec<u8> {
+        jsony::to_binary(&EnrollmentAuthority {
+            authority_seed: self.file.authority_seed.clone(),
+            recovery_secret: self.file.recovery_secret.clone(),
+            recovery_bundle: self.file.recovery_bundle.clone(),
+        })
+    }
+
+    pub(crate) fn prepare_linked_device(
+        server_public_key: &[u8],
+        user_id: UserId,
+        device_name: &str,
+        statements: &[AccountKeyStatement],
+        enrollment_plaintext: &[u8],
+        overwrite_existing: bool,
+        rng: &dyn SecureRandom,
+    ) -> Result<(Self, AccountKeyStatement), String> {
+        let path = identity_path(server_public_key, user_id)?;
+        if path.exists() && !overwrite_existing {
+            return Err(
+                "this installation already has an E2E identity for the linked account"
+                    .to_string(),
+            );
+        }
+        if device_name.trim().is_empty()
+            || device_name.len() > rpc::e2e::MAX_DEVICE_NAME_BYTES
+            || device_name.chars().any(char::is_control)
+        {
+            return Err("device name must be 1-64 bytes with no control characters".to_string());
+        }
+        let enrollment: EnrollmentAuthority = jsony::from_binary(enrollment_plaintext)
+            .map_err(|error| format!("invalid device enrollment bundle: {error}"))?;
+        let authority_seed = fixed::<ACCOUNT_AUTHORITY_KEY_LEN>(
+            &enrollment.authority_seed,
+            "enrollment authority seed",
+        )?;
+        let recovery_secret =
+            fixed::<KEY_LEN>(&enrollment.recovery_secret, "enrollment recovery secret")?;
+        let ledger = ValidatedAccountLedger::validate(server_public_key, user_id, statements)?;
+        if ed25519_public_key(&authority_seed)? != ledger.authority_public_key {
+            return Err("enrollment authority does not match the signed account ledger".to_string());
+        }
+        let recovery_hash = digest::digest(&digest::SHA256, &enrollment.recovery_bundle);
+        if ledger.recovery_bundle_hash.as_slice() != recovery_hash.as_ref() {
+            return Err("enrollment recovery bundle does not match the account ledger".to_string());
+        }
+
+        let mut signing_seed = [0u8; DEVICE_SIGNING_KEY_LEN];
+        let mut encryption_seed = [0u8; E2E_SEED_LEN];
+        rng.fill(&mut signing_seed)
+            .map_err(|_| "failed to generate device signing key".to_string())?;
+        rng.fill(&mut encryption_seed)
+            .map_err(|_| "failed to generate device encryption key".to_string())?;
+        let device_id = random_device_id(rng).map_err(|error| error.to_string())?;
+        let device = DevicePublicKeys {
+            device_id,
+            name: device_name.trim().to_string(),
+            key_epoch: 1,
+            signing_public_key: ed25519_public_key(&signing_seed)?.to_vec(),
+            encryption_public_key: e2e_public_key(&encryption_seed).to_vec(),
+        };
+        let statement = sign_account_statement(
+            AccountKeyStatementBody {
+                account_id: ledger.account_id,
+                account_generation: ledger.account_generation,
+                roster_epoch: ledger.roster_epoch.saturating_add(1),
+                previous: ledger.head,
+                authority_key_epoch: ledger.authority_key_epoch,
+                action: AccountKeyAction::AddDevice {
+                    device: device.clone(),
+                },
+            },
+            &authority_seed,
+            None,
+        )?;
+        let mut own_ledger = statements.to_vec();
+        own_ledger.push(statement.clone());
+        ValidatedAccountLedger::validate(server_public_key, user_id, &own_ledger)?;
+        let identity = Self {
+            path,
+            file: IdentityFile {
+                version: STORE_VERSION,
+                server_public_key: server_public_key.to_vec(),
+                user_id,
+                account_id: ledger.account_id,
+                authority_seed: authority_seed.to_vec(),
+                recovery_secret: recovery_secret.to_vec(),
+                recovery_bundle: enrollment.recovery_bundle.clone(),
+                device_id,
+                device_name: device.name,
+                device_key_epoch: 1,
+                device_signing_seed: signing_seed.to_vec(),
+                device_encryption_seed: encryption_seed.to_vec(),
+                own_ledger,
+                server_registered: false,
+                peers: Vec::new(),
+                sender_chains: Vec::new(),
+                replay_heads: Vec::new(),
+                seen_events: Vec::new(),
+            },
+        };
+        identity.validate(server_public_key, user_id)?;
+        Ok((identity, statement))
+    }
+
+    pub(crate) fn linked_device_path(
+        server_public_key: &[u8],
+        user_id: UserId,
+    ) -> Result<PathBuf, String> {
+        identity_path(server_public_key, user_id)
+    }
+
+    pub(crate) fn commit_linked_device(mut self) -> Result<(), String> {
+        self.file.server_registered = true;
+        self.persist()
+    }
+
     pub(crate) fn load_or_create(
         server_public_key: &[u8],
         user_id: UserId,
+        device_name: &str,
         rng: &dyn SecureRandom,
     ) -> Result<(Self, bool), String> {
         let path = identity_path(server_public_key, user_id)?;
@@ -156,6 +284,7 @@ impl LocalE2eIdentity {
                             authority_public_key: authority_public.to_vec(),
                             first_device: DevicePublicKeys {
                                 device_id,
+                                name: device_name.to_string(),
                                 key_epoch: 1,
                                 signing_public_key: ed25519_public_key(&signing_seed)?.to_vec(),
                                 encryption_public_key: e2e_public_key(&encryption_seed).to_vec(),
@@ -177,6 +306,7 @@ impl LocalE2eIdentity {
                         recovery_secret: recovery_secret.to_vec(),
                         recovery_bundle,
                         device_id,
+                        device_name: device_name.to_string(),
                         device_key_epoch: 1,
                         device_signing_seed: signing_seed.to_vec(),
                         device_encryption_seed: encryption_seed.to_vec(),
@@ -248,9 +378,11 @@ impl LocalE2eIdentity {
         rpc::crypto::encode_hex(&self.file.recovery_secret)
     }
 
+    #[cfg(test)]
     pub(crate) fn device_public_keys(&self) -> Result<DevicePublicKeys, String> {
         Ok(DevicePublicKeys {
             device_id: self.file.device_id,
+            name: self.file.device_name.clone(),
             key_epoch: self.file.device_key_epoch,
             signing_public_key: ed25519_public_key(self.signing_seed())?.to_vec(),
             encryption_public_key: e2e_public_key(self.encryption_seed()).to_vec(),
@@ -280,6 +412,7 @@ impl LocalE2eIdentity {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_authority(
         &self,
         ledger: &ValidatedAccountLedger,
@@ -306,6 +439,7 @@ impl LocalE2eIdentity {
         Ok((authority_seed, recovery_secret))
     }
 
+    #[cfg(test)]
     pub(crate) fn adopt_linked_account(
         &mut self,
         statements: Vec<AccountKeyStatement>,
@@ -546,6 +680,7 @@ impl LocalE2eIdentity {
             || self.file.server_public_key != server_public_key
             || self.file.user_id != user_id
             || self.file.device_key_epoch == 0
+            || self.file.device_name.trim().is_empty()
         {
             return Err("local E2E identity context is invalid".to_string());
         }
@@ -624,6 +759,7 @@ fn seal_recovery_bundle(
     Ok(sealed)
 }
 
+#[cfg(test)]
 fn open_recovery_bundle(
     server_public_key: &[u8],
     user_id: UserId,
@@ -637,7 +773,7 @@ fn open_recovery_bundle(
         bytes: *recovery_secret,
     };
     let mut sealed = bundle.to_vec();
-    let len = open_in_place_with_aad(&key, 0, &aad, &mut sealed)
+    let len = rpc::crypto::open_in_place_with_aad(&key, 0, &aad, &mut sealed)
         .map_err(|error| error.to_string())?;
     sealed[..len]
         .try_into()
@@ -728,6 +864,7 @@ mod tests {
                     authority_public_key: authority_public.to_vec(),
                     first_device: DevicePublicKeys {
                         device_id,
+                        name: format!("device-{marker}"),
                         key_epoch: 1,
                         signing_public_key: ed25519_public_key(&signing_seed).unwrap().to_vec(),
                         encryption_public_key: e2e_public_key(&encryption_seed).to_vec(),
@@ -750,6 +887,7 @@ mod tests {
                 recovery_secret: recovery_secret.to_vec(),
                 recovery_bundle,
                 device_id,
+                device_name: format!("device-{marker}"),
                 device_key_epoch: 1,
                 device_signing_seed: signing_seed.to_vec(),
                 device_encryption_seed: encryption_seed.to_vec(),

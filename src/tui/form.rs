@@ -432,6 +432,13 @@ impl<F: Copy + Eq> FormState<F> {
         self.editor.text()
     }
 
+    pub(crate) fn replace_active_text(&mut self, text: &str) -> Option<(F, String)> {
+        let active = self.active_text?;
+        self.editor.set_lines(text);
+        self.editor.set_cursor_offset(self.editor.text_len());
+        Some((active, self.editor.text()))
+    }
+
     pub(crate) fn render_editor(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         self.editor.set_theme(theme.join_input_editor_theme());
         self.editor.resize(area.w.max(1));

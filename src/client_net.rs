@@ -26,6 +26,7 @@ use mio::{
     net::{TcpStream, UdpSocket},
 };
 use ring::rand::SecureRandom;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 use rpc::{
     control::{
         ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
@@ -34,8 +35,8 @@ use rpc::{
         ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, FileContentEncoding, FileMetadata,
         MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey,
         P2pNatKind, P2pPeerInfo, P2pRole, ParticipantVoiceStatus, RoomInfo, RoomKind,
-        ServerControl, UserSummary, decode_server_control, decode_server_hello,
-        encode_client_control, encode_client_hello, max_file_wire_bytes,
+        ServerControl, UserSummary, DeviceLinkTicket, decode_server_control, decode_server_hello,
+        encode_client_control, encode_client_hello, encode_device_link_ticket, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, RecordProtection, SessionTransport,
@@ -69,6 +70,7 @@ use crate::e2e::{
     AcceptedPeerIdentity, AuthenticatedChat, E2eState, MessageProvenance, OpenFailure,
     PeerIdentityOutcome, SealBlocked,
 };
+use crate::e2e_store::LocalE2eIdentity;
 use crate::file_compression::{
     self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
 };
@@ -155,6 +157,7 @@ const FILE_PROGRESS_STEP_BYTES: u64 = 256 * 1024;
 const ENCODER_FEEDBACK_ALPHA: f32 = 0.35;
 const ENCODER_PROFILE_HOLD: Duration = Duration::from_secs(10);
 const MAX_COMMANDS_PER_ITERATION: usize = 8;
+const DEFAULT_INITIAL_DEVICE_NAME: &str = "first-device";
 const MAX_PENDING_PLAYBACK_PACKETS: usize = 256;
 const MAX_RECENT_VOICE_SEQUENCES: usize = 512;
 const MAX_RECENT_VOICE_STREAMS: usize = 256;
@@ -329,10 +332,6 @@ pub struct ClientConfig {
     pub server_public_key: Option<String>,
     /// Durable DM contact identity tuples and former trusted tuples.
     pub e2e_peer_pins: Vec<E2ePeerPin>,
-    /// Optional one-time high-entropy code copied from an existing device.
-    /// It is used only when this installation must join an existing account
-    /// ledger and is never transmitted to the server.
-    pub e2e_recovery_code: Option<String>,
     pub require_native_encryption: bool,
     pub file_policy: FilePolicy,
     /// The in-memory download ring buffer shared with the web server, filled
@@ -526,6 +525,7 @@ pub enum NetworkCommand {
     },
     ShowE2eRecoveryCode,
     ListE2eDevices,
+    CreateDeviceLink,
     Shutdown,
 }
 
@@ -601,6 +601,25 @@ pub enum NetworkEvent {
     },
     E2eAccountIdentity {
         account_id: AccountId,
+    },
+    DeviceLinkCreated {
+        pairing_string: String,
+        transfer_password: String,
+        expires_at_ms: u64,
+    },
+    DeviceLinkRedeemed {
+        device_name: String,
+    },
+    DevicePairingSucceeded {
+        token: String,
+        username: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
+        server_public_key: String,
+    },
+    DevicePairingIdentityExists {
+        message: String,
+        transfer_password: String,
     },
     /// One chunk of server-retained history for a room.
     HistoryChunk {
@@ -941,6 +960,157 @@ pub fn spawn_pair_once(
         .expect("failed to spawn pairing worker")
 }
 
+pub fn spawn_device_pair_once(
+    config: ClientConfig,
+    ticket: DeviceLinkTicket,
+    transfer_password: String,
+    device_name: String,
+    overwrite_existing: bool,
+    events: NetworkEventSender,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("chatt-device-pair".to_string())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let mut ticket = ticket;
+            let mut transfer_password = transfer_password;
+            let event = match device_pair_once(
+                &config,
+                &ticket,
+                &transfer_password,
+                &device_name,
+                overwrite_existing,
+            ) {
+                Ok((token, username, udp_addr, udp_probe_addr, server_public_key)) => {
+                    NetworkEvent::DevicePairingSucceeded {
+                        token,
+                        username,
+                        udp_addr,
+                        udp_probe_addr,
+                        server_public_key,
+                    }
+                }
+                Err(DevicePairFailure::IdentityExists { message }) => {
+                    NetworkEvent::DevicePairingIdentityExists {
+                        message,
+                        transfer_password: std::mem::take(&mut transfer_password),
+                    }
+                }
+                Err(DevicePairFailure::Other(error)) => NetworkEvent::PairingFailed(error),
+            };
+            ticket.redemption_secret.zeroize();
+            transfer_password.zeroize();
+            let _ = events.send(event);
+        })
+        .expect("failed to spawn device-pairing worker")
+}
+
+fn device_pair_once(
+    config: &ClientConfig,
+    ticket: &DeviceLinkTicket,
+    transfer_password: &str,
+    device_name: &str,
+    overwrite_existing: bool,
+) -> Result<(String, String, String, Option<String>, String), DevicePairFailure> {
+    let (mut stream, transport, trusted) = connect_and_handshake(config, false)?;
+    let mut control = transport.control_record();
+    write_blocking_control(
+        &mut stream,
+        &mut control,
+        ClientControl::FetchDeviceLink {
+            redemption_secret: ticket.redemption_secret.clone(),
+        },
+    )?;
+    let (enrollment_bundle, account_chain, user_id, username) = loop {
+        let frame = read_blocking_frame(&mut stream)
+            .map_err(|error| format!("failed to read device-link bundle: {error}"))?;
+        let plaintext = control
+            .open_next(CHANNEL_CONTROL, &frame)
+            .map_err(|error| error.to_string())?;
+        match decode_server_control(&plaintext)? {
+            ServerControl::DeviceLinkBundle {
+                enrollment_bundle,
+                account_chain,
+                user_id,
+                username,
+            } => break (enrollment_bundle, account_chain, user_id, username),
+            ServerControl::Error { message, .. } => return Err(message.into()),
+            _ => {}
+        }
+    };
+    let secret_hash = crate::device_link::redemption_secret_hash(&ticket.redemption_secret);
+    let enrollment = crate::device_link::open_enrollment(
+        &enrollment_bundle,
+        transfer_password,
+        &trusted,
+        &secret_hash,
+    )?;
+    let identity_path = LocalE2eIdentity::linked_device_path(&trusted, user_id)?;
+    if identity_path.exists() && !overwrite_existing {
+        return Err(DevicePairFailure::IdentityExists {
+            message: format!(
+                "Encrypted identity state for this server and account already exists at {}. This state is stored separately from the client config, so deleting the config does not remove it. Overwriting replaces the local device identity and may make history encrypted only to that identity unreadable on this installation. Overwrite it and continue?",
+                identity_path.display()
+            ),
+        });
+    }
+    let rng = ring::rand::SystemRandom::new();
+    let (identity, statement) = LocalE2eIdentity::prepare_linked_device(
+        &trusted,
+        user_id,
+        device_name,
+        &account_chain,
+        &enrollment,
+        overwrite_existing,
+        &rng,
+    )?;
+    write_blocking_control(
+        &mut stream,
+        &mut control,
+        ClientControl::RedeemDeviceLink {
+            redemption_secret: ticket.redemption_secret.clone(),
+            statement,
+            receive_files: config.file_policy.receives_any(),
+            file_receive_limit_bytes: config.file_policy.advertised_limit(),
+        },
+    )?;
+    loop {
+        let frame = read_blocking_frame(&mut stream)
+            .map_err(|error| format!("failed to read device-link redemption: {error}"))?;
+        let plaintext = control
+            .open_next(CHANNEL_CONTROL, &frame)
+            .map_err(|error| error.to_string())?;
+        match decode_server_control(&plaintext)? {
+            ServerControl::DeviceLinked {
+                token,
+                username: linked_username,
+                udp_addr,
+                udp_probe_addr,
+                user_id: linked_user_id,
+                ..
+            } => {
+                if linked_user_id != user_id || linked_username != username {
+                    return Err(
+                        "server linked the device to a different account"
+                            .to_string()
+                            .into(),
+                    );
+                }
+                identity.commit_linked_device()?;
+                return Ok((
+                    token,
+                    username,
+                    udp_addr,
+                    udp_probe_addr,
+                    encode_hex(&trusted),
+                ));
+            }
+            ServerControl::Error { message, .. } => return Err(message.into()),
+            _ => {}
+        }
+    }
+}
+
 enum OpenPairOutcome {
     Paired {
         token: String,
@@ -1201,7 +1371,6 @@ fn run_worker_inner(
         session_id: None,
         user_id: None,
         user_names: HashMap::new(),
-        pending_dm_opens: VecDeque::new(),
         active_room: None,
         voice_room: None,
         active_stream: None,
@@ -1260,6 +1429,7 @@ fn run_worker_inner(
             &config.e2e_peer_pins,
         ),
         e2e_bound: false,
+        pending_device_link: None,
         deferred_e2e: HashMap::new(),
         deferred_e2e_bytes: 0,
         deferred_e2e_items: 0,
@@ -1585,6 +1755,17 @@ enum PairFailure {
     Other(String),
 }
 
+enum DevicePairFailure {
+    IdentityExists { message: String },
+    Other(String),
+}
+
+impl From<String> for DevicePairFailure {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
 fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), PairFailure> {
     let (mut stream, transport, _trusted) =
         connect_and_handshake(config, false).map_err(PairFailure::Other)?;
@@ -1749,7 +1930,6 @@ struct WorkerState {
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
     user_names: HashMap<UserId, String>,
-    pending_dm_opens: VecDeque<UserId>,
     /// The room the app is viewing, target for uploads injected outside the
     /// app thread. Set by [`NetworkCommand::SetActiveRoom`].
     active_room: Option<RoomId>,
@@ -1817,12 +1997,28 @@ struct WorkerState {
     /// happens on this thread so only plaintext crosses the event channel.
     e2e: E2eState,
     e2e_bound: bool,
+    pending_device_link: Option<PendingCreatedDeviceLink>,
     deferred_e2e: HashMap<RoomId, DeferredE2eRoom>,
     deferred_e2e_bytes: usize,
     deferred_e2e_items: usize,
     shutdown: bool,
     disconnect_reason: Option<String>,
     auth_failure: Option<(u16, String)>,
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct PendingCreatedDeviceLink {
+    secret_hash: Vec<u8>,
+    pairing_string: String,
+    transfer_password: String,
+}
+
+struct PendingAuthentication {
+    session_id: SessionId,
+    user_id: UserId,
+    rooms: Vec<RoomInfo>,
+    users: Vec<UserSummary>,
+    default_room: RoomId,
 }
 
 enum DeferredE2eInbound {
@@ -3494,7 +3690,6 @@ impl WorkerState {
             }
             NetworkCommand::OpenDm(user_id) => {
                 self.queue_control(ClientControl::OpenDm { user_id })?;
-                self.pending_dm_opens.push_back(user_id);
             }
             NetworkCommand::SetUploadRate(rate) => {
                 self.upload_throttle.set_rate(rate);
@@ -3580,6 +3775,39 @@ impl WorkerState {
                 let _ = self
                     .events
                     .send(NetworkEvent::Error(format!("E2E account devices: {devices}")));
+            }
+            NetworkCommand::CreateDeviceLink => {
+                if !self.e2e_bound {
+                    return Err("the local E2E device is not bound yet; retry shortly".to_string());
+                }
+                if self.pending_device_link.is_some() {
+                    return Err("a device link is already being created".to_string());
+                }
+                let rng = ring::rand::SystemRandom::new();
+                let mut secret = [0u8; KEY_LEN];
+                rng.fill(&mut secret)
+                    .map_err(|_| "failed to generate device-link secret".to_string())?;
+                let redemption_secret = encode_hex(&secret);
+                let secret_hash = crate::device_link::redemption_secret_hash(&redemption_secret);
+                let (enrollment_bundle, transfer_password) =
+                    self.e2e.create_device_enrollment(&secret_hash)?;
+                let pairing_string = encode_device_link_ticket(&DeviceLinkTicket {
+                    version: rpc::PROTOCOL_VERSION,
+                    redemption_secret,
+                    tcp_addr: self.config.tcp_addr.clone(),
+                    udp_addr: self.config.udp_addr.clone(),
+                    udp_probe_addr: self.config.udp_probe_addr.clone(),
+                    server_public_key: encode_hex(&self.server_public_key),
+                })?;
+                self.queue_control(ClientControl::CreateDeviceLink {
+                    redemption_secret_hash: secret_hash.clone(),
+                    enrollment_bundle,
+                })?;
+                self.pending_device_link = Some(PendingCreatedDeviceLink {
+                    secret_hash,
+                    pairing_string,
+                    transfer_password,
+                });
             }
             NetworkCommand::SetP2pEnabled(enabled) => {
                 // P2P would bypass an outer secure link, so it stays off in
@@ -5230,84 +5458,14 @@ impl WorkerState {
                 default_room,
                 ..
             } => {
-                self.session_id = Some(session_id);
-                self.user_id = Some(user_id);
-                self.active_room = Some(default_room);
-                self.room_server_rtts.clear();
-                kvlog::info!(
-                    "client authenticated",
-                    session_id = session_id.0,
-                    user_id = user_id.0,
-                    room_count = rooms.len(),
-                    user_count = users.len()
-                );
-                let local_device_is_new = self
-                    .e2e
-                    .initialize_device(&self.server_public_key, user_id)?;
-                self.e2e_bound = false;
-                self.user_names.clear();
-                let mut folded_names = HashSet::new();
-                for user in &users {
-                    if !folded_names.insert(user.username.to_ascii_lowercase()) {
-                        return Err("server directory contains duplicate usernames".to_string());
-                    }
-                    self.user_names.insert(user.user_id, user.username.clone());
-                }
-                // Fetch every DM peer's key, not just unknown ones: a key that
-                // changed while this client was offline must trip the pin
-                // check now rather than on the first undecryptable message.
-                let mut dm_peers: Vec<(UserId, RoomId, String)> = Vec::new();
-                for room in &rooms {
-                    let username = match dm_peer_for_local(room, user_id) {
-                        Some(peer) => self.user_names.get(&peer).cloned().ok_or_else(|| {
-                            format!("DM peer {} is absent from directory", peer.0)
-                        })?,
-                        None => String::new(),
-                    };
-                    self.e2e.note_room(room, &username)?;
-                    if let Some(peer) = self.e2e.dm_peer(room.room_id)
-                        && !dm_peers.iter().any(|(known, _, _)| *known == peer)
-                    {
-                        dm_peers.push((peer, room.room_id, username));
-                    }
-                }
-                let _ = self.events.send(NetworkEvent::Authenticated {
+                let pending = PendingAuthentication {
                     session_id,
                     user_id,
                     rooms,
                     users,
                     default_room,
-                    video_transport_mode: self.transport_mode,
-                    video_auth_key: self.video_auth_key,
-                });
-                for (user_id, room_id, username) in &dm_peers {
-                    if self.e2e.fetching_identity(*room_id).is_some() {
-                        let _ = self.events.send(NetworkEvent::E2eIdentityFetching {
-                            room_id: *room_id,
-                            user_id: *user_id,
-                            username: username.clone(),
-                        });
-                    }
-                }
-                self.bind_udp();
-                if local_device_is_new {
-                    let _ = self.events.send(NetworkEvent::Status(
-                        "created a new encrypted account device identity".to_string(),
-                    ));
-                    if let Some(code) = self.e2e.recovery_code() {
-                        let _ = self.events.send(NetworkEvent::E2eRecoveryCode { code });
-                    }
-                }
-                let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
-                    user_id,
-                    after: self.e2e.account_chain_after(user_id),
-                });
-                for (user_id, _, _) in dm_peers {
-                    let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
-                        user_id,
-                        after: self.e2e.account_chain_after(user_id),
-                    });
-                }
+                };
+                self.finish_authenticated(pending, DEFAULT_INITIAL_DEVICE_NAME)?;
             }
             ServerControl::OpenPaired { .. } => {
                 kvlog::warn!("unexpected open-paired on established session; ignoring");
@@ -5681,12 +5839,10 @@ impl WorkerState {
                 let _ = self.events.send(NetworkEvent::RoomUpserted(room));
             }
             ServerControl::DmOpened { room_id, peer } => {
-                if self.pending_dm_opens.pop_front() != Some(peer) {
-                    return Err(format!(
-                        "unsolicited or mismatched DM open response for user {}",
-                        peer.0
-                    ));
-                }
+                // Authenticated room metadata is the authority for this
+                // mapping. The app separately correlates the peer with the UI
+                // clients that requested it, so a late or duplicate response
+                // must not tear down the network session.
                 self.e2e.confirm_dm(room_id, peer)?;
                 let _ = self.events.send(NetworkEvent::DmOpened { room_id, peer });
             }
@@ -5718,23 +5874,7 @@ impl WorkerState {
                 let local_user = self
                     .user_id
                     .ok_or_else(|| "account ledger arrived before authentication".to_string())?;
-                let recovery_candidate = (user_id == local_user
-                    && base.is_none()
-                    && self.config.e2e_recovery_code.is_some())
-                    .then(|| statements.clone());
-                let ledger = match self.e2e.apply_account_chain(user_id, base, statements) {
-                    Ok(ledger) => ledger,
-                    Err(error) => {
-                        let Some(candidate) = recovery_candidate else {
-                            return Err(error);
-                        };
-                        self.e2e.stage_recovery_chain(candidate)?;
-                        self.queue_control(ClientControl::FetchE2eRecoveryBundle {
-                            user_id: local_user,
-                        })?;
-                        return Ok(());
-                    }
-                };
+                let ledger = self.e2e.apply_account_chain(user_id, base, statements)?;
                 if user_id == local_user {
                     let Some(ledger) = ledger else {
                         let genesis = self
@@ -5817,20 +5957,126 @@ impl WorkerState {
                 }
                 self.e2e_bound = true;
             }
-            ServerControl::E2eRecoveryBundle { user_id, bundle } => {
-                if Some(user_id) != self.user_id {
-                    return Err("server returned another account's recovery bundle".to_string());
-                }
-                let bundle = bundle.ok_or_else(|| {
-                    "existing encrypted account has no recovery bundle".to_string()
-                })?;
-                let recovery_code = self.config.e2e_recovery_code.as_deref().ok_or_else(|| {
-                    "server returned a recovery bundle when no device link was requested"
-                        .to_string()
-                })?;
-                let statement = self.e2e.finish_recovery_link(recovery_code, bundle)?;
-                self.queue_control(ClientControl::AppendAccountKeyStatement { statement })?;
+            ServerControl::E2eRecoveryBundle { .. } => {
+                return Err("server sent an unrequested recovery bundle".to_string());
             }
+            ServerControl::DeviceLinkCreated {
+                redemption_secret_hash,
+                expires_at_ms,
+            } => {
+                let mut pending = self
+                    .pending_device_link
+                    .take()
+                    .ok_or_else(|| "server confirmed an unrequested device link".to_string())?;
+                if pending.secret_hash != redemption_secret_hash {
+                    return Err("server confirmed the wrong device link".to_string());
+                }
+                let _ = self.events.send(NetworkEvent::DeviceLinkCreated {
+                    pairing_string: std::mem::take(&mut pending.pairing_string),
+                    transfer_password: std::mem::take(&mut pending.transfer_password),
+                    expires_at_ms,
+                });
+            }
+            ServerControl::DeviceLinkRedeemed { device_name, .. } => {
+                let _ = self
+                    .events
+                    .send(NetworkEvent::DeviceLinkRedeemed { device_name });
+            }
+            ServerControl::DeviceLinkBundle { .. } | ServerControl::DeviceLinked { .. } => {
+                return Err("server sent a device-pairing response on a normal session".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_authenticated(
+        &mut self,
+        pending: PendingAuthentication,
+        device_name: &str,
+    ) -> Result<(), String> {
+        let PendingAuthentication {
+            session_id,
+            user_id,
+            rooms,
+            users,
+            default_room,
+        } = pending;
+        self.session_id = Some(session_id);
+        self.user_id = Some(user_id);
+        self.active_room = Some(default_room);
+        self.room_server_rtts.clear();
+        kvlog::info!(
+            "client authenticated",
+            session_id = session_id.0,
+            user_id = user_id.0,
+            room_count = rooms.len(),
+            user_count = users.len()
+        );
+        let local_device_is_new =
+            self.e2e
+                .initialize_device(&self.server_public_key, user_id, device_name)?;
+        self.e2e_bound = false;
+        self.user_names.clear();
+        let mut folded_names = HashSet::new();
+        for user in &users {
+            if !folded_names.insert(user.username.to_ascii_lowercase()) {
+                return Err("server directory contains duplicate usernames".to_string());
+            }
+            self.user_names.insert(user.user_id, user.username.clone());
+        }
+        let mut dm_peers: Vec<(UserId, RoomId, String)> = Vec::new();
+        for room in &rooms {
+            let username = match dm_peer_for_local(room, user_id) {
+                Some(peer) => self
+                    .user_names
+                    .get(&peer)
+                    .cloned()
+                    .ok_or_else(|| format!("DM peer {} is absent from directory", peer.0))?,
+                None => String::new(),
+            };
+            self.e2e.note_room(room, &username)?;
+            if let Some(peer) = self.e2e.dm_peer(room.room_id)
+                && !dm_peers.iter().any(|(known, _, _)| *known == peer)
+            {
+                dm_peers.push((peer, room.room_id, username));
+            }
+        }
+        let _ = self.events.send(NetworkEvent::Authenticated {
+            session_id,
+            user_id,
+            rooms,
+            users,
+            default_room,
+            video_transport_mode: self.transport_mode,
+            video_auth_key: self.video_auth_key,
+        });
+        for (user_id, room_id, username) in &dm_peers {
+            if self.e2e.fetching_identity(*room_id).is_some() {
+                let _ = self.events.send(NetworkEvent::E2eIdentityFetching {
+                    room_id: *room_id,
+                    user_id: *user_id,
+                    username: username.clone(),
+                });
+            }
+        }
+        self.bind_udp();
+        if local_device_is_new {
+            let _ = self.events.send(NetworkEvent::Status(
+                "created a new encrypted account device identity".to_string(),
+            ));
+            if let Some(code) = self.e2e.recovery_code() {
+                let _ = self.events.send(NetworkEvent::E2eRecoveryCode { code });
+            }
+        }
+        let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
+            user_id,
+            after: self.e2e.account_chain_after(user_id),
+        });
+        for (user_id, _, _) in dm_peers {
+            let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
+                user_id,
+                after: self.e2e.account_chain_after(user_id),
+            });
         }
         Ok(())
     }
@@ -7390,6 +7636,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
         NetworkCommand::ShowE2eRecoveryCode => "show_e2e_recovery_code",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
+        NetworkCommand::CreateDeviceLink => "create_device_link",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -7524,6 +7771,10 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
         ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
         ServerControl::E2eRecoveryBundle { .. } => "e2e_recovery_bundle",
+        ServerControl::DeviceLinkCreated { .. } => "device_link_created",
+        ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
+        ServerControl::DeviceLinked { .. } => "device_linked",
+        ServerControl::DeviceLinkRedeemed { .. } => "device_link_redeemed",
     }
 }
 

@@ -29,11 +29,11 @@ use ring::rand::SystemRandom;
 use rpc::control::{ChatMessage, RoomInfo, RoomKind};
 use rpc::crypto::{decode_hex, encode_hex};
 use rpc::e2e::{
-    AccountKeyAction, AccountKeyStatement, AccountKeyStatementBody, DeviceKeyStatus, DmContent,
-    DmContentKind, DmEventEnvelope, DmPairKeys, DmPlaintext, E2E_PUBLIC_KEY_LEN, E2E_SEED_LEN,
-    EventRecipient, RosterCheckpoint, SenderEventHeader, ValidatedAccountLedger,
-    account_statement_hash, dm_pair_keys, open_dm_envelope, open_dm_event,
-    seal_dm_envelope, seal_dm_event, sign_account_statement, sign_device_binding,
+    AccountKeyAction, AccountKeyStatement, DeviceKeyStatus, DmContent, DmContentKind,
+    DmEventEnvelope, DmPairKeys, DmPlaintext, E2E_PUBLIC_KEY_LEN, E2E_SEED_LEN, EventRecipient,
+    RosterCheckpoint, SenderEventHeader, ValidatedAccountLedger, account_statement_hash,
+    dm_pair_keys, open_dm_envelope, open_dm_event, seal_dm_envelope, seal_dm_event,
+    sign_device_binding,
 };
 use rpc::ids::{LedgerHash, MessageId, RoomId, SessionId, UserId};
 
@@ -51,7 +51,6 @@ pub struct E2eState {
     stored_pins: Vec<E2ePeerPin>,
     rooms: HashMap<RoomId, DmRoom>,
     device_identity: Option<LocalE2eIdentity>,
-    pending_recovery: Option<PendingRecovery>,
     next_presentation: u64,
     rng: SystemRandom,
 }
@@ -74,15 +73,6 @@ struct DmRoom {
     /// Trust level of the identity replaced by the current key while that
     /// continuity change remains independently unconfirmed.
     change_from: Option<E2eTrustLevel>,
-}
-
-struct PendingRecovery {
-    base_statements: Vec<AccountKeyStatement>,
-    ledger: ValidatedAccountLedger,
-    authority_seed: Option<[u8; 32]>,
-    recovery_secret: Option<[u8; rpc::crypto::KEY_LEN]>,
-    recovery_bundle: Option<Vec<u8>>,
-    add_statement: Option<AccountKeyStatement>,
 }
 
 struct TrustedIdentity {
@@ -200,6 +190,23 @@ pub enum OpenFailure {
     Replay,
 }
 
+fn replay_observation_needs_commit(
+    observation: ReplayObservation,
+    live: bool,
+) -> Result<bool, OpenFailure> {
+    match observation {
+        ReplayObservation::Fresh => Ok(true),
+        // The replay journal is durable while the rendered chat log is not.
+        // An identical authenticated event from history must therefore be
+        // allowed to rebuild the log after reconnecting. Live duplicates are
+        // still discarded, and non-identical stale/forked events stay closed.
+        ReplayObservation::Duplicate if !live => Ok(false),
+        ReplayObservation::Duplicate | ReplayObservation::Stale | ReplayObservation::Fork => {
+            Err(OpenFailure::Replay)
+        }
+    }
+}
+
 impl E2eState {
     pub fn new(
         seed_hex: Option<&str>,
@@ -221,7 +228,6 @@ impl E2eState {
             stored_pins: pins.to_vec(),
             rooms: HashMap::new(),
             device_identity: None,
-            pending_recovery: None,
             next_presentation: 0,
             rng: SystemRandom::new(),
         }
@@ -231,9 +237,10 @@ impl E2eState {
         &mut self,
         server_public_key: &[u8],
         user_id: UserId,
+        device_name: &str,
     ) -> Result<bool, String> {
         let (identity, created) =
-            LocalE2eIdentity::load_or_create(server_public_key, user_id, &self.rng)?;
+            LocalE2eIdentity::load_or_create(server_public_key, user_id, device_name, &self.rng)?;
         self.device_identity = Some(identity);
         self.my_id = Some(user_id);
         self.configured_local_user = Some(user_id);
@@ -315,41 +322,7 @@ impl E2eState {
             return Ok(None);
         }
         if user_id == identity.user_id() {
-            match identity.replace_own_ledger(statements.clone()) {
-                Ok(ledger) => Ok(Some(ledger)),
-                Err(error) => {
-                    let Some(pending) = self.pending_recovery.as_ref() else {
-                        return Err(error);
-                    };
-                    let linked = pending.add_statement.as_ref().is_some_and(|add| {
-                        statements.len() == pending.base_statements.len() + 1
-                            && statements[..pending.base_statements.len()]
-                                == pending.base_statements
-                            && statements.last() == Some(add)
-                    });
-                    if !linked {
-                        return Err(error);
-                    }
-                    let authority_seed = pending
-                        .authority_seed
-                        .ok_or_else(|| "recovery authority is unavailable".to_string())?;
-                    let recovery_secret = pending
-                        .recovery_secret
-                        .ok_or_else(|| "recovery secret is unavailable".to_string())?;
-                    let recovery_bundle = pending
-                        .recovery_bundle
-                        .clone()
-                        .ok_or_else(|| "recovery bundle is unavailable".to_string())?;
-                    let ledger = identity.adopt_linked_account(
-                        statements,
-                        authority_seed,
-                        recovery_secret,
-                        recovery_bundle,
-                    )?;
-                    self.pending_recovery = None;
-                    Ok(Some(ledger))
-                }
-            }
+            identity.replace_own_ledger(statements).map(Some)
         } else {
             identity.store_peer_ledger(user_id, statements).map(Some)
         }
@@ -400,6 +373,17 @@ impl E2eState {
         Some(self.device_identity.as_ref()?.recovery_code())
     }
 
+    pub fn create_device_enrollment(
+        &self,
+        ticket_hash: &[u8],
+    ) -> Result<(Vec<u8>, String), String> {
+        let identity = self
+            .device_identity
+            .as_ref()
+            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
+        crate::device_link::seal_enrollment(identity, ticket_hash, &self.rng)
+    }
+
     pub fn revoke_device_statement(
         &self,
         device_id: rpc::ids::DeviceId,
@@ -436,7 +420,8 @@ impl E2eState {
                     DeviceKeyStatus::Revoked => "revoked",
                 };
                 format!(
-                    "{} epoch {} {state}{}",
+                    "{} — {} epoch {} {state}{}",
+                    key.keys.name,
                     rpc::crypto::encode_hex(&key.keys.device_id.0),
                     key.keys.key_epoch,
                     if key.keys.device_id == current {
@@ -447,69 +432,6 @@ impl E2eState {
                 )
             })
             .collect())
-    }
-
-    pub fn stage_recovery_chain(
-        &mut self,
-        statements: Vec<AccountKeyStatement>,
-    ) -> Result<ValidatedAccountLedger, String> {
-        let identity = self
-            .device_identity
-            .as_ref()
-            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
-        let ledger = ValidatedAccountLedger::validate(
-            identity.server_public_key(),
-            identity.user_id(),
-            &statements,
-        )?;
-        if ledger.account_id == identity.account_id() {
-            return Err("recovery was requested for the current account identity".to_string());
-        }
-        self.pending_recovery = Some(PendingRecovery {
-            base_statements: statements,
-            ledger: ledger.clone(),
-            authority_seed: None,
-            recovery_secret: None,
-            recovery_bundle: None,
-            add_statement: None,
-        });
-        Ok(ledger)
-    }
-
-    pub fn finish_recovery_link(
-        &mut self,
-        recovery_code: &str,
-        bundle: Vec<u8>,
-    ) -> Result<AccountKeyStatement, String> {
-        let identity = self
-            .device_identity
-            .as_ref()
-            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
-        let pending = self
-            .pending_recovery
-            .as_mut()
-            .ok_or_else(|| "no account recovery is pending".to_string())?;
-        let (authority_seed, recovery_secret) =
-            identity.recover_authority(&pending.ledger, &bundle, recovery_code)?;
-        let statement = sign_account_statement(
-            AccountKeyStatementBody {
-                account_id: pending.ledger.account_id,
-                account_generation: pending.ledger.account_generation,
-                roster_epoch: pending.ledger.roster_epoch.saturating_add(1),
-                previous: pending.ledger.head,
-                authority_key_epoch: pending.ledger.authority_key_epoch,
-                action: AccountKeyAction::AddDevice {
-                    device: identity.device_public_keys()?,
-                },
-            },
-            &authority_seed,
-            None,
-        )?;
-        pending.authority_seed = Some(authority_seed);
-        pending.recovery_secret = Some(recovery_secret);
-        pending.recovery_bundle = Some(bundle);
-        pending.add_statement = Some(statement.clone());
-        Ok(statement)
     }
 
     #[cfg(test)]
@@ -1386,7 +1308,7 @@ impl E2eState {
                 return Err(OpenFailure::Crypto);
             }
         };
-        if let Some(header) = opened.event {
+        let needs_replay_commit = if let Some(header) = opened.event {
             let observation = self
                 .device_identity
                 .as_mut()
@@ -1403,13 +1325,16 @@ impl E2eState {
                     live,
                 )
                 .map_err(|_| OpenFailure::Crypto)?;
-            if observation != ReplayObservation::Fresh {
-                return Err(OpenFailure::Replay);
-            }
-        }
+            replay_observation_needs_commit(observation, live)?
+        } else {
+            false
+        };
         message.sender_name = opened.sender_name;
         message.body = body;
-        if let Some(header) = opened.event {
+        if needs_replay_commit {
+            let header = opened
+                .event
+                .expect("only authenticated events require replay application");
             self.device_identity
                 .as_mut()
                 .ok_or(OpenFailure::NoKeys)?
@@ -1586,6 +1511,26 @@ fn open_with_direction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_duplicate_rebuilds_chat_but_live_duplicate_is_rejected() {
+        assert_eq!(
+            replay_observation_needs_commit(ReplayObservation::Duplicate, false),
+            Ok(false)
+        );
+        assert_eq!(
+            replay_observation_needs_commit(ReplayObservation::Duplicate, true),
+            Err(OpenFailure::Replay)
+        );
+        assert_eq!(
+            replay_observation_needs_commit(ReplayObservation::Fresh, false),
+            Ok(true)
+        );
+        assert_eq!(
+            replay_observation_needs_commit(ReplayObservation::Fork, false),
+            Err(OpenFailure::Replay)
+        );
+    }
 
     fn seeded(seed: u8, my_id: UserId) -> E2eState {
         let mut state = E2eState::new(Some(&encode_hex(&[seed; E2E_SEED_LEN])), Some(my_id), &[]);

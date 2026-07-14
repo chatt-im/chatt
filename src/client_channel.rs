@@ -7,10 +7,13 @@ use std::{
     },
 };
 
-use extui::event::polling::Waker;
+use extui::event::polling::{self, Waker};
 
 use crate::{
-    app::{RoomSettingsDraft, ServerEditDraft, UserVolumeDialog},
+    app::{
+        RoomSettingsDraft, ServerEditDraft, UserVolumeDialog,
+        device_pair::{DeviceLinkDialog, DevicePairDialog},
+    },
     clipboard_paste::ImagePaste,
 };
 
@@ -60,6 +63,8 @@ pub(crate) enum OverlaySpec {
     NativeEncryptionWarning { label: String, generation: u64 },
     E2eIdentity(E2eIdentityOverlay),
     PairingPassword { retry: bool },
+    DevicePair(DevicePairDialog),
+    DeviceLink(DeviceLinkDialog),
     PasteUpload(ImagePaste),
 }
 
@@ -78,6 +83,10 @@ pub(crate) enum TerminalEvent {
     Navigation(NavigationEvent),
     PairingPasswordChallenge { retry: bool },
     PairingFailed(String),
+    DevicePairingIdentityExists {
+        message: String,
+        transfer_password: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -137,7 +146,7 @@ impl std::ops::BitOrAssign for DirtySections {
 
 /// Core-to-render-thread signalling for one terminal.
 pub(crate) struct ClientChannel {
-    pub(crate) waker: Waker,
+    waker: ChannelWaker,
     terminate: AtomicBool,
     handoff: AtomicBool,
     resize_generation: AtomicU64,
@@ -145,10 +154,33 @@ pub(crate) struct ClientChannel {
     events: Mutex<VecDeque<TerminalEvent>>,
 }
 
+enum ChannelWaker {
+    /// The primary terminal shares extui's signal-aware global waker, so
+    /// SIGWINCH interrupts its input poll immediately.
+    Global,
+    /// Attached terminals receive resize notifications over local control and
+    /// retain an independent application waker.
+    Local(Waker),
+}
+
 impl ClientChannel {
     pub(crate) fn new() -> io::Result<Self> {
         Ok(Self {
-            waker: Waker::new()?,
+            waker: ChannelWaker::Local(Waker::new()?),
+            terminate: AtomicBool::new(false),
+            handoff: AtomicBool::new(false),
+            resize_generation: AtomicU64::new(0),
+            dirty: AtomicU16::new(0),
+            events: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    pub(crate) fn new_primary() -> io::Result<Self> {
+        if polling::global_waker().is_none() {
+            return Err(io::Error::other("extui global waker is not initialized"));
+        }
+        Ok(Self {
+            waker: ChannelWaker::Global,
             terminate: AtomicBool::new(false),
             handoff: AtomicBool::new(false),
             resize_generation: AtomicU64::new(0),
@@ -158,7 +190,20 @@ impl ClientChannel {
     }
 
     pub(crate) fn wake(&self) {
-        let _ = self.waker.wake();
+        let waker = match &self.waker {
+            ChannelWaker::Global => polling::global_waker(),
+            ChannelWaker::Local(waker) => Some(waker),
+        };
+        if let Some(waker) = waker {
+            let _ = waker.wake();
+        }
+    }
+
+    pub(crate) fn poll_waker(&self) -> Option<&Waker> {
+        match &self.waker {
+            ChannelWaker::Global => polling::global_waker(),
+            ChannelWaker::Local(waker) => Some(waker),
+        }
     }
 
     /// Accumulates `sections` into the dirty mask and wakes the render

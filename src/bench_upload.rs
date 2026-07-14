@@ -104,7 +104,6 @@ fn client_config(
         token: token.to_string(),
         server_public_key: None,
         e2e_peer_pins: Vec::new(),
-        e2e_recovery_code: None,
         require_native_encryption: true,
         file_policy: FilePolicy {
             default: EffectiveFiles {

@@ -44,6 +44,8 @@ tempfile = "3.27.0"
 mimalloc = { version = "0.1.52", features = ["override"], optional = true }
 dhat = { version = "0.3", optional = true }
 memchr = "2.8.3"
+argon2-kdf = "1.7.1"
+zeroize = { version = "1.9", features = ["derive"] }
 
 [features]
 default = ["audio-realtime", "mimalloc-allocator", "embed-web"]
