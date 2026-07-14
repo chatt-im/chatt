@@ -2553,6 +2553,7 @@ mod tests {
             trust_level: crate::config::E2eTrustLevel::Accepted,
             change_from: None,
             verified_keys: Vec::new(),
+            synced_verification_notice: false,
         }
     }
 

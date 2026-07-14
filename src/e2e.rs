@@ -34,9 +34,11 @@ use rpc::e2e::{
     DmEventEnvelope, DmPairKeys, DmPlaintext, E2E_PUBLIC_KEY_LEN, E2E_SEED_LEN, EventRecipient,
     RosterCheckpoint, SenderEventHeader, ValidatedAccountLedger, account_statement_hash,
     dm_pair_keys, open_dm_envelope, open_dm_event, seal_dm_envelope, seal_dm_event,
-    sign_device_binding,
+    VerificationSyncCheckpoint, VerificationSyncHeader, VerificationSyncSnapshot,
+    decode_verification_sync_envelope, open_verification_sync, seal_verification_sync,
+    sign_device_binding, verification_sync_checkpoint,
 };
-use rpc::ids::{LedgerHash, MessageId, RoomId, SessionId, UserId};
+use rpc::ids::{AccountId, LedgerHash, MessageId, RoomId, SessionId, UserId};
 
 use crate::config::{E2ePeerIdentity, E2ePeerPin, E2eTrustLevel};
 use crate::e2e_store::{LocalE2eIdentity, ReplayObservation};
@@ -123,6 +125,9 @@ pub struct AcceptedPeerIdentity {
     pub change_from: Option<E2eTrustLevel>,
     /// Every retained peer key that has been independently verified.
     pub verified_keys: Vec<[u8; E2E_PUBLIC_KEY_LEN]>,
+    /// This device learned the current Verified state from another device and
+    /// has not yet displayed the once-only room notice.
+    pub synced_verification_notice: bool,
 }
 
 /// Immutable worker-owned identity snapshot used to bind an automatic TOFU
@@ -376,6 +381,159 @@ impl E2eState {
         ))
     }
 
+    pub fn verification_sync_checkpoint(&self) -> Option<VerificationSyncCheckpoint> {
+        self.device_identity
+            .as_ref()
+            .and_then(LocalE2eIdentity::verification_checkpoint)
+    }
+
+    pub fn verification_sync_dirty(&self) -> bool {
+        self.device_identity
+            .as_ref()
+            .is_some_and(LocalE2eIdentity::verification_dirty)
+    }
+
+    pub fn create_verification_sync(
+        &self,
+    ) -> Result<(
+        Option<VerificationSyncCheckpoint>,
+        VerificationSyncSnapshot,
+        Vec<u8>,
+        VerificationSyncCheckpoint,
+    ), String> {
+        let identity = self
+            .device_identity
+            .as_ref()
+            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
+        if !identity.verification_dirty() {
+            return Err("verification sync has no local changes".to_string());
+        }
+        let ledger = identity.own_ledger();
+        let previous = identity.verification_checkpoint();
+        let version = previous.map_or(1, |checkpoint| checkpoint.version.saturating_add(1));
+        let snapshot = identity.next_verification_snapshot()?;
+        let recipients = ledger
+            .active_devices()
+            .map(|device| {
+                let encryption_public_key = device
+                    .encryption_public_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "account device encryption key has the wrong length".to_string())?;
+                Ok(EventRecipient {
+                    user_id: identity.user_id(),
+                    account_id: identity.account_id(),
+                    device_id: device.device_id,
+                    key_epoch: device.key_epoch,
+                    encryption_public_key,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let encoded = seal_verification_sync(
+            identity.signing_seed(),
+            VerificationSyncHeader {
+                account_id: identity.account_id(),
+                author_device: identity.device_id(),
+                author_key_epoch: identity.device_key_epoch(),
+                roster: RosterCheckpoint::from(&ledger),
+                version,
+                previous,
+            },
+            &snapshot,
+            &recipients,
+            &self.rng,
+        )
+        .map_err(|error| error.to_string())?;
+        let checkpoint = verification_sync_checkpoint(&encoded);
+        Ok((previous, snapshot, encoded, checkpoint))
+    }
+
+    pub fn apply_verification_sync(
+        &mut self,
+        encoded: &[u8],
+    ) -> Result<Vec<AcceptedPeerIdentity>, String> {
+        let envelope = decode_verification_sync_envelope(encoded)
+            .map_err(|error| format!("invalid verification sync envelope: {error}"))?;
+        let identity = self
+            .device_identity
+            .as_mut()
+            .ok_or_else(|| "verification sync arrived before E2E initialization".to_string())?;
+        let ledger = identity.own_ledger();
+        if envelope.header.roster != RosterCheckpoint::from(&ledger) {
+            return Err("verification sync was not addressed to the current device roster".to_string());
+        }
+        let author = ledger
+            .device_key(envelope.header.author_device, envelope.header.author_key_epoch)
+            .filter(|device| device.status == DeviceKeyStatus::Active)
+            .ok_or_else(|| "verification sync author is not an active account device".to_string())?;
+        let signing_key: &[u8; rpc::e2e::DEVICE_SIGNING_KEY_LEN] = author
+            .keys
+            .signing_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| "verification sync signing key has the wrong length".to_string())?;
+        let (_, snapshot) = open_verification_sync(
+            encoded,
+            signing_key,
+            identity.user_id(),
+            identity.account_id(),
+            identity.device_id(),
+            identity.device_key_epoch(),
+            identity.encryption_seed(),
+        )
+        .map_err(|error| format!("could not open verification sync: {error}"))?;
+        if snapshot
+            .records
+            .iter()
+            .any(|record| record.user_id == identity.user_id())
+        {
+            return Err("verification sync contains the local account".to_string());
+        }
+        let checkpoint = verification_sync_checkpoint(encoded);
+        identity.apply_verification_snapshot(checkpoint, snapshot)?;
+        Ok(self.refresh_verification_projection())
+    }
+
+    pub fn commit_verification_sync(
+        &mut self,
+        checkpoint: VerificationSyncCheckpoint,
+        snapshot: VerificationSyncSnapshot,
+    ) -> Result<Vec<AcceptedPeerIdentity>, String> {
+        self.device_identity
+            .as_mut()
+            .ok_or_else(|| "verification sync committed before E2E initialization".to_string())?
+            .commit_verification_snapshot(checkpoint, snapshot)?;
+        Ok(self.refresh_verification_projection())
+    }
+
+    pub fn record_verification_update(&mut self, pin: &E2ePeerPin) -> Result<(), String> {
+        let account_id = AccountId(
+            decode_hex(&pin.public_key)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| "verified account identity has the wrong length".to_string())?,
+        );
+        self.device_identity
+            .as_mut()
+            .ok_or_else(|| "local E2E device is unavailable".to_string())?
+            .set_identity_verified(
+                UserId(pin.user_id),
+                account_id,
+                pin.trust_level == E2eTrustLevel::Verified,
+            )
+    }
+
+    pub fn acknowledge_verification_notice(
+        &mut self,
+        user_id: UserId,
+        account_id: AccountId,
+    ) -> Result<(), String> {
+        self.device_identity
+            .as_mut()
+            .ok_or_else(|| "local E2E device is unavailable".to_string())?
+            .acknowledge_verification_notice(user_id, account_id)
+    }
+
     pub fn recovery_bundle(&self) -> Option<(LedgerHash, Vec<u8>)> {
         let identity = self.device_identity.as_ref()?;
         Some((identity.own_ledger().head, identity.recovery_bundle().to_vec()))
@@ -605,6 +763,10 @@ impl E2eState {
         let Ok(public_key) = <[u8; E2E_PUBLIC_KEY_LEN]>::try_from(public_key) else {
             return PeerIdentityOutcome::Rejected;
         };
+        let synced_trust = self
+            .device_identity
+            .as_ref()
+            .and_then(|identity| identity.identity_verification(peer_id, AccountId(public_key)));
         let Some(keys) = self.derive_pair(peer_id, &public_key) else {
             return PeerIdentityOutcome::Rejected;
         };
@@ -634,6 +796,14 @@ impl E2eState {
             room.trust_pending = false;
             room.pin_matched_this_session = true;
             let trusted = room.trusted.first_mut().expect("exact pin exists");
+            if let Some(verified) = synced_trust {
+                trusted.trust_level = if verified {
+                    E2eTrustLevel::Verified
+                } else {
+                    E2eTrustLevel::Accepted
+                };
+                trusted.identity.trust_level = trusted.trust_level;
+            }
             trusted.identity.username.clone_from(&room.username);
             return PeerIdentityOutcome::PinMatched(AcceptedPeerIdentity {
                 room_id,
@@ -642,15 +812,21 @@ impl E2eState {
                 trust_level: trusted.trust_level,
                 change_from: room.change_from,
                 verified_keys: verified_keys(room),
+                synced_verification_notice: false,
             });
         }
 
+        let trust_level = if synced_trust == Some(true) {
+            E2eTrustLevel::Verified
+        } else {
+            E2eTrustLevel::Accepted
+        };
         let identity = E2ePeerIdentity {
             room_id: room_id.0,
             user_id: peer_id.0,
             username: room.username.clone(),
             public_key: encode_hex(&public_key),
-            trust_level: E2eTrustLevel::Accepted,
+            trust_level,
         };
         let same_presentation = room
             .presented
@@ -658,7 +834,7 @@ impl E2eState {
             .is_some_and(|presented| presented.identity == identity);
         room.presented = Some(TrustedIdentity {
             identity,
-            trust_level: E2eTrustLevel::Accepted,
+            trust_level,
             public_key,
             keys,
         });
@@ -696,6 +872,7 @@ impl E2eState {
             trust_level: current.trust_level,
             change_from: room.change_from,
             verified_keys: verified_keys(room),
+            synced_verification_notice: false,
         })
     }
 
@@ -720,6 +897,7 @@ impl E2eState {
             trust_level: current.trust_level,
             change_from: room.change_from,
             verified_keys: verified_keys(room),
+            synced_verification_notice: self.verification_notice_pending(peer_id, current),
         })
     }
 
@@ -1406,6 +1584,63 @@ impl E2eState {
             })
             .ok()
     }
+
+    fn verification_notice_pending(&self, peer_id: UserId, current: &TrustedIdentity) -> bool {
+        let Some(account_id) = account_id_from_identity(&current.identity) else {
+            return false;
+        };
+        self.device_identity.as_ref().is_some_and(|identity| {
+            identity.verification_notice_pending(peer_id, account_id)
+        })
+    }
+
+    fn refresh_verification_projection(&mut self) -> Vec<AcceptedPeerIdentity> {
+        let Some(identity) = self.device_identity.as_ref() else {
+            return Vec::new();
+        };
+        let mut accepted = Vec::new();
+        for (room_id, room) in &mut self.rooms {
+            for trusted in &mut room.trusted {
+                let Some(account_id) = account_id_from_identity(&trusted.identity) else {
+                    continue;
+                };
+                if let Some(verified) = identity.identity_verification(room.peer, account_id) {
+                    trusted.trust_level = if verified {
+                        E2eTrustLevel::Verified
+                    } else {
+                        E2eTrustLevel::Accepted
+                    };
+                    trusted.identity.trust_level = trusted.trust_level;
+                }
+            }
+            if room.trust_pending || !room.pin_matched_this_session {
+                continue;
+            }
+            let Some(current) = room.trusted.first() else {
+                continue;
+            };
+            let account_id = account_id_from_identity(&current.identity);
+            accepted.push(AcceptedPeerIdentity {
+                room_id: *room_id,
+                user_id: room.peer,
+                identity: current.storage(),
+                trust_level: current.trust_level,
+                change_from: room.change_from,
+                verified_keys: verified_keys(room),
+                synced_verification_notice: account_id.is_some_and(|account_id| {
+                    identity.verification_notice_pending(room.peer, account_id)
+                }),
+            });
+        }
+        accepted
+    }
+}
+
+fn account_id_from_identity(identity: &E2ePeerIdentity) -> Option<AccountId> {
+    decode_hex(&identity.public_key)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(AccountId)
 }
 
 fn identity_outcome(room: &DmRoom) -> PeerIdentityOutcome {

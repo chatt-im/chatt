@@ -117,6 +117,7 @@ pub enum ClientControl {
     CreateDeviceLink {
         redemption_secret_hash: Vec<u8>,
         enrollment_bundle: Vec<u8>,
+        verification_checkpoint: Option<crate::e2e::VerificationSyncCheckpoint>,
     },
     CancelDeviceLink {
         redemption_secret_hash: Vec<u8>,
@@ -286,6 +287,17 @@ pub enum ClientControl {
     },
     FetchE2eRecoveryBundle {
         user_id: UserId,
+    },
+    /// Fetches the latest compacted, opaque manual-verification snapshot for
+    /// the authenticated account. A matching checkpoint suppresses the body.
+    FetchE2eVerificationSync {
+        known: Option<crate::e2e::VerificationSyncCheckpoint>,
+    },
+    /// Compare-and-swap replacement of the authenticated account's compacted
+    /// verification snapshot. The server retains only this envelope.
+    PutE2eVerificationSync {
+        expected: Option<crate::e2e::VerificationSyncCheckpoint>,
+        envelope: Vec<u8>,
     },
 }
 
@@ -475,6 +487,20 @@ pub enum ServerControl {
     E2eRecoveryBundle {
         user_id: UserId,
         bundle: Option<Vec<u8>>,
+    },
+    E2eVerificationSync {
+        checkpoint: Option<crate::e2e::VerificationSyncCheckpoint>,
+        /// `None` when the requester's known checkpoint is current.
+        envelope: Option<Vec<u8>>,
+    },
+    E2eVerificationSyncChanged {
+        checkpoint: crate::e2e::VerificationSyncCheckpoint,
+    },
+    E2eVerificationSyncConflict {
+        current: Option<crate::e2e::VerificationSyncCheckpoint>,
+    },
+    E2eVerificationSyncRateLimited {
+        retry_after_ms: u64,
     },
     DeviceLinkCreated {
         redemption_secret_hash: Vec<u8>,
@@ -930,6 +956,7 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
         ClientControl::CreateDeviceLink {
             redemption_secret_hash,
             enrollment_bundle,
+            ..
         } => {
             if redemption_secret_hash.len() != 32 {
                 return Err("device-link secret hash has the wrong length".to_string());
@@ -1090,6 +1117,13 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
         ClientControl::PutE2eRecoveryBundle { bundle, .. } => {
             if bundle.is_empty() || bundle.len() > 16 * 1024 {
                 return Err("recovery bundle length is invalid".to_string());
+            }
+        }
+        ClientControl::PutE2eVerificationSync { envelope, .. } => {
+            if envelope.is_empty()
+                || envelope.len() > crate::e2e::MAX_VERIFICATION_SYNC_ENVELOPE_BYTES
+            {
+                return Err("verification sync envelope length is invalid".to_string());
             }
         }
         _ => {}

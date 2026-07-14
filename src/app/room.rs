@@ -886,6 +886,10 @@ pub(crate) struct RoomSession {
     /// connection session. The exact key and change state let a replacement
     /// identity still raise a fresh, higher-priority notice.
     e2e_identity_notices_shown: HashMap<RoomId, (String, Option<crate::config::E2eTrustLevel>)>,
+    /// Durable ownership lives in the E2E identity store; this is the UI
+    /// projection waiting for the first view of the matching room.
+    e2e_synced_verification_notices: HashMap<RoomId, (UserId, rpc::ids::AccountId)>,
+    e2e_synced_verification_notices_shown: HashSet<(UserId, rpc::ids::AccountId)>,
     stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
     /// Catalog facts for every known room, viewed or not.
@@ -1414,6 +1418,8 @@ impl RoomSession {
             e2e_verified_keys: HashMap::new(),
             e2e_warning_notices: HashMap::new(),
             e2e_identity_notices_shown: HashMap::new(),
+            e2e_synced_verification_notices: HashMap::new(),
+            e2e_synced_verification_notices_shown: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
             metas: BTreeMap::new(),
@@ -1506,6 +1512,8 @@ impl RoomSession {
                 self.e2e_verified_keys.clear();
                 self.e2e_warning_notices.clear();
                 self.e2e_identity_notices_shown.clear();
+                self.e2e_synced_verification_notices.clear();
+                self.e2e_synced_verification_notices_shown.clear();
             }
         }
         continuity
@@ -1535,6 +1543,8 @@ impl RoomSession {
         self.e2e_verified_keys.clear();
         self.e2e_warning_notices.clear();
         self.e2e_identity_notices_shown.clear();
+        self.e2e_synced_verification_notices.clear();
+        self.e2e_synced_verification_notices_shown.clear();
     }
 
     /// Marks every user offline and clears live voice state while keeping the
@@ -2406,6 +2416,58 @@ impl RoomSession {
     pub(crate) fn ensure_e2e_security_notice(&mut self, room_id: RoomId) {
         self.ensure_e2e_blocked_notice(room_id);
         self.ensure_e2e_identity_notice(room_id);
+    }
+
+    pub(crate) fn set_synced_verification_notice(
+        &mut self,
+        room_id: RoomId,
+        user_id: UserId,
+        account_id: rpc::ids::AccountId,
+    ) -> Option<(UserId, rpc::ids::AccountId)> {
+        if self
+            .e2e_synced_verification_notices_shown
+            .contains(&(user_id, account_id))
+        {
+            return None;
+        }
+        self.e2e_synced_verification_notices
+            .insert(room_id, (user_id, account_id));
+        self.show_synced_verification_notice(room_id)
+    }
+
+    pub(crate) fn show_synced_verification_notice(
+        &mut self,
+        room_id: RoomId,
+    ) -> Option<(UserId, rpc::ids::AccountId)> {
+        let is_open = self.viewed_room == Some(room_id)
+            || self
+                .attached_views
+                .values()
+                .any(|viewed_room| *viewed_room == room_id);
+        if !is_open {
+            return None;
+        }
+        let (user_id, account_id) = self
+            .e2e_synced_verification_notices
+            .remove(&room_id)?;
+        let username = self.username_of(user_id);
+        let username = if username.trim().is_empty() {
+            "this contact"
+        } else {
+            &username
+        };
+        let room = self.rooms.get_mut(&room_id)?;
+        room.push_notice_record(NoticeRecord {
+            sender: "security".to_string(),
+            body: format!(
+                "This device learned that you verified {username}'s encryption identity from another device on your account."
+            ),
+            kind: NoticeKind::Info,
+            scroll_bottom: true,
+        });
+        self.e2e_synced_verification_notices_shown
+            .insert((user_id, account_id));
+        Some((user_id, account_id))
     }
 
     fn ensure_e2e_blocked_notice(&mut self, room_id: RoomId) {
@@ -6106,6 +6168,36 @@ mod tests {
         assert!(matches!(
             room.shared(2).journal.back(),
             Some((_, RoomDelta::Notice(_, notice))) if notice.kind == NoticeKind::Warning
+        ));
+    }
+
+    #[test]
+    fn synced_verification_notice_waits_for_room_and_is_consumed_once() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        let room_id = RoomId(2);
+        let account_id = rpc::ids::AccountId([7; 32]);
+        assert_eq!(
+            room.set_synced_verification_notice(room_id, UserId(2), account_id),
+            None
+        );
+
+        room.set_viewed_room(room_id);
+        assert_eq!(
+            room.show_synced_verification_notice(room_id),
+            Some((UserId(2), account_id))
+        );
+        assert_eq!(room.show_synced_verification_notice(room_id), None);
+        assert!(matches!(
+            room.shared(2).journal.back(),
+            Some((_, RoomDelta::Notice(_, notice)))
+                if notice.kind == NoticeKind::Info
+                    && notice.body.contains("another device on your account")
         ));
     }
 

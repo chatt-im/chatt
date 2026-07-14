@@ -43,7 +43,7 @@ use rpc::{
         TransportMode, complete_client_transport_handshake, dev_server_public_key,
         ed25519_public_key_from_hex, encode_hex, generate_client_hello,
     },
-    e2e::DmContentKind,
+    e2e::{DmContentKind, VerificationSyncCheckpoint, VerificationSyncSnapshot},
     evented::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, recv_datagram_with,
         write_queue_to,
@@ -65,7 +65,7 @@ use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
     VoicePayload as AudioVoicePayload,
 };
-use crate::config::{CandidatePrivacy, DownloadTarget, E2ePeerPin, E2eTrustLevel, EffectiveFiles};
+use crate::config::{CandidatePrivacy, DownloadTarget, E2ePeerPin, EffectiveFiles};
 use crate::e2e::{
     AcceptedPeerIdentity, AuthenticatedChat, E2eState, MessageProvenance, OpenFailure,
     PeerIdentityOutcome, SealBlocked,
@@ -519,6 +519,7 @@ pub enum NetworkCommand {
     ConfirmE2ePeerPin {
         pin: E2ePeerPin,
         persisted: bool,
+        manual_verification: bool,
     },
     /// Authority-signs a terminal revocation. All sessions on the account are
     /// unbound until they validate the advanced ledger; the revoked device can
@@ -529,6 +530,10 @@ pub enum NetworkCommand {
     ShowE2eRecoveryCode,
     ListE2eDevices,
     CreateDeviceLink,
+    AcknowledgeSyncedVerificationNotice {
+        user_id: UserId,
+        account_id: AccountId,
+    },
     Shutdown,
 }
 
@@ -699,6 +704,7 @@ pub enum NetworkEvent {
     /// TOFU keys are already active for this session.
     E2ePeerPinProposed {
         pin: E2ePeerPin,
+        manual_verification: bool,
     },
     E2eIdentityFetching {
         room_id: RoomId,
@@ -1446,6 +1452,9 @@ fn run_worker_inner(
         ),
         e2e_bound: false,
         pending_device_link: None,
+        verification_sync_fetching: false,
+        verification_sync_put: None,
+        verification_sync_retry_at: None,
         deferred_e2e: HashMap::new(),
         deferred_e2e_bytes: 0,
         deferred_e2e_items: 0,
@@ -1582,6 +1591,9 @@ fn run_worker_inner(
         worker.poll_udp_bind_retry(now);
         worker.poll_relay_keepalive(now);
         worker.poll_rtt_probe(now);
+        if let Err(error) = worker.poll_verification_sync(now) {
+            return SessionEnd::Disconnected(error);
+        }
         poll_timeout = worker.next_poll_timeout(command_drain, now);
         #[cfg(debug_assertions)]
         if poll_timeout != Duration::ZERO {
@@ -2014,6 +2026,9 @@ struct WorkerState {
     e2e: E2eState,
     e2e_bound: bool,
     pending_device_link: Option<PendingCreatedDeviceLink>,
+    verification_sync_fetching: bool,
+    verification_sync_put: Option<PendingVerificationSyncPut>,
+    verification_sync_retry_at: Option<Instant>,
     deferred_e2e: HashMap<RoomId, DeferredE2eRoom>,
     deferred_e2e_bytes: usize,
     deferred_e2e_items: usize,
@@ -2027,6 +2042,14 @@ struct PendingCreatedDeviceLink {
     secret_hash: Vec<u8>,
     pairing_string: String,
     transfer_password: String,
+}
+
+struct PendingVerificationSyncPut {
+    expected: Option<VerificationSyncCheckpoint>,
+    snapshot: VerificationSyncSnapshot,
+    encoded: Vec<u8>,
+    checkpoint: VerificationSyncCheckpoint,
+    sent: bool,
 }
 
 struct PendingAuthentication {
@@ -3063,6 +3086,79 @@ impl EncoderFeedbackController {
 }
 
 impl WorkerState {
+    fn fetch_verification_sync(&mut self) -> Result<(), String> {
+        if self.verification_sync_fetching || !self.e2e_bound {
+            return Ok(());
+        }
+        self.queue_control(ClientControl::FetchE2eVerificationSync {
+            known: self.e2e.verification_sync_checkpoint(),
+        })?;
+        self.verification_sync_fetching = true;
+        Ok(())
+    }
+
+    fn queue_verification_sync_put(&mut self) -> Result<(), String> {
+        if !self.e2e_bound || !self.e2e.verification_sync_dirty() {
+            return Ok(());
+        }
+        if self.verification_sync_put.is_none() {
+            let (expected, snapshot, encoded, checkpoint) =
+                self.e2e.create_verification_sync()?;
+            self.verification_sync_put = Some(PendingVerificationSyncPut {
+                expected,
+                snapshot,
+                encoded,
+                checkpoint,
+                sent: false,
+            });
+        }
+        let pending = self.verification_sync_put.as_ref().expect("created above");
+        if pending.sent {
+            return Ok(());
+        }
+        let expected = pending.expected;
+        let encoded = pending.encoded.clone();
+        self.queue_control(ClientControl::PutE2eVerificationSync {
+            expected,
+            envelope: encoded,
+        })?;
+        self.verification_sync_put
+            .as_mut()
+            .expect("queued verification put")
+            .sent = true;
+        self.verification_sync_retry_at = None;
+        Ok(())
+    }
+
+    fn emit_verification_identities(&self, identities: Vec<AcceptedPeerIdentity>) {
+        for identity in identities {
+            let _ = self
+                .events
+                .send(NetworkEvent::E2ePeerPinMatched { identity });
+        }
+    }
+
+    fn verification_sync_wake(&self, now: Instant) -> WakeIntent {
+        self.verification_sync_retry_at.map_or(WakeIntent::Idle, |at| {
+            WakeIntent::After(at.saturating_duration_since(now))
+        })
+    }
+
+    fn poll_verification_sync(&mut self, now: Instant) -> Result<(), String> {
+        if self
+            .verification_sync_retry_at
+            .is_some_and(|retry_at| now >= retry_at)
+        {
+            if self.verification_sync_put.is_some() {
+                self.queue_verification_sync_put()?;
+            } else {
+                self.verification_sync_retry_at = None;
+                self.fetch_verification_sync()?;
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     fn next_poll_timeout(&mut self, command_drain: CommandDrainOutcome, now: Instant) -> Duration {
         self.queue_runnable_io();
@@ -3077,6 +3173,7 @@ impl WorkerState {
         schedule.include(self.interface_wake(now));
         schedule.include(self.rtt_probe_wake(now));
         schedule.include(self.udp_bind_retry_wake(now));
+        schedule.include(self.verification_sync_wake(now));
         schedule.timeout()
     }
 
@@ -3741,7 +3838,10 @@ impl WorkerState {
                     ));
                     return Ok(());
                 };
-                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed { pin });
+                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed {
+                    pin,
+                    manual_verification: true,
+                });
             }
             NetworkCommand::ForgetPeerIdentity { expected } => {
                 let Some(pin) = self.e2e.proposed_downgrade(&expected) else {
@@ -3751,9 +3851,16 @@ impl WorkerState {
                     ));
                     return Ok(());
                 };
-                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed { pin });
+                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed {
+                    pin,
+                    manual_verification: true,
+                });
             }
-            NetworkCommand::ConfirmE2ePeerPin { pin, persisted } => {
+            NetworkCommand::ConfirmE2ePeerPin {
+                pin,
+                persisted,
+                manual_verification,
+            } => {
                 if !self.e2e.confirm_pin(&pin, persisted) {
                     kvlog::info!(
                         "stale e2e pin acknowledgement ignored",
@@ -3763,6 +3870,10 @@ impl WorkerState {
                     return Ok(());
                 }
                 if persisted {
+                    if manual_verification {
+                        self.e2e.record_verification_update(&pin)?;
+                        self.queue_verification_sync_put()?;
+                    }
                     if let Some(identity) = self.e2e.accepted_identity(UserId(pin.user_id)) {
                         let _ = self
                             .events
@@ -3818,6 +3929,7 @@ impl WorkerState {
                 self.queue_control(ClientControl::CreateDeviceLink {
                     redemption_secret_hash: secret_hash.clone(),
                     enrollment_bundle,
+                    verification_checkpoint: self.e2e.verification_sync_checkpoint(),
                 })?;
                 self.pending_device_link = Some(PendingCreatedDeviceLink {
                     secret_hash,
@@ -3958,6 +4070,13 @@ impl WorkerState {
                     offset: 0,
                     started: false,
                 });
+            }
+            NetworkCommand::AcknowledgeSyncedVerificationNotice {
+                user_id,
+                account_id,
+            } => {
+                self.e2e
+                    .acknowledge_verification_notice(user_id, account_id)?;
             }
             NetworkCommand::Shutdown => {
                 kvlog::info!("shutdown command handling");
@@ -5972,12 +6091,75 @@ impl WorkerState {
                     return Err("server confirmed the wrong E2E device binding".to_string());
                 }
                 self.e2e_bound = true;
+                self.verification_sync_fetching = false;
+                self.fetch_verification_sync()?;
                 let _ = self
                     .events
                     .send(NetworkEvent::E2eDeviceBound { device_id });
             }
             ServerControl::E2eRecoveryBundle { .. } => {
                 return Err("server sent an unrequested recovery bundle".to_string());
+            }
+            ServerControl::E2eVerificationSync {
+                checkpoint,
+                envelope,
+            } => {
+                if !self.verification_sync_fetching {
+                    return Err("server sent an unrequested verification snapshot".to_string());
+                }
+                self.verification_sync_fetching = false;
+                match (checkpoint, envelope) {
+                    (None, None) => {}
+                    (Some(checkpoint), Some(envelope)) => {
+                        if rpc::e2e::verification_sync_checkpoint(&envelope) != checkpoint {
+                            return Err("verification snapshot checkpoint does not match its envelope"
+                                .to_string());
+                        }
+                        let identities = self.e2e.apply_verification_sync(&envelope)?;
+                        self.emit_verification_identities(identities);
+                    }
+                    (Some(checkpoint), None)
+                        if self.e2e.verification_sync_checkpoint() == Some(checkpoint) => {}
+                    _ => {
+                        return Err("server returned an inconsistent verification snapshot"
+                            .to_string());
+                    }
+                }
+                self.queue_verification_sync_put()?;
+            }
+            ServerControl::E2eVerificationSyncChanged { checkpoint } => {
+                if self
+                    .verification_sync_put
+                    .as_ref()
+                    .is_some_and(|pending| pending.checkpoint == checkpoint)
+                {
+                    let pending = self
+                        .verification_sync_put
+                        .take()
+                        .expect("matching pending verification put");
+                    let identities = self
+                        .e2e
+                        .commit_verification_sync(checkpoint, pending.snapshot)?;
+                    self.emit_verification_identities(identities);
+                    self.queue_verification_sync_put()?;
+                } else if self.e2e.verification_sync_checkpoint() != Some(checkpoint) {
+                    self.verification_sync_put = None;
+                    self.fetch_verification_sync()?;
+                }
+            }
+            ServerControl::E2eVerificationSyncConflict { .. } => {
+                self.verification_sync_put = None;
+                self.verification_sync_retry_at = None;
+                self.fetch_verification_sync()?;
+            }
+            ServerControl::E2eVerificationSyncRateLimited { retry_after_ms } => {
+                if let Some(pending) = self.verification_sync_put.as_mut() {
+                    pending.sent = false;
+                } else {
+                    self.verification_sync_fetching = false;
+                }
+                let delay = Duration::from_millis(retry_after_ms.clamp(100, 60_000));
+                self.verification_sync_retry_at = Some(Instant::now() + delay);
             }
             ServerControl::DeviceLinkCreated {
                 redemption_secret_hash,
@@ -6118,7 +6300,7 @@ impl WorkerState {
                     .current
                     .as_ref()
                     .filter(|(current, _)| current.public_key == snapshot.presented.public_key)
-                    .map_or(E2eTrustLevel::Accepted, |(_, level)| *level);
+                    .map_or(snapshot.presented.trust_level, |(_, level)| *level);
                 let Some(pin) = self.e2e.proposed_trust(&snapshot, trust_level) else {
                     return Err(
                         "peer identity changed during automatic TOFU activation".to_string()
@@ -6139,7 +6321,10 @@ impl WorkerState {
                 if !self.e2e.confirm_pin(&pin, true) {
                     return Err("peer identity could not be activated".to_string());
                 }
-                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed { pin });
+                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed {
+                    pin,
+                    manual_verification: false,
+                });
                 let Some(identity) = self.e2e.accepted_identity(user_id) else {
                     return Err("activated peer identity is unavailable".to_string());
                 };
@@ -6162,6 +6347,7 @@ impl WorkerState {
             }
             PeerIdentityOutcome::PinMatched(identity) => {
                 let room_id = identity.room_id;
+                let identity = self.e2e.accepted_identity(user_id).unwrap_or(identity);
                 let _ = self
                     .events
                     .send(NetworkEvent::E2ePeerPinMatched { identity });
@@ -7663,6 +7849,9 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::ShowE2eRecoveryCode => "show_e2e_recovery_code",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
+        NetworkCommand::AcknowledgeSyncedVerificationNotice { .. } => {
+            "acknowledge_synced_verification_notice"
+        }
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -7797,6 +7986,12 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
         ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
         ServerControl::E2eRecoveryBundle { .. } => "e2e_recovery_bundle",
+        ServerControl::E2eVerificationSync { .. } => "e2e_verification_sync",
+        ServerControl::E2eVerificationSyncChanged { .. } => "e2e_verification_sync_changed",
+        ServerControl::E2eVerificationSyncConflict { .. } => "e2e_verification_sync_conflict",
+        ServerControl::E2eVerificationSyncRateLimited { .. } => {
+            "e2e_verification_sync_rate_limited"
+        }
         ServerControl::DeviceLinkCreated { .. } => "device_link_created",
         ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
         ServerControl::DeviceLinked { .. } => "device_linked",
