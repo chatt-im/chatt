@@ -85,6 +85,9 @@ pub struct ChatEntry {
     pub body: String,
     pub timestamp_ms: u64,
     pub local: bool,
+    /// The remote DM content is authenticated by a key that has not been
+    /// independently verified.
+    pub unverified: bool,
     /// The body was replaced by an edit; the heading renders an `(edited)`
     /// marker.
     pub edited: bool,
@@ -340,7 +343,7 @@ impl VirtualChatBuffer {
         self.bump_layout_epoch();
     }
 
-    fn build_entry(&self, message: ChatMessage, local: bool) -> ChatEntry {
+    fn build_entry(&self, message: ChatMessage, local: bool, unverified: bool) -> ChatEntry {
         let inline = crate::markdown::inline_ranges(&message.body);
         let refs = self.build_ref_spans(&message.body, inline.refs);
         ChatEntry {
@@ -349,6 +352,7 @@ impl VirtualChatBuffer {
             body: message.body,
             timestamp_ms: message.timestamp_ms,
             local,
+            unverified: unverified && !local,
             edited: message.flags.edited(),
             file_transfer_id: message.file_transfer_id,
             links: inline.urls,
@@ -363,13 +367,27 @@ impl VirtualChatBuffer {
     /// Replaces the message with `message_id` by the folded `message`,
     /// recomputing links, references, and layout while keeping the entry's
     /// local flag and expansion. Returns whether the message was resident.
+    #[cfg(test)]
     pub fn edit_message(&mut self, message_id: u64, message: ChatMessage) -> bool {
+        let unverified = self
+            .find_message(message_id)
+            .map(|index| self.messages[index].unverified)
+            .unwrap_or(false);
+        self.edit_authenticated_message(message_id, message, unverified)
+    }
+
+    pub fn edit_authenticated_message(
+        &mut self,
+        message_id: u64,
+        message: ChatMessage,
+        unverified: bool,
+    ) -> bool {
         let Some(index) = self.find_message(message_id) else {
             return false;
         };
         let expanded = self.messages[index].expanded;
         let local = self.messages[index].local;
-        let mut entry = self.build_entry(message, local);
+        let mut entry = self.build_entry(message, local, unverified);
         entry.expanded = expanded;
         self.messages[index] = entry;
         self.bump_reindex_revision();
@@ -388,9 +406,14 @@ impl VirtualChatBuffer {
         true
     }
 
+    #[cfg(test)]
     pub fn push_chat(&mut self, message: ChatMessage, local: bool) {
+        self.push_authenticated_chat(message, local, false);
+    }
+
+    pub fn push_authenticated_chat(&mut self, message: ChatMessage, local: bool, unverified: bool) {
         let old_len = self.messages.len();
-        let entry = self.build_entry(message, local);
+        let entry = self.build_entry(message, local, unverified);
         self.messages.push(entry);
         self.bump_revision();
         self.repair_layout_index_after_append(old_len);
@@ -422,14 +445,24 @@ impl VirtualChatBuffer {
     /// must be sorted by `message_id` and older than every resident message.
     /// The bottom-relative scroll is untouched, so the view does not jump;
     /// cursor and anchor shift with the entries they name.
+    #[cfg(test)]
     pub fn prepend_chat(&mut self, messages: Vec<(ChatMessage, bool)>) {
+        self.prepend_authenticated_chat(
+            messages
+                .into_iter()
+                .map(|(message, local)| (message, local, false))
+                .collect(),
+        );
+    }
+
+    pub fn prepend_authenticated_chat(&mut self, messages: Vec<(ChatMessage, bool, bool)>) {
         if messages.is_empty() {
             return;
         }
         let count = messages.len();
         let entries: Vec<ChatEntry> = messages
             .into_iter()
-            .map(|(message, local)| self.build_entry(message, local))
+            .map(|(message, local, unverified)| self.build_entry(message, local, unverified))
             .collect();
         self.messages.splice(0..0, entries);
         self.bump_reindex_revision();
@@ -447,14 +480,24 @@ impl VirtualChatBuffer {
     /// Inserts one message at its sorted position among real messages,
     /// leaving notices pinned where they were pushed. For the rare history
     /// straggler that lands between resident messages.
+    #[cfg(test)]
     pub fn insert_chat(&mut self, message: ChatMessage, local: bool) {
+        self.insert_authenticated_chat(message, local, false);
+    }
+
+    pub fn insert_authenticated_chat(
+        &mut self,
+        message: ChatMessage,
+        local: bool,
+        unverified: bool,
+    ) {
         let key = message.message_id.0;
         let index = self
             .messages
             .iter()
             .rposition(|entry| entry.id != 0 && entry.id < key)
             .map_or(0, |newest_older| newest_older + 1);
-        let entry = self.build_entry(message, local);
+        let entry = self.build_entry(message, local, unverified);
         self.messages.insert(index, entry);
         self.bump_reindex_revision();
         if let Some(cursor) = &mut self.cursor
@@ -516,6 +559,7 @@ impl VirtualChatBuffer {
             body,
             timestamp_ms: 0,
             local: false,
+            unverified: false,
             edited: false,
             file_transfer_id: None,
             links: inline.urls,
@@ -1375,6 +1419,7 @@ impl VirtualChatBuffer {
         }
         if self.messages[prev].local != self.messages[cur].local
             || self.messages[prev].sender != self.messages[cur].sender
+            || self.messages[prev].unverified != self.messages[cur].unverified
         {
             return true;
         }
@@ -2749,6 +2794,7 @@ mod tests {
                 timestamp_ms,
                 local,
                 edited: false,
+                unverified: false,
                 file_transfer_id: None,
                 links: inline.urls,
                 refs,

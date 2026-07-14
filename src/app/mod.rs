@@ -451,6 +451,13 @@ pub(crate) struct App {
     pending_network_commands: VecDeque<NetworkCommand>,
     pending_dm_open: HashMap<(RoomId, UserId), VecDeque<crate::client_channel::ClientId>>,
     pending_dm_clients: HashMap<UserId, VecDeque<crate::client_channel::ClientId>>,
+    /// Terminals that explicitly requested review through `/identity`.
+    /// Authentication discovery and ordinary DM navigation never populate it.
+    pending_identity_review: HashMap<UserId, VecDeque<crate::client_channel::ClientId>>,
+    /// Open identity reviews, bound to room, exact key, and trust level. A
+    /// display-name refresh does not invalidate the review.
+    open_e2e_reviews:
+        HashMap<crate::client_channel::ClientId, (RoomId, String, crate::config::E2eTrustLevel)>,
     pending_mutation_clients:
         HashMap<(RoomId, MessageId, bool), VecDeque<crate::client_channel::ClientId>>,
     pending_room_catalog_save: Option<PendingRoomCatalogSave>,
@@ -1060,6 +1067,7 @@ fn web_room_messages(
     let resolver = |target| client_view.web_ref_for(room, target);
     let mut messages = Vec::with_capacity(view.messages.len());
     for message in &view.messages {
+        let unverified = room.message_unverified(message.room_id, message.message_id, local_user);
         let web_message = match message.file_transfer_id {
             Some(transfer_id) => match view.files.get(&crate::room_history::FileHistoryKey {
                 timestamp_ms: message.timestamp_ms,
@@ -1071,10 +1079,15 @@ fn web_room_messages(
                     detail.length,
                     detail.dimensions(),
                     local_user,
+                    unverified,
                 ),
-                None => crate::web_server::WebMessage::from_chat(message, &resolver, local_user),
+                None => crate::web_server::WebMessage::from_chat(
+                    message, &resolver, local_user, unverified,
+                ),
             },
-            None => crate::web_server::WebMessage::from_chat(message, &resolver, local_user),
+            None => {
+                crate::web_server::WebMessage::from_chat(message, &resolver, local_user, unverified)
+            }
         };
         messages.push(web_message);
     }
@@ -1347,6 +1360,8 @@ impl App {
             pending_network_commands: VecDeque::new(),
             pending_dm_open: HashMap::new(),
             pending_dm_clients: HashMap::new(),
+            pending_identity_review: HashMap::new(),
+            open_e2e_reviews: HashMap::new(),
             pending_mutation_clients: HashMap::new(),
             pending_room_catalog_save: None,
             supervisor: SupervisorState::default(),
@@ -1652,6 +1667,12 @@ impl App {
             CoreCommand::CancelNativeEncryption { generation } => {
                 self.cancel_native_encryption_warning(generation)
             }
+            CoreCommand::CloseE2eIdentity => {
+                self.open_e2e_reviews.remove(&self.issuing_client);
+                self.navigate_owner(NavigationEvent::CloseOverlay);
+            }
+            CoreCommand::ForgetE2eIdentity(identity) => self.forget_e2e_identity(identity),
+            CoreCommand::ConfirmE2eIdentity(target) => self.confirm_e2e_verification(target),
             CoreCommand::Connect { alias } => {
                 self.start_connection(&alias, self.issuing_client);
             }
@@ -2835,12 +2856,9 @@ impl App {
             return false;
         };
         let previous = entry.e2e_peer_pins.clone();
-        let folded_username = pin.username.trim().to_lowercase();
-        entry.e2e_peer_pins.retain(|stored| {
-            stored.room_id != pin.room_id
-                && stored.user_id != pin.user_id
-                && stored.username.trim().to_lowercase() != folded_username
-        });
+        entry
+            .e2e_peer_pins
+            .retain(|stored| stored.room_id != pin.room_id && stored.user_id != pin.user_id);
         entry.e2e_peer_pins.push(pin);
         if let Err(error) = self.config.save_runtime() {
             if let Some(entry) = self
@@ -2956,6 +2974,8 @@ impl App {
         self.room.udp_unreachable = false;
         self.pending_dm_open.clear();
         self.pending_dm_clients.clear();
+        self.pending_identity_review.clear();
+        self.open_e2e_reviews.clear();
         self.pending_mutation_clients.clear();
         self.supervisor.network.reset();
         self.supervisor.capture.reset();
@@ -2973,13 +2993,24 @@ impl App {
         self.requested_voice_room = None;
         self.pending_dm_open.clear();
         self.pending_dm_clients.clear();
+        self.pending_identity_review.clear();
+        self.open_e2e_reviews.clear();
         self.view.cancel_pending_edit();
+        self.room.clear_e2e_trust_states();
         self.room.reset_for_disconnect();
     }
 
     /// Mirrors the viewed room into the web feed and tells the worker which
     /// room externally injected uploads target.
     fn sync_viewed_room_to_feeds(&mut self) {
+        self.sync_web_room_feed();
+        self.sync_web_e2e_security();
+        if let Some(room_id) = self.room.viewed_room {
+            self.send_network_command(NetworkCommand::SetActiveRoom(room_id), false);
+        }
+    }
+
+    fn sync_web_room_feed(&mut self) {
         // The web feed mirrors the primary view's buffer, so catch it up
         // before exporting.
         self.view.sync_active(&self.room);
@@ -2990,9 +3021,42 @@ impl App {
                 web_room_messages(&view, &self.room, &self.view, self.user_id),
             );
         }
-        if let Some(room_id) = self.room.viewed_room {
-            self.send_network_command(NetworkCommand::SetActiveRoom(room_id), false);
-        }
+    }
+
+    fn sync_web_e2e_security(&self) {
+        let Some(feed) = &self.web_feed else {
+            return;
+        };
+        let Some(state) = self
+            .room
+            .viewed_room
+            .and_then(|room_id| self.room.e2e_trust_state(room_id))
+        else {
+            feed.set_e2e_security("clear", "");
+            return;
+        };
+        let (level, message) = match state {
+            room::DmTrustState::FetchingKey { .. } => ("blocked", "Fetching Identity Key"),
+            room::DmTrustState::KeyUnavailable { .. } => {
+                ("blocked", "Identity Key Unavailable (DM Disabled)")
+            }
+            room::DmTrustState::Accepted {
+                change_from: None, ..
+            } => ("warning", "Identity Unverified (MITM Vulnerable)"),
+            room::DmTrustState::Accepted {
+                change_from: Some(crate::config::E2eTrustLevel::Accepted),
+                ..
+            } => ("danger", "Identity Changed (MITM Vulnerable)"),
+            room::DmTrustState::Accepted {
+                change_from: Some(crate::config::E2eTrustLevel::Verified),
+                ..
+            } => ("danger", "Verified Identity Changed (Possible MITM Attack)"),
+            room::DmTrustState::Verified { .. } => {
+                feed.set_e2e_security("clear", "");
+                return;
+            }
+        };
+        feed.set_e2e_security(level, message);
     }
 
     /// Switches the issuing terminal's viewed room. For the primary this moves
@@ -3017,6 +3081,7 @@ impl App {
             return false;
         }
         self.view.switch_room(room_id, &self.room);
+        self.room.ensure_e2e_warning_notice(room_id);
         if self.room.begin_history_fetch(room_id)
             && !self.send_network_command(
                 NetworkCommand::FetchHistory {
@@ -3171,6 +3236,9 @@ impl App {
     }
 
     fn after_view_switch(&mut self) {
+        if let Some(room_id) = self.view.viewed_room {
+            self.room.ensure_e2e_warning_notice(room_id);
+        }
         self.sync_viewed_room_to_feeds();
         self.request_initial_history_for_viewed_room();
         self.request_gap_backfill_for_viewed_room();
@@ -3224,6 +3292,22 @@ impl App {
             self.set_error("no room selected");
             return;
         };
+        if let Some(state) = self.room.e2e_trust_state(room_id).cloned()
+            && state.blocked()
+        {
+            match state {
+                room::DmTrustState::KeyUnavailable { username, .. } => self.set_error(format!(
+                    "{username} has not published an encryption key; sending is blocked"
+                )),
+                room::DmTrustState::FetchingKey { .. } => {
+                    self.set_error(
+                        "the peer encryption key is still being fetched; try again shortly",
+                    );
+                }
+                room::DmTrustState::Accepted { .. } | room::DmTrustState::Verified { .. } => {}
+            }
+            return;
+        }
         self.send_network_command(NetworkCommand::SendChat { room_id, body }, true);
     }
 
@@ -3843,7 +3927,7 @@ impl App {
                 ));
                 self.room.network_disconnected = false;
                 self.room.udp_unreachable = false;
-                self.room.clear_e2e_identity_changes();
+                self.room.clear_e2e_trust_states();
                 self.last_network_notice = None;
                 let catalog = crate::room_catalog::load(self.room.history_storage().catalog_dir());
                 let known = self.room.authenticated(
@@ -3988,10 +4072,13 @@ impl App {
                     self.report_web_delete_error(target, &message);
                 }
             }
-            NetworkEvent::Chat(message) => {
+            NetworkEvent::Chat(record) => {
+                let message = &record.message;
                 let viewed = self.room.viewed_room == Some(message.room_id);
                 if message.target.is_some() {
-                    let update = self.room.mutation_received(&message, self.user_id);
+                    let update = self
+                        .room
+                        .authenticated_mutation_received(&record, self.user_id);
                     let Some(update) = update else {
                         return;
                     };
@@ -4012,6 +4099,11 @@ impl App {
                                     &folded,
                                     &|target| self.view.web_ref_for(&self.room, target),
                                     self.user_id,
+                                    self.room.message_unverified(
+                                        folded.room_id,
+                                        folded.message_id,
+                                        self.user_id,
+                                    ),
                                 ));
                             }
                             MutationOutcome::AppliedDelete => {
@@ -4024,7 +4116,7 @@ impl App {
                     return;
                 }
                 let feed_message = (viewed && self.web_feed.is_some()).then(|| message.clone());
-                let update = RoomSession::chat_received(&mut self.room, message, self.user_id);
+                let update = RoomSession::chat_received(&mut self.room, record, self.user_id);
                 let Some(update) = update else {
                     return;
                 };
@@ -4044,6 +4136,11 @@ impl App {
                         &message,
                         &|target| self.view.web_ref_for(&self.room, target),
                         self.user_id,
+                        self.room.message_unverified(
+                            message.room_id,
+                            message.message_id,
+                            self.user_id,
+                        ),
                     ));
                 }
                 if !update.local {
@@ -4146,42 +4243,163 @@ impl App {
                 );
             }
             NetworkEvent::E2ePeerPinProposed { pin } => {
-                let user_id = UserId(pin.user_id);
                 let persisted = self.persist_e2e_pin(pin.clone());
                 self.send_network_command(
                     NetworkCommand::ConfirmE2ePeerPin { pin, persisted },
                     true,
                 );
-                if persisted {
-                    self.room.set_e2e_identity_changed(user_id, false);
-                    self.set_status(format!(
-                        "pinned encryption identity for {}",
-                        self.room.username_of(user_id)
-                    ));
+                if !persisted {
+                    self.set_error(
+                        "could not save the encryption identity; it remains active for this session",
+                    );
                 }
             }
-            NetworkEvent::E2ePeerIdentityChanged {
+            NetworkEvent::E2eIdentityFetching {
+                room_id,
                 user_id,
-                pinned,
-                presented,
+                username,
             } => {
-                kvlog::warn!(
-                    "peer e2e identity changed",
-                    user_id = user_id.0,
-                    pinned_username = pinned.username.as_str(),
-                    presented_username = presented.username.as_str(),
-                    pinned_key = pinned.public_key.as_str(),
-                    presented_key = presented.public_key.as_str()
+                self.room.set_e2e_trust_state(
+                    room_id,
+                    room::DmTrustState::FetchingKey {
+                        peer: user_id,
+                        username,
+                    },
                 );
-                self.room.set_e2e_identity_changed(user_id, true);
+                self.sync_web_e2e_security();
+            }
+            NetworkEvent::E2eKeyUnavailable {
+                room_id,
+                user_id,
+                username,
+            } => {
+                self.room.set_e2e_trust_state(
+                    room_id,
+                    room::DmTrustState::KeyUnavailable {
+                        peer: user_id,
+                        username: username.clone(),
+                    },
+                );
+                self.sync_web_e2e_security();
+                let open_clients: Vec<_> = self
+                    .open_e2e_reviews
+                    .iter()
+                    .filter_map(|(client_id, (open_room, _, _))| {
+                        (*open_room == room_id).then_some(*client_id)
+                    })
+                    .collect();
+                for client_id in open_clients {
+                    self.open_e2e_reviews.remove(&client_id);
+                    self.send_terminal_event(
+                        Audience::Client(client_id),
+                        TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
+                    );
+                }
+                self.pending_identity_review.remove(&user_id);
                 self.set_error(format!(
-                    "encryption identity for {} CHANGED (previously {}) — messages are blocked; \
-                     verify out of band, then /trust {} to accept the new identity",
-                    presented.username, pinned.username, presented.username
+                    "{username} has not published an encryption key; ask them to connect with an E2E-capable client"
                 ));
             }
-            NetworkEvent::E2ePeerIdentityVerified { user_id } => {
-                self.room.set_e2e_identity_changed(user_id, false);
+            NetworkEvent::E2ePeerPinMatched { identity } => {
+                let previous_level =
+                    self.room
+                        .e2e_trust_state(identity.room_id)
+                        .and_then(|state| match state {
+                            room::DmTrustState::Accepted {
+                                peer,
+                                identity: current,
+                                ..
+                            } if *peer == identity.user_id
+                                && current.room_id == identity.identity.room_id
+                                && current.user_id == identity.identity.user_id
+                                && current.public_key == identity.identity.public_key =>
+                            {
+                                Some(crate::config::E2eTrustLevel::Accepted)
+                            }
+                            room::DmTrustState::Verified {
+                                peer,
+                                identity: current,
+                            } if *peer == identity.user_id
+                                && current.room_id == identity.identity.room_id
+                                && current.user_id == identity.identity.user_id
+                                && current.public_key == identity.identity.public_key =>
+                            {
+                                Some(crate::config::E2eTrustLevel::Verified)
+                            }
+                            _ => None,
+                        });
+                let state = match identity.trust_level {
+                    crate::config::E2eTrustLevel::Accepted => room::DmTrustState::Accepted {
+                        peer: identity.user_id,
+                        identity: identity.identity.clone(),
+                        change_from: identity.change_from,
+                    },
+                    crate::config::E2eTrustLevel::Verified => room::DmTrustState::Verified {
+                        peer: identity.user_id,
+                        identity: identity.identity.clone(),
+                    },
+                };
+                self.room.set_e2e_verified_keys(
+                    identity.room_id,
+                    identity.verified_keys.iter().copied(),
+                );
+                self.room.set_e2e_trust_state(identity.room_id, state);
+                if self.room.viewed_room == Some(identity.room_id) {
+                    self.sync_web_room_feed();
+                }
+                self.sync_web_e2e_security();
+                if let Some(previous_level) = previous_level
+                    && previous_level != identity.trust_level
+                {
+                    let username = if identity.identity.username.trim().is_empty() {
+                        self.room.username_of(identity.user_id)
+                    } else {
+                        identity.identity.username.clone()
+                    };
+                    self.set_status(match identity.trust_level {
+                        crate::config::E2eTrustLevel::Accepted => {
+                            format!("Forgot independent verification for {username}")
+                        }
+                        crate::config::E2eTrustLevel::Verified => {
+                            format!("Verified {username}'s encryption identity")
+                        }
+                    });
+                }
+                let stale_clients: Vec<_> = self
+                    .open_e2e_reviews
+                    .iter()
+                    .filter_map(|(client_id, (room_id, public_key, trust_level))| {
+                        (*room_id == identity.room_id
+                            && (public_key != &identity.identity.public_key
+                                || *trust_level != identity.trust_level))
+                            .then_some(*client_id)
+                    })
+                    .collect();
+                for client_id in stale_clients {
+                    self.open_e2e_reviews.remove(&client_id);
+                    self.send_terminal_event(
+                        Audience::Client(client_id),
+                        TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
+                    );
+                }
+                if let Some(clients) = self.pending_identity_review.remove(&identity.user_id) {
+                    let target = crate::client_channel::E2eIdentityTarget {
+                        room_id: identity.room_id,
+                        user_id: identity.user_id,
+                        username: if identity.identity.username.trim().is_empty() {
+                            self.room.username_of(identity.user_id)
+                        } else {
+                            identity.identity.username.clone()
+                        },
+                        public_key: identity.identity.public_key.clone(),
+                        accepted: identity.clone(),
+                    };
+                    for client_id in clients {
+                        self.run_as_client(client_id, |app| {
+                            app.open_e2e_identity(target.clone(), None);
+                        });
+                    }
+                }
             }
             NetworkEvent::VoiceStarted {
                 room_id,
@@ -5120,6 +5338,10 @@ impl App {
     /// teardown is best-effort; preview resources cannot depend on it.
     pub(crate) fn retire_client(&mut self, client_id: crate::client_channel::ClientId) {
         self.clients.remove(&client_id);
+        self.open_e2e_reviews.remove(&client_id);
+        for clients in self.pending_identity_review.values_mut() {
+            clients.retain(|pending| *pending != client_id);
+        }
         self.room.remove_client_view(client_id);
         if self.pairing_owner == Some(client_id) {
             self.pairing_owner = None;
@@ -6776,8 +6998,8 @@ impl App {
             command if command.starts_with("/room ") => self.switch_room_command(command),
             "/dm" => self.set_error("usage: /dm user"),
             command if command.starts_with("/dm ") => self.open_dm_command(command),
-            "/trust" => self.set_error("usage: /trust user"),
-            command if command.starts_with("/trust ") => self.trust_command(command),
+            "/identity" => self.identity_command("/identity"),
+            command if command.starts_with("/identity ") => self.identity_command(command),
             "/voice" => match room_id {
                 Some(room_id) => self.join_voice_room(room_id),
                 None => self.set_error("no room selected"),
@@ -6834,24 +7056,179 @@ impl App {
         self.open_dm_with(user_id);
     }
 
-    /// Accepts a DM peer's changed encryption identity: the worker re-pins the
-    /// presented tuple and unblocks sends, answering with
-    /// [`NetworkEvent::E2ePeerPinProposed`] for durable persistence.
-    fn trust_command(&mut self, command: &str) {
-        let name = command.trim_start_matches("/trust ").trim();
-        if name.is_empty() {
-            self.set_error("usage: /trust user");
+    fn forget_e2e_identity(&mut self, identity: crate::e2e::AcceptedPeerIdentity) {
+        let matches =
+            self.room
+                .e2e_trust_state(identity.room_id)
+                .is_some_and(|state| match state {
+                    room::DmTrustState::Accepted {
+                        peer,
+                        identity: current,
+                        ..
+                    }
+                    | room::DmTrustState::Verified {
+                        peer,
+                        identity: current,
+                    } => {
+                        *peer == identity.user_id
+                            && current.room_id == identity.identity.room_id
+                            && current.user_id == identity.identity.user_id
+                            && current.public_key == identity.identity.public_key
+                    }
+                    _ => false,
+                });
+        if !matches {
+            self.set_error("that saved identity is stale; review the current identity");
             return;
         }
-        let Some(user_id) = self.room.user_id_by_name(name) else {
-            self.set_error(format!("no user named {name}"));
-            return;
+        if self.send_network_command(
+            NetworkCommand::ForgetPeerIdentity { expected: identity },
+            true,
+        ) {
+            self.set_status("forgetting independent identity verification");
+        }
+    }
+
+    fn active_server_identity_key(&self) -> Result<[u8; 32], String> {
+        let label = self
+            .room
+            .active_server_label
+            .as_deref()
+            .ok_or_else(|| "select a server before verifying identities".to_string())?;
+        let server = self
+            .config
+            .server(label)
+            .map_err(|error| error.to_string())?;
+        if server.server_public_key.trim().is_empty() {
+            return Ok(rpc::crypto::dev_server_public_key());
+        }
+        rpc::crypto::ed25519_public_key_from_hex(server.server_public_key.trim())
+            .map_err(|_| "the configured server public key is invalid".to_string())
+    }
+
+    fn local_verification_text(&self) -> Result<String, String> {
+        let server_key = self.active_server_identity_key()?;
+        let label = self
+            .room
+            .active_server_label
+            .as_deref()
+            .ok_or_else(|| "select a server before verifying identities".to_string())?;
+        let server = self
+            .config
+            .server(label)
+            .map_err(|error| error.to_string())?;
+        let seed = rpc::crypto::decode_hex(&server.e2e_identity_seed)
+            .map_err(|_| "the local encryption identity is invalid".to_string())?;
+        let seed = <[u8; rpc::e2e::E2E_SEED_LEN]>::try_from(seed.as_slice())
+            .map_err(|_| "the local encryption identity is invalid".to_string())?;
+        let public_key = rpc::e2e::e2e_public_key(&seed);
+        let user_id = self
+            .user_id
+            .ok_or_else(|| "authentication has not completed".to_string())?;
+        crate::e2e_identity::VerificationText::new(&server_key, user_id.0, &public_key)
+            .map(|text| text.encode())
+            .map_err(|_| "could not build the local verification text".to_string())
+    }
+
+    fn open_e2e_identity(
+        &mut self,
+        target: crate::client_channel::E2eIdentityTarget,
+        error: Option<String>,
+    ) {
+        let local_verification_text = match self.local_verification_text() {
+            Ok(text) => text,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
         };
-        if !self.room.e2e_identity_changed(user_id) {
-            self.set_status(format!("no pending encryption identity change for {name}"));
+        let replaces_open = self
+            .open_e2e_reviews
+            .get(&self.issuing_client)
+            .is_some_and(|(room_id, _, _)| *room_id == target.room_id);
+        self.open_e2e_reviews.insert(
+            self.issuing_client,
+            (
+                target.room_id,
+                target.public_key.clone(),
+                target.accepted.trust_level,
+            ),
+        );
+        let overlay = OverlaySpec::E2eIdentity(crate::client_channel::E2eIdentityOverlay {
+            target,
+            local_verification_text,
+            pasted_verification_text: String::new(),
+            result: None,
+            error,
+        });
+        self.navigate_owner(if replaces_open {
+            NavigationEvent::ReplaceOverlay(overlay)
+        } else {
+            NavigationEvent::ShowOverlay(overlay)
+        });
+    }
+
+    fn confirm_e2e_verification(&mut self, target: crate::client_channel::E2eIdentityTarget) {
+        let room_id = target.room_id;
+        let expected = target.accepted.clone();
+        let matches = self
+            .room
+            .e2e_trust_state(room_id)
+            .is_some_and(|state| match state {
+                room::DmTrustState::Accepted { peer, identity, .. }
+                | room::DmTrustState::Verified { peer, identity } => {
+                    *peer == expected.user_id
+                        && identity.room_id == expected.identity.room_id
+                        && identity.user_id == expected.identity.user_id
+                        && identity.public_key == expected.identity.public_key
+                }
+                _ => false,
+            });
+        if !matches || expected.identity.public_key != target.public_key {
+            self.set_error("the accepted identity changed during verification");
             return;
         }
-        self.send_network_command(NetworkCommand::TrustPeerIdentity { user_id }, true);
+        let sent = self.send_network_command(NetworkCommand::VerifyPeerIdentity { expected }, true);
+        if sent {
+            self.set_status("saving independently confirmed identity");
+        }
+    }
+
+    /// Opens the one identity screen for a DM peer. The command itself never
+    /// changes state; every save, confirmation, or forget action remains bound
+    /// to the exact identity shown by the overlay.
+    fn identity_command(&mut self, command: &str) {
+        let name = command.strip_prefix("/identity").unwrap_or("").trim();
+        let user_id = if name.is_empty() {
+            let Some(room_id) = self.view.viewed_room else {
+                self.set_error("open a DM first, or use /identity user");
+                return;
+            };
+            let Some(peer) = self.room.dm_peer_of(room_id) else {
+                self.set_error("open a DM first, or use /identity user");
+                return;
+            };
+            peer
+        } else {
+            let Some(user_id) = self.room.user_id_by_name(name) else {
+                self.set_error(format!("no user named {name}"));
+                return;
+            };
+            user_id
+        };
+        if self.room.dm_room_for_peer(user_id).is_none() {
+            self.pending_identity_review
+                .entry(user_id)
+                .or_default()
+                .push_back(self.issuing_client);
+            self.open_dm_with(user_id);
+            return;
+        }
+        self.pending_identity_review
+            .entry(user_id)
+            .or_default()
+            .push_back(self.issuing_client);
+        self.send_network_command(NetworkCommand::ReviewPeerIdentity { user_id }, true);
     }
 
     /// Asks the server for the DM room with `user_id`; the view switches when
@@ -8251,8 +8628,9 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Presence { .. } => "presence",
         NetworkEvent::E2eLocalUserId { .. } => "e2e_local_user_id",
         NetworkEvent::E2ePeerPinProposed { .. } => "e2e_peer_pin_proposed",
-        NetworkEvent::E2ePeerIdentityChanged { .. } => "e2e_peer_identity_changed",
-        NetworkEvent::E2ePeerIdentityVerified { .. } => "e2e_peer_identity_verified",
+        NetworkEvent::E2eIdentityFetching { .. } => "e2e_identity_fetching",
+        NetworkEvent::E2eKeyUnavailable { .. } => "e2e_key_unavailable",
+        NetworkEvent::E2ePeerPinMatched { .. } => "e2e_peer_pin_matched",
         NetworkEvent::VoiceStarted { .. } => "voice_started",
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
         NetworkEvent::PeerTransport { .. } => "peer_transport",
@@ -8306,7 +8684,9 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SetUploadRate(_) => "set_upload_rate",
         NetworkCommand::SetFilePolicy(_) => "set_file_policy",
         NetworkCommand::SetP2pEnabled(_) => "set_p2p_enabled",
-        NetworkCommand::TrustPeerIdentity { .. } => "trust_peer_identity",
+        NetworkCommand::ReviewPeerIdentity { .. } => "review_peer_identity",
+        NetworkCommand::VerifyPeerIdentity { .. } => "verify_peer_identity",
+        NetworkCommand::ForgetPeerIdentity { .. } => "forget_peer_identity",
         NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
         NetworkCommand::ConfirmE2eLocalUser { .. } => "confirm_e2e_local_user",
         NetworkCommand::Shutdown => "shutdown",
@@ -9408,6 +9788,55 @@ mod tests {
     }
 
     #[test]
+    fn dm_navigation_does_not_schedule_identity_dialog_while_fetching() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        let room_id = RoomId(0x8000_0001);
+        let mut server = ServerEntry {
+            label: "test".to_string(),
+            ..ServerEntry::default()
+        };
+        server.e2e_peer_pins.push(crate::config::E2ePeerPin {
+            room_id: room_id.0,
+            user_id: 2,
+            username: "bob".to_string(),
+            public_key: "11".repeat(32),
+            trust_level: crate::config::E2eTrustLevel::Accepted,
+            change_from: None,
+            previous: Vec::new(),
+        });
+        app.config.servers.push(server);
+        app.room.active_server_label = Some("test".to_string());
+        app.room.authenticated(
+            &[dm_room_info(room_id.0, UserId(1), UserId(2))],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            room_id,
+            None,
+            app.user_id,
+        );
+        app.room.set_e2e_trust_state(
+            room_id,
+            room::DmTrustState::FetchingKey {
+                peer: UserId(2),
+                username: "bob".to_string(),
+            },
+        );
+
+        app.open_dm_with(UserId(2));
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            NetworkCommand::OpenDm(UserId(2))
+        ));
+        assert!(app.pending_identity_review.get(&UserId(2)).is_none());
+    }
+
+    #[test]
     fn own_user_presence_produces_no_status_notice() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
@@ -9447,7 +9876,7 @@ mod tests {
     }
 
     #[test]
-    fn renamed_e2e_peer_is_quarantined_and_trusted_by_new_name() {
+    fn renamed_e2e_peer_keeps_the_same_trust_state() {
         let mut app = test_app();
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
@@ -9467,37 +9896,149 @@ mod tests {
             user: user_summary(UserId(2), "robert"),
             online: true,
         });
-        app.handle_network_event(NetworkEvent::E2ePeerIdentityChanged {
-            user_id: UserId(2),
-            pinned: crate::config::E2ePeerIdentity {
-                room_id: 0x8000_0001,
-                user_id: 2,
-                username: "bob".to_string(),
-                public_key: "11".repeat(32),
-            },
-            presented: crate::config::E2ePeerIdentity {
-                room_id: 0x8000_0001,
-                user_id: 2,
-                username: "robert".to_string(),
-                public_key: "11".repeat(32),
+        app.handle_network_event(NetworkEvent::E2ePeerPinMatched {
+            identity: crate::e2e::AcceptedPeerIdentity {
+                room_id: RoomId(0x8000_0001),
+                user_id: UserId(2),
+                identity: crate::config::E2ePeerIdentity {
+                    room_id: 0x8000_0001,
+                    user_id: 2,
+                    username: "robert".to_string(),
+                    public_key: "11".repeat(32),
+                    trust_level: crate::config::E2eTrustLevel::Accepted,
+                },
+                trust_level: crate::config::E2eTrustLevel::Accepted,
+                change_from: None,
+                verified_keys: Vec::new(),
             },
         });
 
         assert_eq!(app.room.username_of(UserId(2)), "robert");
-        assert!(app.room.e2e_identity_changed(UserId(2)));
-        assert_eq!(app.view.status.kind(), StatusKind::Error);
-        assert!(app.view.status.text().contains("previously bob"));
+        assert!(matches!(
+            app.room.e2e_trust_state(RoomId(0x8000_0001)),
+            Some(room::DmTrustState::Accepted {
+                change_from: None,
+                ..
+            })
+        ));
+        assert!(app.set_viewed_room(RoomId(0x8000_0001)));
+        while rx.try_recv().is_ok() {}
 
-        app.view.composer.set_lines("/trust robert");
+        app.view.composer.set_lines("/identity robert");
         app.submit_input();
         assert!(matches!(
             rx.try_recv().unwrap(),
-            NetworkCommand::TrustPeerIdentity { user_id: UserId(2) }
+            NetworkCommand::ReviewPeerIdentity { user_id: UserId(2) }
+        ));
+
+        app.view.composer.set_lines("/identity");
+        app.submit_input();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            NetworkCommand::ReviewPeerIdentity { user_id: UserId(2) }
         ));
     }
 
     #[test]
-    fn restored_e2e_peer_identity_clears_changed_state() {
+    fn identity_user_opens_missing_dm_and_routes_review_to_requester() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        enter_room_with_users(
+            &mut app,
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+        );
+
+        app.view.composer.set_lines("/identity bob");
+        app.submit_input();
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            NetworkCommand::OpenDm(UserId(2))
+        ));
+        assert_eq!(
+            app.pending_identity_review
+                .get(&UserId(2))
+                .and_then(|clients| clients.back()),
+            Some(&crate::client_channel::ClientId::PRIMARY)
+        );
+        assert_eq!(
+            app.pending_identity_review
+                .get(&UserId(2))
+                .map(VecDeque::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn local_verification_text_uses_development_server_key_fallback() {
+        let mut app = test_app();
+        app.config.servers.push(ServerEntry {
+            label: "development".to_string(),
+            server_public_key: String::new(),
+            e2e_identity_seed: "11".repeat(32),
+            ..ServerEntry::default()
+        });
+        app.room.active_server_label = Some("development".to_string());
+        app.user_id = Some(UserId(42));
+
+        let text = app.local_verification_text().unwrap();
+
+        assert!(text.starts_with(&format!(
+            "chatt-e2e:v1:{}:42:",
+            rpc::base32::encode(&rpc::crypto::dev_server_public_key())
+        )));
+        assert_eq!(
+            crate::e2e_identity::VerificationText::parse(&text)
+                .unwrap()
+                .encode(),
+            text
+        );
+    }
+
+    #[test]
+    fn forgetting_verification_keeps_the_exact_durable_pin_accepted() {
+        let mut app = test_app();
+        let path =
+            std::env::temp_dir().join(format!("chatt-forget-identity-{}.toml", std::process::id()));
+        app.config.config_path = Some(path.clone());
+        app.room.active_server_label = Some("test".to_string());
+        let mut pin = crate::config::E2ePeerPin {
+            room_id: 0x8000_0001,
+            user_id: 2,
+            username: "bob".to_string(),
+            public_key: "11".repeat(32),
+            trust_level: crate::config::E2eTrustLevel::Verified,
+            change_from: None,
+            previous: Vec::new(),
+        };
+        app.config.servers.push(ServerEntry {
+            label: "test".to_string(),
+            e2e_peer_pins: vec![pin.clone()],
+            ..ServerEntry::default()
+        });
+
+        pin.trust_level = crate::config::E2eTrustLevel::Accepted;
+        assert!(app.persist_e2e_pin(pin));
+        assert_eq!(app.config.servers[0].e2e_peer_pins.len(), 1);
+        assert_eq!(
+            app.config.servers[0].e2e_peer_pins[0].trust_level,
+            crate::config::E2eTrustLevel::Accepted
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("e2e-peer-pins")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restored_e2e_peer_pin_match_clears_changed_state_without_claiming_verification() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
         app.room.authenticated(
@@ -9511,26 +10052,48 @@ mod tests {
             app.user_id,
         );
 
-        app.handle_network_event(NetworkEvent::E2ePeerIdentityChanged {
-            user_id: UserId(2),
-            pinned: crate::config::E2ePeerIdentity {
-                room_id: 0x8000_0001,
-                user_id: 2,
-                username: "bob".to_string(),
-                public_key: "11".repeat(32),
+        app.room.set_e2e_trust_state(
+            RoomId(0x8000_0001),
+            room::DmTrustState::Accepted {
+                peer: UserId(2),
+                identity: crate::config::E2ePeerIdentity {
+                    room_id: 0x8000_0001,
+                    user_id: 2,
+                    username: "robert".to_string(),
+                    public_key: "22".repeat(32),
+                    trust_level: crate::config::E2eTrustLevel::Accepted,
+                },
+                change_from: Some(crate::config::E2eTrustLevel::Accepted),
             },
-            presented: crate::config::E2ePeerIdentity {
-                room_id: 0x8000_0001,
-                user_id: 2,
-                username: "robert".to_string(),
-                public_key: "11".repeat(32),
+        );
+        assert!(matches!(
+            app.room.e2e_trust_state(RoomId(0x8000_0001)),
+            Some(room::DmTrustState::Accepted {
+                change_from: Some(crate::config::E2eTrustLevel::Accepted),
+                ..
+            })
+        ));
+        app.handle_network_event(NetworkEvent::E2ePeerPinMatched {
+            identity: crate::e2e::AcceptedPeerIdentity {
+                room_id: RoomId(0x8000_0001),
+                user_id: UserId(2),
+                identity: crate::config::E2ePeerIdentity {
+                    room_id: 0x8000_0001,
+                    user_id: 2,
+                    username: "bob".to_string(),
+                    public_key: "11".repeat(32),
+                    trust_level: crate::config::E2eTrustLevel::Accepted,
+                },
+                trust_level: crate::config::E2eTrustLevel::Accepted,
+                change_from: None,
+                verified_keys: Vec::new(),
             },
         });
-        assert!(app.room.e2e_identity_changed(UserId(2)));
 
-        app.handle_network_event(NetworkEvent::E2ePeerIdentityVerified { user_id: UserId(2) });
-
-        assert!(!app.room.e2e_identity_changed(UserId(2)));
+        assert!(matches!(
+            app.room.e2e_trust_state(RoomId(0x8000_0001)),
+            Some(room::DmTrustState::Accepted { .. })
+        ));
     }
 
     #[test]

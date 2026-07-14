@@ -163,6 +163,7 @@ pub struct WebMessage {
     pub body: String,
     /// Whether this message was authored by the client hosting the web view.
     pub local: bool,
+    pub unverified: bool,
     /// Whether the displayed body is the folded result of an edit mutation.
     pub edited: bool,
     pub timestamp_ms: u64,
@@ -231,6 +232,7 @@ impl WebMessage {
         message: &ChatMessage,
         resolver: web_wire::RefResolver,
         local_user: Option<UserId>,
+        unverified: bool,
     ) -> Self {
         let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
         WebMessage {
@@ -240,6 +242,7 @@ impl WebMessage {
             sender: message.sender_name.clone(),
             body: message.body.clone(),
             local: Some(message.sender) == local_user,
+            unverified: unverified && Some(message.sender) != local_user,
             edited: message.flags.edited(),
             fragments: split_fragments(&message.body, resolver),
             timestamp_ms: message.timestamp_ms,
@@ -276,6 +279,7 @@ impl WebMessage {
             sender: metadata.sender_name.clone(),
             body: body.clone(),
             local: Some(metadata.sender) == local_user,
+            unverified: false,
             edited: false,
             fragments: split_fragments(&body, &|_| None),
             timestamp_ms: metadata.timestamp_ms,
@@ -298,6 +302,7 @@ impl WebMessage {
         size: u64,
         dimensions: Option<(u32, u32)>,
         local_user: Option<UserId>,
+        unverified: bool,
     ) -> Self {
         let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
         // Rebuild the body from the served name rather than reusing the stored
@@ -309,6 +314,7 @@ impl WebMessage {
             sender: message.sender_name.clone(),
             body: body.clone(),
             local: Some(message.sender) == local_user,
+            unverified: unverified && Some(message.sender) != local_user,
             edited: message.flags.edited(),
             fragments: split_fragments(&body, &|_| None),
             timestamp_ms: message.timestamp_ms,
@@ -338,10 +344,16 @@ impl WebMessage {
         } else {
             incoming.ref_code.clone()
         };
+        let unverified = if incoming.message_id != 0 {
+            incoming.unverified
+        } else {
+            self.unverified
+        };
         *self = WebMessage {
             attachment,
             message_id,
             ref_code,
+            unverified,
             ..incoming
         };
     }
@@ -356,6 +368,7 @@ impl WebMessage {
             sender: "Alice".to_string(),
             body: body.to_string(),
             local: false,
+            unverified: false,
             edited: false,
             fragments: split_fragments(body, &|_| None),
             timestamp_ms: 100,
@@ -435,6 +448,11 @@ enum WebFeed {
     SetRoom {
         name: String,
         messages: Vec<WebMessage>,
+    },
+    /// Read-only browser projection of the viewed DM's E2E security state.
+    E2eSecurity {
+        payload: String,
+        active: bool,
     },
     /// A `share_available` envelope. The web thread retains it by `stream_id` and
     /// replays it to a browser that connects after the share started.
@@ -677,6 +695,19 @@ impl WebFeedSender {
     /// current room's content.
     pub fn set_room(&self, name: String, messages: Vec<WebMessage>) {
         let _ = self.tx.send(WebFeed::SetRoom { name, messages });
+        self.wake.wake();
+    }
+
+    pub fn set_e2e_security(&self, level: &str, message: &str) {
+        let payload = jsony::object! {
+            type: "e2e_security",
+            level,
+            message,
+        };
+        let _ = self.tx.send(WebFeed::E2eSecurity {
+            payload,
+            active: level != "clear",
+        });
         self.wake.wake();
     }
 
@@ -1031,6 +1062,7 @@ fn run(
     // running local publisher or remote subscriber and would otherwise begin
     // with live delta frames.
     let mut video_fast_start: HashMap<u32, VideoFastStart> = HashMap::new();
+    let mut e2e_security = None::<String>;
 
     loop {
         if let Err(error) = server.poll_once(None) {
@@ -1087,6 +1119,9 @@ fn run(
                                 &room_name,
                             ),
                         );
+                        if let Some(payload) = &e2e_security {
+                            let _ = server.send_websocket_text(id, payload);
+                        }
                         for payload in active_shares.values() {
                             let _ = server.send_websocket_text(id, payload);
                         }
@@ -1658,6 +1693,12 @@ fn run(
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }
+                }
+                Ok(WebFeed::E2eSecurity { payload, active }) => {
+                    for id in &clients {
+                        let _ = server.send_websocket_text(*id, &payload);
+                    }
+                    e2e_security = active.then_some(payload);
                 }
                 Ok(WebFeed::Config {
                     readonly: new_readonly,
@@ -2464,7 +2505,7 @@ mod tests {
             flags: rpc::control::MessageFlags::default(),
             target: None,
         };
-        let message = WebMessage::from_chat(&announcement, &|_| None, None);
+        let message = WebMessage::from_chat(&announcement, &|_| None, None, false);
         // The file id keys the upsert, and the message id matches it so the
         // placeholder shares an id with the inline version that enriches it.
         assert_eq!(message.file_id, Some(7));
@@ -2491,10 +2532,32 @@ mod tests {
         };
         chat.flags.set_edited();
 
-        let message = WebMessage::from_chat(&chat, &|_| None, Some(UserId(2)));
+        let message = WebMessage::from_chat(&chat, &|_| None, Some(UserId(2)), false);
         assert_eq!(message.body, "revised **text**");
         assert!(message.local);
         assert!(message.edited);
+    }
+
+    #[test]
+    fn chat_message_exposes_unverified_only_for_remote_messages() {
+        use rpc::control::ChatMessage;
+        use rpc::ids::MessageId;
+
+        let chat = ChatMessage {
+            envelope: None,
+            message_id: MessageId(9),
+            room_id: RoomId(1),
+            sender: UserId(2),
+            sender_name: "Alice".to_string(),
+            timestamp_ms: 5,
+            body: "hello".to_string(),
+            file_transfer_id: None,
+            flags: rpc::control::MessageFlags::default(),
+            target: None,
+        };
+
+        assert!(WebMessage::from_chat(&chat, &|_| None, None, true).unverified);
+        assert!(!WebMessage::from_chat(&chat, &|_| None, Some(UserId(2)), true).unverified);
     }
 
     #[test]
@@ -2594,6 +2657,7 @@ mod tests {
             body: body.to_string(),
             local: false,
             edited: false,
+            unverified: false,
             fragments: split_fragments(body, &|_| None),
             timestamp_ms: 5,
             attachment: None,

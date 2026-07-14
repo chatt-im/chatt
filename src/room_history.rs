@@ -19,8 +19,13 @@ use kvlog::encoding::{
 };
 use kvlog::{Encode, LogLevel};
 use ring::digest::{SHA256, digest};
-use rpc::control::{ChatMessage, MAX_CHAT_BODY_BYTES, MessageFlags};
 use rpc::ids::{FileTransferId, MessageId, RoomId, UserId};
+use rpc::{
+    control::{ChatMessage, MAX_CHAT_BODY_BYTES, MessageFlags},
+    crypto::{decode_hex, encode_hex},
+};
+
+use crate::e2e::MessageProvenance;
 
 const RECOVERY_MIN_RECORDS: usize = 2;
 const MAX_ROOM_RECORD_BYTES: usize = 128 * 1024;
@@ -79,6 +84,9 @@ pub(crate) struct LoadedHistory {
     pub files: HashMap<FileHistoryKey, FileDetail>,
     /// Raw mutation records in id order, for seeding session mutation state.
     pub mutations: Vec<ChatMessage>,
+    /// Exact peer key that authenticated each stored DM record, keyed by that
+    /// record's message id. Missing entries are legacy/unknown provenance.
+    pub provenance: HashMap<u64, MessageProvenance>,
 }
 
 /// A validated history load and its append handle, when the active file was
@@ -100,7 +108,16 @@ pub(crate) struct RoomHistoryStore {
 impl RoomHistoryStore {
     /// Encodes one chat record and appends it. Errors permanently disable this
     /// handle so no later record can be written behind a partial append.
+    #[cfg(test)]
     pub(crate) fn append_message(&mut self, message: &ChatMessage) {
+        self.append_authenticated_message(message, None);
+    }
+
+    pub(crate) fn append_authenticated_message(
+        &mut self,
+        message: &ChatMessage,
+        provenance: Option<MessageProvenance>,
+    ) {
         self.encoder.clear();
         let level = if message.file_transfer_id.is_some() {
             LogLevel::Warn
@@ -139,6 +156,10 @@ impl RoomHistoryStore {
                 target
                     .0
                     .encode_log_value_into(field.static_key(StaticKey::target));
+            }
+            if let Some(provenance) = provenance {
+                encode_hex(&provenance.peer_public_key)
+                    .encode_log_value_into(field.dynamic_key("e2e_peer_key"));
             }
         }
         self.write_record();
@@ -518,7 +539,10 @@ fn read_capped(path: &Path) -> Option<(Vec<u8>, bool)> {
 
 #[derive(Clone, Debug)]
 enum ParsedRecord {
-    Message(ChatMessage),
+    Message {
+        message: ChatMessage,
+        provenance: Option<MessageProvenance>,
+    },
     FileDetail {
         key: FileHistoryKey,
         detail: FileDetail,
@@ -660,6 +684,7 @@ fn parse_fields(
     let mut correlation_timestamp = None;
     let mut status = None;
     let mut target = None;
+    let mut e2e_peer_key = None;
 
     for field in fields {
         let (key, value) = field?;
@@ -678,6 +703,18 @@ fn parse_fields(
             }
             Key::Static(StaticKey::status) => set_once(&mut status, exact_u64(value)?)?,
             Key::Static(StaticKey::target) => set_once(&mut target, exact_u64(value)?)?,
+            Key::Dynamic(b"e2e_peer_key") => {
+                let encoded = exact_string(value)?;
+                let decoded = decode_hex(&encoded).map_err(|_| MunchError::InvalidValue)?;
+                let key = <[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>::try_from(decoded.as_slice())
+                    .map_err(|_| MunchError::InvalidValue)?;
+                set_once(
+                    &mut e2e_peer_key,
+                    MessageProvenance {
+                        peer_public_key: key,
+                    },
+                )?;
+            }
             _ => {}
         }
     }
@@ -718,18 +755,21 @@ fn parse_fields(
                     flags
                 }
             };
-            Ok(ParsedRecord::Message(ChatMessage {
-                envelope: None,
-                message_id: MessageId(id),
-                room_id: RoomId(room),
-                sender: UserId(user),
-                sender_name: caller,
-                timestamp_ms,
-                body,
-                file_transfer_id: object.map(FileTransferId),
-                flags,
-                target: target.map(MessageId),
-            }))
+            Ok(ParsedRecord::Message {
+                message: ChatMessage {
+                    envelope: None,
+                    message_id: MessageId(id),
+                    room_id: RoomId(room),
+                    sender: UserId(user),
+                    sender_name: caller,
+                    timestamp_ms,
+                    body,
+                    file_transfer_id: object.map(FileTransferId),
+                    flags,
+                    target: target.map(MessageId),
+                },
+                provenance: e2e_peer_key,
+            })
         }
         (None, None) => {
             if level != LogLevel::Debug
@@ -800,9 +840,16 @@ fn fold_records(records: &[ValidatedRecord]) -> LoadedHistory {
     let mut messages: HashMap<u64, ChatMessage> = HashMap::new();
     let mut mutations: Vec<ChatMessage> = Vec::new();
     let mut details = Vec::new();
+    let mut provenance = HashMap::new();
     for record in records {
         match &record.parsed {
-            ParsedRecord::Message(message) => {
+            ParsedRecord::Message {
+                message,
+                provenance: record_provenance,
+            } => {
+                if let Some(record_provenance) = record_provenance {
+                    provenance.insert(message.message_id.0, *record_provenance);
+                }
                 if message.target.is_some() {
                     mutations.push(message.clone());
                 } else {
@@ -848,6 +895,7 @@ fn fold_records(records: &[ValidatedRecord]) -> LoadedHistory {
         messages,
         files,
         mutations,
+        provenance,
     }
 }
 
@@ -1203,6 +1251,22 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_message_preserves_exact_e2e_key_provenance() {
+        let path = scratch("round-trip-e2e-provenance");
+        let mut store = fresh_store(&path);
+        let original = text_message(12, 1_700_000_000_001, "authenticated dm");
+        let provenance = MessageProvenance {
+            peer_public_key: [0x5a; rpc::e2e::E2E_PUBLIC_KEY_LEN],
+        };
+        store.append_authenticated_message(&original, Some(provenance));
+        drop(store);
+
+        let opened = open_path(&path, 7);
+        assert_eq!(opened.loaded.messages, vec![original]);
+        assert_eq!(opened.loaded.provenance.get(&12), Some(&provenance));
+    }
+
+    #[test]
     fn same_transfer_id_at_different_timestamps_keeps_both_details() {
         let path = scratch("file-identity");
         let mut store = fresh_store(&path);
@@ -1250,7 +1314,10 @@ mod tests {
         matched.file_transfer_id = Some(FileTransferId(5));
         records.push(ValidatedRecord {
             range: 0..0,
-            parsed: ParsedRecord::Message(matched),
+            parsed: ParsedRecord::Message {
+                message: matched,
+                provenance: None,
+            },
         });
         records.push(ValidatedRecord {
             range: 0..0,
@@ -1272,7 +1339,10 @@ mod tests {
         other.file_transfer_id = Some(FileTransferId(6));
         records.push(ValidatedRecord {
             range: 0..0,
-            parsed: ParsedRecord::Message(other),
+            parsed: ParsedRecord::Message {
+                message: other,
+                provenance: None,
+            },
         });
         records.push(ValidatedRecord {
             range: 0..0,

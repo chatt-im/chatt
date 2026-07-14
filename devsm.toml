@@ -23,6 +23,7 @@ managed = false
 allow_multiple = true
 cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
+env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
 env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
@@ -44,6 +45,7 @@ managed = false
 allow_multiple = true
 cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
+env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
 env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
@@ -65,6 +67,7 @@ managed = false
 allow_multiple = true
 cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/bob"
+env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
 env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-bob-playback.wav", or_else = "" }
@@ -85,6 +88,7 @@ managed = false
 allow_multiple = true
 cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/soundboard"
+env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
 env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-soundboard-playback.wav", or_else = "" }
@@ -98,7 +102,7 @@ fi
 '''
 info = "Run the Carol prerecorded-audio soundboard client; trailing args run a chatt subcommand against it"
 
-[action.reset-server-data]
+[action.reset-dev-data]
 require = [
   { resource = "private-server-data" },
   { resource = "public-server-data" },
@@ -107,14 +111,28 @@ require = [
 sh = '''
 set -eu
 
-git restore --source=HEAD -- 'dev/*-server-data/users.toml'
+git restore --source=HEAD -- \
+  'dev/*-server-data/users.toml' \
+  dev/chatt-alice.toml \
+  dev/chatt-bob.toml \
+  dev/chatt-soundboard.toml
 for data_dir in dev/*-server-data; do
   find "$data_dir" -depth -mindepth 1 ! -path "$data_dir/users.toml" -delete
 done
+for client_dir in \
+  /tmp/chatt-dev \
+  /tmp/chatt-alice \
+  /tmp/chatt-bob \
+  /tmp/chatt-soundboard
+do
+  if [ -e "$client_dir" ]; then
+    find "$client_dir" -depth -delete
+  fi
+done
 
-echo "Reset test server data; retained users.toml fixtures"
+echo "Reset dev server state, user fixtures, client history, and downloads"
 '''
-info = "Reset all test server data while retaining the configured users"
+info = "Reset all generated server and client development data"
 
 [test.cargo]
 cmd = ["cargo", "nextest", "run", "--workspace", {var = "args"}]

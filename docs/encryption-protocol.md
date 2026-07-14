@@ -32,25 +32,39 @@ useful as the code moves.
   version, content class, room id, and sender. Chat plaintexts are zero-padded
   to 160-byte multiples; sealed file streams are Padmé-padded and their chunks
   are AEAD frames under a random per-transfer content key carried inside the
-  sealed metadata envelope. Peer keys are server-distributed and TOFU-pinned in
-  `client.toml`, bound to the DM room id, user id, and case-folded username.
-  The local identity seed is likewise bound to its authenticated user id. A
-  first-use or `/trust` pin becomes active only after an atomic `0600` config
-  replacement is acknowledged by the network worker. The durable room-id
+  sealed metadata envelope. Peer keys are server-distributed and become usable
+  immediately under trust on first use (TOFU). Durable pins in `client.toml`
+  bind the DM room id, user id, and X25519 public key, retain the latest display
+  name, and carry an `Accepted` or `Verified` trust level. `Accepted` means the
+  key has only TOFU continuity; `Verified` means that exact key was compared
+  through an independent channel using its 24
+  identity words or a matching Chatt verification card. A server presentation
+  matching a stored pin is only a session-level pin match and never upgrades
+  `Accepted` to `Verified`. The local identity seed is likewise bound to its
+  authenticated user id. First-use and replacement keys become active in memory
+  immediately; an atomic `0600` config replacement preserves continuity across
+  restart. A failed write does not hide plaintext or disable the current session.
+  `/identity` and `/identity user` only open exact-key independent verification;
+  there is no blind-accept action. The durable room-id
   binding remains encryption-required while reconnect room state is rebuilt;
   reclassifying a pinned DM as public/private fails the connection instead of
-  enabling plaintext fallback. A changed key or substantive username change
-  presents a complete replacement tuple, blocks sending, and quarantines all
-  messages for that DM until `/trust`; former trusted tuples become receive-only
-  for retained history after that decision. DM chat and file sender labels are
-  taken from the authenticated tuple (or local configured identity for an own
-  echo), never from the server's unauthenticated outer display-name field.
+  enabling plaintext fallback. A changed key remains usable but produces a
+  persistent red continuity warning; a display-name change alone does not change
+  trust. Former keys remain receive-only for retained history unless the server
+  later presents one as current again. DM chat and file sender labels use current
+  room-directory display state (or the local configured name for an own echo),
+  never the outer per-message display-name field; names are not trust material.
   Edit and deletion targets remain visible for server-side ownership checks,
   but are duplicated inside the authenticated plaintext; clients reject a
   mutation if the server-visible target differs from the sealed target.
-  Ciphertext which races identity lookup is retained in arrival order, bounded
-  to 2 MiB and 1024 controls; overflow or forbidden plaintext/envelope forms
-  fail the connection closed. Deliberately no
+  Each opened remote message records the exact peer key that authenticated it.
+  The TUI and browser show `(Unverified)` unless that key is independently
+  verified; verification relabels retained messages from the same key without
+  relabeling messages from other keys. Before the server's key response, records
+  use a bounded in-memory ordering queue (2 MiB/1024 controls per room, 16
+  MiB/8192 globally). It is not persisted, and overflow fails the connection
+  instead of silently discarding data. File payloads that race key discovery are
+  declined rather than buffered. Forbidden plaintext/envelope forms still fail closed. Deliberately no
   ratchet: keys are static so server-fetched DM history stays decryptable, and
   seed compromise exposes all of that user's DM traffic. The server still sees
   DM routing metadata (participants, timing, size classes, edit/delete
@@ -67,6 +81,45 @@ useful as the code moves.
   not quantum-resistant. A post-quantum upgrade should use a hybrid exchange
   that combines X25519 with ML-KEM from NIST FIPS 203, and should evaluate
   post-quantum server authentication such as ML-DSA from NIST FIPS 204.
+
+## DM Identity Presentation and Verification
+
+The canonical identity formatter in `src/e2e_identity.rs` validates a 32-byte
+X25519 public key and exposes two losslessly related public presentations:
+
+- Lowercase hexadecimal is the complete raw key as 64 unseparated digits.
+- `Chatt public-key identity words` append the first eight bits of
+  `SHA-256(public_key)` to the raw 256 key bits, read the 264 bits
+  most-significant-bit first as 24 11-bit indices, and map those indices through
+  the 2048 unique lowercase words in `assets/english.txt`.
+
+The hash byte is only a transcription checksum. The words are not a wallet
+seed, recovery phrase, secret, or separate SHA-256 identity fingerprint. The
+first 256 encoded bits are exactly the public key Chatt will pin.
+
+A public verification card is one canonical line:
+
+```text
+chatt-e2e:v1:<server-ed25519-key-base32>:<user-id-decimal>:<x25519-key-base32>:<checksum-base32>
+```
+
+The checksum is the first eight bytes of SHA-256 over the preceding canonical
+ASCII fields. The binary key and checksum fields use Chatt's lowercase,
+unpadded Crockford base32 encoding; this shortens the card without replacing or
+truncating either public key. The checksum detects damaged pastes; it is not a
+signature or proof. The full server Ed25519 key prevents a card from being
+accidentally applied to another configured server, and the user id prevents
+applying it to another account. Import marks a key `Verified` only when server,
+expected peer user id, and exact presented/accepted X25519 key all match.
+Wrong-server, wrong-user, self-card, malformed, checksum, and stale-key cases
+are distinct errors. A key mismatch has no verification action in the dialog.
+
+The Chat status bar and browser warning are projections of the authoritative
+room trust state: `FetchingKey`, `KeyUnavailable`, `Accepted`, or `Verified`.
+Only key discovery and key unavailability temporarily prevent sending.
+`Accepted` remains usable while showing either the yellow first-use warning or a
+red continuity-change warning. Background authentication never opens modal
+stacks; only explicit `/identity` requests open the verification screen.
 
 ## Server Configuration
 
@@ -215,17 +268,28 @@ Server:
 Client:
 
 - `src/config.rs`: client TOML fields in `ServerEntry`, durable DM identity
-  tuples, and runtime persistence in `write_runtime_config`.
+  tuples and trust levels, and runtime persistence in `write_runtime_config`.
+- `src/e2e_identity.rs`: canonical X25519 hex/word presentation and
+  context-bound verification-card parsing and checksums.
 - `src/e2e.rs`: pinned-room classification, per-session DM identity state,
-  trust quarantine, authenticated sender labels, and chat envelope policy.
+  snapshot-checked TOFU/verification transitions, authenticated sender binding,
+  exact-key message provenance, and chat envelope policy.
+- `src/app/room.rs`, `src/app/mod.rs`, and `src/tui/overlay.rs`: room-keyed
+  trust projection, Chat-bar warnings, requester-scoped dialog routing, and the
+  verification interface.
+- `src/room_history.rs`, `src/chat_buffer.rs`, `src/web_wire.rs`, and
+  `web/src/App.tsx`: exact-key provenance persistence and `(Unverified)`
+  annotations in retained TUI and browser messages.
 - `src/cli/mod.rs`: join-string pairing CLI and named-server persistence after
   successful pairing.
 - `src/client_net.rs`: server connection and handshake in
   `connect_and_handshake`; public key pin selection in
   `pinned_server_public_key`; first auth or pairing message in
   `run_worker_inner`; control send in `WorkerState::queue_control`;
-  server message handling in `WorkerState::handle_control`; UDP media send and
-  receive in `WorkerState::send_media`, `WorkerState::handle_udp_packet`, and
+  server message handling and the transient pre-key ordering queue in
+  `WorkerState::handle_control`, `defer_e2e`, and `drain_deferred_e2e_room`;
+  UDP media send and receive in
+  `WorkerState::send_media`, `WorkerState::handle_udp_packet`, and
   `WorkerState::handle_p2p_media`.
 
 ## Open Security Work
@@ -238,8 +302,9 @@ Client:
 - Implement session rekeying. Constants exist for rekey timing, but the current
   transport does not perform an in-band rekey.
 - If public/private room content must survive server compromise, add group
-  end-to-end encryption. Direct messages already use TOFU-pinned client identity
-  keys, but device verification and key transparency remain future work.
+  end-to-end encryption. Direct messages use TOFU client identity keys and
+  support independent word/card verification; multi-device identity
+  policy and key transparency remain future work.
 
 References:
 

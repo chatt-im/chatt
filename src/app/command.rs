@@ -18,6 +18,7 @@ use super::{
 use crate::clipboard_paste::ImagePasteSource;
 use crate::ui::settings::{FieldId, FieldIntent};
 use crate::ui::welcome::WelcomeDraft;
+use crate::{client_channel::E2eIdentityTarget, e2e::AcceptedPeerIdentity};
 
 pub(crate) enum SettingsOp {
     Save,
@@ -101,6 +102,9 @@ pub(crate) enum CoreCommand {
     CancelNativeEncryption {
         generation: u64,
     },
+    CloseE2eIdentity,
+    ForgetE2eIdentity(AcceptedPeerIdentity),
+    ConfirmE2eIdentity(E2eIdentityTarget),
     Connect {
         alias: String,
     },

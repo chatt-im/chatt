@@ -8,6 +8,7 @@ use crate::chat_buffer::VirtualChatBuffer;
 pub(crate) enum SlashArg {
     None,
     User,
+    OptionalUser,
     Room,
     Sound,
     FreeText(&'static str),
@@ -18,7 +19,7 @@ impl SlashArg {
     pub(crate) fn wire_kind(self) -> &'static str {
         match self {
             SlashArg::None => "none",
-            SlashArg::User => "user",
+            SlashArg::User | SlashArg::OptionalUser => "user",
             SlashArg::Room => "room",
             SlashArg::Sound => "sound",
             SlashArg::FreeText(_) => "free",
@@ -187,10 +188,10 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         web: false,
     },
     SlashCommand {
-        name: "/trust",
-        usage: "/trust user",
-        description: "accept a DM peer's changed encryption identity",
-        arg: SlashArg::User,
+        name: "/identity",
+        usage: "/identity [user]",
+        description: "review, confirm, or forget a DM identity",
+        arg: SlashArg::OptionalUser,
         web: false,
     },
     SlashCommand {

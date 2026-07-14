@@ -106,6 +106,7 @@ class Reader {
     const body = this.string();
     const local = this.u8() === 1;
     const edited = this.u8() === 1;
+    const unverified = this.u8() === 1;
     let attachment: WebMessage["attachment"] = null;
     if (this.u8() === 1) {
       const name = this.string();
@@ -152,6 +153,7 @@ class Reader {
       body,
       local,
       edited,
+      unverified,
       timestamp_ms,
       attachment,
       file_id,

@@ -651,21 +651,41 @@ Current status:
   a long-term X25519 identity (`e2e-identity-seed` in `client.toml`, generated
   on first connect), a per-DM key is derived by static-static Diffie-Hellman,
   and every message is sealed with a one-shot ChaCha20-Poly1305 key. The server
-  relays and stores only ciphertext for DM content; the DM composer shows
-  `[e2e]`. Chat plaintexts are padded to 160-byte multiples and file transfers
-  to their Padmé length, so the server sees only coarse size classes plus a
-  placeholder file name. Peer identity keys are distributed by the server and
-  pinned on first use together with the DM room id, user id, and username. Pin
-  updates are activated only after an atomic owner-only config write. If any
-  part of that identity changes, sending and all inbound plaintext for that DM
-  are blocked until you verify out of band and run `/trust user`; old trusted
-  keys remain available for retained history after that decision. A durable DM
-  pin also keeps its room id encryption-required across reconnects, so a server
-  cannot downgrade that room to public/private and trigger plaintext fallback.
-  Authenticated DM sender labels come from the trusted identity tuple, not the
-  server's outer display-name field. Visible edit/delete targets are also sealed
-  into the authenticated plaintext, so clients reject server retargeting.
-  Messages that race identity lookup are held as ciphertext in a bounded queue.
+  relays and stores only ciphertext for DM content. Chat plaintexts are padded
+  to 160-byte multiples and file transfers to their Padmé length, so the server
+  sees only coarse size classes plus a placeholder file name. Peer identity keys
+  are distributed by the server and used immediately with trust on first use
+  (TOFU); there is no acceptance quarantine. An unverified DM keeps the yellow
+  `Identity Unverified (MITM Vulnerable)` warning in the Chat bar. A changed key
+  remains usable but turns that warning red; a change from an independently
+  verified key uses the stronger `Verified Identity Changed (Possible MITM
+  Attack)` wording. Username changes are display changes, not key changes.
+  `/identity` opens the independent-verification screen. **Verified** means all
+  24 words were compared through a call, in person, or another trusted service,
+  or that the contact's context-bound verification text matched. Verification
+  text is checked automatically as it is typed or pasted; manual word comparison
+  is recorded with the control beside the identity-word heading. Forgetting
+  verification downgrades that exact key to ordinary TOFU trust without disabling
+  the DM. `/identity user` reviews a contact outside the viewed DM; the command
+  itself changes no state. Pin updates use an atomic owner-only config write. A
+  failed write leaves the key usable for the current session but loses continuity
+  across restart. Every remote DM message is annotated `(Unverified)` unless the
+  exact key that authenticated it has been independently verified. Verification
+  relabels all retained messages from that key; messages authenticated by another
+  retained key keep their own status. Old keys remain available for retained
+  history. A durable DM pin also keeps its room id encryption-required across
+  reconnects, so a server cannot downgrade that room to public/private and
+  trigger plaintext fallback.
+  DM sender labels use the current room-directory display name, not the server's
+  outer per-message display-name field; display names are not trust material.
+  Visible edit/delete targets are also sealed into the authenticated plaintext,
+  so clients reject server retargeting.
+  A small in-memory, per-room ordering queue holds records that arrive before the
+  server's key response. It is bounded to 2 MiB/1024 controls per room and 16
+  MiB/8192 controls process-wide, is never written to disk, and drains as soon as
+  the key is available. Overflow fails the connection rather than silently
+  dropping authenticated data. File payloads that race key discovery are declined
+  rather than buffered; the sender must resend afterward.
   A DM plaintext, a DM file without a sealed envelope, or a
   remapped/unsolicited DM response is rejected. There is no
   forward secrecy by design (static keys keep server-fetched history
@@ -673,6 +693,19 @@ Current status:
   The server still sees who messages whom, timing, edit/delete targets, can
   replay an exact sender envelope within the same room/sender/content class,
   and sees DM voice/video, which remain transport-encrypted only.
+
+- The identity dialog presents the complete lowercase 64-hex X25519 public key
+  and `Chatt public-key identity words`. The 24 words losslessly encode the raw
+  256 public-key bits followed by the first eight bits of SHA-256 of that key,
+  split most-significant-bit first into 24 11-bit indices over
+  `assets/english.txt`. This checksum detects transcription errors; it is not a
+  second identity fingerprint, a seed phrase, or a secret. A copied verification
+  card has canonical form
+  `chatt-e2e:v1:<server-key-base32>:<user-id>:<x25519-key-base32>:<checksum-base32>`
+  and contains public data only. The key and checksum fields use lowercase,
+  unpadded Crockford base32 to keep the single-line card compact. Its truncated
+  SHA-256 checksum detects corruption but does not authenticate the card; the
+  channel used to obtain it supplies the independent trust.
 - The current handshake uses X25519 and Ed25519. It is not yet
   quantum-resistant; the documented next step is a hybrid X25519 + ML-KEM
   handshake and post-quantum or hybrid server authentication.

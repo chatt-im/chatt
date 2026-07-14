@@ -470,6 +470,7 @@ pub(crate) fn draw_room_screen(
             app,
             focus,
             last_history_search.map(HistorySearch::query),
+            layout,
             buf,
         );
         buf.damage(chat_log_bar_area);
@@ -809,6 +810,11 @@ fn draw_room_list_item(
     if item.voice {
         row = row.with(base.patch(theme.good)).text(buf, " V ");
     }
+    if item.e2e_blocked {
+        row = row
+            .with(base.patch(theme.error) | Modifier::BOLD)
+            .text(buf, " ! ");
+    }
     if item.unread > 0 {
         row = row
             .with(base.patch(theme.warn) | Modifier::BOLD)
@@ -913,6 +919,11 @@ fn draw_room_select_item(
         .with(HAlign::Right);
     if item.voice {
         row = row.with(base.patch(theme.good)).text(buf, " voice ");
+    }
+    if item.e2e_blocked {
+        row = row
+            .with(base.patch(theme.error) | Modifier::BOLD)
+            .text(buf, " ! ");
     }
     if item.unread > 0 {
         row = row
@@ -1588,18 +1599,72 @@ fn draw_chat_log_bar(
     app: &RenderState<'_>,
     focus: ChatPanelFocus,
     search_query: Option<&str>,
+    layout: &mut RoomLayout,
     buf: &mut Buffer,
 ) {
+    layout.identity_status_rect = Rect::EMPTY;
     if area.is_empty() {
         return;
     }
     let focused = focus == ChatPanelFocus::ChatLog;
     let (fill, label, _) = section_bar_styles(app.view.theme, ChatPanelFocus::ChatLog, focused);
     area.with(fill).clear(buf);
-    let row = area.with(Ellipsis(true)).with(label).text(buf, " Chat ");
+    let mut row = area.with(Ellipsis(true)).with(label).text(buf, " Chat ");
     if let Some(query) = search_query {
-        row.with(fill.patch(app.view.theme.accent))
+        row = row
+            .with(fill.patch(app.view.theme.accent))
             .fmt(buf, format_args!(" /{query} "));
+    }
+    let security = app
+        .view
+        .viewed_room
+        .and_then(|room_id| app.room.e2e_trust_state(room_id))
+        .and_then(|state| chat_security_label(state, app.view.theme));
+    if let Some((text, style)) = security {
+        let prefix_width = UnicodeWidthStr::width(" Chat ")
+            + search_query
+                .map(|query| UnicodeWidthStr::width(query) + UnicodeWidthStr::width(" / "))
+                .unwrap_or(0);
+        let status_width = UnicodeWidthStr::width(text) + 2;
+        let prefix_width = prefix_width.min(usize::from(area.w));
+        layout.identity_status_rect = Rect {
+            x: area.x.saturating_add(prefix_width as u16),
+            y: area.y,
+            w: status_width.min(usize::from(area.w).saturating_sub(prefix_width)) as u16,
+            h: area.h,
+        };
+        row.with(fill.patch(style) | Modifier::BOLD)
+            .with(Ellipsis(true))
+            .text(buf, &format!(" {text} "));
+    }
+}
+
+fn chat_security_label(
+    state: &crate::app::room::DmTrustState,
+    theme: Theme,
+) -> Option<(&'static str, Style)> {
+    match state {
+        crate::app::room::DmTrustState::Accepted {
+            change_from: None, ..
+        } => Some(("Identity Unverified (MITM Vulnerable)", theme.warn)),
+        crate::app::room::DmTrustState::Accepted {
+            change_from: Some(crate::config::E2eTrustLevel::Verified),
+            ..
+        } => Some((
+            "Verified Identity Changed (Possible MITM Attack)",
+            theme.error,
+        )),
+        crate::app::room::DmTrustState::Accepted {
+            change_from: Some(crate::config::E2eTrustLevel::Accepted),
+            ..
+        } => Some(("Identity Changed (MITM Vulnerable)", theme.error)),
+        crate::app::room::DmTrustState::FetchingKey { .. } => {
+            Some(("Fetching Identity Key", theme.warn))
+        }
+        crate::app::room::DmTrustState::KeyUnavailable { .. } => {
+            Some(("Identity Key Unavailable (DM Disabled)", theme.error))
+        }
+        crate::app::room::DmTrustState::Verified { .. } => None,
     }
 }
 
@@ -1987,10 +2052,16 @@ fn draw_chat_heading(
     } else if app.view.active.chat.is_expanded(message) {
         name.push_str(" (Expanded)");
     }
-    content
+    let name_row = content
         .with(base.patch(accent))
         .with(Ellipsis(true))
         .text(buf, &name);
+    if msg.unverified {
+        name_row
+            .with(base.patch(app.view.theme.warn) | Modifier::BOLD)
+            .with(Ellipsis(true))
+            .text(buf, " (Unverified)");
+    }
     let age = chat_age(msg.timestamp_ms, now_ms);
     if !age.is_empty() {
         content
@@ -2013,6 +2084,59 @@ fn chat_entry_accent(theme: Theme, local: bool, notice_kind: Option<NoticeKind>)
 mod tests {
     use super::*;
     use rpc::ids::{StreamId, UserId};
+
+    fn peer_identity() -> crate::config::E2ePeerIdentity {
+        crate::config::E2ePeerIdentity {
+            room_id: 9,
+            user_id: 2,
+            username: "bob".to_string(),
+            public_key: "11".repeat(rpc::e2e::E2E_PUBLIC_KEY_LEN),
+            trust_level: crate::config::E2eTrustLevel::Accepted,
+        }
+    }
+
+    #[test]
+    fn chat_security_label_uses_exact_warning_text_and_severity() {
+        let theme = Theme::base16_dark();
+        let accepted = crate::app::room::DmTrustState::Accepted {
+            peer: UserId(2),
+            identity: peer_identity(),
+            change_from: None,
+        };
+        assert_eq!(
+            chat_security_label(&accepted, theme),
+            Some(("Identity Unverified (MITM Vulnerable)", theme.warn))
+        );
+
+        let changed = crate::app::room::DmTrustState::Accepted {
+            peer: UserId(2),
+            identity: peer_identity(),
+            change_from: Some(crate::config::E2eTrustLevel::Accepted),
+        };
+        assert_eq!(
+            chat_security_label(&changed, theme),
+            Some(("Identity Changed (MITM Vulnerable)", theme.error))
+        );
+
+        let verified_changed = crate::app::room::DmTrustState::Accepted {
+            peer: UserId(2),
+            identity: peer_identity(),
+            change_from: Some(crate::config::E2eTrustLevel::Verified),
+        };
+        assert_eq!(
+            chat_security_label(&verified_changed, theme),
+            Some((
+                "Verified Identity Changed (Possible MITM Attack)",
+                theme.error
+            ))
+        );
+
+        let verified = crate::app::room::DmTrustState::Verified {
+            peer: UserId(2),
+            identity: peer_identity(),
+        };
+        assert_eq!(chat_security_label(&verified, theme), None);
+    }
 
     #[test]
     fn dialog_frame_uses_full_width_top_title_and_uniform_padding() {
@@ -2078,8 +2202,12 @@ mod tests {
             "Message @zoe [e2e]"
         );
         assert_eq!(
-            composer_placeholder(Some("@zoe"), Some(E2eHint::IdentityChanged)),
-            "Message @zoe [e2e — identity changed, /trust to resume]"
+            composer_placeholder(Some("@zoe"), Some(E2eHint::Accepted)),
+            "Message @zoe [e2e: identity unverified]"
+        );
+        assert_eq!(
+            composer_placeholder(Some("@zoe"), Some(E2eHint::Verified)),
+            "Message @zoe [e2e: identity verified]"
         );
     }
 
@@ -2771,7 +2899,11 @@ fn draw_history_search(
         let message = app.view.active.chat.message(found.message);
         let first_match = found.ranges.first().map(|range| range.start as usize);
         let (line_start, line_end) = body_line_around(&message.body, first_match);
-        let prefix = format!("{}: ", message.sender);
+        let prefix = if message.unverified {
+            format!("{} (Unverified): ", message.sender)
+        } else {
+            format!("{}: ", message.sender)
+        };
         let prefix_width = prefix.width().min(row.w as usize);
         buf.set_stringn(
             row.x,
@@ -2892,13 +3024,18 @@ fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, b
         let viewed = app.view.viewed_room;
         let room_name = viewed.and_then(|room_id| app.room.room_name_of(room_id));
         let e2e = viewed
-            .and_then(|room_id| app.room.dm_peer_of(room_id))
-            .map(|peer| {
-                if app.room.e2e_identity_changed(peer) {
-                    E2eHint::IdentityChanged
-                } else {
-                    E2eHint::Sealed
-                }
+            .and_then(|room_id| {
+                app.room.e2e_trust_state(room_id).map(|state| match state {
+                    crate::app::room::DmTrustState::FetchingKey { .. } => E2eHint::Fetching,
+                    crate::app::room::DmTrustState::KeyUnavailable { .. } => E2eHint::Unavailable,
+                    crate::app::room::DmTrustState::Accepted { .. } => E2eHint::Accepted,
+                    crate::app::room::DmTrustState::Verified { .. } => E2eHint::Verified,
+                })
+            })
+            .or_else(|| {
+                viewed
+                    .and_then(|room_id| app.room.dm_peer_of(room_id))
+                    .map(|_| E2eHint::Sealed)
             });
         area.with(app.view.theme.subtle.without_bg())
             .with(Ellipsis(true))
@@ -2911,8 +3048,10 @@ fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, b
 enum E2eHint {
     /// Messages to this room are sealed.
     Sealed,
-    /// The peer's identity tuple changed; sends are blocked until `/trust`.
-    IdentityChanged,
+    Fetching,
+    Unavailable,
+    Accepted,
+    Verified,
 }
 
 /// Recovers the editor's private visual-row scroll offset after rendering.
@@ -2969,9 +3108,10 @@ fn composer_placeholder(room_name: Option<&str>, e2e: Option<E2eHint>) -> String
     match e2e {
         None => hint,
         Some(E2eHint::Sealed) => format!("{hint} [e2e]"),
-        Some(E2eHint::IdentityChanged) => {
-            format!("{hint} [e2e — identity changed, /trust to resume]")
-        }
+        Some(E2eHint::Fetching) => format!("{hint} [e2e blocked — fetching identity key]"),
+        Some(E2eHint::Unavailable) => format!("{hint} [e2e blocked — peer has no key]"),
+        Some(E2eHint::Accepted) => format!("{hint} [e2e: identity unverified]"),
+        Some(E2eHint::Verified) => format!("{hint} [e2e: identity verified]"),
     }
 }
 
