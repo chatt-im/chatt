@@ -1554,7 +1554,12 @@ impl E2eState {
     fn find_contact_pin(&self, room_id: RoomId, peer: UserId) -> Option<&E2ePeerPin> {
         self.stored_pins
             .iter()
-            .find(|pin| pin.room_id == room_id.0 || pin.user_id == peer.0)
+            .find(|pin| pin.room_id == room_id.0 && pin.user_id == peer.0)
+            .or_else(|| {
+                self.stored_pins
+                    .iter()
+                    .find(|pin| pin.room_id == 0 && pin.user_id == peer.0)
+            })
     }
 
     fn derive_identity(

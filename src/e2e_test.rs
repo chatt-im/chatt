@@ -639,6 +639,68 @@ fn manual_verification_syncs_to_an_existing_linked_device() {
 }
 
 #[test]
+fn linked_device_first_dm_treats_peer_as_unverified_not_changed() {
+    let world = TestWorld::new();
+    let mut alice_primary = world.device("alice-first-dm-primary", ALICE, ALICE_TOKEN);
+    let mut alice_linked = world.device("alice-first-dm-linked", ALICE, "");
+    let mut bob = world.device("bob-first-dm", BOB, BOB_TOKEN);
+    // A reset server can reuse its first numeric DM id while the client still
+    // retains a pin for an unrelated contact from the previous server state.
+    alice_linked.config.e2e_peer_pins.push(E2ePeerPin {
+        room_id: 0x8000_0000,
+        user_id: 3,
+        username: "carol".to_string(),
+        public_key: "11".repeat(rpc::e2e::E2E_PUBLIC_KEY_LEN),
+        trust_level: E2eTrustLevel::Accepted,
+        change_from: None,
+        previous: Vec::new(),
+    });
+    bob.connect_ready();
+    alice_primary.connect_ready();
+
+    pair_device(&mut alice_primary, &mut alice_linked);
+    alice_linked.connect_ready();
+    alice_linked.send(NetworkCommand::OpenDm(BOB));
+    alice_linked.wait_for("first DM open", |event| {
+        matches!(event, NetworkEvent::DmOpened { peer, .. } if *peer == BOB)
+    });
+    let alice_identity = alice_linked.wait_for("Bob's first identity", |event| {
+        matches!(
+            event,
+            NetworkEvent::E2ePeerPinMatched { identity }
+                if identity.user_id == BOB
+        )
+    });
+    let NetworkEvent::E2ePeerPinMatched {
+        identity: alice_identity,
+    } = alice_identity
+    else {
+        unreachable!()
+    };
+    let bob_identity = bob.wait_for("Alice's first identity", |event| {
+        matches!(
+            event,
+            NetworkEvent::E2ePeerPinMatched { identity }
+                if identity.user_id == ALICE
+        )
+    });
+    let NetworkEvent::E2ePeerPinMatched {
+        identity: bob_identity,
+    } = bob_identity
+    else {
+        unreachable!()
+    };
+
+    for identity in [alice_identity, bob_identity] {
+        assert_eq!(identity.trust_level, E2eTrustLevel::Accepted);
+        assert_eq!(
+            identity.change_from, None,
+            "a peer first observed after device linking is unverified, not changed"
+        );
+    }
+}
+
+#[test]
 fn linked_device_rebuilds_live_dm_messages_from_history_after_restart() {
     let world = TestWorld::new();
     let mut alice = world.device("alice-primary", ALICE, ALICE_TOKEN);
