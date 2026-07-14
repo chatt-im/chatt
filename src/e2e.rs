@@ -4,6 +4,25 @@
 //! `(room id, user id, public key)` identity presented at authentication, keeps
 //! former keys for retained history, and reports exact-key provenance for every
 //! authenticated DM message.
+//!
+//! Identity continuity is deliberately visible state, not a gate on readable
+//! authenticated content. A first or replacement key becomes usable under
+//! TOFU, while exact-key provenance lets every view mark its messages
+//! unverified and a persistent security indicator reports whether an accepted
+//! key replaced an accepted or independently verified identity. Independent
+//! verification upgrades only the exact active key.
+//!
+//! Do not turn identity changes into a user-facing plaintext quarantine. A
+//! quarantine needs another durable pending-content lifecycle across history,
+//! reconnects, mutations, and file transfers, substantially increasing the
+//! state and audit surface. More importantly, it creates a perverse incentive:
+//! when accepting a changed key is the quickest way to reveal blocked messages,
+//! users are trained to approve first and verify later. That turns the trust
+//! action into an unblock button and weakens the continuity check quarantine
+//! was meant to protect. Chatt instead keeps the ordinary chat flow usable and
+//! makes the changed identity and provenance continuously visible. The only
+//! pending state below is the worker's bounded ordering/atomic-transition
+//! state, never a request for the user to accept a key.
 
 use hashbrown::HashMap;
 use ring::rand::SystemRandom;
@@ -36,7 +55,9 @@ struct DmRoom {
     presentation: u64,
     key_unavailable: bool,
     /// A served key is staged while the worker constructs its automatic TOFU
-    /// update. No other control can interleave with this transition.
+    /// update. No other control can interleave with this transition. This is a
+    /// short worker-atomic state, not a user-facing identity quarantine; the
+    /// rationale for keeping changed-key content visible is in the module docs.
     trust_pending: bool,
     /// Existing pins are send-disabled until the server presents the same key
     /// in this session. This prevents reconnect traffic racing key checking.
@@ -62,7 +83,9 @@ impl TrustedIdentity {
 }
 
 /// What applying a served identity tuple did. `Pending` is an internal staging
-/// result that the network worker activates immediately under TOFU.
+/// result that the network worker activates immediately under TOFU. It never
+/// asks the user to approve a key before content is shown; continuity and
+/// exact-key verification are projected separately by [`AcceptedPeerIdentity`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerIdentityOutcome {
     Pending(PendingPeerIdentity),

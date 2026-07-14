@@ -44,6 +44,18 @@ useful as the code moves.
   authenticated user id. First-use and replacement keys become active in memory
   immediately; an atomic `0600` config replacement preserves continuity across
   restart. A failed write does not hide plaintext or disable the current session.
+  This is intentionally not a user-facing quarantine model. Quarantining
+  authenticated content would require another durable pending lifecycle across
+  live messages, history, mutations, reconnects, and file transfers, increasing
+  the security-sensitive state and audit surface. It would also create a
+  perverse incentive: accepting a changed identity would become the quickest
+  way to reveal blocked messages, training users to approve first and verify
+  later. That turns trust into an unblock action and weakens the continuity
+  check quarantine was intended to protect. Chatt instead keeps the chat flow
+  available, records the exact opening key on every message, labels content from
+  an unverified key, and keeps first-use or changed-key security state
+  persistently visible in the chat UI. Only exact-key independent verification
+  clears that state.
   `/identity` and `/identity user` only open exact-key independent verification;
   there is no blind-accept action. The durable room-id
   binding remains encryption-required while reconnect room state is rebuilt;

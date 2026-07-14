@@ -104,6 +104,14 @@ pub(crate) enum DmTrustState {
         peer: UserId,
         username: String,
     },
+    /// A usable TOFU key that has not been independently verified. This state
+    /// intentionally remains readable/sendable even when `change_from` is set:
+    /// exact-key provenance marks its messages unverified, while the chat bar
+    /// and room notice keep the continuity change visible. Requiring a trust
+    /// action to reveal messages would make approval the quickest way to
+    /// unblock the conversation, training users to approve first and verify
+    /// later. It would also add a second pending-content lifecycle to the
+    /// client.
     Accepted {
         peer: UserId,
         identity: E2ePeerIdentity,
