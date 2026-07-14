@@ -49,8 +49,8 @@ use rpc::{
     },
     frame, history,
     ids::{
-        AccountId, BugReportId, DeviceId, EventId, FileTransferId, MessageId, RoomId, SessionId,
-        StreamId, UserId,
+        AccountId, BugReportId, DeviceId, EventId, FileTransferId, LedgerHash, MessageId, RoomId,
+        SessionId, StreamId, UserId,
     },
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
     recv::RecvBuffer,
@@ -5781,17 +5781,23 @@ impl WorkerState {
                 roster_epoch,
                 head,
             } => {
-                if Some(user_id) == self.user_id {
+                let local_user = self.user_id == Some(user_id);
+                if local_user {
                     self.e2e_bound = false;
                 }
-                if let Some(current) = self.e2e.account_ledger(user_id) {
-                    if current.head == head {
-                        return Ok(());
-                    }
-                    if roster_epoch <= current.roster_epoch {
-                        return Err("account directory announced a rollback or same-epoch fork"
-                            .to_string());
-                    }
+                let current = self
+                    .e2e
+                    .account_ledger(user_id)
+                    .map(|ledger| (ledger.roster_epoch, ledger.head));
+                let registration_pending =
+                    local_user && !self.e2e.local_account_server_registered();
+                if !account_head_requires_fetch(
+                    current,
+                    registration_pending,
+                    roster_epoch,
+                    head,
+                )? {
+                    return Ok(());
                 }
                 self.queue_control(ClientControl::FetchAccountKeyChain {
                     user_id,
@@ -7783,6 +7789,27 @@ fn random_u64() -> Result<u64, String> {
     Ok(u64::from_le_bytes(bytes).max(1))
 }
 
+/// Decides whether a signed-ledger head notification needs a directory fetch.
+/// A newly generated local ledger is known before it exists on the server, so
+/// an equal head still needs one confirming response to finish registration.
+fn account_head_requires_fetch(
+    current: Option<(u64, LedgerHash)>,
+    local_registration_pending: bool,
+    announced_epoch: u64,
+    announced_head: LedgerHash,
+) -> Result<bool, String> {
+    let Some((current_epoch, current_head)) = current else {
+        return Ok(true);
+    };
+    if current_head == announced_head {
+        return Ok(local_registration_pending);
+    }
+    if announced_epoch <= current_epoch {
+        return Err("account directory announced a rollback or same-epoch fork".to_string());
+    }
+    Ok(true)
+}
+
 fn configured_nat_kind() -> P2pNatKind {
     match std::env::var("CHATT_P2P_NAT")
         .unwrap_or_default()
@@ -7966,6 +7993,27 @@ mod tests {
 
     fn user(id: u64) -> UserId {
         UserId(id)
+    }
+
+    #[test]
+    fn matching_initial_local_head_is_fetched_until_registration_is_confirmed() {
+        let head = LedgerHash([7; 32]);
+        let current = Some((1, head));
+
+        assert!(account_head_requires_fetch(current, true, 1, head).unwrap());
+        assert!(!account_head_requires_fetch(current, false, 1, head).unwrap());
+    }
+
+    #[test]
+    fn account_head_change_requires_a_strictly_newer_epoch() {
+        let current = Some((4, LedgerHash([4; 32])));
+
+        assert!(
+            account_head_requires_fetch(current, false, 5, LedgerHash([5; 32])).unwrap()
+        );
+        assert!(
+            account_head_requires_fetch(current, false, 4, LedgerHash([6; 32])).is_err()
+        );
     }
 
     fn interface_snapshot(addr: &str) -> InterfaceSnapshot {
