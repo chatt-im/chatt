@@ -874,6 +874,10 @@ pub(crate) struct RoomSession {
     e2e_verified_keys: HashMap<RoomId, HashSet<[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>>,
     /// Stable warning notice currently journaled for a blocked room.
     e2e_warning_notices: HashMap<RoomId, NoticeKey>,
+    /// The accepted identity state already announced on entry during this
+    /// connection session. The exact key and change state let a replacement
+    /// identity still raise a fresh, higher-priority notice.
+    e2e_identity_notices_shown: HashMap<RoomId, (String, Option<crate::config::E2eTrustLevel>)>,
     stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
     /// Catalog facts for every known room, viewed or not.
@@ -1401,6 +1405,7 @@ impl RoomSession {
             e2e_trust: HashMap::new(),
             e2e_verified_keys: HashMap::new(),
             e2e_warning_notices: HashMap::new(),
+            e2e_identity_notices_shown: HashMap::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
             metas: BTreeMap::new(),
@@ -1492,6 +1497,7 @@ impl RoomSession {
                 self.e2e_trust.clear();
                 self.e2e_verified_keys.clear();
                 self.e2e_warning_notices.clear();
+                self.e2e_identity_notices_shown.clear();
             }
         }
         continuity
@@ -1520,6 +1526,7 @@ impl RoomSession {
         self.e2e_trust.clear();
         self.e2e_verified_keys.clear();
         self.e2e_warning_notices.clear();
+        self.e2e_identity_notices_shown.clear();
     }
 
     /// Marks every user offline and clears live voice state while keeping the
@@ -2358,9 +2365,17 @@ impl RoomSession {
             {
                 room.remove_notice_record(old);
             }
-            self.ensure_e2e_warning_notice(room_id);
+            self.ensure_e2e_security_notice(room_id);
         } else {
             self.clear_e2e_warning_notice(room_id);
+        }
+        if self.viewed_room == Some(room_id)
+            || self
+                .attached_views
+                .values()
+                .any(|viewed_room| *viewed_room == room_id)
+        {
+            self.ensure_e2e_identity_notice(room_id);
         }
     }
 
@@ -2380,7 +2395,12 @@ impl RoomSession {
         }
     }
 
-    pub(crate) fn ensure_e2e_warning_notice(&mut self, room_id: RoomId) {
+    pub(crate) fn ensure_e2e_security_notice(&mut self, room_id: RoomId) {
+        self.ensure_e2e_blocked_notice(room_id);
+        self.ensure_e2e_identity_notice(room_id);
+    }
+
+    fn ensure_e2e_blocked_notice(&mut self, room_id: RoomId) {
         let Some(state) = self.e2e_trust.get(&room_id).filter(|state| state.blocked()) else {
             return;
         };
@@ -2406,6 +2426,62 @@ impl RoomSession {
         self.e2e_warning_notices.insert(room_id, key);
     }
 
+    fn ensure_e2e_identity_notice(&mut self, room_id: RoomId) {
+        let Some(DmTrustState::Accepted {
+            identity,
+            change_from,
+            ..
+        }) = self.e2e_trust.get(&room_id)
+        else {
+            return;
+        };
+        let announced = (identity.public_key.clone(), *change_from);
+        if self.e2e_identity_notices_shown.get(&room_id) == Some(&announced) {
+            return;
+        }
+
+        let username = if identity.username.trim().is_empty() {
+            self.username_of(UserId(identity.user_id))
+        } else {
+            identity.username.clone()
+        };
+        let username = if username.trim().is_empty() {
+            "this contact"
+        } else {
+            &username
+        };
+        let (body, kind) = match change_from {
+            None => (
+                format!(
+                    "{username}'s encryption identity is unverified. Use `/identity`, then compare the identity with {username} through trusted out-of-band communication, such as a call or in person."
+                ),
+                NoticeKind::Warning,
+            ),
+            Some(crate::config::E2eTrustLevel::Accepted) => (
+                format!(
+                    "{username}'s encryption identity changed and is unverified. This could indicate a man-in-the-middle attack. Use `/identity`, then compare the new identity with {username} through trusted out-of-band communication before trusting this conversation."
+                ),
+                NoticeKind::Error,
+            ),
+            Some(crate::config::E2eTrustLevel::Verified) => (
+                format!(
+                    "{username}'s previously verified encryption identity changed. The new identity is unverified, and this could indicate a man-in-the-middle attack. Use `/identity`, then compare the new identity with {username} through trusted out-of-band communication before trusting this conversation."
+                ),
+                NoticeKind::Error,
+            ),
+        };
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        room.push_notice_record(NoticeRecord {
+            sender: "security".to_string(),
+            body,
+            kind,
+            scroll_bottom: true,
+        });
+        self.e2e_identity_notices_shown.insert(room_id, announced);
+    }
+
     pub(crate) fn clear_e2e_warning_notice(&mut self, room_id: RoomId) {
         let Some(key) = self.e2e_warning_notices.remove(&room_id) else {
             return;
@@ -2423,6 +2499,7 @@ impl RoomSession {
             }
         }
         self.e2e_trust.clear();
+        self.e2e_identity_notices_shown.clear();
     }
 
     pub(crate) fn username_of(&self, user_id: UserId) -> String {
@@ -3425,6 +3502,23 @@ mod tests {
         AuthenticatedChat {
             message: message_in(room_id, id, sender, body),
             provenance: key.map(|peer_public_key| MessageProvenance { peer_public_key }),
+        }
+    }
+
+    fn accepted_identity(
+        room_id: RoomId,
+        change_from: Option<crate::config::E2eTrustLevel>,
+    ) -> DmTrustState {
+        DmTrustState::Accepted {
+            peer: UserId(2),
+            identity: crate::config::E2ePeerIdentity {
+                room_id: room_id.0,
+                user_id: 2,
+                username: "bob".to_string(),
+                public_key: "11".repeat(32),
+                trust_level: crate::config::E2eTrustLevel::Accepted,
+            },
+            change_from,
         }
     }
 
@@ -5919,12 +6013,12 @@ mod tests {
         let first_key = room.e2e_warning_notices[&room_id];
         let first_len = room.shared(1).journal.len();
 
-        room.ensure_e2e_warning_notice(room_id);
+        room.ensure_e2e_security_notice(room_id);
         assert_eq!(room.shared(1).journal.len(), first_len);
         assert_eq!(room.e2e_warning_notices[&room_id], first_key);
 
         room.push_notice_to(room_id, "network", "later notice");
-        room.ensure_e2e_warning_notice(room_id);
+        room.ensure_e2e_security_notice(room_id);
         let replacement = room.e2e_warning_notices[&room_id];
         assert_ne!(replacement, first_key);
         assert!(matches!(
@@ -5948,6 +6042,93 @@ mod tests {
             },
         );
         assert!(!room.e2e_warning_notices.contains_key(&room_id));
+    }
+
+    #[test]
+    fn entering_unverified_room_appends_one_warning_per_session() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        let room_id = RoomId(1);
+        room.set_e2e_trust_state(room_id, accepted_identity(room_id, None));
+
+        let first_len = room.shared(1).journal.len();
+        assert!(matches!(
+            room.shared(1).journal.back(),
+            Some((_, RoomDelta::Notice(_, notice)))
+                if notice.kind == NoticeKind::Warning
+                    && notice.body.contains("unverified")
+                    && notice.body.contains("/identity")
+                    && notice.body.contains("out-of-band")
+        ));
+
+        room.ensure_e2e_security_notice(room_id);
+        assert_eq!(room.shared(1).journal.len(), first_len);
+        room.set_viewed_room(RoomId(2));
+        room.set_viewed_room(room_id);
+        room.ensure_e2e_security_notice(room_id);
+        assert_eq!(room.shared(1).journal.len(), first_len);
+
+        room.clear_e2e_trust_states();
+        room.set_e2e_trust_state(room_id, accepted_identity(room_id, None));
+        assert_eq!(room.shared(1).journal.len(), first_len + 1);
+    }
+
+    #[test]
+    fn unverified_notice_waits_until_the_room_is_entered() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        let room_id = RoomId(2);
+        room.set_e2e_trust_state(room_id, accepted_identity(room_id, None));
+        assert!(!room.e2e_identity_notices_shown.contains_key(&room_id));
+
+        room.set_viewed_room(room_id);
+        room.ensure_e2e_security_notice(room_id);
+
+        assert!(room.e2e_identity_notices_shown.contains_key(&room_id));
+        assert!(matches!(
+            room.shared(2).journal.back(),
+            Some((_, RoomDelta::Notice(_, notice))) if notice.kind == NoticeKind::Warning
+        ));
+    }
+
+    #[test]
+    fn entering_room_with_changed_identity_appends_error_notice() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        let room_id = RoomId(1);
+        room.set_e2e_trust_state(
+            room_id,
+            accepted_identity(room_id, Some(crate::config::E2eTrustLevel::Verified)),
+        );
+
+        let first_len = room.shared(1).journal.len();
+        assert!(matches!(
+            room.shared(1).journal.back(),
+            Some((_, RoomDelta::Notice(_, notice)))
+                if notice.kind == NoticeKind::Error
+                    && notice.body.contains("previously verified")
+                    && notice.body.contains("changed")
+                    && notice.body.contains("unverified")
+                    && notice.body.contains("/identity")
+                    && notice.body.contains("out-of-band")
+        ));
+        room.ensure_e2e_security_notice(room_id);
+        assert_eq!(room.shared(1).journal.len(), first_len);
     }
 
     #[test]

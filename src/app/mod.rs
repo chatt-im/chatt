@@ -3081,7 +3081,7 @@ impl App {
             return false;
         }
         self.view.switch_room(room_id, &self.room);
-        self.room.ensure_e2e_warning_notice(room_id);
+        self.room.ensure_e2e_security_notice(room_id);
         if self.room.begin_history_fetch(room_id)
             && !self.send_network_command(
                 NetworkCommand::FetchHistory {
@@ -3237,7 +3237,7 @@ impl App {
 
     fn after_view_switch(&mut self) {
         if let Some(room_id) = self.view.viewed_room {
-            self.room.ensure_e2e_warning_notice(room_id);
+            self.room.ensure_e2e_security_notice(room_id);
         }
         self.sync_viewed_room_to_feeds();
         self.request_initial_history_for_viewed_room();
