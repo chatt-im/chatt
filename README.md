@@ -660,6 +660,9 @@ Current status:
   remains usable but turns that warning red; a change from an independently
   verified key uses the stronger `Verified Identity Changed (Possible MITM
   Attack)` wording. Username changes are display changes, not key changes.
+  The first time an unverified DM is entered in each connection session, its
+  chat also explains how to use `/identity` with trusted out-of-band
+  communication; an identity change makes this an error notice.
   `/identity` opens the independent-verification screen. **Verified** means all
   24 words were compared through a call, in person, or another trusted service,
   or that the contact's context-bound verification text matched. Verification

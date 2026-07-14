@@ -22,6 +22,7 @@ pub struct NoticeId(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeKind {
     Info,
+    Warning,
     Error,
 }
 

@@ -2074,6 +2074,7 @@ fn draw_chat_heading(
 fn chat_entry_accent(theme: Theme, local: bool, notice_kind: Option<NoticeKind>) -> Style {
     match notice_kind {
         Some(NoticeKind::Info) => theme.muted,
+        Some(NoticeKind::Warning) => theme.warn,
         Some(NoticeKind::Error) => theme.error,
         None if local => theme.good,
         None => theme.accent,
