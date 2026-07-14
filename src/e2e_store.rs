@@ -288,10 +288,13 @@ impl LocalE2eIdentity {
         let path = identity_path(data_dir, server_public_key, user_id);
         match fs::read(&path) {
             Ok(bytes) => {
-                let file: IdentityFile = jsony::from_binary(&bytes)
-                    .map_err(|error| format!("failed to decode {}: {error}", path.display()))?;
+                let file: IdentityFile = jsony::from_binary(&bytes).map_err(|error| {
+                    identity_unavailable(&path, &format!("the file could not be decoded: {error}"))
+                })?;
                 let identity = Self { path, file };
-                identity.validate(server_public_key, user_id)?;
+                identity
+                    .validate(server_public_key, user_id)
+                    .map_err(|error| identity_unavailable(&identity.path, &error))?;
                 Ok((identity, false))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -373,7 +376,10 @@ impl LocalE2eIdentity {
                 identity.persist()?;
                 Ok((identity, true))
             }
-            Err(error) => Err(format!("failed to read {}: {error}", path.display())),
+            Err(error) => Err(identity_unavailable(
+                &path,
+                &format!("the file could not be read: {error}"),
+            )),
         }
     }
 
@@ -1139,6 +1145,13 @@ fn identity_path(data_dir: &Path, server_public_key: &[u8], user_id: UserId) -> 
     context.extend_from_slice(&user_id.0.to_le_bytes());
     let name = rpc::crypto::encode_hex(digest::digest(&digest::SHA256, &context).as_ref());
     data_dir.join("e2e").join(format!("{name}.bin"))
+}
+
+fn identity_unavailable(path: &Path, reason: &str) -> String {
+    format!(
+        "Local E2E identity state at {} is unreadable or incompatible: {reason}. Chatt stopped reconnecting and left the file unchanged. Restore it from a backup, or, if another linked device still works, move this file aside (do not delete it) and link this installation again. If neither is possible, preserve the file for diagnosis.",
+        path.display()
+    )
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {

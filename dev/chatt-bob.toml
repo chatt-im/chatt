@@ -10,6 +10,14 @@ udp-addr = "127.0.0.1:41000"
 room-id = 2147483648
 user-id = 1
 username = "Alice"
+public-key = "7ebd84d427d950278e91aff0613b5973b4e111ae8aef1af88fab2df1af0253c1"
+trust-level = "accepted"
+change-from = "accepted"
+
+[[servers.e2e-peer-pins.previous]]
+room-id = 2147483648
+user-id = 1
+username = "Alice"
 public-key = "af95a609b64e39d00c00fc94d263fe8578331362e0bc6eb1a970f8fb14b6987e"
 trust-level = "accepted"
 

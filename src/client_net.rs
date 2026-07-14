@@ -800,6 +800,12 @@ pub enum NetworkEvent {
         code: u16,
         message: String,
     },
+    /// Durable local account/device state could not be loaded. Retrying the
+    /// same bytes cannot recover, so the worker stops until the user repairs or
+    /// replaces the file explicitly.
+    LocalIdentityUnavailable {
+        message: String,
+    },
     PairingSucceeded,
     PairingFailed(String),
     /// A pairing/open-pairing attempt was rejected because the chosen username is
@@ -1294,6 +1300,14 @@ fn run_worker(
                 });
                 break;
             }
+            SessionEnd::LocalIdentityUnavailable(message) => {
+                kvlog::error!(
+                    "local E2E identity unavailable",
+                    error = message.as_str()
+                );
+                let _ = events.send(NetworkEvent::LocalIdentityUnavailable { message });
+                break;
+            }
         }
     }
     kvlog::info!("network worker stopped");
@@ -1461,6 +1475,7 @@ fn run_worker_inner(
         shutdown: false,
         disconnect_reason: None,
         auth_failure: None,
+        local_identity_failure: None,
     };
     worker.loop_work.queue_tcp_read();
 
@@ -1602,6 +1617,8 @@ fn run_worker_inner(
     }
     if let Some((code, reason)) = worker.auth_failure.take() {
         SessionEnd::AuthFailed { code, reason }
+    } else if let Some(message) = worker.local_identity_failure.take() {
+        SessionEnd::LocalIdentityUnavailable(message)
     } else if let Some(reason) = worker.disconnect_reason.take() {
         SessionEnd::Disconnected(reason)
     } else {
@@ -1615,6 +1632,7 @@ enum SessionEnd {
     ConnectFailed(String),
     Disconnected(String),
     AuthFailed { code: u16, reason: String },
+    LocalIdentityUnavailable(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2035,6 +2053,7 @@ struct WorkerState {
     shutdown: bool,
     disconnect_reason: Option<String>,
     auth_failure: Option<(u16, String)>,
+    local_identity_failure: Option<String>,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -5178,8 +5197,9 @@ impl WorkerState {
                 true,
             )
             .map_err(|_| "Could not decrypt the transfer metadata".to_string())?;
-        self.e2e
-            .record_opened_event(&opened, &sealed_meta, true)
+        let needs_replay_commit = self
+            .e2e
+            .record_opened_file_offer(&opened, &sealed_meta)
             .map_err(|_| "Transfer metadata event was replayed or reordered".to_string())?;
         let event_id = opened
             .event
@@ -5198,9 +5218,11 @@ impl WorkerState {
         file.original_name.clone_from(&meta.original_name);
         file.size = meta.size;
         file.encoding = meta.encoding;
-        self.e2e
-            .mark_opened_event_applied(&opened)
-            .map_err(|_| "Could not persist the transfer replay checkpoint".to_string())?;
+        if needs_replay_commit {
+            self.e2e
+                .mark_opened_event_applied(&opened)
+                .map_err(|_| "Could not persist the transfer replay checkpoint".to_string())?;
+        }
         Ok(Some(IncomingSeal {
             content_key: KeyMaterial {
                 id: 1,
@@ -6220,9 +6242,18 @@ impl WorkerState {
             room_count = rooms.len(),
             user_count = users.len()
         );
-        let local_device_is_new =
-            self.e2e
-                .initialize_device(&self.server_public_key, user_id, device_name)?;
+        let local_device_is_new = match self.e2e.initialize_device(
+            &self.server_public_key,
+            user_id,
+            device_name,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                self.local_identity_failure = Some(error);
+                self.shutdown = true;
+                return Ok(());
+            }
+        };
         self.e2e_bound = false;
         self.user_names.clear();
         let mut folded_names = HashSet::new();

@@ -1384,14 +1384,20 @@ impl E2eState {
         Ok(ledger)
     }
 
-    pub fn record_opened_event(
+    /// Records the second protocol delivery of a file-announcement event.
+    ///
+    /// The server sends the same authenticated envelope first as the room's
+    /// chat announcement and then as `FileOffered`. An exact duplicate is
+    /// therefore expected here, while a stale event, fork, or same-id payload
+    /// change remains a replay failure. Returns whether the caller must mark a
+    /// newly observed event as applied after accepting the metadata.
+    pub fn record_opened_file_offer(
         &mut self,
         opened: &OpenedDm,
         encoded: &[u8],
-        live: bool,
-    ) -> Result<(), OpenFailure> {
+    ) -> Result<bool, OpenFailure> {
         let Some(header) = opened.event else {
-            return Ok(());
+            return Ok(false);
         };
         let observation = self
             .device_identity
@@ -1406,13 +1412,13 @@ impl E2eState {
                 header.predecessor,
                 header.event_id,
                 encoded,
-                live,
+                true,
             )
             .map_err(|_| OpenFailure::Crypto)?;
-        if observation == ReplayObservation::Fresh {
-            Ok(())
-        } else {
-            Err(OpenFailure::Replay)
+        match observation {
+            ReplayObservation::Fresh => Ok(true),
+            ReplayObservation::Duplicate => Ok(false),
+            ReplayObservation::Stale | ReplayObservation::Fork => Err(OpenFailure::Replay),
         }
     }
 

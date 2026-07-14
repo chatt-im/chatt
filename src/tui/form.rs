@@ -413,8 +413,7 @@ impl<F: Copy + Eq> FormState<F> {
     /// the field value, keeping a following commit from restoring stale text.
     pub(crate) fn sync_active_text(&mut self, field: F, value: &str) {
         if self.active_text == Some(field) {
-            self.editor.set_lines(value);
-            self.editor.set_cursor_offset(self.editor.text_len());
+            self.replace_editor_text(value);
         }
     }
 
@@ -434,9 +433,17 @@ impl<F: Copy + Eq> FormState<F> {
 
     pub(crate) fn replace_active_text(&mut self, text: &str) -> Option<(F, String)> {
         let active = self.active_text?;
+        self.replace_editor_text(text);
+        Some((active, self.editor.text()))
+    }
+
+    fn replace_editor_text(&mut self, text: &str) {
+        let restore_insert_mode = self.editor.mode() == Mode::Insert;
         self.editor.set_lines(text);
         self.editor.set_cursor_offset(self.editor.text_len());
-        Some((active, self.editor.text()))
+        if restore_insert_mode {
+            self.editor.enter_insert_mode();
+        }
     }
 
     pub(crate) fn render_editor(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
@@ -1075,6 +1082,23 @@ mod tests {
         assert_eq!(event.action, FormAction::ActivateNextInsert);
         assert_eq!(event.commit, Some((Field::One, "value".to_string())));
         assert_eq!(form.active_text(), Some(Field::One));
+    }
+
+    #[test]
+    fn replacing_active_text_preserves_vim_insert_mode() {
+        let mut form = FormState::with_order(Field::One, FormBindings::Vim, [Field::One]);
+        form.focus_text(Field::One, "", true);
+
+        let commit = form.replace_active_text("photo-host-stadium-narrow-video-frost");
+
+        assert_eq!(
+            commit,
+            Some((
+                Field::One,
+                "photo-host-stadium-narrow-video-frost".to_string()
+            ))
+        );
+        assert_eq!(form.editor_mut().mode(), Mode::Insert);
     }
 
     #[test]
