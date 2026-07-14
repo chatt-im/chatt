@@ -5655,9 +5655,18 @@ impl WorkerState {
                         "peer identity changed during automatic TOFU activation".to_string()
                     );
                 };
-                // Automatic TOFU is active for this session immediately. The
-                // app still writes the pin atomically so continuity survives a
-                // restart, but a failed write no longer hides plaintext.
+                // Automatic TOFU is active for this session immediately. This
+                // deliberately applies to replacement keys too: Chatt does not
+                // quarantine authenticated plaintext behind a trust action,
+                // which would add a durable pending-content state machine and
+                // create a perverse incentive to treat trust as an unblock
+                // button: approve first to reveal the conversation, verify
+                // later if ever. Instead, the exact opening key travels with
+                // each message and the app keeps first-use or changed-identity
+                // state visibly unverified, with a persistent continuity
+                // warning when a pin changed. The app still writes the pin
+                // atomically so continuity survives a restart, but a failed
+                // write does not hide content.
                 if !self.e2e.confirm_pin(&pin, true) {
                     return Err("peer identity could not be activated".to_string());
                 }
