@@ -4271,6 +4271,9 @@ impl App {
             NetworkEvent::E2eAccountIdentity { account_id } => {
                 self.e2e_account_id = Some(account_id);
             }
+            NetworkEvent::E2eDeviceBound { device_id } => {
+                let _ = device_id;
+            }
             NetworkEvent::E2ePeerPinProposed { pin } => {
                 let persisted = self.persist_e2e_pin(pin.clone());
                 self.send_network_command(
@@ -4720,7 +4723,11 @@ impl App {
                 )));
                 self.set_status("one-time device link created");
             }
-            NetworkEvent::DeviceLinkRedeemed { device_name } => {
+            NetworkEvent::DeviceLinkRedeemed {
+                device_id,
+                device_name,
+            } => {
+                let _ = device_id;
                 self.navigate_owner(NavigationEvent::CloseOverlay);
                 self.set_status(format!("device linked: {device_name}"));
             }
@@ -8757,6 +8764,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Presence { .. } => "presence",
         NetworkEvent::E2eRecoveryCode { .. } => "e2e_recovery_code",
         NetworkEvent::E2eAccountIdentity { .. } => "e2e_account_identity",
+        NetworkEvent::E2eDeviceBound { .. } => "e2e_device_bound",
         NetworkEvent::DeviceLinkCreated { .. } => "device_link_created",
         NetworkEvent::DeviceLinkRedeemed { .. } => "device_link_redeemed",
         NetworkEvent::DevicePairingSucceeded { .. } => "device_pairing_succeeded",

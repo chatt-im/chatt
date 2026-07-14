@@ -493,6 +493,18 @@ impl VideoCopyStats {
 }
 
 impl Server {
+    /// Replaces the configured users before the event loop starts and rebuilds
+    /// every index derived from them. Embedded harnesses should use this
+    /// instead of mutating [`Self::users`] directly.
+    pub fn seed_users(&mut self, users: Vec<UserConfig>) -> Result<(), String> {
+        if !self.sessions.is_empty() || !self.clients.is_empty() {
+            return Err("cannot replace server users after clients connect".to_string());
+        }
+        self.usernames = UsernameRegistry::open(self.config.data_dir(), &users)?;
+        self.users.users = users;
+        Ok(())
+    }
+
     /// Local TCP address the listener is bound to, resolving an ephemeral `:0`
     /// port to the concrete port the OS assigned.
     pub fn tcp_local_addr(&self) -> io::Result<SocketAddr> {
@@ -728,7 +740,9 @@ impl Server {
             }
             self.requeue_unclogged_uploaders();
             self.drain_history_replies();
-            self.handle_admin_commands(admin_rx);
+            if self.handle_admin_commands(admin_rx) {
+                return Ok(());
+            }
             self.flush_disconnects();
             let now = Instant::now();
             self.sweep_idle_connections(now);
@@ -737,14 +751,18 @@ impl Server {
         }
     }
 
-    fn handle_admin_commands(&mut self, admin_rx: &mpsc::Receiver<AdminCommand>) {
+    /// Returns true when an embedded owner requested a clean shutdown.
+    fn handle_admin_commands(&mut self, admin_rx: &mpsc::Receiver<AdminCommand>) -> bool {
         loop {
             match admin_rx.try_recv() {
                 Ok(AdminCommand::Invite { user, reply }) => {
                     let result = self.create_invite(&user);
                     let _ = reply.send(result);
                 }
-                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Ok(AdminCommand::Shutdown) => return true,
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
+                    return false;
+                }
             }
         }
     }

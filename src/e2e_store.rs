@@ -124,6 +124,7 @@ impl LocalE2eIdentity {
     }
 
     pub(crate) fn prepare_linked_device(
+        data_dir: &Path,
         server_public_key: &[u8],
         user_id: UserId,
         device_name: &str,
@@ -132,7 +133,7 @@ impl LocalE2eIdentity {
         overwrite_existing: bool,
         rng: &dyn SecureRandom,
     ) -> Result<(Self, AccountKeyStatement), String> {
-        let path = identity_path(server_public_key, user_id)?;
+        let path = identity_path(data_dir, server_public_key, user_id);
         if path.exists() && !overwrite_existing {
             return Err(
                 "this installation already has an E2E identity for the linked account"
@@ -221,10 +222,11 @@ impl LocalE2eIdentity {
     }
 
     pub(crate) fn linked_device_path(
+        data_dir: &Path,
         server_public_key: &[u8],
         user_id: UserId,
-    ) -> Result<PathBuf, String> {
-        identity_path(server_public_key, user_id)
+    ) -> PathBuf {
+        identity_path(data_dir, server_public_key, user_id)
     }
 
     pub(crate) fn commit_linked_device(mut self) -> Result<(), String> {
@@ -233,12 +235,13 @@ impl LocalE2eIdentity {
     }
 
     pub(crate) fn load_or_create(
+        data_dir: &Path,
         server_public_key: &[u8],
         user_id: UserId,
         device_name: &str,
         rng: &dyn SecureRandom,
     ) -> Result<(Self, bool), String> {
-        let path = identity_path(server_public_key, user_id)?;
+        let path = identity_path(data_dir, server_public_key, user_id);
         match fs::read(&path) {
             Ok(bytes) => {
                 let file: IdentityFile = jsony::from_binary(&bytes)
@@ -795,14 +798,12 @@ fn fixed<const N: usize>(bytes: &[u8], name: &str) -> Result<[u8; N], String> {
         .map_err(|_| format!("{name} has the wrong length"))
 }
 
-fn identity_path(server_public_key: &[u8], user_id: UserId) -> Result<PathBuf, String> {
-    let base = crate::paths::client_data_dir()
-        .ok_or_else(|| "HOME is not set; cannot store the E2E device identity".to_string())?;
+fn identity_path(data_dir: &Path, server_public_key: &[u8], user_id: UserId) -> PathBuf {
     let mut context = Vec::with_capacity(server_public_key.len() + 8);
     context.extend_from_slice(server_public_key);
     context.extend_from_slice(&user_id.0.to_le_bytes());
     let name = rpc::crypto::encode_hex(digest::digest(&digest::SHA256, &context).as_ref());
-    Ok(base.join("e2e").join(format!("{name}.bin")))
+    data_dir.join("e2e").join(format!("{name}.bin"))
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {

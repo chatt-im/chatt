@@ -148,6 +148,7 @@ impl ServerEntry {
             username: self.effective_username(),
             token: self.token.clone(),
             server_public_key: non_empty_string(&self.server_public_key),
+            data_dir: crate::paths::client_data_dir(),
             e2e_peer_pins: self.e2e_peer_pins.clone(),
             require_native_encryption: self.require_native_encryption,
             file_policy: config.file_policy(self),
