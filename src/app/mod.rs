@@ -4082,6 +4082,10 @@ impl App {
                     let Some(update) = update else {
                         return;
                     };
+                    if let Some(regression) = update.message_id_regression {
+                        self.report_message_id_regression(regression);
+                        return;
+                    }
                     if update.read_advanced {
                         self.mark_room_catalog_dirty();
                     }
@@ -4120,6 +4124,10 @@ impl App {
                 let Some(update) = update else {
                     return;
                 };
+                if let Some(regression) = update.message_id_regression {
+                    self.report_message_id_regression(regression);
+                    return;
+                }
                 if !update.fresh {
                     return;
                 }
@@ -4960,6 +4968,31 @@ impl App {
         }
         self.last_network_notice = Some(body.to_string());
         self.push_error_notice(sender, body);
+    }
+
+    fn report_message_id_regression(&mut self, regression: room::MessageIdRegression) {
+        let room_name = self
+            .room
+            .room_name_of(regression.room_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("room {}", regression.room_id.0));
+        let body = format!(
+            "dropped out-of-order chat record {} in {room_name}; latest known message ID is {}",
+            regression.received.0, regression.high_watermark.0
+        );
+        kvlog::error!(
+            "out-of-order live chat record rejected",
+            room_id = regression.room_id.0,
+            received_message_id = regression.received.0,
+            high_watermark = regression.high_watermark.0
+        );
+        self.set_error(body.clone());
+        if !self
+            .room
+            .push_error_notice_to(regression.room_id, "network", body.clone())
+        {
+            self.push_error_notice("network", body);
+        }
     }
 
     /// Journals a system line into the viewed room; before any room is
@@ -9423,6 +9456,24 @@ mod tests {
         }
     }
 
+    fn test_chat_record(room_id: RoomId, message_id: MessageId) -> crate::e2e::AuthenticatedChat {
+        crate::e2e::AuthenticatedChat {
+            message: rpc::control::ChatMessage {
+                envelope: None,
+                message_id,
+                room_id,
+                sender: UserId(2),
+                sender_name: "bob".to_string(),
+                timestamp_ms: message_id.0 * 1_000,
+                body: "late message".to_string(),
+                file_transfer_id: None,
+                flags: rpc::control::MessageFlags::default(),
+                target: None,
+            },
+            provenance: None,
+        }
+    }
+
     /// Registers room 1 as the viewed room with `users` in the directory.
     fn enter_room_with_users(app: &mut App, users: Vec<rpc::control::UserSummary>) {
         app.room.authenticated(
@@ -11112,6 +11163,52 @@ mod tests {
             Some(crate::chat_buffer::NoticeKind::Info)
         );
         assert_eq!(app.view.status.text(), "slash commands listed");
+    }
+
+    #[test]
+    fn out_of_order_live_chat_posts_an_error_in_the_affected_room() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        let room_1 = test_room_info(1);
+        let mut room_2 = test_room_info(2);
+        room_2.head = Some(MessageId(10));
+        app.room.authenticated(
+            &[room_1, room_2],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        app.view.switch_room(RoomId(1), &app.room);
+
+        app.handle_network_event(NetworkEvent::Chat(test_chat_record(
+            RoomId(2),
+            MessageId(9),
+        )));
+
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert!(
+            app.view
+                .status
+                .text()
+                .contains("out-of-order chat record 9")
+        );
+        assert!(app.view.status.text().contains("message ID is 10"));
+        assert!(app.room.set_viewed_room(RoomId(2)));
+        app.view.switch_room(RoomId(2), &app.room);
+        app.view.sync_active(&app.room);
+        assert_eq!(app.view.active.chat.len(), 1);
+        let notice = app.view.active.chat.message(0);
+        assert_eq!(notice.sender, "network");
+        assert!(notice.body.contains("out-of-order chat record 9"));
+        assert!(notice.body.contains("message ID is 10"));
+        assert_eq!(
+            notice.notice_kind,
+            Some(crate::chat_buffer::NoticeKind::Error)
+        );
     }
 
     #[test]
