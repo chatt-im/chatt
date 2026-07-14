@@ -3,17 +3,8 @@ label = "local"
 username = "Bob"
 token = "bob-dev-token"
 server-public-key = ""
-e2e-identity-seed = "4a7274324f4e1e9bb7ab319d01b7ca2cfd15e668fc84693e53967b41b081f5d7"
-e2e-local-user-id = 2
 tcp-addr = "127.0.0.1:41000"
 udp-addr = "127.0.0.1:41000"
-
-[[servers.e2e-peer-pins]]
-room-id = 0
-user-id = 1
-username = ""
-public-key = "f5ebfbc4d9cd606b6086f4c1bf26033b06a87d425935efd362b2d457c71ee71c"
-trust-level = "accepted"
 
 [audio]
 bitrate-bps = 48000

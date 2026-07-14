@@ -251,6 +251,16 @@ impl E2eState {
         statements.last().map(account_statement_hash)
     }
 
+    /// Whether the server has returned and validated this installation's
+    /// locally generated account ledger. A matching head notification alone
+    /// is not enough: the initial registration still needs one directory
+    /// response before the device can bind to that checkpoint.
+    pub fn local_account_server_registered(&self) -> bool {
+        self.device_identity
+            .as_ref()
+            .is_some_and(LocalE2eIdentity::server_registered)
+    }
+
     pub fn own_genesis(&self) -> Option<AccountKeyStatement> {
         self.device_identity
             .as_ref()?
@@ -1657,9 +1667,11 @@ mod tests {
         else {
             panic!();
         };
+        assert_eq!(snapshot.reason, PendingIdentityReason::FirstContact);
         let pin = alice
             .proposed_trust(&snapshot, E2eTrustLevel::Accepted)
             .unwrap();
+        assert_eq!(pin.change_from, None);
         assert_eq!(
             alice.seal_chat(RoomId(9), DmContentKind::Text, None, "hi", 1),
             Err(SealBlocked::PeerKeyMissing)
