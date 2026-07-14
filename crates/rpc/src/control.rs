@@ -1,6 +1,9 @@
 use jsony::Jsony;
 
-use crate::ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId};
+use crate::ids::{
+    BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId, StreamId,
+    UserId,
+};
 
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 224 * 1024;
 pub const MAX_CHAT_BODY_BYTES: usize = 8 * 1024;
@@ -109,7 +112,7 @@ pub enum ClientControl {
     SendChat {
         room_id: RoomId,
         body: String,
-        /// Encoded [`crate::e2e::DmEnvelope`] replacing `body` in DM rooms;
+        /// Encoded [`crate::e2e::DmEventEnvelope`] replacing `body` in DM rooms;
         /// exactly one of the two is set.
         envelope: Option<Vec<u8>>,
     },
@@ -132,7 +135,7 @@ pub enum ClientControl {
         /// the server never learns the true size.
         size: u64,
         encoding: FileContentEncoding,
-        /// Encoded [`crate::e2e::DmEnvelope`] holding the transfer's real
+        /// Encoded [`crate::e2e::DmEventEnvelope`] holding the transfer's real
         /// metadata and content key; required for
         /// [`FileContentEncoding::Sealed`], absent otherwise. The server copies
         /// it verbatim into the announcement message and [`FileMetadata`].
@@ -217,7 +220,7 @@ pub enum ClientControl {
         room_id: RoomId,
         target: MessageId,
         body: String,
-        /// Encoded [`crate::e2e::DmEnvelope`] replacing `body` in DM rooms;
+        /// Encoded [`crate::e2e::DmEventEnvelope`] replacing `body` in DM rooms;
         /// exactly one of the two is set.
         envelope: Option<Vec<u8>>,
     },
@@ -226,20 +229,37 @@ pub enum ClientControl {
     DeleteChat {
         room_id: RoomId,
         target: MessageId,
-        /// Encoded [`crate::e2e::DmEnvelope`] authenticating the deletion and
+        /// Encoded [`crate::e2e::DmEventEnvelope`] authenticating the deletion and
         /// target in DM rooms; absent in other rooms.
         envelope: Option<Vec<u8>>,
     },
-    /// Publish this user's long-term X25519 identity public key for DM
-    /// end-to-end encryption. Sent after every successful authentication;
-    /// idempotent, last publish wins. Broadcast to other sessions as
-    /// [`ServerControl::E2eKey`] when it changes.
-    PublishE2eKey {
-        public_key: Vec<u8>,
+    /// Appends one authority-signed transition to the authenticated account's
+    /// device ledger. The statement's `previous` hash is the compare-and-swap
+    /// anchor, so concurrent device administration cannot silently overwrite.
+    AppendAccountKeyStatement {
+        statement: crate::e2e::AccountKeyStatement,
     },
-    /// Ask for a user's published identity key. Answered with
-    /// [`ServerControl::E2eKey`].
-    FetchE2eKey {
+    /// Fetches a user's signed account/device ledger. When `after` is known the
+    /// server may return only the suffix following that checkpoint.
+    FetchAccountKeyChain {
+        user_id: UserId,
+        after: Option<LedgerHash>,
+    },
+    /// Proves possession of an active device signing key for this authenticated
+    /// transport session. DM sends are unavailable until this succeeds.
+    BindE2eDevice {
+        device_id: DeviceId,
+        key_epoch: u64,
+        ledger_head: LedgerHash,
+        signature: Vec<u8>,
+    },
+    /// Stores the opaque recovery bundle named by the signed ledger head. The
+    /// server never receives the recovery secret or account authority seed.
+    PutE2eRecoveryBundle {
+        ledger_head: LedgerHash,
+        bundle: Vec<u8>,
+    },
+    FetchE2eRecoveryBundle {
         user_id: UserId,
     },
 }
@@ -410,12 +430,26 @@ pub enum ServerControl {
         client_transfer_id: FileTransferId,
         reason: String,
     },
-    /// A user's DM identity key: the reply to [`ClientControl::FetchE2eKey`],
-    /// also pushed to every other live session when a key is first published
-    /// or changes. `None` when the user has not published one.
-    E2eKey {
+    /// Full signed device ledger, or the requested suffix when `base` is set.
+    AccountKeyChain {
         user_id: UserId,
-        public_key: Option<Vec<u8>>,
+        base: Option<LedgerHash>,
+        statements: Vec<crate::e2e::AccountKeyStatement>,
+    },
+    /// Push notification that a user's signed ledger advanced. Recipients fetch
+    /// and validate the chain before changing current sending authorization.
+    AccountKeyHeadChanged {
+        user_id: UserId,
+        roster_epoch: u64,
+        head: LedgerHash,
+    },
+    E2eDeviceBound {
+        device_id: DeviceId,
+        key_epoch: u64,
+    },
+    E2eRecoveryBundle {
+        user_id: UserId,
+        bundle: Option<Vec<u8>>,
     },
 }
 
@@ -547,7 +581,7 @@ pub struct ChatMessage {
     pub flags: MessageFlags,
     /// `Some` marks this record as a mutation of that message id.
     pub target: Option<MessageId>,
-    /// Encoded [`crate::e2e::DmEnvelope`] carrying the sealed content in DM
+    /// Encoded [`crate::e2e::DmEventEnvelope`] carrying the sealed content in DM
     /// rooms; `body` is empty then and receiving clients fill it after opening
     /// the envelope.
     pub envelope: Option<Vec<u8>>,
@@ -567,7 +601,7 @@ pub struct FileMetadata {
     pub size: u64,
     pub encoding: FileContentEncoding,
     pub timestamp_ms: u64,
-    /// Encoded [`crate::e2e::DmEnvelope`] with the transfer's real metadata
+    /// Encoded [`crate::e2e::DmEventEnvelope`] with the transfer's real metadata
     /// and content key, relayed verbatim from
     /// [`ClientControl::UploadFileStart`] for sealed transfers.
     pub sealed_meta: Option<Vec<u8>>,
@@ -917,9 +951,31 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("share extradata exceeds maximum length".to_string());
             }
         }
-        ClientControl::PublishE2eKey { public_key } => {
-            if public_key.len() != crate::e2e::E2E_PUBLIC_KEY_LEN {
-                return Err("published identity key has the wrong length".to_string());
+        ClientControl::AppendAccountKeyStatement { statement } => {
+            if statement.authority_signature.len() != 64
+                || statement
+                    .co_signature
+                    .as_ref()
+                    .is_some_and(|signature| signature.len() != 64)
+            {
+                return Err("account key statement signature has the wrong length".to_string());
+            }
+        }
+        ClientControl::BindE2eDevice {
+            key_epoch,
+            signature,
+            ..
+        } => {
+            if *key_epoch == 0 {
+                return Err("device key epoch is zero".to_string());
+            }
+            if signature.len() != 64 {
+                return Err("device binding signature has the wrong length".to_string());
+            }
+        }
+        ClientControl::PutE2eRecoveryBundle { bundle, .. } => {
+            if bundle.is_empty() || bundle.len() > 16 * 1024 {
+                return Err("recovery bundle length is invalid".to_string());
             }
         }
         _ => {}
@@ -1240,22 +1296,6 @@ mod tests {
                 "bound too small for original {original}"
             );
         }
-    }
-
-    #[test]
-    fn publish_e2e_key_requires_exact_key_length() {
-        assert!(
-            encode_client_control(&ClientControl::PublishE2eKey {
-                public_key: vec![1u8; 31],
-            })
-            .is_err()
-        );
-        assert!(
-            encode_client_control(&ClientControl::PublishE2eKey {
-                public_key: vec![1u8; 32],
-            })
-            .is_ok()
-        );
     }
 
     #[test]

@@ -396,6 +396,7 @@ pub(crate) struct App {
     pub control_socket: Option<local_control::ControlSocket>,
     pub session_id: Option<SessionId>,
     pub user_id: Option<UserId>,
+    e2e_account_id: Option<rpc::ids::AccountId>,
     requested_voice_room: Option<RoomId>,
     /// The user explicitly left voice this session; suppresses the voice
     /// auto-join on (re-)authentication until the next explicit join.
@@ -1327,6 +1328,7 @@ impl App {
             control_socket,
             session_id: None,
             user_id: None,
+            e2e_account_id: None,
             requested_voice_room: None,
             voice_left: false,
             pending_pair: None,
@@ -2752,13 +2754,6 @@ impl App {
                 return false;
             }
         };
-        let server = match self.ensure_e2e_identity(server) {
-            Ok(server) => server,
-            Err(error) => {
-                self.set_error(error);
-                return false;
-            }
-        };
         self.disconnect_network();
         let owner = self
             .connection_attempt
@@ -2814,33 +2809,6 @@ impl App {
         true
     }
 
-    /// Guarantees the server entry carries a DM identity seed, generating and
-    /// persisting one on first connect.
-    fn ensure_e2e_identity(&mut self, mut server: ServerEntry) -> Result<ServerEntry, String> {
-        use ring::rand::SecureRandom;
-        if !server.e2e_identity_seed.trim().is_empty() {
-            return Ok(server);
-        }
-        let mut seed = [0u8; rpc::e2e::E2E_SEED_LEN];
-        ring::rand::SystemRandom::new()
-            .fill(&mut seed)
-            .map_err(|_| "failed to generate encryption identity".to_string())?;
-        let seed = rpc::crypto::encode_hex(&seed);
-        server.e2e_identity_seed = seed.clone();
-        if let Some(entry) = self
-            .config
-            .servers
-            .iter_mut()
-            .find(|entry| entry.label == server.label)
-        {
-            entry.e2e_identity_seed = seed;
-        }
-        self.config
-            .save_runtime()
-            .map_err(|error| format!("failed to persist encryption identity: {error}"))?;
-        Ok(server)
-    }
-
     /// Persists a complete DM identity snapshot. The network worker activates
     /// it only after the acknowledgement sent by the event handler.
     fn persist_e2e_pin(&mut self, pin: crate::config::E2ePeerPin) -> bool {
@@ -2871,42 +2839,6 @@ impl App {
             }
             kvlog::warn!("failed to persist e2e pin", error = error.as_str());
             self.set_error(format!("failed to persist encryption pin: {error}"));
-            return false;
-        }
-        true
-    }
-
-    fn persist_e2e_local_user(&mut self, user_id: UserId) -> bool {
-        let Some(label) = self.room.active_server_label.clone() else {
-            return false;
-        };
-        let Some(entry) = self
-            .config
-            .servers
-            .iter_mut()
-            .find(|entry| entry.label == label)
-        else {
-            return false;
-        };
-        if entry.e2e_local_user_id == user_id.0 {
-            return true;
-        }
-        let previous = entry.e2e_local_user_id;
-        entry.e2e_local_user_id = user_id.0;
-        if let Err(error) = self.config.save_runtime() {
-            if let Some(entry) = self
-                .config
-                .servers
-                .iter_mut()
-                .find(|entry| entry.label == label)
-            {
-                entry.e2e_local_user_id = previous;
-            }
-            kvlog::warn!(
-                "failed to persist local e2e user id",
-                error = error.as_str()
-            );
-            self.set_error(format!("failed to persist encryption account id: {error}"));
             return false;
         }
         true
@@ -2963,6 +2895,7 @@ impl App {
         self.room.network_selected = false;
         self.session_id = None;
         self.user_id = None;
+        self.e2e_account_id = None;
         self.reset_room_for_disconnect();
         self.room.server_rtt_ms = None;
         self.last_network_notice = None;
@@ -4243,12 +4176,13 @@ impl App {
                     ));
                 }
             }
-            NetworkEvent::E2eLocalUserId { user_id } => {
-                let persisted = self.persist_e2e_local_user(user_id);
-                self.send_network_command(
-                    NetworkCommand::ConfirmE2eLocalUser { user_id, persisted },
-                    true,
-                );
+            NetworkEvent::E2eRecoveryCode { code } => {
+                self.set_error(format!(
+                    "Store this E2E recovery code securely; it can authorize another device: {code}"
+                ));
+            }
+            NetworkEvent::E2eAccountIdentity { account_id } => {
+                self.e2e_account_id = Some(account_id);
             }
             NetworkEvent::E2ePeerPinProposed { pin } => {
                 let persisted = self.persist_e2e_pin(pin.clone());
@@ -7033,6 +6967,28 @@ impl App {
             command if command.starts_with("/dm ") => self.open_dm_command(command),
             "/identity" => self.identity_command("/identity"),
             command if command.starts_with("/identity ") => self.identity_command(command),
+            "/devices" => {
+                self.send_network_command(NetworkCommand::ListE2eDevices, true);
+            }
+            "/devices recovery" => {
+                self.send_network_command(NetworkCommand::ShowE2eRecoveryCode, true);
+            }
+            command if command.starts_with("/devices revoke ") => {
+                let encoded = command.trim_start_matches("/devices revoke ").trim();
+                let device_id = rpc::crypto::decode_hex(encoded)
+                    .ok()
+                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                    .map(rpc::ids::DeviceId);
+                match device_id {
+                    Some(device_id) => {
+                        self.send_network_command(
+                            NetworkCommand::RevokeE2eDevice { device_id },
+                            true,
+                        );
+                    }
+                    None => self.set_error("device id must be exactly 16 bytes of hex"),
+                }
+            }
             "/voice" => match room_id {
                 Some(room_id) => self.join_voice_room(room_id),
                 None => self.set_error("no room selected"),
@@ -7141,24 +7097,13 @@ impl App {
 
     fn local_verification_text(&self) -> Result<String, String> {
         let server_key = self.active_server_identity_key()?;
-        let label = self
-            .room
-            .active_server_label
-            .as_deref()
-            .ok_or_else(|| "select a server before verifying identities".to_string())?;
-        let server = self
-            .config
-            .server(label)
-            .map_err(|error| error.to_string())?;
-        let seed = rpc::crypto::decode_hex(&server.e2e_identity_seed)
-            .map_err(|_| "the local encryption identity is invalid".to_string())?;
-        let seed = <[u8; rpc::e2e::E2E_SEED_LEN]>::try_from(seed.as_slice())
-            .map_err(|_| "the local encryption identity is invalid".to_string())?;
-        let public_key = rpc::e2e::e2e_public_key(&seed);
+        let account_id = self
+            .e2e_account_id
+            .ok_or_else(|| "the signed account identity is still being fetched".to_string())?;
         let user_id = self
             .user_id
             .ok_or_else(|| "authentication has not completed".to_string())?;
-        crate::e2e_identity::VerificationText::new(&server_key, user_id.0, &public_key)
+        crate::e2e_identity::VerificationText::new(&server_key, user_id.0, &account_id.0)
             .map(|text| text.encode())
             .map_err(|_| "could not build the local verification text".to_string())
     }
@@ -8659,7 +8604,8 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::TransferEnded { .. } => "transfer_ended",
         NetworkEvent::TransferComplete { .. } => "transfer_complete",
         NetworkEvent::Presence { .. } => "presence",
-        NetworkEvent::E2eLocalUserId { .. } => "e2e_local_user_id",
+        NetworkEvent::E2eRecoveryCode { .. } => "e2e_recovery_code",
+        NetworkEvent::E2eAccountIdentity { .. } => "e2e_account_identity",
         NetworkEvent::E2ePeerPinProposed { .. } => "e2e_peer_pin_proposed",
         NetworkEvent::E2eIdentityFetching { .. } => "e2e_identity_fetching",
         NetworkEvent::E2eKeyUnavailable { .. } => "e2e_key_unavailable",
@@ -8721,7 +8667,9 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::VerifyPeerIdentity { .. } => "verify_peer_identity",
         NetworkCommand::ForgetPeerIdentity { .. } => "forget_peer_identity",
         NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
-        NetworkCommand::ConfirmE2eLocalUser { .. } => "confirm_e2e_local_user",
+        NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
+        NetworkCommand::ShowE2eRecoveryCode => "show_e2e_recovery_code",
+        NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -10031,16 +9979,16 @@ mod tests {
         app.config.servers.push(ServerEntry {
             label: "development".to_string(),
             server_public_key: String::new(),
-            e2e_identity_seed: "11".repeat(32),
             ..ServerEntry::default()
         });
         app.room.active_server_label = Some("development".to_string());
         app.user_id = Some(UserId(42));
+        app.e2e_account_id = Some(rpc::ids::AccountId([0x11; 32]));
 
         let text = app.local_verification_text().unwrap();
 
         assert!(text.starts_with(&format!(
-            "chatt-e2e:v1:{}:42:",
+            "chatt-e2e:v2:{}:42:",
             rpc::base32::encode(&rpc::crypto::dev_server_public_key())
         )));
         assert_eq!(

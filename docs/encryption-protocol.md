@@ -24,64 +24,57 @@ useful as the code moves.
   files are decrypted by the server, so they are not end-to-end encrypted.
 - Direct messages are end-to-end encrypted (text, edits, deletions, and file
   transfers).
-  Each user holds a long-term X25519 identity seed; the per-DM root is a
-  static-static X25519 agreement HKDF-bound to both user ids and public keys,
-  with mirrored directional keys. Every message derives a one-shot
-  ChaCha20-Poly1305 key from a fresh 32-byte salt (no counters, so restarts and
-  concurrent sessions can never reuse a nonce), with AAD binding the envelope
-  version, content class, room id, and sender. Chat plaintexts are zero-padded
-  to 160-byte multiples; sealed file streams are Padmé-padded and their chunks
-  are AEAD frames under a random per-transfer content key carried inside the
-  sealed metadata envelope. Peer keys are server-distributed and become usable
-  immediately under trust on first use (TOFU). Durable pins in `client.toml`
-  bind the DM room id, user id, and X25519 public key, retain the latest display
-  name, and carry an `Accepted` or `Verified` trust level. `Accepted` means the
-  key has only TOFU continuity; `Verified` means that exact key was compared
-  through an independent channel using its 24
-  identity words or a matching Chatt verification card. A server presentation
-  matching a stored pin is only a session-level pin match and never upgrades
-  `Accepted` to `Verified`. The local identity seed is likewise bound to its
-  authenticated user id. First-use and replacement keys become active in memory
-  immediately; an atomic `0600` config replacement preserves continuity across
-  restart. A failed write does not hide plaintext or disable the current session.
-  This is intentionally not a user-facing quarantine model. Quarantining
-  authenticated content would require another durable pending lifecycle across
-  live messages, history, mutations, reconnects, and file transfers, increasing
-  the security-sensitive state and audit surface. It would also create a
-  perverse incentive: accepting a changed identity would become the quickest
-  way to reveal blocked messages, training users to approve first and verify
-  later. That turns trust into an unblock action and weakens the continuity
-  check quarantine was intended to protect. Chatt instead keeps the chat flow
-  available, records the exact opening key on every message, labels content from
-  an unverified key, and keeps first-use or changed-key security state
-  persistently visible in the chat UI. Only exact-key independent verification
-  clears that state.
-  `/identity` and `/identity user` only open exact-key independent verification;
-  there is no blind-accept action. The durable room-id
-  binding remains encryption-required while reconnect room state is rebuilt;
-  reclassifying a pinned DM as public/private fails the connection instead of
-  enabling plaintext fallback. A changed key remains usable but produces a
-  persistent red continuity warning; a display-name change alone does not change
-  trust. Former keys remain receive-only for retained history unless the server
-  later presents one as current again. DM chat and file sender labels use current
-  room-directory display state (or the local configured name for an own echo),
-  never the outer per-message display-name field; names are not trust material.
-  Edit and deletion targets remain visible for server-side ownership checks,
-  but are duplicated inside the authenticated plaintext; clients reject a
-  mutation if the server-visible target differs from the sealed target.
-  Each opened remote message records the exact peer key that authenticated it.
-  The TUI and browser show `(Unverified)` unless that key is independently
-  verified; verification relabels retained messages from the same key without
-  relabeling messages from other keys. Before the server's key response, records
-  use a bounded in-memory ordering queue (2 MiB/1024 controls per room, 16
-  MiB/8192 globally). It is not persisted, and overflow fails the connection
-  instead of silently discarding data. File payloads that race key discovery are
-  declined rather than buffered. Forbidden plaintext/envelope forms still fail closed. Deliberately no
-  ratchet: keys are static so server-fetched DM history stays decryptable, and
-  seed compromise exposes all of that user's DM traffic. The server still sees
-  DM routing metadata (participants, timing, size classes, edit/delete
-  targets), can replay an exact sender envelope within the same
-  room/sender/content class, and DM voice/video stay transport-encrypted only.
+  Each account has a stable Ed25519 authority and an authority-signed,
+  append-only device ledger. Every installation has independent Ed25519 event
+  signing and X25519 delivery keys, a random 128-bit device id, and monotonic
+  key epochs. Ledger actions add devices, rotate a device key with an old-key
+  co-signature, retire a key with final sender-chain heads, revoke a device,
+  rotate the account authority with a new-authority co-signature, and update
+  the recovery-bundle hash. Retired and revoked material is terminal: it can
+  validate history at the roster checkpoint that originally authorized it but
+  can never become current sending or delivery authorization again.
+
+  A sender creates one random content key per event and wraps it independently
+  to every active device on both the sender and recipient accounts using an
+  ephemeral X25519 agreement. The author device signs the complete envelope:
+  random sender event id, room, sender/account/device/key epoch, content class,
+  authenticated creation time, per-room/device sequence and predecessor,
+  both signed roster checkpoints, the exact recipient wrap set, and ciphertext.
+  The server requires a session-bound proof from an active device before it
+  accepts a DM event and rejects events whose author or roster head differs
+  from that binding. A ledger advance invalidates every account session binding
+  until each still-active device validates the new chain and binds again.
+
+  Clients persist peer and local ledger heads and accept only exact append-only
+  extensions. A full response that drops or changes a persisted prefix is a
+  rollback/fork error, including after server data restoration. Before any
+  event effect, clients durably journal its sender event id and ciphertext
+  digest. Exact duplicates, same-id forks, stale live sequences, and broken
+  immediate predecessor chains are discarded. This prevents a relay from
+  replaying an old text, file announcement, edit, or deletion under a fresh
+  server message id. Displayed DM timestamps come from authenticated plaintext;
+  server ids/timestamps remain routing and pagination metadata only.
+
+  File announcements are ordinary signed sender events. Their event id is also
+  included in every file-chunk AEAD transcript, alongside room, sender, and
+  chunk counter, so chunks cannot be transplanted between transfers. Chat
+  plaintexts retain length padding; sealed file streams retain Padmé padding.
+
+  A new account identity is stored in an owner-only, atomic local identity file
+  scoped by server public key and authenticated user id. The server stores only
+  an opaque recovery bundle whose SHA-256 is committed by the signed ledger.
+  `/devices recovery` displays the high-entropy recovery/link code. Supplying
+  that code as `[[servers]].e2e-recovery-code` on a new installation decrypts
+  the bundle locally, signs an `AddDevice` transition, and retains independent
+  device keys; neither code nor authority seed is sent to the server. `/devices`
+  lists device ids and states, and `/devices revoke <device-id-hex>` creates a
+  terminal signed revocation.
+
+  `/identity` verification now compares the stable account id, so legitimate
+  device addition or rotation does not change the human-verified fingerprint.
+  Display names are never trust material. The server still sees DM participants,
+  delivery timing, padded size classes, and server-visible ownership targets;
+  DM voice/video remain transport-encrypted rather than end-to-end encrypted.
 - The default server config sets `security.chat-history-limit = 0`, so the
   server does not retain chat bodies for future room joins. It still keeps
   transient session, room membership, active upload, and P2P routing state in
@@ -96,42 +89,41 @@ useful as the code moves.
 
 ## DM Identity Presentation and Verification
 
-The canonical identity formatter in `src/e2e_identity.rs` validates a 32-byte
-X25519 public key and exposes two losslessly related public presentations:
+The canonical identity formatter in `src/e2e_identity.rs` validates the
+32-byte stable account id and exposes two losslessly related public
+presentations:
 
-- Lowercase hexadecimal is the complete raw key as 64 unseparated digits.
-- `Chatt public-key identity words` append the first eight bits of
-  `SHA-256(public_key)` to the raw 256 key bits, read the 264 bits
+- Lowercase hexadecimal is the complete raw account id as 64 unseparated digits.
+- `Chatt account identity words` append the first eight bits of
+  `SHA-256(account_id)` to the raw 256 identity bits, read the 264 bits
   most-significant-bit first as 24 11-bit indices, and map those indices through
   the 2048 unique lowercase words in `assets/english.txt`.
 
 The hash byte is only a transcription checksum. The words are not a wallet
 seed, recovery phrase, secret, or separate SHA-256 identity fingerprint. The
-first 256 encoded bits are exactly the public key Chatt will pin.
+first 256 encoded bits are exactly the stable account id Chatt will pin.
 
 A public verification card is one canonical line:
 
 ```text
-chatt-e2e:v1:<server-ed25519-key-base32>:<user-id-decimal>:<x25519-key-base32>:<checksum-base32>
+chatt-e2e:v2:<server-ed25519-key-base32>:<user-id-decimal>:<account-id-base32>:<checksum-base32>
 ```
 
 The checksum is the first eight bytes of SHA-256 over the preceding canonical
-ASCII fields. The binary key and checksum fields use Chatt's lowercase,
+ASCII fields. The binary identity and checksum fields use Chatt's lowercase,
 unpadded Crockford base32 encoding; this shortens the card without replacing or
-truncating either public key. The checksum detects damaged pastes; it is not a
+truncating the server key or account id. The checksum detects damaged pastes; it is not a
 signature or proof. The full server Ed25519 key prevents a card from being
 accidentally applied to another configured server, and the user id prevents
 applying it to another account. Import marks a key `Verified` only when server,
-expected peer user id, and exact presented/accepted X25519 key all match.
-Wrong-server, wrong-user, self-card, malformed, checksum, and stale-key cases
+expected peer user id, and exact presented/accepted account id all match.
+Wrong-server, wrong-user, self-card, malformed, checksum, and stale-account cases
 are distinct errors. A key mismatch has no verification action in the dialog.
 
-The Chat status bar and browser warning are projections of the authoritative
-room trust state: `FetchingKey`, `KeyUnavailable`, `Accepted`, or `Verified`.
-Only key discovery and key unavailability temporarily prevent sending.
-`Accepted` remains usable while showing either the yellow first-use warning or a
-red continuity-change warning. Background authentication never opens modal
-stacks; only explicit `/identity` requests open the verification screen.
+The Chat status bar and browser warning project account-level `Accepted` or
+`Verified` state separately from device-ledger authorization. Background
+authentication never opens modal stacks; only explicit `/identity` requests
+open the verification screen.
 
 ## Server Configuration
 
@@ -255,8 +247,9 @@ Shared protocol:
   `RecordProtection`; AEAD framing in `TransportCipher`, `seal_with_key`, and
   `open_with_key`; truncated-HMAC setup proofs in `auth_proof`; replay tracking
   in `AntiReplay`.
-- `crates/rpc/src/e2e.rs`: DM pair-key derivation, envelope sealing/opening,
-  content-class and room/sender AAD, and plaintext padding.
+- `crates/rpc/src/e2e.rs`: account/device ledger validation, signed rotations
+  and revocations, session-binding proofs, multi-recipient event sealing/opening,
+  sender chains, file-event chunk binding, and plaintext padding.
 - `crates/rpc/src/media.rs`: the per-session `MediaProtection` codec and its
   `seal_media`/`open_media` (returning `OpenedMedia` with an `AddressProof`),
   the raw-key peer codec `seal_peer_media`/`open_peer_media`, and `parse_header`.
@@ -267,6 +260,9 @@ Server:
   identity loading in `Config::server_key_pair`; pairing persistence in
   `Config::mark_user_paired`; token helpers in `hash_secret` and
   `verify_secret_hash`.
+- `crates/server/src/device_directory.rs`: durable authority-signed account
+  ledgers, append compare-and-swap validation, current active-device lookup,
+  and opaque recovery bundles.
 - `crates/server/src/main.rs`: server startup in `main` and `Server::bind`;
   invite creation in `Server::create_invite`;
   TCP handshake in `Server::process_frame`; auth dispatch in
@@ -279,13 +275,16 @@ Server:
 
 Client:
 
-- `src/config.rs`: client TOML fields in `ServerEntry`, durable DM identity
-  tuples and trust levels, and runtime persistence in `write_runtime_config`.
-- `src/e2e_identity.rs`: canonical X25519 hex/word presentation and
+- `src/config.rs`: client TOML fields in `ServerEntry`, optional recovery-link
+  code, durable account verification pins, and runtime persistence.
+- `src/e2e_identity.rs`: canonical account-id hex/word presentation and
   context-bound verification-card parsing and checksums.
-- `src/e2e.rs`: pinned-room classification, per-session DM identity state,
-  snapshot-checked TOFU/verification transitions, authenticated sender binding,
-  exact-key message provenance, and chat envelope policy.
+- `src/e2e_store.rs`: owner-only device private keys, account and peer ledger
+  checkpoints, recovery material, sender sequence reservations, and replay
+  journal.
+- `src/e2e.rs`: account recovery/device enrollment, roster-based recipient
+  selection, current-versus-historical key authorization, authenticated sender
+  events, replay observation, and account-level verification projection.
 - `src/app/room.rs`, `src/app/mod.rs`, and `src/tui/overlay.rs`: room-keyed
   trust projection, Chat-bar warnings, requester-scoped dialog routing, and the
   verification interface.
@@ -298,7 +297,8 @@ Client:
   `connect_and_handshake`; public key pin selection in
   `pinned_server_public_key`; first auth or pairing message in
   `run_worker_inner`; control send in `WorkerState::queue_control`;
-  server message handling and the transient pre-key ordering queue in
+  account-ledger synchronization and device session binding; server message
+  handling and the transient pre-ledger ordering queue in
   `WorkerState::handle_control`, `defer_e2e`, and `drain_deferred_e2e_room`;
   UDP media send and receive in
   `WorkerState::send_media`, `WorkerState::handle_udp_packet`, and
@@ -313,10 +313,12 @@ Client:
   Rust implementation is chosen.
 - Implement session rekeying. Constants exist for rekey timing, but the current
   transport does not perform an in-band rekey.
+- Add an externally auditable key-transparency log or witness gossip for account
+  ledger heads. Signed client checkpoints already make rollback/forks locally
+  detectable, but independent witnesses would make equivocation detectable
+  across clients that never communicate.
 - If public/private room content must survive server compromise, add group
-  end-to-end encryption. Direct messages use TOFU client identity keys and
-  support independent word/card verification; multi-device identity
-  policy and key transparency remain future work.
+  end-to-end encryption; the account/device primitives currently protect DMs.
 
 References:
 

@@ -1,4 +1,4 @@
-//! Canonical, public presentations of a Chatt X25519 identity.
+//! Canonical, public presentations of a Chatt account identity.
 //!
 //! These values contain no private key material. The word form encodes the
 //! exact 256-bit public key plus an eight-bit error-detection checksum; the
@@ -12,7 +12,7 @@ const PUBLIC_KEY_LEN: usize = 32;
 const WORD_COUNT: usize = 24;
 const WORD_BITS: usize = 11;
 const VERIFICATION_TEXT_CHECKSUM_BYTES: usize = 8;
-const VERIFICATION_TEXT_PREFIX: &str = "chatt-e2e:v1";
+const VERIFICATION_TEXT_PREFIX: &str = "chatt-e2e:v2";
 const WORDLIST_TEXT: &str = include_str!("../assets/english.txt");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,7 +104,7 @@ impl VerificationText {
     pub(crate) fn parse(value: &str) -> Result<Self, VerificationTextError> {
         let value = value.trim();
         let mut fields = value.split(':');
-        if fields.next() != Some("chatt-e2e") || fields.next() != Some("v1") {
+        if fields.next() != Some("chatt-e2e") || fields.next() != Some("v2") {
             return Err(VerificationTextError::UnsupportedVersion);
         }
         let server_base32 = fields.next().ok_or(VerificationTextError::Malformed)?;

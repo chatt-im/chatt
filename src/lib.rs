@@ -14,6 +14,7 @@ mod config;
 mod config_diagnostics;
 mod e2e;
 mod e2e_identity;
+mod e2e_store;
 mod file_compression;
 mod fuzzy;
 mod highlight;

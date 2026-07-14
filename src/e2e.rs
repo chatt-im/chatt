@@ -1,16 +1,16 @@
-//! Client-side DM end-to-end encryption state.
+//! Client-side account/device end-to-end encryption state.
 //!
-//! The network worker owns this state. It binds a DM key to the complete
-//! `(room id, user id, public key)` identity presented at authentication, keeps
-//! former keys for retained history, and reports exact-key provenance for every
-//! authenticated DM message.
+//! The network worker owns a server-scoped account authority, an independent
+//! signing/encryption key pair for this installation, persisted peer ledger
+//! checkpoints, per-device sender chains, and the replay journal. New events
+//! are signed by the author device and their one-time content key is wrapped
+//! to every active device on both DM accounts.
 //!
-//! Identity continuity is deliberately visible state, not a gate on readable
-//! authenticated content. A first or replacement key becomes usable under
-//! TOFU, while exact-key provenance lets every view mark its messages
-//! unverified and a persistent security indicator reports whether an accepted
-//! key replaced an accepted or independently verified identity. Independent
-//! verification upgrades only the exact active key.
+//! The UI's contact fingerprint represents the stable account id. Device keys
+//! are authorized only by the append-only authority-signed ledger; retired or
+//! revoked keys remain eligible solely for historical signature validation at
+//! the roster checkpoint that originally authorized them. They can never be
+//! selected again for current sending authorization.
 //!
 //! Do not turn identity changes into a user-facing plaintext quarantine. A
 //! quarantine needs another durable pending-content lifecycle across history,
@@ -29,12 +29,19 @@ use ring::rand::SystemRandom;
 use rpc::control::{ChatMessage, RoomInfo, RoomKind};
 use rpc::crypto::{decode_hex, encode_hex};
 use rpc::e2e::{
-    DmContent, DmContentKind, DmPairKeys, DmPlaintext, E2E_PUBLIC_KEY_LEN, E2E_SEED_LEN,
-    dm_pair_keys, e2e_public_key, open_dm_envelope, seal_dm_envelope,
+    AccountKeyAction, AccountKeyStatement, AccountKeyStatementBody, DeviceKeyStatus, DmContent,
+    DmContentKind, DmEventEnvelope, DmPairKeys, DmPlaintext, E2E_PUBLIC_KEY_LEN, E2E_SEED_LEN,
+    EventRecipient, RosterCheckpoint, SenderEventHeader, ValidatedAccountLedger,
+    account_statement_hash, dm_pair_keys, open_dm_envelope, open_dm_event,
+    seal_dm_envelope, seal_dm_event, sign_account_statement, sign_device_binding,
 };
-use rpc::ids::{MessageId, RoomId, UserId};
+use rpc::ids::{LedgerHash, MessageId, RoomId, SessionId, UserId};
 
 use crate::config::{E2ePeerIdentity, E2ePeerPin, E2eTrustLevel};
+use crate::e2e_store::{LocalE2eIdentity, ReplayObservation};
+
+#[cfg(test)]
+use rpc::e2e::e2e_public_key;
 
 pub struct E2eState {
     seed: Option<[u8; E2E_SEED_LEN]>,
@@ -43,6 +50,8 @@ pub struct E2eState {
     my_id: Option<UserId>,
     stored_pins: Vec<E2ePeerPin>,
     rooms: HashMap<RoomId, DmRoom>,
+    device_identity: Option<LocalE2eIdentity>,
+    pending_recovery: Option<PendingRecovery>,
     next_presentation: u64,
     rng: SystemRandom,
 }
@@ -65,6 +74,15 @@ struct DmRoom {
     /// Trust level of the identity replaced by the current key while that
     /// continuity change remains independently unconfirmed.
     change_from: Option<E2eTrustLevel>,
+}
+
+struct PendingRecovery {
+    base_statements: Vec<AccountKeyStatement>,
+    ledger: ValidatedAccountLedger,
+    authority_seed: Option<[u8; 32]>,
+    recovery_secret: Option<[u8; rpc::crypto::KEY_LEN]>,
+    recovery_bundle: Option<Vec<u8>>,
+    add_statement: Option<AccountKeyStatement>,
 }
 
 struct TrustedIdentity {
@@ -140,6 +158,8 @@ pub struct OpenedDm {
     pub sender_name: String,
     /// Exact peer identity key that authenticated this envelope.
     pub peer_public_key: [u8; E2E_PUBLIC_KEY_LEN],
+    /// Present for the multi-device event format.
+    pub event: Option<SenderEventHeader>,
 }
 
 /// Client-local provenance attached after a DM envelope authenticates. The
@@ -176,6 +196,8 @@ pub enum OpenFailure {
     /// to the DM is a protocol violation.
     Policy,
     Crypto,
+    /// The authenticated sender event was already applied or is stale.
+    Replay,
 }
 
 impl E2eState {
@@ -198,17 +220,296 @@ impl E2eState {
             my_id: None,
             stored_pins: pins.to_vec(),
             rooms: HashMap::new(),
+            device_identity: None,
+            pending_recovery: None,
             next_presentation: 0,
             rng: SystemRandom::new(),
         }
     }
 
+    pub fn initialize_device(
+        &mut self,
+        server_public_key: &[u8],
+        user_id: UserId,
+    ) -> Result<bool, String> {
+        let (identity, created) =
+            LocalE2eIdentity::load_or_create(server_public_key, user_id, &self.rng)?;
+        self.device_identity = Some(identity);
+        self.my_id = Some(user_id);
+        self.configured_local_user = Some(user_id);
+        self.local_user_persisted = true;
+        Ok(created)
+    }
+
+    pub fn account_chain_after(&self, user_id: UserId) -> Option<LedgerHash> {
+        let identity = self.device_identity.as_ref()?;
+        let statements = if user_id == identity.user_id() {
+            identity.own_statements()
+        } else {
+            identity.peer_statements(user_id)?
+        };
+        statements.last().map(account_statement_hash)
+    }
+
+    pub fn own_genesis(&self) -> Option<AccountKeyStatement> {
+        self.device_identity
+            .as_ref()?
+            .own_statements()
+            .first()
+            .cloned()
+    }
+
+    /// Merges a directory reply only when it extends the exact persisted
+    /// checkpoint requested by this client. A full response is still checked
+    /// against the persisted prefix, turning a server restore or fork into a
+    /// hard continuity error instead of silently making an older roster
+    /// current again.
+    pub fn apply_account_chain(
+        &mut self,
+        user_id: UserId,
+        base: Option<LedgerHash>,
+        suffix: Vec<AccountKeyStatement>,
+    ) -> Result<Option<ValidatedAccountLedger>, String> {
+        let identity = self
+            .device_identity
+            .as_mut()
+            .ok_or_else(|| "account ledger arrived before local E2E initialization".to_string())?;
+        let known = if user_id == identity.user_id() {
+            Some(identity.own_statements())
+        } else {
+            identity.peer_statements(user_id)
+        };
+        let statements = match base {
+            Some(base) => {
+                let known = known.ok_or_else(|| {
+                    "account ledger suffix arrived without a local base".to_string()
+                })?;
+                if known.last().map(account_statement_hash) != Some(base) {
+                    return Err("account ledger suffix does not extend the requested checkpoint"
+                        .to_string());
+                }
+                let mut merged = known.to_vec();
+                merged.extend(suffix);
+                merged
+            }
+            None => suffix,
+        };
+        if statements.is_empty() {
+            if known.is_some()
+                && (user_id != identity.user_id() || identity.server_registered())
+            {
+                return Err(
+                    "account directory lost a previously persisted signed ledger".to_string(),
+                );
+            }
+            return Ok(None);
+        }
+        if user_id == identity.user_id() {
+            match identity.replace_own_ledger(statements.clone()) {
+                Ok(ledger) => Ok(Some(ledger)),
+                Err(error) => {
+                    let Some(pending) = self.pending_recovery.as_ref() else {
+                        return Err(error);
+                    };
+                    let linked = pending.add_statement.as_ref().is_some_and(|add| {
+                        statements.len() == pending.base_statements.len() + 1
+                            && statements[..pending.base_statements.len()]
+                                == pending.base_statements
+                            && statements.last() == Some(add)
+                    });
+                    if !linked {
+                        return Err(error);
+                    }
+                    let authority_seed = pending
+                        .authority_seed
+                        .ok_or_else(|| "recovery authority is unavailable".to_string())?;
+                    let recovery_secret = pending
+                        .recovery_secret
+                        .ok_or_else(|| "recovery secret is unavailable".to_string())?;
+                    let recovery_bundle = pending
+                        .recovery_bundle
+                        .clone()
+                        .ok_or_else(|| "recovery bundle is unavailable".to_string())?;
+                    let ledger = identity.adopt_linked_account(
+                        statements,
+                        authority_seed,
+                        recovery_secret,
+                        recovery_bundle,
+                    )?;
+                    self.pending_recovery = None;
+                    Ok(Some(ledger))
+                }
+            }
+        } else {
+            identity.store_peer_ledger(user_id, statements).map(Some)
+        }
+    }
+
+    pub fn account_ledger(&self, user_id: UserId) -> Option<ValidatedAccountLedger> {
+        let identity = self.device_identity.as_ref()?;
+        let statements = if user_id == identity.user_id() {
+            identity.own_statements()
+        } else {
+            identity.peer_statements(user_id)?
+        };
+        ValidatedAccountLedger::validate(identity.server_public_key(), user_id, statements).ok()
+    }
+
+    pub fn device_binding(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(rpc::ids::DeviceId, u64, LedgerHash, Vec<u8>), String> {
+        let identity = self
+            .device_identity
+            .as_ref()
+            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
+        let ledger = identity.own_ledger();
+        let signature = sign_device_binding(
+            identity.signing_seed(),
+            session_id,
+            identity.user_id(),
+            identity.device_id(),
+            identity.device_key_epoch(),
+            ledger.head,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok((
+            identity.device_id(),
+            identity.device_key_epoch(),
+            ledger.head,
+            signature,
+        ))
+    }
+
+    pub fn recovery_bundle(&self) -> Option<(LedgerHash, Vec<u8>)> {
+        let identity = self.device_identity.as_ref()?;
+        Some((identity.own_ledger().head, identity.recovery_bundle().to_vec()))
+    }
+
+    pub fn recovery_code(&self) -> Option<String> {
+        Some(self.device_identity.as_ref()?.recovery_code())
+    }
+
+    pub fn revoke_device_statement(
+        &self,
+        device_id: rpc::ids::DeviceId,
+    ) -> Result<AccountKeyStatement, String> {
+        let identity = self
+            .device_identity
+            .as_ref()
+            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
+        let ledger = identity.own_ledger();
+        if !ledger
+            .device_keys
+            .iter()
+            .any(|key| key.keys.device_id == device_id)
+        {
+            return Err("cannot revoke an unknown account device".to_string());
+        }
+        identity.sign_next_account_action(AccountKeyAction::RevokeDevice { device_id })
+    }
+
+    pub fn device_descriptions(&self) -> Result<Vec<String>, String> {
+        let identity = self
+            .device_identity
+            .as_ref()
+            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
+        let current = identity.device_id();
+        Ok(identity
+            .own_ledger()
+            .device_keys
+            .into_iter()
+            .map(|key| {
+                let state = match key.status {
+                    DeviceKeyStatus::Active => "active",
+                    DeviceKeyStatus::Retired => "retired",
+                    DeviceKeyStatus::Revoked => "revoked",
+                };
+                format!(
+                    "{} epoch {} {state}{}",
+                    rpc::crypto::encode_hex(&key.keys.device_id.0),
+                    key.keys.key_epoch,
+                    if key.keys.device_id == current {
+                        " (this device)"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect())
+    }
+
+    pub fn stage_recovery_chain(
+        &mut self,
+        statements: Vec<AccountKeyStatement>,
+    ) -> Result<ValidatedAccountLedger, String> {
+        let identity = self
+            .device_identity
+            .as_ref()
+            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
+        let ledger = ValidatedAccountLedger::validate(
+            identity.server_public_key(),
+            identity.user_id(),
+            &statements,
+        )?;
+        if ledger.account_id == identity.account_id() {
+            return Err("recovery was requested for the current account identity".to_string());
+        }
+        self.pending_recovery = Some(PendingRecovery {
+            base_statements: statements,
+            ledger: ledger.clone(),
+            authority_seed: None,
+            recovery_secret: None,
+            recovery_bundle: None,
+            add_statement: None,
+        });
+        Ok(ledger)
+    }
+
+    pub fn finish_recovery_link(
+        &mut self,
+        recovery_code: &str,
+        bundle: Vec<u8>,
+    ) -> Result<AccountKeyStatement, String> {
+        let identity = self
+            .device_identity
+            .as_ref()
+            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
+        let pending = self
+            .pending_recovery
+            .as_mut()
+            .ok_or_else(|| "no account recovery is pending".to_string())?;
+        let (authority_seed, recovery_secret) =
+            identity.recover_authority(&pending.ledger, &bundle, recovery_code)?;
+        let statement = sign_account_statement(
+            AccountKeyStatementBody {
+                account_id: pending.ledger.account_id,
+                account_generation: pending.ledger.account_generation,
+                roster_epoch: pending.ledger.roster_epoch.saturating_add(1),
+                previous: pending.ledger.head,
+                authority_key_epoch: pending.ledger.authority_key_epoch,
+                action: AccountKeyAction::AddDevice {
+                    device: identity.device_public_keys()?,
+                },
+            },
+            &authority_seed,
+            None,
+        )?;
+        pending.authority_seed = Some(authority_seed);
+        pending.recovery_secret = Some(recovery_secret);
+        pending.recovery_bundle = Some(bundle);
+        pending.add_statement = Some(statement.clone());
+        Ok(statement)
+    }
+
+    #[cfg(test)]
     pub fn public_key(&self) -> Option<[u8; E2E_PUBLIC_KEY_LEN]> {
         self.seed.as_ref().map(e2e_public_key)
     }
 
     /// Pins the seed to its authenticated account and clears per-session room
     /// state. The caller persists a first observed local id before reconnect.
+    #[cfg(test)]
     pub fn set_local_user(&mut self, user_id: UserId) -> Result<bool, String> {
         if let Some(expected) = self.configured_local_user
             && expected != user_id
@@ -224,16 +525,6 @@ impl E2eState {
         self.local_user_persisted = !first_observation;
         self.rooms.clear();
         Ok(first_observation)
-    }
-
-    pub fn confirm_local_user(&mut self, user_id: UserId, persisted: bool) -> bool {
-        if self.my_id != Some(user_id) || self.local_user_persisted {
-            return false;
-        }
-        if persisted {
-            self.local_user_persisted = true;
-        }
-        true
     }
 
     /// Registers one authenticated room. DM mappings are immutable within a
@@ -381,21 +672,18 @@ impl E2eState {
         });
         if let Some(index) = exact {
             if index != 0 {
-                let replacing = room.trusted.first().map(|identity| identity.trust_level);
-                let returning = room.trusted[index].trust_level;
-                room.change_from = if returning == E2eTrustLevel::Verified {
-                    None
-                } else {
-                    match (room.change_from, replacing) {
-                        (Some(E2eTrustLevel::Verified), _) | (_, Some(E2eTrustLevel::Verified)) => {
-                            Some(E2eTrustLevel::Verified)
-                        }
-                        (Some(level), _) | (None, Some(level)) => Some(level),
-                        (None, None) => None,
-                    }
+                // Historical material is decryption-only. Directory order can
+                // never turn it back into current sending authorization, even
+                // when that exact key was independently verified in the past.
+                room.presented = None;
+                room.trust_pending = true;
+                room.pin_matched_this_session = false;
+                room.key_unavailable = true;
+                return PeerIdentityOutcome::KeyUnavailable {
+                    room_id,
+                    user_id: peer_id,
+                    username: room.username.clone(),
                 };
-                let trusted = room.trusted.remove(index);
-                room.trusted.insert(0, trusted);
             }
             room.presented = None;
             room.key_unavailable = false;
@@ -594,7 +882,7 @@ impl E2eState {
     }
 
     pub fn seal_chat(
-        &self,
+        &mut self,
         room_id: RoomId,
         kind: DmContentKind,
         target: Option<MessageId>,
@@ -621,11 +909,14 @@ impl E2eState {
     }
 
     pub fn seal_content(
-        &self,
+        &mut self,
         room_id: RoomId,
         content: DmContent,
         sent_at_ms: u64,
     ) -> Result<Vec<u8>, SealBlocked> {
+        if self.device_identity.is_some() {
+            return self.seal_event_content(room_id, content, sent_at_ms);
+        }
         if self.seed.is_none() || !self.local_user_persisted {
             return Err(SealBlocked::NoIdentity);
         }
@@ -655,6 +946,80 @@ impl E2eState {
         .map_err(|_| SealBlocked::Crypto)
     }
 
+    fn seal_event_content(
+        &mut self,
+        room_id: RoomId,
+        content: DmContent,
+        sent_at_ms: u64,
+    ) -> Result<Vec<u8>, SealBlocked> {
+        let sender = self.my_id.ok_or(SealBlocked::NoIdentity)?;
+        let peer = self
+            .rooms
+            .get(&room_id)
+            .map(|room| room.peer)
+            .ok_or(SealBlocked::PeerKeyMissing)?;
+        let own_ledger = self
+            .account_ledger(sender)
+            .ok_or(SealBlocked::NoIdentity)?;
+        let peer_ledger = self
+            .account_ledger(peer)
+            .ok_or(SealBlocked::PeerKeyMissing)?;
+        let mut recipients = Vec::new();
+        for (user_id, ledger) in [(sender, &own_ledger), (peer, &peer_ledger)] {
+            for device in ledger.active_devices() {
+                let encryption_public_key = device
+                    .encryption_public_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SealBlocked::Crypto)?;
+                recipients.push(EventRecipient {
+                    user_id,
+                    account_id: ledger.account_id,
+                    device_id: device.device_id,
+                    key_epoch: device.key_epoch,
+                    encryption_public_key,
+                });
+            }
+        }
+        let identity = self
+            .device_identity
+            .as_mut()
+            .ok_or(SealBlocked::NoIdentity)?;
+        let reserved = identity
+            .reserve_event(room_id, &self.rng)
+            .map_err(|_| SealBlocked::Crypto)?;
+        let header = SenderEventHeader {
+            event_id: reserved.event_id,
+            room_id,
+            sender,
+            sender_account: own_ledger.account_id,
+            author_device: identity.device_id(),
+            author_key_epoch: identity.device_key_epoch(),
+            sequence: reserved.sequence,
+            predecessor: reserved.predecessor,
+            kind: content.kind(),
+            created_at_ms: sent_at_ms,
+            semantic_target: None,
+            sender_roster: RosterCheckpoint::from(&own_ledger),
+            recipient_roster: RosterCheckpoint::from(&peer_ledger),
+        };
+        let sealed = seal_dm_event(
+            identity.signing_seed(),
+            header,
+            &DmPlaintext {
+                sent_at_ms,
+                content,
+            },
+            &recipients,
+            &self.rng,
+        )
+        .map_err(|_| SealBlocked::Crypto)?;
+        identity
+            .commit_sent_event(room_id, reserved.event_id)
+            .map_err(|_| SealBlocked::Crypto)?;
+        Ok(sealed)
+    }
+
     pub fn open_envelope(
         &self,
         room_id: RoomId,
@@ -662,7 +1027,18 @@ impl E2eState {
         kind: DmContentKind,
         envelope: &[u8],
         own_username: &str,
+        live: bool,
     ) -> Result<OpenedDm, OpenFailure> {
+        if self.device_identity.is_some() {
+            return self.open_event_envelope(
+                room_id,
+                sender,
+                kind,
+                envelope,
+                own_username,
+                live,
+            );
+        }
         let my_id = self.my_id.ok_or(OpenFailure::NoKeys)?;
         let room = self.rooms.get(&room_id).ok_or(OpenFailure::Policy)?;
         let sender_is_trusted = sender == my_id
@@ -696,6 +1072,7 @@ impl E2eState {
                         room.username.clone()
                     },
                     peer_public_key: identity.public_key,
+                    event: None,
                 });
                 break;
             }
@@ -748,13 +1125,194 @@ impl E2eState {
         }
     }
 
+    fn open_event_envelope(
+        &self,
+        room_id: RoomId,
+        sender: UserId,
+        kind: DmContentKind,
+        encoded: &[u8],
+        own_username: &str,
+        live: bool,
+    ) -> Result<OpenedDm, OpenFailure> {
+        let identity = self.device_identity.as_ref().ok_or(OpenFailure::NoKeys)?;
+        let my_id = identity.user_id();
+        let room = self.rooms.get(&room_id).ok_or(OpenFailure::Policy)?;
+        if sender != my_id && sender != room.peer {
+            return Err(OpenFailure::Policy);
+        }
+        let envelope: DmEventEnvelope =
+            jsony::from_binary(encoded).map_err(|_| OpenFailure::Crypto)?;
+        let header = envelope.header;
+        if header.room_id != room_id
+            || header.sender != sender
+            || header.kind != kind
+            || header.sequence == 0
+        {
+            return Err(OpenFailure::Policy);
+        }
+        let recipient = if sender == my_id { room.peer } else { my_id };
+        let sender_ledger = self.ledger_at_checkpoint(sender, header.sender_roster)?;
+        let recipient_ledger = self.ledger_at_checkpoint(recipient, header.recipient_roster)?;
+        if live && RosterCheckpoint::from(&self.account_ledger(sender).ok_or(OpenFailure::NoKeys)?)
+            != header.sender_roster
+        {
+            return Err(OpenFailure::Crypto);
+        }
+        if header.sender_account != sender_ledger.account_id {
+            return Err(OpenFailure::Policy);
+        }
+        let author = sender_ledger
+            .device_key(header.author_device, header.author_key_epoch)
+            .filter(|key| key.status == DeviceKeyStatus::Active)
+            .ok_or(OpenFailure::Crypto)?;
+        let author_signing_public_key = author
+            .keys
+            .signing_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| OpenFailure::Crypto)?;
+
+        let mut expected_recipients = Vec::new();
+        for (user_id, ledger) in [(sender, &sender_ledger), (recipient, &recipient_ledger)] {
+            for device in ledger.active_devices() {
+                expected_recipients.push((
+                    user_id,
+                    ledger.account_id,
+                    device.device_id,
+                    device.key_epoch,
+                ));
+            }
+        }
+        expected_recipients.sort_unstable();
+        let mut actual_recipients: Vec<_> = envelope
+            .recipient_keys
+            .iter()
+            .map(|key| (key.user_id, key.account_id, key.device_id, key.key_epoch))
+            .collect();
+        actual_recipients.sort_unstable();
+        if actual_recipients != expected_recipients {
+            return Err(OpenFailure::Crypto);
+        }
+
+        let opened = open_dm_event(
+            encoded,
+            author_signing_public_key,
+            my_id,
+            identity.account_id(),
+            identity.device_id(),
+            identity.device_key_epoch(),
+            identity.encryption_seed(),
+        )
+        .map_err(|_| OpenFailure::Crypto)?;
+        if opened.header != header || opened.plaintext.sent_at_ms != header.created_at_ms {
+            return Err(OpenFailure::Crypto);
+        }
+        Ok(OpenedDm {
+            plaintext: opened.plaintext,
+            sender_name: if sender == my_id {
+                own_username.to_string()
+            } else {
+                room.username.clone()
+            },
+            peer_public_key: if sender == my_id {
+                recipient_ledger.account_id.0
+            } else {
+                sender_ledger.account_id.0
+            },
+            event: Some(header),
+        })
+    }
+
+    fn ledger_at_checkpoint(
+        &self,
+        user_id: UserId,
+        checkpoint: RosterCheckpoint,
+    ) -> Result<ValidatedAccountLedger, OpenFailure> {
+        let identity = self.device_identity.as_ref().ok_or(OpenFailure::NoKeys)?;
+        let statements = if user_id == identity.user_id() {
+            identity.own_statements()
+        } else {
+            identity.peer_statements(user_id).ok_or(OpenFailure::NoKeys)?
+        };
+        let Some(index) = statements
+            .iter()
+            .position(|statement| account_statement_hash(statement) == checkpoint.head)
+        else {
+            let current = ValidatedAccountLedger::validate(
+                identity.server_public_key(),
+                user_id,
+                statements,
+            )
+            .map_err(|_| OpenFailure::Crypto)?;
+            return if current.roster_epoch < checkpoint.roster_epoch {
+                Err(OpenFailure::NoKeys)
+            } else {
+                Err(OpenFailure::Crypto)
+            };
+        };
+        let ledger = ValidatedAccountLedger::validate(
+            identity.server_public_key(),
+            user_id,
+            &statements[..=index],
+        )
+        .map_err(|_| OpenFailure::Crypto)?;
+        if RosterCheckpoint::from(&ledger) != checkpoint {
+            return Err(OpenFailure::Crypto);
+        }
+        Ok(ledger)
+    }
+
+    pub fn record_opened_event(
+        &mut self,
+        opened: &OpenedDm,
+        encoded: &[u8],
+        live: bool,
+    ) -> Result<(), OpenFailure> {
+        let Some(header) = opened.event else {
+            return Ok(());
+        };
+        let observation = self
+            .device_identity
+            .as_mut()
+            .ok_or(OpenFailure::NoKeys)?
+            .observe_event(
+                header.sender,
+                header.author_device,
+                header.author_key_epoch,
+                header.room_id,
+                header.sequence,
+                header.predecessor,
+                header.event_id,
+                encoded,
+                live,
+            )
+            .map_err(|_| OpenFailure::Crypto)?;
+        if observation == ReplayObservation::Fresh {
+            Ok(())
+        } else {
+            Err(OpenFailure::Replay)
+        }
+    }
+
+    pub fn mark_opened_event_applied(&mut self, opened: &OpenedDm) -> Result<(), OpenFailure> {
+        let Some(header) = opened.event else {
+            return Ok(());
+        };
+        self.device_identity
+            .as_mut()
+            .ok_or(OpenFailure::NoKeys)?
+            .mark_event_applied(header.event_id)
+            .map_err(|_| OpenFailure::Crypto)
+    }
+
     /// Opens a chat message in place. Receive policy is deliberately strict:
     /// every known DM must carry an envelope and public-room envelopes are
     /// rejected instead of interpreted as plaintext.
-    pub fn open_message(
-        &self,
+    pub fn open_message_with_replay(
+        &mut self,
         message: &mut ChatMessage,
         own_username: &str,
+        live: bool,
     ) -> Result<Option<MessageProvenance>, OpenFailure> {
         let is_dm = self.requires_e2e(message.room_id);
         let Some(envelope) = message.envelope.take() else {
@@ -783,6 +1341,7 @@ impl E2eState {
             kind,
             &envelope,
             own_username,
+            live,
         ) {
             Ok(opened) => opened,
             Err(failure) => {
@@ -800,6 +1359,9 @@ impl E2eState {
                 sender_ms = plaintext.sent_at_ms
             );
         }
+        // Display and persist the sender-authenticated timestamp. The outer
+        // relay timestamp remains only a delivery/pagination hint.
+        message.timestamp_ms = plaintext.sent_at_ms;
         let body = match plaintext.content {
             DmContent::Text { body } => body,
             DmContent::Edit { target, body } if message.target == Some(target) => body,
@@ -814,11 +1376,48 @@ impl E2eState {
                 return Err(OpenFailure::Crypto);
             }
         };
+        if let Some(header) = opened.event {
+            let observation = self
+                .device_identity
+                .as_mut()
+                .ok_or(OpenFailure::NoKeys)?
+                .observe_event(
+                    header.sender,
+                    header.author_device,
+                    header.author_key_epoch,
+                    header.room_id,
+                    header.sequence,
+                    header.predecessor,
+                    header.event_id,
+                    &envelope,
+                    live,
+                )
+                .map_err(|_| OpenFailure::Crypto)?;
+            if observation != ReplayObservation::Fresh {
+                return Err(OpenFailure::Replay);
+            }
+        }
         message.sender_name = opened.sender_name;
         message.body = body;
+        if let Some(header) = opened.event {
+            self.device_identity
+                .as_mut()
+                .ok_or(OpenFailure::NoKeys)?
+                .mark_event_applied(header.event_id)
+                .map_err(|_| OpenFailure::Crypto)?;
+        }
         Ok(Some(MessageProvenance {
             peer_public_key: opened.peer_public_key,
         }))
+    }
+
+    #[cfg(test)]
+    pub fn open_message(
+        &mut self,
+        message: &mut ChatMessage,
+        own_username: &str,
+    ) -> Result<Option<MessageProvenance>, OpenFailure> {
+        self.open_message_with_replay(message, own_username, true)
     }
 
     fn find_contact_pin(&self, room_id: RoomId, peer: UserId) -> Option<&E2ePeerPin> {
@@ -848,7 +1447,11 @@ impl E2eState {
         peer_id: UserId,
         peer_public: &[u8; E2E_PUBLIC_KEY_LEN],
     ) -> Option<DmPairKeys> {
-        let seed = self.seed.as_ref()?;
+        let seed = self
+            .device_identity
+            .as_ref()
+            .map(LocalE2eIdentity::encryption_seed)
+            .or(self.seed.as_ref())?;
         let my_id = self.my_id?;
         dm_pair_keys(seed, my_id, peer_public, peer_id)
             .map_err(|error| {
@@ -1100,7 +1703,7 @@ mod tests {
 
     #[test]
     fn key_change_stages_atomically_then_retains_old_history() {
-        let (mut alice, bob) = linked_pair();
+        let (mut alice, mut bob) = linked_pair();
         let old = bob
             .seal_chat(RoomId(9), DmContentKind::Text, None, "old", 1_000)
             .unwrap();
@@ -1185,7 +1788,7 @@ mod tests {
     }
 
     #[test]
-    fn verifying_second_key_does_not_verify_first_key() {
+    fn historical_verified_key_cannot_become_current_again() {
         let (mut alice, bob) = linked_pair();
         let first_key = bob.public_key().unwrap();
         let second_key = e2e_public_key(&[3; E2E_SEED_LEN]);
@@ -1206,14 +1809,11 @@ mod tests {
         assert_eq!(verified.verified_keys, vec![second_key]);
         assert!(!verified.verified_keys.contains(&first_key));
 
-        let PeerIdentityOutcome::PinMatched(returned) =
-            alice.handle_peer_key(UserId(2), Some(&first_key))
-        else {
-            panic!("retained exact key should remain usable");
-        };
-        assert_eq!(returned.trust_level, E2eTrustLevel::Accepted);
-        assert_eq!(returned.change_from, Some(E2eTrustLevel::Verified));
-        assert_eq!(returned.verified_keys, vec![second_key]);
+        assert!(matches!(
+            alice.handle_peer_key(UserId(2), Some(&first_key)),
+            PeerIdentityOutcome::KeyUnavailable { .. }
+        ));
+        assert!(alice.accepted_identity(UserId(2)).is_none());
     }
 
     #[test]
@@ -1245,7 +1845,7 @@ mod tests {
 
     #[test]
     fn username_change_is_display_only_and_keeps_messages_usable() {
-        let (mut alice, bob) = linked_pair();
+        let (mut alice, mut bob) = linked_pair();
         let before_rename = alice.accepted_identity(UserId(2)).unwrap();
         let envelope = bob
             .seal_chat(RoomId(9), DmContentKind::Text, None, "before rename", 1_000)
@@ -1401,7 +2001,7 @@ mod tests {
 
     #[test]
     fn dm_plaintext_and_wrong_sender_fail_closed() {
-        let (alice, _) = linked_pair();
+        let (mut alice, _) = linked_pair();
         let mut plaintext = text_message(RoomId(9), UserId(2), None);
         assert_eq!(
             alice.open_message(&mut plaintext, "alice"),
@@ -1416,7 +2016,7 @@ mod tests {
 
     #[test]
     fn dm_mutations_authenticate_kind_and_target() {
-        let (alice, bob) = linked_pair();
+        let (mut alice, mut bob) = linked_pair();
         let target = MessageId(17);
 
         let edit_envelope = bob
