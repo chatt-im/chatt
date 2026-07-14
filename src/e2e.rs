@@ -26,6 +26,7 @@
 
 use hashbrown::HashMap;
 use ring::rand::SystemRandom;
+use std::path::PathBuf;
 use rpc::control::{ChatMessage, RoomInfo, RoomKind};
 use rpc::crypto::{decode_hex, encode_hex};
 use rpc::e2e::{
@@ -51,6 +52,7 @@ pub struct E2eState {
     stored_pins: Vec<E2ePeerPin>,
     rooms: HashMap<RoomId, DmRoom>,
     device_identity: Option<LocalE2eIdentity>,
+    data_dir: Option<PathBuf>,
     next_presentation: u64,
     rng: SystemRandom,
 }
@@ -212,6 +214,7 @@ impl E2eState {
         seed_hex: Option<&str>,
         configured_local_user: Option<UserId>,
         pins: &[E2ePeerPin],
+        data_dir: Option<PathBuf>,
     ) -> Self {
         let seed = seed_hex.and_then(|hex| {
             let Ok(seed) = decode_hex(hex) else {
@@ -228,6 +231,7 @@ impl E2eState {
             stored_pins: pins.to_vec(),
             rooms: HashMap::new(),
             device_identity: None,
+            data_dir,
             next_presentation: 0,
             rng: SystemRandom::new(),
         }
@@ -239,8 +243,16 @@ impl E2eState {
         user_id: UserId,
         device_name: &str,
     ) -> Result<bool, String> {
-        let (identity, created) =
-            LocalE2eIdentity::load_or_create(server_public_key, user_id, device_name, &self.rng)?;
+        let data_dir = self.data_dir.as_deref().ok_or_else(|| {
+            "HOME is not set; cannot store the E2E device identity".to_string()
+        })?;
+        let (identity, created) = LocalE2eIdentity::load_or_create(
+            data_dir,
+            server_public_key,
+            user_id,
+            device_name,
+            &self.rng,
+        )?;
         self.device_identity = Some(identity);
         self.my_id = Some(user_id);
         self.configured_local_user = Some(user_id);
@@ -1533,7 +1545,12 @@ mod tests {
     }
 
     fn seeded(seed: u8, my_id: UserId) -> E2eState {
-        let mut state = E2eState::new(Some(&encode_hex(&[seed; E2E_SEED_LEN])), Some(my_id), &[]);
+        let mut state = E2eState::new(
+            Some(&encode_hex(&[seed; E2E_SEED_LEN])),
+            Some(my_id),
+            &[],
+            None,
+        );
         state.set_local_user(my_id).unwrap();
         state
     }
@@ -1781,6 +1798,7 @@ mod tests {
             Some(&encode_hex(&[1; E2E_SEED_LEN])),
             Some(UserId(1)),
             &pins,
+            None,
         );
         reconnect.set_local_user(UserId(1)).unwrap();
 
@@ -1916,6 +1934,7 @@ mod tests {
             Some(&encode_hex(&[1; E2E_SEED_LEN])),
             Some(UserId(1)),
             &[stale_pin],
+            None,
         );
         alice.set_local_user(UserId(1)).unwrap();
         alice
@@ -2026,6 +2045,7 @@ mod tests {
             Some(&encode_hex(&[1; E2E_SEED_LEN])),
             Some(UserId(1)),
             &pins,
+            None,
         );
         reconnect.set_local_user(UserId(1)).unwrap();
         reconnect
@@ -2059,7 +2079,12 @@ mod tests {
 
     #[test]
     fn local_user_id_change_is_rejected() {
-        let mut alice = E2eState::new(Some(&encode_hex(&[1; E2E_SEED_LEN])), Some(UserId(1)), &[]);
+        let mut alice = E2eState::new(
+            Some(&encode_hex(&[1; E2E_SEED_LEN])),
+            Some(UserId(1)),
+            &[],
+            None,
+        );
         assert!(alice.set_local_user(UserId(2)).is_err());
     }
 }

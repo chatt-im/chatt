@@ -36,6 +36,9 @@ mod imp {
             user: String,
             reply: Sender<Result<String, String>>,
         },
+        /// Stops the server event loop. Used by embedded lifecycle owners such
+        /// as the in-process end-to-end test harness.
+        Shutdown,
     }
 
     pub struct AdminSocket {
@@ -479,6 +482,7 @@ mod imp {
                             assert_eq!(user, "alice");
                             reply.send(Ok("tcj1_join".to_string())).unwrap();
                         }
+                        AdminCommand::Shutdown => panic!("unexpected shutdown command"),
                     },
                 );
 
@@ -599,6 +603,7 @@ mod imp {
             user: String,
             reply: Sender<Result<String, String>>,
         },
+        Shutdown,
     }
 
     pub struct AdminSocket;

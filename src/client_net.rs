@@ -330,6 +330,9 @@ pub struct ClientConfig {
     pub username: String,
     pub token: String,
     pub server_public_key: Option<String>,
+    /// Installation-local durable state root. Explicitly carried into the
+    /// worker so multiple devices can coexist safely in one process.
+    pub data_dir: Option<PathBuf>,
     /// Durable DM contact identity tuples and former trusted tuples.
     pub e2e_peer_pins: Vec<E2ePeerPin>,
     pub require_native_encryption: bool,
@@ -602,12 +605,18 @@ pub enum NetworkEvent {
     E2eAccountIdentity {
         account_id: AccountId,
     },
+    /// This session proved possession of its active device key at the current
+    /// account ledger head and may now create encrypted events.
+    E2eDeviceBound {
+        device_id: DeviceId,
+    },
     DeviceLinkCreated {
         pairing_string: String,
         transfer_password: String,
         expires_at_ms: u64,
     },
     DeviceLinkRedeemed {
+        device_id: DeviceId,
         device_name: String,
     },
     DevicePairingSucceeded {
@@ -1045,7 +1054,12 @@ fn device_pair_once(
         &trusted,
         &secret_hash,
     )?;
-    let identity_path = LocalE2eIdentity::linked_device_path(&trusted, user_id)?;
+    let data_dir = config.data_dir.as_deref().ok_or_else(|| {
+        DevicePairFailure::Other(
+            "HOME is not set; cannot store the E2E device identity".to_string(),
+        )
+    })?;
+    let identity_path = LocalE2eIdentity::linked_device_path(data_dir, &trusted, user_id);
     if identity_path.exists() && !overwrite_existing {
         return Err(DevicePairFailure::IdentityExists {
             message: format!(
@@ -1056,6 +1070,7 @@ fn device_pair_once(
     }
     let rng = ring::rand::SystemRandom::new();
     let (identity, statement) = LocalE2eIdentity::prepare_linked_device(
+        data_dir,
         &trusted,
         user_id,
         device_name,
@@ -1427,6 +1442,7 @@ fn run_worker_inner(
             None,
             None,
             &config.e2e_peer_pins,
+            config.data_dir.clone(),
         ),
         e2e_bound: false,
         pending_device_link: None,
@@ -5956,6 +5972,9 @@ impl WorkerState {
                     return Err("server confirmed the wrong E2E device binding".to_string());
                 }
                 self.e2e_bound = true;
+                let _ = self
+                    .events
+                    .send(NetworkEvent::E2eDeviceBound { device_id });
             }
             ServerControl::E2eRecoveryBundle { .. } => {
                 return Err("server sent an unrequested recovery bundle".to_string());
@@ -5977,10 +5996,17 @@ impl WorkerState {
                     expires_at_ms,
                 });
             }
-            ServerControl::DeviceLinkRedeemed { device_name, .. } => {
+            ServerControl::DeviceLinkRedeemed {
+                device_id,
+                device_name,
+                ..
+            } => {
                 let _ = self
                     .events
-                    .send(NetworkEvent::DeviceLinkRedeemed { device_name });
+                    .send(NetworkEvent::DeviceLinkRedeemed {
+                        device_id,
+                        device_name,
+                    });
             }
             ServerControl::DeviceLinkBundle { .. } | ServerControl::DeviceLinked { .. } => {
                 return Err("server sent a device-pairing response on a normal session".to_string());

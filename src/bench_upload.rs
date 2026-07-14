@@ -103,6 +103,7 @@ fn client_config(
         username: name.to_string(),
         token: token.to_string(),
         server_public_key: None,
+        data_dir: crate::paths::client_data_dir(),
         e2e_peer_pins: Vec::new(),
         require_native_encryption: true,
         file_policy: FilePolicy {
@@ -199,7 +200,7 @@ fn upload_50mb_loopback() {
     const PAYLOAD_BYTES: usize = 50 * 1024 * 1024;
 
     let mut server = Server::bind(server_config()).expect("bind server");
-    server.users.users = server_users();
+    server.seed_users(server_users()).expect("seed benchmark users");
     let tcp = server
         .tcp_local_addr()
         .expect("server tcp addr")

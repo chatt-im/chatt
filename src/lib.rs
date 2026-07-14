@@ -3,6 +3,8 @@ mod attach;
 pub mod audio;
 #[cfg(test)]
 mod bench_upload;
+#[cfg(test)]
+mod e2e_test;
 mod bindings;
 mod chat_buffer;
 pub mod cli;
