@@ -15,7 +15,7 @@ use std::{
 
 use rpc::{
     control::{DeviceLinkTicket, RoomInfo, decode_device_link_ticket},
-    crypto::dev_server_seed_hex,
+    crypto::{dev_server_public_key, dev_server_seed_hex},
     ids::{DeviceId, MessageId, RoomId, UserId},
 };
 use server::{
@@ -28,9 +28,13 @@ use crate::{
     app::{AppEvent, NetworkEventSender},
     client_net::{
         ClientConfig, FilePolicy, NetworkClient, NetworkCommand, NetworkEvent,
-        spawn_device_pair_once,
+        UploadFileRequest, spawn_device_pair_once,
     },
-    config::{CandidatePrivacy, E2ePeerPin, E2eTrustLevel, EffectiveFiles},
+    config::{
+        CandidatePrivacy, DownloadTarget, E2ePeerPin, E2eTrustLevel, EffectiveFiles,
+    },
+    e2e_store::LocalE2eIdentity,
+    receive_store::Source,
 };
 
 const ALICE: UserId = UserId(1);
@@ -347,6 +351,38 @@ impl TestDevice {
         chat.message.message_id
     }
 
+    fn receive_files_in_memory(&mut self) {
+        self.config.file_policy.default = EffectiveFiles {
+            target: DownloadTarget::Memory,
+            max_download_bytes: 1024 * 1024,
+        };
+    }
+
+    fn upload(&self, room_id: RoomId, path: PathBuf) {
+        self.send(NetworkCommand::UploadFile {
+            room_id: Some(room_id),
+            request: UploadFileRequest::new(path),
+        });
+    }
+
+    fn wait_file(&mut self, name: &str, expected: &[u8]) {
+        let event = self.wait_for("received file", |event| {
+            matches!(
+                event,
+                NetworkEvent::FileReceived { metadata, .. }
+                    if metadata.original_name == name
+            )
+        });
+        let NetworkEvent::FileReceived { served_name, .. } = event else {
+            unreachable!()
+        };
+        let Some(Source::Memory { bytes, .. }) = self.config.download_store.resolve(&served_name)
+        else {
+            panic!("{}: received file is absent from memory", self.label)
+        };
+        assert_eq!(bytes.as_slice(), expected, "{}: file contents", self.label);
+    }
+
     fn fetch_history(&mut self, room_id: RoomId) -> Vec<String> {
         self.send(NetworkCommand::FetchHistory {
             room_id,
@@ -455,6 +491,86 @@ fn send_chat(sender: &TestDevice, room_id: RoomId, body: &str) {
         room_id,
         body: body.to_string(),
     });
+}
+
+#[test]
+fn unreadable_local_identity_stops_without_reconnecting_or_replacing_it() {
+    let world = TestWorld::new();
+    let mut alice = world.device("alice-unreadable-identity", ALICE, ALICE_TOKEN);
+    let data_dir = alice.config.data_dir.as_deref().unwrap();
+    let identity_path =
+        LocalE2eIdentity::linked_device_path(data_dir, &dev_server_public_key(), ALICE);
+    std::fs::create_dir_all(identity_path.parent().unwrap()).unwrap();
+    let original = b"not a valid identity file";
+    std::fs::write(&identity_path, original).unwrap();
+
+    alice.connect();
+    let event = alice.wait_for("fatal local identity error", |event| {
+        matches!(event, NetworkEvent::LocalIdentityUnavailable { .. })
+    });
+    let NetworkEvent::LocalIdentityUnavailable { message } = event else {
+        unreachable!()
+    };
+    assert!(message.contains(&identity_path.display().to_string()));
+    assert!(message.contains("stopped reconnecting"));
+    assert!(message.contains("left the file unchanged"));
+    assert_eq!(std::fs::read(&identity_path).unwrap(), original);
+    assert!(!alice
+        .backlog
+        .iter()
+        .any(|event| matches!(event, NetworkEvent::ReconnectScheduled { .. })));
+    match alice
+        .events
+        .as_ref()
+        .unwrap()
+        .recv_timeout(Duration::from_millis(200))
+    {
+        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
+        Ok(AppEvent::Network(NetworkEvent::ReconnectScheduled { .. })) => {
+            panic!("unreadable identity scheduled a reconnect")
+        }
+        Ok(_) => panic!("unexpected event after fatal identity failure"),
+    }
+}
+
+#[test]
+fn sealed_dm_files_reach_every_device_after_pairing() {
+    let world = TestWorld::new();
+    let mut alice = world.device("alice-file-primary", ALICE, ALICE_TOKEN);
+    let mut alice_second = world.device("alice-file-secondary", ALICE, "");
+    let mut bob = world.device("bob-file", BOB, BOB_TOKEN);
+    alice.receive_files_in_memory();
+    alice_second.receive_files_in_memory();
+    bob.receive_files_in_memory();
+    alice.connect_ready();
+    bob.connect_ready();
+    let room_id = open_dm(&mut alice, &mut bob);
+
+    pair_device(&mut alice, &mut alice_second);
+    bob.wait_peer_ready(ALICE);
+    alice_second.connect_ready();
+    alice_second.wait_peer_ready(BOB);
+
+    let from_bob = b"sealed file from bob";
+    let bob_path = world.root.path().join("from-bob.txt");
+    std::fs::write(&bob_path, from_bob).unwrap();
+    bob.upload(room_id, bob_path);
+    alice.wait_file("from-bob.txt", from_bob);
+    alice_second.wait_file("from-bob.txt", from_bob);
+
+    let from_primary = b"sealed file from alice's primary device";
+    let primary_path = world.root.path().join("from-primary.txt");
+    std::fs::write(&primary_path, from_primary).unwrap();
+    alice.upload(room_id, primary_path);
+    alice_second.wait_file("from-primary.txt", from_primary);
+    bob.wait_file("from-primary.txt", from_primary);
+
+    let from_linked = b"sealed file from alice's linked device";
+    let linked_path = world.root.path().join("from-linked.txt");
+    std::fs::write(&linked_path, from_linked).unwrap();
+    alice_second.upload(room_id, linked_path);
+    alice.wait_file("from-linked.txt", from_linked);
+    bob.wait_file("from-linked.txt", from_linked);
 }
 
 #[test]

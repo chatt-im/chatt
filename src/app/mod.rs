@@ -4958,6 +4958,24 @@ impl App {
                     retry_in.as_secs()
                 ));
             }
+            NetworkEvent::LocalIdentityUnavailable { message } => {
+                self.room.network_disconnected = true;
+                self.room.udp_unreachable = false;
+                self.stop_audio();
+                self.stop_all_shares();
+                self.reset_room_for_disconnect();
+                // This is a persistent local-state failure, not a transient
+                // network outage. Remove the finished worker so supervision
+                // cannot turn it into another automatic reconnect loop.
+                self.active_network_generation = None;
+                self.connection_attempt = None;
+                if let Some(network) = self.network.take() {
+                    network.stop();
+                }
+                self.supervisor.network.reset();
+                self.push_network_notice("e2e", &message);
+                self.set_error(message);
+            }
             NetworkEvent::WorkerStopped { reason } => {
                 self.stop_audio();
                 self.fail_screencast_if_running(
@@ -8851,6 +8869,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::NativeEncryptionRequired => "native_encryption_required",
         NetworkEvent::MediaConnectivity { .. } => "media_connectivity",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
+        NetworkEvent::LocalIdentityUnavailable { .. } => "local_identity_unavailable",
         NetworkEvent::WorkerStopped { .. } => "worker_stopped",
         NetworkEvent::ShareStarted { .. } => "share_started",
         NetworkEvent::ShareAvailable { .. } => "share_available",
@@ -9940,6 +9959,26 @@ mod tests {
             app.pending_network_commands.front(),
             Some(NetworkCommand::SendChat { body, .. }) if body == "hello"
         ));
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+    }
+
+    #[test]
+    fn local_identity_failure_disables_automatic_network_recovery() {
+        let mut app = test_app();
+        let (tx, _rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.active_network_generation = Some(7);
+        let message = "local identity is unreadable; file preserved".to_string();
+
+        app.handle_network_event(NetworkEvent::LocalIdentityUnavailable {
+            message: message.clone(),
+        });
+
+        assert!(app.network.is_none());
+        assert_eq!(app.active_network_generation, None);
+        assert!(!app.supervisor.network.is_pending());
+        assert!(!app.supervise_network(Instant::now()));
+        assert_eq!(app.last_network_notice.as_deref(), Some(message.as_str()));
         assert_eq!(app.view.status.kind(), StatusKind::Error);
     }
 
