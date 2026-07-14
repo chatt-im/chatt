@@ -11,7 +11,10 @@
 //! Encoding is canonical: a code decodes only if re-encoding the result
 //! reproduces it.
 
-use crate::ids::{MessageId, RoomId};
+use crate::{
+    base32,
+    ids::{MessageId, RoomId},
+};
 
 /// Prefix that introduces a message reference in message bodies.
 pub const REF_PREFIX: &str = "@@";
@@ -21,8 +24,6 @@ pub const MIN_CODE_LEN: usize = 5;
 
 /// Longest code [`MessageRef::decode`] can accept.
 pub const MAX_CODE_LEN: usize = 25;
-
-const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// The durable identity of a chat message, as carried by an `@@` reference.
 ///
@@ -51,21 +52,8 @@ impl MessageRef {
         let mut payload = Vec::with_capacity(16);
         push_leb128(&mut payload, u64::from(self.room_id.0));
         push_leb128(&mut payload, self.message_id.0);
-        let mut out = String::with_capacity(payload.len() * 2);
-        let mut acc = 0u32;
-        let mut bits = 0u32;
-        for &byte in &payload {
-            acc = acc << 8 | u32::from(byte);
-            bits += 8;
-            while bits >= 5 {
-                bits -= 5;
-                out.push(ALPHABET[(acc >> bits) as usize & 31] as char);
-            }
-        }
-        if bits > 0 {
-            out.push(ALPHABET[(acc << (5 - bits)) as usize & 31] as char);
-        }
-        out.push(ALPHABET[usize::from(checksum(&payload))] as char);
+        let mut out = base32::encode(&payload);
+        out.push(base32::encode_value(checksum(&payload)));
         out
     }
 
@@ -81,7 +69,7 @@ impl MessageRef {
         }
         let mut values = Vec::with_capacity(code.len());
         for byte in code.bytes() {
-            values.push(char_value(byte)?);
+            values.push(base32::decode_value(byte)?);
         }
         let Some((&check, data)) = values.split_last() else {
             return None;
@@ -113,7 +101,7 @@ impl MessageRef {
         };
         let mut normalized = String::with_capacity(values.len());
         for &value in &values {
-            normalized.push(ALPHABET[usize::from(value)] as char);
+            normalized.push(base32::encode_value(value));
         }
         if decoded.encode() != normalized {
             return None;
@@ -127,18 +115,7 @@ impl MessageRef {
 /// This is the accept set for tokenizers scanning `@@` codes: the Crockford
 /// base32 alphabet in either case plus the decode aliases `i`, `l`, and `o`.
 pub fn is_ref_char(byte: u8) -> bool {
-    char_value(byte).is_some()
-}
-
-fn char_value(byte: u8) -> Option<u8> {
-    let byte = byte.to_ascii_lowercase();
-    let byte = match byte {
-        b'i' | b'l' => b'1',
-        b'o' => b'0',
-        _ => byte,
-    };
-    let index = ALPHABET.iter().position(|&c| c == byte)?;
-    Some(index as u8)
+    base32::decode_value(byte).is_some()
 }
 
 fn checksum(payload: &[u8]) -> u8 {

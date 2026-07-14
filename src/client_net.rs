@@ -61,10 +61,11 @@ use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
     VoicePayload as AudioVoicePayload,
 };
-use crate::config::{
-    CandidatePrivacy, DownloadTarget, E2ePeerIdentity, E2ePeerPin, EffectiveFiles,
+use crate::config::{CandidatePrivacy, DownloadTarget, E2ePeerPin, E2eTrustLevel, EffectiveFiles};
+use crate::e2e::{
+    AcceptedPeerIdentity, AuthenticatedChat, E2eState, MessageProvenance, OpenFailure,
+    PeerIdentityOutcome, SealBlocked,
 };
-use crate::e2e::{E2eState, OpenFailure, PeerIdentityOutcome, SealBlocked};
 use crate::file_compression::{
     self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
 };
@@ -88,6 +89,8 @@ const P2P_POLL_TIMEOUT: Duration = Duration::from_millis(20);
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_DEFERRED_E2E_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DEFERRED_E2E_ITEMS: usize = 1024;
+const MAX_DEFERRED_E2E_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DEFERRED_E2E_GLOBAL_ITEMS: usize = 8192;
 const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a direct path must stay healthy before the client stops relaying
 /// voice through the server.
@@ -493,13 +496,22 @@ pub enum NetworkCommand {
     /// The join-time advertisement to the server refreshes on reconnect.
     SetFilePolicy(FilePolicy),
     SetP2pEnabled(bool),
-    /// Re-pins the presented DM identity tuple for a peer whose key or username
-    /// changed, unblocking sends to that DM (`/trust`).
-    TrustPeerIdentity {
+    /// Requests the worker's exact current review snapshot. This never changes
+    /// trust by itself.
+    ReviewPeerIdentity {
         user_id: UserId,
     },
-    /// Result of atomically persisting an E2E pin proposal. The worker only
-    /// activates the key after a matching successful acknowledgement.
+    VerifyPeerIdentity {
+        expected: AcceptedPeerIdentity,
+    },
+    /// Forgets independent verification of the exact active key. The key stays
+    /// usable and is persisted again at the ordinary accepted trust level.
+    ForgetPeerIdentity {
+        expected: AcceptedPeerIdentity,
+    },
+    /// Result of atomically persisting an E2E pin proposal. TOFU keys are
+    /// already active for this session; this acknowledgement makes continuity
+    /// durable or applies an explicit verification-level change.
     ConfirmE2ePeerPin {
         pin: E2ePeerPin,
         persisted: bool,
@@ -584,12 +596,12 @@ pub enum NetworkEvent {
         room_id: RoomId,
         /// Echo of the originating request's paging cursor.
         before: Option<MessageId>,
-        messages: Vec<ChatMessage>,
+        messages: Vec<AuthenticatedChat>,
         at_start: bool,
         /// True on the final chunk for one fetch request.
         complete: bool,
     },
-    Chat(ChatMessage),
+    Chat(AuthenticatedChat),
     ChatMutationRejected {
         room_id: RoomId,
         target: MessageId,
@@ -644,22 +656,25 @@ pub enum NetworkEvent {
         user: UserSummary,
         online: bool,
     },
-    /// A first-use or explicitly trusted DM identity tuple that the main
-    /// thread must write durably before the worker may use it.
+    /// A TOFU or verification update for the main thread to persist. Automatic
+    /// TOFU keys are already active for this session.
     E2ePeerPinProposed {
         pin: E2ePeerPin,
     },
-    /// A peer's served DM identity tuple contradicts the pinned one: sends to
-    /// that DM are blocked until the user runs `/trust`.
-    E2ePeerIdentityChanged {
+    E2eIdentityFetching {
+        room_id: RoomId,
         user_id: UserId,
-        pinned: E2ePeerIdentity,
-        presented: E2ePeerIdentity,
+        username: String,
     },
-    /// The peer's currently served DM identity tuple matches the durable pin.
-    /// Clears any stale identity-change warning in the UI.
-    E2ePeerIdentityVerified {
+    E2eKeyUnavailable {
+        room_id: RoomId,
         user_id: UserId,
+        username: String,
+    },
+    /// Internal/session fact: the server presented the tuple already stored in
+    /// the durable pin. This does not mean independently verified.
+    E2ePeerPinMatched {
+        identity: AcceptedPeerIdentity,
     },
     VoiceStarted {
         room_id: RoomId,
@@ -1221,13 +1236,15 @@ fn run_worker_inner(
         next_bug_report: 1,
         outgoing_bug_reports: VecDeque::new(),
         incoming_files: HashMap::new(),
+        skipped_untrusted_files: HashSet::new(),
         e2e: E2eState::new(
             config.e2e_identity_seed.as_deref(),
             config.e2e_local_user_id,
             &config.e2e_peer_pins,
         ),
-        deferred_e2e: VecDeque::new(),
+        deferred_e2e: HashMap::new(),
         deferred_e2e_bytes: 0,
+        deferred_e2e_items: 0,
         shutdown: false,
         disconnect_reason: None,
         auth_failure: None,
@@ -1772,12 +1789,14 @@ struct WorkerState {
     next_bug_report: u64,
     outgoing_bug_reports: VecDeque<OutgoingBugReport>,
     incoming_files: HashMap<FileTransferId, IncomingFile>,
+    skipped_untrusted_files: HashSet<FileTransferId>,
     /// DM end-to-end sealing state: identity seed, room-to-peer map, pinned
     /// peer keys, and derived pair keys. All sealing and opening happens on
     /// this thread so only plaintext crosses the event channel.
     e2e: E2eState,
-    deferred_e2e: VecDeque<DeferredE2eInbound>,
+    deferred_e2e: HashMap<RoomId, DeferredE2eRoom>,
     deferred_e2e_bytes: usize,
+    deferred_e2e_items: usize,
     shutdown: bool,
     disconnect_reason: Option<String>,
     auth_failure: Option<(u16, String)>,
@@ -1789,22 +1808,37 @@ enum DeferredE2eInbound {
     FileOffered {
         file: FileMetadata,
         contents: bool,
-    },
-    FileChunk {
-        transfer_id: FileTransferId,
-        offset: u64,
-        data: Vec<u8>,
-    },
-    FileComplete {
-        transfer_id: FileTransferId,
-    },
-    FileCanceled {
-        transfer_id: FileTransferId,
-        reason: String,
+        skipped_untrusted: bool,
     },
 }
 
+#[derive(Default)]
+struct DeferredE2eRoom {
+    items: VecDeque<DeferredE2eInbound>,
+    bytes: usize,
+}
+
+enum OpenChat {
+    Ready(Option<MessageProvenance>),
+    Deferred,
+}
+
 impl DeferredE2eInbound {
+    fn room_id(&self) -> Option<RoomId> {
+        match self {
+            Self::Chat(message) => Some(message.room_id),
+            Self::History(chunk) => Some(chunk.room_id),
+            Self::FileOffered { file, .. } => Some(file.room_id),
+        }
+    }
+
+    fn logical_items(&self) -> usize {
+        match self {
+            Self::History(chunk) => chunk.messages.len(),
+            Self::Chat(_) | Self::FileOffered { .. } => 1,
+        }
+    }
+
     fn retained_bytes(&self) -> usize {
         match self {
             Self::Chat(message) => history::encoded_message_len(message),
@@ -1818,9 +1852,6 @@ impl DeferredE2eInbound {
                 .sealed_meta
                 .as_ref()
                 .map_or(256, |meta| meta.len().saturating_add(256)),
-            Self::FileChunk { data, .. } => data.len().saturating_add(32),
-            Self::FileComplete { .. } => 16,
-            Self::FileCanceled { reason, .. } => reason.len().saturating_add(16),
         }
     }
 }
@@ -2949,7 +2980,7 @@ impl WorkerState {
 
     /// Prepares an outbound chat payload for its room: DM rooms get the body
     /// sealed into an envelope, other rooms pass plaintext through. `Err(())`
-    /// means the send was blocked (peer key missing/changed) and the user has
+    /// means the send was blocked (peer key missing) and the user has
     /// already been told.
     fn seal_dm_body(
         &mut self,
@@ -2973,10 +3004,6 @@ impl WorkerState {
                     }
                     SealBlocked::PeerKeyMissing => {
                         "cannot send: this user has not published an encryption key yet".to_string()
-                    }
-                    SealBlocked::PeerIdentityChanged => {
-                        "cannot send: this user's encryption identity changed — /trust <user> to resume"
-                            .to_string()
                     }
                     SealBlocked::Crypto => "cannot send: sealing the message failed".to_string(),
                 };
@@ -3451,10 +3478,33 @@ impl WorkerState {
             NetworkCommand::SetFilePolicy(policy) => {
                 self.config.file_policy = policy;
             }
-            NetworkCommand::TrustPeerIdentity { user_id } => {
-                let Some(pin) = self.e2e.proposed_trust(user_id) else {
+            NetworkCommand::ReviewPeerIdentity { user_id } => {
+                if let Some(identity) = self.e2e.accepted_identity(user_id) {
+                    let _ = self
+                        .events
+                        .send(NetworkEvent::E2ePeerPinMatched { identity });
+                } else {
                     let _ = self.events.send(NetworkEvent::Status(
-                        "no pending encryption identity change for that user".to_string(),
+                        "the peer identity key is still being fetched or is unavailable"
+                            .to_string(),
+                    ));
+                }
+            }
+            NetworkCommand::VerifyPeerIdentity { expected } => {
+                let Some(pin) = self.e2e.proposed_verification(&expected) else {
+                    let _ = self.events.send(NetworkEvent::Error(
+                        "the accepted encryption identity changed while it was being verified"
+                            .to_string(),
+                    ));
+                    return Ok(());
+                };
+                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed { pin });
+            }
+            NetworkCommand::ForgetPeerIdentity { expected } => {
+                let Some(pin) = self.e2e.proposed_downgrade(&expected) else {
+                    let _ = self.events.send(NetworkEvent::Error(
+                        "the verified encryption identity changed before verification could be forgotten"
+                            .to_string(),
                     ));
                     return Ok(());
                 };
@@ -3470,10 +3520,15 @@ impl WorkerState {
                     return Ok(());
                 }
                 if persisted {
-                    self.drain_deferred_e2e()?;
+                    if let Some(identity) = self.e2e.accepted_identity(UserId(pin.user_id)) {
+                        let _ = self
+                            .events
+                            .send(NetworkEvent::E2ePeerPinMatched { identity });
+                    }
                 } else {
                     let _ = self.events.send(NetworkEvent::Error(
-                        "encryption pin was not saved; DM remains blocked".to_string(),
+                        "encryption identity is active for this session but could not be saved"
+                            .to_string(),
                     ));
                 }
             }
@@ -3843,10 +3898,6 @@ impl WorkerState {
                 }
                 SealBlocked::PeerKeyMissing => {
                     "cannot send file: this user has not published an encryption key yet"
-                        .to_string()
-                }
-                SealBlocked::PeerIdentityChanged => {
-                    "cannot send file: this user's encryption identity changed — /trust <user> to resume"
                         .to_string()
                 }
                 SealBlocked::Crypto => "cannot send file: sealing the metadata failed".to_string(),
@@ -4490,7 +4541,15 @@ impl WorkerState {
 
     fn handle_file_offered(&mut self, file: FileMetadata, contents: bool) -> Result<(), String> {
         if !self.file_offer_ready(&file)? {
-            self.defer_e2e(DeferredE2eInbound::FileOffered { file, contents })?;
+            if contents {
+                self.skip_offered_download(&file);
+            }
+            self.skipped_untrusted_files.insert(file.transfer_id);
+            self.defer_e2e(DeferredE2eInbound::FileOffered {
+                file,
+                contents: false,
+                skipped_untrusted: true,
+            })?;
             return Ok(());
         }
         self.handle_file_offered_ready(file, contents);
@@ -4663,6 +4722,21 @@ impl WorkerState {
                 }
             }
         }
+    }
+
+    fn handle_untrusted_file_offered_ready(&mut self, mut file: FileMetadata) {
+        if let Err(reason) = self.unseal_offer(&mut file) {
+            let _ = self.events.send(NetworkEvent::Error(format!(
+                "deferred file announcement failed after key discovery: {reason}"
+            )));
+            return;
+        }
+        self.skipped_untrusted_files.remove(&file.transfer_id);
+        self.end_transfer_skipped(
+            &file,
+            "File not downloaded while identity was untrusted; ask the sender to resend"
+                .to_string(),
+        );
     }
 
     /// Opens a sealed offer's metadata envelope and substitutes the true name,
@@ -5050,19 +5124,25 @@ impl WorkerState {
             at_start = chunk.at_start,
             complete = chunk.complete
         );
-        let mut opened = chunk.clone();
-        for message in &mut opened.messages {
-            if !self.open_chat_message(message)? {
-                self.defer_e2e(DeferredE2eInbound::History(chunk))?;
-                return Ok(true);
+        let mut opened = Vec::with_capacity(chunk.messages.len());
+        for mut message in chunk.messages.iter().cloned() {
+            match self.open_chat_message(&mut message)? {
+                OpenChat::Ready(provenance) => opened.push(AuthenticatedChat {
+                    message,
+                    provenance,
+                }),
+                OpenChat::Deferred => {
+                    self.defer_e2e(DeferredE2eInbound::History(chunk))?;
+                    return Ok(true);
+                }
             }
         }
         let _ = self.events.send(NetworkEvent::HistoryChunk {
-            room_id: opened.room_id,
-            before: opened.before,
-            messages: opened.messages,
-            at_start: opened.at_start,
-            complete: opened.complete,
+            room_id: chunk.room_id,
+            before: chunk.before,
+            messages: opened,
+            at_start: chunk.at_start,
+            complete: chunk.complete,
         });
         Ok(true)
     }
@@ -5107,7 +5187,7 @@ impl WorkerState {
                 // Fetch every DM peer's key, not just unknown ones: a key that
                 // changed while this client was offline must trip the pin
                 // check now rather than on the first undecryptable message.
-                let mut dm_peers: Vec<UserId> = Vec::new();
+                let mut dm_peers: Vec<(UserId, RoomId, String)> = Vec::new();
                 for room in &rooms {
                     let username = match dm_peer_for_local(room, user_id) {
                         Some(peer) => self.user_names.get(&peer).cloned().ok_or_else(|| {
@@ -5117,9 +5197,9 @@ impl WorkerState {
                     };
                     self.e2e.note_room(room, &username)?;
                     if let Some(peer) = self.e2e.dm_peer(room.room_id)
-                        && !dm_peers.contains(&peer)
+                        && !dm_peers.iter().any(|(known, _, _)| *known == peer)
                     {
-                        dm_peers.push(peer);
+                        dm_peers.push((peer, room.room_id, username));
                     }
                 }
                 let _ = self.events.send(NetworkEvent::Authenticated {
@@ -5131,13 +5211,22 @@ impl WorkerState {
                     video_transport_mode: self.transport_mode,
                     video_auth_key: self.video_auth_key,
                 });
+                for (user_id, room_id, username) in &dm_peers {
+                    if self.e2e.fetching_identity(*room_id).is_some() {
+                        let _ = self.events.send(NetworkEvent::E2eIdentityFetching {
+                            room_id: *room_id,
+                            user_id: *user_id,
+                            username: username.clone(),
+                        });
+                    }
+                }
                 self.bind_udp();
                 if !local_id_is_new && let Some(public_key) = self.e2e.public_key() {
                     let _ = self.queue_control(ClientControl::PublishE2eKey {
                         public_key: public_key.to_vec(),
                     });
                 }
-                for user_id in dm_peers {
+                for (user_id, _, _) in dm_peers {
                     let _ = self.queue_control(ClientControl::FetchE2eKey { user_id });
                 }
             }
@@ -5153,10 +5242,16 @@ impl WorkerState {
                     body_size = message.body.len()
                 );
                 let mut message = message;
-                if self.open_chat_message(&mut message)? {
-                    let _ = self.events.send(NetworkEvent::Chat(message));
-                } else {
-                    self.defer_e2e(DeferredE2eInbound::Chat(message))?;
+                match self.open_chat_message(&mut message)? {
+                    OpenChat::Ready(provenance) => {
+                        let _ = self.events.send(NetworkEvent::Chat(AuthenticatedChat {
+                            message,
+                            provenance,
+                        }));
+                    }
+                    OpenChat::Deferred => {
+                        self.defer_e2e(DeferredE2eInbound::Chat(message))?;
+                    }
                 }
             }
             ServerControl::ChatMutationRejected {
@@ -5379,20 +5474,16 @@ impl WorkerState {
                 offset,
                 data,
             } => {
-                if self.deferred_file_transfer(transfer_id) {
-                    self.defer_e2e(DeferredE2eInbound::FileChunk {
-                        transfer_id,
-                        offset,
-                        data,
-                    })?;
+                if self.skipped_untrusted_files.contains(&transfer_id) {
+                    // The transfer was declined before any sealed metadata was
+                    // exposed. A server race may still deliver chunks; never
+                    // retain attacker-sized pre-trust file ciphertext.
                 } else {
                     self.handle_file_chunk(transfer_id, offset, data);
                 }
             }
             ServerControl::FileComplete { transfer_id } => {
-                if self.deferred_file_transfer(transfer_id) {
-                    self.defer_e2e(DeferredE2eInbound::FileComplete { transfer_id })?;
-                } else {
+                if !self.skipped_untrusted_files.contains(&transfer_id) {
                     self.handle_file_complete(transfer_id);
                 }
             }
@@ -5400,12 +5491,7 @@ impl WorkerState {
                 transfer_id,
                 reason,
             } => {
-                if self.deferred_file_transfer(transfer_id) {
-                    self.defer_e2e(DeferredE2eInbound::FileCanceled {
-                        transfer_id,
-                        reason,
-                    })?;
-                } else {
+                if !self.skipped_untrusted_files.contains(&transfer_id) {
                     self.handle_file_canceled(transfer_id, &reason);
                 }
             }
@@ -5502,6 +5588,11 @@ impl WorkerState {
                         None => String::new(),
                     };
                 if let Some(user_id) = self.e2e.note_room(&room, &username)? {
+                    let _ = self.events.send(NetworkEvent::E2eIdentityFetching {
+                        room_id: room.room_id,
+                        user_id,
+                        username: username.clone(),
+                    });
                     let _ = self.queue_control(ClientControl::FetchE2eKey { user_id });
                 }
                 let _ = self.events.send(NetworkEvent::RoomUpserted(room));
@@ -5553,35 +5644,63 @@ impl WorkerState {
         outcome: PeerIdentityOutcome,
     ) -> Result<(), String> {
         match outcome {
-            PeerIdentityOutcome::Proposed { pin } => {
-                kvlog::info!("peer e2e identity proposed", user_id = user_id.0);
+            PeerIdentityOutcome::Pending(snapshot) => {
+                let trust_level = snapshot
+                    .current
+                    .as_ref()
+                    .filter(|(current, _)| current.public_key == snapshot.presented.public_key)
+                    .map_or(E2eTrustLevel::Accepted, |(_, level)| *level);
+                let Some(pin) = self.e2e.proposed_trust(&snapshot, trust_level) else {
+                    return Err(
+                        "peer identity changed during automatic TOFU activation".to_string()
+                    );
+                };
+                // Automatic TOFU is active for this session immediately. The
+                // app still writes the pin atomically so continuity survives a
+                // restart, but a failed write no longer hides plaintext.
+                if !self.e2e.confirm_pin(&pin, true) {
+                    return Err("peer identity could not be activated".to_string());
+                }
                 let _ = self.events.send(NetworkEvent::E2ePeerPinProposed { pin });
-            }
-            PeerIdentityOutcome::Changed { pinned, presented } => {
-                kvlog::warn!("peer e2e identity changed", user_id = user_id.0);
-                let _ = self.events.send(NetworkEvent::E2ePeerIdentityChanged {
-                    user_id,
-                    pinned,
-                    presented,
-                });
-            }
-            PeerIdentityOutcome::Unchanged => {
+                let Some(identity) = self.e2e.accepted_identity(user_id) else {
+                    return Err("activated peer identity is unavailable".to_string());
+                };
+                let room_id = identity.room_id;
                 let _ = self
                     .events
-                    .send(NetworkEvent::E2ePeerIdentityVerified { user_id });
-                self.drain_deferred_e2e()?;
+                    .send(NetworkEvent::E2ePeerPinMatched { identity });
+                self.drain_deferred_e2e_room(room_id)?;
+            }
+            PeerIdentityOutcome::KeyUnavailable {
+                room_id,
+                user_id,
+                username,
+            } => {
+                let _ = self.events.send(NetworkEvent::E2eKeyUnavailable {
+                    room_id,
+                    user_id,
+                    username,
+                });
+            }
+            PeerIdentityOutcome::PinMatched(identity) => {
+                let room_id = identity.room_id;
+                let _ = self
+                    .events
+                    .send(NetworkEvent::E2ePeerPinMatched { identity });
+                self.drain_deferred_e2e_room(room_id)?;
             }
             PeerIdentityOutcome::Rejected => {}
         }
         Ok(())
     }
 
-    /// Opens a DM envelope. `Ok(false)` means the original encrypted message
-    /// must be retained until a key/trust transition; malformed or forbidden
-    /// wire forms fail the connection instead of reaching app history.
-    fn open_chat_message(&mut self, message: &mut ChatMessage) -> Result<bool, String> {
-        let Err(failure) = self.e2e.open_message(message, &self.config.username) else {
-            return Ok(true);
+    /// Opens a chat record and returns its client-authenticated key provenance.
+    /// `Deferred` is reserved for the short ordering window before a peer key
+    /// response arrives; malformed or forbidden forms fail the connection.
+    fn open_chat_message(&mut self, message: &mut ChatMessage) -> Result<OpenChat, String> {
+        let failure = match self.e2e.open_message(message, &self.config.username) {
+            Ok(provenance) => return Ok(OpenChat::Ready(provenance)),
+            Err(failure) => failure,
         };
         kvlog::warn!(
             "dm envelope failed to open",
@@ -5602,7 +5721,7 @@ impl WorkerState {
                 {
                     let _ = self.queue_control(ClientControl::FetchE2eKey { user_id });
                 }
-                Ok(false)
+                Ok(OpenChat::Deferred)
             }
             OpenFailure::Policy => Err(format!(
                 "server sent a forbidden plaintext/envelope form for room {}",
@@ -5616,107 +5735,116 @@ impl WorkerState {
     }
 
     fn defer_e2e(&mut self, item: DeferredE2eInbound) -> Result<(), String> {
-        self.defer_e2e_at(item, false)
-    }
-
-    fn defer_e2e_front(&mut self, item: DeferredE2eInbound) -> Result<(), String> {
-        self.defer_e2e_at(item, true)
-    }
-
-    fn defer_e2e_at(&mut self, item: DeferredE2eInbound, front: bool) -> Result<(), String> {
+        let room_id = item
+            .room_id()
+            .ok_or_else(|| "encrypted DM data arrived without a room".to_string())?;
         let retained = item.retained_bytes();
-        let next_bytes = self
-            .deferred_e2e_bytes
-            .checked_add(retained)
-            .ok_or_else(|| "deferred E2E byte count overflowed".to_string())?;
-        if self.deferred_e2e.len() >= MAX_DEFERRED_E2E_ITEMS || next_bytes > MAX_DEFERRED_E2E_BYTES
-        {
-            return Err(
-                "too much encrypted DM data arrived while keys were unavailable".to_string(),
-            );
+        let room = self.deferred_e2e.entry(room_id).or_default();
+        let room_full = room.items.len() >= MAX_DEFERRED_E2E_ITEMS
+            || room.bytes.saturating_add(retained) > MAX_DEFERRED_E2E_BYTES;
+        let global_full = self.deferred_e2e_items >= MAX_DEFERRED_E2E_GLOBAL_ITEMS
+            || self.deferred_e2e_bytes.saturating_add(retained) > MAX_DEFERRED_E2E_GLOBAL_BYTES;
+        if room_full || global_full {
+            return Err("encrypted DM pre-key ordering buffer exceeded its bound".to_string());
         }
-        self.deferred_e2e_bytes = next_bytes;
-        if front {
-            self.deferred_e2e.push_front(item);
-        } else {
-            self.deferred_e2e.push_back(item);
-        }
+        room.bytes = room.bytes.saturating_add(retained);
+        self.deferred_e2e_bytes = self.deferred_e2e_bytes.saturating_add(retained);
+        self.deferred_e2e_items = self.deferred_e2e_items.saturating_add(1);
+        room.items.push_back(item);
         Ok(())
     }
 
-    fn deferred_file_transfer(&self, transfer_id: FileTransferId) -> bool {
-        self.deferred_e2e.iter().any(|item| {
-            matches!(
-                item,
-                DeferredE2eInbound::FileOffered { file, .. }
-                    if file.transfer_id == transfer_id
-            )
-        })
-    }
-
-    fn drain_deferred_e2e(&mut self) -> Result<(), String> {
-        let count = self.deferred_e2e.len();
+    fn drain_deferred_e2e_room(&mut self, room_id: RoomId) -> Result<usize, String> {
+        let Some(mut room) = self.deferred_e2e.remove(&room_id) else {
+            return Ok(0);
+        };
+        self.deferred_e2e_bytes = self.deferred_e2e_bytes.saturating_sub(room.bytes);
+        self.deferred_e2e_items = self.deferred_e2e_items.saturating_sub(room.items.len());
+        room.bytes = 0;
+        let mut recovered = 0usize;
+        let count = room.items.len();
         for _ in 0..count {
-            let Some(item) = self.deferred_e2e.pop_front() else {
+            let Some(item) = room.items.pop_front() else {
                 break;
             };
-            self.deferred_e2e_bytes = self
-                .deferred_e2e_bytes
-                .saturating_sub(item.retained_bytes());
+            let logical_items = item.logical_items();
             match item {
                 DeferredE2eInbound::Chat(mut message) => {
-                    if self.open_chat_message(&mut message)? {
-                        let _ = self.events.send(NetworkEvent::Chat(message));
-                    } else {
-                        self.defer_e2e_front(DeferredE2eInbound::Chat(message))?;
-                        break;
+                    match self.open_chat_message(&mut message)? {
+                        OpenChat::Ready(provenance) => {
+                            let _ = self.events.send(NetworkEvent::Chat(AuthenticatedChat {
+                                message,
+                                provenance,
+                            }));
+                        }
+                        OpenChat::Deferred => {
+                            room.items.push_front(DeferredE2eInbound::Chat(message));
+                            break;
+                        }
                     }
                 }
                 DeferredE2eInbound::History(chunk) => {
-                    let mut opened = chunk.clone();
+                    let mut opened = Vec::with_capacity(chunk.messages.len());
                     let mut ready = true;
-                    for message in &mut opened.messages {
-                        if !self.open_chat_message(message)? {
-                            ready = false;
-                            break;
+                    for mut message in chunk.messages.iter().cloned() {
+                        match self.open_chat_message(&mut message)? {
+                            OpenChat::Ready(provenance) => opened.push(AuthenticatedChat {
+                                message,
+                                provenance,
+                            }),
+                            OpenChat::Deferred => {
+                                ready = false;
+                                break;
+                            }
                         }
                     }
                     if ready {
                         let _ = self.events.send(NetworkEvent::HistoryChunk {
-                            room_id: opened.room_id,
-                            before: opened.before,
-                            messages: opened.messages,
-                            at_start: opened.at_start,
-                            complete: opened.complete,
+                            room_id: chunk.room_id,
+                            before: chunk.before,
+                            messages: opened,
+                            at_start: chunk.at_start,
+                            complete: chunk.complete,
                         });
                     } else {
-                        self.defer_e2e_front(DeferredE2eInbound::History(chunk))?;
+                        room.items.push_front(DeferredE2eInbound::History(chunk));
                         break;
                     }
                 }
-                DeferredE2eInbound::FileOffered { file, contents } => {
+                DeferredE2eInbound::FileOffered {
+                    file,
+                    contents,
+                    skipped_untrusted,
+                } => {
                     if self.file_offer_ready(&file)? {
-                        self.handle_file_offered_ready(file, contents);
+                        if skipped_untrusted {
+                            self.handle_untrusted_file_offered_ready(file);
+                        } else {
+                            self.handle_file_offered_ready(file, contents);
+                        }
                     } else {
-                        self.defer_e2e_front(DeferredE2eInbound::FileOffered { file, contents })?;
+                        room.items.push_front(DeferredE2eInbound::FileOffered {
+                            file,
+                            contents,
+                            skipped_untrusted,
+                        });
                         break;
                     }
                 }
-                DeferredE2eInbound::FileChunk {
-                    transfer_id,
-                    offset,
-                    data,
-                } => self.handle_file_chunk(transfer_id, offset, data),
-                DeferredE2eInbound::FileComplete { transfer_id } => {
-                    self.handle_file_complete(transfer_id);
-                }
-                DeferredE2eInbound::FileCanceled {
-                    transfer_id,
-                    reason,
-                } => self.handle_file_canceled(transfer_id, &reason),
             }
+            recovered = recovered.saturating_add(logical_items);
         }
-        Ok(())
+        if !room.items.is_empty() {
+            room.bytes = room
+                .items
+                .iter()
+                .map(DeferredE2eInbound::retained_bytes)
+                .sum();
+            self.deferred_e2e_bytes = self.deferred_e2e_bytes.saturating_add(room.bytes);
+            self.deferred_e2e_items = self.deferred_e2e_items.saturating_add(room.items.len());
+            self.deferred_e2e.insert(room_id, room);
+        }
+        Ok(recovered)
     }
 
     /// Handles the server telling us our upload lost its last recipient: cancel
@@ -7035,7 +7163,9 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SetUploadRate(_) => "set_upload_rate",
         NetworkCommand::SetFilePolicy(_) => "set_file_policy",
         NetworkCommand::SetP2pEnabled(_) => "set_p2p_enabled",
-        NetworkCommand::TrustPeerIdentity { .. } => "trust_peer_identity",
+        NetworkCommand::ReviewPeerIdentity { .. } => "review_peer_identity",
+        NetworkCommand::VerifyPeerIdentity { .. } => "verify_peer_identity",
+        NetworkCommand::ForgetPeerIdentity { .. } => "forget_peer_identity",
         NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
         NetworkCommand::ConfirmE2eLocalUser { .. } => "confirm_e2e_local_user",
         NetworkCommand::Shutdown => "shutdown",

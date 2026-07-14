@@ -16,7 +16,8 @@ use crate::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 use crate::{
     chat_buffer::{NoticeId, NoticeKind, VirtualChatBuffer},
     client_net::{TerminalVerb, TransferDirection},
-    config::Config,
+    config::{Config, E2ePeerIdentity},
+    e2e::{AuthenticatedChat, MessageProvenance},
     room_catalog::{CatalogRoom, CatalogRoomKind, RoomCatalog},
     room_history::{self, FileHistoryKey, HistoryStorage, RoomHistoryStore},
     web_server::WebAttachment,
@@ -89,6 +90,47 @@ pub(crate) struct RoomSelectItem {
     pub(crate) voice: bool,
     /// This room is the one the chat panel shows.
     pub(crate) viewed: bool,
+    /// The DM is still waiting for a usable peer key.
+    pub(crate) e2e_blocked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DmTrustState {
+    FetchingKey {
+        peer: UserId,
+        username: String,
+    },
+    KeyUnavailable {
+        peer: UserId,
+        username: String,
+    },
+    Accepted {
+        peer: UserId,
+        identity: E2ePeerIdentity,
+        change_from: Option<crate::config::E2eTrustLevel>,
+    },
+    Verified {
+        peer: UserId,
+        identity: E2ePeerIdentity,
+    },
+}
+
+impl DmTrustState {
+    pub(crate) fn blocked(&self) -> bool {
+        !matches!(self, Self::Accepted { .. } | Self::Verified { .. })
+    }
+
+    fn warning(&self) -> String {
+        match self {
+            Self::FetchingKey { username, .. } => format!(
+                "security: Fetching {username}'s encryption identity key. Sending and decryption are temporarily unavailable."
+            ),
+            Self::KeyUnavailable { username, .. } => format!(
+                "security: {username} has not published an encryption key. Sending and encrypted messages are unavailable. Ask them to connect with an E2E-capable client."
+            ),
+            Self::Accepted { .. } | Self::Verified { .. } => String::new(),
+        }
+    }
 }
 
 impl crate::ui::select::SelectableItem for RoomSelectItem {
@@ -189,6 +231,11 @@ pub(crate) struct RoomShared {
     /// history merges can dedup and order pages, and so views and the web
     /// feed can mirror a room without re-reading disk.
     messages: MessageLog,
+    /// Exact peer key that authenticated each original DM message. Absence in
+    /// a DM means legacy local history with unknown provenance.
+    message_provenance: HashMap<MessageKey, MessageProvenance>,
+    verified_e2e_keys: HashSet<[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>,
+    e2e_room: bool,
     files: std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
     history: Option<RoomHistoryStore>,
     web_attachments: HashMap<MessageKey, WebAttachment>,
@@ -223,6 +270,7 @@ struct SenderMutations {
 struct EditRecord {
     mutation_id: MessageKey,
     body: String,
+    provenance: Option<MessageProvenance>,
 }
 
 /// What applying one mutation record did to the room's visible state.
@@ -243,6 +291,9 @@ impl RoomShared {
     fn empty() -> Self {
         Self {
             messages: MessageLog::default(),
+            message_provenance: HashMap::new(),
+            verified_e2e_keys: HashSet::new(),
+            e2e_room: false,
             files: std::collections::HashMap::new(),
             history: None,
             web_attachments: HashMap::new(),
@@ -273,6 +324,30 @@ impl RoomShared {
     pub(crate) fn message_by_key(&self, key: MessageKey) -> Option<&ChatMessage> {
         let index = self.messages.position(key)?;
         self.messages.as_slice().get(index)
+    }
+
+    fn message_unverified(&self, key: MessageKey, local_user: Option<UserId>) -> bool {
+        let Some(message) = self.message_by_key(key) else {
+            return false;
+        };
+        if !self.e2e_room || Some(message.sender) == local_user {
+            return false;
+        }
+        let original_unverified = self
+            .message_provenance
+            .get(&key)
+            .is_none_or(|provenance| !self.verified_e2e_keys.contains(&provenance.peer_public_key));
+        let edit_unverified = self
+            .mutations
+            .get(&key)
+            .and_then(|states| states.by_sender.get(&message.sender))
+            .and_then(|state| state.latest_edit.as_ref())
+            .is_some_and(|edit| {
+                edit.provenance.is_none_or(|provenance| {
+                    !self.verified_e2e_keys.contains(&provenance.peer_public_key)
+                })
+            });
+        original_unverified || edit_unverified
     }
 
     /// Journal entries newer than `applied`, when the journal still covers
@@ -321,7 +396,7 @@ impl RoomShared {
     /// shared step of live receipt and load-time seeding. State is separated
     /// by sender so an unverified pending mutation cannot displace the target
     /// author's mutation before an older history page delivers the target.
-    fn note_mutation_state(&mut self, record: &ChatMessage) {
+    fn note_mutation_state(&mut self, record: &ChatMessage, provenance: Option<MessageProvenance>) {
         let Some(target) = record.target else {
             return;
         };
@@ -344,23 +419,25 @@ impl RoomShared {
             state.latest_edit = Some(EditRecord {
                 mutation_id: record.message_id.0,
                 body: record.body.clone(),
+                provenance,
             });
         }
     }
 
     /// Applies one live or paged-in mutation record: captures it to disk once,
     /// folds it into the target's state, and updates the visible buffer.
-    fn receive_mutation(&mut self, record: &ChatMessage) -> MutationOutcome {
-        if record.target.is_none() {
+    fn receive_mutation(&mut self, record: &AuthenticatedChat) -> MutationOutcome {
+        let message = &record.message;
+        if message.target.is_none() {
             return MutationOutcome::Ignored;
         }
-        if self.seen_mutations.insert(record.message_id.0)
+        if self.seen_mutations.insert(message.message_id.0)
             && let Some(store) = &mut self.history
         {
-            store.append_message(record);
+            store.append_authenticated_message(message, record.provenance);
         }
-        self.note_mutation_state(record);
-        self.refold_target(record.target.expect("checked above").0)
+        self.note_mutation_state(message, record.provenance);
+        self.refold_target(message.target.expect("checked above").0)
     }
 
     /// Re-derives the target's display state from its mutation state and
@@ -425,8 +502,8 @@ impl RoomShared {
 
     /// Applies one live message: dedup, disk capture, canonical list, journal,
     /// and web-attachment correlation. Returns whether it was fresh.
-    fn receive_chat(&mut self, message: &ChatMessage, max_messages: usize) -> bool {
-        let mut message = message.clone();
+    fn receive_chat(&mut self, record: &AuthenticatedChat, max_messages: usize) -> bool {
+        let mut message = record.message.clone();
         self.fold_pending_state(&mut message);
         let deleted = message.flags.deleted();
         let key = MessageLog::key(&message);
@@ -434,7 +511,10 @@ impl RoomShared {
             return false;
         }
         if let Some(store) = &mut self.history {
-            store.append_message(&message);
+            store.append_authenticated_message(&message, record.provenance);
+        }
+        if let Some(provenance) = record.provenance {
+            self.message_provenance.insert(key, provenance);
         }
         self.messages.trim_front(max_messages);
         self.trim_orphaned_attachments();
@@ -462,13 +542,13 @@ impl RoomShared {
     /// fold into their targets (or the pending stash) instead of displaying;
     /// tombstoned messages enter only the canonical log, which is what stops
     /// a later page from resurrecting them. Returns whether anything changed.
-    fn merge_history_page(&mut self, page: Vec<ChatMessage>, max_messages: usize) -> bool {
-        let (mutation_records, normals): (Vec<ChatMessage>, Vec<ChatMessage>) = page
+    fn merge_history_page(&mut self, page: Vec<AuthenticatedChat>, max_messages: usize) -> bool {
+        let (mutation_records, normals): (Vec<AuthenticatedChat>, Vec<AuthenticatedChat>) = page
             .into_iter()
-            .partition(|message| message.target.is_some());
+            .partition(|record| record.message.target.is_some());
         let mut changed = false;
         let mut mutation_records = mutation_records;
-        mutation_records.sort_by_key(MessageLog::key);
+        mutation_records.sort_by_key(|record| MessageLog::key(&record.message));
         for record in &mutation_records {
             match self.receive_mutation(record) {
                 MutationOutcome::AppliedEdit(_) | MutationOutcome::AppliedDelete => changed = true,
@@ -476,29 +556,38 @@ impl RoomShared {
             }
         }
         let mut fresh = normals;
-        fresh.sort_by_key(MessageLog::key);
-        fresh.dedup_by_key(|message| MessageLog::key(message));
-        fresh.retain(|message| !self.messages.contains(MessageLog::key(message)));
+        fresh.sort_by_key(|record| MessageLog::key(&record.message));
+        fresh.dedup_by_key(|record| MessageLog::key(&record.message));
+        fresh.retain(|record| !self.messages.contains(MessageLog::key(&record.message)));
         if fresh.is_empty() {
             return changed;
         }
-        for message in &mut fresh {
-            self.fold_pending_state(message);
+        for record in &mut fresh {
+            self.fold_pending_state(&mut record.message);
         }
         if let Some(store) = &mut self.history {
-            for message in &fresh {
-                store.append_message(message);
+            for record in &fresh {
+                store.append_authenticated_message(&record.message, record.provenance);
+            }
+        }
+        for record in &fresh {
+            if let Some(provenance) = record.provenance {
+                self.message_provenance
+                    .insert(record.message.message_id.0, provenance);
             }
         }
         collect_web_attachments(
-            &fresh,
+            &fresh
+                .iter()
+                .map(|record| record.message.clone())
+                .collect::<Vec<_>>(),
             &self.files,
             &mut self.web_attachments,
             &mut self.web_file_attachments,
         );
         let oldest_resident = self.messages.first().map(MessageLog::key);
         let split = oldest_resident.map_or(fresh.len(), |oldest| {
-            fresh.partition_point(|message| MessageLog::key(message) < oldest)
+            fresh.partition_point(|record| MessageLog::key(&record.message) < oldest)
         });
         let rest = fresh.split_off(split);
         let older = fresh;
@@ -506,7 +595,11 @@ impl RoomShared {
         // undo it; the overflow is the oldest data and stays on disk only.
         let budget = max_messages.saturating_sub(self.messages.len());
         let skip = older.len().saturating_sub(budget);
-        let older: Vec<ChatMessage> = older.into_iter().skip(skip).collect();
+        let older: Vec<ChatMessage> = older
+            .into_iter()
+            .skip(skip)
+            .map(|record| record.message)
+            .collect();
         if !older.is_empty() {
             let keys = older
                 .iter()
@@ -518,7 +611,8 @@ impl RoomShared {
                 self.record(RoomDelta::Prepend(keys));
             }
         }
-        for message in rest {
+        for record in rest {
+            let message = record.message;
             let deleted = message.flags.deleted();
             let key = MessageLog::key(&message);
             match self.messages.insert(message) {
@@ -541,6 +635,7 @@ impl RoomShared {
         };
         let oldest_key = MessageLog::key(oldest);
         let oldest_timestamp = oldest.timestamp_ms;
+        self.message_provenance.retain(|id, _| *id >= oldest_key);
         self.web_attachments.retain(|id, _| *id >= oldest_key);
         self.files
             .retain(|key, _| key.timestamp_ms >= oldest_timestamp);
@@ -609,8 +704,11 @@ impl RoomView {
                     return;
                 };
                 let stick = self.chat.scroll_offset() == 0;
-                self.chat
-                    .push_chat(message.clone(), Some(message.sender) == local_user);
+                self.chat.push_authenticated_chat(
+                    message.clone(),
+                    Some(message.sender) == local_user,
+                    shared.message_unverified(*key, local_user),
+                );
                 if stick {
                     self.chat.bottom();
                 }
@@ -619,22 +717,35 @@ impl RoomView {
                 let Some(message) = shared.message_by_key(*key) else {
                     return;
                 };
-                self.chat
-                    .insert_chat(message.clone(), Some(message.sender) == local_user);
+                self.chat.insert_authenticated_chat(
+                    message.clone(),
+                    Some(message.sender) == local_user,
+                    shared.message_unverified(*key, local_user),
+                );
             }
             RoomDelta::Prepend(keys) => {
                 let flagged = keys
                     .iter()
                     .filter_map(|key| shared.message_by_key(*key))
-                    .map(|message| (message.clone(), Some(message.sender) == local_user))
+                    .map(|message| {
+                        (
+                            message.clone(),
+                            Some(message.sender) == local_user,
+                            shared.message_unverified(message.message_id.0, local_user),
+                        )
+                    })
                     .collect();
-                self.chat.prepend_chat(flagged);
+                self.chat.prepend_authenticated_chat(flagged);
             }
             RoomDelta::Edit(key) => {
                 let Some(message) = shared.message_by_key(*key) else {
                     return;
                 };
-                self.chat.edit_message(*key, message.clone());
+                self.chat.edit_authenticated_message(
+                    *key,
+                    message.clone(),
+                    shared.message_unverified(*key, local_user),
+                );
             }
             RoomDelta::Delete(key) => {
                 self.chat.remove_message(*key);
@@ -686,8 +797,11 @@ impl RoomView {
         }
         self.notice_ids.clear();
         for message in shared.visible_messages() {
-            self.chat
-                .push_chat(message.clone(), Some(message.sender) == local_user);
+            self.chat.push_authenticated_chat(
+                message.clone(),
+                Some(message.sender) == local_user,
+                shared.message_unverified(message.message_id.0, local_user),
+            );
         }
         // Journal-resident notices survive the rebuild (appended after the
         // log, which matches their recency), so an attaching view still sees
@@ -755,10 +869,11 @@ pub(crate) struct RoomSession {
     pub(super) settings_owner: Option<crate::client_channel::ClientId>,
     pub(super) settings_generation: u64,
     muted_users: HashSet<UserId>,
-    /// DM peers whose served encryption key contradicts the pinned one; sends
-    /// to them are blocked until `/trust`. Cleared on re-auth and re-populated
-    /// by the worker's key checks.
-    e2e_changed_peers: HashSet<UserId>,
+    /// Authoritative session mirror of each DM's send/decrypt trust state.
+    e2e_trust: HashMap<RoomId, DmTrustState>,
+    e2e_verified_keys: HashMap<RoomId, HashSet<[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>>,
+    /// Stable warning notice currently journaled for a blocked room.
+    e2e_warning_notices: HashMap<RoomId, NoticeKey>,
     stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
     /// Catalog facts for every known room, viewed or not.
@@ -1274,7 +1389,9 @@ impl RoomSession {
             settings_owner: None,
             settings_generation: 0,
             muted_users: HashSet::new(),
-            e2e_changed_peers: HashSet::new(),
+            e2e_trust: HashMap::new(),
+            e2e_verified_keys: HashMap::new(),
+            e2e_warning_notices: HashMap::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
             metas: BTreeMap::new(),
@@ -1363,6 +1480,9 @@ impl RoomSession {
                 self.stream_users.clear();
                 self.volume_preview = None;
                 self.attached_views.clear();
+                self.e2e_trust.clear();
+                self.e2e_verified_keys.clear();
+                self.e2e_warning_notices.clear();
             }
         }
         continuity
@@ -1388,6 +1508,9 @@ impl RoomSession {
         self.stream_users.clear();
         self.volume_preview = None;
         self.attached_views.clear();
+        self.e2e_trust.clear();
+        self.e2e_verified_keys.clear();
+        self.e2e_warning_notices.clear();
     }
 
     /// Marks every user offline and clears live voice state while keeping the
@@ -1524,14 +1647,36 @@ impl RoomSession {
     fn materialize_room(&self, room_id: RoomId) -> RoomShared {
         let opened = room_history::open_in(self.history.room_dir(room_id), room_id);
         let mut room = RoomShared::empty();
+        room.e2e_room = self
+            .metas
+            .get(&room_id)
+            .is_some_and(|meta| matches!(meta.kind, ClientRoomKind::Dm { .. }));
+        room.verified_e2e_keys = self
+            .e2e_verified_keys
+            .get(&room_id)
+            .cloned()
+            .unwrap_or_default();
         room.messages = MessageLog::from_sorted(opened.loaded.messages);
         room.messages.trim_front(self.max_messages);
         room.files = opened.loaded.files;
         room.trim_orphaned_attachments();
         room.history = opened.store;
+        room.message_provenance = opened
+            .loaded
+            .provenance
+            .iter()
+            .map(|(id, provenance)| (*id, *provenance))
+            .collect();
         for mutation in &opened.loaded.mutations {
             room.seen_mutations.insert(mutation.message_id.0);
-            room.note_mutation_state(mutation);
+            room.note_mutation_state(
+                mutation,
+                opened
+                    .loaded
+                    .provenance
+                    .get(&mutation.message_id.0)
+                    .copied(),
+            );
         }
         // Views must rebuild from the log rather than believe an empty
         // buffer matches revision zero.
@@ -2004,18 +2149,29 @@ impl RoomSession {
         }
     }
 
-    pub(crate) fn history_chunk_received(
+    pub(crate) fn history_chunk_received<M>(
         &mut self,
         room_id: RoomId,
         before: Option<MessageId>,
-        messages: Vec<ChatMessage>,
+        messages: Vec<M>,
         at_start: bool,
         complete: bool,
         _local_user: Option<UserId>,
-    ) -> HistoryChunkUpdate {
-        let page_oldest = messages.iter().map(MessageLog::key).min();
+    ) -> HistoryChunkUpdate
+    where
+        M: Into<AuthenticatedChat>,
+    {
+        let messages: Vec<_> = messages.into_iter().map(Into::into).collect();
+        let page_oldest = messages
+            .iter()
+            .map(|record| MessageLog::key(&record.message))
+            .min();
+        let plain_messages: Vec<_> = messages
+            .iter()
+            .map(|record| record.message.clone())
+            .collect();
         let completion = complete
-            .then(|| self.complete_history_fetch(room_id, before, &messages, at_start))
+            .then(|| self.complete_history_fetch(room_id, before, &plain_messages, at_start))
             .flatten();
         if let Some(completion) = completion {
             self.detect_initial_history_gap(
@@ -2046,7 +2202,11 @@ impl RoomSession {
 
     /// Merges a server history page into whichever room holds `room_id`,
     /// returning whether the room gained any messages.
-    pub(crate) fn merge_history(&mut self, room_id: RoomId, messages: Vec<ChatMessage>) -> bool {
+    pub(crate) fn merge_history<M>(&mut self, room_id: RoomId, messages: Vec<M>) -> bool
+    where
+        M: Into<AuthenticatedChat>,
+    {
+        let messages: Vec<_> = messages.into_iter().map(Into::into).collect();
         let viewed = self.room_is_viewed(room_id);
         let max_messages = self.max_messages;
         let Some(room) = self.room_mut(room_id) else {
@@ -2072,6 +2232,11 @@ impl RoomSession {
             messages: room.visible_messages().cloned().collect(),
             files: room.files.clone(),
             mutations: Vec::new(),
+            provenance: room
+                .message_provenance
+                .iter()
+                .map(|(id, provenance)| (*id, *provenance))
+                .collect(),
         }
     }
 
@@ -2103,6 +2268,10 @@ impl RoomSession {
                     && meta.head > meta.last_read,
                 voice: voice_room == Some(*room_id),
                 viewed: self.viewed_room == Some(*room_id),
+                e2e_blocked: self
+                    .e2e_trust
+                    .get(room_id)
+                    .is_some_and(DmTrustState::blocked),
             });
         }
         items
@@ -2158,24 +2327,93 @@ impl RoomSession {
         }
     }
 
-    /// Marks or clears a DM peer's pending encryption-identity change.
-    pub(crate) fn set_e2e_identity_changed(&mut self, peer: UserId, changed: bool) {
-        if changed {
-            self.e2e_changed_peers.insert(peer);
+    pub(crate) fn dm_room_for_peer(&self, peer: UserId) -> Option<RoomId> {
+        self.metas
+            .iter()
+            .find_map(|(room_id, _)| (self.dm_peer_of(*room_id) == Some(peer)).then_some(*room_id))
+    }
+
+    pub(crate) fn e2e_trust_state(&self, room_id: RoomId) -> Option<&DmTrustState> {
+        self.e2e_trust.get(&room_id)
+    }
+
+    pub(crate) fn set_e2e_trust_state(&mut self, room_id: RoomId, state: DmTrustState) {
+        let blocked = state.blocked();
+        let previous_warning = self.e2e_trust.get(&room_id).map(DmTrustState::warning);
+        let next_warning = blocked.then(|| state.warning());
+        self.e2e_trust.insert(room_id, state);
+        if blocked {
+            if previous_warning != next_warning
+                && let Some(old) = self.e2e_warning_notices.remove(&room_id)
+                && let Some(room) = self.rooms.get_mut(&room_id)
+            {
+                room.remove_notice_record(old);
+            }
+            self.ensure_e2e_warning_notice(room_id);
         } else {
-            self.e2e_changed_peers.remove(&peer);
+            self.clear_e2e_warning_notice(room_id);
         }
     }
 
-    /// Whether sends to this DM peer are blocked on an unacknowledged identity change.
-    pub(crate) fn e2e_identity_changed(&self, peer: UserId) -> bool {
-        self.e2e_changed_peers.contains(&peer)
+    pub(crate) fn set_e2e_verified_keys(
+        &mut self,
+        room_id: RoomId,
+        keys: impl IntoIterator<Item = [u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>,
+    ) {
+        let keys: HashSet<_> = keys.into_iter().collect();
+        if self.e2e_verified_keys.get(&room_id) == Some(&keys) {
+            return;
+        }
+        self.e2e_verified_keys.insert(room_id, keys.clone());
+        if let Some(room) = self.rooms.get_mut(&room_id) {
+            room.verified_e2e_keys = keys;
+            room.invalidate();
+        }
     }
 
-    /// Forgets all pending identity changes; the worker re-reports any that
-    /// persist after re-authentication.
-    pub(crate) fn clear_e2e_identity_changes(&mut self) {
-        self.e2e_changed_peers.clear();
+    pub(crate) fn ensure_e2e_warning_notice(&mut self, room_id: RoomId) {
+        let Some(state) = self.e2e_trust.get(&room_id).filter(|state| state.blocked()) else {
+            return;
+        };
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        if self.e2e_warning_notices.get(&room_id).is_some_and(|key| {
+            room.journal.back().is_some_and(
+                |(_, delta)| matches!(delta, RoomDelta::Notice(newest, _) if newest == key),
+            )
+        }) {
+            return;
+        }
+        if let Some(old) = self.e2e_warning_notices.remove(&room_id) {
+            room.remove_notice_record(old);
+        }
+        let key = room.push_notice_record(NoticeRecord {
+            sender: "security".to_string(),
+            body: state.warning().trim_start_matches("security: ").to_string(),
+            kind: NoticeKind::Error,
+            scroll_bottom: true,
+        });
+        self.e2e_warning_notices.insert(room_id, key);
+    }
+
+    pub(crate) fn clear_e2e_warning_notice(&mut self, room_id: RoomId) {
+        let Some(key) = self.e2e_warning_notices.remove(&room_id) else {
+            return;
+        };
+        if let Some(room) = self.rooms.get_mut(&room_id) {
+            room.remove_notice_record(key);
+        }
+    }
+
+    pub(crate) fn clear_e2e_trust_states(&mut self) {
+        let notices = std::mem::take(&mut self.e2e_warning_notices);
+        for (room_id, key) in notices {
+            if let Some(room) = self.rooms.get_mut(&room_id) {
+                room.remove_notice_record(key);
+            }
+        }
+        self.e2e_trust.clear();
     }
 
     pub(crate) fn username_of(&self, user_id: UserId) -> String {
@@ -2369,15 +2607,28 @@ impl RoomSession {
             .cloned()
     }
 
+    pub(crate) fn message_unverified(
+        &self,
+        room_id: RoomId,
+        message_id: MessageId,
+        local_user: Option<UserId>,
+    ) -> bool {
+        self.rooms
+            .get(&room_id)
+            .is_some_and(|room| room.message_unverified(message_id.0, local_user))
+    }
+
     /// Applies a live chat message to whichever room it belongs to, recording
     /// it in the room's journal for every view to thread in. Unviewed rooms
     /// bump their unread count. Returns `None` for rooms this client does not
     /// know.
     pub(crate) fn chat_received(
         &mut self,
-        message: ChatMessage,
+        record: impl Into<AuthenticatedChat>,
         local_user: Option<UserId>,
     ) -> Option<RoomChatUpdate> {
+        let record = record.into();
+        let message = &record.message;
         let local = Some(message.sender) == local_user;
         let room_id = message.room_id;
         if let Some(meta) = self.metas.get_mut(&room_id) {
@@ -2386,7 +2637,7 @@ impl RoomSession {
         let viewed = self.room_is_viewed(room_id);
         let max_messages = self.max_messages;
         let room = self.room_mut_materializing(room_id)?;
-        let fresh = room.receive_chat(&message, max_messages);
+        let fresh = room.receive_chat(&record, max_messages);
         let mut read_advanced = false;
         if fresh {
             if viewed {
@@ -2406,14 +2657,29 @@ impl RoomSession {
     /// Mutations advance the head like any message but never bump unread
     /// counts or ring the notification; viewing counts them read immediately.
     /// Returns `None` for rooms this client does not know.
+    #[cfg(test)]
     pub(crate) fn mutation_received(
         &mut self,
-        record: &ChatMessage,
+        message: &ChatMessage,
         local_user: Option<UserId>,
     ) -> Option<RoomMutationUpdate> {
-        let room_id = record.room_id;
+        self.authenticated_mutation_received(
+            &AuthenticatedChat {
+                message: message.clone(),
+                provenance: None,
+            },
+            local_user,
+        )
+    }
+
+    pub(crate) fn authenticated_mutation_received(
+        &mut self,
+        record: &AuthenticatedChat,
+        local_user: Option<UserId>,
+    ) -> Option<RoomMutationUpdate> {
+        let room_id = record.message.room_id;
         if let Some(meta) = self.metas.get_mut(&room_id) {
-            meta.head = Some(record.message_id).max(meta.head);
+            meta.head = Some(record.message.message_id).max(meta.head);
         }
         let _ = local_user;
         let viewed = self.room_is_viewed(room_id);
@@ -3077,6 +3343,19 @@ mod tests {
         }
     }
 
+    fn authenticated_message(
+        room_id: RoomId,
+        id: u64,
+        sender: UserId,
+        body: &str,
+        key: Option<[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>,
+    ) -> AuthenticatedChat {
+        AuthenticatedChat {
+            message: message_in(room_id, id, sender, body),
+            provenance: key.map(|peer_public_key| MessageProvenance { peer_public_key }),
+        }
+    }
+
     #[test]
     fn room_name_of_reports_known_rooms_only() {
         let mut client = test_room();
@@ -3084,6 +3363,128 @@ mod tests {
 
         assert_eq!(client.session.room_name_of(RoomId(1)), Some("room-1"));
         assert_eq!(client.session.room_name_of(RoomId(9)), None);
+    }
+
+    #[test]
+    fn dm_verification_relabels_only_messages_from_that_exact_key() {
+        let mut client = test_room();
+        let room_id = RoomId(9);
+        client.session.authenticated(
+            &[dm_room_info(9, UserId(1), UserId(2))],
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            room_id,
+            None,
+            Some(UserId(1)),
+        );
+        let first_key = [0x11; rpc::e2e::E2E_PUBLIC_KEY_LEN];
+        let second_key = [0x22; rpc::e2e::E2E_PUBLIC_KEY_LEN];
+        client.session.chat_received(
+            authenticated_message(room_id, 1, UserId(2), "from first", Some(first_key)),
+            Some(UserId(1)),
+        );
+        client.session.chat_received(
+            authenticated_message(room_id, 2, UserId(2), "from second", Some(second_key)),
+            Some(UserId(1)),
+        );
+        client.session.chat_received(
+            authenticated_message(room_id, 3, UserId(2), "unknown key", None),
+            Some(UserId(1)),
+        );
+        client.session.chat_received(
+            authenticated_message(room_id, 4, UserId(1), "local echo", None),
+            Some(UserId(1)),
+        );
+
+        client.session.set_e2e_verified_keys(room_id, [second_key]);
+        let chat = client.chat();
+        assert!(chat.message(0).unverified);
+        assert!(!chat.message(1).unverified);
+        assert!(chat.message(2).unverified);
+        assert!(!chat.message(3).unverified);
+
+        client
+            .session
+            .set_e2e_verified_keys(room_id, [first_key, second_key]);
+        let chat = client.chat();
+        assert!(!chat.message(0).unverified);
+        assert!(!chat.message(1).unverified);
+        assert!(chat.message(2).unverified);
+    }
+
+    #[test]
+    fn dm_edit_keeps_exact_key_provenance_in_the_annotation() {
+        let mut client = test_room();
+        let room_id = RoomId(9);
+        client.session.authenticated(
+            &[dm_room_info(9, UserId(1), UserId(2))],
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            room_id,
+            None,
+            Some(UserId(1)),
+        );
+        let verified_key = [0x33; rpc::e2e::E2E_PUBLIC_KEY_LEN];
+        let replacement_key = [0x44; rpc::e2e::E2E_PUBLIC_KEY_LEN];
+        client
+            .session
+            .set_e2e_verified_keys(room_id, [verified_key]);
+        client.session.chat_received(
+            authenticated_message(room_id, 1, UserId(2), "original", Some(verified_key)),
+            Some(UserId(1)),
+        );
+        assert!(!client.chat().message(0).unverified);
+
+        let mut edit = authenticated_message(
+            room_id,
+            2,
+            UserId(2),
+            "edited under replacement",
+            Some(replacement_key),
+        );
+        edit.message.target = Some(MessageId(1));
+        edit.message.flags.set_edited();
+        client
+            .session
+            .authenticated_mutation_received(&edit, Some(UserId(1)));
+        let entry = client.chat().message(0);
+        assert_eq!(entry.body, "edited under replacement");
+        assert!(entry.unverified);
+    }
+
+    #[test]
+    fn exact_key_verification_does_not_cross_server_boundaries() {
+        let mut client = test_room();
+        let room_id = RoomId(9);
+        let key = [0x55; rpc::e2e::E2E_PUBLIC_KEY_LEN];
+        client.session.authenticated(
+            &[dm_room_info(9, UserId(1), UserId(2))],
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            room_id,
+            None,
+            Some(UserId(1)),
+        );
+        client.session.set_e2e_verified_keys(room_id, [key]);
+
+        assert_eq!(
+            client.session.connect_to_server(
+                "other-server".to_string(),
+                HistoryStorage::disabled(),
+                "alice".to_string(),
+            ),
+            ServerContinuity::NewServer
+        );
+        client.session.authenticated(
+            &[dm_room_info(9, UserId(1), UserId(2))],
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            room_id,
+            None,
+            Some(UserId(1)),
+        );
+        client.session.chat_received(
+            authenticated_message(room_id, 1, UserId(2), "same bytes", Some(key)),
+            Some(UserId(1)),
+        );
+
+        assert!(client.chat().message(0).unverified);
     }
 
     #[test]
@@ -5284,6 +5685,57 @@ mod tests {
             .expect("remote selection");
         assert_eq!(selected.user_id, UserId(2));
         assert_eq!(selected.username, "bob");
+    }
+
+    #[test]
+    fn e2e_warning_notice_is_stable_then_moves_to_the_newest_delta() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        let room_id = RoomId(1);
+        room.set_e2e_trust_state(
+            room_id,
+            DmTrustState::FetchingKey {
+                peer: UserId(2),
+                username: "bob".to_string(),
+            },
+        );
+        let first_key = room.e2e_warning_notices[&room_id];
+        let first_len = room.shared(1).journal.len();
+
+        room.ensure_e2e_warning_notice(room_id);
+        assert_eq!(room.shared(1).journal.len(), first_len);
+        assert_eq!(room.e2e_warning_notices[&room_id], first_key);
+
+        room.push_notice_to(room_id, "network", "later notice");
+        room.ensure_e2e_warning_notice(room_id);
+        let replacement = room.e2e_warning_notices[&room_id];
+        assert_ne!(replacement, first_key);
+        assert!(matches!(
+            room.shared(1).journal.back(),
+            Some((_, RoomDelta::Notice(key, notice)))
+                if *key == replacement && notice.kind == NoticeKind::Error
+        ));
+
+        room.set_e2e_trust_state(
+            room_id,
+            DmTrustState::Accepted {
+                peer: UserId(2),
+                identity: crate::config::E2ePeerIdentity {
+                    room_id: 1,
+                    user_id: 2,
+                    username: "bob".to_string(),
+                    public_key: "11".repeat(32),
+                    trust_level: crate::config::E2eTrustLevel::Accepted,
+                },
+                change_from: None,
+            },
+        );
+        assert!(!room.e2e_warning_notices.contains_key(&room_id));
     }
 
     #[test]

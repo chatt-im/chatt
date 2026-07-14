@@ -13,6 +13,7 @@ mod clipboard_paste;
 mod config;
 mod config_diagnostics;
 mod e2e;
+mod e2e_identity;
 mod file_compression;
 mod fuzzy;
 mod highlight;

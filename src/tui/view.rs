@@ -301,6 +301,12 @@ impl ClientView {
         self.pending_clipboard.take()
     }
 
+    /// Queues public text for the render thread's existing OSC 52/platform
+    /// clipboard handoff. Modes must not invoke platform helpers directly.
+    pub(crate) fn queue_clipboard(&mut self, text: String) {
+        self.pending_clipboard = Some(text);
+    }
+
     /// Queues `url` to be opened by the external opener on the next runtime
     /// tick.
     pub(crate) fn request_open_url(&mut self, url: impl Into<String>) {

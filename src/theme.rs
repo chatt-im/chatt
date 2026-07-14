@@ -163,7 +163,7 @@ impl Theme {
                 .with_bg_rgb(0x29, 0x29, 0x29)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
             join_input_inactive: d
-                .with_bg_rgb(0x1c, 0x1c, 0x1c)
+                .with_bg_rgb(0x23, 0x23, 0x23)
                 .with_fg_rgb(0xd8, 0xdb, 0xd6),
             join_input_boundary_active: d
                 .with_bg_rgb(0x4d, 0x4d, 0x4d)
@@ -464,6 +464,18 @@ impl Theme {
             },
         }
     }
+
+    pub fn join_input_inactive_editor_theme(&self) -> EditorTheme {
+        EditorTheme {
+            name: "chatt-join-input-inactive",
+            text: self.join_input_inactive,
+            selection: SelectionTheme {
+                charwise: self.editor_selection_charwise,
+                linewise: self.join_input_boundary_active,
+                blockwise: self.editor_selection_charwise,
+            },
+        }
+    }
 }
 
 impl SyntaxTheme {
@@ -697,5 +709,17 @@ mod tests {
             assert_eq!(theme.scrollbar.bg(), theme.status_fill.bg());
             assert!(theme.scrollbar.fg().is_some());
         }
+    }
+
+    #[test]
+    fn tomorrow_night_inactive_input_stands_out_from_dialog_panel() {
+        let theme = Theme::tomorrow_night();
+
+        assert_eq!(
+            theme.join_input_inactive.bg(),
+            Style::DEFAULT.with_bg_rgb(0x23, 0x23, 0x23).bg()
+        );
+        assert_ne!(theme.join_input_inactive.bg(), theme.dialog_panel.bg());
+        assert_ne!(theme.join_input_inactive.bg(), theme.join_input_active.bg());
     }
 }

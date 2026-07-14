@@ -14,6 +14,26 @@ use crate::{
     clipboard_paste::ImagePaste,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct E2eIdentityTarget {
+    pub(crate) room_id: rpc::ids::RoomId,
+    pub(crate) user_id: rpc::ids::UserId,
+    pub(crate) username: String,
+    pub(crate) public_key: String,
+    pub(crate) accepted: crate::e2e::AcceptedPeerIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct E2eIdentityOverlay {
+    pub(crate) target: E2eIdentityTarget,
+    /// Copyable encoding of the local public identity, including the server
+    /// and account context checked when another user pastes it.
+    pub(crate) local_verification_text: String,
+    pub(crate) pasted_verification_text: String,
+    pub(crate) result: Option<Result<(), String>>,
+    pub(crate) error: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ClientId(pub(crate) u32);
 
@@ -38,6 +58,7 @@ pub(crate) enum ScreenSpec {
 pub(crate) enum OverlaySpec {
     UserVolume(UserVolumeDialog),
     NativeEncryptionWarning { label: String, generation: u64 },
+    E2eIdentity(E2eIdentityOverlay),
     PairingPassword { retry: bool },
     PasteUpload(ImagePaste),
 }

@@ -72,6 +72,28 @@ body {
   height: 100%;
 }
 
+.e2e-blocked-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 8px 14px;
+  background: color-mix(in srgb, var(--warn) 14%, var(--bg-elevated));
+  border-bottom: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 14px;
+}
+
+.e2e-blocked-banner strong {
+  letter-spacing: 0.04em;
+}
+
+.e2e-blocked-banner.is-danger {
+  background: color-mix(in srgb, var(--error) 14%, var(--bg-elevated));
+  border-bottom-color: var(--error);
+  color: var(--error);
+}
+
 /* Shown only after a sustained connection failure. It floats in the unused
  * top-right corner rather than occupying a permanent header bar. */
 .conn-overlay {
@@ -392,6 +414,12 @@ body {
   font-weight: 400;
 }
 
+.message-unverified {
+  color: var(--warn);
+  font-size: 0.9em;
+  font-weight: 600;
+}
+
 /* Every message has a persistent, full-size group control at the far right.
  * Inward/outward list icons describe the action without relying on a small
  * rotating disclosure arrow. */
@@ -452,7 +480,7 @@ body {
 }
 
 .message-group-summary::before {
-  content: "·";
+  content: "|";
   margin-right: var(--space);
 }
 

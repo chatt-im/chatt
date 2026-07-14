@@ -1227,6 +1227,8 @@ pub(crate) struct RoomLayout {
     pub room_hits: Vec<(Rect, rpc::ids::RoomId)>,
     pub lobby_bar_rect: Rect,
     pub chat_log_bar_rect: Rect,
+    /// Visible DM identity status in the chat section bar.
+    pub identity_status_rect: Rect,
     pub composer_rect: Rect,
     /// Composer editor plus its optional half-block frame and side gutters.
     pub composer_frame_rect: Rect,
@@ -1253,6 +1255,7 @@ impl Default for RoomLayout {
             room_hits: Vec::new(),
             lobby_bar_rect: Rect::EMPTY,
             chat_log_bar_rect: Rect::EMPTY,
+            identity_status_rect: Rect::EMPTY,
             composer_rect: Rect::EMPTY,
             composer_frame_rect: Rect::EMPTY,
             composer_scrollbar: None,
@@ -1809,6 +1812,11 @@ impl RoomMode {
             mouse.column,
             mouse.row,
         );
+        let in_identity_status = crate::tui::form::rect_contains(
+            self.layout.identity_status_rect,
+            mouse.column,
+            mouse.row,
+        );
         let scrollbar = self
             .layout
             .rooms_scrollbar
@@ -1827,6 +1835,14 @@ impl RoomMode {
             .map(|(_, id)| *id);
 
         match mouse.kind {
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
+                if in_identity_status =>
+            {
+                cx.send(CoreCommand::RunSlash {
+                    room_id: cx.view.viewed_room,
+                    input: "/identity".to_string(),
+                });
+            }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
                 if transfer_hit.is_some() =>
             {
@@ -2022,6 +2038,7 @@ impl RoomMode {
         match scrollbar.id {
             ScrollbarId::Rooms => self.set_lobby_list_focus(cx, LobbyListFocus::Rooms),
             ScrollbarId::Compose => self.enter_compose_insert_mode(cx),
+            ScrollbarId::Identity => return,
         }
         self.scrollbar_drag = Some(press.drag);
         if let Some(target) = press.target {
@@ -2036,6 +2053,7 @@ impl RoomMode {
         let scrollbar = match drag.id {
             ScrollbarId::Rooms => self.layout.rooms_scrollbar,
             ScrollbarId::Compose => self.layout.composer_scrollbar,
+            ScrollbarId::Identity => None,
         };
         let Some(scrollbar) = scrollbar else {
             self.scrollbar_drag = None;
@@ -2072,6 +2090,7 @@ impl RoomMode {
                 target,
                 scrollbar.state.viewport,
             ),
+            ScrollbarId::Identity => {}
         }
     }
 
@@ -4291,6 +4310,73 @@ mod tests {
             !app.view.active.chat.has_visual(),
             "a click is a cursor move, not a selection"
         );
+    }
+
+    #[test]
+    fn clicking_unverified_identity_status_runs_identity_command() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let room_id = RoomId(0x8000_0001);
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[rpc::control::RoomInfo {
+                room_id,
+                name: "dm:1:2".to_string(),
+                kind: rpc::control::RoomKind::Dm {
+                    user_a: UserId(1),
+                    user_b: UserId(2),
+                },
+                head: None,
+                voice_users: Vec::new(),
+            }],
+            vec![
+                participant(UserId(1), "alice"),
+                participant(UserId(2), "bob"),
+            ],
+            room_id,
+            None,
+            app.user_id,
+        );
+        app.room.set_e2e_trust_state(
+            room_id,
+            crate::app::room::DmTrustState::Accepted {
+                peer: UserId(2),
+                identity: crate::config::E2ePeerIdentity {
+                    room_id: room_id.0,
+                    user_id: 2,
+                    username: "bob".to_string(),
+                    public_key: "11".repeat(rpc::e2e::E2E_PUBLIC_KEY_LEN),
+                    trust_level: crate::config::E2eTrustLevel::Accepted,
+                },
+                change_from: None,
+            },
+        );
+
+        let mut buffer = Buffer::new(100, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let status = room.layout().identity_status_rect;
+        assert!(!status.is_empty());
+
+        {
+            let mut cx = app.view_cx();
+            AppMode::process_mouse(
+                &mut room,
+                &mut cx,
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    status.x + 1,
+                    status.y,
+                ),
+            );
+        }
+
+        assert!(matches!(
+            app.take_queued_core_command(),
+            Some(CoreCommand::RunSlash {
+                room_id: Some(clicked_room),
+                input,
+            }) if clicked_room == room_id && input == "/identity"
+        ));
     }
 
     #[test]

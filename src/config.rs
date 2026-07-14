@@ -101,8 +101,8 @@ impl Default for ServerEntry {
     }
 }
 
-/// One formerly-trusted DM identity tuple. Old tuples remain usable only for
-/// opening retained history; sends always use the current tuple.
+/// One retained DM identity tuple. It can open retained history and preserves
+/// exact-key verification if the server later presents that key as current.
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct E2ePeerIdentity {
@@ -110,11 +110,21 @@ pub struct E2ePeerIdentity {
     pub user_id: u64,
     pub username: String,
     pub public_key: String,
+    #[toml(default)]
+    pub trust_level: E2eTrustLevel,
+}
+
+/// What the user established about a TOFU-pinned public identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum E2eTrustLevel {
+    #[default]
+    Accepted,
+    Verified,
 }
 
 /// A TOFU-pinned DM identity tuple for one contact, stored per server entry.
-/// Binding the key to the room, stable user id, and case-insensitive username
-/// prevents a later-compromised server from silently remapping an existing DM.
+/// The room and stable user id are trust material; `username` is display state.
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct E2ePeerPin {
@@ -124,6 +134,13 @@ pub struct E2ePeerPin {
     #[toml(default)]
     pub username: String,
     pub public_key: String,
+    #[toml(default)]
+    pub trust_level: E2eTrustLevel,
+    /// Trust level of the identity replaced by the current unverified key.
+    /// `None` means this is a first observation or the change was resolved by
+    /// independently verifying the current key.
+    #[toml(default)]
+    pub change_from: Option<E2eTrustLevel>,
     #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
     pub previous: Vec<E2ePeerIdentity>,
 }
@@ -3744,11 +3761,14 @@ server-public-key = ""
             user_id: 9,
             username: "Bob".to_string(),
             public_key: "22".repeat(32),
+            trust_level: E2eTrustLevel::Verified,
+            change_from: Some(E2eTrustLevel::Accepted),
             previous: vec![E2ePeerIdentity {
                 room_id: 11,
                 user_id: 9,
                 username: "Robert".to_string(),
                 public_key: "33".repeat(32),
+                trust_level: E2eTrustLevel::Accepted,
             }],
         });
         config.servers.push(server);
@@ -3760,6 +3780,10 @@ server-public-key = ""
 
         assert_eq!(parsed.servers[0].e2e_local_user_id, 7);
         assert_eq!(parsed.servers[0].e2e_peer_pins[0].room_id, 11);
+        assert_eq!(
+            parsed.servers[0].e2e_peer_pins[0].trust_level,
+            E2eTrustLevel::Verified
+        );
         assert_eq!(
             parsed.servers[0].e2e_peer_pins[0].previous[0].username,
             "Robert"

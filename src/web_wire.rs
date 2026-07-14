@@ -351,6 +351,7 @@ fn encode_message(buf: &mut Vec<u8>, message: &WebMessage) {
     put_str(buf, &message.body);
     buf.push(u8::from(message.local));
     buf.push(u8::from(message.edited));
+    buf.push(u8::from(message.unverified));
     match &message.attachment {
         None => buf.push(0),
         Some(attachment) => {
@@ -437,6 +438,7 @@ pub(crate) struct DecodedMessage {
     pub body: String,
     pub local: bool,
     pub edited: bool,
+    pub unverified: bool,
     pub attachment_name: Option<String>,
     pub fragments: Vec<Fragment>,
 }
@@ -516,6 +518,7 @@ impl Reader<'_> {
         let body = self.string();
         let local = self.u8() == 1;
         let edited = self.u8() == 1;
+        let unverified = self.u8() == 1;
         let attachment_name = if self.u8() == 1 {
             let name = self.string();
             let _kind = self.u8();
@@ -552,6 +555,7 @@ impl Reader<'_> {
             body,
             local,
             edited,
+            unverified,
             attachment_name,
             fragments,
         }
@@ -724,15 +728,17 @@ mod tests {
     }
 
     #[test]
-    fn message_frame_carries_plaintext_author_and_edit_state() {
+    fn message_frame_carries_plaintext_author_edit_and_verification_state() {
         let mut message = WebMessage::text_for_test(9, "revised");
         message.local = true;
         message.edited = true;
+        message.unverified = true;
         let decoded = decode_single(&encode_single(&message));
 
         assert_eq!(decoded.body, "revised");
         assert!(decoded.local);
         assert!(decoded.edited);
+        assert!(decoded.unverified);
     }
 
     #[test]

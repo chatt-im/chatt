@@ -1,3 +1,4 @@
+pub mod base32;
 pub mod bitstream;
 pub mod control;
 pub mod crypto;

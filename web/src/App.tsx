@@ -155,6 +155,7 @@ function isMessageContinuation(
     !!previous &&
     !message.edited &&
     !previous.edited &&
+    message.unverified === previous.unverified &&
     previous.sender === message.sender &&
     message.timestamp_ms - previous.timestamp_ms < GROUP_WINDOW_MS
   );
@@ -1219,6 +1220,9 @@ function MessageRow(props: {
       <Show when={!continuation()}>
         <div class="message-meta">
           <span class="message-sender">{props.message.sender}</span>
+          <Show when={props.message.unverified}>
+            <span class="message-unverified">(Unverified)</span>
+          </Show>
           <Show when={props.message.edited}>
             <span class="message-edited">(edited)</span>
           </Show>
@@ -1548,6 +1552,13 @@ export default function App() {
   // The compose box is hidden until the client reports a writable feed in its
   // `config` envelope, so a read-only view never shows controls it cannot use.
   const [readonly, setReadonly] = createSignal(true);
+  const [e2eSecurity, setE2eSecurity] = createSignal<null | {
+    level: "warning" | "danger" | "blocked";
+    message: string;
+  }>(null);
+  const e2eBlocked = () =>
+    e2eSecurity()?.level === "blocked" ? e2eSecurity() : null;
+  const interactionBlocked = () => readonly() || e2eBlocked() !== null;
   const [editor, setEditor] = createSignal(createEditorState(loadSessionDraft()));
   const draft = () => editor().value;
   const [assist, setAssist] = createSignal(CLOSED_ASSIST);
@@ -1641,7 +1652,7 @@ export default function App() {
     // Emoji is plain local text, so it stays available while editing or offline;
     // slash commands need a live, non-editing session to dispatch.
     if (ctx.mode === "emoji") return ctx;
-    return editing() || readonly() || !connected() ? null : ctx;
+    return editing() || interactionBlocked() || !connected() ? null : ctx;
   });
   const completionView = createMemo<{
     context: NonNullable<ReturnType<typeof completionContext>>;
@@ -2961,6 +2972,10 @@ export default function App() {
   async function submitCompose() {
     setAssist(CLOSED_ASSIST);
     if (!connected() || submitting()) return;
+    if (e2eBlocked()) {
+      setComposeError("The peer encryption key is unavailable; try again after key discovery.");
+      return;
+    }
     setComposeError(null);
     const edit = editing();
     if (edit) {
@@ -3680,6 +3695,15 @@ export default function App() {
         setMaxUploadBytes(env.max_upload_bytes);
         setCommandList(env.commands);
         document.title = `Chatt | ${env.room_name}`;
+      } else if (env.type === "e2e_security") {
+        if (env.level !== "clear") {
+          setE2eSecurity({ level: env.level, message: env.message });
+        }
+        if (env.level === "blocked") {
+          cancelEdit();
+        } else if (env.level === "clear") {
+          setE2eSecurity(null);
+        }
       } else if (env.type === "command_candidates") {
         if (candidateRequests.accept(env.kind, env.request_id)) {
           setCandidateCache((prev) => ({ ...prev, [env.kind]: env.items }));
@@ -3696,6 +3720,7 @@ export default function App() {
             body: line.text,
             local: true,
             edited: false,
+            unverified: false,
             timestamp_ms: Date.now(),
             attachment: null,
             file_id: null,
@@ -3928,6 +3953,18 @@ export default function App() {
               : undefined
           }
         >
+          <Show when={e2eSecurity()}>
+            {(security) => (
+              <div
+                class="e2e-blocked-banner"
+                classList={{ "is-danger": security().level !== "warning" }}
+                role="alert"
+              >
+                <strong>{security().level === "blocked" ? "E2E BLOCKED" : "E2E WARNING"}</strong>
+                <span>{security().message}</span>
+              </div>
+            )}
+          </Show>
           <Show when={shares().length > 0}>
             <section class="share-pane">
               <ScreenShare
@@ -4001,10 +4038,10 @@ export default function App() {
                       group={messageList().groups.get(message)!}
                       onToggleGroup={toggleMessageGroup}
                       onOpenPreview={openPreview}
-                      onQuoteRef={readonly() ? undefined : quoteRef}
-                      onAbortTransfer={readonly() ? undefined : abortTransfer}
-                      onEdit={readonly() ? undefined : beginEdit}
-                      onDelete={readonly() ? undefined : deleteMessage}
+                      onQuoteRef={interactionBlocked() ? undefined : quoteRef}
+                      onAbortTransfer={interactionBlocked() ? undefined : abortTransfer}
+                      onEdit={interactionBlocked() ? undefined : beginEdit}
+                      onDelete={interactionBlocked() ? undefined : deleteMessage}
                       autoplay={message.autoplay ?? "disabled"}
                     />
                   </div>
@@ -4132,7 +4169,7 @@ export default function App() {
                     aria-label="Attach files"
                     title="Attach files"
                     onClick={openComposeFileDialog}
-                    disabled={submitting()}
+                    disabled={submitting() || e2eBlocked() !== null}
                   >
                     <Icon name="plus" />
                   </button>
@@ -4181,6 +4218,7 @@ export default function App() {
                     if (assist().kind === "completion") setAssist(CLOSED_ASSIST);
                   }}
                   onPaste={onComposePaste}
+                  disabled={e2eBlocked() !== null}
                 />
                 <input
                   class="composer-file-input"
@@ -4198,7 +4236,7 @@ export default function App() {
                   aria-haspopup="dialog"
                   aria-expanded={pickerOpen()}
                   title="Emoji"
-                  disabled={submitting()}
+                  disabled={submitting() || e2eBlocked() !== null}
                   onPointerEnter={() => setEmojiLoadRequested(true)}
                   onClick={() => {
                     setEmojiLoadRequested(true);

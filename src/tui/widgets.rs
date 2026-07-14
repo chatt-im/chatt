@@ -23,6 +23,7 @@ pub(crate) struct ScrollbarLayout {
 pub(crate) enum ScrollbarId {
     Rooms,
     Compose,
+    Identity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

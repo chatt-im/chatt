@@ -45,6 +45,7 @@ export interface WebMessage {
   // body is the folded result of an edit.
   local: boolean;
   edited: boolean;
+  unverified: boolean;
   timestamp_ms: number;
   attachment: WebAttachment | null;
   // The file transfer id for a file message, else null. A message with both
@@ -154,6 +155,13 @@ export type ServerEnvelope =
       max_upload_bytes: number;
       room_name: string;
       commands: WebCommandInfo[];
+    }
+  // The browser cannot make trust decisions. It mirrors warnings for the
+  // viewed DM and disables content-changing controls only at `blocked`.
+  | {
+      type: "e2e_security";
+      level: "clear" | "warning" | "danger" | "blocked";
+      message: string;
     }
   | { type: "room"; name: string }
   // Captured output of a `run_command`, shown as ephemeral system rows.

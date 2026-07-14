@@ -60,6 +60,11 @@ impl ViewCx<'_> {
         self.view.set_transient_status(status);
     }
 
+    pub(crate) fn queue_clipboard(&mut self, text: String) {
+        self.view.queue_clipboard(text);
+        self.view.set_transient_status("copied to clipboard");
+    }
+
     pub(crate) fn request_transition(&mut self, transition: ModeTransition) {
         self.navigation.push_back(transition);
     }
@@ -406,13 +411,15 @@ impl ScreenSpec {
 impl OverlaySpec {
     fn into_mode(self, theme: &crate::theme::Theme) -> Box<dyn AppMode> {
         use crate::tui::overlay::{
-            DialogMode, NativeEncryptionWarningMode, PasswordPromptMode, PasteImageUploadMode,
+            DialogMode, E2eIdentityMode, NativeEncryptionWarningMode, PasswordPromptMode,
+            PasteImageUploadMode,
         };
         match self {
             Self::UserVolume(dialog) => Box::new(DialogMode::new(dialog)),
             Self::NativeEncryptionWarning { label, generation } => {
                 Box::new(NativeEncryptionWarningMode::new(label, generation))
             }
+            Self::E2eIdentity(dialog) => Box::new(E2eIdentityMode::new(dialog, theme)),
             Self::PairingPassword { retry } => Box::new(PasswordPromptMode::new(retry)),
             Self::PasteUpload(image) => Box::new(PasteImageUploadMode::new(image, theme)),
         }
