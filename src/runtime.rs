@@ -91,7 +91,7 @@ fn run_app_inner(
         } else {
             InitialMode::Servers
         };
-        let primary_channel = Arc::new(ClientChannel::new()?);
+        let primary_channel = Arc::new(ClientChannel::new_primary()?);
         app.set_primary_channel(primary_channel.clone());
         // Bind the initial view to the current epoch before the render thread
         // starts, so the first sync is not mistaken for a server transition.
@@ -136,7 +136,6 @@ fn run_app_inner(
         channel = Some(primary_channel);
     }
 
-    let mut resize_count = (!headless).then(polling::resize_count);
     let mut next_client_id = 1u64;
     let mut clients = HashMap::<ClientId, RemoteClient>::new();
     // Zero so the first iteration ticks immediately and derives the real
@@ -179,21 +178,11 @@ fn run_app_inner(
         dirty |= app.tick();
 
         let quit = (!headless && app.take_quit_requested()) || polling::termination_requested();
-        let resized = resize_count.as_mut().is_some_and(|previous| {
-            let current = polling::resize_count();
-            let resized = current != *previous;
-            *previous = current;
-            resized
-        });
         wait_timeout = app.next_tick_timeout(Instant::now());
         app.release_core_state();
 
         if let Some(channel) = &channel {
-            if resized {
-                channel.resize();
-            } else {
-                channel.wake_sections(dirty);
-            }
+            channel.wake_sections(dirty);
         }
         for client in clients.values() {
             client.channel.wake_sections(dirty);

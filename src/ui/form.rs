@@ -250,6 +250,29 @@ impl<'a> Form<'a> {
         }
     }
 
+    /// Full-width explanatory copy for a form section. Unlike a static field,
+    /// this does not register a label, hit target, or field-like value column.
+    pub(crate) fn description(&mut self, text: &str) {
+        self.description_with_error(text, false);
+    }
+
+    pub(crate) fn description_with_error(&mut self, text: &str, error: bool) {
+        let lines = wrap_detail(text, self.state.viewport().w.max(1) as usize);
+        let height = u16::try_from(lines.len().max(1)).unwrap_or(u16::MAX);
+        let row = self.state.next_row(height);
+        let (Some(mut area), Some(buf)) = (row.rect, self.buf.as_deref_mut()) else {
+            return;
+        };
+        let palette = row_palette(self.theme, self.surface);
+        let style = palette
+            .base
+            .patch(if error { self.theme.error } else { self.theme.subtle });
+        area.with(style).clear(buf);
+        for line in &lines {
+            area.take_top(1).with(style).text(buf, line);
+        }
+    }
+
     pub(crate) fn with_label_width(mut self, label_width: u16) -> Self {
         self.label_width = label_width;
         self
@@ -344,6 +367,40 @@ impl<'a> Form<'a> {
                 self.label_width,
                 label,
                 value,
+                false,
+                false,
+                false,
+            );
+        }
+    }
+
+    /// A read-only value which uses as many rows as necessary instead of
+    /// silently shortening copy-sensitive content such as enrollment tokens.
+    pub(crate) fn wrapped_static_row(&mut self, label: &str, value: &str) {
+        let value_width = self
+            .state
+            .viewport()
+            .w
+            .saturating_sub(self.label_width)
+            .max(1) as usize;
+        let lines = wrap_detail(value, value_width);
+        let height = u16::try_from(lines.len().max(1)).unwrap_or(u16::MAX);
+        let id = self.id(label);
+        let row = self.state.next_row(height);
+        let area = self.state.register_field(row, id, FormFieldKind::Static);
+        let (Some(mut area), Some(buf)) = (area, self.buf.as_deref_mut()) else {
+            return;
+        };
+        let palette = row_palette(self.theme, self.surface);
+        for (index, line) in lines.iter().enumerate() {
+            let line_area = area.take_top(1);
+            widgets::draw_labeled_value_with(
+                line_area,
+                buf,
+                palette,
+                self.label_width,
+                if index == 0 { label } else { "" },
+                line,
                 false,
                 false,
                 false,
@@ -458,6 +515,41 @@ impl<'a> Form<'a> {
         validate: impl Fn(&str) -> Option<String>,
     ) -> Response {
         self.text_with_placeholder(label, value, None, validate)
+    }
+
+    /// Single-line secret field backed by the shared editor, focus model,
+    /// mouse hit testing, and configured standard/Vim bindings. Only its
+    /// presentation differs from an ordinary text field.
+    pub(crate) fn secret_text(
+        &mut self,
+        label: &str,
+        value: &mut String,
+        validate: impl Fn(&str) -> Option<String>,
+    ) -> Response {
+        if !self.enabled {
+            return self.disabled_row(label, concealed(value));
+        }
+        let id = self.id(label);
+        let row = self.state.next_row(1);
+        let area = self.state.register_field(row, id, FormFieldKind::Text);
+        let focused = self.state.focus() == id;
+        let mut changed = false;
+        if let Some((commit_id, text)) = self.commit.take() {
+            if commit_id == id {
+                if *value != text {
+                    *value = text;
+                    changed = true;
+                }
+            } else {
+                self.commit = Some((commit_id, text));
+            }
+        }
+        if focused {
+            self.seed_editor(id, value, area);
+        }
+        let error = validate(value).is_some();
+        self.render_secret_text_row(id, label, value, focused, error, area);
+        self.respond(focused, changed)
     }
 
     pub(crate) fn adjustable_text(
@@ -706,6 +798,62 @@ impl<'a> Form<'a> {
         }
     }
 
+    fn render_secret_text_row(
+        &mut self,
+        id: FieldId,
+        label: &str,
+        value: &str,
+        focused: bool,
+        error: bool,
+        area: Option<Rect>,
+    ) {
+        let Some(area) = area else {
+            return;
+        };
+        let shown = concealed(value);
+        if !focused {
+            if let Some(buf) = self.buf.as_deref_mut() {
+                draw_value_row(
+                    area,
+                    buf,
+                    self.theme,
+                    self.surface,
+                    self.label_width,
+                    label,
+                    &shown,
+                    false,
+                    false,
+                    self.dirty,
+                    error,
+                );
+            }
+            return;
+        }
+        let input = editor_rect(area, self.label_width);
+        self.state.register_text_area(id, input);
+        if let Some(buf) = self.buf.as_deref_mut() {
+            widgets::draw_labeled_editor_frame(
+                area,
+                buf,
+                self.theme,
+                row_palette(self.theme, self.surface),
+                self.label_width,
+                label,
+                true,
+                error,
+            );
+            // Render first so the editor retains its configured mode, viewport,
+            // and cursor request, then overwrite every visible glyph before
+            // drawing the concealed value.
+            self.state.render_editor(input, buf, self.theme);
+            input.with(self.theme.join_input_active).clear(buf);
+            input
+                .with(self.theme.join_input_active)
+                .with(Ellipsis(true))
+                .text(buf, &shown);
+        }
+    }
+
     pub(crate) fn draw_labeled_value(
         &mut self,
         area: Rect,
@@ -931,6 +1079,10 @@ fn on_off(value: bool) -> String {
     }
 }
 
+fn concealed(value: &str) -> String {
+    "*".repeat(value.chars().count())
+}
+
 fn cycle_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -977,6 +1129,10 @@ fn wrap_detail(text: &str, width: usize) -> Vec<String> {
         lines.push(current);
     }
     lines
+}
+
+pub(crate) fn wrapped_line_count(text: &str, width: u16) -> u16 {
+    u16::try_from(wrap_detail(text, width.max(1) as usize).len().max(1)).unwrap_or(u16::MAX)
 }
 
 fn split_cells(text: &str, width: usize) -> (&str, &str) {
@@ -1128,5 +1284,82 @@ mod tests {
             cell_style(&mut buf, 8, 0),
             theme.join_input_active.patch(theme.muted)
         );
+    }
+
+    #[test]
+    fn focused_secret_uses_editor_chrome_without_rendering_plaintext() {
+        let theme = Theme::tomorrow_night();
+        let mut state = state_with_focus(FormBindings::Standard, "root", "Secret");
+        let mut buf = Buffer::new(24, 1);
+        let mut value = "coral-lantern".to_string();
+
+        state.begin_frame(Rect {
+            x: 0,
+            y: 0,
+            w: 24,
+            h: 1,
+        });
+        {
+            let mut form = Form::new(
+                &mut state,
+                Some(&mut buf),
+                &theme,
+                false,
+                FieldIntent::None,
+                None,
+                None,
+            )
+            .with_label_width(8)
+            .with_surface(FormSurface::Dialog);
+            form.secret_text("Secret", &mut value, |_| None);
+        }
+        state.finish_frame();
+
+        let rendered = (8..24)
+            .map(|column| cell_text(&mut buf, column, 0))
+            .collect::<String>();
+        assert!(rendered.starts_with("*************"));
+        assert!(!rendered.contains("coral"));
+        for column in 8..24 {
+            assert_eq!(
+                cell_style(&mut buf, column, 0),
+                theme.join_input_active
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_static_row_renders_the_entire_value() {
+        let theme = Theme::tomorrow_night();
+        let mut state = state_with_focus(FormBindings::Standard, "root", "unused");
+        let mut buf = Buffer::new(12, 2);
+
+        state.begin_frame(Rect {
+            x: 0,
+            y: 0,
+            w: 12,
+            h: 2,
+        });
+        {
+            let mut form = Form::new(
+                &mut state,
+                Some(&mut buf),
+                &theme,
+                false,
+                FieldIntent::None,
+                None,
+                None,
+            )
+            .with_label_width(4)
+            .with_surface(FormSurface::Dialog);
+            form.wrapped_static_row("Link", "tcd1_abcdefghijk");
+        }
+        state.finish_frame();
+
+        let rendered = (0..2)
+            .flat_map(|row| (4..12).map(move |column| (column, row)))
+            .map(|(column, row)| cell_text(&mut buf, column, row))
+            .collect::<String>();
+        assert_eq!(rendered, "tcd1_abcdefghijk");
     }
 }

@@ -8,9 +8,14 @@ use extui::{
 use extui_bindings::InputKey;
 use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 use unicode_width::UnicodeWidthStr;
-
 use crate::{
-    app::{UserVolumeDialog, command::CoreCommand},
+    app::{
+        UserVolumeDialog,
+        command::CoreCommand,
+        device_pair::{
+            DeviceLinkButton, DeviceLinkDialog, DevicePairDialog, DevicePairEvent,
+        },
+    },
     bindings::{self, BindCommand, Resolved},
     client_channel::{DirtySections, E2eIdentityOverlay, E2eIdentityTarget},
     clipboard_paste::{
@@ -1617,6 +1622,172 @@ fn native_encryption_header_style(theme: &Theme) -> extui::Style {
     }
 }
 
+pub(crate) struct DevicePairMode {
+    dialog: DevicePairDialog,
+}
+
+impl DevicePairMode {
+    pub(crate) fn new(dialog: DevicePairDialog) -> Self {
+        Self { dialog }
+    }
+
+    fn handle_event(&mut self, cx: &mut ViewCx<'_>, event: DevicePairEvent) {
+        match event {
+            DevicePairEvent::Consumed => {}
+            DevicePairEvent::Cancel => cx.send(CoreCommand::CancelPairing),
+            DevicePairEvent::Submit {
+                pairing_string,
+                transfer_password,
+                device_name,
+                overwrite_existing,
+            } => cx.send(CoreCommand::SubmitDevicePair {
+                pairing_string,
+                transfer_password,
+                device_name,
+                overwrite_existing,
+            }),
+        }
+    }
+}
+
+impl AppMode for DevicePairMode {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
+        let mut app = crate::tui::render::RenderState::new(cx);
+        let area = buf.rect();
+        let form_height = self.dialog.form_height(area.w);
+        let Some(panel) =
+            crate::tui::render::form_dialog_panel(area, form_height)
+        else {
+            return;
+        };
+        let body = crate::tui::render::draw_dialog_frame(
+            panel,
+            buf,
+            &app.view.theme,
+            "Pair a device",
+        );
+        self.dialog.render(body, buf, &app.view.theme);
+        crate::tui::render::draw_overlay_key_preview(&mut app, bindings::FORM_LAYER, buf);
+    }
+
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        let event = self.dialog.handle_key(key, &cx.view.theme);
+        self.handle_event(cx, event);
+        Action::Continue
+    }
+
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        let event = self.dialog.handle_mouse(mouse, &cx.view.theme);
+        self.handle_event(cx, event);
+        Action::Continue
+    }
+
+    fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        self.dialog.paste(&text, &cx.view.theme);
+    }
+
+    fn process_client_event(&mut self, event: crate::client_channel::TerminalEvent) {
+        match event {
+            crate::client_channel::TerminalEvent::PairingFailed(error) => {
+                self.dialog.pairing_failed(error);
+            }
+            crate::client_channel::TerminalEvent::DevicePairingIdentityExists {
+                message,
+                transfer_password,
+            } => self.dialog.identity_exists(message, transfer_password),
+            _ => {}
+        }
+    }
+
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
+        form_dialog_presentation("Pair")
+    }
+}
+
+pub(crate) struct DeviceLinkMode {
+    dialog: DeviceLinkDialog,
+}
+
+impl DeviceLinkMode {
+    pub(crate) fn new(dialog: DeviceLinkDialog) -> Self {
+        Self { dialog }
+    }
+
+    fn handle_button(&mut self, cx: &mut ViewCx<'_>, button: DeviceLinkButton) {
+        if let Some(value) = self.dialog.value(button) {
+            cx.queue_clipboard(value.to_string());
+        } else {
+            cx.request_transition(ModeTransition::Pop);
+        }
+    }
+}
+
+impl AppMode for DeviceLinkMode {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
+        let mut app = crate::tui::render::RenderState::new(cx);
+        let area = buf.rect();
+        let form_height = self.dialog.form_height(area.w);
+        let Some(panel) = crate::tui::render::form_dialog_panel(area, form_height) else {
+            return;
+        };
+        let body = crate::tui::render::draw_dialog_frame(
+            panel,
+            buf,
+            &app.view.theme,
+            "Device link created",
+        );
+        self.dialog.render(body, buf, &app.view.theme);
+        crate::tui::render::draw_overlay_key_preview(&mut app, bindings::FORM_LAYER, buf);
+    }
+
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if let Some(button) = self.dialog.handle_key(key, &cx.view.theme) {
+            self.handle_button(cx, button);
+        }
+        Action::Continue
+    }
+
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        if let Some(button) = self.dialog.handle_mouse(mouse, &cx.view.theme) {
+            self.handle_button(cx, button);
+        }
+        Action::Continue
+    }
+
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
+        form_dialog_presentation("Device link")
+    }
+}
+
+fn form_dialog_presentation(status_label: &'static str) -> ModePresentation {
+    ModePresentation {
+        coverage: Coverage::Overlay,
+        chrome: Some(ChromeSpec {
+            theme_mode: theme::UiMode::ServerEdit,
+            status_label,
+            layer: bindings::FORM_LAYER,
+        }),
+    }
+}
+
 /// Transient overlay prompting for the open-pairing password.
 ///
 /// The entered password is held verbatim but rendered as `*` characters. Enter
@@ -1773,6 +1944,7 @@ impl AppMode for PasswordPromptMode {
                 self.apply_password_challenge(retry);
             }
             TerminalEvent::PairingFailed(error) => self.apply_error(error),
+            TerminalEvent::DevicePairingIdentityExists { .. } => {}
             TerminalEvent::Navigation(_) => {}
         }
     }

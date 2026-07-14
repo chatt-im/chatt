@@ -30,7 +30,8 @@ use rpc::{
         self, ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
         ERROR_BUG_REPORT_REJECTED, ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST,
         ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED,
-        ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, FileContentEncoding,
+        ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN,
+        ERROR_DEVICE_LINK_UNAVAILABLE, FileContentEncoding,
         FileMetadata, InviteTicket, MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
         MAX_FILE_CHUNK_BYTES, MessageFlags, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole,
         RoomInfo, RoomKind, ServerControl, UserSummary, decode_client_control, decode_client_hello,
@@ -47,7 +48,7 @@ use rpc::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
         recv_datagram_with, write_queue_to,
     },
-    e2e::{DmContentKind, DmEventEnvelope},
+    e2e::{AccountKeyAction, DmContentKind, DmEventEnvelope},
     frame,
     ids::{
         BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId, StreamId,
@@ -122,6 +123,7 @@ const MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const RTT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 const RTT_STALE_AFTER: Duration = Duration::from_secs(15);
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEVICE_LINK_TTL: Duration = Duration::from_secs(10 * 60);
 const OPEN_PAIR_RATE_WINDOW: Duration = Duration::from_secs(60);
 const OPEN_PAIR_PER_IP_LIMIT: usize = 6;
 const OPEN_PAIR_GLOBAL_LIMIT: usize = 30;
@@ -431,6 +433,7 @@ pub struct Server {
     store: RoomStore,
     file_size_limit_bytes: u64,
     invites: HashMap<String, InviteState>,
+    device_links: HashMap<Vec<u8>, DeviceLinkState>,
     open_pair_global_allocations: VecDeque<Instant>,
     open_pair_ip_allocations: HashMap<IpAddr, VecDeque<Instant>>,
     rng: ring::rand::SystemRandom,
@@ -631,6 +634,7 @@ impl Server {
             store,
             file_size_limit_bytes,
             invites: HashMap::new(),
+            device_links: HashMap::new(),
             open_pair_global_allocations: VecDeque::new(),
             open_pair_ip_allocations: HashMap::new(),
             rng: ring::rand::SystemRandom::new(),
@@ -1785,13 +1789,57 @@ impl Server {
                 receive_files,
                 file_receive_limit_bytes,
             ),
+            (
+                ConnState::AwaitAuth,
+                ClientControl::FetchDeviceLink { redemption_secret },
+            ) => self.fetch_device_link(token, &redemption_secret),
+            (
+                ConnState::AwaitAuth,
+                ClientControl::RedeemDeviceLink {
+                    redemption_secret,
+                    statement,
+                    receive_files,
+                    file_receive_limit_bytes,
+                },
+            ) => self.redeem_device_link(
+                token,
+                &redemption_secret,
+                statement,
+                receive_files,
+                file_receive_limit_bytes,
+            ),
             (ConnState::AwaitAuth, _) => Err("authenticate before sending control messages".into()),
             (
                 ConnState::Ready,
                 ClientControl::Authenticate { .. }
                 | ClientControl::Pair { .. }
-                | ClientControl::OpenPair { .. },
+                | ClientControl::OpenPair { .. }
+                | ClientControl::FetchDeviceLink { .. }
+                | ClientControl::RedeemDeviceLink { .. },
             ) => Err("session is already authenticated".into()),
+            (
+                ConnState::Ready,
+                ClientControl::CreateDeviceLink {
+                    redemption_secret_hash,
+                    enrollment_bundle,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.create_device_link(
+                    session_id,
+                    redemption_secret_hash,
+                    enrollment_bundle,
+                )
+            }
+            (
+                ConnState::Ready,
+                ClientControl::CancelDeviceLink {
+                    redemption_secret_hash,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.cancel_device_link(session_id, &redemption_secret_hash)
+            }
             (
                 ConnState::Ready,
                 ClientControl::SendChat {
@@ -2093,6 +2141,169 @@ impl Server {
         }
     }
 
+    fn create_device_link(
+        &mut self,
+        session_id: SessionId,
+        redemption_secret_hash: Vec<u8>,
+        enrollment_bundle: Vec<u8>,
+    ) -> Result<(), String> {
+        let (user_id, tcp_token, is_bound) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| (session.user_id, session.tcp_token, session.e2e_device.is_some()))
+            .ok_or_else(|| "unknown session".to_string())?;
+        if !is_bound {
+            return Err("bind an active E2E device before creating a device link".to_string());
+        }
+        self.expire_device_links();
+        if self.device_links.contains_key(&redemption_secret_hash) {
+            return Err("device-link redemption secret is already active".to_string());
+        }
+        let expires_at_ms = now_ms().saturating_add(DEVICE_LINK_TTL.as_millis() as u64);
+        self.device_links.insert(
+            redemption_secret_hash.clone(),
+            DeviceLinkState {
+                user_id,
+                enrollment_bundle,
+                expires_at: Instant::now() + DEVICE_LINK_TTL,
+            },
+        );
+        self.send_control_to_token(
+            tcp_token,
+            &ServerControl::DeviceLinkCreated {
+                redemption_secret_hash,
+                expires_at_ms,
+            },
+        )
+    }
+
+    fn cancel_device_link(
+        &mut self,
+        session_id: SessionId,
+        redemption_secret_hash: &[u8],
+    ) -> Result<(), String> {
+        let user_id = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.user_id)
+            .ok_or_else(|| "unknown session".to_string())?;
+        if self
+            .device_links
+            .get(redemption_secret_hash)
+            .is_some_and(|link| link.user_id == user_id)
+        {
+            self.device_links.remove(redemption_secret_hash);
+        }
+        Ok(())
+    }
+
+    fn fetch_device_link(&mut self, token: Token, redemption_secret: &str) -> Result<(), String> {
+        self.expire_device_links();
+        let secret_hash = device_link_secret_hash(redemption_secret);
+        let Some(link) = self.device_links.get(&secret_hash) else {
+            return self.reject_auth(
+                token,
+                ERROR_DEVICE_LINK_UNAVAILABLE,
+                "device link is invalid, expired, canceled, or already used".to_string(),
+            );
+        };
+        let username = self
+            .usernames
+            .username_for(link.user_id)
+            .ok_or_else(|| "device-link account has no registered username".to_string())?
+            .to_string();
+        let account_chain = self.device_directory.chain_for(link.user_id)?;
+        self.send_control_to_token(
+            token,
+            &ServerControl::DeviceLinkBundle {
+                enrollment_bundle: link.enrollment_bundle.clone(),
+                account_chain,
+                user_id: link.user_id,
+                username,
+            },
+        )
+    }
+
+    fn redeem_device_link(
+        &mut self,
+        token: Token,
+        redemption_secret: &str,
+        statement: rpc::e2e::AccountKeyStatement,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+    ) -> Result<(), String> {
+        self.expire_device_links();
+        let secret_hash = device_link_secret_hash(redemption_secret);
+        let Some(link) = self.device_links.get(&secret_hash) else {
+            return self.reject_auth(
+                token,
+                ERROR_DEVICE_LINK_UNAVAILABLE,
+                "device link is invalid, expired, canceled, or already used".to_string(),
+            );
+        };
+        let (user_id, username) = (
+            link.user_id,
+            self.usernames
+                .username_for(link.user_id)
+                .ok_or_else(|| "device-link account has no registered username".to_string())?
+                .to_string(),
+        );
+        let (device_id, device_name) = match &statement.body.action {
+            AccountKeyAction::AddDevice { device } => (device.device_id, device.name.clone()),
+            _ => return Err("device-link redemption requires an AddDevice statement".to_string()),
+        };
+        let bearer_token = format!("tct2_{}", random_secret_hex(&self.rng)?);
+        let credential_hash = hash_secret(&bearer_token);
+        let (roster_epoch, head) = self.device_directory.redeem_device(
+            user_id,
+            statement,
+            credential_hash.clone(),
+            device_id,
+            0,
+        )?;
+        // Consumption follows the durable ledger+credential write. The
+        // single-threaded event loop makes concurrent redeemers serialize.
+        self.device_links.remove(&secret_hash);
+
+        let account_tokens = self
+            .sessions
+            .values()
+            .filter(|session| session.user_id == user_id)
+            .map(|session| session.tcp_token)
+            .collect::<Vec<_>>();
+        self.send_control_to_tokens(
+            &account_tokens,
+            &ServerControl::DeviceLinkRedeemed {
+                redemption_secret_hash: secret_hash.clone(),
+                device_id,
+                device_name,
+            },
+        );
+        self.announce_account_key_head_changed(user_id, roster_epoch, head);
+
+        let user = self
+            .users
+            .users
+            .iter()
+            .find(|user| user.id == user_id)
+            .cloned()
+            .unwrap_or_else(|| Self::dynamic_user(user_id, &username));
+        self.establish_session_with_credential(
+            token,
+            &user,
+            receive_files,
+            file_receive_limit_bytes,
+            true,
+            Some(credential_hash),
+            Some(IssuedSessionToken::DeviceLink(bearer_token)),
+        )
+    }
+
+    fn expire_device_links(&mut self) {
+        let now = Instant::now();
+        self.device_links.retain(|_, link| link.expires_at > now);
+    }
+
     fn authenticate_client(
         &mut self,
         token: Token,
@@ -2102,13 +2313,68 @@ impl Server {
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
         kvlog::info!("authenticate attempt", token = token.0);
-        if auth_token.starts_with(DYNAMIC_TOKEN_PREFIX) {
-            return self.authenticate_dynamic(
+        if let Some((user_id, _device_id, password_epoch, credential_hash)) =
+            self.device_directory.authenticate_credential(auth_token)
+        {
+            let username = username.trim();
+            if !valid_username(username) || !self.usernames.is_available(username, Some(user_id)) {
+                return self.reject_auth(
+                    token,
+                    ERROR_AUTH_REJECTED,
+                    "authentication failed: invalid username for this credential".to_string(),
+                );
+            }
+            let user = if is_dynamic_user_id(user_id) {
+                if !self.config.is_public() {
+                    return self.reject_auth(
+                        token,
+                        ERROR_PUBLIC_DISABLED,
+                        "authentication failed: public dynamic users are disabled on this server"
+                            .to_string(),
+                    );
+                }
+                if password_epoch != self.config.password_epoch() {
+                    return self.reject_auth(
+                        token,
+                        ERROR_TOKEN_STALE_EPOCH,
+                        "authentication failed: the server password changed; re-pair to refresh your token"
+                            .to_string(),
+                    );
+                }
+                self.usernames.claim_dynamic(user_id, username)?;
+                Self::dynamic_user(user_id, username)
+            } else {
+                let user = self
+                    .users
+                    .users
+                    .iter()
+                    .find(|user| user.id == user_id)
+                    .cloned()
+                    .ok_or_else(|| "bearer credential refers to an unknown user".to_string())?;
+                if user.username == username {
+                    user
+                } else {
+                    let updated = self.users.set_user_username(user_id, username.to_string())?;
+                    self.usernames.set_explicit(user_id, &updated.username);
+                    updated
+                }
+            };
+            return self.establish_session_with_credential(
                 token,
-                username,
-                auth_token,
+                &user,
                 receive_files,
                 file_receive_limit_bytes,
+                true,
+                Some(credential_hash),
+                None,
+            );
+        }
+        if auth_token.starts_with(DYNAMIC_TOKEN_PREFIX) {
+            return self.reject_auth(
+                token,
+                ERROR_AUTH_REJECTED,
+                "authentication failed: this bearer token is not registered to a device"
+                    .to_string(),
             );
         }
         let Some(user) = self
@@ -2284,7 +2550,7 @@ impl Server {
         }
         let user = match self
             .users
-            .mark_user_paired(&user_name, username.to_string(), token_hash)
+            .mark_user_paired(&user_name, username.to_string(), String::new())
         {
             Ok(user) => user,
             Err(error) => {
@@ -2303,6 +2569,16 @@ impl Server {
                 );
             }
         };
+        if let Err(error) = self
+            .device_directory
+            .add_credential(user.id, token_hash.clone(), None, 0)
+        {
+            return self.reject_auth(
+                token,
+                control::ERROR_INTERNAL,
+                format!("pairing failed: could not persist device credential: {error}"),
+            );
+        }
         self.invites.remove(&user_name);
         self.usernames.set_explicit(user.id, &user.username);
         kvlog::info!(
@@ -2311,124 +2587,13 @@ impl Server {
             user_id = user.id.0,
             user = user.internal_reference.as_str()
         );
-        self.establish_session(
+        self.establish_session_with_credential(
             token,
             &user,
             receive_files,
             file_receive_limit_bytes,
             false,
-            None,
-        )
-    }
-
-    /// Authenticates a dynamic user from a server-issued bearer token. No config
-    /// lookup: the token's AEAD tag proves authenticity and the claims carry the
-    /// user id.
-    fn authenticate_dynamic(
-        &mut self,
-        token: Token,
-        username: &str,
-        auth_token: &str,
-        receive_files: bool,
-        file_receive_limit_bytes: u64,
-    ) -> Result<(), String> {
-        if !self.config.is_public() {
-            kvlog::warn!(
-                "authenticate rejected",
-                token = token.0,
-                reason = "public_disabled"
-            );
-            return self.reject_auth(
-                token,
-                ERROR_PUBLIC_DISABLED,
-                "authentication failed: public dynamic users are disabled on this server"
-                    .to_string(),
-            );
-        }
-        let claims = verify_dynamic_token(&self.config.security.server_identity_seed, auth_token);
-        let Ok(claims) = claims else {
-            kvlog::warn!(
-                "authenticate rejected",
-                token = token.0,
-                reason = "invalid_dynamic_token"
-            );
-            return self.reject_auth(
-                token,
-                ERROR_AUTH_REJECTED,
-                "authentication failed: the token is not valid for this server".to_string(),
-            );
-        };
-        if !is_dynamic_user_id(claims.user_id) {
-            kvlog::warn!(
-                "authenticate rejected",
-                token = token.0,
-                reason = "invalid_dynamic_user_id",
-                user_id = claims.user_id.0
-            );
-            return self.reject_auth(
-                token,
-                ERROR_AUTH_REJECTED,
-                "authentication failed: the token is not valid for this server".to_string(),
-            );
-        }
-        if claims.password_epoch != self.config.password_epoch() {
-            kvlog::warn!(
-                "authenticate rejected",
-                token = token.0,
-                reason = "stale_epoch"
-            );
-            return self.reject_auth(
-                token,
-                ERROR_TOKEN_STALE_EPOCH,
-                "authentication failed: the server password changed; re-pair to refresh your token"
-                    .to_string(),
-            );
-        }
-        let username = username.trim();
-        if !valid_username(username) {
-            kvlog::warn!(
-                "authenticate rejected",
-                token = token.0,
-                user_id = claims.user_id.0,
-                reason = "invalid_username"
-            );
-            return self.reject_auth(
-                token,
-                ERROR_PAIRING_INVALID_REQUEST,
-                "authentication failed: username must be 1-64 bytes with no control characters"
-                    .to_string(),
-            );
-        }
-        if !self.usernames.is_available(username, Some(claims.user_id)) {
-            kvlog::warn!(
-                "authenticate rejected",
-                token = token.0,
-                user_id = claims.user_id.0,
-                reason = "username_taken"
-            );
-            return self.reject_username_taken(token);
-        }
-        if let Err(error) = self.usernames.claim_dynamic(claims.user_id, username) {
-            kvlog::error!(
-                "authenticate rejected",
-                token = token.0,
-                user_id = claims.user_id.0,
-                reason = "state_write_failed",
-                error = error.as_str()
-            );
-            return self.reject_auth(
-                token,
-                control::ERROR_INTERNAL,
-                "authentication failed: the server could not persist state; retry".to_string(),
-            );
-        }
-        let user = Self::dynamic_user(claims.user_id, username);
-        self.establish_session(
-            token,
-            &user,
-            receive_files,
-            file_receive_limit_bytes,
-            true,
+            Some(token_hash),
             None,
         )
     }
@@ -2566,15 +2731,29 @@ impl Server {
                 "open pairing failed: the server could not persist state; retry later".to_string(),
             );
         }
+        let credential_hash = hash_secret(&issued);
+        if let Err(error) = self.device_directory.add_credential(
+            user_id,
+            credential_hash.clone(),
+            None,
+            current_epoch,
+        ) {
+            return self.reject_auth(
+                token,
+                control::ERROR_INTERNAL,
+                format!("open pairing failed: could not persist device credential: {error}"),
+            );
+        }
         kvlog::info!("open pair accepted", token = token.0, user_id = user_id.0);
         let user = Self::dynamic_user(user_id, username);
-        self.establish_session(
+        self.establish_session_with_credential(
             token,
             &user,
             receive_files,
             file_receive_limit_bytes,
             false,
-            Some(issued),
+            Some(credential_hash),
+            Some(IssuedSessionToken::OpenPair(issued)),
         )
     }
 
@@ -2673,6 +2852,27 @@ impl Server {
         announce: bool,
         issued_token: Option<String>,
     ) -> Result<(), String> {
+        self.establish_session_with_credential(
+            token,
+            user,
+            receive_files,
+            file_receive_limit_bytes,
+            announce,
+            None,
+            issued_token.map(IssuedSessionToken::OpenPair),
+        )
+    }
+
+    fn establish_session_with_credential(
+        &mut self,
+        token: Token,
+        user: &UserConfig,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+        announce: bool,
+        credential_hash: Option<String>,
+        issued_token: Option<IssuedSessionToken>,
+    ) -> Result<(), String> {
         let user_id = user.user_id();
 
         let session_id = SessionId(self.next_session);
@@ -2707,6 +2907,7 @@ impl Server {
                 connected_at_ms: now_ms(),
                 pending_disk_history_fetches: 0,
                 e2e_device: None,
+                credential_hash,
             },
         );
 
@@ -2727,8 +2928,19 @@ impl Server {
         let rooms = self.accessible_room_infos(user_id);
         let users = self.user_summaries();
         let response = match issued_token {
-            Some(token) => ServerControl::OpenPaired {
+            Some(IssuedSessionToken::OpenPair(token)) => ServerControl::OpenPaired {
                 token,
+                udp_addr: self.config.network.public_udp_addr.clone(),
+                udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
+                session_id,
+                user_id,
+                rooms,
+                users,
+                default_room: self.default_room,
+            },
+            Some(IssuedSessionToken::DeviceLink(token)) => ServerControl::DeviceLinked {
+                token,
+                username: username.clone(),
                 udp_addr: self.config.network.public_udp_addr.clone(),
                 udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
                 session_id,
@@ -2885,11 +3097,50 @@ impl Server {
             .get(&session_id)
             .map(|session| session.user_id)
             .ok_or_else(|| "unknown session".to_string())?;
-        let DirectoryAppend::Advanced { roster_epoch, head } =
+        let DirectoryAppend::Advanced {
+            roster_epoch,
+            head,
+            revoked_credentials,
+        } =
             self.device_directory.append(user_id, statement)?
         else {
             return Ok(());
         };
+        kvlog::info!(
+            "account device ledger advanced",
+            session_id = session_id.0,
+            user_id = user_id.0,
+            roster_epoch,
+            head = encode_hex(&head.0).as_str()
+        );
+        self.announce_account_key_head_changed(user_id, roster_epoch, head);
+        let revoked_tokens = self
+            .sessions
+            .values()
+            .filter(|session| {
+                session
+                    .credential_hash
+                    .as_ref()
+                    .is_some_and(|hash| revoked_credentials.contains(hash))
+            })
+            .map(|session| session.tcp_token)
+            .collect::<Vec<_>>();
+        for token in revoked_tokens {
+            self.disconnect(token);
+        }
+        Ok(())
+    }
+
+    /// Invalidates bindings to the old account checkpoint and publishes the
+    /// new roster to every live account. Peers need additions as well as
+    /// revocations so subsequent DM content keys are wrapped to every active
+    /// device in the new roster.
+    fn announce_account_key_head_changed(
+        &mut self,
+        user_id: UserId,
+        roster_epoch: u64,
+        head: LedgerHash,
+    ) {
         // A binding covers one exact ledger checkpoint. Advancing the account's
         // authorization state invalidates every old proof; still-authorized
         // devices re-fetch and bind to the new head.
@@ -2900,13 +3151,6 @@ impl Server {
         {
             session.e2e_device = None;
         }
-        kvlog::info!(
-            "account device ledger advanced",
-            session_id = session_id.0,
-            user_id = user_id.0,
-            roster_epoch,
-            head = encode_hex(&head.0).as_str()
-        );
         let control = ServerControl::AccountKeyHeadChanged {
             user_id,
             roster_epoch,
@@ -2919,7 +3163,6 @@ impl Server {
             .filter(|token| self.clients.contains_key(token))
             .collect();
         self.send_control_to_tokens(&tokens, &control);
-        Ok(())
     }
 
     fn bind_e2e_device(
@@ -2930,10 +3173,16 @@ impl Server {
         ledger_head: LedgerHash,
         signature: &[u8],
     ) -> Result<(), String> {
-        let (user_id, token) = self
+        let (user_id, token, credential_hash) = self
             .sessions
             .get(&session_id)
-            .map(|session| (session.user_id, session.tcp_token))
+            .map(|session| {
+                (
+                    session.user_id,
+                    session.tcp_token,
+                    session.credential_hash.clone(),
+                )
+            })
             .ok_or_else(|| "unknown session".to_string())?;
         let signing_public_key = self
             .device_directory
@@ -2949,6 +3198,10 @@ impl Server {
             signature,
         )
         .map_err(|error| error.to_string())?;
+        if let Some(credential_hash) = credential_hash {
+            self.device_directory
+                .bind_credential(user_id, &credential_hash, device_id)?;
+        }
         let session = self
             .sessions
             .get_mut(&session_id)
@@ -5786,6 +6039,14 @@ struct Session {
     /// Device possession proof bound to the current signed account-ledger head.
     /// `None` sessions may fetch/link devices but cannot originate DM events.
     e2e_device: Option<BoundE2eDevice>,
+    /// Persisted bearer credential used by this installation. Revoking the
+    /// corresponding E2E device removes this hash in the same snapshot.
+    credential_hash: Option<String>,
+}
+
+enum IssuedSessionToken {
+    OpenPair(String),
+    DeviceLink(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5906,6 +6167,12 @@ struct PeerLink {
 struct InviteState {
     pairing_code_hash: String,
     expires_at: std::time::Instant,
+}
+
+struct DeviceLinkState {
+    user_id: UserId,
+    enrollment_bundle: Vec<u8>,
+    expires_at: Instant,
 }
 
 struct RoomState {
@@ -6071,6 +6338,12 @@ fn random_secret_hex(rng: &ring::rand::SystemRandom) -> Result<String, String> {
     rng.fill(&mut bytes)
         .map_err(|_| "failed to generate invite secret".to_string())?;
     Ok(encode_hex(&bytes))
+}
+
+fn device_link_secret_hash(secret: &str) -> Vec<u8> {
+    ring::digest::digest(&ring::digest::SHA256, secret.as_bytes())
+        .as_ref()
+        .to_vec()
 }
 
 fn ordered_pair(a: SessionId, b: SessionId) -> (SessionId, SessionId) {
@@ -6253,6 +6526,10 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::BindE2eDevice { .. } => "bind_e2e_device",
         ClientControl::PutE2eRecoveryBundle { .. } => "put_e2e_recovery_bundle",
         ClientControl::FetchE2eRecoveryBundle { .. } => "fetch_e2e_recovery_bundle",
+        ClientControl::CreateDeviceLink { .. } => "create_device_link",
+        ClientControl::CancelDeviceLink { .. } => "cancel_device_link",
+        ClientControl::FetchDeviceLink { .. } => "fetch_device_link",
+        ClientControl::RedeemDeviceLink { .. } => "redeem_device_link",
     }
 }
 
@@ -6298,6 +6575,10 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
         ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
         ServerControl::E2eRecoveryBundle { .. } => "e2e_recovery_bundle",
+        ServerControl::DeviceLinkCreated { .. } => "device_link_created",
+        ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
+        ServerControl::DeviceLinked { .. } => "device_linked",
+        ServerControl::DeviceLinkRedeemed { .. } => "device_link_redeemed",
     }
 }
 
@@ -6379,6 +6660,7 @@ mod tests {
             connected_at_ms: 0,
             pending_disk_history_fetches: 0,
             e2e_device: None,
+            credential_hash: None,
         }
     }
 
@@ -7282,6 +7564,38 @@ mod tests {
     }
 
     #[test]
+    fn dm_open_reply_reaches_requester_not_peers_other_devices() {
+        let mut server = test_server();
+        let bob = SessionId(1);
+        let mut bob_peer = live_user(&mut server, Token(11), bob, UserId(2));
+        let mut alice_first = live_user(&mut server, Token(22), SessionId(2), UserId(1));
+        let mut alice_second = live_user(&mut server, Token(33), SessionId(3), UserId(1));
+
+        server.open_dm(bob, UserId(1));
+
+        let opened = read_until(&mut bob_peer, |control| {
+            matches!(control, ServerControl::DmOpened { .. })
+        });
+        assert!(matches!(
+            opened,
+            ServerControl::DmOpened {
+                peer: UserId(1),
+                ..
+            }
+        ));
+        for peer in [&mut alice_first, &mut alice_second] {
+            assert!(matches!(
+                read_until(peer, |control| matches!(
+                    control,
+                    ServerControl::RoomUpserted { .. }
+                )),
+                ServerControl::RoomUpserted { .. }
+            ));
+            assert_no_control(peer);
+        }
+    }
+
+    #[test]
     fn dm_open_with_self_is_rejected() {
         let mut server = test_server();
         let requester = SessionId(1);
@@ -7361,6 +7675,7 @@ mod tests {
                     authority_public_key: authority_public.to_vec(),
                     first_device: rpc::e2e::DevicePublicKeys {
                         device_id: DeviceId([tag; 16]),
+                        name: format!("device-{tag}"),
                         key_epoch: 1,
                         signing_public_key: rpc::e2e::ed25519_public_key(&signing_seed)
                             .unwrap()
@@ -7476,6 +7791,89 @@ mod tests {
             .append_account_key_statement(publisher, genesis)
             .unwrap();
         assert_no_control(&mut reader_peer);
+    }
+
+    #[test]
+    fn device_link_redemption_broadcasts_new_roster_to_other_accounts() {
+        let mut server = test_server();
+        let alice = UserId(config::FIRST_DYNAMIC_USER_ID);
+        server.usernames.claim_dynamic(alice, "Alice").unwrap();
+        let genesis = test_account_genesis(&server, alice, 7);
+        server
+            .device_directory
+            .append(alice, genesis)
+            .unwrap();
+        let ledger = server.device_directory.validated(alice).unwrap().unwrap();
+        let authority_seed = [7; 32];
+        let device_id = DeviceId([9; 16]);
+        let statement = rpc::e2e::sign_account_statement(
+            rpc::e2e::AccountKeyStatementBody {
+                account_id: ledger.account_id,
+                account_generation: ledger.account_generation,
+                roster_epoch: ledger.roster_epoch + 1,
+                previous: ledger.head,
+                authority_key_epoch: ledger.authority_key_epoch,
+                action: rpc::e2e::AccountKeyAction::AddDevice {
+                    device: rpc::e2e::DevicePublicKeys {
+                        device_id,
+                        name: "Alice's second device".to_string(),
+                        key_epoch: 1,
+                        signing_public_key: rpc::e2e::ed25519_public_key(&[10; 32])
+                            .unwrap()
+                            .to_vec(),
+                        encryption_public_key: rpc::e2e::e2e_public_key(&[11; 32]).to_vec(),
+                    },
+                },
+            },
+            &authority_seed,
+            None,
+        )
+        .unwrap();
+
+        let _alice_peer = live_user(&mut server, Token(11), SessionId(1), alice);
+        let mut bob_peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
+        server.next_session = 3;
+        let mut linking_peer = seed_session_client(&mut server, Token(33));
+        let redemption_secret = "single-use-device-link-secret";
+        server.device_links.insert(
+            device_link_secret_hash(redemption_secret),
+            DeviceLinkState {
+                user_id: alice,
+                enrollment_bundle: vec![1],
+                expires_at: Instant::now() + DEVICE_LINK_TTL,
+            },
+        );
+
+        server
+            .redeem_device_link(
+                Token(33),
+                redemption_secret,
+                statement,
+                false,
+                0,
+            )
+            .unwrap();
+
+        let changed = read_until(&mut bob_peer, |control| {
+            matches!(control, ServerControl::AccountKeyHeadChanged { .. })
+        });
+        let ServerControl::AccountKeyHeadChanged {
+            user_id,
+            roster_epoch,
+            ..
+        } = changed
+        else {
+            unreachable!();
+        };
+        assert_eq!(user_id, alice);
+        assert_eq!(roster_epoch, 2);
+        assert!(matches!(
+            read_until(&mut linking_peer, |control| matches!(
+                control,
+                ServerControl::DeviceLinked { .. }
+            )),
+            ServerControl::DeviceLinked { .. }
+        ));
     }
 
     #[test]
@@ -9943,7 +10341,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_accepts_issued_dynamic_token() {
+    fn authenticate_accepts_registered_device_token() {
         let mut server = open_pair_test_server();
         let seed = server.config.security.server_identity_seed.clone();
         let token = issue_dynamic_token(
@@ -9954,6 +10352,15 @@ mod tests {
             },
         )
         .unwrap();
+        server
+            .device_directory
+            .add_credential(
+                UserId(config::FIRST_DYNAMIC_USER_ID),
+                hash_secret(&token),
+                None,
+                0,
+            )
+            .unwrap();
 
         let _peer = seed_session_client(&mut server, Token(1));
         let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
@@ -10150,7 +10557,13 @@ mod tests {
             .iter()
             .find(|user| user.internal_reference == "dana")
             .expect("user exists");
-        assert!(verify_secret_hash(&user.token_hash, new_token));
+        assert!(user.token_hash.is_empty());
+        let (credential_user, device, _, _) = server
+            .device_directory
+            .authenticate_credential(new_token)
+            .expect("device credential persisted");
+        assert_eq!(credential_user, user.id);
+        assert_eq!(device, None);
         assert_eq!(user.username, "Dana");
         assert!(server.invites.is_empty());
     }

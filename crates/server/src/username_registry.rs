@@ -110,6 +110,10 @@ impl UsernameRegistry {
         self.by_user.contains_key(&user_id)
     }
 
+    pub fn username_for(&self, user_id: UserId) -> Option<&str> {
+        self.by_user.get(&user_id).map(String::as_str)
+    }
+
     /// Whether `name` is free, or already owned by `claimant`.
     pub fn is_available(&self, name: &str, claimant: Option<UserId>) -> bool {
         match self.owner_of(name) {

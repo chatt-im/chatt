@@ -249,8 +249,11 @@ impl ClientThread {
             } else {
                 IDLE_POLL_INTERVAL
             };
-            match event::poll_with_custom_waker(&stdin, Some(&channel.waker), Some(poll_interval))?
-            {
+            match event::poll_with_custom_waker(
+                &stdin,
+                channel.poll_waker(),
+                Some(poll_interval),
+            )? {
                 Polled::ReadReady => events.read_from(&stdin)?,
                 Polled::Woken | Polled::TimedOut => {}
             }

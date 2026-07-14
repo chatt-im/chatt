@@ -3,6 +3,7 @@ pub(crate) mod audio_supervisor;
 pub(crate) mod command;
 pub(crate) mod commands;
 pub(crate) mod dialogs;
+pub(crate) mod device_pair;
 pub(crate) mod participants;
 pub(crate) mod room;
 pub(crate) mod room_settings;
@@ -25,8 +26,8 @@ use std::{
 use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use rpc::{
     control::{
-        ChatMutationKind, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, InviteTicket,
-        ParticipantVoiceStatus,
+        ChatMutationKind, DeviceLinkTicket, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN,
+        InviteTicket, ParticipantVoiceStatus,
     },
     crypto::OPEN_PAIR_RECOVERY_PREFIX,
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
@@ -38,7 +39,7 @@ use crate::{
     },
     client_net::{
         NetworkClient, NetworkCommand, NetworkEvent, TerminalVerb, TransferDirection,
-        UploadFileRequest, spawn_open_pair_once, spawn_pair_once,
+        UploadFileRequest, spawn_device_pair_once, spawn_open_pair_once, spawn_pair_once,
     },
     config::{
         self, Config, NotificationSoundMode, ServerEntry, SoundboardClip, ThemeSelection,
@@ -443,6 +444,9 @@ pub(crate) struct App {
     pub voice_bytes_received: u64,
     pub encoder_profile: LiveEncoderProfile,
     pub last_network_notice: Option<String>,
+    /// Command-line navigation is retained until the primary terminal channel
+    /// exists. Emitting an overlay during `App::new` would otherwise drop it.
+    pending_startup_join: Option<PendingJoin>,
     pending_after_welcome: Option<PendingJoin>,
     pub pending_audio_apply: Option<PendingAudioApply>,
     /// When set, the deadline at which outbound voice should be hard-disabled
@@ -1252,6 +1256,9 @@ impl AppEvents {
 /// A join requested on the command line, to be started once the app is running.
 #[derive(Clone)]
 pub(crate) enum PendingJoin {
+    /// Disposable device enrollment. The ticket is absent on the documented
+    /// path so it can be pasted into a hidden TUI field.
+    Device { ticket: Option<DeviceLinkTicket> },
     /// Invite-based pairing from a `tcj1_` join string.
     Invite(InviteTicket),
     /// Open pairing against a bare `host:port` address.
@@ -1356,6 +1363,7 @@ impl App {
             voice_bytes_received: 0,
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
+            pending_startup_join: pending_join,
             pending_after_welcome: None,
             pending_audio_apply: None,
             pending_voice_teardown_at: None,
@@ -1384,9 +1392,7 @@ impl App {
         app.view.mic_muted = app.mic_muted.clone();
         app.view.deafened = app.deafened.clone();
         app.rebuild_server_items();
-        if let Some(pending) = pending_join {
-            app.start_pending_join(pending);
-        } else if app.config.servers.is_empty() {
+        if app.pending_startup_join.is_none() && app.config.servers.is_empty() {
             app.set_status("no servers configured; run chatt pair <server>");
         }
         Ok(app)
@@ -1394,6 +1400,7 @@ impl App {
 
     fn start_pending_join(&mut self, pending: PendingJoin) {
         match pending {
+            PendingJoin::Device { ticket } => self.start_device_pairing_prompt(ticket),
             PendingJoin::Invite(ticket) => self.start_join_pairing(ticket),
             PendingJoin::Open { addr } => self.start_open_pairing(addr),
             PendingJoin::Named { specifier } => self.start_named_join(specifier),
@@ -1437,6 +1444,9 @@ impl App {
         channel: Arc<crate::client_channel::ClientChannel>,
     ) {
         self.primary_channel = Some(channel);
+        if let Some(pending) = self.pending_startup_join.take() {
+            self.start_pending_join(pending);
+        }
     }
 
     /// Builds and registers the view for a newly attached terminal, mirroring
@@ -1717,6 +1727,17 @@ impl App {
             CoreCommand::SubmitPairPassword(password) => {
                 self.submit_open_pair_password(password);
             }
+            CoreCommand::SubmitDevicePair {
+                pairing_string,
+                transfer_password,
+                device_name,
+                overwrite_existing,
+            } => self.submit_device_pairing(
+                pairing_string,
+                transfer_password,
+                device_name,
+                overwrite_existing,
+            ),
             CoreCommand::CancelPairing => self.cancel_open_pairing(),
             CoreCommand::AudioManualReset => self.audio_manual_reset(),
             CoreCommand::ReportBug(description) => self.start_bug_report(description),
@@ -3292,6 +3313,72 @@ impl App {
         crate::room_catalog::save(catalog_dir, &self.room.catalog(self.room.voice_room));
     }
 
+    fn start_device_pairing_prompt(&mut self, ticket: Option<DeviceLinkTicket>) {
+        self.pairing_owner = Some(self.issuing_client);
+        self.password_prompt_active = true;
+        let pairing_string = ticket
+            .as_ref()
+            .and_then(|ticket| rpc::control::encode_device_link_ticket(ticket).ok())
+            .unwrap_or_default();
+        self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::DevicePair(
+            device_pair::DevicePairDialog::new(
+                pairing_string,
+                self.config.ui.default_bindings,
+            ),
+        )));
+        self.set_status("enter the one-time device link details");
+    }
+
+    fn submit_device_pairing(
+        &mut self,
+        pairing_string: String,
+        transfer_password: String,
+        device_name: String,
+        overwrite_existing: bool,
+    ) {
+        let result = (|| -> Result<(), String> {
+            let ticket = rpc::control::decode_device_link_ticket(pairing_string.trim())?;
+            let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&ticket.tcp_addr));
+            let server = ServerEntry {
+                label: alias.clone(),
+                tcp_addr: ticket.tcp_addr.clone(),
+                udp_addr: ticket.udp_addr.clone(),
+                udp_probe_addr: ticket.udp_probe_addr.clone(),
+                username: "pairing".to_string(),
+                token: String::new(),
+                server_public_key: ticket.server_public_key.clone(),
+                ..ServerEntry::default()
+            };
+            let client_config = server.client_config(&self.config, self.download_store.clone());
+            spawn_device_pair_once(
+                client_config,
+                ticket,
+                transfer_password,
+                device_name,
+                overwrite_existing,
+                self.events.sender().for_unscoped_network(),
+            );
+            self.pending_pair = Some(PendingPair {
+                server,
+                open: None,
+                open_password: String::new(),
+                pairing_code: None,
+                completion: PairCompletion::OpenEditor,
+            });
+            self.set_status(format!("pairing device with {alias}"));
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if let Some(channel) = self
+                .pairing_owner
+                .and_then(|owner| self.channel_for(owner))
+            {
+                channel.push(TerminalEvent::PairingFailed(error.clone()));
+            }
+            self.set_error(error);
+        }
+    }
+
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
         self.username_retry = None;
         self.pairing_owner = Some(self.issuing_client);
@@ -4617,6 +4704,67 @@ impl App {
                     )),
                 );
                 self.set_error("server is not using native encryption");
+            }
+            NetworkEvent::DeviceLinkCreated {
+                pairing_string,
+                transfer_password,
+                expires_at_ms,
+            } => {
+                self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::DeviceLink(
+                    device_pair::DeviceLinkDialog::new(
+                        pairing_string,
+                        transfer_password,
+                        expires_at_ms,
+                        self.config.ui.default_bindings,
+                    ),
+                )));
+                self.set_status("one-time device link created");
+            }
+            NetworkEvent::DeviceLinkRedeemed { device_name } => {
+                self.navigate_owner(NavigationEvent::CloseOverlay);
+                self.set_status(format!("device linked: {device_name}"));
+            }
+            NetworkEvent::DevicePairingSucceeded {
+                token,
+                username,
+                udp_addr,
+                udp_probe_addr,
+                server_public_key,
+            } => {
+                self.password_prompt_active = false;
+                self.run_as_pairing_owner(|app| {
+                    let Some(mut pair) = app.pending_pair.take() else {
+                        app.set_error("device pairing completed without pending server state");
+                        return;
+                    };
+                    pair.server.token = token;
+                    pair.server.username = username;
+                    pair.server.udp_addr = udp_addr;
+                    pair.server.udp_probe_addr = udp_probe_addr;
+                    pair.server.server_public_key = server_public_key;
+                    app.navigate_owner(NavigationEvent::CloseOverlay);
+                    app.complete_pairing(pair.server, pair.completion);
+                });
+                self.pairing_owner = None;
+            }
+            NetworkEvent::DevicePairingIdentityExists {
+                message,
+                transfer_password,
+            } => {
+                if let Some(channel) = self
+                    .pairing_owner
+                    .and_then(|owner| self.channel_for(owner))
+                {
+                    channel.push(TerminalEvent::DevicePairingIdentityExists {
+                        message,
+                        transfer_password,
+                    });
+                    self.set_status("device pairing needs overwrite confirmation");
+                } else {
+                    self.pending_pair.take();
+                    self.pairing_owner = None;
+                    self.set_error("device pairing confirmation owner is no longer connected");
+                }
             }
             NetworkEvent::PairingSucceeded => {
                 self.run_as_pairing_owner(|app| {
@@ -6970,6 +7118,9 @@ impl App {
             "/devices" => {
                 self.send_network_command(NetworkCommand::ListE2eDevices, true);
             }
+            "/devices link" => {
+                self.send_network_command(NetworkCommand::CreateDeviceLink, true);
+            }
             "/devices recovery" => {
                 self.send_network_command(NetworkCommand::ShowE2eRecoveryCode, true);
             }
@@ -8606,6 +8757,12 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Presence { .. } => "presence",
         NetworkEvent::E2eRecoveryCode { .. } => "e2e_recovery_code",
         NetworkEvent::E2eAccountIdentity { .. } => "e2e_account_identity",
+        NetworkEvent::DeviceLinkCreated { .. } => "device_link_created",
+        NetworkEvent::DeviceLinkRedeemed { .. } => "device_link_redeemed",
+        NetworkEvent::DevicePairingSucceeded { .. } => "device_pairing_succeeded",
+        NetworkEvent::DevicePairingIdentityExists { .. } => {
+            "device_pairing_identity_exists"
+        }
         NetworkEvent::E2ePeerPinProposed { .. } => "e2e_peer_pin_proposed",
         NetworkEvent::E2eIdentityFetching { .. } => "e2e_identity_fetching",
         NetworkEvent::E2eKeyUnavailable { .. } => "e2e_key_unavailable",
@@ -8670,6 +8827,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
         NetworkCommand::ShowE2eRecoveryCode => "show_e2e_recovery_code",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
+        NetworkCommand::CreateDeviceLink => "create_device_link",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -8703,6 +8861,32 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn command_line_device_pairing_waits_for_primary_terminal() {
+        let mut app = App::new(
+            Config::default(),
+            Some(PendingJoin::Device { ticket: None }),
+        )
+        .expect("test app");
+        assert!(app.test_terminal_events.is_empty());
+
+        let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("channel"));
+        app.set_primary_channel(channel.clone());
+
+        let mut events = channel.drain_events();
+        assert!(matches!(
+            events.pop_front(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                OverlaySpec::DevicePair(_)
+            )))
+        ));
+        assert!(events.is_empty());
+        assert_eq!(
+            app.pairing_owner,
+            Some(crate::client_channel::ClientId::PRIMARY)
+        );
     }
 
     #[test]
@@ -9216,6 +9400,34 @@ mod tests {
             Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
                 OverlaySpec::PairingPassword { retry: false }
             )))
+        ));
+    }
+
+    #[test]
+    fn existing_device_identity_requests_overwrite_without_canceling_pairing() {
+        let mut app = test_app();
+        let owner = crate::client_channel::ClientId(6);
+        let _view = attach_test_client(&mut app, owner);
+        let channel = app.channel_for(owner).expect("attached channel");
+        app.pending_pair = Some(pending_open_pair("public"));
+        app.pairing_owner = Some(owner);
+
+        app.handle_app_event(
+            NetworkEvent::DevicePairingIdentityExists {
+                message: "Existing identity found. Overwrite it?".to_string(),
+                transfer_password: "coral-lantern".to_string(),
+            }
+            .into(),
+        );
+
+        assert!(app.pending_pair.is_some());
+        assert_eq!(app.pairing_owner, Some(owner));
+        assert!(matches!(
+            channel.drain_events().pop_front(),
+            Some(TerminalEvent::DevicePairingIdentityExists {
+                message,
+                transfer_password,
+            }) if message.contains("Overwrite") && transfer_password == "coral-lantern"
         ));
     }
 

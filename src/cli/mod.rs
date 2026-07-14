@@ -64,13 +64,13 @@ UI. The daemon owns server, audio, web, and local-control state while other \
         Command {
             name: "pair",
             aliases: &[],
-            about: "Pair with a server from an invite ticket or a public address.",
-            long_about: "",
+            about: "Pair a new device or join a server.",
+            long_about: "With no argument, securely prompts in the TUI for a one-time device pairing string, transfer password, and device name.",
             args: &[Arg {
                 name: "join_string",
                 value_name: "TICKET_OR_ADDRESS",
-                help: "An invite ticket (tcj1_...) or a public server host:port",
-                required: true,
+                help: "Optional device link (tcd1_...), invite (tcj1_...), or public host:port",
+                required: false,
                 possible: &[],
             }],
             flags: &[],
@@ -422,7 +422,14 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         Some(("daemon", _)) => run_daemon_app(config_path),
         Some(("pair", sub)) => {
             let target = sub.value_of("join_string").unwrap_or_default().trim();
-            let pending = if target.starts_with(rpc::control::JOIN_STRING_PREFIX) {
+            let pending = if target.is_empty() {
+                crate::app::PendingJoin::Device { ticket: None }
+            } else if target.starts_with(rpc::control::DEVICE_LINK_STRING_PREFIX) {
+                eprintln!("warning: passing a device pairing string as an argument may expose it in shell history or process listings");
+                crate::app::PendingJoin::Device {
+                    ticket: Some(rpc::control::decode_device_link_ticket(target)?),
+                }
+            } else if target.starts_with(rpc::control::JOIN_STRING_PREFIX) {
                 crate::app::PendingJoin::Invite(rpc::control::decode_invite_ticket(target)?)
             } else {
                 crate::app::PendingJoin::Open {

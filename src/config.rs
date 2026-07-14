@@ -62,10 +62,6 @@ pub struct ServerEntry {
     /// TOFU-pinned DM identity tuples of peers on this server.
     #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
     pub e2e_peer_pins: Vec<E2ePeerPin>,
-    /// High-entropy code copied out-of-band from an existing account device.
-    /// Clear it after the new device has joined successfully.
-    #[toml(default, ToToml skip_if = String::is_empty)]
-    pub e2e_recovery_code: String,
     #[toml(default = true, ToToml skip_if = |value: &bool| *value)]
     pub require_native_encryption: bool,
     #[toml(default, style = Header, ToToml skip_if = FileOverrides::is_empty)]
@@ -87,7 +83,6 @@ impl Default for ServerEntry {
             token: "alice-dev-token".to_string(),
             server_public_key: String::new(),
             e2e_peer_pins: Vec::new(),
-            e2e_recovery_code: String::new(),
             require_native_encryption: true,
             files: FileOverrides::default(),
             history: HistoryOverrides::default(),
@@ -154,7 +149,6 @@ impl ServerEntry {
             token: self.token.clone(),
             server_public_key: non_empty_string(&self.server_public_key),
             e2e_peer_pins: self.e2e_peer_pins.clone(),
-            e2e_recovery_code: non_empty_string(&self.e2e_recovery_code),
             require_native_encryption: self.require_native_encryption,
             file_policy: config.file_policy(self),
             download_store,
@@ -2355,13 +2349,6 @@ pub fn validate_server_entry(server: &ServerEntry) -> Result<(), String> {
     if let Some(addr) = &server.udp_probe_addr {
         validate_endpoint(addr, "udp-probe-addr")?;
     }
-    if !server.e2e_recovery_code.trim().is_empty() {
-        let code = rpc::crypto::decode_hex(server.e2e_recovery_code.trim())
-            .map_err(|_| "e2e-recovery-code is not valid hex".to_string())?;
-        if code.len() != rpc::crypto::KEY_LEN {
-            return Err("e2e-recovery-code must encode exactly 32 bytes".to_string());
-        }
-    }
     Ok(())
 }
 
@@ -3751,7 +3738,6 @@ server-public-key = ""
     fn runtime_config_round_trips_bound_e2e_identity_history() {
         let mut config = Config::default();
         let mut server = ServerEntry::default();
-        server.e2e_recovery_code = "44".repeat(32);
         server.e2e_peer_pins.push(E2ePeerPin {
             room_id: 11,
             user_id: 9,
@@ -3774,7 +3760,6 @@ server-public-key = ""
         let mut document = toml_spanner::parse(&rendered, &arena).unwrap();
         let parsed: Config = document.to().unwrap();
 
-        assert_eq!(parsed.servers[0].e2e_recovery_code, "44".repeat(32));
         assert_eq!(parsed.servers[0].e2e_peer_pins[0].room_id, 11);
         assert_eq!(
             parsed.servers[0].e2e_peer_pins[0].trust_level,

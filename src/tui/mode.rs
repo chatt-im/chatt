@@ -411,8 +411,8 @@ impl ScreenSpec {
 impl OverlaySpec {
     fn into_mode(self, theme: &crate::theme::Theme) -> Box<dyn AppMode> {
         use crate::tui::overlay::{
-            DialogMode, E2eIdentityMode, NativeEncryptionWarningMode, PasswordPromptMode,
-            PasteImageUploadMode,
+            DeviceLinkMode, DevicePairMode, DialogMode, E2eIdentityMode,
+            NativeEncryptionWarningMode, PasswordPromptMode, PasteImageUploadMode,
         };
         match self {
             Self::UserVolume(dialog) => Box::new(DialogMode::new(dialog)),
@@ -421,6 +421,8 @@ impl OverlaySpec {
             }
             Self::E2eIdentity(dialog) => Box::new(E2eIdentityMode::new(dialog, theme)),
             Self::PairingPassword { retry } => Box::new(PasswordPromptMode::new(retry)),
+            Self::DevicePair(dialog) => Box::new(DevicePairMode::new(dialog)),
+            Self::DeviceLink(dialog) => Box::new(DeviceLinkMode::new(dialog)),
             Self::PasteUpload(image) => Box::new(PasteImageUploadMode::new(image, theme)),
         }
     }

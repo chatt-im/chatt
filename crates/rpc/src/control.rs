@@ -50,12 +50,14 @@ pub const ERROR_ROOM_NOT_FOUND: u16 = 404;
 pub const ERROR_REQUEST_REJECTED: u16 = 412;
 /// The server failed internally while handling an otherwise valid request.
 pub const ERROR_INTERNAL: u16 = 500;
+pub const ERROR_DEVICE_LINK_UNAVAILABLE: u16 = 411;
 /// Most messages one `FetchHistory` may request.
 pub const MAX_HISTORY_FETCH_MESSAGES: u16 = 500;
 /// A mutation is only valid while at most this many messages exist in the room
 /// after its target; the server validates by scanning back this many records.
 pub const MUTATION_WINDOW_MESSAGES: usize = 256;
 pub const JOIN_STRING_PREFIX: &str = "tcj1_";
+pub const DEVICE_LINK_STRING_PREFIX: &str = "tcd1_";
 const MAX_JOIN_STRING_BYTES: usize = 4096;
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -106,6 +108,29 @@ pub enum ClientControl {
         username: String,
         password: String,
         existing_token: String,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+    },
+    /// Creates a short-lived device link for the authenticated, E2E-bound
+    /// account. The client hashes the redemption secret before transmission;
+    /// the enrollment bundle is opaque to the server.
+    CreateDeviceLink {
+        redemption_secret_hash: Vec<u8>,
+        enrollment_bundle: Vec<u8>,
+    },
+    CancelDeviceLink {
+        redemption_secret_hash: Vec<u8>,
+    },
+    /// Fetches an opaque enrollment bundle before authentication. Fetching is
+    /// non-consuming so a mistyped transfer password can be retried.
+    FetchDeviceLink {
+        redemption_secret: String,
+    },
+    /// Atomically consumes a device link, appends the signed AddDevice, and
+    /// creates a device-specific bearer credential.
+    RedeemDeviceLink {
+        redemption_secret: String,
+        statement: crate::e2e::AccountKeyStatement,
         receive_files: bool,
         file_receive_limit_bytes: u64,
     },
@@ -451,6 +476,32 @@ pub enum ServerControl {
         user_id: UserId,
         bundle: Option<Vec<u8>>,
     },
+    DeviceLinkCreated {
+        redemption_secret_hash: Vec<u8>,
+        expires_at_ms: u64,
+    },
+    DeviceLinkBundle {
+        enrollment_bundle: Vec<u8>,
+        account_chain: Vec<crate::e2e::AccountKeyStatement>,
+        user_id: UserId,
+        username: String,
+    },
+    DeviceLinked {
+        token: String,
+        username: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
+        session_id: SessionId,
+        user_id: UserId,
+        rooms: Vec<RoomInfo>,
+        users: Vec<UserSummary>,
+        default_room: RoomId,
+    },
+    DeviceLinkRedeemed {
+        redemption_secret_hash: Vec<u8>,
+        device_id: DeviceId,
+        device_name: String,
+    },
 }
 
 /// The operation named by [`ServerControl::ChatMutationRejected`].
@@ -712,6 +763,17 @@ pub struct InviteTicket {
     pub server_public_key: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct DeviceLinkTicket {
+    pub version: u16,
+    pub redemption_secret: String,
+    pub tcp_addr: String,
+    pub udp_addr: String,
+    pub udp_probe_addr: Option<String>,
+    pub server_public_key: String,
+}
+
 pub fn encode_client_hello(value: &ClientHello) -> Vec<u8> {
     jsony::to_binary(value)
 }
@@ -768,6 +830,31 @@ pub fn decode_invite_ticket(value: &str) -> Result<InviteTicket, String> {
     let bytes = decode_base64url_no_pad(payload)?;
     let ticket: InviteTicket = bounded_decode(&bytes)?;
     validate_invite_ticket(&ticket)?;
+    Ok(ticket)
+}
+
+pub fn encode_device_link_ticket(value: &DeviceLinkTicket) -> Result<String, String> {
+    validate_device_link_ticket(value)?;
+    let payload = jsony::to_binary(value);
+    let mut out = String::with_capacity(
+        DEVICE_LINK_STRING_PREFIX.len() + encoded_base64_len(payload.len()),
+    );
+    out.push_str(DEVICE_LINK_STRING_PREFIX);
+    encode_base64url_no_pad(&payload, &mut out);
+    Ok(out)
+}
+
+pub fn decode_device_link_ticket(value: &str) -> Result<DeviceLinkTicket, String> {
+    let value = value.trim();
+    if value.len() > MAX_JOIN_STRING_BYTES {
+        return Err("device pairing string exceeds maximum length".to_string());
+    }
+    let payload = value
+        .strip_prefix(DEVICE_LINK_STRING_PREFIX)
+        .ok_or_else(|| "device pairing string has an unknown prefix".to_string())?;
+    let bytes = decode_base64url_no_pad(payload)?;
+    let ticket: DeviceLinkTicket = bounded_decode(&bytes)?;
+    validate_device_link_ticket(&ticket)?;
     Ok(ticket)
 }
 
@@ -839,6 +926,33 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             validate_auth_field("display name", username)?;
             validate_optional_auth_field("password", password)?;
             validate_optional_auth_field("existing token", existing_token)?;
+        }
+        ClientControl::CreateDeviceLink {
+            redemption_secret_hash,
+            enrollment_bundle,
+        } => {
+            if redemption_secret_hash.len() != 32 {
+                return Err("device-link secret hash has the wrong length".to_string());
+            }
+            if enrollment_bundle.is_empty() || enrollment_bundle.len() > 16 * 1024 {
+                return Err("device enrollment bundle length is invalid".to_string());
+            }
+        }
+        ClientControl::CancelDeviceLink {
+            redemption_secret_hash,
+        } => {
+            if redemption_secret_hash.len() != 32 {
+                return Err("device-link secret hash has the wrong length".to_string());
+            }
+        }
+        ClientControl::FetchDeviceLink { redemption_secret }
+        | ClientControl::RedeemDeviceLink {
+            redemption_secret, ..
+        } => {
+            validate_auth_field("device-link redemption secret", redemption_secret)?;
+            if redemption_secret.len() < MIN_PAIRING_SECRET_BYTES {
+                return Err("device-link redemption secret is too short".to_string());
+            }
         }
         ClientControl::SendChat { body, envelope, .. }
         | ClientControl::EditChat { body, envelope, .. } => match envelope {
@@ -1006,6 +1120,36 @@ fn validate_invite_ticket(value: &InviteTicket) -> Result<(), String> {
     validate_endpoint("invite UDP address", &value.udp_addr)?;
     if let Some(addr) = &value.udp_probe_addr {
         validate_endpoint("invite UDP probe address", addr)?;
+    }
+    Ok(())
+}
+
+fn validate_device_link_ticket(value: &DeviceLinkTicket) -> Result<(), String> {
+    if value.version != crate::PROTOCOL_VERSION {
+        return Err(format!(
+            "unsupported device-link version {}",
+            value.version
+        ));
+    }
+    validate_auth_field("device-link redemption secret", &value.redemption_secret)?;
+    if value.redemption_secret.len() < MIN_PAIRING_SECRET_BYTES {
+        return Err("device-link redemption secret is too short".to_string());
+    }
+    let secret = crate::crypto::decode_hex(&value.redemption_secret)
+        .map_err(|_| "device-link redemption secret is not valid hex".to_string())?;
+    if secret.len() != crate::crypto::KEY_LEN {
+        return Err("device-link redemption secret has the wrong length".to_string());
+    }
+    validate_auth_field("server public key", &value.server_public_key)?;
+    let key = crate::crypto::decode_hex(&value.server_public_key)
+        .map_err(|_| "device-link server key is not valid hex".to_string())?;
+    if key.len() != crate::crypto::ED25519_PUBLIC_KEY_LEN {
+        return Err("device-link server key has the wrong length".to_string());
+    }
+    validate_endpoint("device-link TCP address", &value.tcp_addr)?;
+    validate_endpoint("device-link UDP address", &value.udp_addr)?;
+    if let Some(addr) = &value.udp_probe_addr {
+        validate_endpoint("device-link UDP probe address", addr)?;
     }
     Ok(())
 }

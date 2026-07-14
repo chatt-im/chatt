@@ -42,6 +42,7 @@ pub const ACCOUNT_AUTHORITY_KEY_LEN: usize = 32;
 pub const DEVICE_SIGNING_KEY_LEN: usize = 32;
 pub const MAX_ACTIVE_ACCOUNT_DEVICES: usize = 16;
 pub const MAX_ACCOUNT_KEY_STATEMENTS: usize = 4096;
+pub const MAX_DEVICE_NAME_BYTES: usize = 64;
 const ACCOUNT_ID_LABEL: &[u8] = b"chatt account identity v1";
 const ACCOUNT_STATEMENT_LABEL: &[u8] = b"chatt account key statement v1";
 
@@ -50,6 +51,8 @@ const ACCOUNT_STATEMENT_LABEL: &[u8] = b"chatt account key statement v1";
 #[jsony(Binary, version)]
 pub struct DevicePublicKeys {
     pub device_id: DeviceId,
+    /// Human-readable installation name, authenticated by the account ledger.
+    pub name: String,
     pub key_epoch: u64,
     pub signing_public_key: Vec<u8>,
     pub encryption_public_key: Vec<u8>,
@@ -482,6 +485,17 @@ fn statement_signing_bytes(body: &AccountKeyStatementBody) -> Vec<u8> {
 }
 
 fn validate_device_public_keys(device: &DevicePublicKeys) -> Result<(), String> {
+    let name = device.name.trim();
+    if name.is_empty()
+        || name.len() > MAX_DEVICE_NAME_BYTES
+        || name.chars().any(char::is_control)
+        || name != device.name
+    {
+        return Err(
+            "device name must be trimmed, 1-64 bytes, and contain no control characters"
+                .to_string(),
+        );
+    }
     if device.key_epoch == 0 {
         return Err("device key epoch is zero".to_string());
     }
@@ -1550,6 +1564,7 @@ mod tests {
         (
             DevicePublicKeys {
                 device_id: DeviceId([device; 16]),
+                name: format!("device-{device}"),
                 key_epoch,
                 signing_public_key: ed25519_public_key(&signing_seed).unwrap().to_vec(),
                 encryption_public_key: e2e_public_key(&encryption_seed).to_vec(),
