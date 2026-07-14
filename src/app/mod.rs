@@ -3036,6 +3036,7 @@ impl App {
         }
         self.view.switch_room(room_id, &self.room);
         self.room.ensure_e2e_security_notice(room_id);
+        self.show_synced_verification_notice(room_id);
         if self.room.begin_history_fetch(room_id)
             && !self.send_network_command(
                 NetworkCommand::FetchHistory {
@@ -3192,12 +3193,26 @@ impl App {
     fn after_view_switch(&mut self) {
         if let Some(room_id) = self.view.viewed_room {
             self.room.ensure_e2e_security_notice(room_id);
+            self.show_synced_verification_notice(room_id);
         }
         self.sync_viewed_room_to_feeds();
         self.request_initial_history_for_viewed_room();
         self.request_gap_backfill_for_viewed_room();
         self.mark_room_catalog_dirty();
         self.set_status(format!("viewing {}", self.room.room_name));
+    }
+
+    fn show_synced_verification_notice(&mut self, room_id: RoomId) {
+        let Some((user_id, account_id)) = self.room.show_synced_verification_notice(room_id) else {
+            return;
+        };
+        let _ = self.send_network_command(
+            NetworkCommand::AcknowledgeSyncedVerificationNotice {
+                user_id,
+                account_id,
+            },
+            true,
+        );
     }
 
     fn request_initial_history_for_viewed_room(&mut self) {
@@ -4274,10 +4289,17 @@ impl App {
             NetworkEvent::E2eDeviceBound { device_id } => {
                 let _ = device_id;
             }
-            NetworkEvent::E2ePeerPinProposed { pin } => {
+            NetworkEvent::E2ePeerPinProposed {
+                pin,
+                manual_verification,
+            } => {
                 let persisted = self.persist_e2e_pin(pin.clone());
                 self.send_network_command(
-                    NetworkCommand::ConfirmE2ePeerPin { pin, persisted },
+                    NetworkCommand::ConfirmE2ePeerPin {
+                        pin,
+                        persisted,
+                        manual_verification,
+                    },
                     true,
                 );
                 if !persisted {
@@ -4376,6 +4398,29 @@ impl App {
                     identity.verified_keys.iter().copied(),
                 );
                 self.room.set_e2e_trust_state(identity.room_id, state);
+                if identity.synced_verification_notice {
+                    let account_id = rpc::crypto::decode_hex(&identity.identity.public_key)
+                        .ok()
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(rpc::ids::AccountId);
+                    if let Some(account_id) = account_id
+                        && let Some((user_id, account_id)) = self
+                            .room
+                            .set_synced_verification_notice(
+                                identity.room_id,
+                                identity.user_id,
+                                account_id,
+                            )
+                    {
+                        let _ = self.send_network_command(
+                            NetworkCommand::AcknowledgeSyncedVerificationNotice {
+                                user_id,
+                                account_id,
+                            },
+                            true,
+                        );
+                    }
+                }
                 if self.room.viewed_room == Some(identity.room_id) {
                     self.sync_web_room_feed();
                 }
@@ -4388,12 +4433,21 @@ impl App {
                     } else {
                         identity.identity.username.clone()
                     };
-                    self.set_status(match identity.trust_level {
+                    self.set_status(if identity.synced_verification_notice
+                        && identity.trust_level
+                            == crate::config::E2eTrustLevel::Verified
+                    {
+                        format!(
+                            "Synced verification for {username} from another account device"
+                        )
+                    } else {
+                        match identity.trust_level {
                         crate::config::E2eTrustLevel::Accepted => {
                             format!("Forgot independent verification for {username}")
                         }
                         crate::config::E2eTrustLevel::Verified => {
                             format!("Verified {username}'s encryption identity")
+                        }
                         }
                     });
                 }
@@ -8836,6 +8890,9 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::ShowE2eRecoveryCode => "show_e2e_recovery_code",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
+        NetworkCommand::AcknowledgeSyncedVerificationNotice { .. } => {
+            "acknowledge_synced_verification_notice"
+        }
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -10129,6 +10186,7 @@ mod tests {
                 trust_level: crate::config::E2eTrustLevel::Accepted,
                 change_from: None,
                 verified_keys: Vec::new(),
+                synced_verification_notice: false,
             },
         });
 
@@ -10306,6 +10364,7 @@ mod tests {
                 trust_level: crate::config::E2eTrustLevel::Accepted,
                 change_from: None,
                 verified_keys: Vec::new(),
+                synced_verification_notice: false,
             },
         });
 

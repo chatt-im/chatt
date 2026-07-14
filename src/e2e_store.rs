@@ -6,6 +6,7 @@
 //! keyed by server identity and authenticated user id.
 
 use std::{
+    collections::HashSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -18,14 +19,16 @@ use rpc::{
     e2e::{
         ACCOUNT_AUTHORITY_KEY_LEN, AccountKeyAction, AccountKeyStatement,
         AccountKeyStatementBody, DevicePublicKeys, E2E_SEED_LEN, DEVICE_SIGNING_KEY_LEN,
-        ValidatedAccountLedger, account_id, ed25519_public_key, e2e_public_key,
-        random_device_id, sign_account_statement,
+        MAX_VERIFICATION_SYNC_RECORDS, ValidatedAccountLedger, VerificationSyncCheckpoint,
+        VerificationSyncRecord, VerificationSyncSnapshot, VerificationSyncState, account_id,
+        account_statement_hash, ed25519_public_key, e2e_public_key, random_device_id,
+        sign_account_statement,
     },
     ids::{AccountId, DeviceId, EventId, LedgerHash, RoomId, UserId},
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-const STORE_VERSION: u16 = 1;
+const STORE_VERSION: u16 = 2;
 const RECOVERY_AAD_LABEL: &[u8] = b"chatt account recovery bundle v1";
 
 #[derive(Clone, Debug, Jsony)]
@@ -85,6 +88,18 @@ struct IdentityFile {
     sender_chains: Vec<StoredSenderChain>,
     replay_heads: Vec<StoredReplayHead>,
     seen_events: Vec<StoredSeenEvent>,
+    verification_snapshot: VerificationSyncSnapshot,
+    verification_checkpoint: Option<VerificationSyncCheckpoint>,
+    verification_pending: Vec<VerificationSyncRecord>,
+    verification_notices: Vec<VerificationIdentity>,
+    verification_republish: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+struct VerificationIdentity {
+    user_id: UserId,
+    account_id: AccountId,
 }
 
 #[derive(Jsony, Zeroize, ZeroizeOnDrop)]
@@ -93,6 +108,10 @@ struct EnrollmentAuthority {
     authority_seed: Vec<u8>,
     recovery_secret: Vec<u8>,
     recovery_bundle: Vec<u8>,
+    #[zeroize(skip)]
+    verification_records: Vec<VerificationSyncRecord>,
+    #[zeroize(skip)]
+    verification_checkpoint: Option<VerificationSyncCheckpoint>,
 }
 
 pub(crate) struct LocalE2eIdentity {
@@ -115,12 +134,15 @@ pub(crate) enum ReplayObservation {
 }
 
 impl LocalE2eIdentity {
-    pub(crate) fn enrollment_authority(&self) -> Vec<u8> {
-        jsony::to_binary(&EnrollmentAuthority {
+    pub(crate) fn enrollment_authority(&self) -> Result<Vec<u8>, String> {
+        let verification_records = self.next_verification_snapshot()?.records;
+        Ok(jsony::to_binary(&EnrollmentAuthority {
             authority_seed: self.file.authority_seed.clone(),
             recovery_secret: self.file.recovery_secret.clone(),
             recovery_bundle: self.file.recovery_bundle.clone(),
-        })
+            verification_records,
+            verification_checkpoint: self.file.verification_checkpoint,
+        }))
     }
 
     pub(crate) fn prepare_linked_device(
@@ -162,6 +184,23 @@ impl LocalE2eIdentity {
         if ledger.recovery_bundle_hash.as_slice() != recovery_hash.as_ref() {
             return Err("enrollment recovery bundle does not match the account ledger".to_string());
         }
+        let verification_notices: Vec<_> = enrollment
+            .verification_records
+            .iter()
+            .filter(|record| record.state == VerificationSyncState::Verified)
+            .map(|record| VerificationIdentity {
+                user_id: record.user_id,
+                account_id: record.account_id,
+            })
+            .collect();
+        let verification_pending = enrollment
+            .verification_records
+            .iter()
+            .map(|record| VerificationSyncRecord {
+                modified_at: 0,
+                ..*record
+            })
+            .collect();
 
         let mut signing_seed = [0u8; DEVICE_SIGNING_KEY_LEN];
         let mut encryption_seed = [0u8; E2E_SEED_LEN];
@@ -215,6 +254,11 @@ impl LocalE2eIdentity {
                 sender_chains: Vec::new(),
                 replay_heads: Vec::new(),
                 seen_events: Vec::new(),
+                verification_snapshot: VerificationSyncSnapshot::default(),
+                verification_checkpoint: enrollment.verification_checkpoint,
+                verification_pending,
+                verification_notices,
+                verification_republish: true,
             },
         };
         identity.validate(server_public_key, user_id)?;
@@ -319,6 +363,11 @@ impl LocalE2eIdentity {
                         sender_chains: Vec::new(),
                         replay_heads: Vec::new(),
                         seen_events: Vec::new(),
+                        verification_snapshot: VerificationSyncSnapshot::default(),
+                        verification_checkpoint: None,
+                        verification_pending: Vec::new(),
+                        verification_notices: Vec::new(),
+                        verification_republish: false,
                     },
                 };
                 identity.persist()?;
@@ -507,8 +556,17 @@ impl LocalE2eIdentity {
         if device.status != rpc::e2e::DeviceKeyStatus::Active {
             return Err("local device has been retired or revoked".to_string());
         }
+        let roster_changed = self.file.own_ledger.last().map(account_statement_hash)
+            != statements.last().map(account_statement_hash);
         self.file.own_ledger = statements;
         self.file.server_registered = true;
+        if roster_changed
+            && (self.file.verification_checkpoint.is_some()
+                || !self.file.verification_snapshot.records.is_empty()
+                || !self.file.verification_pending.is_empty())
+        {
+            self.file.verification_republish = true;
+        }
         self.persist()?;
         Ok(ledger)
     }
@@ -537,6 +595,209 @@ impl LocalE2eIdentity {
         }
         self.persist()?;
         Ok(ledger)
+    }
+
+    pub(crate) fn verification_checkpoint(&self) -> Option<VerificationSyncCheckpoint> {
+        self.file.verification_checkpoint
+    }
+
+    pub(crate) fn verification_dirty(&self) -> bool {
+        self.file.verification_republish || !self.file.verification_pending.is_empty()
+    }
+
+    pub(crate) fn identity_verified(&self, user_id: UserId, account_id: AccountId) -> bool {
+        self.identity_verification(user_id, account_id) == Some(true)
+    }
+
+    pub(crate) fn identity_verification(
+        &self,
+        user_id: UserId,
+        account_id: AccountId,
+    ) -> Option<bool> {
+        effective_verification_record(&self.file, user_id, account_id).map(|record| {
+            record.state == VerificationSyncState::Verified
+        })
+    }
+
+    pub(crate) fn set_identity_verified(
+        &mut self,
+        user_id: UserId,
+        account_id: AccountId,
+        verified: bool,
+    ) -> Result<(), String> {
+        if user_id.0 == 0
+            || user_id == self.file.user_id
+            || account_id == AccountId::default()
+        {
+            return Err("verification sync identity is invalid".to_string());
+        }
+        let state = if verified {
+            VerificationSyncState::Verified
+        } else {
+            VerificationSyncState::Unverified
+        };
+        if effective_verification_record(&self.file, user_id, account_id)
+            .is_some_and(|record| record.state == state)
+        {
+            return Ok(());
+        }
+        if let Some(pending) = self
+            .file
+            .verification_pending
+            .iter_mut()
+            .find(|record| record.user_id == user_id && record.account_id == account_id)
+        {
+            pending.state = state;
+        } else {
+            let already_in_snapshot = self.file.verification_snapshot.records.iter().any(
+                |record| record.user_id == user_id && record.account_id == account_id,
+            );
+            let identities = self.file.verification_snapshot.records.len().saturating_add(
+                self.file
+                    .verification_pending
+                    .iter()
+                    .filter(|pending| {
+                        !self.file.verification_snapshot.records.iter().any(|record| {
+                            record.user_id == pending.user_id
+                                && record.account_id == pending.account_id
+                        })
+                    })
+                    .count(),
+            );
+            if !already_in_snapshot && identities >= MAX_VERIFICATION_SYNC_RECORDS {
+                return Err("verification sync has reached its 256-identity limit".to_string());
+            }
+            self.file.verification_pending.push(VerificationSyncRecord {
+                user_id,
+                account_id,
+                state,
+                modified_at: 0,
+            });
+        }
+        if !verified {
+            self.file.verification_notices.retain(|identity| {
+                identity.user_id != user_id || identity.account_id != account_id
+            });
+        }
+        self.persist()
+    }
+
+    /// Builds the next canonical snapshot without mutating the durable base.
+    /// The caller retains it until the server acknowledges its checkpoint.
+    pub(crate) fn next_verification_snapshot(&self) -> Result<VerificationSyncSnapshot, String> {
+        let version = self
+            .file
+            .verification_checkpoint
+            .map_or(1, |checkpoint| checkpoint.version.saturating_add(1));
+        let mut records = self.file.verification_snapshot.records.clone();
+        for pending in &self.file.verification_pending {
+            let mut pending = *pending;
+            pending.modified_at = version;
+            match records.iter_mut().find(|record| {
+                record.user_id == pending.user_id && record.account_id == pending.account_id
+            }) {
+                Some(record) => *record = pending,
+                None => records.push(pending),
+            }
+        }
+        records.sort_unstable_by_key(|record| (record.user_id, record.account_id));
+        if records.len() > MAX_VERIFICATION_SYNC_RECORDS {
+            return Err("verification sync has reached its 256-identity limit".to_string());
+        }
+        Ok(VerificationSyncSnapshot { records })
+    }
+
+    /// Applies an authenticated snapshot. Local unsent changes remain as a
+    /// bounded overlay, while only remote Verified transitions create notices.
+    pub(crate) fn apply_verification_snapshot(
+        &mut self,
+        checkpoint: VerificationSyncCheckpoint,
+        snapshot: VerificationSyncSnapshot,
+    ) -> Result<Vec<(UserId, AccountId)>, String> {
+        if let Some(known) = self.file.verification_checkpoint {
+            if checkpoint.version < known.version {
+                return Err("verification sync attempted a rollback".to_string());
+            }
+            if checkpoint.version == known.version && checkpoint != known {
+                return Err("verification sync forked a known version".to_string());
+            }
+        }
+        let pending = self.file.verification_pending.clone();
+        let newly_verified: Vec<_> = snapshot
+            .records
+            .iter()
+            .filter(|record| record.state == VerificationSyncState::Verified)
+            .filter(|record| {
+                !self.identity_verified(record.user_id, record.account_id)
+                    && !pending.iter().any(|local| {
+                        local.user_id == record.user_id && local.account_id == record.account_id
+                    })
+            })
+            .map(|record| (record.user_id, record.account_id))
+            .collect();
+        self.file.verification_snapshot = snapshot;
+        self.file.verification_checkpoint = Some(checkpoint);
+        for (user_id, account_id) in &newly_verified {
+            let identity = VerificationIdentity {
+                user_id: *user_id,
+                account_id: *account_id,
+            };
+            if !self.file.verification_notices.contains(&identity) {
+                self.file.verification_notices.push(identity);
+            }
+        }
+        let effective: Vec<_> = self
+            .file
+            .verification_notices
+            .iter()
+            .copied()
+            .filter(|identity| {
+                effective_verification_record(&self.file, identity.user_id, identity.account_id)
+                    .is_some_and(|record| record.state == VerificationSyncState::Verified)
+            })
+            .collect();
+        self.file.verification_notices = effective;
+        self.persist()?;
+        Ok(newly_verified)
+    }
+
+    pub(crate) fn commit_verification_snapshot(
+        &mut self,
+        checkpoint: VerificationSyncCheckpoint,
+        snapshot: VerificationSyncSnapshot,
+    ) -> Result<(), String> {
+        self.file.verification_pending.retain(|pending| {
+            !snapshot.records.iter().any(|record| {
+                record.user_id == pending.user_id
+                    && record.account_id == pending.account_id
+                    && record.state == pending.state
+            })
+        });
+        self.file.verification_snapshot = snapshot;
+        self.file.verification_checkpoint = Some(checkpoint);
+        self.file.verification_republish = false;
+        self.persist()
+    }
+
+    pub(crate) fn verification_notice_pending(
+        &self,
+        user_id: UserId,
+        account_id: AccountId,
+    ) -> bool {
+        self.file
+            .verification_notices
+            .contains(&VerificationIdentity { user_id, account_id })
+    }
+
+    pub(crate) fn acknowledge_verification_notice(
+        &mut self,
+        user_id: UserId,
+        account_id: AccountId,
+    ) -> Result<(), String> {
+        self.file.verification_notices.retain(|identity| {
+            identity.user_id != user_id || identity.account_id != account_id
+        });
+        self.persist()
     }
 
     pub(crate) fn reserve_event(
@@ -722,6 +983,62 @@ impl LocalE2eIdentity {
         {
             return Err("local private device keys do not match the ledger".to_string());
         }
+        let checkpoint_version = self.file.verification_checkpoint.map(|known| known.version);
+        if checkpoint_version == Some(0)
+            || (checkpoint_version.is_none()
+                && !self.file.verification_snapshot.records.is_empty())
+            || self.file.verification_snapshot.records.len() > MAX_VERIFICATION_SYNC_RECORDS
+            || self.file.verification_snapshot.records.iter().any(|record| {
+                record.user_id.0 == 0
+                    || record.user_id == user_id
+                    || record.account_id == AccountId::default()
+                    || record.modified_at == 0
+                    || Some(record.modified_at) > checkpoint_version
+            })
+            || self
+                .file
+                .verification_snapshot
+                .records
+                .windows(2)
+                .any(|pair| {
+                    (pair[0].user_id, pair[0].account_id)
+                        >= (pair[1].user_id, pair[1].account_id)
+                })
+            || self.file.verification_pending.len() > MAX_VERIFICATION_SYNC_RECORDS
+            || self.file.verification_pending.iter().any(|record| {
+                record.user_id.0 == 0
+                    || record.user_id == user_id
+                    || record.account_id == AccountId::default()
+                    || record.modified_at != 0
+            })
+        {
+            return Err("local verification sync state is invalid".to_string());
+        }
+        let mut identities = HashSet::new();
+        for record in self
+            .file
+            .verification_snapshot
+            .records
+            .iter()
+            .chain(&self.file.verification_pending)
+        {
+            identities.insert((record.user_id, record.account_id));
+        }
+        let notice_identities: HashSet<_> = self
+            .file
+            .verification_notices
+            .iter()
+            .map(|identity| (identity.user_id, identity.account_id))
+            .collect();
+        if identities.len() > MAX_VERIFICATION_SYNC_RECORDS
+            || notice_identities.len() != self.file.verification_notices.len()
+            || self.file.verification_notices.len() > MAX_VERIFICATION_SYNC_RECORDS
+            || self.file.verification_notices.iter().any(|notice| {
+                !self.identity_verified(notice.user_id, notice.account_id)
+            })
+        {
+            return Err("local verification sync metadata is invalid".to_string());
+        }
         Ok(())
     }
 
@@ -729,6 +1046,24 @@ impl LocalE2eIdentity {
         let bytes = jsony::to_binary(&self.file);
         atomic_write_private(&self.path, &bytes)
     }
+}
+
+fn effective_verification_record(
+    file: &IdentityFile,
+    user_id: UserId,
+    account_id: AccountId,
+) -> Option<VerificationSyncRecord> {
+    file.verification_pending
+        .iter()
+        .find(|record| record.user_id == user_id && record.account_id == account_id)
+        .copied()
+        .or_else(|| {
+            file.verification_snapshot
+                .records
+                .iter()
+                .find(|record| record.user_id == user_id && record.account_id == account_id)
+                .copied()
+        })
 }
 
 fn require_monotonic_chain(
@@ -834,6 +1169,7 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
     use rpc::e2e::{DeviceKeyStatus, account_statement_hash};
+    use rpc::ids::VerificationSyncHash;
 
     fn identity(path: PathBuf, server: &[u8], user_id: UserId, marker: u8) -> LocalE2eIdentity {
         let authority_seed = [marker; ACCOUNT_AUTHORITY_KEY_LEN];
@@ -898,6 +1234,11 @@ mod tests {
                 sender_chains: Vec::new(),
                 replay_heads: Vec::new(),
                 seen_events: Vec::new(),
+                verification_snapshot: VerificationSyncSnapshot::default(),
+                verification_checkpoint: None,
+                verification_pending: Vec::new(),
+                verification_notices: Vec::new(),
+                verification_republish: false,
             },
         }
     }
@@ -959,6 +1300,106 @@ mod tests {
             DeviceKeyStatus::Revoked
         );
         assert!(secondary.replace_own_ledger(linked_chain).is_err());
+    }
+
+    #[test]
+    fn verification_changes_coalesce_and_remote_verification_raises_one_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = [0x33; 32];
+        let mut source = identity(
+            temp.path().join("source.bin"),
+            &server,
+            UserId(1),
+            10,
+        );
+        let peer = UserId(2);
+        let peer_account = AccountId([8; 32]);
+        source
+            .set_identity_verified(peer, peer_account, true)
+            .unwrap();
+        source
+            .set_identity_verified(peer, peer_account, false)
+            .unwrap();
+        source
+            .set_identity_verified(peer, peer_account, true)
+            .unwrap();
+        assert_eq!(source.file.verification_pending.len(), 1);
+        let snapshot = source.next_verification_snapshot().unwrap();
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.records[0].state, VerificationSyncState::Verified);
+
+        let mut receiver = identity(
+            temp.path().join("receiver.bin"),
+            &server,
+            UserId(1),
+            20,
+        );
+        let checkpoint = VerificationSyncCheckpoint {
+            version: 1,
+            digest: VerificationSyncHash([4; 32]),
+        };
+        assert_eq!(
+            receiver
+                .apply_verification_snapshot(checkpoint, snapshot.clone())
+                .unwrap(),
+            vec![(peer, peer_account)]
+        );
+        assert!(receiver.identity_verified(peer, peer_account));
+        assert!(receiver.verification_notice_pending(peer, peer_account));
+        receiver
+            .acknowledge_verification_notice(peer, peer_account)
+            .unwrap();
+        assert!(!receiver.verification_notice_pending(peer, peer_account));
+
+        let mut forgotten = snapshot;
+        forgotten.records[0].state = VerificationSyncState::Unverified;
+        forgotten.records[0].modified_at = 2;
+        receiver
+            .apply_verification_snapshot(
+                VerificationSyncCheckpoint {
+                    version: 2,
+                    digest: VerificationSyncHash([5; 32]),
+                },
+                forgotten,
+            )
+            .unwrap();
+        assert!(!receiver.identity_verified(peer, peer_account));
+        assert!(!receiver.verification_notice_pending(peer, peer_account));
+    }
+
+    #[test]
+    fn device_enrollment_bootstraps_effective_verifications_as_pending_and_noticed() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = [0x44; 32];
+        let user_id = UserId(3);
+        let mut source = identity(
+            temp.path().join("source-enrollment.bin"),
+            &server,
+            user_id,
+            30,
+        );
+        let peer = UserId(4);
+        let peer_account = AccountId([9; 32]);
+        source
+            .set_identity_verified(peer, peer_account, true)
+            .unwrap();
+        let enrollment = source.enrollment_authority().unwrap();
+        assert!(enrollment.len() < 16 * 1024);
+
+        let (linked, _) = LocalE2eIdentity::prepare_linked_device(
+            temp.path(),
+            &server,
+            user_id,
+            "linked-device",
+            source.own_statements(),
+            &enrollment,
+            false,
+            &ring::rand::SystemRandom::new(),
+        )
+        .unwrap();
+        assert!(linked.identity_verified(peer, peer_account));
+        assert!(linked.verification_dirty());
+        assert!(linked.verification_notice_pending(peer, peer_account));
     }
 
     #[test]

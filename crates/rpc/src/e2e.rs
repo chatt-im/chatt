@@ -22,6 +22,7 @@ use crate::crypto::{
 };
 use crate::ids::{
     AccountId, DeviceId, EventId, LedgerHash, MessageId, RoomId, UserId,
+    VerificationSyncHash,
 };
 
 pub const E2E_PUBLIC_KEY_LEN: usize = 32;
@@ -43,8 +44,84 @@ pub const DEVICE_SIGNING_KEY_LEN: usize = 32;
 pub const MAX_ACTIVE_ACCOUNT_DEVICES: usize = 16;
 pub const MAX_ACCOUNT_KEY_STATEMENTS: usize = 4096;
 pub const MAX_DEVICE_NAME_BYTES: usize = 64;
+pub const MAX_VERIFICATION_SYNC_ENVELOPE_BYTES: usize = 16 * 1024;
+pub const MAX_VERIFICATION_SYNC_RECORDS: usize = 256;
 const ACCOUNT_ID_LABEL: &[u8] = b"chatt account identity v1";
 const ACCOUNT_STATEMENT_LABEL: &[u8] = b"chatt account key statement v1";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Jsony)]
+#[jsony(Binary, version)]
+pub struct VerificationSyncCheckpoint {
+    pub version: u64,
+    pub digest: VerificationSyncHash,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary)]
+pub enum VerificationSyncState {
+    Unverified,
+    Verified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct VerificationSyncRecord {
+    pub user_id: UserId,
+    pub account_id: AccountId,
+    pub state: VerificationSyncState,
+    pub modified_at: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct VerificationSyncSnapshot {
+    pub records: Vec<VerificationSyncRecord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct VerificationSyncHeader {
+    pub account_id: AccountId,
+    pub author_device: DeviceId,
+    pub author_key_epoch: u64,
+    pub roster: RosterCheckpoint,
+    pub version: u64,
+    pub previous: Option<VerificationSyncCheckpoint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct VerificationSyncEnvelope {
+    pub header: VerificationSyncHeader,
+    pub ephemeral_public_key: Vec<u8>,
+    pub recipient_keys: Vec<EventKeyWrap>,
+    pub sealed: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Jsony)]
+#[jsony(Binary, version)]
+struct VerificationSyncSignatureInput {
+    label: Vec<u8>,
+    header: VerificationSyncHeader,
+    ephemeral_public_key: Vec<u8>,
+    recipient_keys: Vec<EventKeyWrap>,
+    sealed: Vec<u8>,
+}
+
+#[derive(Jsony)]
+#[jsony(Binary, version)]
+struct VerificationSyncWrapContext {
+    label: Vec<u8>,
+    header: VerificationSyncHeader,
+    ephemeral_public_key: Vec<u8>,
+    device_id: DeviceId,
+    key_epoch: u64,
+}
+
+const VERIFICATION_SYNC_AAD_LABEL: &[u8] = b"chatt verification sync aad v1";
+const VERIFICATION_SYNC_SIGNATURE_LABEL: &[u8] = b"chatt verification sync signature v1";
+const VERIFICATION_SYNC_WRAP_LABEL: &[u8] = b"chatt verification sync key wrap v1";
 
 /// Public signing and encryption keys for one independently keyed installation.
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -1058,6 +1135,276 @@ pub fn open_dm_event(
     })
 }
 
+pub fn verification_sync_checkpoint(encoded: &[u8]) -> VerificationSyncCheckpoint {
+    let digest = digest::digest(&digest::SHA256, encoded);
+    VerificationSyncCheckpoint {
+        version: decode_verification_sync_envelope(encoded)
+            .map_or(0, |envelope| envelope.header.version),
+        digest: VerificationSyncHash(digest.as_ref().try_into().expect("SHA-256 length")),
+    }
+}
+
+pub fn decode_verification_sync_envelope(
+    encoded: &[u8],
+) -> Result<VerificationSyncEnvelope, CryptoError> {
+    if encoded.is_empty() || encoded.len() > MAX_VERIFICATION_SYNC_ENVELOPE_BYTES {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    let envelope: VerificationSyncEnvelope =
+        jsony::from_binary(encoded).map_err(|_| CryptoError::InvalidEncoding)?;
+    if envelope.header.version == 0
+        || envelope.header.account_id != envelope.header.roster.account_id
+        || envelope.header.author_key_epoch == 0
+        || envelope.ephemeral_public_key.len() != E2E_PUBLIC_KEY_LEN
+        || envelope.signature.len() != 64
+        || envelope.recipient_keys.is_empty()
+        || envelope.recipient_keys.len() > MAX_ACTIVE_ACCOUNT_DEVICES
+    {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    let expected_version = envelope
+        .header
+        .previous
+        .map_or(1, |previous| previous.version.saturating_add(1));
+    if envelope.header.version != expected_version {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    Ok(envelope)
+}
+
+pub fn verify_verification_sync_signature(
+    envelope: &VerificationSyncEnvelope,
+    author_signing_public_key: &[u8; DEVICE_SIGNING_KEY_LEN],
+) -> Result<(), CryptoError> {
+    let input = VerificationSyncSignatureInput {
+        label: VERIFICATION_SYNC_SIGNATURE_LABEL.to_vec(),
+        header: envelope.header,
+        ephemeral_public_key: envelope.ephemeral_public_key.clone(),
+        recipient_keys: envelope.recipient_keys.clone(),
+        sealed: envelope.sealed.clone(),
+    };
+    signature::UnparsedPublicKey::new(&signature::ED25519, author_signing_public_key)
+        .verify(&jsony::to_binary(&input), &envelope.signature)
+        .map_err(|_| CryptoError::InvalidSignature)
+}
+
+pub fn seal_verification_sync(
+    signing_seed: &[u8; DEVICE_SIGNING_KEY_LEN],
+    header: VerificationSyncHeader,
+    snapshot: &VerificationSyncSnapshot,
+    recipients: &[EventRecipient],
+    rng: &dyn SecureRandom,
+) -> Result<Vec<u8>, CryptoError> {
+    validate_verification_sync_snapshot(snapshot, header.version)?;
+    if header.version == 0
+        || header.account_id != header.roster.account_id
+        || recipients.is_empty()
+        || recipients.len() > MAX_ACTIVE_ACCOUNT_DEVICES
+    {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    let mut recipients = recipients.to_vec();
+    recipients.sort_by_key(|recipient| (recipient.device_id, recipient.key_epoch));
+    if recipients.iter().any(|recipient| {
+        recipient.user_id.0 == 0 || recipient.account_id != header.account_id
+    }) || recipients.windows(2).any(|pair| {
+        pair[0].device_id == pair[1].device_id && pair[0].key_epoch == pair[1].key_epoch
+    }) {
+        return Err(CryptoError::InvalidEncoding);
+    }
+
+    let mut content_key_bytes = [0u8; KEY_LEN];
+    rng.fill(&mut content_key_bytes)
+        .map_err(|_| CryptoError::Random)?;
+    let content_key = KeyMaterial {
+        id: 1,
+        bytes: content_key_bytes,
+    };
+    let mut ephemeral_seed = [0u8; E2E_SEED_LEN];
+    rng.fill(&mut ephemeral_seed)
+        .map_err(|_| CryptoError::Random)?;
+    let ephemeral_secret = StaticSecret::from(ephemeral_seed);
+    let ephemeral_public_key = PublicKey::from(&ephemeral_secret).to_bytes();
+
+    let inner = jsony::to_binary(snapshot);
+    let padded_len = padded_envelope_len(inner.len());
+    let mut sealed = Vec::with_capacity(padded_len + TAG_LEN);
+    sealed.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+    sealed.extend_from_slice(&inner);
+    sealed.resize(padded_len, 0);
+    seal_in_place_append_tag(
+        &content_key,
+        0,
+        &verification_sync_aad(&header),
+        0,
+        &mut sealed,
+    )?;
+
+    let mut recipient_keys = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        let shared = ephemeral_secret
+            .diffie_hellman(&PublicKey::from(recipient.encryption_public_key));
+        if !shared.was_contributory() {
+            return Err(CryptoError::InvalidKey);
+        }
+        let context = VerificationSyncWrapContext {
+            label: VERIFICATION_SYNC_WRAP_LABEL.to_vec(),
+            header,
+            ephemeral_public_key: ephemeral_public_key.to_vec(),
+            device_id: recipient.device_id,
+            key_epoch: recipient.key_epoch,
+        };
+        let context = jsony::to_binary(&context);
+        let wrap_key = verification_sync_wrap_key(shared.as_bytes(), &context)?;
+        let mut sealed_key = content_key.bytes.to_vec();
+        seal_in_place_append_tag(&wrap_key, 0, &context, 0, &mut sealed_key)?;
+        recipient_keys.push(EventKeyWrap {
+            user_id: recipient.user_id,
+            account_id: recipient.account_id,
+            device_id: recipient.device_id,
+            key_epoch: recipient.key_epoch,
+            sealed_key,
+        });
+    }
+    let input = VerificationSyncSignatureInput {
+        label: VERIFICATION_SYNC_SIGNATURE_LABEL.to_vec(),
+        header,
+        ephemeral_public_key: ephemeral_public_key.to_vec(),
+        recipient_keys: recipient_keys.clone(),
+        sealed: sealed.clone(),
+    };
+    let signing_key = signature::Ed25519KeyPair::from_seed_unchecked(signing_seed)
+        .map_err(|_| CryptoError::InvalidKey)?;
+    let signature = signing_key.sign(&jsony::to_binary(&input)).as_ref().to_vec();
+    let encoded = jsony::to_binary(&VerificationSyncEnvelope {
+        header,
+        ephemeral_public_key: ephemeral_public_key.to_vec(),
+        recipient_keys,
+        sealed,
+        signature,
+    });
+    if encoded.len() > MAX_VERIFICATION_SYNC_ENVELOPE_BYTES {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    Ok(encoded)
+}
+
+pub fn open_verification_sync(
+    encoded: &[u8],
+    author_signing_public_key: &[u8; DEVICE_SIGNING_KEY_LEN],
+    local_user: UserId,
+    local_account: AccountId,
+    local_device: DeviceId,
+    local_key_epoch: u64,
+    local_encryption_seed: &[u8; E2E_SEED_LEN],
+) -> Result<(VerificationSyncHeader, VerificationSyncSnapshot), CryptoError> {
+    let envelope = decode_verification_sync_envelope(encoded)?;
+    verify_verification_sync_signature(&envelope, author_signing_public_key)?;
+    if envelope.header.account_id != local_account {
+        return Err(CryptoError::WrongKeyId);
+    }
+    let addressed = envelope
+        .recipient_keys
+        .iter()
+        .find(|recipient| {
+            recipient.user_id == local_user
+                && recipient.account_id == local_account
+                && recipient.device_id == local_device
+                && recipient.key_epoch == local_key_epoch
+        })
+        .ok_or(CryptoError::WrongKeyId)?;
+    let ephemeral_public: [u8; E2E_PUBLIC_KEY_LEN] = envelope
+        .ephemeral_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoError::InvalidEncoding)?;
+    let shared = StaticSecret::from(*local_encryption_seed)
+        .diffie_hellman(&PublicKey::from(ephemeral_public));
+    if !shared.was_contributory() {
+        return Err(CryptoError::InvalidKey);
+    }
+    let context = VerificationSyncWrapContext {
+        label: VERIFICATION_SYNC_WRAP_LABEL.to_vec(),
+        header: envelope.header,
+        ephemeral_public_key: envelope.ephemeral_public_key,
+        device_id: addressed.device_id,
+        key_epoch: addressed.key_epoch,
+    };
+    let context = jsony::to_binary(&context);
+    let wrap_key = verification_sync_wrap_key(shared.as_bytes(), &context)?;
+    let mut sealed_key = addressed.sealed_key.clone();
+    let key_len = open_in_place_with_aad(&wrap_key, 0, &context, &mut sealed_key)?;
+    let key_bytes = sealed_key[..key_len]
+        .try_into()
+        .map_err(|_| CryptoError::InvalidEncoding)?;
+    let content_key = KeyMaterial {
+        id: 1,
+        bytes: key_bytes,
+    };
+    let mut sealed = envelope.sealed;
+    let plain_len = open_in_place_with_aad(
+        &content_key,
+        0,
+        &verification_sync_aad(&envelope.header),
+        &mut sealed,
+    )?;
+    let plain = &sealed[..plain_len];
+    let inner_len = plain
+        .first_chunk::<4>()
+        .map(|bytes| u32::from_le_bytes(*bytes) as usize)
+        .ok_or(CryptoError::InvalidEncoding)?;
+    let inner = plain
+        .get(4..4 + inner_len)
+        .ok_or(CryptoError::InvalidEncoding)?;
+    let snapshot = jsony::from_binary(inner).map_err(|_| CryptoError::InvalidEncoding)?;
+    validate_verification_sync_snapshot(&snapshot, envelope.header.version)?;
+    Ok((envelope.header, snapshot))
+}
+
+fn validate_verification_sync_snapshot(
+    snapshot: &VerificationSyncSnapshot,
+    version: u64,
+) -> Result<(), CryptoError> {
+    if snapshot.records.len() > MAX_VERIFICATION_SYNC_RECORDS
+        || snapshot.records.iter().any(|record| {
+            record.user_id.0 == 0
+                || record.account_id == AccountId::default()
+                || record.modified_at == 0
+                || record.modified_at > version
+        })
+        || snapshot.records.windows(2).any(|pair| {
+            (pair[0].user_id, pair[0].account_id) >= (pair[1].user_id, pair[1].account_id)
+        })
+    {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    Ok(())
+}
+
+fn verification_sync_aad(header: &VerificationSyncHeader) -> Vec<u8> {
+    let encoded = jsony::to_binary(header);
+    let mut aad = Vec::with_capacity(VERIFICATION_SYNC_AAD_LABEL.len() + encoded.len());
+    aad.extend_from_slice(VERIFICATION_SYNC_AAD_LABEL);
+    aad.extend_from_slice(&encoded);
+    aad
+}
+
+fn verification_sync_wrap_key(
+    shared: &[u8],
+    context: &[u8],
+) -> Result<KeyMaterial, CryptoError> {
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, context);
+    let prk = salt.extract(shared);
+    let info = [VERIFICATION_SYNC_WRAP_LABEL, context];
+    let okm = prk
+        .expand(&info, EventHkdfLen)
+        .map_err(|_| CryptoError::InvalidKey)?;
+    let mut bytes = [0u8; KEY_LEN];
+    okm.fill(&mut bytes)
+        .map_err(|_| CryptoError::InvalidKey)?;
+    Ok(KeyMaterial { id: 1, bytes })
+}
+
 fn event_aad(header: &SenderEventHeader) -> Vec<u8> {
     let encoded = jsony::to_binary(header);
     let mut aad = Vec::with_capacity(DM_EVENT_AAD_LABEL.len() + encoded.len());
@@ -1768,5 +2115,144 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn verification_snapshot_opens_on_each_account_device_and_is_signed() {
+        let rng = SystemRandom::new();
+        let (author, author_signing, author_encryption) = test_device(31, 1);
+        let (second, _, second_encryption) = test_device(32, 1);
+        let user_id = UserId(7);
+        let account_id = AccountId([41; 32]);
+        let header = VerificationSyncHeader {
+            account_id,
+            author_device: author.device_id,
+            author_key_epoch: 1,
+            roster: RosterCheckpoint {
+                account_id,
+                account_generation: 1,
+                roster_epoch: 2,
+                head: LedgerHash([42; 32]),
+            },
+            version: 1,
+            previous: None,
+        };
+        let snapshot = VerificationSyncSnapshot {
+            records: vec![VerificationSyncRecord {
+                user_id: UserId(99),
+                account_id: AccountId([55; 32]),
+                state: VerificationSyncState::Verified,
+                modified_at: 1,
+            }],
+        };
+        let recipients = [
+            EventRecipient {
+                user_id,
+                account_id,
+                device_id: author.device_id,
+                key_epoch: 1,
+                encryption_public_key: e2e_public_key(&author_encryption),
+            },
+            EventRecipient {
+                user_id,
+                account_id,
+                device_id: second.device_id,
+                key_epoch: 1,
+                encryption_public_key: e2e_public_key(&second_encryption),
+            },
+        ];
+        let encoded = seal_verification_sync(
+            &author_signing,
+            header,
+            &snapshot,
+            &recipients,
+            &rng,
+        )
+        .unwrap();
+        let author_public = <[u8; 32]>::try_from(author.signing_public_key.as_slice()).unwrap();
+        for (device, seed) in [
+            (author.device_id, author_encryption),
+            (second.device_id, second_encryption),
+        ] {
+            let (opened_header, opened_snapshot) = open_verification_sync(
+                &encoded,
+                &author_public,
+                user_id,
+                account_id,
+                device,
+                1,
+                &seed,
+            )
+            .unwrap();
+            assert_eq!(opened_header, header);
+            assert_eq!(opened_snapshot, snapshot);
+        }
+
+        let mut tampered = decode_verification_sync_envelope(&encoded).unwrap();
+        tampered.header.version = 2;
+        assert!(
+            open_verification_sync(
+                &jsony::to_binary(&tampered),
+                &author_public,
+                user_id,
+                account_id,
+                author.device_id,
+                1,
+                &author_encryption,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn maximum_verification_snapshot_stays_within_the_wire_cap() {
+        let rng = SystemRandom::new();
+        let (author, author_signing, _) = test_device(61, 1);
+        let user_id = UserId(5);
+        let account_id = AccountId([62; 32]);
+        let mut recipients = Vec::new();
+        for marker in 70..86 {
+            let (device, _, encryption) = test_device(marker, 1);
+            recipients.push(EventRecipient {
+                user_id,
+                account_id,
+                device_id: device.device_id,
+                key_epoch: 1,
+                encryption_public_key: e2e_public_key(&encryption),
+            });
+        }
+        let records = (0..MAX_VERIFICATION_SYNC_RECORDS)
+            .map(|index| {
+                let mut peer_account = [0u8; 32];
+                peer_account[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+                VerificationSyncRecord {
+                    user_id: UserId(index as u64 + 100),
+                    account_id: AccountId(peer_account),
+                    state: VerificationSyncState::Verified,
+                    modified_at: 1,
+                }
+            })
+            .collect();
+        let encoded = seal_verification_sync(
+            &author_signing,
+            VerificationSyncHeader {
+                account_id,
+                author_device: author.device_id,
+                author_key_epoch: 1,
+                roster: RosterCheckpoint {
+                    account_id,
+                    account_generation: 1,
+                    roster_epoch: 16,
+                    head: LedgerHash([63; 32]),
+                },
+                version: 1,
+                previous: None,
+            },
+            &VerificationSyncSnapshot { records },
+            &recipients,
+            &rng,
+        )
+        .unwrap();
+        assert!(encoded.len() <= MAX_VERIFICATION_SYNC_ENVELOPE_BYTES);
     }
 }

@@ -17,6 +17,7 @@ mod history_reader;
 pub mod local_admin;
 pub mod room_store;
 pub mod user_store;
+mod verification_sync_store;
 mod username_registry;
 
 use mio::{
@@ -48,7 +49,11 @@ use rpc::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
         recv_datagram_with, write_queue_to,
     },
-    e2e::{AccountKeyAction, DmContentKind, DmEventEnvelope},
+    e2e::{
+        AccountKeyAction, DmContentKind, DmEventEnvelope, RosterCheckpoint,
+        VerificationSyncCheckpoint, decode_verification_sync_envelope,
+        verification_sync_checkpoint, verify_verification_sync_signature,
+    },
     frame,
     ids::{
         BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId, StreamId,
@@ -68,6 +73,7 @@ use local_admin::{AdminCommand, AdminSocket};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
 use username_registry::UsernameRegistry;
+use verification_sync_store::VerificationSyncStore;
 
 #[cfg(test)]
 use rpc::evented::ReadPumpOutcome;
@@ -127,6 +133,11 @@ const DEVICE_LINK_TTL: Duration = Duration::from_secs(10 * 60);
 const OPEN_PAIR_RATE_WINDOW: Duration = Duration::from_secs(60);
 const OPEN_PAIR_PER_IP_LIMIT: usize = 6;
 const OPEN_PAIR_GLOBAL_LIMIT: usize = 30;
+const VERIFICATION_SYNC_RATE_WINDOW: Duration = Duration::from_secs(60);
+const VERIFICATION_SYNC_PUT_ACCOUNT_LIMIT: usize = 8;
+const VERIFICATION_SYNC_PUT_GLOBAL_LIMIT: usize = 256;
+const VERIFICATION_SYNC_FETCH_ACCOUNT_LIMIT: usize = 32;
+const VERIFICATION_SYNC_FETCH_GLOBAL_LIMIT: usize = 2048;
 /// Soft target for retained encoded history carried by one control chunk.
 /// The protocol hard cap is higher; this leaves room for framing, encryption,
 /// and future metadata while allowing one fetch to stream over several chunks.
@@ -409,6 +420,7 @@ pub struct Server {
     usernames: UsernameRegistry,
     /// Authority-signed account/device ledgers, persisted under the data dir.
     device_directory: DeviceDirectory,
+    verification_sync: VerificationSyncStore,
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
@@ -436,6 +448,10 @@ pub struct Server {
     device_links: HashMap<Vec<u8>, DeviceLinkState>,
     open_pair_global_allocations: VecDeque<Instant>,
     open_pair_ip_allocations: HashMap<IpAddr, VecDeque<Instant>>,
+    verification_put_global: VecDeque<Instant>,
+    verification_put_accounts: HashMap<UserId, VecDeque<Instant>>,
+    verification_fetch_global: VecDeque<Instant>,
+    verification_fetch_accounts: HashMap<UserId, VecDeque<Instant>>,
     rng: ring::rand::SystemRandom,
     server_key_pair: ring::signature::Ed25519KeyPair,
     next_media_sweep_at: Option<Instant>,
@@ -551,6 +567,7 @@ impl Server {
             server_key_pair.public_key().as_ref().to_vec(),
         )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let verification_sync = VerificationSyncStore::open(config.data_dir());
         let mut rooms = HashMap::new();
         for room in &config.rooms {
             let access = match &room.members {
@@ -624,6 +641,7 @@ impl Server {
             users,
             usernames,
             device_directory,
+            verification_sync,
             poll,
             listener,
             udp,
@@ -649,6 +667,10 @@ impl Server {
             device_links: HashMap::new(),
             open_pair_global_allocations: VecDeque::new(),
             open_pair_ip_allocations: HashMap::new(),
+            verification_put_global: VecDeque::new(),
+            verification_put_accounts: HashMap::new(),
+            verification_fetch_global: VecDeque::new(),
+            verification_fetch_accounts: HashMap::new(),
             rng: ring::rand::SystemRandom::new(),
             server_key_pair,
             next_media_sweep_at: None,
@@ -1840,6 +1862,7 @@ impl Server {
                 ClientControl::CreateDeviceLink {
                     redemption_secret_hash,
                     enrollment_bundle,
+                    verification_checkpoint,
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
@@ -1847,6 +1870,7 @@ impl Server {
                     session_id,
                     redemption_secret_hash,
                     enrollment_bundle,
+                    verification_checkpoint,
                 )
             }
             (
@@ -1986,6 +2010,20 @@ impl Server {
                     token,
                     &ServerControl::E2eRecoveryBundle { user_id, bundle },
                 )
+            }
+            (
+                ConnState::Ready,
+                ClientControl::FetchE2eVerificationSync { known },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.fetch_e2e_verification_sync(session_id, known)
+            }
+            (
+                ConnState::Ready,
+                ClientControl::PutE2eVerificationSync { expected, envelope },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.put_e2e_verification_sync(session_id, expected, envelope)
             }
             (
                 ConnState::Ready,
@@ -2164,6 +2202,7 @@ impl Server {
         session_id: SessionId,
         redemption_secret_hash: Vec<u8>,
         enrollment_bundle: Vec<u8>,
+        verification_checkpoint: Option<VerificationSyncCheckpoint>,
     ) -> Result<(), String> {
         let (user_id, tcp_token, is_bound) = self
             .sessions
@@ -2174,6 +2213,19 @@ impl Server {
             return Err("bind an active E2E device before creating a device link".to_string());
         }
         self.expire_device_links();
+        let current_verification = self
+            .verification_sync
+            .current(user_id)?
+            .map(|(checkpoint, _)| checkpoint);
+        if current_verification != verification_checkpoint {
+            return Err(
+                "fetch the latest E2E verification state before creating a device link"
+                    .to_string(),
+            );
+        }
+        if self.device_links.values().any(|link| link.user_id == user_id) {
+            return Err("an E2E device link is already active for this account".to_string());
+        }
         if self.device_links.contains_key(&redemption_secret_hash) {
             return Err("device-link redemption secret is already active".to_string());
         }
@@ -3236,6 +3288,159 @@ impl Server {
                 key_epoch,
             },
         )
+    }
+
+    fn fetch_e2e_verification_sync(
+        &mut self,
+        session_id: SessionId,
+        known: Option<VerificationSyncCheckpoint>,
+    ) -> Result<(), String> {
+        let (user_id, token) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| (session.user_id, session.tcp_token))
+            .ok_or_else(|| "unknown session".to_string())?;
+        if let Some(retry_after_ms) = rate_limited(
+            &mut self.verification_fetch_global,
+            &mut self.verification_fetch_accounts,
+            user_id,
+            VERIFICATION_SYNC_FETCH_GLOBAL_LIMIT,
+            VERIFICATION_SYNC_FETCH_ACCOUNT_LIMIT,
+        ) {
+            return self.send_control_to_token(
+                token,
+                &ServerControl::E2eVerificationSyncRateLimited { retry_after_ms },
+            );
+        }
+        let current = self.verification_sync.current(user_id)?;
+        let checkpoint = current.as_ref().map(|(checkpoint, _)| *checkpoint);
+        let envelope = current
+            .filter(|(checkpoint, _)| Some(*checkpoint) != known)
+            .map(|(_, envelope)| envelope);
+        self.send_control_to_token(
+            token,
+            &ServerControl::E2eVerificationSync {
+                checkpoint,
+                envelope,
+            },
+        )
+    }
+
+    fn put_e2e_verification_sync(
+        &mut self,
+        session_id: SessionId,
+        expected: Option<VerificationSyncCheckpoint>,
+        encoded: Vec<u8>,
+    ) -> Result<(), String> {
+        let (user_id, token, bound) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| (session.user_id, session.tcp_token, session.e2e_device))
+            .ok_or_else(|| "unknown session".to_string())?;
+        let Some(bound) = bound else {
+            return self.send_control_to_token(
+                token,
+                &ServerControl::Error {
+                    code: control::ERROR_REQUEST_REJECTED,
+                    message: "bind an active E2E device before synchronizing verification"
+                        .to_string(),
+                },
+            );
+        };
+        if let Some(retry_after_ms) = rate_limited(
+            &mut self.verification_put_global,
+            &mut self.verification_put_accounts,
+            user_id,
+            VERIFICATION_SYNC_PUT_GLOBAL_LIMIT,
+            VERIFICATION_SYNC_PUT_ACCOUNT_LIMIT,
+        ) {
+            return self.send_control_to_token(
+                token,
+                &ServerControl::E2eVerificationSyncRateLimited { retry_after_ms },
+            );
+        }
+        if self.device_links.values().any(|link| link.user_id == user_id) {
+            return self.send_control_to_token(
+                token,
+                &ServerControl::E2eVerificationSyncRateLimited {
+                    retry_after_ms: DEVICE_LINK_TTL.as_millis() as u64,
+                },
+            );
+        }
+        let current = self.verification_sync.current(user_id)?;
+        let current_checkpoint = current.as_ref().map(|(checkpoint, _)| *checkpoint);
+        if current_checkpoint != expected {
+            return self.send_control_to_token(
+                token,
+                &ServerControl::E2eVerificationSyncConflict {
+                    current: current_checkpoint,
+                },
+            );
+        }
+
+        let envelope = decode_verification_sync_envelope(&encoded)
+            .map_err(|_| "verification sync envelope is malformed".to_string())?;
+        if envelope.header.previous != expected
+            || envelope.header.author_device != bound.device_id
+            || envelope.header.author_key_epoch != bound.key_epoch
+            || envelope.header.roster.head != bound.ledger_head
+        {
+            return Err("verification sync envelope does not match the bound device".to_string());
+        }
+        let ledger = self
+            .device_directory
+            .validated(user_id)?
+            .ok_or_else(|| "account has no device ledger".to_string())?;
+        if envelope.header.account_id != ledger.account_id
+            || envelope.header.roster != RosterCheckpoint::from(&ledger)
+        {
+            return Err("verification sync envelope names the wrong account roster".to_string());
+        }
+        let signing_public_key = self
+            .device_directory
+            .active_device_signing_key(
+                user_id,
+                bound.device_id,
+                bound.key_epoch,
+                bound.ledger_head,
+            )?
+            .ok_or_else(|| "verification sync author is not active".to_string())?;
+        verify_verification_sync_signature(&envelope, &signing_public_key)
+            .map_err(|_| "verification sync signature is invalid".to_string())?;
+
+        let mut expected_recipients = ledger
+            .active_devices()
+            .map(|device| (device.device_id, device.key_epoch))
+            .collect::<Vec<_>>();
+        expected_recipients.sort_unstable();
+        let mut actual_recipients = envelope
+            .recipient_keys
+            .iter()
+            .map(|recipient| {
+                if recipient.user_id != user_id || recipient.account_id != ledger.account_id {
+                    return Err("verification sync recipient names another account".to_string());
+                }
+                Ok((recipient.device_id, recipient.key_epoch))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        actual_recipients.sort_unstable();
+        if actual_recipients != expected_recipients {
+            return Err("verification sync recipients do not match the active roster".to_string());
+        }
+
+        let checkpoint = verification_sync_checkpoint(&encoded);
+        self.verification_sync.replace(user_id, encoded)?;
+        let tokens = self
+            .sessions
+            .values()
+            .filter(|session| session.user_id == user_id)
+            .map(|session| session.tcp_token)
+            .collect::<Vec<_>>();
+        self.send_control_to_tokens(
+            &tokens,
+            &ServerControl::E2eVerificationSyncChanged { checkpoint },
+        );
+        Ok(())
     }
 
     /// Whether the session's user may access the room. Denials never reveal
@@ -6315,6 +6520,39 @@ fn prune_instants(queue: &mut VecDeque<Instant>, now: Instant, window: Duration)
     }
 }
 
+fn rate_limited(
+    global: &mut VecDeque<Instant>,
+    accounts: &mut HashMap<UserId, VecDeque<Instant>>,
+    user_id: UserId,
+    global_limit: usize,
+    account_limit: usize,
+) -> Option<u64> {
+    let now = Instant::now();
+    prune_instants(global, now, VERIFICATION_SYNC_RATE_WINDOW);
+    accounts.retain(|_, queue| {
+        prune_instants(queue, now, VERIFICATION_SYNC_RATE_WINDOW);
+        !queue.is_empty()
+    });
+    let account = accounts.entry(user_id).or_default();
+    if global.len() >= global_limit || account.len() >= account_limit {
+        let oldest = match (global.front(), account.front()) {
+            (Some(global), Some(account)) => Some((*global).min(*account)),
+            (Some(global), None) => Some(*global),
+            (None, Some(account)) => Some(*account),
+            (None, None) => None,
+        };
+        return Some(oldest.map_or(1_000, |oldest| {
+            VERIFICATION_SYNC_RATE_WINDOW
+                .saturating_sub(now.saturating_duration_since(oldest))
+                .as_millis()
+                .max(1) as u64
+        }));
+    }
+    global.push_back(now);
+    account.push_back(now);
+    None
+}
+
 fn now_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as u64,
@@ -6544,6 +6782,8 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::BindE2eDevice { .. } => "bind_e2e_device",
         ClientControl::PutE2eRecoveryBundle { .. } => "put_e2e_recovery_bundle",
         ClientControl::FetchE2eRecoveryBundle { .. } => "fetch_e2e_recovery_bundle",
+        ClientControl::FetchE2eVerificationSync { .. } => "fetch_e2e_verification_sync",
+        ClientControl::PutE2eVerificationSync { .. } => "put_e2e_verification_sync",
         ClientControl::CreateDeviceLink { .. } => "create_device_link",
         ClientControl::CancelDeviceLink { .. } => "cancel_device_link",
         ClientControl::FetchDeviceLink { .. } => "fetch_device_link",
@@ -6593,6 +6833,12 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
         ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
         ServerControl::E2eRecoveryBundle { .. } => "e2e_recovery_bundle",
+        ServerControl::E2eVerificationSync { .. } => "e2e_verification_sync",
+        ServerControl::E2eVerificationSyncChanged { .. } => "e2e_verification_sync_changed",
+        ServerControl::E2eVerificationSyncConflict { .. } => "e2e_verification_sync_conflict",
+        ServerControl::E2eVerificationSyncRateLimited { .. } => {
+            "e2e_verification_sync_rate_limited"
+        }
         ServerControl::DeviceLinkCreated { .. } => "device_link_created",
         ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
         ServerControl::DeviceLinked { .. } => "device_linked",
@@ -10920,5 +11166,35 @@ mod tests {
         assert!(!is_fd_pressure_accept_error(&io::Error::from(
             io::ErrorKind::PermissionDenied
         )));
+    }
+
+    #[test]
+    fn verification_sync_rate_limit_bounds_each_account_and_global_work() {
+        let mut global = VecDeque::new();
+        let mut accounts = HashMap::new();
+        let user = UserId(77);
+        for _ in 0..3 {
+            assert_eq!(rate_limited(&mut global, &mut accounts, user, 10, 3), None);
+        }
+        assert!(rate_limited(&mut global, &mut accounts, user, 10, 3).is_some());
+        assert_eq!(global.len(), 3);
+        assert_eq!(accounts[&user].len(), 3);
+
+        for marker in 1..=7 {
+            assert_eq!(
+                rate_limited(
+                    &mut global,
+                    &mut accounts,
+                    UserId(100 + marker),
+                    10,
+                    3,
+                ),
+                None
+            );
+        }
+        assert!(
+            rate_limited(&mut global, &mut accounts, UserId(200), 10, 3).is_some()
+        );
+        assert_eq!(global.len(), 10);
     }
 }

@@ -30,7 +30,7 @@ use crate::{
         ClientConfig, FilePolicy, NetworkClient, NetworkCommand, NetworkEvent,
         spawn_device_pair_once,
     },
-    config::{CandidatePrivacy, E2ePeerPin, EffectiveFiles},
+    config::{CandidatePrivacy, E2ePeerPin, E2eTrustLevel, EffectiveFiles},
 };
 
 const ALICE: UserId = UserId(1);
@@ -299,13 +299,17 @@ impl TestDevice {
                 panic!("{}: network event channel disconnected", self.label)
             }
         };
-        if let NetworkEvent::E2ePeerPinProposed { pin } = &event {
-            self.persist_and_confirm_pin(pin.clone());
+        if let NetworkEvent::E2ePeerPinProposed {
+            pin,
+            manual_verification,
+        } = &event
+        {
+            self.persist_and_confirm_pin(pin.clone(), *manual_verification);
         }
         event
     }
 
-    fn persist_and_confirm_pin(&mut self, pin: E2ePeerPin) {
+    fn persist_and_confirm_pin(&mut self, pin: E2ePeerPin, manual_verification: bool) {
         if let Some(existing) = self
             .config
             .e2e_peer_pins
@@ -319,6 +323,7 @@ impl TestDevice {
         self.send(NetworkCommand::ConfirmE2ePeerPin {
             pin,
             persisted: true,
+            manual_verification,
         });
     }
 
@@ -449,6 +454,71 @@ fn send_chat(sender: &TestDevice, room_id: RoomId, body: &str) {
     sender.send(NetworkCommand::SendChat {
         room_id,
         body: body.to_string(),
+    });
+}
+
+#[test]
+fn manual_verification_syncs_to_an_existing_linked_device() {
+    let world = TestWorld::new();
+    let mut alice_primary = world.device("alice-sync-primary", ALICE, ALICE_TOKEN);
+    let mut alice_linked = world.device("alice-sync-linked", ALICE, ALICE_TOKEN);
+    let mut bob = world.device("bob-sync", BOB, BOB_TOKEN);
+    alice_primary.connect_ready();
+    bob.connect_ready();
+    open_dm(&mut alice_primary, &mut bob);
+    pair_device(&mut alice_primary, &mut alice_linked);
+    alice_linked.connect_ready();
+    alice_linked.wait_peer_ready(BOB);
+
+    alice_primary.send(NetworkCommand::ReviewPeerIdentity { user_id: BOB });
+    let review = alice_primary.wait_for("identity review", |event| {
+        matches!(event, NetworkEvent::E2ePeerPinMatched { identity } if identity.user_id == BOB)
+    });
+    let NetworkEvent::E2ePeerPinMatched { identity: review } = review else {
+        unreachable!()
+    };
+    alice_primary.send(NetworkCommand::VerifyPeerIdentity { expected: review });
+    let verified = alice_primary.wait_for("local verification", |event| {
+        matches!(
+            event,
+            NetworkEvent::E2ePeerPinMatched { identity }
+                if identity.user_id == BOB
+                    && identity.trust_level == E2eTrustLevel::Verified
+                    && !identity.synced_verification_notice
+        )
+    });
+    alice_linked.wait_for("synced verification", |event| {
+        matches!(
+            event,
+            NetworkEvent::E2ePeerPinMatched { identity }
+                if identity.user_id == BOB
+                    && identity.trust_level == E2eTrustLevel::Verified
+                    && identity.synced_verification_notice
+        )
+    });
+    let NetworkEvent::E2ePeerPinMatched {
+        identity: verified,
+    } = verified
+    else {
+        unreachable!()
+    };
+    alice_primary.send(NetworkCommand::ForgetPeerIdentity { expected: verified });
+    alice_primary.wait_for("local verification removal", |event| {
+        matches!(
+            event,
+            NetworkEvent::E2ePeerPinMatched { identity }
+                if identity.user_id == BOB
+                    && identity.trust_level == E2eTrustLevel::Accepted
+        )
+    });
+    alice_linked.wait_for("synced verification removal", |event| {
+        matches!(
+            event,
+            NetworkEvent::E2ePeerPinMatched { identity }
+                if identity.user_id == BOB
+                    && identity.trust_level == E2eTrustLevel::Accepted
+                    && !identity.synced_verification_notice
+        )
     });
 }
 

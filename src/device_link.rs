@@ -7,10 +7,10 @@ use zeroize::Zeroizing;
 
 use crate::e2e_store::LocalE2eIdentity;
 
-const BUNDLE_VERSION: u8 = 1;
+const BUNDLE_VERSION: u8 = 2;
 const SALT_LEN: usize = 16;
 const WORD_COUNT: usize = 6;
-const AAD_LABEL: &[u8] = b"chatt disposable device enrollment v1";
+const AAD_LABEL: &[u8] = b"chatt disposable device enrollment v2";
 const WORDLIST: &str = include_str!("../assets/english.txt");
 
 pub(crate) fn seal_enrollment(
@@ -19,7 +19,7 @@ pub(crate) fn seal_enrollment(
     rng: &dyn SecureRandom,
 ) -> Result<(Vec<u8>, String), String> {
     seal_plaintext(
-        identity.enrollment_authority(),
+        identity.enrollment_authority()?,
         identity.server_public_key(),
         ticket_hash,
         rng,
