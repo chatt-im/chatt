@@ -2,18 +2,19 @@ use std::fmt;
 
 use jsony::Jsony;
 use mls_rs::{
+    CryptoProvider,
     MlsMessage,
     external_client::{
         ExternalClient, ExternalReceivedMessage, ExternalSnapshot,
         builder::{ExternalBaseConfig, WithCryptoProvider, WithIdentityProvider, WithMlsRules},
     },
-    group::ContentType,
+    group::{CommitEffect, ContentType, proposal::Proposal},
     WireFormat,
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use rpc::mls::MlsCommitBundle;
 
-use crate::{ChattIdentityProvider, ChattMlsPolicy};
+use crate::{CIPHER_SUITE, ChattIdentityProvider, ChattMlsPolicy};
 
 type ValidatorConfig = WithMlsRules<
     ChattMlsPolicy,
@@ -38,6 +39,7 @@ pub struct PublicGroupState {
 pub struct AppliedPublicCommit {
     pub state: PublicGroupState,
     pub committer_client_id: Vec<u8>,
+    pub added_key_package_refs: Vec<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -165,6 +167,7 @@ impl PublicGroupValidator {
             .map_err(|error| PublicValidationError::Decode(error.to_string()))?;
         match group.process_incoming_message(commit) {
             Ok(ExternalReceivedMessage::Commit(description)) => {
+                let added_key_package_refs = added_key_package_refs(&description.effect)?;
                 let committer_client_id = group
                     .roster()
                     .member_with_index(description.committer)
@@ -202,6 +205,7 @@ impl PublicGroupValidator {
                 Ok(AppliedPublicCommit {
                     state: next,
                     committer_client_id,
+                    added_key_package_refs,
                 })
             }
             Ok(_) => Err(PublicValidationError::UnexpectedMessage),
@@ -222,6 +226,19 @@ impl PublicGroupValidator {
             .map_err(|error| PublicValidationError::Decode(error.to_string()))?;
         let message = MlsMessage::from_bytes(encoded)
             .map_err(|error| PublicValidationError::Decode(error.to_string()))?;
+        // `mls-rs` deliberately accepts retained-epoch application messages so
+        // recipients can tolerate an unordered delivery service.  Submission
+        // is a different boundary: accepting an old ciphertext after a commit
+        // would let a sender bypass Chatt's stale-epoch retry and revocation
+        // ordering simply by labelling the outer request with the current
+        // epoch.
+        if message.epoch() != Some(current.epoch)
+            || message.group_id() != Some(current.group_id.as_slice())
+        {
+            return Err(PublicValidationError::InvalidCommit(
+                "application message does not belong to the current group epoch".to_string(),
+            ));
+        }
         match group.process_incoming_message(message) {
             Ok(ExternalReceivedMessage::Ciphertext(ContentType::Application)) => Ok(()),
             Ok(_) => Err(PublicValidationError::UnexpectedMessage),
@@ -237,6 +254,49 @@ impl PublicGroupValidator {
         }
         Ok(())
     }
+
+    pub fn key_package_reference(
+        &self,
+        encoded: &[u8],
+    ) -> Result<Vec<u8>, PublicValidationError> {
+        let key_package = MlsMessage::from_bytes(encoded)
+            .map_err(|error| PublicValidationError::Decode(error.to_string()))?
+            .into_key_package()
+            .ok_or(PublicValidationError::UnexpectedMessage)?;
+        key_package_reference(&key_package)
+    }
+}
+
+fn added_key_package_refs(
+    effect: &CommitEffect,
+) -> Result<Vec<Vec<u8>>, PublicValidationError> {
+    let epoch = match effect {
+        CommitEffect::NewEpoch(epoch) | CommitEffect::Removed { new_epoch: epoch, .. } => epoch,
+        CommitEffect::ReInit(_) => return Ok(Vec::new()),
+    };
+    epoch
+        .applied_proposals()
+        .iter()
+        .filter_map(|proposal| match &proposal.proposal {
+            Proposal::Add(add) => Some(add.key_package()),
+            _ => None,
+        })
+        .map(key_package_reference)
+        .collect()
+}
+
+fn key_package_reference(
+    key_package: &mls_rs::KeyPackage,
+) -> Result<Vec<u8>, PublicValidationError> {
+    let cipher = RustCryptoProvider::default()
+        .cipher_suite_provider(CIPHER_SUITE)
+        .ok_or_else(|| {
+            PublicValidationError::Decode("mandatory cipher suite is unavailable".to_string())
+        })?;
+    key_package
+        .to_reference(&cipher)
+        .map(|reference| reference.to_vec())
+        .map_err(|error| PublicValidationError::Decode(error.to_string()))
 }
 
 fn member_client_ids(

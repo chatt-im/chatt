@@ -8099,10 +8099,27 @@ mod tests {
             2,
         );
         let device_id = DeviceId([9; 16]);
-        let packages = vec![rpc::mls::PublishedKeyPackage {
-            device_id,
-            package: vec![1, 2, 3],
-        }];
+        let package_dir = tempfile::tempdir().unwrap();
+        let server_id: [u8; 32] = server
+            .server_key_pair
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let (package_source, _) = chatt_mls::LocalInstallation::open_or_create(
+            package_dir.path(),
+            server_id,
+            UserId(999),
+            "package source",
+        )
+        .unwrap();
+        let mut package = package_source
+            .client
+            .generate_key_packages(package_source.bootstrap.device_id, 1)
+            .unwrap()
+            .remove(0);
+        package.device_id = device_id;
+        let packages = vec![package];
         let attempt_id = rpc::ids::PairAttemptId([5; 16]);
         let redemption_secret = "single-use-device-link-secret";
         server.device_links.insert(

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{Arc, RwLock},
 };
@@ -34,6 +34,7 @@ pub enum PolicyError {
     UnknownRoom,
     AccountNotInRoom,
     ActiveDeviceRemoval,
+    InvalidGroupRoster,
     ReinitializationNotAllowed,
     LockPoisoned,
 }
@@ -54,6 +55,9 @@ impl fmt::Display for PolicyError {
             }
             Self::ActiveDeviceRemoval => {
                 f.write_str("commit removes a device that is still active")
+            }
+            Self::InvalidGroupRoster => {
+                f.write_str("commit would violate the fixed room roster")
             }
             Self::ReinitializationNotAllowed => {
                 f.write_str("MLS reinitialization would change the immutable room")
@@ -345,6 +349,53 @@ impl ChattMlsPolicy {
     pub fn new(identities: ChattIdentityProvider) -> Self {
         Self { identities }
     }
+
+    fn validate_group_roster(
+        &self,
+        roster: &Roster,
+        context: &mls_rs::group::GroupContext,
+    ) -> Result<(), PolicyError> {
+        let state = self
+            .identities
+            .state
+            .read()
+            .map_err(|_| PolicyError::LockPoisoned)?;
+        let room = state
+            .rooms
+            .get(context.group_id())
+            .ok_or(PolicyError::UnknownRoom)?;
+        let mut clients = HashSet::new();
+        let mut accounts = HashSet::new();
+        for member in roster.members_iter() {
+            let client_id = basic_client_id(&member.signing_identity)?;
+            if !clients.insert(client_id.to_vec()) {
+                return Err(PolicyError::InvalidGroupRoster);
+            }
+            let account = state
+                .devices
+                .get(client_id)
+                .map(|device| device.account_id)
+                .or_else(|| {
+                    parse_mls_client_id(&self.identities.server_id, client_id)
+                        .ok()
+                        .map(|(account, _)| account)
+                })
+                .ok_or(PolicyError::UnknownDevice)?;
+            if room.member_accounts.binary_search(&account).is_err() {
+                return Err(PolicyError::AccountNotInRoom);
+            }
+            accounts.insert(account);
+        }
+        if accounts.len() != room.member_accounts.len()
+            || room
+                .member_accounts
+                .iter()
+                .any(|account| !accounts.contains(account))
+        {
+            return Err(PolicyError::InvalidGroupRoster);
+        }
+        Ok(())
+    }
 }
 
 impl MlsRules for ChattMlsPolicy {
@@ -383,10 +434,11 @@ impl MlsRules for ChattMlsPolicy {
 
     fn commit_options(
         &self,
-        _new_roster: &Roster,
-        _new_context: &mls_rs::group::GroupContext,
+        new_roster: &Roster,
+        new_context: &mls_rs::group::GroupContext,
         _proposals: &ProposalBundle,
     ) -> Result<CommitOptions, Self::Error> {
+        self.validate_group_roster(new_roster, new_context)?;
         Ok(CommitOptions::new()
             .with_path_required(true)
             .with_ratchet_tree_extension(true)

@@ -6625,11 +6625,7 @@ impl WorkerState {
                     rpc::mls::MlsSubmitOutcome::Stored { sequence }
                     | rpc::mls::MlsSubmitOutcome::AlreadyStored { sequence } => {
                         let entry = installation.client.outbox(room_id, event_id)?;
-                        let should_emit = !matches!(
-                            entry.state,
-                            chatt_mls::OutboxState::Delivered { .. }
-                        );
-                        installation
+                        let should_emit = installation
                             .client
                             .mark_outgoing_delivered(room_id, event_id, sequence)?;
                         if should_emit {
