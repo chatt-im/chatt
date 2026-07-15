@@ -8,6 +8,7 @@ use mls_rs::{
         builder::{ExternalBaseConfig, WithCryptoProvider, WithIdentityProvider, WithMlsRules},
     },
     group::ContentType,
+    WireFormat,
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use rpc::mls::MlsCommitBundle;
@@ -83,6 +84,10 @@ impl PublicGroupValidator {
             .mls_rules(ChattMlsPolicy::new(identities))
             .build();
         Self { client }
+    }
+
+    pub fn new_historical_observer(identities: ChattIdentityProvider) -> Self {
+        Self::new(identities.historical_group_info_observer())
     }
 
     pub fn observe_group_info(
@@ -222,6 +227,15 @@ impl PublicGroupValidator {
             Ok(_) => Err(PublicValidationError::UnexpectedMessage),
             Err(error) => Err(PublicValidationError::InvalidCommit(error.to_string())),
         }
+    }
+
+    pub fn validate_welcome(&self, encoded: &[u8]) -> Result<(), PublicValidationError> {
+        let message = MlsMessage::from_bytes(encoded)
+            .map_err(|error| PublicValidationError::Decode(error.to_string()))?;
+        if message.wire_format() != WireFormat::Welcome {
+            return Err(PublicValidationError::UnexpectedMessage);
+        }
+        Ok(())
     }
 }
 

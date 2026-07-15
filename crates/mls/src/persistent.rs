@@ -133,7 +133,37 @@ pub enum ProcessedDelivery {
         event: Option<MlsChattEvent>,
     },
     Commit { sequence: u64, epoch: u64 },
+    /// The MLS application was authentic and advanced the secret tree, but
+    /// its Chatt payload was malformed or did not match the public envelope.
+    /// Such a message must not pin the ordered delivery cursor forever.
+    RejectedApplication { sequence: u64, reason: String },
     AlreadyProcessed { sequence: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+enum DeliveryMarker {
+    Application {
+        sequence: u64,
+        event_id: EventId,
+        message_hash: [u8; 32],
+    },
+    Commit {
+        sequence: u64,
+        parent_epoch: u64,
+        epoch: u64,
+        message_hash: [u8; 32],
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+struct PendingCommitRecord {
+    descriptor: EncryptedRoomDescriptor,
+    parent_epoch: u64,
+    epoch: u64,
+    commit: Vec<u8>,
+    group_info: Vec<u8>,
 }
 
 /// One installation's MLS client and encrypted application cache.
@@ -241,7 +271,7 @@ impl PersistentClient {
         let client = ClientBuilder::<BaseSqlConfig>::new_sqlite(storage)
             .map_err(|error| error.to_string())?
             .crypto_provider(RustCryptoProvider::default())
-            .identity_provider(identities.clone())
+            .identity_provider(identities.historical_group_info_observer())
             .mls_rules(ChattMlsPolicy::new(identities.clone()))
             .signing_identity(signing_identity, signing_secret.clone(), CIPHER_SUITE)
             .build();
@@ -371,6 +401,18 @@ impl PersistentClient {
             .commit_message
             .to_bytes()
             .map_err(|error| error.to_string())?;
+        let next_epoch = group
+            .context()
+            .epoch()
+            .checked_add(1)
+            .ok_or_else(|| "MLS epoch is exhausted".to_string())?;
+        self.store_pending_commit(&PendingCommitRecord {
+            descriptor: descriptor.clone(),
+            parent_epoch: group.context().epoch(),
+            epoch: next_epoch,
+            commit: commit.clone(),
+            group_info: group_info.clone(),
+        })?;
         group
             .write_to_storage()
             .map_err(|error| error.to_string())?;
@@ -387,18 +429,45 @@ impl PersistentClient {
         descriptor: &EncryptedRoomDescriptor,
         sequence: u64,
     ) -> Result<(), String> {
-        let mut group = self.load_group(descriptor)?;
-        if !group.has_pending_commit() {
-            return Err("MLS group has no pending commit to accept".to_string());
+        let cursor = self.cursor(descriptor.room_id)?;
+        if cursor.checked_add(1) != Some(sequence) {
+            return Err(format!(
+                "cannot accept MLS commit at delivery sequence {sequence} with cursor {cursor}"
+            ));
         }
-        group
-            .apply_pending_commit()
-            .map_err(|error| error.to_string())?;
-        group
-            .write_to_storage()
-            .map_err(|error| error.to_string())?;
+        let pending = self
+            .pending_commit(descriptor.room_id)?
+            .ok_or_else(|| "MLS group has no durable pending commit".to_string())?;
+        if pending.descriptor != *descriptor
+            || pending.parent_epoch.checked_add(1) != Some(pending.epoch)
+        {
+            return Err("durable MLS pending commit is inconsistent".to_string());
+        }
         self.store_descriptor(descriptor)?;
-        self.set_cursor(descriptor.room_id, sequence)
+        let delivery = MlsDeliveryEvent::Commit {
+            sequence,
+            parent_epoch: pending.parent_epoch,
+            epoch: pending.epoch,
+            commit: pending.commit,
+        };
+        let mut group = self.load_group(descriptor)?;
+        if group.has_pending_commit() {
+            group
+                .apply_pending_commit()
+                .map_err(|error| error.to_string())?;
+            self.store_delivery_marker(descriptor.room_id, &delivery)?;
+            group
+                .write_to_storage()
+                .map_err(|error| error.to_string())?;
+        } else if group.context().epoch() != pending.epoch
+            || !self
+                .delivery_marker(descriptor.room_id)?
+                .is_some_and(|marker| marker.matches(&delivery))
+        {
+            return Err("MLS group has no matching pending commit to accept".to_string());
+        }
+        self.set_cursor(descriptor.room_id, sequence)?;
+        self.clear_pending_commit_record(descriptor.room_id)
     }
 
     pub fn reject_pending_commit(
@@ -407,7 +476,10 @@ impl PersistentClient {
     ) -> Result<(), String> {
         let mut group = self.load_group(descriptor)?;
         group.clear_pending_commit();
-        group.write_to_storage().map_err(|error| error.to_string())
+        group
+            .write_to_storage()
+            .map_err(|error| error.to_string())?;
+        self.clear_pending_commit_record(descriptor.room_id)
     }
 
     pub fn join_welcome(
@@ -477,7 +549,7 @@ impl PersistentClient {
             .as_basic()
             .map(|credential| credential.identifier.clone())
             .ok_or_else(|| "local MLS credential is not Basic".to_string())?;
-        let validator = PublicGroupValidator::new(self.identities.clone());
+        let validator = PublicGroupValidator::new_historical_observer(self.identities.clone());
         let observed = validator
             .observe_group_info(encoded_group_info)
             .map_err(|error| error.to_string())?;
@@ -497,8 +569,12 @@ impl PersistentClient {
         let (group, commit) = builder
             .build(group_info)
             .map_err(|error| error.to_string())?;
+        let next_epoch = observed
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| "MLS epoch is exhausted".to_string())?;
         if group.context().group_id() != descriptor.mls_group_id
-            || group.context().epoch() != observed.epoch.saturating_add(1)
+            || group.context().epoch() != next_epoch
         {
             return Err("external rejoin produced an unexpected MLS group state".to_string());
         }
@@ -595,6 +671,9 @@ impl PersistentClient {
             OutboxState::PendingEncryption => {}
         }
         let mut group = self.load_group(descriptor)?;
+        if group.has_pending_commit() {
+            return Err("cannot encrypt an MLS application with a pending commit".to_string());
+        }
         let epoch = group.context().epoch();
         let ciphertext = group
             .encrypt_application_message(&jsony::to_binary(&entry.event), Vec::new())
@@ -627,27 +706,34 @@ impl PersistentClient {
             .insert(&key, &jsony::to_binary(&entry))
             .map_err(|error| error.to_string())?;
         let cursor = self.cursor(room_id)?;
-        if sequence == cursor + 1 {
+        if cursor.checked_add(1) == Some(sequence) {
             self.set_cursor(room_id, sequence)?;
         }
         Ok(())
     }
 
-    /// Handles `StaleEpochNotStored`, which proves the old exact ciphertext
-    /// was not appended by the delivery service. Submit responses can be
-    /// duplicated or reordered, so resetting an already-pending entry and a
-    /// stale response arriving after delivery are both harmless no-ops.
-    pub fn retry_stale_outgoing(&self, room_id: RoomId, event_id: EventId) -> Result<(), String> {
+    /// Handles `StaleEpochNotStored`, which proves a ciphertext from an epoch
+    /// older than `current_epoch` was not appended by the delivery service.
+    /// A delayed response must not reset ciphertext already re-encrypted for
+    /// the epoch named by that response (or a later epoch).
+    pub fn retry_stale_outgoing(
+        &self,
+        room_id: RoomId,
+        event_id: EventId,
+        current_epoch: u64,
+    ) -> Result<(), String> {
         let key = outbox_key(room_id, event_id);
         let mut entry = self.outbox_entry(room_id, event_id)?;
         match entry.state {
-            OutboxState::PendingDelivery { .. } => {
+            OutboxState::PendingDelivery { epoch, .. } if epoch < current_epoch => {
                 entry.state = OutboxState::PendingEncryption;
                 self.application
                     .insert(&key, &jsony::to_binary(&entry))
                     .map_err(|error| error.to_string())?;
             }
-            OutboxState::PendingEncryption | OutboxState::Delivered { .. } => {}
+            OutboxState::PendingDelivery { .. }
+            | OutboxState::PendingEncryption
+            | OutboxState::Delivered { .. } => {}
         }
         Ok(())
     }
@@ -657,9 +743,10 @@ impl PersistentClient {
         descriptor: &EncryptedRoomDescriptor,
         delivery: &MlsDeliveryEvent,
     ) -> Result<ProcessedDelivery, String> {
-        self.process_delivery_with_hook(descriptor, delivery, || Ok(()))
+        self.process_delivery_with_hooks(descriptor, delivery, || Ok(()), || Ok(()))
     }
 
+    #[cfg(test)]
     fn process_delivery_with_hook<F>(
         &self,
         descriptor: &EncryptedRoomDescriptor,
@@ -669,16 +756,38 @@ impl PersistentClient {
     where
         F: FnOnce() -> Result<(), String>,
     {
+        self.process_delivery_with_hooks(
+            descriptor,
+            delivery,
+            before_application_group_write,
+            || Ok(()),
+        )
+    }
+
+    fn process_delivery_with_hooks<F, G>(
+        &self,
+        descriptor: &EncryptedRoomDescriptor,
+        delivery: &MlsDeliveryEvent,
+        before_application_group_write: F,
+        after_group_write: G,
+    ) -> Result<ProcessedDelivery, String>
+    where
+        F: FnOnce() -> Result<(), String>,
+        G: FnOnce() -> Result<(), String>,
+    {
         descriptor.validate()?;
         let sequence = delivery.sequence();
         let cursor = self.cursor(descriptor.room_id)?;
         if sequence <= cursor {
             return Ok(ProcessedDelivery::AlreadyProcessed { sequence });
         }
-        if sequence != cursor + 1 {
+        let expected_sequence = cursor
+            .checked_add(1)
+            .ok_or_else(|| "MLS delivery cursor is exhausted".to_string())?;
+        if sequence != expected_sequence {
             return Err(format!(
                 "MLS delivery gap: expected {}, received {sequence}",
-                cursor + 1
+                expected_sequence
             ));
         }
         if let MlsDeliveryEvent::Application {
@@ -716,6 +825,15 @@ impl PersistentClient {
             }
         }
         let mut group = self.load_group(descriptor)?;
+        if let MlsDeliveryEvent::Commit {
+            parent_epoch,
+            epoch,
+            ..
+        } = delivery
+            && parent_epoch.checked_add(1) != Some(*epoch)
+        {
+            return Err("MLS commit delivery does not advance exactly one epoch".to_string());
+        }
         let (encoded, outer_event_id, advertised_epoch) = match delivery {
             MlsDeliveryEvent::Commit { commit, epoch, .. } => (commit, None, *epoch),
             MlsDeliveryEvent::Application {
@@ -736,6 +854,36 @@ impl PersistentClient {
                     self.set_cursor(descriptor.room_id, sequence)?;
                     return Ok(ProcessedDelivery::AlreadyProcessed { sequence });
                 }
+                if let Some(marker) = self.delivery_marker(descriptor.room_id)?
+                    && marker.matches(delivery)
+                {
+                    match marker {
+                        DeliveryMarker::Commit { epoch, .. }
+                            if group.context().epoch() == epoch =>
+                        {
+                            self.set_cursor(descriptor.room_id, sequence)?;
+                            self.clear_pending_commit_record(descriptor.room_id)?;
+                            return Ok(ProcessedDelivery::Commit { sequence, epoch });
+                        }
+                        DeliveryMarker::Application { .. } => {
+                            self.set_cursor(descriptor.room_id, sequence)?;
+                            return Ok(ProcessedDelivery::AlreadyProcessed { sequence });
+                        }
+                        DeliveryMarker::Commit { .. } => {}
+                    }
+                }
+                if outer_event_id.is_some() {
+                    // The delivery service cannot authenticate PrivateMessage
+                    // sender data or detect secret-tree replays. A member can
+                    // therefore resubmit a copied ciphertext under another
+                    // outer event id. It is not an epoch transition and must
+                    // not wedge the ordered cursor for every recipient.
+                    self.set_cursor(descriptor.room_id, sequence)?;
+                    return Ok(ProcessedDelivery::RejectedApplication {
+                        sequence,
+                        reason: format!("invalid MLS application: {error}"),
+                    });
+                }
                 return Err(error.to_string());
             }
         };
@@ -744,42 +892,51 @@ impl PersistentClient {
                 let event_id = outer_event_id.ok_or_else(|| {
                     "commit delivery contained an application message".to_string()
                 })?;
-                let member = group
-                    .roster()
-                    .member_with_index(application.sender_index)
-                    .map_err(|error| error.to_string())?;
-                let client_id = member
-                    .signing_identity
-                    .credential
-                    .as_basic()
-                    .map(|credential| credential.identifier.clone())
-                    .ok_or_else(|| "MLS sender does not use a Basic credential".to_string())?;
-                let sender_account = self
-                    .identities
-                    .account_for_client(&client_id)
-                    .map_err(|error| error.to_string())?;
-                let event: MlsChattEvent = jsony::from_binary(application.data())
-                    .map_err(|error| format!("invalid Chatt MLS event: {error}"))?;
-                validate_event(&event, descriptor.room_id, event_id, sender_account)?;
-                let cached = CachedIncomingEvent {
-                    sequence,
-                    sender_client_id: client_id,
-                    event,
-                };
-                // Cache first. If the MLS write fails, reloading the group
-                // rolls decryption back and this idempotent insert is harmless.
-                self.application
-                    .insert(
-                        &incoming_key(descriptor.room_id, event_id),
-                        &jsony::to_binary(&cached),
-                    )
-                    .map_err(|error| error.to_string())?;
+                let opened = (|| {
+                    let member = group
+                        .roster()
+                        .member_with_index(application.sender_index)
+                        .map_err(|error| error.to_string())?;
+                    let client_id = member
+                        .signing_identity
+                        .credential
+                        .as_basic()
+                        .map(|credential| credential.identifier.clone())
+                        .ok_or_else(|| "MLS sender does not use a Basic credential".to_string())?;
+                    let sender_account = self
+                        .identities
+                        .account_for_client(&client_id)
+                        .map_err(|error| error.to_string())?;
+                    let event: MlsChattEvent = jsony::from_binary(application.data())
+                        .map_err(|error| format!("invalid Chatt MLS event: {error}"))?;
+                    validate_event(&event, descriptor.room_id, event_id, sender_account)?;
+                    Ok::<_, String>(CachedIncomingEvent {
+                        sequence,
+                        sender_client_id: client_id,
+                        event,
+                    })
+                })();
+                // Cache and mark first. If the MLS write fails, reloading the
+                // group rolls decryption back and these inserts are harmless.
+                if let Ok(cached) = &opened {
+                    self.application
+                        .insert(
+                            &incoming_key(descriptor.room_id, event_id),
+                            &jsony::to_binary(cached),
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                self.store_delivery_marker(descriptor.room_id, delivery)?;
                 before_application_group_write()?;
                 group
                     .write_to_storage()
                     .map_err(|error| error.to_string())?;
+                after_group_write()?;
                 self.set_cursor(descriptor.room_id, sequence)?;
-                Ok(ProcessedDelivery::Application(cached))
+                match opened {
+                    Ok(cached) => Ok(ProcessedDelivery::Application(cached)),
+                    Err(reason) => Ok(ProcessedDelivery::RejectedApplication { sequence, reason }),
+                }
             }
             ReceivedMessage::Commit(commit) => {
                 if outer_event_id.is_some() {
@@ -796,10 +953,13 @@ impl PersistentClient {
                         "MLS commit delivery epoch does not match its result (local {epoch}, advertised {advertised_epoch}, effect {effect})"
                     ));
                 }
+                self.store_delivery_marker(descriptor.room_id, delivery)?;
                 group
                     .write_to_storage()
                     .map_err(|error| error.to_string())?;
+                after_group_write()?;
                 self.set_cursor(descriptor.room_id, sequence)?;
+                self.clear_pending_commit_record(descriptor.room_id)?;
                 Ok(ProcessedDelivery::Commit { sequence, epoch })
             }
             _ => Err("ordered MLS stream contained an unsupported message type".to_string()),
@@ -907,6 +1067,28 @@ impl PersistentClient {
             .transpose()
     }
 
+    /// Recovers room creation when the server durably accepted the exact
+    /// initial commit but its direct response was lost. The canonical
+    /// GroupInfo is byte-for-byte the one stored with our pending commit.
+    pub fn recover_accepted_room_creation(
+        &self,
+        descriptor: &EncryptedRoomDescriptor,
+        group_info: &[u8],
+    ) -> Result<bool, String> {
+        let Some(pending) = self.pending_commit(descriptor.room_id)? else {
+            return Ok(false);
+        };
+        if pending.parent_epoch != 0
+            || pending.epoch != 1
+            || pending.descriptor != *descriptor
+            || pending.group_info != group_info
+        {
+            return Ok(false);
+        }
+        self.accept_pending_commit(descriptor, 1)?;
+        Ok(true)
+    }
+
     pub fn descriptors(&self) -> Result<Vec<EncryptedRoomDescriptor>, String> {
         self.application
             .get_by_prefix("descriptor/")
@@ -924,20 +1106,37 @@ impl PersistentClient {
         if group.has_pending_commit() {
             return Ok(None);
         }
+        let members = group
+            .roster()
+            .members_iter()
+            .map(|member| {
+                let client_id = member
+                    .signing_identity
+                    .credential
+                    .as_basic()
+                    .map(|credential| credential.identifier.clone())
+                    .ok_or_else(|| "MLS member does not use a Basic credential".to_string())?;
+                let account = self
+                    .identities
+                    .account_for_client(&client_id)
+                    .map_err(|error| error.to_string())?;
+                Ok((member.index, client_id, account))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut account_leaves = HashMap::new();
+        for (_, _, account) in &members {
+            *account_leaves.entry(*account).or_insert(0usize) += 1;
+        }
         let mut removals = Vec::new();
-        for member in group.roster().members_iter() {
-            let client_id = member
-                .signing_identity
-                .credential
-                .as_basic()
-                .map(|credential| credential.identifier.as_slice())
-                .ok_or_else(|| "MLS member does not use a Basic credential".to_string())?;
+        for (index, client_id, account) in members {
             if !self
                 .identities
-                .is_client_active(client_id)
+                .is_client_active(&client_id)
                 .map_err(|error| error.to_string())?
+                && account_leaves[&account] > 1
             {
-                removals.push(member.index);
+                removals.push(index);
+                *account_leaves.get_mut(&account).unwrap() -= 1;
             }
         }
         if removals.is_empty() {
@@ -961,6 +1160,15 @@ impl PersistentClient {
             .commit_message
             .to_bytes()
             .map_err(|error| error.to_string())?;
+        self.store_pending_commit(&PendingCommitRecord {
+            descriptor: descriptor.clone(),
+            parent_epoch: epoch,
+            epoch: epoch
+                .checked_add(1)
+                .ok_or_else(|| "MLS epoch is exhausted".to_string())?,
+            commit: commit.clone(),
+            group_info: group_info.clone(),
+        })?;
         group
             .write_to_storage()
             .map_err(|error| error.to_string())?;
@@ -973,6 +1181,14 @@ impl PersistentClient {
                 group_info,
             },
         )))
+    }
+
+    pub fn has_pending_commit(
+        &self,
+        descriptor: &EncryptedRoomDescriptor,
+    ) -> Result<bool, String> {
+        self.load_group(descriptor)
+            .map(|group| group.has_pending_commit())
     }
 
     pub fn outbox(&self, room_id: RoomId, event_id: EventId) -> Result<OutboxEntry, String> {
@@ -1003,6 +1219,51 @@ impl PersistentClient {
     fn set_cursor(&self, room_id: RoomId, sequence: u64) -> Result<(), String> {
         self.application
             .transact_insert(&[Item::new(cursor_key(room_id), jsony::to_binary(&sequence))])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn delivery_marker(&self, room_id: RoomId) -> Result<Option<DeliveryMarker>, String> {
+        self.application
+            .get(&delivery_marker_key(room_id))
+            .map_err(|error| error.to_string())?
+            .map(|bytes| jsony::from_binary(&bytes).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    fn store_delivery_marker(
+        &self,
+        room_id: RoomId,
+        delivery: &MlsDeliveryEvent,
+    ) -> Result<(), String> {
+        let marker = DeliveryMarker::from_delivery(delivery);
+        self.application
+            .insert(&delivery_marker_key(room_id), &jsony::to_binary(&marker))
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn pending_commit(&self, room_id: RoomId) -> Result<Option<PendingCommitRecord>, String> {
+        self.application
+            .get(&pending_commit_key(room_id))
+            .map_err(|error| error.to_string())?
+            .map(|bytes| jsony::from_binary(&bytes).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    fn store_pending_commit(&self, pending: &PendingCommitRecord) -> Result<(), String> {
+        self.application
+            .insert(
+                &pending_commit_key(pending.descriptor.room_id),
+                &jsony::to_binary(pending),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn clear_pending_commit_record(&self, room_id: RoomId) -> Result<(), String> {
+        self.application
+            .delete(&pending_commit_key(room_id))
             .map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -1082,6 +1343,52 @@ fn incoming_key(room_id: RoomId, event_id: EventId) -> String {
 
 fn outbox_key(room_id: RoomId, event_id: EventId) -> String {
     format!("outbox/{:08x}/{}", room_id.0, hex(&event_id.0))
+}
+
+fn delivery_marker_key(room_id: RoomId) -> String {
+    format!("delivery-marker/{:08x}", room_id.0)
+}
+
+fn pending_commit_key(room_id: RoomId) -> String {
+    format!("pending-commit/{:08x}", room_id.0)
+}
+
+impl DeliveryMarker {
+    fn from_delivery(delivery: &MlsDeliveryEvent) -> Self {
+        match delivery {
+            MlsDeliveryEvent::Application {
+                sequence,
+                event_id,
+                ciphertext,
+                ..
+            } => Self::Application {
+                sequence: *sequence,
+                event_id: *event_id,
+                message_hash: message_hash(ciphertext),
+            },
+            MlsDeliveryEvent::Commit {
+                sequence,
+                parent_epoch,
+                epoch,
+                commit,
+            } => Self::Commit {
+                sequence: *sequence,
+                parent_epoch: *parent_epoch,
+                epoch: *epoch,
+                message_hash: message_hash(commit),
+            },
+        }
+    }
+
+    fn matches(&self, delivery: &MlsDeliveryEvent) -> bool {
+        self == &Self::from_delivery(delivery)
+    }
+}
+
+fn message_hash(message: &[u8]) -> [u8; 32] {
+    let mut hash = [0; 32];
+    hash.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, message).as_ref());
+    hash
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1207,8 +1514,58 @@ mod tests {
             bob.client.process_delivery(&descriptor, &delivery).unwrap(),
             ProcessedDelivery::AlreadyProcessed { sequence: 2 }
         ));
+        let mismatched = MlsChattEvent {
+            event_id: EventId([43; 16]),
+            timestamp_ms: 3,
+            content: ChattEventContent::Text {
+                body: "valid MLS, mismatched envelope".to_string(),
+            },
+            ..event.clone()
+        };
+        alice.client.queue_outgoing(mismatched.clone()).unwrap();
+        let (epoch, ciphertext) = alice
+            .client
+            .encrypt_outgoing(&descriptor, mismatched.event_id)
+            .unwrap();
+        assert!(matches!(
+            bob.client
+                .process_delivery(
+                    &descriptor,
+                    &MlsDeliveryEvent::Application {
+                        sequence: 3,
+                        epoch,
+                        event_id: EventId([44; 16]),
+                        ciphertext,
+                    },
+                )
+                .unwrap(),
+            ProcessedDelivery::RejectedApplication { sequence: 3, .. }
+        ));
+        assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 3);
+        let MlsDeliveryEvent::Application {
+            ciphertext: replayed,
+            ..
+        } = &delivery
+        else {
+            unreachable!()
+        };
+        assert!(matches!(
+            bob.client
+                .process_delivery(
+                    &descriptor,
+                    &MlsDeliveryEvent::Application {
+                        sequence: 4,
+                        epoch,
+                        event_id: EventId([45; 16]),
+                        ciphertext: replayed.clone(),
+                    },
+                )
+                .unwrap(),
+            ProcessedDelivery::RejectedApplication { sequence: 4, .. }
+        ));
+        assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 4);
         let duplicate_commit = MlsDeliveryEvent::Commit {
-            sequence: 2,
+            sequence: 4,
             parent_epoch: epoch,
             epoch: epoch + 1,
             commit: vec![0xff],
@@ -1217,11 +1574,94 @@ mod tests {
             bob.client
                 .process_delivery(&descriptor, &duplicate_commit)
                 .unwrap(),
-            ProcessedDelivery::AlreadyProcessed { sequence: 2 }
+            ProcessedDelivery::AlreadyProcessed { sequence: 4 }
         ));
         let history = bob.client.cached_history(descriptor.room_id).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].sequence, 2);
         assert_eq!(history[0].event, event);
+    }
+
+    #[test]
+    fn receiver_crash_after_commit_write_recovers_cursor_from_exact_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [51; 32];
+        let (alice, _) = LocalInstallation::open_or_create(
+            &temp.path().join("alice"),
+            server_id,
+            UserId(1),
+            "Alice",
+        )
+        .unwrap();
+        let (bob, _) = LocalInstallation::open_or_create(
+            &temp.path().join("bob"),
+            server_id,
+            UserId(2),
+            "Bob",
+        )
+        .unwrap();
+        alice.install_roster(&bob.bootstrap.own_roster).unwrap();
+        bob.install_roster(&alice.bootstrap.own_roster).unwrap();
+        let descriptor = EncryptedRoomDescriptor::new(
+            RoomId(92),
+            alice.bootstrap.account_id,
+            vec![alice.bootstrap.account_id, bob.bootstrap.account_id],
+            1,
+        )
+        .unwrap();
+        let package = bob
+            .client
+            .generate_key_packages(bob.bootstrap.device_id, 1)
+            .unwrap()
+            .remove(0);
+        let initial = alice
+            .client
+            .create_room(
+                &descriptor,
+                &[(bob.bootstrap.device_id, package.package)],
+            )
+            .unwrap();
+        alice.client.accept_pending_commit(&descriptor, 1).unwrap();
+        let shared = initial.welcome.as_ref().unwrap();
+        bob.client
+            .join_welcome(
+                &descriptor,
+                &MlsWelcome {
+                    delivery_id: 1,
+                    sequence: 1,
+                    device_id: bob.bootstrap.device_id,
+                    descriptor: shared.descriptor.clone(),
+                    welcome: shared.welcome.clone(),
+                },
+            )
+            .unwrap();
+        let (_, rejoin) = bob
+            .client
+            .prepare_external_rejoin(&descriptor, &initial.group_info)
+            .unwrap();
+        let delivery = MlsDeliveryEvent::Commit {
+            sequence: 2,
+            parent_epoch: 1,
+            epoch: 2,
+            commit: rejoin.commit,
+        };
+        assert_eq!(
+            alice.client.process_delivery_with_hooks(
+                &descriptor,
+                &delivery,
+                || Ok(()),
+                || Err("injected crash after commit write".to_string()),
+            ),
+            Err("injected crash after commit write".to_string())
+        );
+        assert_eq!(alice.client.cursor(descriptor.room_id).unwrap(), 1);
+        assert!(matches!(
+            alice.client.process_delivery(&descriptor, &delivery).unwrap(),
+            ProcessedDelivery::Commit {
+                sequence: 2,
+                epoch: 2
+            }
+        ));
+        assert_eq!(alice.client.cursor(descriptor.room_id).unwrap(), 2);
     }
 }

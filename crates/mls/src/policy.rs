@@ -16,8 +16,11 @@ use mls_rs::{
 };
 use mls_rs_core::identity::MemberValidationContext;
 use rpc::{
-    identity::{SignedDeviceCertificate, SignedDeviceRoster, validate_device_roster},
-    ids::{AccountId, UserId},
+    identity::{
+        SignedDeviceCertificate, SignedDeviceRoster, parse_mls_client_id,
+        validate_device_roster,
+    },
+    ids::{AccountId, DeviceId, UserId},
     mls::EncryptedRoomDescriptor,
 };
 
@@ -72,11 +75,14 @@ impl mls_rs::error::IntoAnyError for PolicyError {
 struct CertifiedDevice {
     account_id: AccountId,
     user_id: UserId,
+    device_id: DeviceId,
     signature_key: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
 struct PolicyState {
+    /// Certificates in the current authority-signed roster, used for all new
+    /// MLS membership decisions.
     devices: HashMap<Vec<u8>, CertifiedDevice>,
     rooms: HashMap<Vec<u8>, EncryptedRoomDescriptor>,
 }
@@ -86,6 +92,7 @@ struct PolicyState {
 pub struct ChattIdentityProvider {
     server_id: Arc<Vec<u8>>,
     state: Arc<RwLock<PolicyState>>,
+    allow_historical_group_info: bool,
 }
 
 impl ChattIdentityProvider {
@@ -93,7 +100,17 @@ impl ChattIdentityProvider {
         Self {
             server_id: Arc::new(server_id),
             state: Arc::new(RwLock::new(PolicyState::default())),
+            allow_historical_group_info: false,
         }
+    }
+
+    /// Returns an observer view for a canonical GroupInfo fetched from the
+    /// authenticated Chatt delivery service. Existing historical leaves may
+    /// no longer be in the current roster; commit validation remains strict.
+    pub fn historical_group_info_observer(&self) -> Self {
+        let mut observer = self.clone();
+        observer.allow_historical_group_info = true;
+        observer
     }
 
     /// Replaces all active certificates for an account with one validated
@@ -106,10 +123,9 @@ impl ChattIdentityProvider {
             .devices
             .retain(|_, device| device.account_id != roster.body.account_id);
         for certificate in &roster.body.active_devices {
-            state.devices.insert(
-                certificate.body.mls_client_id.clone(),
-                certified_device(certificate),
-            );
+            let client_id = certificate.body.mls_client_id.clone();
+            let device = certified_device(certificate);
+            state.devices.insert(client_id, device);
         }
         Ok(())
     }
@@ -163,6 +179,23 @@ impl ChattIdentityProvider {
         Ok(())
     }
 
+    fn validate_historical_in_group(
+        &self,
+        signing_identity: &SigningIdentity,
+        group_id: &[u8],
+    ) -> Result<(), PolicyError> {
+        let client_id = basic_client_id(signing_identity)?;
+        let account_id = parse_mls_client_id(&self.server_id, client_id)
+            .map(|(account_id, _)| account_id)
+            .map_err(|_| PolicyError::UnknownDevice)?;
+        let state = self.state.read().map_err(|_| PolicyError::LockPoisoned)?;
+        let room = state.rooms.get(group_id).ok_or(PolicyError::UnknownRoom)?;
+        if room.member_accounts.binary_search(&account_id).is_err() {
+            return Err(PolicyError::AccountNotInRoom);
+        }
+        Ok(())
+    }
+
     fn is_active(&self, signing_identity: &SigningIdentity) -> Result<bool, PolicyError> {
         let client_id = basic_client_id(signing_identity)?;
         Ok(self
@@ -183,20 +216,33 @@ impl ChattIdentityProvider {
             .contains_key(client_id))
     }
 
-    pub fn account_for_client(&self, client_id: &[u8]) -> Result<AccountId, PolicyError> {
+    pub fn device_for_client(&self, client_id: &[u8]) -> Result<DeviceId, PolicyError> {
         self.state
             .read()
             .map_err(|_| PolicyError::LockPoisoned)?
             .devices
             .get(client_id)
-            .map(|device| device.account_id)
+            .map(|device| device.device_id)
             .ok_or(PolicyError::UnknownDevice)
     }
 
+    pub fn account_for_client(&self, client_id: &[u8]) -> Result<AccountId, PolicyError> {
+        let state = self.state.read().map_err(|_| PolicyError::LockPoisoned)?;
+        if let Some(account_id) = state
+            .devices
+            .get(client_id)
+            .map(|device| device.account_id)
+        {
+            return Ok(account_id);
+        }
+        parse_mls_client_id(&self.server_id, client_id)
+            .map(|(account_id, _)| account_id)
+            .map_err(|_| PolicyError::UnknownDevice)
+    }
+
     pub fn user_for_account(&self, account_id: AccountId) -> Result<UserId, PolicyError> {
-        self.state
-            .read()
-            .map_err(|_| PolicyError::LockPoisoned)?
+        let state = self.state.read().map_err(|_| PolicyError::LockPoisoned)?;
+        state
             .devices
             .values()
             .find(|device| device.account_id == account_id)
@@ -214,6 +260,27 @@ impl IdentityProvider for ChattIdentityProvider {
         _timestamp: Option<MlsTime>,
         context: MemberValidationContext<'_>,
     ) -> Result<(), Self::Error> {
+        let historical_group_id = match context {
+            MemberValidationContext::ForNewGroup { current_context }
+                if self.allow_historical_group_info =>
+            {
+                Some(current_context.group_id())
+            }
+            _ => None,
+        };
+        if let Some(group_id) = historical_group_id {
+            return self.validate_in_group(signing_identity, Some(group_id)).or_else(|error| {
+                if matches!(
+                    &error,
+                    PolicyError::UnknownDevice | PolicyError::SignatureKeyMismatch
+                )
+                {
+                    self.validate_historical_in_group(signing_identity, group_id)
+                } else {
+                    Err(error)
+                }
+            });
+        }
         let group_id = match context {
             MemberValidationContext::ForCommit {
                 current_context, ..
@@ -241,8 +308,16 @@ impl IdentityProvider for ChattIdentityProvider {
         signing_identity: &SigningIdentity,
         _extensions: &ExtensionList,
     ) -> Result<Vec<u8>, Self::Error> {
-        self.certificate_for(signing_identity)?;
-        Ok(basic_client_id(signing_identity)?.to_vec())
+        match self.certificate_for(signing_identity) {
+            Ok(_) => Ok(basic_client_id(signing_identity)?.to_vec()),
+            Err(error) if self.allow_historical_group_info => {
+                let client_id = basic_client_id(signing_identity)?;
+                parse_mls_client_id(&self.server_id, client_id)
+                    .map_err(|_| error)
+                    .map(|_| client_id.to_vec())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn valid_successor(
@@ -342,6 +417,7 @@ fn certified_device(certificate: &SignedDeviceCertificate) -> CertifiedDevice {
     CertifiedDevice {
         account_id: certificate.body.account_id,
         user_id: certificate.body.user_id,
+        device_id: certificate.body.device_id,
         signature_key: certificate.body.mls_signature_public_key.clone(),
     }
 }
@@ -477,6 +553,20 @@ mod tests {
         second = sign_device_roster(second.body, &[1; 32]).unwrap();
         identities.install_roster(&second).unwrap();
         assert!(!identities.is_active(&old_identity).unwrap());
+        assert_eq!(
+            identities
+                .account_for_client(basic_client_id(&old_identity).unwrap())
+                .unwrap(),
+            first.body.account_id
+        );
+        let reopened = ChattIdentityProvider::new(server.to_vec());
+        reopened.install_roster(&second).unwrap();
+        assert_eq!(
+            reopened
+                .account_for_client(basic_client_id(&old_identity).unwrap())
+                .unwrap(),
+            first.body.account_id
+        );
     }
 
     #[test]

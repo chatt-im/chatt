@@ -104,6 +104,50 @@ pub fn mls_client_id(
     Ok(id)
 }
 
+/// Parses the account and device routing identity embedded in a canonical MLS
+/// Basic credential. Certification is still required when adding a leaf; this
+/// parser is for attributing an already-authenticated historical group member.
+pub fn parse_mls_client_id(
+    server_id: &[u8],
+    client_id: &[u8],
+) -> Result<(AccountId, DeviceId), String> {
+    let header_len = CLIENT_ID_LABEL.len() + 2;
+    let Some(header) = client_id.get(..header_len) else {
+        return Err("MLS client id is truncated".to_string());
+    };
+    if !header.starts_with(CLIENT_ID_LABEL) {
+        return Err("MLS client id has the wrong domain".to_string());
+    }
+    let encoded_server_len = u16::from_be_bytes(
+        header[CLIENT_ID_LABEL.len()..]
+            .try_into()
+            .map_err(|_| "MLS client id has an invalid server length".to_string())?,
+    ) as usize;
+    let expected_len = header_len
+        .checked_add(encoded_server_len)
+        .and_then(|len| len.checked_add(ACCOUNT_ID_LEN + 16))
+        .ok_or_else(|| "MLS client id length overflow".to_string())?;
+    if client_id.len() != expected_len || encoded_server_len != server_id.len() {
+        return Err("MLS client id has an invalid length".to_string());
+    }
+    let encoded_server = &client_id[header_len..header_len + encoded_server_len];
+    if encoded_server != server_id {
+        return Err("MLS client id belongs to another server".to_string());
+    }
+    let account_start = header_len + encoded_server_len;
+    let account = AccountId(
+        client_id[account_start..account_start + ACCOUNT_ID_LEN]
+            .try_into()
+            .map_err(|_| "MLS client id account is truncated".to_string())?,
+    );
+    let device = DeviceId(
+        client_id[account_start + ACCOUNT_ID_LEN..]
+            .try_into()
+            .map_err(|_| "MLS client id device is truncated".to_string())?,
+    );
+    Ok((account, device))
+}
+
 pub fn authority_public_key(seed: &[u8; AUTHORITY_KEY_LEN]) -> Result<[u8; 32], String> {
     let key = signature::Ed25519KeyPair::from_seed_unchecked(seed)
         .map_err(|_| "account authority seed is invalid".to_string())?;
@@ -409,6 +453,19 @@ mod tests {
                 .unwrap_err()
                 .contains("stale")
         );
+    }
+
+    #[test]
+    fn canonical_mls_client_id_round_trips_and_is_server_scoped() {
+        let account = AccountId([7; 32]);
+        let device = DeviceId([8; 16]);
+        let encoded = mls_client_id(b"server-a", account, device).unwrap();
+        assert_eq!(
+            parse_mls_client_id(b"server-a", &encoded).unwrap(),
+            (account, device)
+        );
+        assert!(parse_mls_client_id(b"server-b", &encoded).is_err());
+        assert!(parse_mls_client_id(b"server-a", &encoded[..encoded.len() - 1]).is_err());
     }
 
     #[test]

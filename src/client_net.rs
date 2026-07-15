@@ -6426,17 +6426,19 @@ impl WorkerState {
                 self.handle_mls_key_package(device_id, package)?;
             }
             ServerControl::EncryptedRoomCreated { room_id, epoch: _ } => {
-                let pending = self
-                    .pending_mls_commits
-                    .remove(&room_id)
-                    .ok_or_else(|| "server created an unrequested encrypted room".to_string())?;
-                let PendingMlsCommit::MemberUpdate(descriptor) = pending else {
-                    return Err("room creation matched an external rejoin".to_string());
-                };
                 let installation = self
                     .mls
                     .as_ref()
                     .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
+                let Some(pending) = self.pending_mls_commits.remove(&room_id) else {
+                    if installation.client.descriptor(room_id)?.is_some() {
+                        return Ok(());
+                    }
+                    return Err("server created an unrequested encrypted room".to_string());
+                };
+                let PendingMlsCommit::MemberUpdate(descriptor) = pending else {
+                    return Err("room creation matched an external rejoin".to_string());
+                };
                 installation
                     .client
                     .accept_pending_commit(&descriptor, 1)?;
@@ -6574,6 +6576,14 @@ impl WorkerState {
                             }
                         }
                         chatt_mls::ProcessedDelivery::Commit { .. } => saw_commit = true,
+                        chatt_mls::ProcessedDelivery::RejectedApplication {
+                            sequence,
+                            reason,
+                        } => {
+                            let _ = self.events.send(NetworkEvent::Status(format!(
+                                "discarded invalid encrypted event {sequence}: {reason}"
+                            )));
+                        }
                         chatt_mls::ProcessedDelivery::AlreadyProcessed { .. } => {}
                     }
                 }
@@ -6626,8 +6636,12 @@ impl WorkerState {
                             self.emit_mls_chatt_event(entry.event, sequence)?;
                         }
                     }
-                    rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { .. } => {
-                        installation.client.retry_stale_outgoing(room_id, event_id)?;
+                    rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { current_epoch } => {
+                        installation.client.retry_stale_outgoing(
+                            room_id,
+                            event_id,
+                            current_epoch,
+                        )?;
                         let after_sequence = installation.client.cursor(room_id)?;
                         self.queue_control(ClientControl::FetchMlsEvents {
                             room_id,
@@ -6649,16 +6663,25 @@ impl WorkerState {
                     rpc::mls::MlsCommitOutcome::Accepted { sequence, .. }
                     | rpc::mls::MlsCommitOutcome::AlreadyAccepted { sequence, .. } => {
                         let mut refetch_after = None;
+                        let mut resume_outbox = false;
                         if let Some(pending) = self.pending_mls_commits.remove(&room_id)
                             && let Some(installation) = self.mls.as_ref()
                         {
                             match pending {
-                                PendingMlsCommit::MemberUpdate(descriptor) => installation
-                                    .client
-                                    .accept_pending_commit(&descriptor, sequence)?,
-                                PendingMlsCommit::ExternalRejoin(descriptor) => installation
-                                    .client
-                                    .accept_external_rejoin(&descriptor, sequence)?,
+                                PendingMlsCommit::MemberUpdate(_) => {
+                                    // Keep the exact commit pending until it
+                                    // reaches its position in the ordered
+                                    // stream. Applying it here and setting the
+                                    // cursor to `sequence` would skip any
+                                    // applications appended earlier in the
+                                    // same epoch.
+                                }
+                                PendingMlsCommit::ExternalRejoin(descriptor) => {
+                                    installation
+                                        .client
+                                        .accept_external_rejoin(&descriptor, sequence)?;
+                                    resume_outbox = true;
+                                }
                             }
                             refetch_after = Some(installation.client.cursor(room_id)?);
                         }
@@ -6669,7 +6692,10 @@ impl WorkerState {
                                 limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
                             })?;
                         }
-                        self.queue_pending_mls_outbox()?;
+                        if resume_outbox {
+                            self.queue_mls_maintenance()?;
+                            self.queue_pending_mls_outbox()?;
+                        }
                     }
                     rpc::mls::MlsCommitOutcome::StaleEpoch { .. } => {
                         if let Some(pending) = self.pending_mls_commits.remove(&room_id)
@@ -6777,6 +6803,23 @@ impl WorkerState {
                     self.pending_mls_commits.get(&room_id),
                     Some(PendingMlsCommit::ExternalRejoin(_))
                 ) {
+                    return Ok(());
+                }
+                let installation = self.mls.as_ref().ok_or_else(|| {
+                    "GroupInfo arrived without a local MLS installation".to_string()
+                })?;
+                if installation
+                    .client
+                    .recover_accepted_room_creation(&descriptor, &group_info)?
+                {
+                    self.pending_mls_commits.remove(&room_id);
+                    self.pending_mls_rooms.remove(&room_id);
+                    self.pending_mls_group_infos.remove(&room_id);
+                    self.queue_control(ClientControl::FetchMlsEvents {
+                        room_id,
+                        after_sequence: 1,
+                        limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
+                    })?;
                     return Ok(());
                 }
                 if let Some(PendingMlsCommit::MemberUpdate(pending_descriptor)) =
@@ -7086,6 +7129,14 @@ impl WorkerState {
             ));
             return Ok(true);
         }
+        if self.pending_mls_commits.contains_key(&room_id)
+            || installation.client.has_pending_commit(&descriptor)?
+        {
+            let _ = self.events.send(NetworkEvent::Status(
+                "encrypted message queued while room membership is reconciled".to_string(),
+            ));
+            return Ok(true);
+        }
         let (epoch, ciphertext) = installation
             .client
             .encrypt_outgoing(&descriptor, event_id)?;
@@ -7120,6 +7171,14 @@ impl WorkerState {
             .ok_or_else(|| "encrypted room MLS setup is not ready".to_string())?;
         if !self.mls_bound {
             return Err("local MLS device is not bound".to_string());
+        }
+        if self.pending_mls_commits.contains_key(&room_id)
+            || installation.client.has_pending_commit(&descriptor)?
+        {
+            return Err(
+                "cannot send file while encrypted room membership is being reconciled"
+                    .to_string(),
+            );
         }
         installation.client.queue_outgoing(rpc::mls::MlsChattEvent {
             version: rpc::mls::MLS_PROTOCOL_VERSION,
@@ -7473,6 +7532,11 @@ impl WorkerState {
                 .client
                 .descriptor(room_id)?
                 .ok_or_else(|| "MLS outbox room descriptor is missing".to_string())?;
+            if self.pending_mls_commits.contains_key(&room_id)
+                || installation.client.has_pending_commit(&descriptor)?
+            {
+                continue;
+            }
             let (epoch, ciphertext) = match entry.state {
                 chatt_mls::OutboxState::PendingEncryption => installation
                     .client

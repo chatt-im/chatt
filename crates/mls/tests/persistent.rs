@@ -113,7 +113,18 @@ fn sqlcipher_reopen_preserves_exact_outbox_and_received_history() {
     let bundle = alice_client
         .create_room(&descriptor, &[(bob.id, bob_package.package)])
         .unwrap();
-    alice_client.accept_pending_commit(&descriptor, 1).unwrap();
+    let mut unrelated_group_info = bundle.group_info.clone();
+    unrelated_group_info[0] ^= 1;
+    assert!(
+        !alice_client
+            .recover_accepted_room_creation(&descriptor, &unrelated_group_info)
+            .unwrap()
+    );
+    assert!(
+        alice_client
+            .recover_accepted_room_creation(&descriptor, &bundle.group_info)
+            .unwrap()
+    );
     let shared_welcome = bundle.welcome.as_ref().unwrap();
     let welcome = MlsWelcome {
         delivery_id: 1,
@@ -268,28 +279,194 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         encrypted,
     );
     alice_client
-        .retry_stale_outgoing(descriptor.room_id, event.event_id)
+        .retry_stale_outgoing(descriptor.room_id, event.event_id, encrypted.0 + 1)
         .unwrap();
     alice_client
-        .retry_stale_outgoing(descriptor.room_id, event.event_id)
+        .retry_stale_outgoing(descriptor.room_id, event.event_id, encrypted.0 + 1)
         .unwrap();
     assert!(matches!(
         alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
         chatt_mls::OutboxState::PendingEncryption
     ));
-    alice_client
+    let reencrypted = alice_client
         .encrypt_outgoing(&descriptor, event.event_id)
         .unwrap();
+    alice_client
+        .retry_stale_outgoing(descriptor.room_id, event.event_id, reencrypted.0)
+        .unwrap();
+    assert!(matches!(
+        alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
+        chatt_mls::OutboxState::PendingDelivery { epoch, .. } if epoch == reencrypted.0
+    ));
     alice_client
         .mark_outgoing_delivered(descriptor.room_id, event.event_id, 2)
         .unwrap();
     alice_client
-        .retry_stale_outgoing(descriptor.room_id, event.event_id)
+        .retry_stale_outgoing(descriptor.room_id, event.event_id, encrypted.0 + 1)
         .unwrap();
     assert!(matches!(
         alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
         chatt_mls::OutboxState::Delivered { sequence: 2 }
     ));
+}
+
+#[test]
+fn accepted_local_commit_waits_for_earlier_same_epoch_applications() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = b"ordered local commit test server";
+    let alice = device(server, 1, 1, 1);
+    let bob = device(server, 2, 2, 2);
+    let identities = ChattIdentityProvider::new(server.to_vec());
+    identities.install_roster(&alice.roster).unwrap();
+    identities.install_roster(&bob.roster).unwrap();
+    let descriptor = EncryptedRoomDescriptor::new(
+        RoomId(79),
+        alice.roster.body.account_id,
+        vec![alice.roster.body.account_id, bob.roster.body.account_id],
+        100,
+    )
+    .unwrap();
+    identities.install_room(descriptor.clone()).unwrap();
+    let alice_client = PersistentClient::open(
+        &temp.path().join("alice-ordered.db"),
+        [41; 32],
+        identities.clone(),
+        alice.signing_identity,
+        alice.signing_secret,
+    )
+    .unwrap();
+    let bob_client = PersistentClient::open(
+        &temp.path().join("bob-ordered.db"),
+        [42; 32],
+        identities.clone(),
+        bob.signing_identity,
+        bob.signing_secret,
+    )
+    .unwrap();
+    let package = bob_client
+        .generate_key_packages(bob.id, 1)
+        .unwrap()
+        .remove(0);
+    let initial = alice_client
+        .create_room(&descriptor, &[(bob.id, package.package)])
+        .unwrap();
+    alice_client.accept_pending_commit(&descriptor, 1).unwrap();
+    let shared = initial.welcome.as_ref().unwrap();
+    bob_client
+        .join_welcome(
+            &descriptor,
+            &MlsWelcome {
+                delivery_id: 1,
+                sequence: 1,
+                device_id: bob.id,
+                descriptor: shared.descriptor.clone(),
+                welcome: shared.welcome.clone(),
+            },
+        )
+        .unwrap();
+
+    let replacement = device(server, 2, 2, 3);
+    let mut replacement_roster = replacement.roster.clone();
+    replacement_roster.body.revision = 2;
+    replacement_roster = sign_device_roster(replacement_roster.body, &[2; 32]).unwrap();
+    identities.install_roster(&replacement_roster).unwrap();
+    assert!(
+        alice_client
+            .prepare_revocation_commit(&descriptor)
+            .unwrap()
+            .is_none()
+    );
+    let replacement_client = PersistentClient::open(
+        &temp.path().join("bob-replacement-ordered.db"),
+        [43; 32],
+        identities.clone(),
+        replacement.signing_identity,
+        replacement.signing_secret,
+    )
+    .unwrap();
+    let (join_parent, join) = replacement_client
+        .prepare_external_rejoin(&descriptor, &initial.group_info)
+        .unwrap();
+    let join_delivery = MlsDeliveryEvent::Commit {
+        sequence: 2,
+        parent_epoch: join_parent,
+        epoch: join_parent + 1,
+        commit: join.commit,
+    };
+    assert!(matches!(
+        alice_client
+            .process_delivery(&descriptor, &join_delivery)
+            .unwrap(),
+        ProcessedDelivery::Commit {
+            sequence: 2,
+            epoch: 2
+        }
+    ));
+    assert!(matches!(
+        bob_client
+            .process_delivery(&descriptor, &join_delivery)
+            .unwrap(),
+        ProcessedDelivery::Commit {
+            sequence: 2,
+            epoch: 2
+        }
+    ));
+    replacement_client
+        .accept_external_rejoin(&descriptor, 2)
+        .unwrap();
+    let (parent_epoch, commit) = alice_client
+        .prepare_revocation_commit(&descriptor)
+        .unwrap()
+        .expect("old Bob leaf requires removal");
+    assert_eq!(parent_epoch, 2);
+    assert!(alice_client.accept_pending_commit(&descriptor, 4).is_err());
+
+    let event = MlsChattEvent {
+        version: MLS_PROTOCOL_VERSION,
+        room_id: descriptor.room_id,
+        event_id: EventId([11; 16]),
+        sender_account: bob.roster.body.account_id,
+        timestamp_ms: 202,
+        content: ChattEventContent::Text {
+            body: "queued before the accepted commit".to_string(),
+        },
+    };
+    bob_client.queue_outgoing(event.clone()).unwrap();
+    let (epoch, ciphertext) = bob_client
+        .encrypt_outgoing(&descriptor, event.event_id)
+        .unwrap();
+    assert!(matches!(
+        alice_client
+            .process_delivery(
+                &descriptor,
+                &MlsDeliveryEvent::Application {
+                    sequence: 3,
+                    epoch,
+                    event_id: event.event_id,
+                    ciphertext,
+                },
+            )
+            .unwrap(),
+        ProcessedDelivery::Application(ref cached) if cached.event == event
+    ));
+    assert!(matches!(
+        alice_client
+            .process_delivery(
+                &descriptor,
+                &MlsDeliveryEvent::Commit {
+                    sequence: 4,
+                    parent_epoch,
+                    epoch: parent_epoch + 1,
+                    commit: commit.commit,
+                },
+            )
+            .unwrap(),
+        ProcessedDelivery::Commit {
+            sequence: 4,
+            epoch: 3
+        }
+    ));
+    assert_eq!(alice_client.cursor(descriptor.room_id).unwrap(), 4);
 }
 
 #[test]
