@@ -9,7 +9,7 @@ use std::{
     collections::VecDeque,
     net::{TcpListener, UdpSocket},
     path::PathBuf,
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -830,13 +830,15 @@ fn linked_device_first_dm_treats_peer_as_unverified_not_changed() {
     }
 }
 
-const LINKED_DEVICE_MATRIX_BITS: u16 = 12;
-const LINKED_DEVICE_MATRIX_CASES: u16 = 1 << LINKED_DEVICE_MATRIX_BITS;
-const LINKED_DEVICE_MATRIX_SHARDS: u16 = 16;
+const LINKED_DEVICE_MATRIX_BITS: u32 = 16;
+const LINKED_DEVICE_MATRIX_PAIRWISE_ROWS: u32 = 32;
+const LINKED_DEVICE_MATRIX_RANDOM_CASES: usize = 16;
+const LINKED_DEVICE_MATRIX_WORKERS: usize = 8;
+const LINKED_DEVICE_MATRIX_SEED: u64 = 0x6d61_7472_6978_2d31;
 
 #[derive(Clone, Copy, Debug)]
 struct LinkedDeviceMatrixCase {
-    bits: u16,
+    bits: u32,
     bob_connects_first: bool,
     dm_before_link: bool,
     linked_offline_for_first_message: bool,
@@ -849,11 +851,15 @@ struct LinkedDeviceMatrixCase {
     restart_primary_between_media: bool,
     restart_linked_between_media: bool,
     restart_bob_between_media: bool,
+    pre_link_message_from_alice: bool,
+    pre_link_message_from_bob: bool,
+    bob_offline_during_link: bool,
+    cross_text_sends_before_draining: bool,
 }
 
 impl LinkedDeviceMatrixCase {
-    fn from_bits(bits: u16) -> Self {
-        let bit = |index| bits & (1u16 << index) != 0u16;
+    fn from_bits(bits: u32) -> Self {
+        let bit = |index| bits & (1u32 << index) != 0u32;
         Self {
             bits,
             bob_connects_first: bit(0),
@@ -868,6 +874,115 @@ impl LinkedDeviceMatrixCase {
             restart_primary_between_media: bit(9),
             restart_linked_between_media: bit(10),
             restart_bob_between_media: bit(11),
+            pre_link_message_from_alice: bit(12),
+            pre_link_message_from_bob: bit(13),
+            bob_offline_during_link: bit(14),
+            cross_text_sends_before_draining: bit(15),
+        }
+    }
+
+    fn has_pre_link_messages(self) -> bool {
+        self.pre_link_message_from_alice || self.pre_link_message_from_bob
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MatrixRng(u64);
+
+impl MatrixRng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.0;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn shuffle<T>(&mut self, values: &mut [T]) {
+        for index in (1..values.len()).rev() {
+            values.swap(index, self.next_u64() as usize % (index + 1));
+        }
+    }
+}
+
+fn linked_device_matrix_seed() -> u64 {
+    let Ok(value) = std::env::var("CHATT_E2E_MATRIX_SEED") else {
+        return LINKED_DEVICE_MATRIX_SEED;
+    };
+    let parsed = value
+        .strip_prefix("0x")
+        .map(|hex| u64::from_str_radix(hex, 16))
+        .unwrap_or_else(|| value.parse());
+    parsed.unwrap_or_else(|error| panic!("invalid CHATT_E2E_MATRIX_SEED {value:?}: {error}"))
+}
+
+fn linked_device_matrix_cases(seed: u64) -> Vec<LinkedDeviceMatrixCase> {
+    if let Ok(value) = std::env::var("CHATT_E2E_MATRIX_CASE") {
+        let parsed = value
+            .strip_prefix("0x")
+            .map(|hex| u32::from_str_radix(hex, 16))
+            .unwrap_or_else(|| value.parse());
+        let bits = parsed
+            .unwrap_or_else(|error| panic!("invalid CHATT_E2E_MATRIX_CASE {value:?}: {error}"));
+        assert!(bits < 1 << LINKED_DEVICE_MATRIX_BITS);
+        return vec![LinkedDeviceMatrixCase::from_bits(bits)];
+    }
+    assert!(LINKED_DEVICE_MATRIX_BITS < LINKED_DEVICE_MATRIX_PAIRWISE_ROWS);
+    let mut rng = MatrixRng::new(seed);
+    let mut columns: Vec<u32> = (1..LINKED_DEVICE_MATRIX_PAIRWISE_ROWS).collect();
+    rng.shuffle(&mut columns);
+    let complements = rng.next_u64() as u32;
+    let mut encoded = Vec::with_capacity(
+        LINKED_DEVICE_MATRIX_PAIRWISE_ROWS as usize + LINKED_DEVICE_MATRIX_RANDOM_CASES,
+    );
+
+    // Distinct non-zero linear forms over five input bits form an orthogonal
+    // array: every pair of flags sees 00, 01, 10, and 11 equally often. The
+    // shuffled columns and complements change higher-order interactions per
+    // seed without weakening that pairwise guarantee.
+    for row in 0..LINKED_DEVICE_MATRIX_PAIRWISE_ROWS {
+        let mut bits = 0u32;
+        for factor in 0..LINKED_DEVICE_MATRIX_BITS as usize {
+            let enabled = ((row & columns[factor]).count_ones() % 2 != 0)
+                ^ (complements & (1 << factor) != 0);
+            bits |= u32::from(enabled) << factor;
+        }
+        encoded.push(bits);
+    }
+
+    let mask = (1u32 << LINKED_DEVICE_MATRIX_BITS) - 1;
+    while encoded.len()
+        < LINKED_DEVICE_MATRIX_PAIRWISE_ROWS as usize + LINKED_DEVICE_MATRIX_RANDOM_CASES
+    {
+        let bits = rng.next_u64() as u32 & mask;
+        if !encoded.contains(&bits) {
+            encoded.push(bits);
+        }
+    }
+    rng.shuffle(&mut encoded);
+    encoded
+        .into_iter()
+        .map(LinkedDeviceMatrixCase::from_bits)
+        .collect()
+}
+
+fn assert_linked_device_matrix_is_pairwise(cases: &[LinkedDeviceMatrixCase]) {
+    for first in 0..LINKED_DEVICE_MATRIX_BITS {
+        for second in first + 1..LINKED_DEVICE_MATRIX_BITS {
+            let mut combinations = [false; 4];
+            for case in cases {
+                let first_enabled = case.bits & (1 << first) != 0;
+                let second_enabled = case.bits & (1 << second) != 0;
+                combinations[usize::from(first_enabled) * 2 + usize::from(second_enabled)] = true;
+            }
+            assert!(
+                combinations.into_iter().all(|covered| covered),
+                "matrix generator missed a combination for factors {first} and {second}"
+            );
         }
     }
 }
@@ -902,7 +1017,7 @@ fn restart_with_peer(
 
 fn run_linked_device_matrix_case(case: LinkedDeviceMatrixCase) {
     let world = TestWorld::new();
-    let suffix = format!("{:03x}", case.bits);
+    let suffix = format!("{:04x}", case.bits);
     let mut alice_primary = world.device(
         &format!("alice-matrix-primary-{suffix}"),
         ALICE,
@@ -933,15 +1048,45 @@ fn run_linked_device_matrix_case(case: LinkedDeviceMatrixCase) {
         bob.connect_ready();
     }
 
-    let room_id = if case.dm_before_link {
+    let dm_before_link = case.dm_before_link || case.has_pre_link_messages();
+    let room_id = if dm_before_link {
         open_dm(&mut alice_primary, &mut bob)
     } else {
         RoomId(0)
     };
+
+    let mut pre_link_bodies = Vec::new();
+    if case.pre_link_message_from_alice {
+        pre_link_bodies.push(format!("matrix pre-link Alice {}", case.bits));
+    }
+    if case.pre_link_message_from_bob {
+        pre_link_bodies.push(format!("matrix pre-link Bob {}", case.bits));
+    }
+    for (index, body) in pre_link_bodies.iter().enumerate() {
+        let sender = if case.pre_link_message_from_alice && index == 0 {
+            &alice_primary
+        } else {
+            &bob
+        };
+        send_chat(sender, room_id, body);
+    }
+    for body in &pre_link_bodies {
+        alice_primary.wait_chat(body);
+        bob.wait_chat(body);
+    }
+
+    if case.bob_offline_during_link {
+        bob.stop();
+    }
     pair_device(&mut alice_primary, &mut alice_linked);
 
-    let room_id = if case.dm_before_link {
-        let bob_identity = bob.wait_peer_refresh(ALICE);
+    let room_id = if dm_before_link {
+        let bob_identity = if case.bob_offline_during_link {
+            bob.connect_ready();
+            bob.wait_peer_identity(ALICE)
+        } else {
+            bob.wait_peer_refresh(ALICE)
+        };
         assert_standard_unverified(case, "bob after Alice linked", &bob_identity);
         room_id
     } else {
@@ -953,8 +1098,18 @@ fn run_linked_device_matrix_case(case: LinkedDeviceMatrixCase) {
         let NetworkEvent::DmOpened { room_id, .. } = opened else {
             unreachable!()
         };
-        for device in [&mut alice_primary, &mut bob] {
-            device.wait_for("matrix DM room", |event| {
+        if case.bob_offline_during_link {
+            bob.connect_ready();
+        }
+        alice_primary.wait_for("matrix DM room", |event| {
+            matches!(
+                event,
+                NetworkEvent::RoomUpserted(RoomInfo { room_id: id, .. })
+                    if *id == room_id
+            )
+        });
+        if !case.bob_offline_during_link {
+            bob.wait_for("matrix DM room", |event| {
                 matches!(
                     event,
                     NetworkEvent::RoomUpserted(RoomInfo { room_id: id, .. })
@@ -972,7 +1127,7 @@ fn run_linked_device_matrix_case(case: LinkedDeviceMatrixCase) {
     };
 
     let bootstrap = format!("matrix bootstrap {}", case.bits);
-    if case.dm_before_link && case.linked_offline_for_first_message {
+    if dm_before_link && case.linked_offline_for_first_message {
         send_chat(&bob, room_id, &bootstrap);
         bob.wait_chat(&bootstrap);
         alice_primary.wait_chat(&bootstrap);
@@ -985,7 +1140,7 @@ fn run_linked_device_matrix_case(case: LinkedDeviceMatrixCase) {
             "matrix case {case:?}: linked device missed pre-connect history"
         );
     } else {
-        if case.dm_before_link {
+        if dm_before_link {
             alice_linked.connect_ready();
             let identity = alice_linked.wait_peer_identity(BOB);
             assert_standard_unverified(case, "Alice linked", &identity);
@@ -1009,6 +1164,28 @@ fn run_linked_device_matrix_case(case: LinkedDeviceMatrixCase) {
         }
     }
 
+    if !pre_link_bodies.is_empty() {
+        let history = alice_linked.fetch_history(room_id);
+        for body in &pre_link_bodies {
+            assert!(
+                !history.iter().any(|candidate| candidate == body),
+                "matrix case {case:?}: linked device decrypted message sent before linkage"
+            );
+        }
+        let placeholders = history
+            .iter()
+            .filter(|body| {
+                body.as_str()
+                    == "Encrypted message unavailable on this device (sent before it was linked)."
+            })
+            .count();
+        assert!(
+            placeholders >= pre_link_bodies.len(),
+            "matrix case {case:?}: expected {} pre-link placeholders, found {placeholders}",
+            pre_link_bodies.len()
+        );
+    }
+
     if case.restart_primary_before_text {
         restart_with_peer(case, &mut alice_primary, BOB);
     }
@@ -1025,15 +1202,19 @@ fn run_linked_device_matrix_case(case: LinkedDeviceMatrixCase) {
     } else {
         send_chat(&alice_primary, room_id, &alice_text);
     }
-    alice_primary.wait_chat(&alice_text);
-    alice_linked.wait_chat(&alice_text);
-    bob.wait_chat(&alice_text);
-
     let bob_text = format!("matrix Bob text {}", case.bits);
-    send_chat(&bob, room_id, &bob_text);
-    alice_primary.wait_chat(&bob_text);
-    alice_linked.wait_chat(&bob_text);
-    bob.wait_chat(&bob_text);
+    if case.cross_text_sends_before_draining {
+        send_chat(&bob, room_id, &bob_text);
+    }
+    for device in [&mut alice_primary, &mut alice_linked, &mut bob] {
+        device.wait_chat(&alice_text);
+    }
+    if !case.cross_text_sends_before_draining {
+        send_chat(&bob, room_id, &bob_text);
+    }
+    for device in [&mut alice_primary, &mut alice_linked, &mut bob] {
+        device.wait_chat(&bob_text);
+    }
 
     if case.restart_primary_between_media {
         restart_with_peer(case, &mut alice_primary, BOB);
@@ -1079,24 +1260,21 @@ fn run_linked_device_matrix_case(case: LinkedDeviceMatrixCase) {
     relay_voice(&bob, alice_voice, bob_stream, bob_payload);
 }
 
-fn run_linked_device_matrix_shard(shard: u16) {
-    assert!(shard < LINKED_DEVICE_MATRIX_SHARDS);
-    let cases_per_shard = LINKED_DEVICE_MATRIX_CASES / LINKED_DEVICE_MATRIX_SHARDS;
-    let start = shard * cases_per_shard;
-    for bits in start..start + cases_per_shard {
-        let case = LinkedDeviceMatrixCase::from_bits(bits);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_linked_device_matrix_case(case)
-        }));
-        if let Err(payload) = result {
-            let message = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic");
-            panic!("linked-device E2E matrix case {bits:#05x} failed ({case:?}): {message}");
-        }
-    }
+fn run_linked_device_matrix_case_catching(case: LinkedDeviceMatrixCase) -> Result<(), String> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_linked_device_matrix_case(case)
+    }));
+    result.map_err(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        format!(
+            "linked-device E2E matrix case {:#06x} failed ({case:?}): {message}",
+            case.bits
+        )
+    })
 }
 
 #[test]
@@ -1104,33 +1282,41 @@ fn linked_device_offline_history_survives_stale_pin_and_restarts() {
     run_linked_device_matrix_case(LinkedDeviceMatrixCase::from_bits(0x0c2e));
 }
 
-macro_rules! linked_device_matrix_shards {
-    ($($name:ident: $shard:literal),+ $(,)?) => {$(
-        #[test]
-        fn $name() {
-            run_linked_device_matrix_shard($shard);
-        }
-    )+};
+#[test]
+fn linked_device_dm_opened_while_peer_was_offline() {
+    run_linked_device_matrix_case(LinkedDeviceMatrixCase::from_bits(0xcaf9));
 }
 
-linked_device_matrix_shards!(
-    linked_device_matrix_00: 0,
-    linked_device_matrix_01: 1,
-    linked_device_matrix_02: 2,
-    linked_device_matrix_03: 3,
-    linked_device_matrix_04: 4,
-    linked_device_matrix_05: 5,
-    linked_device_matrix_06: 6,
-    linked_device_matrix_07: 7,
-    linked_device_matrix_08: 8,
-    linked_device_matrix_09: 9,
-    linked_device_matrix_10: 10,
-    linked_device_matrix_11: 11,
-    linked_device_matrix_12: 12,
-    linked_device_matrix_13: 13,
-    linked_device_matrix_14: 14,
-    linked_device_matrix_15: 15,
-);
+#[test]
+fn linked_device_pairing_and_send_matrix() {
+    let seed = linked_device_matrix_seed();
+    let cases = linked_device_matrix_cases(seed);
+    if cases.len() > 1 {
+        assert_linked_device_matrix_is_pairwise(&cases);
+    }
+    let failure = Mutex::new(None);
+    let workers = LINKED_DEVICE_MATRIX_WORKERS.min(cases.len());
+    thread::scope(|scope| {
+        for worker in 0..workers {
+            let failure = &failure;
+            let cases = &cases;
+            scope.spawn(move || {
+                for case in cases.iter().copied().skip(worker).step_by(workers) {
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    if let Err(message) = run_linked_device_matrix_case_catching(case) {
+                        *failure.lock().unwrap() = Some(message);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(message) = failure.into_inner().unwrap() {
+        panic!("{message}; reproduce with CHATT_E2E_MATRIX_SEED={seed:#018x}");
+    }
+}
 
 #[test]
 fn linked_device_rebuilds_live_dm_messages_from_history_after_restart() {
@@ -1217,39 +1403,198 @@ fn linked_device_shows_placeholder_for_messages_sent_before_linking() {
     assert!(!bodies.iter().any(|body| body == "before the second device existed"));
 }
 
-#[test]
-fn revoked_linked_device_is_disconnected_and_remaining_devices_keep_messaging() {
+#[derive(Clone, Copy, Debug)]
+struct RevocationMatrixCase {
+    bits: u8,
+    dm_before_link: bool,
+    victim_connected: bool,
+    message_before_revocation: bool,
+}
+
+impl RevocationMatrixCase {
+    fn from_bits(bits: u8) -> Self {
+        Self {
+            bits,
+            dm_before_link: bits & 1 != 0,
+            victim_connected: bits & 2 != 0,
+            message_before_revocation: bits & 4 != 0,
+        }
+    }
+}
+
+fn run_revocation_matrix_case(case: RevocationMatrixCase) {
     let world = TestWorld::new();
-    let mut alice = world.device("alice-primary", ALICE, ALICE_TOKEN);
-    let mut bob = world.device("bob", BOB, BOB_TOKEN);
-    let mut alice_second = world.device("alice-secondary", ALICE, "");
+    let suffix = case.bits.to_string();
+    let mut alice = world.device(
+        &format!("alice-revoke-primary-{suffix}"),
+        ALICE,
+        ALICE_TOKEN,
+    );
+    let mut bob = world.device(&format!("bob-revoke-{suffix}"), BOB, BOB_TOKEN);
+    let mut victim = world.device(&format!("alice-revoke-victim-{suffix}"), ALICE, "");
     alice.connect_ready();
     bob.connect_ready();
-    let room_id = open_dm(&mut alice, &mut bob);
+    let room_id = if case.dm_before_link {
+        open_dm(&mut alice, &mut bob)
+    } else {
+        RoomId(0)
+    };
 
-    let second_id = pair_device(&mut alice, &mut alice_second);
-    bob.wait_peer_refresh(ALICE);
-    alice_second.connect_ready();
-    alice_second.wait_peer_ready(BOB);
+    let victim_id = pair_device(&mut alice, &mut victim);
+    if case.dm_before_link {
+        bob.wait_peer_refresh(ALICE);
+    }
+    if case.victim_connected {
+        victim.connect_ready();
+        if case.dm_before_link {
+            victim.wait_peer_ready(BOB);
+        }
+    }
+
+    let room_id = if case.dm_before_link {
+        room_id
+    } else {
+        let room_id = open_dm(&mut alice, &mut bob);
+        if case.victim_connected {
+            victim.wait_for("revocation matrix DM room", |event| {
+                matches!(
+                    event,
+                    NetworkEvent::RoomUpserted(RoomInfo { room_id: id, .. })
+                        if *id == room_id
+                )
+            });
+            victim.wait_peer_ready(BOB);
+        }
+        room_id
+    };
+
+    if case.message_before_revocation {
+        let body = format!("before revocation {}", case.bits);
+        send_chat(&bob, room_id, &body);
+        alice.wait_chat(&body);
+        bob.wait_chat(&body);
+        if case.victim_connected {
+            victim.wait_chat(&body);
+        }
+    }
 
     alice.send(NetworkCommand::RevokeE2eDevice {
-        device_id: second_id,
+        device_id: victim_id,
     });
-    let (code, rejection) = alice_second.wait_for_auth_failure();
+    if !case.victim_connected {
+        victim.connect();
+    }
+    let (code, rejection) = victim.wait_for_auth_failure();
     assert_eq!(code, 401);
     assert!(
         rejection.contains("not valid")
             || rejection.contains("credential")
             || rejection.contains("revoked"),
-        "unexpected revoked-device rejection: {rejection}"
+        "revocation matrix case {case:?}: unexpected rejection: {rejection}"
     );
     alice.wait_for("primary rebind after revocation", |event| {
         matches!(event, NetworkEvent::E2eDeviceBound { .. })
     });
     bob.wait_peer_refresh(ALICE);
 
-    send_chat(&alice, room_id, "from remaining alice device");
-    bob.wait_chat("from remaining alice device");
-    send_chat(&bob, room_id, "to remaining alice device");
-    alice.wait_chat("to remaining alice device");
+    let from_alice = format!("from remaining Alice device {}", case.bits);
+    let from_bob = format!("to remaining Alice device {}", case.bits);
+    send_chat(&alice, room_id, &from_alice);
+    send_chat(&bob, room_id, &from_bob);
+    for body in [&from_alice, &from_bob] {
+        alice.wait_chat(body);
+        bob.wait_chat(body);
+    }
+}
+
+#[test]
+fn linked_device_revocation_matrix() {
+    let failure = Mutex::new(None);
+    thread::scope(|scope| {
+        for worker in 0..4u8 {
+            let failure = &failure;
+            scope.spawn(move || {
+                for bits in (worker..8).step_by(4) {
+                    let case = RevocationMatrixCase::from_bits(bits);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_revocation_matrix_case(case)
+                    }));
+                    if let Err(payload) = result {
+                        let message = payload
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| payload.downcast_ref::<&str>().copied())
+                            .unwrap_or("non-string panic");
+                        *failure.lock().unwrap() = Some(format!(
+                            "linked-device revocation matrix case {case:?} failed: {message}"
+                        ));
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(message) = failure.into_inner().unwrap() {
+        panic!("{message}");
+    }
+}
+
+#[test]
+fn maximum_linked_devices_receive_crossed_message_burst() {
+    let world = TestWorld::new();
+    let mut alice = world.device("alice-fanout-primary", ALICE, ALICE_TOKEN);
+    let mut bob = world.device("bob-fanout-primary", BOB, BOB_TOKEN);
+    alice.connect_ready();
+    bob.connect_ready();
+
+    let linked_count = rpc::e2e::MAX_ACTIVE_ACCOUNT_DEVICES - 1;
+    let mut alice_linked: Vec<_> = (0..linked_count)
+        .map(|index| world.device(&format!("alice-fanout-{index:02}"), ALICE, ""))
+        .collect();
+    let mut bob_linked: Vec<_> = (0..linked_count)
+        .map(|index| world.device(&format!("bob-fanout-{index:02}"), BOB, ""))
+        .collect();
+    for device in &mut alice_linked {
+        pair_device(&mut alice, device);
+    }
+    for device in &mut bob_linked {
+        pair_device(&mut bob, device);
+    }
+    for device in alice_linked.iter_mut().chain(&mut bob_linked) {
+        device.connect_ready();
+    }
+
+    let room_id = open_dm(&mut alice, &mut bob);
+    for device in alice_linked.iter_mut().chain(&mut bob_linked) {
+        device.wait_for("maximum-fanout DM room", |event| {
+            matches!(
+                event,
+                NetworkEvent::RoomUpserted(RoomInfo { room_id: id, .. })
+                    if *id == room_id
+            )
+        });
+        device.wait_peer_ready(if device.user == ALICE { BOB } else { ALICE });
+    }
+
+    let mut bodies = Vec::with_capacity(rpc::e2e::MAX_ACTIVE_ACCOUNT_DEVICES * 2);
+    bodies.push("fanout Alice primary".to_string());
+    send_chat(&alice, room_id, bodies.last().unwrap());
+    for (index, device) in alice_linked.iter().enumerate() {
+        bodies.push(format!("fanout Alice linked {index:02}"));
+        send_chat(device, room_id, bodies.last().unwrap());
+    }
+    bodies.push("fanout Bob primary".to_string());
+    send_chat(&bob, room_id, bodies.last().unwrap());
+    for (index, device) in bob_linked.iter().enumerate() {
+        bodies.push(format!("fanout Bob linked {index:02}"));
+        send_chat(device, room_id, bodies.last().unwrap());
+    }
+
+    for body in &bodies {
+        alice.wait_chat(body);
+        bob.wait_chat(body);
+        for device in alice_linked.iter_mut().chain(&mut bob_linked) {
+            device.wait_chat(body);
+        }
+    }
 }
