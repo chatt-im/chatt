@@ -21,8 +21,7 @@ use crate::crypto::{
     seal_in_place_append_tag,
 };
 use crate::ids::{
-    AccountId, DeviceId, EventId, LedgerHash, MessageId, RoomId, UserId,
-    VerificationSyncHash,
+    AccountId, DeviceId, EventId, LedgerHash, MessageId, RoomId, UserId, VerificationSyncHash,
 };
 
 pub const E2E_PUBLIC_KEY_LEN: usize = 32;
@@ -231,9 +230,9 @@ impl ValidatedAccountLedger {
     }
 
     pub fn device_key(&self, device_id: DeviceId, key_epoch: u64) -> Option<&ValidatedDeviceKey> {
-        self.device_keys.iter().find(|device| {
-            device.keys.device_id == device_id && device.keys.key_epoch == key_epoch
-        })
+        self.device_keys
+            .iter()
+            .find(|device| device.keys.device_id == device_id && device.keys.key_epoch == key_epoch)
     }
 
     /// Validates an entire ledger from its genesis, independently of any
@@ -368,10 +367,9 @@ impl ValidatedAccountLedger {
                 if previous.status != DeviceKeyStatus::Active {
                     return Err("device key rotation predecessor is not active".to_string());
                 }
-                let co_signature = statement
-                    .co_signature
-                    .as_deref()
-                    .ok_or_else(|| "device key rotation lacks the old device signature".to_string())?;
+                let co_signature = statement.co_signature.as_deref().ok_or_else(|| {
+                    "device key rotation lacks the old device signature".to_string()
+                })?;
                 verify_ed25519(
                     &fixed_key::<DEVICE_SIGNING_KEY_LEN>(
                         &previous.keys.signing_public_key,
@@ -424,8 +422,10 @@ impl ValidatedAccountLedger {
                     return Err("device revocation names a non-active device".to_string());
                 }
                 if active_count == 1 {
-                    return Err("device revocation would leave the account with no active device"
-                        .to_string());
+                    return Err(
+                        "device revocation would leave the account with no active device"
+                            .to_string(),
+                    );
                 }
                 for key in self
                     .device_keys
@@ -497,7 +497,12 @@ pub fn account_id(
     input.extend_from_slice(server_public_key);
     input.extend_from_slice(&user_id.0.to_le_bytes());
     input.extend_from_slice(authority_public_key);
-    AccountId(digest::digest(&digest::SHA256, &input).as_ref().try_into().unwrap())
+    AccountId(
+        digest::digest(&digest::SHA256, &input)
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    )
 }
 
 pub fn account_statement_hash(statement: &AccountKeyStatement) -> LedgerHash {
@@ -561,10 +566,7 @@ fn validate_device_public_keys(device: &DevicePublicKeys) -> Result<(), String> 
     if device.key_epoch == 0 {
         return Err("device key epoch is zero".to_string());
     }
-    fixed_key::<DEVICE_SIGNING_KEY_LEN>(
-        &device.signing_public_key,
-        "device signing public key",
-    )?;
+    fixed_key::<DEVICE_SIGNING_KEY_LEN>(&device.signing_public_key, "device signing public key")?;
     let encryption = fixed_key::<E2E_PUBLIC_KEY_LEN>(
         &device.encryption_public_key,
         "device encryption public key",
@@ -818,10 +820,7 @@ pub fn verify_dm_event_signature(
         sealed: envelope.sealed.clone(),
     };
     signature::UnparsedPublicKey::new(&signature::ED25519, author_signing_public_key)
-        .verify(
-            &jsony::to_binary(&signature_input),
-            &envelope.signature,
-        )
+        .verify(&jsony::to_binary(&signature_input), &envelope.signature)
         .map_err(|_| CryptoError::InvalidSignature)
 }
 
@@ -902,13 +901,7 @@ pub fn verify_device_binding(
 ) -> Result<(), CryptoError> {
     signature::UnparsedPublicKey::new(&signature::ED25519, signing_public_key)
         .verify(
-            &device_binding_bytes(
-                session_id,
-                user_id,
-                device_id,
-                key_epoch,
-                ledger_head,
-            ),
+            &device_binding_bytes(session_id, user_id, device_id, key_epoch, ledger_head),
             signed,
         )
         .map_err(|_| CryptoError::InvalidSignature)
@@ -999,9 +992,8 @@ pub fn seal_dm_event(
 
     let mut recipient_keys = Vec::with_capacity(recipients.len());
     for recipient in recipients {
-        let shared = ephemeral_secret.diffie_hellman(&PublicKey::from(
-            recipient.encryption_public_key,
-        ));
+        let shared =
+            ephemeral_secret.diffie_hellman(&PublicKey::from(recipient.encryption_public_key));
         if !shared.was_contributory() {
             return Err(CryptoError::InvalidKey);
         }
@@ -1077,10 +1069,9 @@ pub fn open_dm_event(
                 && recipient.key_epoch == local_key_epoch
         })
         .ok_or(CryptoError::WrongKeyId)?;
-    let ephemeral_public = <[u8; E2E_PUBLIC_KEY_LEN]>::try_from(
-        envelope.ephemeral_public_key.as_slice(),
-    )
-    .map_err(|_| CryptoError::InvalidEncoding)?;
+    let ephemeral_public =
+        <[u8; E2E_PUBLIC_KEY_LEN]>::try_from(envelope.ephemeral_public_key.as_slice())
+            .map_err(|_| CryptoError::InvalidEncoding)?;
     let secret = StaticSecret::from(*local_encryption_seed);
     let shared = secret.diffie_hellman(&PublicKey::from(ephemeral_public));
     if !shared.was_contributory() {
@@ -1106,12 +1097,8 @@ pub fn open_dm_event(
         bytes: key_bytes,
     };
     let mut sealed = envelope.sealed;
-    let plain_len = open_in_place_with_aad(
-        &event_key,
-        0,
-        &event_aad(&envelope.header),
-        &mut sealed,
-    )?;
+    let plain_len =
+        open_in_place_with_aad(&event_key, 0, &event_aad(&envelope.header), &mut sealed)?;
     let plain = &sealed[..plain_len];
     let inner_len = plain
         .first_chunk::<4>()
@@ -1201,11 +1188,13 @@ pub fn seal_verification_sync(
     }
     let mut recipients = recipients.to_vec();
     recipients.sort_by_key(|recipient| (recipient.device_id, recipient.key_epoch));
-    if recipients.iter().any(|recipient| {
-        recipient.user_id.0 == 0 || recipient.account_id != header.account_id
-    }) || recipients.windows(2).any(|pair| {
-        pair[0].device_id == pair[1].device_id && pair[0].key_epoch == pair[1].key_epoch
-    }) {
+    if recipients
+        .iter()
+        .any(|recipient| recipient.user_id.0 == 0 || recipient.account_id != header.account_id)
+        || recipients.windows(2).any(|pair| {
+            pair[0].device_id == pair[1].device_id && pair[0].key_epoch == pair[1].key_epoch
+        })
+    {
         return Err(CryptoError::InvalidEncoding);
     }
 
@@ -1238,8 +1227,8 @@ pub fn seal_verification_sync(
 
     let mut recipient_keys = Vec::with_capacity(recipients.len());
     for recipient in recipients {
-        let shared = ephemeral_secret
-            .diffie_hellman(&PublicKey::from(recipient.encryption_public_key));
+        let shared =
+            ephemeral_secret.diffie_hellman(&PublicKey::from(recipient.encryption_public_key));
         if !shared.was_contributory() {
             return Err(CryptoError::InvalidKey);
         }
@@ -1271,7 +1260,10 @@ pub fn seal_verification_sync(
     };
     let signing_key = signature::Ed25519KeyPair::from_seed_unchecked(signing_seed)
         .map_err(|_| CryptoError::InvalidKey)?;
-    let signature = signing_key.sign(&jsony::to_binary(&input)).as_ref().to_vec();
+    let signature = signing_key
+        .sign(&jsony::to_binary(&input))
+        .as_ref()
+        .to_vec();
     let encoded = jsony::to_binary(&VerificationSyncEnvelope {
         header,
         ephemeral_public_key: ephemeral_public_key.to_vec(),
@@ -1385,10 +1377,7 @@ fn verification_sync_aad(header: &VerificationSyncHeader) -> Vec<u8> {
     aad
 }
 
-fn verification_sync_wrap_key(
-    shared: &[u8],
-    context: &[u8],
-) -> Result<KeyMaterial, CryptoError> {
+fn verification_sync_wrap_key(shared: &[u8], context: &[u8]) -> Result<KeyMaterial, CryptoError> {
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, context);
     let prk = salt.extract(shared);
     let info = [VERIFICATION_SYNC_WRAP_LABEL, context];
@@ -1396,8 +1385,7 @@ fn verification_sync_wrap_key(
         .expand(&info, EventHkdfLen)
         .map_err(|_| CryptoError::InvalidKey)?;
     let mut bytes = [0u8; KEY_LEN];
-    okm.fill(&mut bytes)
-        .map_err(|_| CryptoError::InvalidKey)?;
+    okm.fill(&mut bytes).map_err(|_| CryptoError::InvalidKey)?;
     Ok(KeyMaterial { id: 1, bytes })
 }
 
@@ -1425,8 +1413,7 @@ fn event_wrap_key(shared: &[u8], context: &[u8]) -> Result<KeyMaterial, CryptoEr
         .expand(&info, EventHkdfLen)
         .map_err(|_| CryptoError::InvalidKey)?;
     let mut bytes = [0u8; KEY_LEN];
-    okm.fill(&mut bytes)
-        .map_err(|_| CryptoError::InvalidKey)?;
+    okm.fill(&mut bytes).map_err(|_| CryptoError::InvalidKey)?;
     Ok(KeyMaterial { id: 1, bytes })
 }
 
@@ -1842,8 +1829,16 @@ mod tests {
         let content_key = vec![5u8; KEY_LEN];
         let payload = vec![9u8; 1000];
         let event_id = EventId([9; 16]);
-        let frame =
-            seal_dm_chunk(&content_key, RoomId(4), UserId(7), event_id, 3, &payload, 24).unwrap();
+        let frame = seal_dm_chunk(
+            &content_key,
+            RoomId(4),
+            UserId(7),
+            event_id,
+            3,
+            &payload,
+            24,
+        )
+        .unwrap();
         assert_eq!(frame.len(), DM_CHUNK_OVERHEAD + payload.len() + 24);
         let mut opened = frame.clone();
         assert_eq!(
@@ -1852,11 +1847,27 @@ mod tests {
         );
         let mut reordered = frame.clone();
         assert!(
-            open_dm_chunk(&content_key, RoomId(4), UserId(7), event_id, 4, &mut reordered).is_err()
+            open_dm_chunk(
+                &content_key,
+                RoomId(4),
+                UserId(7),
+                event_id,
+                4,
+                &mut reordered
+            )
+            .is_err()
         );
         let mut wrong_room = frame.clone();
         assert!(
-            open_dm_chunk(&content_key, RoomId(5), UserId(7), event_id, 3, &mut wrong_room).is_err()
+            open_dm_chunk(
+                &content_key,
+                RoomId(5),
+                UserId(7),
+                event_id,
+                3,
+                &mut wrong_room
+            )
+            .is_err()
         );
         let mut wrong_event = frame;
         assert!(
@@ -1958,8 +1969,8 @@ mod tests {
             Some(&first_signing),
         )
         .unwrap();
-        let ledger = ValidatedAccountLedger::validate(&server, user, &[genesis.clone(), retire])
-            .unwrap();
+        let ledger =
+            ValidatedAccountLedger::validate(&server, user, &[genesis.clone(), retire]).unwrap();
         assert_eq!(
             ledger.device_key(first.device_id, 1).unwrap().status,
             DeviceKeyStatus::Retired
@@ -1990,9 +2001,7 @@ mod tests {
                 previous: ledger.head,
                 authority_key_epoch: 1,
                 action: AccountKeyAction::RotateAccountAuthority {
-                    new_authority_public_key: ed25519_public_key(&new_authority)
-                        .unwrap()
-                        .to_vec(),
+                    new_authority_public_key: ed25519_public_key(&new_authority).unwrap().to_vec(),
                 },
             },
             &authority,
@@ -2109,10 +2118,16 @@ mod tests {
                 encryption_public_key: e2e_public_key(&recipient_encryption),
             },
         ];
-        let encoded = seal_dm_event(&author_signing, header, &plaintext, &recipients, &rng).unwrap();
+        let encoded =
+            seal_dm_event(&author_signing, header, &plaintext, &recipients, &rng).unwrap();
         let author_public = <[u8; 32]>::try_from(author.signing_public_key.as_slice()).unwrap();
         for (user, account, device, encryption) in [
-            (UserId(10), sender_account, author.device_id, author_encryption),
+            (
+                UserId(10),
+                sender_account,
+                author.device_id,
+                author_encryption,
+            ),
             (
                 UserId(10),
                 sender_account,
@@ -2199,14 +2214,8 @@ mod tests {
                 encryption_public_key: e2e_public_key(&second_encryption),
             },
         ];
-        let encoded = seal_verification_sync(
-            &author_signing,
-            header,
-            &snapshot,
-            &recipients,
-            &rng,
-        )
-        .unwrap();
+        let encoded =
+            seal_verification_sync(&author_signing, header, &snapshot, &recipients, &rng).unwrap();
         let author_public = <[u8; 32]>::try_from(author.signing_public_key.as_slice()).unwrap();
         for (device, seed) in [
             (author.device_id, author_encryption),

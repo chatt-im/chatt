@@ -496,29 +496,6 @@ impl LocalE2eIdentity {
         self.file.server_registered
     }
 
-    pub(crate) fn sign_next_account_action(
-        &self,
-        action: AccountKeyAction,
-    ) -> Result<AccountKeyStatement, String> {
-        let ledger = self.own_ledger();
-        let authority_seed = fixed::<ACCOUNT_AUTHORITY_KEY_LEN>(
-            &self.file.authority_seed,
-            "account authority seed",
-        )?;
-        sign_account_statement(
-            AccountKeyStatementBody {
-                account_id: ledger.account_id,
-                account_generation: ledger.account_generation,
-                roster_epoch: ledger.roster_epoch.saturating_add(1),
-                previous: ledger.head,
-                authority_key_epoch: ledger.authority_key_epoch,
-                action,
-            },
-            &authority_seed,
-            None,
-        )
-    }
-
     pub(crate) fn peer_statements(&self, user_id: UserId) -> Option<&[AccountKeyStatement]> {
         self.file
             .peers

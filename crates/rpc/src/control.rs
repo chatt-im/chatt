@@ -1,8 +1,8 @@
 use jsony::Jsony;
 
 use crate::ids::{
-    BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId,
-    StreamId, UserId,
+    BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId, StreamId,
+    UserId,
 };
 
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 224 * 1024;
@@ -117,7 +117,6 @@ pub enum ClientControl {
     CreateDeviceLink {
         redemption_secret_hash: Vec<u8>,
         enrollment_bundle: Vec<u8>,
-        verification_checkpoint: Option<crate::e2e::VerificationSyncCheckpoint>,
     },
     /// Explicitly invalidates an unredeemed device link. Closing the creating
     /// client or its dialog never cancels a link.
@@ -133,7 +132,10 @@ pub enum ClientControl {
     /// creates a device-specific bearer credential.
     RedeemDeviceLink {
         redemption_secret: String,
-        statement: crate::e2e::AccountKeyStatement,
+        attempt_id: crate::ids::PairAttemptId,
+        expected_roster: crate::identity::RosterCheckpoint,
+        roster: crate::identity::SignedDeviceRoster,
+        key_packages: Vec<crate::mls::PublishedKeyPackage>,
         /// Client-generated bearer, staged locally with the replacement
         /// identity so a lost response can be reconciled by authentication.
         bearer_token: String,
@@ -294,6 +296,59 @@ pub enum ClientControl {
     PutE2eVerificationSync {
         expected: Option<crate::e2e::VerificationSyncCheckpoint>,
         envelope: Vec<u8>,
+    },
+    /// Fetches the one current authority-signed MLS device roster for an account.
+    FetchDeviceRoster {
+        user_id: UserId,
+    },
+    /// Exact-CAS replacement of the authenticated account's current device roster.
+    PutDeviceRoster {
+        expected: Option<crate::identity::RosterCheckpoint>,
+        roster: crate::identity::SignedDeviceRoster,
+    },
+    /// Binds this authenticated transport session to an active MLS device.
+    BindMlsDevice {
+        device_id: DeviceId,
+        roster: crate::identity::RosterCheckpoint,
+        proof: Vec<u8>,
+    },
+    PublishKeyPackages {
+        device_id: DeviceId,
+        packages: Vec<crate::mls::PublishedKeyPackage>,
+    },
+    TakeKeyPackage {
+        device_id: DeviceId,
+    },
+    CreateEncryptedRoom {
+        descriptor: crate::mls::EncryptedRoomDescriptor,
+        roster_checkpoints: Vec<crate::identity::RosterCheckpoint>,
+        initial_commit: crate::mls::MlsCommitBundle,
+    },
+    FetchGroupInfo {
+        room_id: RoomId,
+    },
+    SubmitCommitBundle {
+        room_id: RoomId,
+        expected_epoch: u64,
+        bundle: crate::mls::MlsCommitBundle,
+    },
+    SubmitMlsApplication {
+        room_id: RoomId,
+        epoch: u64,
+        event_id: crate::ids::EventId,
+        ciphertext: Vec<u8>,
+    },
+    FetchMlsEvents {
+        room_id: RoomId,
+        after_sequence: u64,
+        limit: u16,
+    },
+    FetchMlsWelcome {
+        after_sequence: u64,
+    },
+    AckMlsEvent {
+        room_id: RoomId,
+        sequence: u64,
     },
 }
 
@@ -494,6 +549,63 @@ pub enum ServerControl {
     E2eVerificationSyncRateLimited {
         retry_after_ms: u64,
     },
+    DeviceRoster {
+        user_id: UserId,
+        /// Sticky account fact, independent of the current roster snapshot.
+        initialized: bool,
+        roster: Option<crate::identity::SignedDeviceRoster>,
+    },
+    DeviceRosterStored {
+        checkpoint: crate::identity::RosterCheckpoint,
+    },
+    DeviceRosterConflict {
+        current: Option<crate::identity::RosterCheckpoint>,
+    },
+    MlsDeviceBound {
+        device_id: DeviceId,
+        available_key_packages: u16,
+    },
+    KeyPackagesPublished {
+        device_id: DeviceId,
+        available: u16,
+    },
+    KeyPackage {
+        device_id: DeviceId,
+        package: Option<Vec<u8>>,
+    },
+    EncryptedRoomCreated {
+        room_id: RoomId,
+        epoch: u64,
+    },
+    GroupInfo {
+        room_id: RoomId,
+        /// Present when this Chatt room already has an encrypted MLS group.
+        /// Absence is an ordinary result used by the room creator path.
+        descriptor: Option<crate::mls::EncryptedRoomDescriptor>,
+        epoch: u64,
+        group_info: Vec<u8>,
+    },
+    MlsCommitSubmitted {
+        room_id: RoomId,
+        outcome: crate::mls::MlsCommitOutcome,
+    },
+    MlsApplicationSubmitted {
+        room_id: RoomId,
+        event_id: crate::ids::EventId,
+        outcome: crate::mls::MlsSubmitOutcome,
+    },
+    MlsEvents {
+        room_id: RoomId,
+        events: Vec<crate::mls::MlsDeliveryEvent>,
+    },
+    MlsWelcomes {
+        welcomes: Vec<crate::mls::MlsWelcome>,
+        head_sequence: u64,
+    },
+    MlsEventAcked {
+        room_id: RoomId,
+        sequence: u64,
+    },
     DeviceLinkCreated {
         redemption_secret_hash: Vec<u8>,
         expires_at_ms: u64,
@@ -503,7 +615,7 @@ pub enum ServerControl {
     },
     DeviceLinkBundle {
         enrollment_bundle: Vec<u8>,
-        account_chain: Vec<crate::e2e::AccountKeyStatement>,
+        current_roster: crate::identity::SignedDeviceRoster,
         user_id: UserId,
         username: String,
     },
@@ -857,9 +969,8 @@ pub fn decode_invite_ticket(value: &str) -> Result<InviteTicket, String> {
 pub fn encode_device_link_ticket(value: &DeviceLinkTicket) -> Result<String, String> {
     validate_device_link_ticket(value)?;
     let payload = jsony::to_binary(value);
-    let mut out = String::with_capacity(
-        DEVICE_LINK_STRING_PREFIX.len() + encoded_base64_len(payload.len()),
-    );
+    let mut out =
+        String::with_capacity(DEVICE_LINK_STRING_PREFIX.len() + encoded_base64_len(payload.len()));
     out.push_str(DEVICE_LINK_STRING_PREFIX);
     encode_base64url_no_pad(&payload, &mut out);
     Ok(out)
@@ -976,6 +1087,8 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
         ClientControl::RedeemDeviceLink {
             redemption_secret,
             bearer_token,
+            roster,
+            key_packages,
             ..
         } => {
             validate_auth_field("device-link redemption secret", redemption_secret)?;
@@ -986,6 +1099,12 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             if !bearer_token.starts_with("tct2_") || bearer_token.len() < MIN_PAIRED_TOKEN_BYTES {
                 return Err("device-link bearer token is invalid".to_string());
             }
+            if roster.body.active_devices.is_empty()
+                || roster.body.active_devices.len() > crate::identity::MAX_ACTIVE_DEVICES
+            {
+                return Err("paired MLS roster device count is invalid".to_string());
+            }
+            crate::mls::validate_key_packages(key_packages)?;
         }
         ClientControl::SendChat { body, envelope, .. }
         | ClientControl::EditChat { body, envelope, .. } => match envelope {
@@ -1127,6 +1246,48 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("verification sync envelope length is invalid".to_string());
             }
         }
+        ClientControl::PutDeviceRoster { roster, .. } => {
+            if roster.body.active_devices.is_empty()
+                || roster.body.active_devices.len() > crate::identity::MAX_ACTIVE_DEVICES
+            {
+                return Err("device roster has an invalid active device count".to_string());
+            }
+            if roster.authority_signature.len() != crate::identity::SIGNATURE_LEN {
+                return Err("device roster signature has the wrong length".to_string());
+            }
+        }
+        ClientControl::BindMlsDevice { proof, .. } => {
+            if proof.len() != crate::identity::SIGNATURE_LEN {
+                return Err("MLS device binding proof has the wrong length".to_string());
+            }
+        }
+        ClientControl::PublishKeyPackages { packages, .. } => {
+            crate::mls::validate_key_packages(packages)?;
+        }
+        ClientControl::CreateEncryptedRoom {
+            descriptor,
+            roster_checkpoints,
+            initial_commit,
+        } => {
+            descriptor.validate()?;
+            if roster_checkpoints.len() != descriptor.member_accounts.len() {
+                return Err("encrypted room roster checkpoint count does not match".to_string());
+            }
+            crate::mls::validate_commit_bundle(initial_commit)?;
+        }
+        ClientControl::SubmitCommitBundle { bundle, .. } => {
+            crate::mls::validate_commit_bundle(bundle)?;
+        }
+        ClientControl::SubmitMlsApplication { ciphertext, .. } => {
+            if ciphertext.is_empty() || ciphertext.len() > crate::mls::MAX_MLS_MESSAGE_BYTES {
+                return Err("invalid MLS application message length".to_string());
+            }
+        }
+        ClientControl::FetchMlsEvents { limit, .. } => {
+            if *limit == 0 || usize::from(*limit) > crate::mls::MAX_MLS_EVENT_BATCH {
+                return Err("invalid MLS event fetch limit".to_string());
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -1161,10 +1322,7 @@ fn validate_invite_ticket(value: &InviteTicket) -> Result<(), String> {
 
 fn validate_device_link_ticket(value: &DeviceLinkTicket) -> Result<(), String> {
     if value.version != crate::PROTOCOL_VERSION {
-        return Err(format!(
-            "unsupported device-link version {}",
-            value.version
-        ));
+        return Err(format!("unsupported device-link version {}", value.version));
     }
     validate_auth_field("device-link redemption secret", &value.redemption_secret)?;
     if value.redemption_secret.len() < MIN_PAIRING_SECRET_BYTES {

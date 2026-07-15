@@ -49,6 +49,10 @@ pub struct BugReportId(pub u64);
 #[jsony(Binary)]
 pub struct EventId(pub [u8; 16]);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
+#[jsony(Binary)]
+pub struct PairAttemptId(pub [u8; 16]);
+
 /// Random identifier for one independently keyed client installation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]

@@ -15,10 +15,11 @@ mod config_diagnostics;
 pub mod device_directory;
 mod history_reader;
 pub mod local_admin;
+mod mls_service;
 pub mod room_store;
 pub mod user_store;
-mod verification_sync_store;
 mod username_registry;
+mod verification_sync_store;
 
 use mio::{
     Events, Interest, Poll, Token, Waker,
@@ -29,25 +30,20 @@ use ring::signature::KeyPair;
 use rpc::{
     control::{
         self, ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
-        ERROR_BUG_REPORT_REJECTED, ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST,
-        ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED,
-        ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN,
-        ERROR_DEVICE_LINK_UNAVAILABLE, FileContentEncoding,
-        FileMetadata, InviteTicket, MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
-        MAX_FILE_CHUNK_BYTES, MessageFlags, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole,
-        RoomInfo, RoomKind, ServerControl, UserSummary, decode_client_control, decode_client_hello,
-        encode_invite_ticket, encode_server_control, encode_server_hello, max_file_wire_bytes,
+        ERROR_BUG_REPORT_REJECTED, ERROR_DEVICE_LINK_UNAVAILABLE, ERROR_OPEN_PAIR_RATE_LIMITED,
+        ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH,
+        ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH,
+        ERROR_USERNAME_TAKEN, FileContentEncoding, FileMetadata, InviteTicket,
+        MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES, MAX_FILE_CHUNK_BYTES, MessageFlags,
+        P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind, ServerControl,
+        UserSummary, decode_client_control, decode_client_hello, encode_invite_ticket,
+        encode_server_control, encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims,
         KEY_LEN, KeyMaterial, OPEN_PAIR_RECOVERY_PREFIX, RecordProtection, SessionTransport,
         TransportMode, VideoKeyRole, derive_video_keys, dynamic_user_id_from_recovery_token,
-        encode_hex, issue_dynamic_token,
-        respond_to_client_hello, verify_dynamic_token,
-    },
-    evented::{
-        MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
-        recv_datagram_with, write_queue_to,
+        encode_hex, issue_dynamic_token, respond_to_client_hello, verify_dynamic_token,
     },
     e2e::{
         AccountKeyAction, DeviceKeyStatus, DmContentKind, DmEventEnvelope, RosterCheckpoint,
@@ -55,7 +51,11 @@ use rpc::{
         verification_sync_checkpoint, verify_dm_event_signature,
         verify_verification_sync_signature,
     },
-    frame,
+    evented::{
+        MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
+        recv_datagram_with, write_queue_to,
+    },
+    frame, identity as mls_identity,
     ids::{
         BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId, StreamId,
         UserId,
@@ -68,9 +68,10 @@ use rpc::{
 use config::{
     Config as ServerConfig, UserConfig, hash_secret, valid_username, value_arg, verify_secret_hash,
 };
-use history_reader::{HistoryReadReply, HistoryReader};
 use device_directory::{DeviceDirectory, DirectoryAppend};
+use history_reader::{HistoryReadReply, HistoryReader};
 use local_admin::{AdminCommand, AdminSocket};
+use mls_service::{MlsService, PutRosterError};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
 use username_registry::UsernameRegistry;
@@ -422,6 +423,7 @@ pub struct Server {
     /// Authority-signed account/device ledgers, persisted under the data dir.
     device_directory: DeviceDirectory,
     verification_sync: VerificationSyncStore,
+    mls: MlsService,
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
@@ -534,6 +536,21 @@ impl Server {
     }
 
     pub fn bind(mut config: ServerConfig) -> io::Result<Self> {
+        let infer_public_tcp = config.network.public_tcp_addr.trim().is_empty()
+            || (config.network.tcp_addr.port() == 0
+                && config
+                    .network
+                    .public_tcp_addr
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|endpoint| endpoint.port() == 0));
+        let infer_public_udp = config.network.public_udp_addr.trim().is_empty()
+            || (config.network.udp_addr().port() == 0
+                && config
+                    .network
+                    .public_udp_addr
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|endpoint| endpoint.port() == 0));
+        let infer_public_udp_probe = config.network.public_udp_probe_addr.is_none();
         config.normalize();
         let tcp_addr = config.network.tcp_addr;
         let udp_addr = config.network.udp_addr();
@@ -547,6 +564,36 @@ impl Server {
         } else {
             None
         };
+        if infer_public_tcp {
+            let mut public = config
+                .network
+                .public_tcp_addr
+                .parse::<SocketAddr>()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            public.set_port(listener.local_addr()?.port());
+            config.network.public_tcp_addr = public.to_string();
+        }
+        if infer_public_udp {
+            let mut public = config
+                .network
+                .public_udp_addr
+                .parse::<SocketAddr>()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            public.set_port(udp.local_addr()?.port());
+            config.network.public_udp_addr = public.to_string();
+        }
+        if infer_public_udp_probe
+            && let (Some(public), Some(socket)) = (
+                config.network.public_udp_probe_addr.as_mut(),
+                udp_probe.as_ref(),
+            )
+        {
+            let mut endpoint = public
+                .parse::<SocketAddr>()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            endpoint.set_port(socket.local_addr()?.port());
+            *public = endpoint.to_string();
+        }
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
         poll.registry()
@@ -567,8 +614,13 @@ impl Server {
             config.data_dir(),
             server_key_pair.public_key().as_ref().to_vec(),
         )
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let verification_sync = VerificationSyncStore::open(config.data_dir());
+        let mls = MlsService::open(
+            config.data_dir(),
+            server_key_pair.public_key().as_ref().to_vec(),
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mut rooms = HashMap::new();
         for room in &config.rooms {
             let access = match &room.members {
@@ -643,6 +695,7 @@ impl Server {
             usernames,
             device_directory,
             verification_sync,
+            mls,
             poll,
             listener,
             udp,
@@ -1830,15 +1883,17 @@ impl Server {
                 receive_files,
                 file_receive_limit_bytes,
             ),
-            (
-                ConnState::AwaitAuth,
-                ClientControl::FetchDeviceLink { redemption_secret },
-            ) => self.fetch_device_link(token, &redemption_secret),
+            (ConnState::AwaitAuth, ClientControl::FetchDeviceLink { redemption_secret }) => {
+                self.fetch_device_link(token, &redemption_secret)
+            }
             (
                 ConnState::AwaitAuth,
                 ClientControl::RedeemDeviceLink {
                     redemption_secret,
-                    statement,
+                    attempt_id,
+                    expected_roster,
+                    roster,
+                    key_packages,
                     bearer_token,
                     receive_files,
                     file_receive_limit_bytes,
@@ -1846,7 +1901,10 @@ impl Server {
             ) => self.redeem_device_link(
                 token,
                 &redemption_secret,
-                statement,
+                attempt_id,
+                expected_roster,
+                roster,
+                key_packages,
                 bearer_token,
                 receive_files,
                 file_receive_limit_bytes,
@@ -1865,16 +1923,11 @@ impl Server {
                 ClientControl::CreateDeviceLink {
                     redemption_secret_hash,
                     enrollment_bundle,
-                    verification_checkpoint,
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
-                let result = self.create_device_link(
-                    session_id,
-                    redemption_secret_hash,
-                    enrollment_bundle,
-                    verification_checkpoint,
-                );
+                let result =
+                    self.create_device_link(session_id, redemption_secret_hash, enrollment_bundle);
                 self.report_request_outcome(token, result)
             }
             (
@@ -1935,18 +1988,12 @@ impl Server {
                     envelope,
                 )
             }
-            (
-                ConnState::Ready,
-                ClientControl::AppendAccountKeyStatement { statement },
-            ) => {
+            (ConnState::Ready, ClientControl::AppendAccountKeyStatement { statement }) => {
                 let session_id = self.session_for_token(token)?;
                 let result = self.append_account_key_statement(session_id, statement);
                 self.report_request_outcome(token, result)
             }
-            (
-                ConnState::Ready,
-                ClientControl::FetchAccountKeyChain { user_id, after },
-            ) => {
+            (ConnState::Ready, ClientControl::FetchAccountKeyChain { user_id, after }) => {
                 self.session_for_token(token)?;
                 let (base, statements) = self.device_directory.chain_after(user_id, after)?;
                 self.send_control_to_token(
@@ -1968,26 +2015,15 @@ impl Server {
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
-                let result = self.bind_e2e_device(
-                    session_id,
-                    device_id,
-                    key_epoch,
-                    ledger_head,
-                    &signature,
-                );
+                let result =
+                    self.bind_e2e_device(session_id, device_id, key_epoch, ledger_head, &signature);
                 self.report_request_outcome(token, result)
             }
-            (
-                ConnState::Ready,
-                ClientControl::FetchE2eVerificationSync { known },
-            ) => {
+            (ConnState::Ready, ClientControl::FetchE2eVerificationSync { known }) => {
                 let session_id = self.session_for_token(token)?;
                 self.fetch_e2e_verification_sync(session_id, known)
             }
-            (
-                ConnState::Ready,
-                ClientControl::PutE2eVerificationSync { expected, envelope },
-            ) => {
+            (ConnState::Ready, ClientControl::PutE2eVerificationSync { expected, envelope }) => {
                 let session_id = self.session_for_token(token)?;
                 self.put_e2e_verification_sync(session_id, expected, envelope)
             }
@@ -2125,6 +2161,24 @@ impl Server {
                 let result = self.stop_share(session_id, stream_id);
                 self.report_request_outcome(token, result)
             }
+            (
+                ConnState::Ready,
+                control @ (ClientControl::FetchDeviceRoster { .. }
+                | ClientControl::PutDeviceRoster { .. }
+                | ClientControl::BindMlsDevice { .. }
+                | ClientControl::PublishKeyPackages { .. }
+                | ClientControl::TakeKeyPackage { .. }
+                | ClientControl::CreateEncryptedRoom { .. }
+                | ClientControl::FetchGroupInfo { .. }
+                | ClientControl::SubmitCommitBundle { .. }
+                | ClientControl::SubmitMlsApplication { .. }
+                | ClientControl::FetchMlsEvents { .. }
+                | ClientControl::FetchMlsWelcome { .. }
+                | ClientControl::AckMlsEvent { .. }),
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.handle_mls_control(session_id, control)
+            }
             (ConnState::Ready, ClientControl::Ping { nonce }) => {
                 self.send_control_to_token(token, &ServerControl::Pong { nonce })
             }
@@ -2163,32 +2217,459 @@ impl Server {
         }
     }
 
+    fn handle_mls_control(
+        &mut self,
+        session_id: SessionId,
+        control: ClientControl,
+    ) -> Result<(), String> {
+        let (user_id, token, bound) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| {
+                (
+                    session.user_id,
+                    session.tcp_token,
+                    session.mls_device.clone(),
+                )
+            })
+            .ok_or_else(|| "unknown session".to_string())?;
+        match control {
+            ClientControl::FetchDeviceRoster { user_id } => {
+                let roster = self.mls.roster(user_id).cloned();
+                let initialized = self.mls.initialized(user_id);
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::DeviceRoster {
+                        user_id,
+                        initialized,
+                        roster,
+                    },
+                )
+            }
+            ClientControl::PutDeviceRoster { expected, roster } => {
+                let stored_roster = roster.clone();
+                let active_devices = roster
+                    .body
+                    .active_devices
+                    .iter()
+                    .map(|certificate| certificate.body.device_id)
+                    .collect::<Vec<_>>();
+                let revoked_tokens = self
+                    .sessions
+                    .values()
+                    .filter(|session| session.user_id == user_id)
+                    .filter_map(|session| {
+                        session
+                            .mls_device
+                            .as_ref()
+                            .filter(|bound| !active_devices.contains(&bound.device_id))
+                            .map(|_| session.tcp_token)
+                    })
+                    .collect::<Vec<_>>();
+                match self.mls.put_roster(user_id, expected, roster) {
+                    Ok(checkpoint) => {
+                        for session in self
+                            .sessions
+                            .values_mut()
+                            .filter(|session| session.user_id == user_id)
+                        {
+                            if let Some(bound) = session.mls_device.as_mut() {
+                                if active_devices.contains(&bound.device_id) {
+                                    bound.roster = checkpoint;
+                                } else {
+                                    session.mls_device = None;
+                                }
+                            }
+                        }
+                        self.send_control_to_token(
+                            token,
+                            &ServerControl::DeviceRosterStored { checkpoint },
+                        )?;
+                        let tokens = self
+                            .sessions
+                            .values()
+                            .map(|session| session.tcp_token)
+                            .filter(|token| self.clients.contains_key(token))
+                            .collect::<Vec<_>>();
+                        self.send_control_to_tokens(
+                            &tokens,
+                            &ServerControl::DeviceRoster {
+                                user_id,
+                                initialized: true,
+                                roster: Some(stored_roster),
+                            },
+                        );
+                        for revoked in revoked_tokens {
+                            self.disconnect(revoked);
+                        }
+                        Ok(())
+                    }
+                    Err(PutRosterError::Conflict(current)) => self.send_control_to_token(
+                        token,
+                        &ServerControl::DeviceRosterConflict { current },
+                    ),
+                    Err(PutRosterError::Invalid(error)) => Err(error),
+                }
+            }
+            ClientControl::BindMlsDevice {
+                device_id,
+                roster,
+                proof,
+            } => {
+                let current = self
+                    .mls
+                    .roster(user_id)
+                    .ok_or_else(|| "account has no MLS device roster".to_string())?;
+                if mls_identity::roster_checkpoint(current) != roster {
+                    return Err("MLS device binding names a stale roster".to_string());
+                }
+                let certificate = current
+                    .body
+                    .active_devices
+                    .iter()
+                    .find(|certificate| certificate.body.device_id == device_id)
+                    .ok_or_else(|| "MLS device is not active".to_string())?;
+                ring::signature::UnparsedPublicKey::new(
+                    &ring::signature::ED25519,
+                    &certificate.body.mls_signature_public_key,
+                )
+                .verify(
+                    &mls_identity::mls_device_binding_message(session_id, device_id, roster),
+                    &proof,
+                )
+                .map_err(|_| "MLS device binding proof is invalid".to_string())?;
+                let client_id = certificate.body.mls_client_id.clone();
+                self.sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(|| "session disappeared during MLS binding".to_string())?
+                    .mls_device = Some(BoundMlsDevice {
+                    device_id,
+                    roster,
+                    client_id,
+                });
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::MlsDeviceBound {
+                        device_id,
+                        available_key_packages: self.mls.key_package_count(device_id),
+                    },
+                )
+            }
+            ClientControl::PublishKeyPackages {
+                device_id,
+                packages,
+            } => {
+                let bound = require_mls_device(bound.as_ref(), device_id)?;
+                let available =
+                    self.mls
+                        .publish_key_packages(user_id, bound.device_id, packages)?;
+                let tokens = self
+                    .sessions
+                    .values()
+                    .map(|session| session.tcp_token)
+                    .filter(|token| self.clients.contains_key(token))
+                    .collect::<Vec<_>>();
+                self.send_control_to_tokens(
+                    &tokens,
+                    &ServerControl::KeyPackagesPublished {
+                        device_id,
+                        available,
+                    },
+                );
+                Ok(())
+            }
+            ClientControl::TakeKeyPackage { device_id } => {
+                let package = self.mls.take_key_package(device_id)?;
+                self.send_control_to_token(token, &ServerControl::KeyPackage { device_id, package })
+            }
+            ClientControl::CreateEncryptedRoom {
+                descriptor,
+                roster_checkpoints,
+                initial_commit,
+            } => {
+                let bound = bound
+                    .as_ref()
+                    .ok_or_else(|| "bind an active MLS device first".to_string())?;
+                let account_id = self.mls_account_id(user_id)?;
+                let room_id = descriptor.room_id;
+                let existing_group = self
+                    .mls
+                    .group_info(room_id)
+                    .map(|(descriptor, epoch, group_info)| {
+                        (descriptor.clone(), epoch, group_info.to_vec())
+                    });
+                if let Some((existing, epoch, group_info)) = existing_group {
+                    if !self.check_room_access(session_id, room_id) {
+                        return Err("encrypted room is not accessible".to_string());
+                    }
+                    return self.send_control_to_token(
+                        token,
+                        &ServerControl::GroupInfo {
+                            room_id,
+                            descriptor: Some(existing),
+                            epoch,
+                            group_info,
+                        },
+                    );
+                }
+                self.validate_encrypted_room_descriptor(&descriptor)?;
+                let welcome_devices = initial_commit
+                    .welcome
+                    .as_ref()
+                    .map(|welcome| welcome.device_ids.clone())
+                    .unwrap_or_default();
+                let epoch = self.mls.create_room(
+                    account_id,
+                    &bound.client_id,
+                    descriptor,
+                    &roster_checkpoints,
+                    initial_commit,
+                )?;
+                self.push_latest_mls_welcomes(&welcome_devices);
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::EncryptedRoomCreated { room_id, epoch },
+                )
+            }
+            ClientControl::FetchGroupInfo { room_id } => {
+                if !self.check_room_access(session_id, room_id) {
+                    return Err("encrypted room is not accessible".to_string());
+                }
+                let (descriptor, epoch, group_info) = self
+                    .mls
+                    .group_info(room_id)
+                    .map(|(descriptor, epoch, info)| {
+                        (Some(descriptor.clone()), epoch, info.to_vec())
+                    })
+                    .unwrap_or((None, 0, Vec::new()));
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::GroupInfo {
+                        room_id,
+                        descriptor,
+                        epoch,
+                        group_info,
+                    },
+                )
+            }
+            ClientControl::SubmitCommitBundle {
+                room_id,
+                expected_epoch,
+                bundle,
+            } => {
+                let bound = bound
+                    .as_ref()
+                    .ok_or_else(|| "bind an active MLS device first".to_string())?;
+                self.require_mls_room_member(user_id, room_id)?;
+                let welcome_devices = bundle
+                    .welcome
+                    .as_ref()
+                    .map(|welcome| welcome.device_ids.clone())
+                    .unwrap_or_default();
+                let outcome =
+                    self.mls
+                        .submit_commit(room_id, &bound.client_id, expected_epoch, bundle)?;
+                if matches!(outcome, rpc::mls::MlsCommitOutcome::Accepted { .. }) {
+                    self.push_latest_mls_welcomes(&welcome_devices);
+                }
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::MlsCommitSubmitted {
+                        room_id,
+                        outcome: outcome.clone(),
+                    },
+                )?;
+                if let rpc::mls::MlsCommitOutcome::Accepted { sequence, .. } = outcome
+                    && let Some(events) = self.mls.events(room_id, sequence - 1, 1)
+                {
+                    let tokens = self.mls_room_tokens(room_id);
+                    self.send_control_to_tokens(
+                        &tokens,
+                        &ServerControl::MlsEvents { room_id, events },
+                    );
+                }
+                Ok(())
+            }
+            ClientControl::SubmitMlsApplication {
+                room_id,
+                epoch,
+                event_id,
+                ciphertext,
+            } => {
+                bound
+                    .as_ref()
+                    .ok_or_else(|| "bind an active MLS device first".to_string())?;
+                self.require_mls_room_member(user_id, room_id)?;
+                let outcome = self
+                    .mls
+                    .submit_application(room_id, epoch, event_id, ciphertext)?;
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::MlsApplicationSubmitted {
+                        room_id,
+                        event_id,
+                        outcome,
+                    },
+                )?;
+                if let rpc::mls::MlsSubmitOutcome::Stored { sequence } = outcome
+                    && let Some(events) = self.mls.events(room_id, sequence - 1, 1)
+                {
+                    let tokens = self.mls_room_tokens(room_id);
+                    self.send_control_to_tokens(
+                        &tokens,
+                        &ServerControl::MlsEvents { room_id, events },
+                    );
+                }
+                Ok(())
+            }
+            ClientControl::FetchMlsEvents {
+                room_id,
+                after_sequence,
+                limit,
+            } => {
+                self.require_mls_room_member(user_id, room_id)?;
+                let events = self
+                    .mls
+                    .events(room_id, after_sequence, usize::from(limit))
+                    .ok_or_else(|| "encrypted room does not exist".to_string())?;
+                self.send_control_to_token(token, &ServerControl::MlsEvents { room_id, events })
+            }
+            ClientControl::FetchMlsWelcome { after_sequence } => {
+                let bound = bound
+                    .as_ref()
+                    .ok_or_else(|| "bind an active MLS device first".to_string())?;
+                let welcomes = self.mls.welcomes(bound.device_id, after_sequence);
+                let head_sequence = self.mls.welcome_head(bound.device_id);
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::MlsWelcomes {
+                        welcomes,
+                        head_sequence,
+                    },
+                )
+            }
+            ClientControl::AckMlsEvent { room_id, sequence } => {
+                self.require_mls_room_member(user_id, room_id)?;
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::MlsEventAcked { room_id, sequence },
+                )
+            }
+            _ => unreachable!("non-MLS control routed to MLS handler"),
+        }
+    }
+
+    fn mls_account_id(&self, user_id: UserId) -> Result<rpc::ids::AccountId, String> {
+        self.mls
+            .roster(user_id)
+            .map(|roster| roster.body.account_id)
+            .ok_or_else(|| "account has no MLS device roster".to_string())
+    }
+
+    fn require_mls_room_member(&self, user_id: UserId, room_id: RoomId) -> Result<(), String> {
+        let account_id = self.mls_account_id(user_id)?;
+        if self.mls.room_account_member(room_id, account_id) {
+            Ok(())
+        } else {
+            Err("account is not a member of the encrypted room".to_string())
+        }
+    }
+
+    fn mls_room_tokens(&self, room_id: RoomId) -> Vec<Token> {
+        self.sessions
+            .values()
+            .filter_map(|session| {
+                let account_id = self.mls.roster(session.user_id)?.body.account_id;
+                (self.mls.room_account_member(room_id, account_id)
+                    && self.clients.contains_key(&session.tcp_token))
+                .then_some(session.tcp_token)
+            })
+            .collect()
+    }
+
+    fn validate_encrypted_room_descriptor(
+        &self,
+        descriptor: &rpc::mls::EncryptedRoomDescriptor,
+    ) -> Result<(), String> {
+        let mut members = descriptor
+            .member_accounts
+            .iter()
+            .map(|account| {
+                self.mls
+                    .user_for_account(*account)
+                    .ok_or_else(|| "encrypted room account has no current roster".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        members.sort_unstable();
+        let room = self
+            .rooms
+            .get(&descriptor.room_id)
+            .ok_or_else(|| "create the Chatt room before its MLS group".to_string())?;
+        let mut expected = match &room.access {
+            RoomAccess::Dm(user_a, user_b) => vec![*user_a, *user_b],
+            RoomAccess::Private(users) => users.iter().copied().collect(),
+            RoomAccess::Public => {
+                return Err(
+                    "public rooms cannot be replaced by an encrypted descriptor".to_string()
+                );
+            }
+        };
+        expected.sort_unstable();
+        if members != expected {
+            return Err(
+                "encrypted descriptor does not match the Chatt room membership".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn push_latest_mls_welcomes(&mut self, devices: &[DeviceId]) {
+        let deliveries = self
+            .sessions
+            .values()
+            .filter_map(|session| {
+                let bound = session.mls_device.as_ref()?;
+                devices.contains(&bound.device_id).then(|| {
+                    let head_sequence = self.mls.welcome_head(bound.device_id);
+                    let welcomes = self
+                        .mls
+                        .welcomes(bound.device_id, head_sequence.saturating_sub(1));
+                    (session.tcp_token, welcomes, head_sequence)
+                })
+            })
+            .collect::<Vec<_>>();
+        for (token, welcomes, head_sequence) in deliveries {
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::MlsWelcomes {
+                    welcomes,
+                    head_sequence,
+                },
+            );
+        }
+    }
+
     fn create_device_link(
         &mut self,
         session_id: SessionId,
         redemption_secret_hash: Vec<u8>,
         enrollment_bundle: Vec<u8>,
-        verification_checkpoint: Option<VerificationSyncCheckpoint>,
     ) -> Result<(), String> {
         let (user_id, tcp_token, is_bound) = self
             .sessions
             .get(&session_id)
-            .map(|session| (session.user_id, session.tcp_token, session.e2e_device.is_some()))
+            .map(|session| {
+                (
+                    session.user_id,
+                    session.tcp_token,
+                    session.mls_device.is_some(),
+                )
+            })
             .ok_or_else(|| "unknown session".to_string())?;
         if !is_bound {
-            return Err("bind an active E2E device before creating a device link".to_string());
+            return Err("bind an active MLS device before creating a device link".to_string());
         }
         self.expire_device_links();
-        let current_verification = self
-            .verification_sync
-            .current(user_id)?
-            .map(|(checkpoint, _)| checkpoint);
-        if current_verification != verification_checkpoint {
-            return Err(
-                "fetch the latest E2E verification state before creating a device link"
-                    .to_string(),
-            );
-        }
         if self.device_links.contains_key(&redemption_secret_hash) {
             return Err("device-link redemption secret is already active".to_string());
         }
@@ -2201,6 +2682,11 @@ impl Server {
             DeviceLinkState {
                 user_id,
                 enrollment_bundle,
+                current_roster: self
+                    .mls
+                    .roster(user_id)
+                    .cloned()
+                    .ok_or_else(|| "device-link account has no MLS roster".to_string())?,
                 expires_at: Instant::now() + DEVICE_LINK_TTL,
                 redemption: DeviceLinkRedemption::Active,
             },
@@ -2222,10 +2708,16 @@ impl Server {
         let (user_id, token, bound) = self
             .sessions
             .get(&session_id)
-            .map(|session| (session.user_id, session.tcp_token, session.e2e_device.is_some()))
+            .map(|session| {
+                (
+                    session.user_id,
+                    session.tcp_token,
+                    session.mls_device.is_some(),
+                )
+            })
             .ok_or_else(|| "unknown session".to_string())?;
         if !bound {
-            return Err("bind an active E2E device before canceling a device link".to_string());
+            return Err("bind an active MLS device before canceling a device link".to_string());
         }
         self.expire_device_links();
         let link = self
@@ -2262,12 +2754,12 @@ impl Server {
             .username_for(link.user_id)
             .ok_or_else(|| "device-link account has no registered username".to_string())?
             .to_string();
-        let account_chain = self.device_directory.chain_for(link.user_id)?;
+        let current_roster = link.current_roster.clone();
         self.send_control_to_token(
             token,
             &ServerControl::DeviceLinkBundle {
                 enrollment_bundle: link.enrollment_bundle.clone(),
-                account_chain,
+                current_roster,
                 user_id: link.user_id,
                 username,
             },
@@ -2278,7 +2770,10 @@ impl Server {
         &mut self,
         token: Token,
         redemption_secret: &str,
-        statement: rpc::e2e::AccountKeyStatement,
+        attempt_id: rpc::ids::PairAttemptId,
+        expected_roster: mls_identity::RosterCheckpoint,
+        roster: mls_identity::SignedDeviceRoster,
+        key_packages: Vec<rpc::mls::PublishedKeyPackage>,
         bearer_token: String,
         receive_files: bool,
         file_receive_limit_bytes: u64,
@@ -2300,19 +2795,32 @@ impl Server {
                 .to_string(),
             link.redemption.clone(),
         );
-        let (device_id, device_name) = match &statement.body.action {
-            AccountKeyAction::AddDevice { device } => (device.device_id, device.name.clone()),
-            _ => return Err("device-link redemption requires an AddDevice statement".to_string()),
-        };
-        let statement_hash = rpc::e2e::account_statement_hash(&statement);
+        let added = match &redemption {
+            DeviceLinkRedemption::Active => roster.body.active_devices.iter().find(|certificate| {
+                self.mls.roster(user_id).is_some_and(|current| {
+                    !current
+                        .body
+                        .active_devices
+                        .iter()
+                        .any(|old| old.body.device_id == certificate.body.device_id)
+                })
+            }),
+            DeviceLinkRedemption::Redeemed { device_id, .. } => roster
+                .body
+                .active_devices
+                .iter()
+                .find(|certificate| certificate.body.device_id == *device_id),
+        }
+        .ok_or_else(|| "device-link roster does not add the expected device".to_string())?;
+        let (device_id, device_name) = (added.body.device_id, added.body.device_name.clone());
         let (credential_hash, first_redemption) = match redemption {
             DeviceLinkRedemption::Active => (hash_secret(&bearer_token), true),
             DeviceLinkRedemption::Redeemed {
                 device_id: redeemed_device,
                 credential_hash,
-                statement_hash: redeemed_statement,
+                attempt_id: redeemed_attempt,
             } if redeemed_device == device_id
-                && redeemed_statement == statement_hash
+                && redeemed_attempt == attempt_id
                 && crate::config::verify_secret_hash(&credential_hash, &bearer_token) =>
             {
                 (credential_hash, false)
@@ -2325,14 +2833,15 @@ impl Server {
                 );
             }
         };
-        let (roster_epoch, head) = self.device_directory.redeem_device(
-            user_id,
-            statement,
-            credential_hash.clone(),
-            device_id,
-            0,
-        )?;
         if first_redemption {
+            self.mls.redeem_pair(
+                user_id,
+                expected_roster,
+                roster,
+                device_id,
+                credential_hash.clone(),
+                key_packages,
+            )?;
             let link = self
                 .device_links
                 .get_mut(&secret_hash)
@@ -2340,7 +2849,7 @@ impl Server {
             link.redemption = DeviceLinkRedemption::Redeemed {
                 device_id,
                 credential_hash: credential_hash.clone(),
-                statement_hash,
+                attempt_id,
             };
         }
 
@@ -2359,7 +2868,22 @@ impl Server {
                     device_name,
                 },
             );
-            self.announce_account_key_head_changed(user_id, roster_epoch, head);
+            if let Some(roster) = self.mls.roster(user_id).cloned() {
+                let roster_tokens = self
+                    .sessions
+                    .values()
+                    .map(|session| session.tcp_token)
+                    .filter(|token| self.clients.contains_key(token))
+                    .collect::<Vec<_>>();
+                self.send_control_to_tokens(
+                    &roster_tokens,
+                    &ServerControl::DeviceRoster {
+                        user_id,
+                        initialized: true,
+                        roster: Some(roster),
+                    },
+                );
+            }
         }
 
         let user = self
@@ -2394,6 +2918,34 @@ impl Server {
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
         kvlog::info!("authenticate attempt", token = token.0);
+        if let Some((user_id, _device_id, credential_hash)) =
+            self.mls.authenticate_credential(auth_token)
+        {
+            let username = username.trim();
+            if !valid_username(username) || !self.usernames.is_available(username, Some(user_id)) {
+                return self.reject_auth(
+                    token,
+                    ERROR_AUTH_REJECTED,
+                    "authentication failed: invalid username for this MLS device".to_string(),
+                );
+            }
+            let user = self
+                .users
+                .users
+                .iter()
+                .find(|user| user.id == user_id)
+                .cloned()
+                .unwrap_or_else(|| Self::dynamic_user(user_id, username));
+            return self.establish_session_with_credential(
+                token,
+                &user,
+                receive_files,
+                file_receive_limit_bytes,
+                true,
+                Some(credential_hash),
+                None,
+            );
+        }
         if let Some((user_id, _device_id, password_epoch, credential_hash)) =
             self.device_directory.authenticate_credential(auth_token)
         {
@@ -2435,7 +2987,9 @@ impl Server {
                 if user.username == username {
                     user
                 } else {
-                    let updated = self.users.set_user_username(user_id, username.to_string())?;
+                    let updated = self
+                        .users
+                        .set_user_username(user_id, username.to_string())?;
                     self.usernames.set_explicit(user_id, &updated.username);
                     updated
                 }
@@ -2522,11 +3076,7 @@ impl Server {
             }
         };
         let credential_hash = user.token_hash.clone();
-        if self
-            .device_directory
-            .credential(&credential_hash)
-            .is_none()
-        {
+        if self.device_directory.credential(&credential_hash).is_none() {
             if self.device_directory.validated(user.id)?.is_some() {
                 return self.reject_auth(
                     token,
@@ -2535,12 +3085,8 @@ impl Server {
                         .to_string(),
                 );
             }
-            self.device_directory.add_credential(
-                user.id,
-                credential_hash.clone(),
-                None,
-                0,
-            )?;
+            self.device_directory
+                .add_credential(user.id, credential_hash.clone(), None, 0)?;
         }
         self.establish_session_with_credential(
             token,
@@ -2651,30 +3197,31 @@ impl Server {
             );
             return self.reject_username_taken(token);
         }
-        let user = match self
-            .users
-            .mark_user_paired(&user_name, username.to_string(), String::new())
-        {
-            Ok(user) => user,
-            Err(error) => {
-                kvlog::error!(
-                    "pairing rejected",
-                    token = token.0,
-                    user = user_name.as_str(),
-                    reason = "state_write_failed",
-                    error = error.as_str()
-                );
-                return self.reject_auth(
-                    token,
-                    control::ERROR_INTERNAL,
-                    "pairing failed: the server could not persist the pairing; retry pairing"
-                        .to_string(),
-                );
-            }
-        };
-        if let Err(error) = self
-            .device_directory
-            .add_credential(user.id, token_hash.clone(), None, 0)
+        let user =
+            match self
+                .users
+                .mark_user_paired(&user_name, username.to_string(), String::new())
+            {
+                Ok(user) => user,
+                Err(error) => {
+                    kvlog::error!(
+                        "pairing rejected",
+                        token = token.0,
+                        user = user_name.as_str(),
+                        reason = "state_write_failed",
+                        error = error.as_str()
+                    );
+                    return self.reject_auth(
+                        token,
+                        control::ERROR_INTERNAL,
+                        "pairing failed: the server could not persist the pairing; retry pairing"
+                            .to_string(),
+                    );
+                }
+            };
+        if let Err(error) =
+            self.device_directory
+                .add_credential(user.id, token_hash.clone(), None, 0)
         {
             return self.reject_auth(
                 token,
@@ -2796,8 +3343,7 @@ impl Server {
                 "open pairing failed: recovery token is invalid".to_string(),
             );
         }
-        let existing_user_id = token_user_id
-            .or(recovery_user_id);
+        let existing_user_id = token_user_id.or(recovery_user_id);
         let Some(user_id) = existing_user_id else {
             return self.reject_auth(
                 token,
@@ -3019,6 +3565,7 @@ impl Server {
                 connected_at_ms: now_ms(),
                 pending_disk_history_fetches: 0,
                 e2e_device: None,
+                mls_device: None,
                 credential_hash,
             },
         );
@@ -3076,9 +3623,7 @@ impl Server {
             .filter(|session| session.user_id == user_id && session.announced)
             .count()
             == 1;
-        if announce
-            && first_announced_session
-            && self.live_token_for_session(session_id).is_some()
+        if announce && first_announced_session && self.live_token_for_session(session_id).is_some()
         {
             self.broadcast_presence(session_id, true);
         }
@@ -3240,8 +3785,7 @@ impl Server {
             roster_epoch,
             head,
             revoked_credentials,
-        } =
-            self.device_directory.append(user_id, statement)?
+        } = self.device_directory.append(user_id, statement)?
         else {
             return Ok(());
         };
@@ -3922,13 +4466,18 @@ impl Server {
             .is_some_and(|room| matches!(room.access, RoomAccess::Dm(..)))
     }
 
-    /// Enforces the end-to-end policy on an incoming chat payload: DM rooms
-    /// accept only sealed envelopes and other rooms only plaintext.
+    /// Legacy custom envelopes are never accepted. Private rooms and DMs use
+    /// the MLS delivery service; the ordinary chat store is public-only.
     fn envelope_policy_error(&self, room_id: RoomId, has_envelope: bool) -> Option<&'static str> {
-        match (self.room_is_dm(room_id), has_envelope) {
-            (true, false) => Some("direct messages require end-to-end encryption"),
-            (false, true) => Some("sealed envelopes are only accepted in direct messages"),
-            _ => None,
+        if has_envelope {
+            return Some("legacy sealed envelopes are no longer accepted");
+        }
+        match self.rooms.get(&room_id).map(|room| &room.access) {
+            Some(RoomAccess::Public) => None,
+            Some(RoomAccess::Private(_) | RoomAccess::Dm(..)) => {
+                Some("encrypted rooms accept messages only through MLS")
+            }
+            None => None,
         }
     }
 
@@ -3993,10 +4542,7 @@ impl Server {
             return Some("direct message recipient device roster is stale");
         }
         let mut expected_recipients = Vec::new();
-        for (user_id, ledger) in [
-            (session.user_id, &sender_ledger),
-            (peer, &peer_ledger),
-        ] {
+        for (user_id, ledger) in [(session.user_id, &sender_ledger), (peer, &peer_ledger)] {
             for device in ledger.active_devices() {
                 expected_recipients.push((
                     user_id,
@@ -4060,24 +4606,6 @@ impl Server {
                 room_id = room_id.0,
                 error
             );
-            let token = self
-                .live_token_for_session(session_id)
-                .ok_or_else(|| "chat sender disconnected".to_string())?;
-            return self.send_control_to_token(
-                token,
-                &ServerControl::Error {
-                    code: control::ERROR_REQUEST_REJECTED,
-                    message: error.to_string(),
-                },
-            );
-        }
-        if let Some(error) = self.dm_event_origin_error(
-            session_id,
-            room_id,
-            envelope.as_deref(),
-            DmContentKind::Text,
-            None,
-        ) {
             let token = self
                 .live_token_for_session(session_id)
                 .ok_or_else(|| "chat sender disconnected".to_string())?;
@@ -4163,27 +4691,6 @@ impl Server {
                 error
             );
             return self.reject_chat_mutation(session_id, room_id, target, kind, error.to_string());
-        }
-        let event_kind = match kind {
-            MutationKind::Edit => DmContentKind::Edit,
-            MutationKind::Delete => DmContentKind::Delete,
-        };
-        if let Some(error) =
-            self.dm_event_origin_error(
-                session_id,
-                room_id,
-                envelope.as_deref(),
-                event_kind,
-                Some(target),
-            )
-        {
-            return self.reject_chat_mutation(
-                session_id,
-                room_id,
-                target,
-                kind,
-                error.to_string(),
-            );
         }
         if let Err(denied) = self.store.validate_mutation(room_id, target, sender, kind) {
             kvlog::warn!(
@@ -4300,26 +4807,30 @@ impl Server {
         if original_size > self.file_size_limit_bytes {
             return Err("file exceeds server maximum length".into());
         }
+        let encrypted_room = self
+            .rooms
+            .get(&room_id)
+            .is_some_and(|room| !matches!(room.access, RoomAccess::Public));
+        let mls_encrypted = self.mls.group_info(room_id).is_some();
+        if encrypted_room && !mls_encrypted {
+            return Err("encrypted room file transfer is waiting for MLS setup".into());
+        }
         if sealed_meta.is_some() != (encoding == FileContentEncoding::Sealed) {
             return Err("sealed metadata does not match the upload encoding".into());
         }
-        if (encoding == FileContentEncoding::Sealed) != self.room_is_dm(room_id) {
+        if (encoding == FileContentEncoding::Sealed) != mls_encrypted {
             return Err(match encoding {
-                FileContentEncoding::Sealed => {
-                    "sealed uploads are only accepted in direct messages"
-                }
-                _ => "direct message uploads require end-to-end encryption",
+                FileContentEncoding::Sealed => "sealed uploads require an initialized MLS room",
+                _ => "MLS room uploads require end-to-end encryption",
             }
             .into());
         }
-        if let Some(error) = self.dm_event_origin_error(
-            session_id,
-            room_id,
-            sealed_meta.as_deref(),
-            DmContentKind::FileAnnounce,
-            None,
-        ) {
-            return Err(error.to_string());
+        if mls_encrypted
+            && sealed_meta
+                .as_ref()
+                .is_none_or(|event_id| event_id.len() != 16)
+        {
+            return Err("MLS file upload has an invalid announcement event id".to_string());
         }
         let key = (session_id, client_transfer_id);
         if self.active_uploads.contains_key(&key) {
@@ -4440,8 +4951,10 @@ impl Server {
             );
             return accepted;
         }
-        self.store.append(room_id, &message);
-        self.broadcast_control(room_id, &ServerControl::Chat { message });
+        if !mls_encrypted {
+            self.store.append(room_id, &message);
+            self.broadcast_control(room_id, &ServerControl::Chat { message });
+        }
         if self.live_token_for_session(session_id).is_none() {
             // The uploader's teardown during the broadcast already canceled
             // the upload, giving the persisted message its terminal event.
@@ -5646,9 +6159,7 @@ impl Server {
         let announce_offline = self.sessions.get(&session_id).is_some_and(|leaving| {
             leaving.announced
                 && !self.sessions.iter().any(|(other_id, other)| {
-                    *other_id != session_id
-                        && other.user_id == leaving.user_id
-                        && other.announced
+                    *other_id != session_id && other.user_id == leaving.user_id && other.announced
                 })
         });
         if announce_offline {
@@ -6386,6 +6897,8 @@ struct Session {
     /// Device possession proof bound to the current signed account-ledger head.
     /// `None` sessions may fetch/link devices but cannot originate DM events.
     e2e_device: Option<BoundE2eDevice>,
+    /// Active MLS credential proven on this exact authenticated session.
+    mls_device: Option<BoundMlsDevice>,
     /// Persisted bearer credential used by this installation. Revoking the
     /// corresponding E2E device removes this hash in the same snapshot.
     credential_hash: Option<String>,
@@ -6401,6 +6914,23 @@ struct BoundE2eDevice {
     device_id: DeviceId,
     key_epoch: u64,
     ledger_head: LedgerHash,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BoundMlsDevice {
+    device_id: DeviceId,
+    roster: mls_identity::RosterCheckpoint,
+    client_id: Vec<u8>,
+}
+
+fn require_mls_device(
+    bound: Option<&BoundMlsDevice>,
+    device_id: DeviceId,
+) -> Result<&BoundMlsDevice, String> {
+    match bound {
+        Some(bound) if bound.device_id == device_id => Ok(bound),
+        _ => Err("bind the named active MLS device first".to_string()),
+    }
 }
 
 impl Session {
@@ -6519,6 +7049,7 @@ struct InviteState {
 struct DeviceLinkState {
     user_id: UserId,
     enrollment_bundle: Vec<u8>,
+    current_roster: mls_identity::SignedDeviceRoster,
     expires_at: Instant,
     redemption: DeviceLinkRedemption,
 }
@@ -6529,7 +7060,7 @@ enum DeviceLinkRedemption {
     Redeemed {
         device_id: DeviceId,
         credential_hash: String,
-        statement_hash: LedgerHash,
+        attempt_id: rpc::ids::PairAttemptId,
     },
 }
 
@@ -6921,6 +7452,18 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::CancelDeviceLink { .. } => "cancel_device_link",
         ClientControl::FetchDeviceLink { .. } => "fetch_device_link",
         ClientControl::RedeemDeviceLink { .. } => "redeem_device_link",
+        ClientControl::FetchDeviceRoster { .. } => "fetch_device_roster",
+        ClientControl::PutDeviceRoster { .. } => "put_device_roster",
+        ClientControl::BindMlsDevice { .. } => "bind_mls_device",
+        ClientControl::PublishKeyPackages { .. } => "publish_key_packages",
+        ClientControl::TakeKeyPackage { .. } => "take_key_package",
+        ClientControl::CreateEncryptedRoom { .. } => "create_encrypted_room",
+        ClientControl::FetchGroupInfo { .. } => "fetch_group_info",
+        ClientControl::SubmitCommitBundle { .. } => "submit_commit_bundle",
+        ClientControl::SubmitMlsApplication { .. } => "submit_mls_application",
+        ClientControl::FetchMlsEvents { .. } => "fetch_mls_events",
+        ClientControl::FetchMlsWelcome { .. } => "fetch_mls_welcome",
+        ClientControl::AckMlsEvent { .. } => "ack_mls_event",
     }
 }
 
@@ -6976,6 +7519,19 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
         ServerControl::DeviceLinked { .. } => "device_linked",
         ServerControl::DeviceLinkRedeemed { .. } => "device_link_redeemed",
+        ServerControl::DeviceRoster { .. } => "device_roster",
+        ServerControl::DeviceRosterStored { .. } => "device_roster_stored",
+        ServerControl::DeviceRosterConflict { .. } => "device_roster_conflict",
+        ServerControl::MlsDeviceBound { .. } => "mls_device_bound",
+        ServerControl::KeyPackagesPublished { .. } => "key_packages_published",
+        ServerControl::KeyPackage { .. } => "key_package",
+        ServerControl::EncryptedRoomCreated { .. } => "encrypted_room_created",
+        ServerControl::GroupInfo { .. } => "group_info",
+        ServerControl::MlsCommitSubmitted { .. } => "mls_commit_submitted",
+        ServerControl::MlsApplicationSubmitted { .. } => "mls_application_submitted",
+        ServerControl::MlsEvents { .. } => "mls_events",
+        ServerControl::MlsWelcomes { .. } => "mls_welcomes",
+        ServerControl::MlsEventAcked { .. } => "mls_event_acked",
     }
 }
 
@@ -7057,6 +7613,7 @@ mod tests {
             connected_at_ms: 0,
             pending_disk_history_fetches: 0,
             e2e_device: None,
+            mls_device: None,
             credential_hash: None,
         }
     }
@@ -7884,6 +8441,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "private room chat now uses MLS delivery"]
     fn private_room_chat_reaches_members_only() {
         let mut server = test_server();
         let secret = RoomId(3);
@@ -8051,7 +8609,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn test_account_genesis(server: &Server, user_id: UserId, tag: u8) -> rpc::e2e::AccountKeyStatement {
+    fn test_account_genesis(
+        server: &Server,
+        user_id: UserId,
+        tag: u8,
+    ) -> rpc::e2e::AccountKeyStatement {
         let authority_seed = [tag; 32];
         let signing_seed = [tag.wrapping_add(1); 32];
         let encryption_seed = [tag.wrapping_add(2); 32];
@@ -8094,10 +8656,7 @@ mod tests {
         tag: u8,
     ) -> (BoundE2eDevice, rpc::ids::AccountId) {
         let genesis = test_account_genesis(server, user_id, tag);
-        server
-            .device_directory
-            .append(user_id, genesis)
-            .unwrap();
+        server.device_directory.append(user_id, genesis).unwrap();
         let ledger = server.device_directory.validated(user_id).unwrap().unwrap();
         let bound = BoundE2eDevice {
             device_id: DeviceId([tag; 16]),
@@ -8106,6 +8665,76 @@ mod tests {
         };
         server.sessions.get_mut(&session_id).unwrap().e2e_device = Some(bound);
         (bound, ledger.account_id)
+    }
+
+    fn test_mls_roster(
+        server: &Server,
+        user_id: UserId,
+        authority_seed: [u8; 32],
+        devices: &[(u8, &str)],
+        revision: u64,
+    ) -> mls_identity::SignedDeviceRoster {
+        let server_id: [u8; 32] = server
+            .server_key_pair
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let authority_public_key = mls_identity::authority_public_key(&authority_seed).unwrap();
+        let account_id = mls_identity::account_id(&server_id, user_id, &authority_public_key);
+        let mut active_devices = devices
+            .iter()
+            .map(|(tag, name)| {
+                let device_id = DeviceId([*tag; 16]);
+                mls_identity::sign_device_certificate(
+                    mls_identity::DeviceCertificateBody {
+                        user_id,
+                        account_id,
+                        authority_public_key,
+                        device_id,
+                        device_name: (*name).to_string(),
+                        mls_client_id: mls_identity::mls_client_id(
+                            &server_id, account_id, device_id,
+                        )
+                        .unwrap(),
+                        mls_signature_public_key: vec![*tag; 32],
+                    },
+                    &authority_seed,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        active_devices.sort_by_key(|certificate| certificate.body.device_id);
+        mls_identity::sign_device_roster(
+            mls_identity::DeviceRosterBody {
+                user_id,
+                account_id,
+                authority_public_key,
+                revision,
+                active_devices,
+            },
+            &authority_seed,
+        )
+        .unwrap()
+    }
+
+    fn authorize_test_mls_device(
+        server: &mut Server,
+        session_id: SessionId,
+        user_id: UserId,
+        tag: u8,
+    ) {
+        let roster = test_mls_roster(server, user_id, [tag; 32], &[(tag, "test")], 1);
+        server
+            .mls
+            .put_roster(user_id, None, roster.clone())
+            .unwrap();
+        let certificate = &roster.body.active_devices[0].body;
+        server.sessions.get_mut(&session_id).unwrap().mls_device = Some(BoundMlsDevice {
+            device_id: certificate.device_id,
+            roster: mls_identity::roster_checkpoint(&roster),
+            client_id: certificate.mls_client_id.clone(),
+        });
     }
 
     fn test_dm_event(
@@ -8147,25 +8776,25 @@ mod tests {
             }
         }
         let header = rpc::e2e::SenderEventHeader {
-                event_id: rpc::ids::EventId([tag; 16]),
-                room_id,
-                sender,
-                sender_account: account_id,
-                author_device: bound.device_id,
-                author_key_epoch: bound.key_epoch,
-                sequence: u64::from(tag).max(1),
-                predecessor: None,
-                kind,
-                created_at_ms: u64::from(tag),
-                semantic_target,
-                sender_roster: rpc::e2e::RosterCheckpoint {
-                    account_id,
-                    account_generation: 1,
-                    roster_epoch: 1,
-                    head: bound.ledger_head,
-                },
-                recipient_roster,
-            };
+            event_id: rpc::ids::EventId([tag; 16]),
+            room_id,
+            sender,
+            sender_account: account_id,
+            author_device: bound.device_id,
+            author_key_epoch: bound.key_epoch,
+            sequence: u64::from(tag).max(1),
+            predecessor: None,
+            kind,
+            created_at_ms: u64::from(tag),
+            semantic_target,
+            sender_roster: rpc::e2e::RosterCheckpoint {
+                account_id,
+                account_generation: 1,
+                roster_epoch: 1,
+                head: bound.ledger_head,
+            },
+            recipient_roster,
+        };
         let signing_seed = [bound.device_id.0[0].wrapping_add(1); 32];
         let content = match kind {
             DmContentKind::Text => rpc::e2e::DmContent::Text {
@@ -8266,11 +8895,13 @@ mod tests {
                 ..
             }
         ));
-        assert!(server
-            .device_directory
-            .chain_for(UserId(1))
-            .unwrap()
-            .is_empty());
+        assert!(
+            server
+                .device_directory
+                .chain_for(UserId(1))
+                .unwrap()
+                .is_empty()
+        );
 
         server
             .handle_control(token, ClientControl::Ping { nonce: 41 })
@@ -8282,81 +8913,58 @@ mod tests {
     }
 
     #[test]
-    fn device_link_redemption_broadcasts_new_roster_to_other_accounts() {
+    fn device_link_redemption_atomically_installs_mls_roster_packages_and_bearer() {
         let mut server = test_server();
-        let alice = UserId(config::FIRST_DYNAMIC_USER_ID);
-        server.usernames.claim_dynamic(alice, "Alice").unwrap();
-        let genesis = test_account_genesis(&server, alice, 7);
-        server
-            .device_directory
-            .append(alice, genesis)
-            .unwrap();
-        let ledger = server.device_directory.validated(alice).unwrap().unwrap();
+        let user_id = UserId(config::FIRST_DYNAMIC_USER_ID);
+        server.usernames.claim_dynamic(user_id, "Alice").unwrap();
         let authority_seed = [7; 32];
+        let current = test_mls_roster(&server, user_id, authority_seed, &[(7, "first")], 1);
+        server
+            .mls
+            .put_roster(user_id, None, current.clone())
+            .unwrap();
+        let next = test_mls_roster(
+            &server,
+            user_id,
+            authority_seed,
+            &[(7, "first"), (9, "second")],
+            2,
+        );
         let device_id = DeviceId([9; 16]);
-        let statement = rpc::e2e::sign_account_statement(
-            rpc::e2e::AccountKeyStatementBody {
-                account_id: ledger.account_id,
-                account_generation: ledger.account_generation,
-                roster_epoch: ledger.roster_epoch + 1,
-                previous: ledger.head,
-                authority_key_epoch: ledger.authority_key_epoch,
-                action: rpc::e2e::AccountKeyAction::AddDevice {
-                    device: rpc::e2e::DevicePublicKeys {
-                        device_id,
-                        name: "Alice's second device".to_string(),
-                        key_epoch: 1,
-                        signing_public_key: rpc::e2e::ed25519_public_key(&[10; 32])
-                            .unwrap()
-                            .to_vec(),
-                        encryption_public_key: rpc::e2e::e2e_public_key(&[11; 32]).to_vec(),
-                    },
-                },
-            },
-            &authority_seed,
-            None,
-        )
-        .unwrap();
-
-        let _alice_peer = live_user(&mut server, Token(11), SessionId(1), alice);
-        let mut bob_peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
-        server.next_session = 3;
-        let mut linking_peer = seed_session_client(&mut server, Token(33));
+        let packages = vec![rpc::mls::PublishedKeyPackage {
+            device_id,
+            package: vec![1, 2, 3],
+        }];
+        let attempt_id = rpc::ids::PairAttemptId([5; 16]);
         let redemption_secret = "single-use-device-link-secret";
         server.device_links.insert(
             device_link_secret_hash(redemption_secret),
             DeviceLinkState {
-                user_id: alice,
+                user_id,
                 enrollment_bundle: vec![1],
+                current_roster: current.clone(),
                 expires_at: Instant::now() + DEVICE_LINK_TTL,
                 redemption: DeviceLinkRedemption::Active,
             },
         );
-
+        let mut linking_peer = seed_session_client(&mut server, Token(33));
+        let bearer = "tct2_test-device-bearer-token-value".to_string();
         server
             .redeem_device_link(
                 Token(33),
                 redemption_secret,
-                statement.clone(),
-                "tct2_test-device-bearer-token-value".to_string(),
+                attempt_id,
+                mls_identity::roster_checkpoint(&current),
+                next.clone(),
+                packages.clone(),
+                bearer.clone(),
                 false,
                 0,
             )
             .unwrap();
-
-        let changed = read_until(&mut bob_peer, |control| {
-            matches!(control, ServerControl::AccountKeyHeadChanged { .. })
-        });
-        let ServerControl::AccountKeyHeadChanged {
-            user_id,
-            roster_epoch,
-            ..
-        } = changed
-        else {
-            unreachable!();
-        };
-        assert_eq!(user_id, alice);
-        assert_eq!(roster_epoch, 2);
+        assert_eq!(server.mls.roster(user_id), Some(&next));
+        assert!(server.mls.authenticate_credential(&bearer).is_some());
+        assert!(server.mls.take_key_package(device_id).unwrap().is_some());
         assert!(matches!(
             read_until(&mut linking_peer, |control| matches!(
                 control,
@@ -8365,42 +8973,16 @@ mod tests {
             ServerControl::DeviceLinked { .. }
         ));
 
-        let advanced = server.device_directory.validated(alice).unwrap().unwrap();
-        let later_statement = rpc::e2e::sign_account_statement(
-            rpc::e2e::AccountKeyStatementBody {
-                account_id: advanced.account_id,
-                account_generation: advanced.account_generation,
-                roster_epoch: advanced.roster_epoch + 1,
-                previous: advanced.head,
-                authority_key_epoch: advanced.authority_key_epoch,
-                action: rpc::e2e::AccountKeyAction::AddDevice {
-                    device: rpc::e2e::DevicePublicKeys {
-                        device_id: DeviceId([12; 16]),
-                        name: "Alice's later device".to_string(),
-                        key_epoch: 1,
-                        signing_public_key: rpc::e2e::ed25519_public_key(&[13; 32])
-                            .unwrap()
-                            .to_vec(),
-                        encryption_public_key: rpc::e2e::e2e_public_key(&[14; 32]).to_vec(),
-                    },
-                },
-            },
-            &authority_seed,
-            None,
-        )
-        .unwrap();
-        server
-            .device_directory
-            .append(alice, later_statement)
-            .unwrap();
-
         let mut retry_peer = seed_session_client(&mut server, Token(44));
         server
             .redeem_device_link(
                 Token(44),
                 redemption_secret,
-                statement.clone(),
-                "tct2_test-device-bearer-token-value".to_string(),
+                attempt_id,
+                mls_identity::roster_checkpoint(&current),
+                next,
+                packages,
+                bearer,
                 false,
                 0,
             )
@@ -8412,24 +8994,6 @@ mod tests {
             )),
             ServerControl::DeviceLinked { .. }
         ));
-        let mut copied_link_peer = seed_session_client(&mut server, Token(55));
-        server
-            .redeem_device_link(
-                Token(55),
-                redemption_secret,
-                statement,
-                "tct2_different-device-bearer-token-value".to_string(),
-                false,
-                0,
-            )
-            .unwrap();
-        assert!(matches!(
-            read_plaintext_server_control(&mut copied_link_peer),
-            ServerControl::Error {
-                code: ERROR_DEVICE_LINK_UNAVAILABLE,
-                ..
-            }
-        ));
     }
 
     #[test]
@@ -8438,17 +9002,17 @@ mod tests {
         let user_id = UserId(config::FIRST_DYNAMIC_USER_ID);
         let session_id = SessionId(1);
         let mut peer = live_user(&mut server, Token(11), session_id, user_id);
-        authorize_test_e2e_device(&mut server, session_id, user_id, 7);
+        authorize_test_mls_device(&mut server, session_id, user_id, 7);
 
         server
-            .create_device_link(session_id, vec![1; 32], vec![1], None)
+            .create_device_link(session_id, vec![1; 32], vec![1])
             .unwrap();
         assert!(matches!(
             read_plaintext_server_control(&mut peer),
             ServerControl::DeviceLinkCreated { .. }
         ));
         server
-            .create_device_link(session_id, vec![2; 32], vec![2], None)
+            .create_device_link(session_id, vec![2; 32], vec![2])
             .unwrap();
         assert!(matches!(
             read_plaintext_server_control(&mut peer),
@@ -8472,11 +9036,11 @@ mod tests {
         let user_id = UserId(config::FIRST_DYNAMIC_USER_ID);
         let session_id = SessionId(1);
         let mut peer = live_user(&mut server, Token(11), session_id, user_id);
-        authorize_test_e2e_device(&mut server, session_id, user_id, 7);
+        authorize_test_mls_device(&mut server, session_id, user_id, 7);
         let secret_hash = vec![9; 32];
 
         server
-            .create_device_link(session_id, secret_hash.clone(), vec![1], None)
+            .create_device_link(session_id, secret_hash.clone(), vec![1])
             .unwrap();
         assert!(matches!(
             read_plaintext_server_control(&mut peer),
@@ -8527,6 +9091,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "custom DM envelope protocol was replaced by MLS"]
     fn dm_room_requires_envelopes_for_chat_and_mutations() {
         let mut server = test_server();
         let requester = SessionId(1);
@@ -8537,8 +9102,7 @@ mod tests {
             .store
             .dm_room_for(UserId(1), UserId(2))
             .expect("dm registered");
-        let (bound, account_id) =
-            authorize_test_e2e_device(&mut server, requester, UserId(1), 31);
+        let (bound, account_id) = authorize_test_e2e_device(&mut server, requester, UserId(1), 31);
         let _ = authorize_test_e2e_device(&mut server, SessionId(2), UserId(2), 32);
         let recipient_roster = RosterCheckpoint::from(
             server
@@ -8604,7 +9168,10 @@ mod tests {
         }) else {
             unreachable!();
         };
-        assert!(message.contains("recipient device roster is stale"), "{message}");
+        assert!(
+            message.contains("recipient device roster is stale"),
+            "{message}"
+        );
 
         server
             .send_chat(requester, dm_room, String::new(), Some(text_event.clone()))
@@ -8717,6 +9284,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "custom DM file envelope protocol was replaced by MLS"]
     fn sealed_dm_upload_relays_sealed_meta_and_envelope_in_announcement() {
         let mut server = test_server();
         let uploader = SessionId(1);
@@ -8728,8 +9296,7 @@ mod tests {
             .store
             .dm_room_for(UserId(1), UserId(2))
             .expect("dm registered");
-        let (bound, account_id) =
-            authorize_test_e2e_device(&mut server, uploader, UserId(1), 41);
+        let (bound, account_id) = authorize_test_e2e_device(&mut server, uploader, UserId(1), 41);
         let _ = authorize_test_e2e_device(&mut server, recipient, UserId(2), 42);
         let recipient_roster = RosterCheckpoint::from(
             server
@@ -11600,19 +12167,11 @@ mod tests {
 
         for marker in 1..=7 {
             assert_eq!(
-                rate_limited(
-                    &mut global,
-                    &mut accounts,
-                    UserId(100 + marker),
-                    10,
-                    3,
-                ),
+                rate_limited(&mut global, &mut accounts, UserId(100 + marker), 10, 3,),
                 None
             );
         }
-        assert!(
-            rate_limited(&mut global, &mut accounts, UserId(200), 10, 3).is_some()
-        );
+        assert!(rate_limited(&mut global, &mut accounts, UserId(200), 10, 3).is_some());
         assert_eq!(global.len(), 10);
     }
 }

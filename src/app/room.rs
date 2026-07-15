@@ -2447,9 +2447,7 @@ impl RoomSession {
         if !is_open {
             return None;
         }
-        let (user_id, account_id) = self
-            .e2e_synced_verification_notices
-            .remove(&room_id)?;
+        let (user_id, account_id) = self.e2e_synced_verification_notices.remove(&room_id)?;
         let username = self.username_of(user_id);
         let username = if username.trim().is_empty() {
             "this contact"
