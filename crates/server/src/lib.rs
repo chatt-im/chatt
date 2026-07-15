@@ -8091,14 +8091,9 @@ mod tests {
             .mls
             .put_roster(user_id, None, current.clone(), None)
             .unwrap();
-        let next = test_mls_roster(
-            &server,
-            user_id,
-            authority_seed,
-            &[(7, "first"), (9, "second")],
-            2,
-        );
-        let device_id = DeviceId([9; 16]);
+        let attempt_id = rpc::ids::PairAttemptId([5; 16]);
+        let redemption_secret = "single-use-device-link-secret";
+        let bearer = "tct2_test-device-bearer-token-value".to_string();
         let package_dir = tempfile::tempdir().unwrap();
         let server_id: [u8; 32] = server
             .server_key_pair
@@ -8106,22 +8101,26 @@ mod tests {
             .as_ref()
             .try_into()
             .unwrap();
-        let (package_source, _) = chatt_mls::LocalInstallation::open_or_create(
+        let package_source = chatt_mls::LocalInstallation::create_pending_pair(
             package_dir.path(),
             server_id,
-            UserId(999),
-            "package source",
+            user_id,
+            "second",
+            authority_seed,
+            &current,
+            attempt_id,
+            redemption_secret,
+            &bearer,
         )
         .unwrap();
-        let mut package = package_source
+        let next = package_source.bootstrap.own_roster.clone();
+        let device_id = package_source.bootstrap.device_id;
+        let package = package_source
             .client
             .generate_key_packages(package_source.bootstrap.device_id, 1)
             .unwrap()
             .remove(0);
-        package.device_id = device_id;
         let packages = vec![package];
-        let attempt_id = rpc::ids::PairAttemptId([5; 16]);
-        let redemption_secret = "single-use-device-link-secret";
         server.device_links.insert(
             device_link_secret_hash(redemption_secret),
             DeviceLinkState {
@@ -8133,7 +8132,6 @@ mod tests {
             },
         );
         let mut linking_peer = seed_session_client(&mut server, Token(33));
-        let bearer = "tct2_test-device-bearer-token-value".to_string();
         server
             .redeem_device_link(
                 Token(33),

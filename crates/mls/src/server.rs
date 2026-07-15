@@ -47,6 +47,7 @@ pub enum PublicValidationError {
     Decode(String),
     InvalidGroupInfo(String),
     InvalidCommit(String),
+    InvalidKeyPackage(String),
     UnexpectedMessage,
 }
 
@@ -56,6 +57,7 @@ impl fmt::Display for PublicValidationError {
             Self::Decode(error) => write!(f, "invalid MLS encoding: {error}"),
             Self::InvalidGroupInfo(error) => write!(f, "invalid MLS GroupInfo: {error}"),
             Self::InvalidCommit(error) => write!(f, "invalid MLS commit: {error}"),
+            Self::InvalidKeyPackage(error) => write!(f, "invalid MLS KeyPackage: {error}"),
             Self::UnexpectedMessage => f.write_str("MLS message has the wrong content type"),
         }
     }
@@ -259,11 +261,29 @@ impl PublicGroupValidator {
         &self,
         encoded: &[u8],
     ) -> Result<Vec<u8>, PublicValidationError> {
-        let key_package = MlsMessage::from_bytes(encoded)
-            .map_err(|error| PublicValidationError::Decode(error.to_string()))?
-            .into_key_package()
+        self.validate_key_package(encoded)
+            .map(|(reference, _)| reference)
+    }
+
+    /// Fully validates a KeyPackage and returns its reference plus the Basic
+    /// credential client id authenticated by its leaf-node signature.
+    pub fn validate_key_package(
+        &self,
+        encoded: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), PublicValidationError> {
+        let message = MlsMessage::from_bytes(encoded)
+            .map_err(|error| PublicValidationError::Decode(error.to_string()))?;
+        let key_package = self
+            .client
+            .validate_key_package(message, None)
+            .map_err(|error| PublicValidationError::InvalidKeyPackage(error.to_string()))?;
+        let client_id = key_package
+            .signing_identity()
+            .credential
+            .as_basic()
+            .map(|credential| credential.identifier.clone())
             .ok_or(PublicValidationError::UnexpectedMessage)?;
-        key_package_reference(&key_package)
+        Ok((key_package_reference(&key_package)?, client_id))
     }
 }
 

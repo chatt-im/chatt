@@ -71,6 +71,43 @@ fn device(server: &[u8], user: u64, authority_byte: u8, device_byte: u8) -> Devi
 }
 
 #[test]
+fn outbox_rejects_sender_account_not_bound_to_local_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = b"outbox sender binding test server";
+    let alice = device(server, 1, 1, 1);
+    let bob = device(server, 2, 2, 2);
+    let identities = ChattIdentityProvider::new(server.to_vec());
+    identities.install_roster(&alice.roster).unwrap();
+    identities.install_roster(&bob.roster).unwrap();
+    let client = PersistentClient::open(
+        &temp.path().join("alice.db"),
+        [11; 32],
+        identities,
+        alice.signing_identity,
+        alice.signing_secret,
+    )
+    .unwrap();
+    let event = MlsChattEvent {
+        version: MLS_PROTOCOL_VERSION,
+        room_id: RoomId(77),
+        event_id: EventId([9; 16]),
+        sender_account: bob.roster.body.account_id,
+        timestamp_ms: 200,
+        content: ChattEventContent::Text {
+            body: "wrong sender".to_string(),
+        },
+    };
+
+    assert!(
+        client
+            .queue_outgoing(event)
+            .unwrap_err()
+            .contains("event context is invalid")
+    );
+    assert!(client.pending_outbox().unwrap().is_empty());
+}
+
+#[test]
 fn sqlcipher_reopen_preserves_exact_outbox_and_received_history() {
     let temp = tempfile::tempdir().unwrap();
     let server = b"persistent test server";
@@ -414,6 +451,36 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
             .unwrap()
             .iter()
             .any(|cached| cached.event == delayed)
+    );
+
+    let first_same_timestamp = MlsChattEvent {
+        event_id: EventId([250; 16]),
+        timestamp_ms: 204,
+        content: ChattEventContent::Text {
+            body: "first same-millisecond command".to_string(),
+        },
+        ..event.clone()
+    };
+    let second_same_timestamp = MlsChattEvent {
+        event_id: EventId([1; 16]),
+        content: ChattEventContent::Text {
+            body: "second same-millisecond command".to_string(),
+        },
+        ..first_same_timestamp.clone()
+    };
+    alice_client
+        .queue_outgoing(first_same_timestamp.clone())
+        .unwrap();
+    alice_client
+        .queue_outgoing(second_same_timestamp.clone())
+        .unwrap();
+    let pending = alice_client.pending_outbox().unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|entry| &entry.event)
+            .collect::<Vec<_>>(),
+        vec![&first_same_timestamp, &second_same_timestamp],
     );
 }
 
