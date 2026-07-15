@@ -15,6 +15,7 @@ use std::{
 use jsony::Jsony;
 use ring::{digest, rand::SecureRandom};
 use rpc::{
+    crypto::encode_hex,
     e2e::{
         ACCOUNT_AUTHORITY_KEY_LEN, AccountKeyAction, AccountKeyStatement,
         AccountKeyStatementBody, DevicePublicKeys, E2E_SEED_LEN, DEVICE_SIGNING_KEY_LEN,
@@ -143,6 +144,7 @@ impl LocalE2eIdentity {
         data_dir: &Path,
         server_public_key: &[u8],
         user_id: UserId,
+        link_secret_hash: &[u8],
         device_name: &str,
         statements: &[AccountKeyStatement],
         enrollment_plaintext: &[u8],
@@ -156,7 +158,7 @@ impl LocalE2eIdentity {
                     .to_string(),
             );
         }
-        let path = final_path.with_extension("link");
+        let path = staged_link_path(&final_path, link_secret_hash);
         if device_name.trim().is_empty()
             || device_name.len() > rpc::e2e::MAX_DEVICE_NAME_BYTES
             || device_name.chars().any(char::is_control)
@@ -262,154 +264,6 @@ impl LocalE2eIdentity {
         identity_path(data_dir, server_public_key, user_id)
     }
 
-    pub(crate) fn pending_account_reset(
-        data_dir: &Path,
-        server_public_key: &[u8],
-        user_id: UserId,
-    ) -> Result<Option<Self>, String> {
-        let path = identity_path(data_dir, server_public_key, user_id).with_extension("reset");
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
-        };
-        let file: IdentityFile = jsony::from_binary(&bytes)
-            .map_err(|error| format!("failed to decode staged account reset: {error}"))?;
-        let identity = Self { path, file };
-        identity.validate(server_public_key, user_id)?;
-        Ok(Some(identity))
-    }
-
-    pub(crate) fn prepare_account_reset(
-        data_dir: &Path,
-        server_public_key: &[u8],
-        user_id: UserId,
-        device_name: &str,
-        account_generation: u64,
-        rng: &dyn SecureRandom,
-    ) -> Result<Self, String> {
-        if account_generation == 0 {
-            return Err("account reset generation is zero".to_string());
-        }
-        if let Some(identity) =
-            Self::pending_account_reset(data_dir, server_public_key, user_id)?
-        {
-            if identity.own_ledger().account_generation != account_generation {
-                return Err("a staged account reset targets another generation".to_string());
-            }
-            return Ok(identity);
-        }
-        let path = identity_path(data_dir, server_public_key, user_id).with_extension("reset");
-        let mut authority_seed = [0u8; ACCOUNT_AUTHORITY_KEY_LEN];
-        let mut signing_seed = [0u8; DEVICE_SIGNING_KEY_LEN];
-        let mut encryption_seed = [0u8; E2E_SEED_LEN];
-        rng.fill(&mut authority_seed)
-            .map_err(|_| "failed to generate replacement account authority".to_string())?;
-        rng.fill(&mut signing_seed)
-            .map_err(|_| "failed to generate replacement device signing key".to_string())?;
-        rng.fill(&mut encryption_seed)
-            .map_err(|_| "failed to generate replacement device encryption key".to_string())?;
-        let device_id = random_device_id(rng).map_err(|error| error.to_string())?;
-        let authority_public = ed25519_public_key(&authority_seed)?;
-        let account_id = account_id(server_public_key, user_id, &authority_public);
-        let genesis = sign_account_statement(
-            AccountKeyStatementBody {
-                account_id,
-                account_generation,
-                roster_epoch: 1,
-                previous: LedgerHash::default(),
-                authority_key_epoch: 1,
-                action: AccountKeyAction::Genesis {
-                    authority_public_key: authority_public.to_vec(),
-                    first_device: DevicePublicKeys {
-                        device_id,
-                        name: device_name.to_string(),
-                        key_epoch: 1,
-                        signing_public_key: ed25519_public_key(&signing_seed)?.to_vec(),
-                        encryption_public_key: e2e_public_key(&encryption_seed).to_vec(),
-                    },
-                },
-            },
-            &authority_seed,
-            None,
-        )?;
-        let identity = Self {
-            path,
-            file: IdentityFile {
-                version: STORE_VERSION,
-                server_public_key: server_public_key.to_vec(),
-                user_id,
-                account_id,
-                authority_seed: authority_seed.to_vec(),
-                device_id,
-                device_name: device_name.to_string(),
-                device_key_epoch: 1,
-                device_signing_seed: signing_seed.to_vec(),
-                device_encryption_seed: encryption_seed.to_vec(),
-                own_ledger: vec![genesis],
-                server_registered: false,
-                peers: Vec::new(),
-                sender_chains: Vec::new(),
-                replay_heads: Vec::new(),
-                seen_events: Vec::new(),
-                verification_snapshot: VerificationSyncSnapshot::default(),
-                verification_checkpoint: None,
-                verification_pending: Vec::new(),
-                verification_notices: Vec::new(),
-                verification_republish: false,
-                staged_link_secret_hash: Vec::new(),
-                staged_bearer_token: String::new(),
-            },
-        };
-        identity.validate(server_public_key, user_id)?;
-        identity.persist()?;
-        Ok(identity)
-    }
-
-    pub(crate) fn reset_genesis(&self) -> AccountKeyStatement {
-        self.file.own_ledger[0].clone()
-    }
-
-    pub(crate) fn commit_account_reset(mut self) -> Result<Self, String> {
-        self.file.server_registered = true;
-        self.persist()?;
-        let final_path = identity_path(
-            &self.path.parent().and_then(Path::parent).ok_or_else(|| {
-                "staged account reset path has no data directory".to_string()
-            })?,
-            &self.file.server_public_key,
-            self.file.user_id,
-        );
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let archive = final_path.with_extension(format!("pre-reset-{stamp}"));
-        let archived = if final_path.exists() {
-            fs::rename(&final_path, &archive).map_err(|error| {
-                format!(
-                    "failed to archive {} as {}: {error}",
-                    final_path.display(),
-                    archive.display()
-                )
-            })?;
-            true
-        } else {
-            false
-        };
-        if let Err(error) = fs::rename(&self.path, &final_path) {
-            if archived {
-                let _ = fs::rename(&archive, &final_path);
-            }
-            return Err(format!(
-                "failed to install replacement identity {}: {error}",
-                final_path.display()
-            ));
-        }
-        self.path = final_path;
-        Ok(self)
-    }
-
     pub(crate) fn stage_linked_device(
         &mut self,
         link_secret_hash: &[u8],
@@ -427,7 +281,8 @@ impl LocalE2eIdentity {
         link_secret_hash: &[u8],
         account_chain: &[AccountKeyStatement],
     ) -> Result<Option<(Self, AccountKeyStatement, String)>, String> {
-        let path = identity_path(data_dir, server_public_key, user_id).with_extension("link");
+        let final_path = identity_path(data_dir, server_public_key, user_id);
+        let path = staged_link_path(&final_path, link_secret_hash);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -448,7 +303,7 @@ impl LocalE2eIdentity {
         };
         let chain_matches_before = statements.len() == account_chain.len() + 1
             && statements[..account_chain.len()] == *account_chain;
-        let chain_matches_after = statements == account_chain;
+        let chain_matches_after = account_chain.starts_with(statements);
         if !chain_matches_before && !chain_matches_after {
             return Ok(None);
         }
@@ -499,6 +354,10 @@ impl LocalE2eIdentity {
         }
         self.path = final_path;
         Ok(())
+    }
+
+    pub(crate) fn discard_staged_link(self) {
+        let _ = fs::remove_file(&self.path);
     }
 
     pub(crate) fn load_or_create(
@@ -1223,6 +1082,10 @@ fn identity_path(data_dir: &Path, server_public_key: &[u8], user_id: UserId) -> 
     data_dir.join("e2e").join(format!("{name}.bin"))
 }
 
+fn staged_link_path(final_path: &Path, link_secret_hash: &[u8]) -> PathBuf {
+    final_path.with_extension(format!("link-{}", encode_hex(link_secret_hash)))
+}
+
 fn identity_unavailable(path: &Path, reason: &str) -> String {
     format!(
         "Local E2E identity state at {} is unreadable or incompatible: {reason}. Chatt left the file unchanged. Restore it from a backup, or, if another linked device still works, move this file aside (do not delete it) and link this installation again. If neither is possible, preserve the file for diagnosis.",
@@ -1319,49 +1182,6 @@ mod tests {
     }
 
     #[test]
-    fn account_reset_is_staged_then_archives_previous_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let server = [0x44; 32];
-        let user_id = UserId(9);
-        let rng = ring::rand::SystemRandom::new();
-        let (original, _) = LocalE2eIdentity::load_or_create(
-            temp.path(),
-            &server,
-            user_id,
-            "original",
-            &rng,
-        )
-        .unwrap();
-        let original_account = original.account_id();
-        let staged = LocalE2eIdentity::prepare_account_reset(
-            temp.path(),
-            &server,
-            user_id,
-            "replacement",
-            2,
-            &rng,
-        )
-        .unwrap();
-        assert_ne!(staged.account_id(), original_account);
-        assert_eq!(staged.own_ledger().account_generation, 2);
-        assert!(LocalE2eIdentity::pending_account_reset(temp.path(), &server, user_id)
-            .unwrap()
-            .is_some());
-
-        let installed = staged.commit_account_reset().unwrap();
-        assert_eq!(installed.own_ledger().account_generation, 2);
-        assert!(LocalE2eIdentity::pending_account_reset(temp.path(), &server, user_id)
-            .unwrap()
-            .is_none());
-        let archives = fs::read_dir(temp.path().join("e2e"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains("pre-reset"))
-            .count();
-        assert_eq!(archives, 1);
-    }
-
-    #[test]
     fn verification_changes_coalesce_and_remote_verification_raises_one_notice() {
         let temp = tempfile::tempdir().unwrap();
         let server = [0x33; 32];
@@ -1449,6 +1269,7 @@ mod tests {
             temp.path(),
             &server,
             user_id,
+            &[7; 32],
             "linked-device",
             source.own_statements(),
             &enrollment,

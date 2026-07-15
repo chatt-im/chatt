@@ -65,15 +65,6 @@ pub enum DirectoryAppend {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DirectoryReset {
-    pub roster_epoch: u64,
-    pub head: LedgerHash,
-    pub account_id: rpc::ids::AccountId,
-    pub device_id: DeviceId,
-    pub revoked_credentials: Vec<String>,
-}
-
 impl DeviceDirectory {
     pub fn in_memory(server_public_key: Vec<u8>) -> Self {
         Self {
@@ -336,13 +327,21 @@ impl DeviceDirectory {
             let statements = Self::decode_statements(account)?;
             if account.user_id == user_id.0
                 && credential.device_id == encode_hex(&device_id.0)
-                && statements.last() == Some(&statement)
+                && statements.iter().any(|current| current == &statement)
             {
                 let validated = ValidatedAccountLedger::validate(
                     &self.server_public_key,
                     user_id,
                     &statements,
                 )?;
+                if validated
+                    .device_keys
+                    .iter()
+                    .find(|device| device.keys.device_id == device_id)
+                    .is_none_or(|device| device.status != DeviceKeyStatus::Active)
+                {
+                    return Err("linked device is no longer active".to_string());
+                }
                 return Ok((validated.roster_epoch, validated.head));
             }
             return Err("device bearer token is already registered".to_string());
@@ -392,91 +391,6 @@ impl DeviceDirectory {
         self.save_state(&accounts)?;
         self.accounts = accounts;
         Ok((validated.roster_epoch, validated.head))
-    }
-
-    pub fn reset_account(
-        &mut self,
-        user_id: UserId,
-        genesis: AccountKeyStatement,
-        credential_hash: &str,
-    ) -> Result<DirectoryReset, String> {
-        let mut accounts = self.accounts.clone();
-        let account = accounts
-            .iter_mut()
-            .find(|account| account.user_id == user_id.0)
-            .ok_or_else(|| "account has no device directory entry".to_string())?;
-        let current_statements = Self::decode_statements(account)?;
-        let current = ValidatedAccountLedger::validate(
-            &self.server_public_key,
-            user_id,
-            &current_statements,
-        )?;
-        let replacement = ValidatedAccountLedger::validate(
-            &self.server_public_key,
-            user_id,
-            std::slice::from_ref(&genesis),
-        )?;
-        let device_id = replacement
-            .active_devices()
-            .next()
-            .ok_or_else(|| "replacement account has no active device".to_string())?
-            .device_id;
-
-        let idempotent = current_statements.as_slice() == std::slice::from_ref(&genesis);
-        if !idempotent {
-            let next_generation = current
-                .account_generation
-                .checked_add(1)
-                .ok_or_else(|| "account generation is exhausted".to_string())?;
-            if replacement.account_generation != next_generation {
-                return Err(
-                    "replacement account generation is not the next generation".to_string(),
-                );
-            }
-        }
-        let credential = account
-            .credentials
-            .iter()
-            .find(|credential| credential.token_hash == credential_hash)
-            .ok_or_else(|| "reset credential is no longer registered".to_string())?;
-        if !idempotent {
-            let credential_device = decode_device_id(&credential.device_id)
-                .ok_or_else(|| "reset credential is not bound to a device".to_string())?;
-            if current
-                .active_devices()
-                .all(|device| device.device_id != credential_device)
-            {
-                return Err("reset credential is not bound to an active device".to_string());
-            }
-        }
-        if idempotent && credential.device_id != encode_hex(&device_id.0) {
-            return Err("replacement account credential is not bound to its genesis device"
-                .to_string());
-        }
-
-        let mut revoked_credentials = Vec::new();
-        account.credentials.retain(|credential| {
-            let keep = credential.token_hash == credential_hash;
-            if !keep {
-                revoked_credentials.push(credential.token_hash.clone());
-            }
-            keep
-        });
-        let credential = account
-            .credentials
-            .first_mut()
-            .ok_or_else(|| "reset credential disappeared".to_string())?;
-        credential.device_id = encode_hex(&device_id.0);
-        account.statements = vec![encode_hex(&jsony::to_binary(&genesis))];
-        self.save_state(&accounts)?;
-        self.accounts = accounts;
-        Ok(DirectoryReset {
-            roster_epoch: replacement.roster_epoch,
-            head: replacement.head,
-            account_id: replacement.account_id,
-            device_id,
-            revoked_credentials,
-        })
     }
 
     pub fn active_device_signing_key(

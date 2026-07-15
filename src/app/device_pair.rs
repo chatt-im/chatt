@@ -19,12 +19,14 @@ const PAIR_DESCRIPTION: &str =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DevicePairButton {
     Cancel,
+    Close,
     Pair,
 }
 
 pub(crate) enum DevicePairEvent {
     Consumed,
     Cancel,
+    Close,
     Submit {
         pairing_string: String,
         transfer_password: String,
@@ -94,7 +96,6 @@ impl DevicePairDialog {
                 &mut self.show_secrets,
                 &self.feedback,
                 self.feedback_error,
-                self.submitting,
                 self.confirm_overwrite,
             );
         }
@@ -176,6 +177,11 @@ impl DevicePairDialog {
         self.feedback_error = true;
     }
 
+    pub(crate) fn device_pairing_failed(&mut self, error: String, transfer_password: String) {
+        self.transfer_password = transfer_password;
+        self.pairing_failed(error);
+    }
+
     pub(crate) fn identity_exists(&mut self, message: String, transfer_password: String) {
         self.transfer_password = transfer_password;
         self.submitting = false;
@@ -187,6 +193,7 @@ impl DevicePairDialog {
     fn activate(&mut self, button: DevicePairButton) -> DevicePairEvent {
         match button {
             DevicePairButton::Cancel => DevicePairEvent::Cancel,
+            DevicePairButton::Close => DevicePairEvent::Close,
             DevicePairButton::Pair => {
                 if self.submitting {
                     return DevicePairEvent::Consumed;
@@ -255,7 +262,6 @@ impl DevicePairDialog {
                 &mut self.show_secrets,
                 &self.feedback,
                 self.feedback_error,
-                self.submitting,
                 self.confirm_overwrite,
             )
         };
@@ -279,7 +285,6 @@ fn device_pair_form(
     show_secrets: &mut bool,
     feedback: &str,
     feedback_error: bool,
-    submitting: bool,
     confirm_overwrite: bool,
 ) -> Option<DevicePairButton> {
     form.section_with_id("Enrollment", PAIR_SECTION);
@@ -295,7 +300,6 @@ fn device_pair_form(
     form.checkbox("Show secrets", show_secrets);
     form.description_with_error(feedback, feedback_error);
     form.spacer(1);
-    let previous = form.set_enabled(!submitting);
     let activated = form
         .actions(&[
             ActionButton {
@@ -318,9 +322,14 @@ fn device_pair_form(
                     "Redeem this one-time link and create the device identity."
                 },
             },
+            ActionButton {
+                key: "close",
+                label: "Close",
+                value: DevicePairButton::Close,
+                help: "Hide this dialog without canceling a submitted pairing attempt.",
+            },
         ])
         .activated;
-    form.set_enabled(previous);
     activated
 }
 
@@ -349,10 +358,12 @@ pub(crate) enum DeviceLinkButton {
     CopyTicket,
     CopyPassword,
     GenerateNew,
+    CancelLink,
     Close,
 }
 
 pub(crate) struct DeviceLinkDialog {
+    redemption_secret_hash: Vec<u8>,
     pairing_string: String,
     transfer_password: String,
     expires_at_ms: u64,
@@ -363,12 +374,14 @@ pub(crate) struct DeviceLinkDialog {
 
 impl DeviceLinkDialog {
     pub(crate) fn new(
+        redemption_secret_hash: Vec<u8>,
         pairing_string: String,
         transfer_password: String,
         expires_at_ms: u64,
         bindings: FormBindings,
     ) -> Self {
         Self {
+            redemption_secret_hash,
             pairing_string,
             transfer_password,
             expires_at_ms,
@@ -475,8 +488,14 @@ impl DeviceLinkDialog {
         match button {
             DeviceLinkButton::CopyTicket => Some(&self.pairing_string),
             DeviceLinkButton::CopyPassword => Some(&self.transfer_password),
-            DeviceLinkButton::GenerateNew | DeviceLinkButton::Close => None,
+            DeviceLinkButton::GenerateNew
+            | DeviceLinkButton::CancelLink
+            | DeviceLinkButton::Close => None,
         }
+    }
+
+    pub(crate) fn redemption_secret_hash(&self) -> &[u8] {
+        &self.redemption_secret_hash
     }
 
     fn activate(&mut self, button: Option<DeviceLinkButton>) -> Option<DeviceLinkButton> {
@@ -559,6 +578,12 @@ fn device_link_form(
     };
     form.actions(&[
         ActionButton {
+            key: "cancel-link",
+            label: "Cancel link",
+            value: DeviceLinkButton::CancelLink,
+            help: "Immediately invalidate these exposed link credentials.",
+        },
+        ActionButton {
             key: "copy-ticket",
             label: "Copy ticket",
             value: DeviceLinkButton::CopyTicket,
@@ -627,6 +652,7 @@ mod tests {
     #[test]
     fn generating_a_replacement_link_requires_two_activations() {
         let mut dialog = DeviceLinkDialog::new(
+            vec![0; 32],
             "ticket".to_string(),
             "password".to_string(),
             60_000,
@@ -639,6 +665,43 @@ mod tests {
             Some(DeviceLinkButton::GenerateNew)
         );
         assert!(!dialog.generate_armed);
+    }
+
+    #[test]
+    fn explicit_link_cancel_is_distinct_from_closing_the_dialog() {
+        let hash = vec![7; 32];
+        let mut dialog = DeviceLinkDialog::new(
+            hash.clone(),
+            "ticket".to_string(),
+            "password".to_string(),
+            60_000,
+            FormBindings::Standard,
+        );
+
+        assert_eq!(dialog.redemption_secret_hash(), hash);
+        assert_eq!(
+            dialog.activate(Some(DeviceLinkButton::CancelLink)),
+            Some(DeviceLinkButton::CancelLink)
+        );
+        assert_eq!(
+            dialog.activate(Some(DeviceLinkButton::Close)),
+            Some(DeviceLinkButton::Close)
+        );
+    }
+
+    #[test]
+    fn submitted_device_pairing_can_be_closed_without_canceling() {
+        let mut dialog = DevicePairDialog::new("ticket".to_string(), FormBindings::Standard);
+        dialog.submitting = true;
+
+        assert!(matches!(
+            dialog.activate(DevicePairButton::Close),
+            DevicePairEvent::Close
+        ));
+        assert!(matches!(
+            dialog.activate(DevicePairButton::Cancel),
+            DevicePairEvent::Cancel
+        ));
     }
 
     #[test]
@@ -741,6 +804,7 @@ mod tests {
     #[test]
     fn link_height_reserves_every_pairing_string_row() {
         let dialog = DeviceLinkDialog::new(
+            vec![0; 32],
             format!("tcd1_{}", "a".repeat(180)),
             "coral-lantern".to_string(),
             0,

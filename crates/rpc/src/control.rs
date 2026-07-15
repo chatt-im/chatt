@@ -1,7 +1,7 @@
 use jsony::Jsony;
 
 use crate::ids::{
-    AccountId, BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId,
+    BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId,
     StreamId, UserId,
 };
 
@@ -119,13 +119,10 @@ pub enum ClientControl {
         enrollment_bundle: Vec<u8>,
         verification_checkpoint: Option<crate::e2e::VerificationSyncCheckpoint>,
     },
-    /// Requests the next account generation before a destructive E2E reset.
-    /// The authenticated bearer must still be bound to an active device.
-    BeginE2eAccountReset,
-    /// Atomically replaces the account ledger and rebinds only the requesting
-    /// credential to the new genesis device.
-    ResetE2eAccount {
-        genesis: crate::e2e::AccountKeyStatement,
+    /// Explicitly invalidates an unredeemed device link. Closing the creating
+    /// client or its dialog never cancels a link.
+    CancelDeviceLink {
+        redemption_secret_hash: Vec<u8>,
     },
     /// Fetches an opaque enrollment bundle before authentication. Fetching is
     /// non-consuming so a mistyped transfer password can be retried.
@@ -501,13 +498,8 @@ pub enum ServerControl {
         redemption_secret_hash: Vec<u8>,
         expires_at_ms: u64,
     },
-    E2eAccountResetPrepared {
-        account_generation: u64,
-    },
-    E2eAccountReset {
-        account_id: AccountId,
-        device_id: DeviceId,
-        key_epoch: u64,
+    DeviceLinkCanceled {
+        redemption_secret_hash: Vec<u8>,
     },
     DeviceLinkBundle {
         enrollment_bundle: Vec<u8>,
@@ -968,6 +960,13 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("device enrollment bundle length is invalid".to_string());
             }
         }
+        ClientControl::CancelDeviceLink {
+            redemption_secret_hash,
+        } => {
+            if redemption_secret_hash.len() != 32 {
+                return Err("device-link secret hash has the wrong length".to_string());
+            }
+        }
         ClientControl::FetchDeviceLink { redemption_secret } => {
             validate_auth_field("device-link redemption secret", redemption_secret)?;
             if redemption_secret.len() < MIN_PAIRING_SECRET_BYTES {
@@ -1099,8 +1098,7 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("share extradata exceeds maximum length".to_string());
             }
         }
-        ClientControl::AppendAccountKeyStatement { statement }
-        | ClientControl::ResetE2eAccount { genesis: statement } => {
+        ClientControl::AppendAccountKeyStatement { statement } => {
             if statement.authority_signature.len() != 64
                 || statement
                     .co_signature
