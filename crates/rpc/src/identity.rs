@@ -16,6 +16,7 @@ pub const SIGNATURE_KEY_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
 pub const MAX_ACTIVE_DEVICES: usize = 16;
 pub const MAX_DEVICE_NAME_BYTES: usize = 64;
+pub const ACCOUNT_ID_LEN: usize = 32;
 pub const MAX_MLS_CLIENT_ID_BYTES: usize = 256;
 
 const ACCOUNT_ID_LABEL: &[u8] = b"chatt account identity v1";

@@ -3414,7 +3414,6 @@ mod tests {
 
         app.view.active.chat.prepend_chat(vec![(
             ChatMessage {
-                envelope: None,
                 message_id: MessageId(1),
                 room_id: RoomId(1),
                 sender: UserId(9),
@@ -3481,7 +3480,6 @@ mod tests {
         enter_room_one(app);
         app.room.chat_received(
             ChatMessage {
-                envelope: None,
                 message_id: MessageId(message_id),
                 room_id: RoomId(1),
                 sender,
@@ -3501,7 +3499,6 @@ mod tests {
         enter_room_one(app);
         app.room.chat_received(
             ChatMessage {
-                envelope: None,
                 message_id: MessageId(message_id),
                 room_id: RoomId(1),
                 sender: UserId(2),
@@ -4345,7 +4342,7 @@ mod tests {
                     room_id: room_id.0,
                     user_id: 2,
                     username: "bob".to_string(),
-                    public_key: "11".repeat(rpc::e2e::E2E_PUBLIC_KEY_LEN),
+                    public_key: "11".repeat(rpc::identity::ACCOUNT_ID_LEN),
                     trust_level: crate::config::E2eTrustLevel::Accepted,
                 },
                 change_from: None,

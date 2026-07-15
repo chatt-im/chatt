@@ -1537,7 +1537,6 @@ mod tests {
 
     fn test_message(room_id: RoomId, id: u64) -> ChatMessage {
         ChatMessage {
-            envelope: None,
             message_id: MessageId(id),
             room_id,
             sender: UserId(1),

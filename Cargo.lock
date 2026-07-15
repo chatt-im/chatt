@@ -2321,7 +2321,6 @@ dependencies = [
  "mio",
  "ring",
  "toml-spanner",
- "x25519-dalek",
 ]
 
 [[package]]

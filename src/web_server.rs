@@ -2434,7 +2434,7 @@ mod tests {
     #[test]
     fn from_file_uses_served_name_for_attachment() {
         let metadata = FileMetadata {
-            sealed_meta: None,
+            mls_event_id: None,
             transfer_id: FileTransferId(3),
             room_id: RoomId(1),
             sender: UserId(2),
@@ -2476,7 +2476,7 @@ mod tests {
 
     fn file_metadata(transfer_id: u64) -> FileMetadata {
         FileMetadata {
-            sealed_meta: None,
+            mls_event_id: None,
             transfer_id: FileTransferId(transfer_id),
             room_id: RoomId(1),
             sender: UserId(2),
@@ -2494,7 +2494,6 @@ mod tests {
         use rpc::control::ChatMessage;
         use rpc::ids::MessageId;
         let announcement = ChatMessage {
-            envelope: None,
             message_id: MessageId(99),
             room_id: RoomId(1),
             sender: UserId(2),
@@ -2519,7 +2518,6 @@ mod tests {
         use rpc::ids::MessageId;
 
         let mut chat = ChatMessage {
-            envelope: None,
             message_id: MessageId(9),
             room_id: RoomId(1),
             sender: UserId(2),
@@ -2544,7 +2542,6 @@ mod tests {
         use rpc::ids::MessageId;
 
         let chat = ChatMessage {
-            envelope: None,
             message_id: MessageId(9),
             room_id: RoomId(1),
             sender: UserId(2),
@@ -2631,7 +2628,7 @@ mod tests {
     #[test]
     fn non_image_attachment_drops_dimensions() {
         let metadata = FileMetadata {
-            sealed_meta: None,
+            mls_event_id: None,
             transfer_id: FileTransferId(4),
             room_id: RoomId(1),
             sender: UserId(2),

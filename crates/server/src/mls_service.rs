@@ -241,6 +241,7 @@ impl MlsService {
         user_id: UserId,
         expected: Option<RosterCheckpoint>,
         roster: SignedDeviceRoster,
+        bootstrap_credential_hash: Option<String>,
     ) -> Result<RosterCheckpoint, PutRosterError> {
         let current = self.rosters.get(&user_id).cloned();
         let initial = current.is_none();
@@ -262,6 +263,27 @@ impl MlsService {
                 .map_err(PutRosterError::Invalid)?;
         }
         let before = self.snapshot();
+        if initial && let Some(token_hash) = bootstrap_credential_hash {
+            let [certificate] = roster.body.active_devices.as_slice() else {
+                return Err(PutRosterError::Invalid(
+                    "initial MLS roster must contain exactly one device".to_string(),
+                ));
+            };
+            if self
+                .credentials
+                .iter()
+                .any(|credential| credential.token_hash == token_hash)
+            {
+                return Err(PutRosterError::Invalid(
+                    "initial MLS device credential is already registered".to_string(),
+                ));
+            }
+            self.credentials.push(DeviceCredential {
+                user_id,
+                device_id: certificate.body.device_id,
+                token_hash,
+            });
+        }
         let removed: Vec<Vec<u8>> = current
             .iter()
             .flat_map(|roster| &roster.body.active_devices)
@@ -787,7 +809,7 @@ mod tests {
         std::fs::create_dir(&state_dir).unwrap();
         let mut service = MlsService::open(Some(state_dir.clone()), server_id.to_vec()).unwrap();
         service
-            .put_roster(UserId(9), None, installation.bootstrap.own_roster)
+            .put_roster(UserId(9), None, installation.bootstrap.own_roster, None)
             .unwrap();
         drop(service);
         std::fs::remove_file(state_dir.join("mls-state.bin")).unwrap();
@@ -795,6 +817,48 @@ mod tests {
         let service = MlsService::open(Some(state_dir), server_id.to_vec()).unwrap();
         assert!(service.initialized(UserId(9)));
         assert!(service.roster(UserId(9)).is_none());
+    }
+
+    #[test]
+    fn initial_device_credential_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [16u8; 32];
+        let user_id = UserId(9);
+        let (installation, _) = LocalInstallation::open_or_create(
+            &temp.path().join("client"),
+            server_id,
+            user_id,
+            "client",
+        )
+        .unwrap();
+        let device_id = installation.bootstrap.device_id;
+        let bearer = "initial-mls-device-credential";
+        let state_dir = temp.path().join("server");
+        std::fs::create_dir(&state_dir).unwrap();
+        let mut service = MlsService::open(Some(state_dir.clone()), server_id.to_vec()).unwrap();
+        service
+            .put_roster(
+                user_id,
+                None,
+                installation.bootstrap.own_roster,
+                Some(crate::config::hash_secret(bearer)),
+            )
+            .unwrap();
+        assert_eq!(
+            service.authenticate_credential(bearer).map(|value| value.0),
+            Some(user_id)
+        );
+        drop(service);
+
+        let service = MlsService::open(Some(state_dir), server_id.to_vec()).unwrap();
+        assert_eq!(
+            service.authenticate_credential(bearer).map(|value| value.0),
+            Some(user_id)
+        );
+        assert_eq!(
+            service.authenticate_credential(bearer).map(|value| value.1),
+            Some(device_id)
+        );
     }
 
     #[test]
@@ -821,10 +885,10 @@ mod tests {
         std::fs::create_dir(&state_dir).unwrap();
         let mut service = MlsService::open(Some(state_dir.clone()), server_id.to_vec()).unwrap();
         service
-            .put_roster(UserId(1), None, alice.bootstrap.own_roster.clone())
+            .put_roster(UserId(1), None, alice.bootstrap.own_roster.clone(), None)
             .unwrap();
         service
-            .put_roster(UserId(2), None, bob.bootstrap.own_roster.clone())
+            .put_roster(UserId(2), None, bob.bootstrap.own_roster.clone(), None)
             .unwrap();
         let package = bob
             .client
@@ -937,7 +1001,7 @@ mod tests {
             (UserId(12), bob.bootstrap.own_roster.clone()),
             (UserId(13), carol.bootstrap.own_roster.clone()),
         ] {
-            service.put_roster(user, None, roster).unwrap();
+            service.put_roster(user, None, roster, None).unwrap();
         }
         let bob_package = bob
             .client

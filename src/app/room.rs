@@ -90,20 +90,10 @@ pub(crate) struct RoomSelectItem {
     pub(crate) voice: bool,
     /// This room is the one the chat panel shows.
     pub(crate) viewed: bool,
-    /// The DM is still waiting for a usable peer key.
-    pub(crate) e2e_blocked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DmTrustState {
-    FetchingKey {
-        peer: UserId,
-        username: String,
-    },
-    KeyUnavailable {
-        peer: UserId,
-        username: String,
-    },
     /// A usable TOFU key that has not been independently verified. This state
     /// intentionally remains readable/sendable even when `change_from` is set:
     /// exact-key provenance marks its messages unverified, while the chat bar
@@ -121,24 +111,6 @@ pub(crate) enum DmTrustState {
         peer: UserId,
         identity: E2ePeerIdentity,
     },
-}
-
-impl DmTrustState {
-    pub(crate) fn blocked(&self) -> bool {
-        !matches!(self, Self::Accepted { .. } | Self::Verified { .. })
-    }
-
-    fn warning(&self) -> String {
-        match self {
-            Self::FetchingKey { username, .. } => format!(
-                "security: Fetching {username}'s encryption identity key. Sending and decryption are temporarily unavailable."
-            ),
-            Self::KeyUnavailable { username, .. } => format!(
-                "security: {username} has not published an encryption key. Sending and encrypted messages are unavailable. Ask them to connect with an E2E-capable client."
-            ),
-            Self::Accepted { .. } | Self::Verified { .. } => String::new(),
-        }
-    }
 }
 
 impl crate::ui::select::SelectableItem for RoomSelectItem {
@@ -239,10 +211,10 @@ pub(crate) struct RoomShared {
     /// history merges can dedup and order pages, and so views and the web
     /// feed can mirror a room without re-reading disk.
     messages: MessageLog,
-    /// Exact peer key that authenticated each original DM message. Absence in
-    /// a DM means legacy local history with unknown provenance.
+    /// Exact MLS account id that authenticated each original encrypted
+    /// message. Absence means the record has no authenticated peer provenance.
     message_provenance: HashMap<MessageKey, MessageProvenance>,
-    verified_e2e_keys: HashSet<[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>,
+    verified_e2e_keys: HashSet<[u8; rpc::identity::ACCOUNT_ID_LEN]>,
     e2e_room: bool,
     files: std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
     history: Option<RoomHistoryStore>,
@@ -879,17 +851,13 @@ pub(crate) struct RoomSession {
     muted_users: HashSet<UserId>,
     /// Authoritative session mirror of each DM's send/decrypt trust state.
     e2e_trust: HashMap<RoomId, DmTrustState>,
-    e2e_verified_keys: HashMap<RoomId, HashSet<[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>>,
-    /// Stable warning notice currently journaled for a blocked room.
-    e2e_warning_notices: HashMap<RoomId, NoticeKey>,
+    e2e_verified_keys: HashMap<RoomId, HashSet<[u8; rpc::identity::ACCOUNT_ID_LEN]>>,
     /// The accepted identity state already announced on entry during this
     /// connection session. The exact key and change state let a replacement
     /// identity still raise a fresh, higher-priority notice.
     e2e_identity_notices_shown: HashMap<RoomId, (String, Option<crate::config::E2eTrustLevel>)>,
     /// Durable ownership lives in the E2E identity store; this is the UI
     /// projection waiting for the first view of the matching room.
-    e2e_synced_verification_notices: HashMap<RoomId, (UserId, rpc::ids::AccountId)>,
-    e2e_synced_verification_notices_shown: HashSet<(UserId, rpc::ids::AccountId)>,
     stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
     /// Catalog facts for every known room, viewed or not.
@@ -1416,10 +1384,7 @@ impl RoomSession {
             muted_users: HashSet::new(),
             e2e_trust: HashMap::new(),
             e2e_verified_keys: HashMap::new(),
-            e2e_warning_notices: HashMap::new(),
             e2e_identity_notices_shown: HashMap::new(),
-            e2e_synced_verification_notices: HashMap::new(),
-            e2e_synced_verification_notices_shown: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
             metas: BTreeMap::new(),
@@ -1510,10 +1475,7 @@ impl RoomSession {
                 self.attached_views.clear();
                 self.e2e_trust.clear();
                 self.e2e_verified_keys.clear();
-                self.e2e_warning_notices.clear();
                 self.e2e_identity_notices_shown.clear();
-                self.e2e_synced_verification_notices.clear();
-                self.e2e_synced_verification_notices_shown.clear();
             }
         }
         continuity
@@ -1541,10 +1503,7 @@ impl RoomSession {
         self.attached_views.clear();
         self.e2e_trust.clear();
         self.e2e_verified_keys.clear();
-        self.e2e_warning_notices.clear();
         self.e2e_identity_notices_shown.clear();
-        self.e2e_synced_verification_notices.clear();
-        self.e2e_synced_verification_notices_shown.clear();
     }
 
     /// Marks every user offline and clears live voice state while keeping the
@@ -2302,10 +2261,6 @@ impl RoomSession {
                     && meta.head > meta.last_read,
                 voice: voice_room == Some(*room_id),
                 viewed: self.viewed_room == Some(*room_id),
-                e2e_blocked: self
-                    .e2e_trust
-                    .get(room_id)
-                    .is_some_and(DmTrustState::blocked),
             });
         }
         items
@@ -2372,21 +2327,7 @@ impl RoomSession {
     }
 
     pub(crate) fn set_e2e_trust_state(&mut self, room_id: RoomId, state: DmTrustState) {
-        let blocked = state.blocked();
-        let previous_warning = self.e2e_trust.get(&room_id).map(DmTrustState::warning);
-        let next_warning = blocked.then(|| state.warning());
         self.e2e_trust.insert(room_id, state);
-        if blocked {
-            if previous_warning != next_warning
-                && let Some(old) = self.e2e_warning_notices.remove(&room_id)
-                && let Some(room) = self.rooms.get_mut(&room_id)
-            {
-                room.remove_notice_record(old);
-            }
-            self.ensure_e2e_security_notice(room_id);
-        } else {
-            self.clear_e2e_warning_notice(room_id);
-        }
         if self.viewed_room == Some(room_id)
             || self
                 .attached_views
@@ -2400,7 +2341,7 @@ impl RoomSession {
     pub(crate) fn set_e2e_verified_keys(
         &mut self,
         room_id: RoomId,
-        keys: impl IntoIterator<Item = [u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>,
+        keys: impl IntoIterator<Item = [u8; rpc::identity::ACCOUNT_ID_LEN]>,
     ) {
         let keys: HashSet<_> = keys.into_iter().collect();
         if self.e2e_verified_keys.get(&room_id) == Some(&keys) {
@@ -2414,84 +2355,7 @@ impl RoomSession {
     }
 
     pub(crate) fn ensure_e2e_security_notice(&mut self, room_id: RoomId) {
-        self.ensure_e2e_blocked_notice(room_id);
         self.ensure_e2e_identity_notice(room_id);
-    }
-
-    pub(crate) fn set_synced_verification_notice(
-        &mut self,
-        room_id: RoomId,
-        user_id: UserId,
-        account_id: rpc::ids::AccountId,
-    ) -> Option<(UserId, rpc::ids::AccountId)> {
-        if self
-            .e2e_synced_verification_notices_shown
-            .contains(&(user_id, account_id))
-        {
-            return None;
-        }
-        self.e2e_synced_verification_notices
-            .insert(room_id, (user_id, account_id));
-        self.show_synced_verification_notice(room_id)
-    }
-
-    pub(crate) fn show_synced_verification_notice(
-        &mut self,
-        room_id: RoomId,
-    ) -> Option<(UserId, rpc::ids::AccountId)> {
-        let is_open = self.viewed_room == Some(room_id)
-            || self
-                .attached_views
-                .values()
-                .any(|viewed_room| *viewed_room == room_id);
-        if !is_open {
-            return None;
-        }
-        let (user_id, account_id) = self.e2e_synced_verification_notices.remove(&room_id)?;
-        let username = self.username_of(user_id);
-        let username = if username.trim().is_empty() {
-            "this contact"
-        } else {
-            &username
-        };
-        let room = self.rooms.get_mut(&room_id)?;
-        room.push_notice_record(NoticeRecord {
-            sender: "security".to_string(),
-            body: format!(
-                "This device learned that you verified {username}'s encryption identity from another device on your account."
-            ),
-            kind: NoticeKind::Info,
-            scroll_bottom: true,
-        });
-        self.e2e_synced_verification_notices_shown
-            .insert((user_id, account_id));
-        Some((user_id, account_id))
-    }
-
-    fn ensure_e2e_blocked_notice(&mut self, room_id: RoomId) {
-        let Some(state) = self.e2e_trust.get(&room_id).filter(|state| state.blocked()) else {
-            return;
-        };
-        let Some(room) = self.rooms.get_mut(&room_id) else {
-            return;
-        };
-        if self.e2e_warning_notices.get(&room_id).is_some_and(|key| {
-            room.journal.back().is_some_and(
-                |(_, delta)| matches!(delta, RoomDelta::Notice(newest, _) if newest == key),
-            )
-        }) {
-            return;
-        }
-        if let Some(old) = self.e2e_warning_notices.remove(&room_id) {
-            room.remove_notice_record(old);
-        }
-        let key = room.push_notice_record(NoticeRecord {
-            sender: "security".to_string(),
-            body: state.warning().trim_start_matches("security: ").to_string(),
-            kind: NoticeKind::Error,
-            scroll_bottom: true,
-        });
-        self.e2e_warning_notices.insert(room_id, key);
     }
 
     fn ensure_e2e_identity_notice(&mut self, room_id: RoomId) {
@@ -2550,22 +2414,7 @@ impl RoomSession {
         self.e2e_identity_notices_shown.insert(room_id, announced);
     }
 
-    pub(crate) fn clear_e2e_warning_notice(&mut self, room_id: RoomId) {
-        let Some(key) = self.e2e_warning_notices.remove(&room_id) else {
-            return;
-        };
-        if let Some(room) = self.rooms.get_mut(&room_id) {
-            room.remove_notice_record(key);
-        }
-    }
-
     pub(crate) fn clear_e2e_trust_states(&mut self) {
-        let notices = std::mem::take(&mut self.e2e_warning_notices);
-        for (room_id, key) in notices {
-            if let Some(room) = self.rooms.get_mut(&room_id) {
-                room.remove_notice_record(key);
-            }
-        }
         self.e2e_trust.clear();
         self.e2e_identity_notices_shown.clear();
     }
@@ -3547,7 +3396,6 @@ mod tests {
 
     fn message(id: u64, sender: UserId, body: &str) -> ChatMessage {
         ChatMessage {
-            envelope: None,
             message_id: MessageId(id),
             room_id: RoomId(1),
             sender,
@@ -3565,7 +3413,7 @@ mod tests {
         id: u64,
         sender: UserId,
         body: &str,
-        key: Option<[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>,
+        key: Option<[u8; rpc::identity::ACCOUNT_ID_LEN]>,
     ) -> AuthenticatedChat {
         AuthenticatedChat {
             message: message_in(room_id, id, sender, body),
@@ -3610,8 +3458,8 @@ mod tests {
             None,
             Some(UserId(1)),
         );
-        let first_key = [0x11; rpc::e2e::E2E_PUBLIC_KEY_LEN];
-        let second_key = [0x22; rpc::e2e::E2E_PUBLIC_KEY_LEN];
+        let first_key = [0x11; rpc::identity::ACCOUNT_ID_LEN];
+        let second_key = [0x22; rpc::identity::ACCOUNT_ID_LEN];
         client.session.chat_received(
             authenticated_message(room_id, 1, UserId(2), "from first", Some(first_key)),
             Some(UserId(1)),
@@ -3656,8 +3504,8 @@ mod tests {
             None,
             Some(UserId(1)),
         );
-        let verified_key = [0x33; rpc::e2e::E2E_PUBLIC_KEY_LEN];
-        let replacement_key = [0x44; rpc::e2e::E2E_PUBLIC_KEY_LEN];
+        let verified_key = [0x33; rpc::identity::ACCOUNT_ID_LEN];
+        let replacement_key = [0x44; rpc::identity::ACCOUNT_ID_LEN];
         client
             .session
             .set_e2e_verified_keys(room_id, [verified_key]);
@@ -3688,7 +3536,7 @@ mod tests {
     fn exact_key_verification_does_not_cross_server_boundaries() {
         let mut client = test_room();
         let room_id = RoomId(9);
-        let key = [0x55; rpc::e2e::E2E_PUBLIC_KEY_LEN];
+        let key = [0x55; rpc::identity::ACCOUNT_ID_LEN];
         client.session.authenticated(
             &[dm_room_info(9, UserId(1), UserId(2))],
             vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
@@ -6062,57 +5910,6 @@ mod tests {
     }
 
     #[test]
-    fn e2e_warning_notice_is_stable_then_moves_to_the_newest_delta() {
-        let mut room = test_room();
-        enter(
-            &mut room,
-            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
-            Vec::new(),
-            Some(UserId(1)),
-        );
-        let room_id = RoomId(1);
-        room.set_e2e_trust_state(
-            room_id,
-            DmTrustState::FetchingKey {
-                peer: UserId(2),
-                username: "bob".to_string(),
-            },
-        );
-        let first_key = room.e2e_warning_notices[&room_id];
-        let first_len = room.shared(1).journal.len();
-
-        room.ensure_e2e_security_notice(room_id);
-        assert_eq!(room.shared(1).journal.len(), first_len);
-        assert_eq!(room.e2e_warning_notices[&room_id], first_key);
-
-        room.push_notice_to(room_id, "network", "later notice");
-        room.ensure_e2e_security_notice(room_id);
-        let replacement = room.e2e_warning_notices[&room_id];
-        assert_ne!(replacement, first_key);
-        assert!(matches!(
-            room.shared(1).journal.back(),
-            Some((_, RoomDelta::Notice(key, notice)))
-                if *key == replacement && notice.kind == NoticeKind::Error
-        ));
-
-        room.set_e2e_trust_state(
-            room_id,
-            DmTrustState::Accepted {
-                peer: UserId(2),
-                identity: crate::config::E2ePeerIdentity {
-                    room_id: 1,
-                    user_id: 2,
-                    username: "bob".to_string(),
-                    public_key: "11".repeat(32),
-                    trust_level: crate::config::E2eTrustLevel::Accepted,
-                },
-                change_from: None,
-            },
-        );
-        assert!(!room.e2e_warning_notices.contains_key(&room_id));
-    }
-
-    #[test]
     fn entering_unverified_room_appends_one_warning_per_session() {
         let mut room = test_room();
         enter(
@@ -6166,36 +5963,6 @@ mod tests {
         assert!(matches!(
             room.shared(2).journal.back(),
             Some((_, RoomDelta::Notice(_, notice))) if notice.kind == NoticeKind::Warning
-        ));
-    }
-
-    #[test]
-    fn synced_verification_notice_waits_for_room_and_is_consumed_once() {
-        let mut room = test_room();
-        enter(
-            &mut room,
-            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
-            Vec::new(),
-            Some(UserId(1)),
-        );
-        let room_id = RoomId(2);
-        let account_id = rpc::ids::AccountId([7; 32]);
-        assert_eq!(
-            room.set_synced_verification_notice(room_id, UserId(2), account_id),
-            None
-        );
-
-        room.set_viewed_room(room_id);
-        assert_eq!(
-            room.show_synced_verification_notice(room_id),
-            Some((UserId(2), account_id))
-        );
-        assert_eq!(room.show_synced_verification_notice(room_id), None);
-        assert!(matches!(
-            room.shared(2).journal.back(),
-            Some((_, RoomDelta::Notice(_, notice)))
-                if notice.kind == NoticeKind::Info
-                    && notice.body.contains("another device on your account")
         ));
     }
 

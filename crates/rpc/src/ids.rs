@@ -62,13 +62,3 @@ pub struct DeviceId(pub [u8; 16]);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
 pub struct AccountId(pub [u8; 32]);
-
-/// Hash checkpoint anchoring an append-only account key ledger.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
-#[jsony(Binary)]
-pub struct LedgerHash(pub [u8; 32]);
-
-/// Digest anchoring the latest compacted account verification snapshot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
-#[jsony(Binary)]
-pub struct VerificationSyncHash(pub [u8; 32]);

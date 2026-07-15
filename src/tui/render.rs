@@ -810,11 +810,6 @@ fn draw_room_list_item(
     if item.voice {
         row = row.with(base.patch(theme.good)).text(buf, " V ");
     }
-    if item.e2e_blocked {
-        row = row
-            .with(base.patch(theme.error) | Modifier::BOLD)
-            .text(buf, " ! ");
-    }
     if item.unread > 0 {
         row = row
             .with(base.patch(theme.warn) | Modifier::BOLD)
@@ -919,11 +914,6 @@ fn draw_room_select_item(
         .with(HAlign::Right);
     if item.voice {
         row = row.with(base.patch(theme.good)).text(buf, " voice ");
-    }
-    if item.e2e_blocked {
-        row = row
-            .with(base.patch(theme.error) | Modifier::BOLD)
-            .text(buf, " ! ");
     }
     if item.unread > 0 {
         row = row
@@ -1658,12 +1648,6 @@ fn chat_security_label(
             change_from: Some(crate::config::E2eTrustLevel::Accepted),
             ..
         } => Some(("Identity Changed (MITM Vulnerable)", theme.error)),
-        crate::app::room::DmTrustState::FetchingKey { .. } => {
-            Some(("Fetching Identity Key", theme.warn))
-        }
-        crate::app::room::DmTrustState::KeyUnavailable { .. } => {
-            Some(("Identity Key Unavailable (DM Disabled)", theme.error))
-        }
         crate::app::room::DmTrustState::Verified { .. } => None,
     }
 }
@@ -2091,7 +2075,7 @@ mod tests {
             room_id: 9,
             user_id: 2,
             username: "bob".to_string(),
-            public_key: "11".repeat(rpc::e2e::E2E_PUBLIC_KEY_LEN),
+            public_key: "11".repeat(rpc::identity::ACCOUNT_ID_LEN),
             trust_level: crate::config::E2eTrustLevel::Accepted,
         }
     }
@@ -3027,8 +3011,6 @@ fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, b
         let e2e = viewed
             .and_then(|room_id| {
                 app.room.e2e_trust_state(room_id).map(|state| match state {
-                    crate::app::room::DmTrustState::FetchingKey { .. } => E2eHint::Fetching,
-                    crate::app::room::DmTrustState::KeyUnavailable { .. } => E2eHint::Unavailable,
                     crate::app::room::DmTrustState::Accepted { .. } => E2eHint::Accepted,
                     crate::app::room::DmTrustState::Verified { .. } => E2eHint::Verified,
                 })
@@ -3049,8 +3031,6 @@ fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, b
 enum E2eHint {
     /// Messages to this room are sealed.
     Sealed,
-    Fetching,
-    Unavailable,
     Accepted,
     Verified,
 }
@@ -3109,8 +3089,6 @@ fn composer_placeholder(room_name: Option<&str>, e2e: Option<E2eHint>) -> String
     match e2e {
         None => hint,
         Some(E2eHint::Sealed) => format!("{hint} [e2e]"),
-        Some(E2eHint::Fetching) => format!("{hint} [e2e blocked — fetching identity key]"),
-        Some(E2eHint::Unavailable) => format!("{hint} [e2e blocked — peer has no key]"),
         Some(E2eHint::Accepted) => format!("{hint} [e2e: identity unverified]"),
         Some(E2eHint::Verified) => format!("{hint} [e2e: identity verified]"),
     }

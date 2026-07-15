@@ -46,14 +46,13 @@ use rpc::{
         TransportMode, complete_client_transport_handshake, dev_server_public_key,
         ed25519_public_key_from_hex, encode_hex, generate_client_hello,
     },
-    e2e::{DmContentKind, VerificationSyncCheckpoint, VerificationSyncSnapshot},
     evented::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, recv_datagram_with,
         write_queue_to,
     },
     frame, history,
     ids::{
-        AccountId, BugReportId, DeviceId, EventId, FileTransferId, LedgerHash, MessageId, RoomId,
+        AccountId, BugReportId, DeviceId, EventId, FileTransferId, MessageId, RoomId,
         SessionId, StreamId, UserId,
     },
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
@@ -69,10 +68,7 @@ use crate::audio::{
     VoicePayload as AudioVoicePayload,
 };
 use crate::config::{CandidatePrivacy, DownloadTarget, E2ePeerPin, EffectiveFiles};
-use crate::e2e::{
-    AcceptedPeerIdentity, AuthenticatedChat, E2eState, MessageProvenance, OpenFailure,
-    PeerIdentityOutcome, SealBlocked,
-};
+use crate::e2e::{AcceptedPeerIdentity, AuthenticatedChat, E2eState};
 use crate::file_compression::{
     self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
 };
@@ -94,10 +90,11 @@ const P2P_POLL_TIMEOUT: Duration = Duration::from_millis(20);
 /// deadline wakes in [`WorkerState::next_poll_timeout`] drive the loop; this
 /// only bounds how long a missed schedule could sleep.
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_DEFERRED_E2E_BYTES: usize = 2 * 1024 * 1024;
-const MAX_DEFERRED_E2E_ITEMS: usize = 1024;
-const MAX_DEFERRED_E2E_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
-const MAX_DEFERRED_E2E_GLOBAL_ITEMS: usize = 8192;
+const MAX_PENDING_MLS_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PENDING_MLS_FILE_ITEMS: usize = 1024;
+const MAX_PENDING_MLS_FILE_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_MLS_FILE_GLOBAL_ITEMS: usize = 8192;
+const MLS_KEY_PACKAGE_TARGET: u16 = 16;
 const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a direct path must stay healthy before the client stops relaying
 /// voice through the server.
@@ -523,9 +520,8 @@ pub enum NetworkCommand {
         persisted: bool,
         manual_verification: bool,
     },
-    /// Authority-signs a terminal revocation. All sessions on the account are
-    /// unbound until they validate the advanced ledger; the revoked device can
-    /// never become active again.
+    /// Authority-signs a terminal roster revocation. The removed device can
+    /// never bind again.
     RevokeE2eDevice {
         device_id: DeviceId,
     },
@@ -534,11 +530,32 @@ pub enum NetworkCommand {
     CancelDeviceLink {
         redemption_secret_hash: Vec<u8>,
     },
-    AcknowledgeSyncedVerificationNotice {
-        user_id: UserId,
-        account_id: AccountId,
-    },
     Shutdown,
+}
+
+impl NetworkCommand {
+    fn requires_authenticated_session(&self) -> bool {
+        matches!(
+            self,
+            Self::SendChat { .. }
+                | Self::EditChat { .. }
+                | Self::DeleteChat { .. }
+                | Self::UploadFile { .. }
+                | Self::CancelTransfer { .. }
+                | Self::JoinVoice(_)
+                | Self::LeaveVoice
+                | Self::FetchHistory { .. }
+                | Self::OpenDm(_)
+                | Self::SetVoiceStatus(_)
+                | Self::StartShare { .. }
+                | Self::StopShare { .. }
+                | Self::ReportBug { .. }
+                | Self::RevokeE2eDevice { .. }
+                | Self::ListE2eDevices
+                | Self::CreateDeviceLink
+                | Self::CancelDeviceLink { .. }
+        )
+    }
 }
 
 /// Which side of a file transfer a [`NetworkEvent::TransferProgress`] describes.
@@ -605,12 +622,12 @@ pub enum NetworkEvent {
         room_id: RoomId,
         peer: UserId,
     },
-    E2eAccountIdentity {
+    MlsAccountIdentity {
         account_id: AccountId,
     },
-    /// This session proved possession of its active device key at the current
-    /// account ledger head and may now create encrypted events.
-    E2eDeviceBound {
+    /// This session proved possession of its active MLS device key and may now
+    /// create encrypted events.
+    MlsDeviceBound {
         device_id: DeviceId,
     },
     DeviceLinkCreated {
@@ -711,16 +728,6 @@ pub enum NetworkEvent {
     E2ePeerPinProposed {
         pin: E2ePeerPin,
         manual_verification: bool,
-    },
-    E2eIdentityFetching {
-        room_id: RoomId,
-        user_id: UserId,
-        username: String,
-    },
-    E2eKeyUnavailable {
-        room_id: RoomId,
-        user_id: UserId,
-        username: String,
     },
     /// Internal/session fact: the server presented the tuple already stored in
     /// the durable pin. This does not mean independently verified.
@@ -1377,8 +1384,15 @@ fn run_worker(
         udp_addr = %config.udp_addr
     );
     let mut reconnect = ReconnectSchedule::new();
+    let mut pending_authenticated_commands = VecDeque::new();
     loop {
-        match run_worker_inner(&config, &events, &commands, &mut poll) {
+        match run_worker_inner(
+            &config,
+            &events,
+            &commands,
+            &mut pending_authenticated_commands,
+            &mut poll,
+        ) {
             SessionEnd::Shutdown => break,
             SessionEnd::ConnectFailed(reason) => {
                 kvlog::warn!(
@@ -1421,6 +1435,7 @@ fn run_worker_inner(
     config: &ClientConfig,
     events: &NetworkEventSender,
     commands: &Receiver<NetworkCommand>,
+    pending_authenticated_commands: &mut VecDeque<NetworkCommand>,
     poll: &mut Poll,
 ) -> SessionEnd {
     let (std_tcp, transport, _trusted) = match connect_and_handshake(config, false) {
@@ -1568,7 +1583,6 @@ fn run_worker_inner(
             &config.e2e_peer_pins,
             config.data_dir.clone(),
         ),
-        e2e_bound: false,
         mls: None,
         mls_bound: false,
         mls_new: false,
@@ -1579,21 +1593,18 @@ fn run_worker_inner(
         mls_installed_rosters: HashSet::new(),
         pending_mls_commits: HashMap::new(),
         pending_mls_roster: None,
+        mls_key_package_publish_pending: false,
         mls_file_announcements: HashMap::new(),
         room_kinds: HashMap::new(),
         pending_device_link: None,
-        verification_sync_fetching: false,
-        verification_sync_put: None,
-        verification_sync_retry_at: None,
-        deferred_e2e: HashMap::new(),
-        deferred_e2e_bytes: 0,
-        deferred_e2e_items: 0,
-        deferred_e2e_warned_rooms: HashSet::new(),
+        pending_mls_file_offers: HashMap::new(),
+        pending_mls_file_bytes: 0,
+        pending_mls_file_items: 0,
+        pending_mls_file_warned_rooms: HashSet::new(),
         shutdown: false,
         disconnect_reason: None,
         auth_failure: None,
         local_identity_failure: None,
-        e2e_public_only: false,
     };
     worker.loop_work.queue_tcp_read();
 
@@ -1687,13 +1698,39 @@ fn run_worker_inner(
             return SessionEnd::Disconnected(error);
         }
 
-        let command_drain =
-            match drain_commands_with(commands, MAX_COMMANDS_PER_ITERATION, |command| {
-                worker.handle_command(command)
-            }) {
+        let mut command_drain = CommandDrainOutcome::Empty;
+        if worker.user_id.is_some() {
+            let mut handled = 0;
+            while handled < MAX_COMMANDS_PER_ITERATION {
+                let Some(command) = pending_authenticated_commands.pop_front() else {
+                    break;
+                };
+                if let Err(error) = worker.handle_command(command) {
+                    return SessionEnd::Disconnected(error);
+                }
+                handled += 1;
+            }
+            if !pending_authenticated_commands.is_empty() {
+                command_drain = CommandDrainOutcome::HitLimit;
+            }
+        }
+        if command_drain != CommandDrainOutcome::HitLimit {
+            command_drain = match drain_commands_with(
+                commands,
+                MAX_COMMANDS_PER_ITERATION,
+                |command| {
+                    if worker.user_id.is_none() && command.requires_authenticated_session() {
+                        pending_authenticated_commands.push_back(command);
+                        Ok(())
+                    } else {
+                        worker.handle_command(command)
+                    }
+                },
+            ) {
                 Ok(outcome) => outcome,
                 Err(error) => return SessionEnd::Disconnected(error),
             };
+        }
         if command_drain == CommandDrainOutcome::Disconnected {
             worker.shutdown = true;
         }
@@ -1724,9 +1761,6 @@ fn run_worker_inner(
         worker.poll_udp_bind_retry(now);
         worker.poll_relay_keepalive(now);
         worker.poll_rtt_probe(now);
-        if let Err(error) = worker.poll_verification_sync(now) {
-            return SessionEnd::Disconnected(error);
-        }
         poll_timeout = worker.next_poll_timeout(command_drain, now);
         #[cfg(debug_assertions)]
         if poll_timeout != Duration::ZERO {
@@ -2121,9 +2155,8 @@ struct WorkerState {
     transport_mode: TransportMode,
     /// Session-authentication key for external-link video connection setup.
     video_auth_key: [u8; KEY_LEN],
-    /// Server identity is part of every account id and local identity-store
-    /// namespace, preventing credentials or ledgers crossing server trust
-    /// domains.
+    /// Server identity is part of every AccountId and MLS store namespace,
+    /// preventing credentials or room state crossing server trust domains.
     server_public_key: [u8; 32],
     server_udp_addr: SocketAddr,
     server_udp_probe_addr: Option<SocketAddr>,
@@ -2192,11 +2225,8 @@ struct WorkerState {
     outgoing_bug_reports: VecDeque<OutgoingBugReport>,
     incoming_files: HashMap<FileTransferId, IncomingFile>,
     skipped_untrusted_files: HashSet<FileTransferId>,
-    /// Account/device ledgers, independent local keys, replay journal, DM room
-    /// mapping, and account-level verification state. All sealing and opening
-    /// happens on this thread so only plaintext crosses the event channel.
+    /// Local stable-AccountId pins and manual verification levels.
     e2e: E2eState,
-    e2e_bound: bool,
     mls: Option<LocalInstallation>,
     mls_bound: bool,
     mls_new: bool,
@@ -2207,23 +2237,23 @@ struct WorkerState {
     mls_installed_rosters: HashSet<UserId>,
     pending_mls_commits: HashMap<RoomId, PendingMlsCommit>,
     pending_mls_roster: Option<rpc::identity::SignedDeviceRoster>,
+    /// A replenishment batch has been queued but not yet acknowledged. Several
+    /// consumers may drain packages before that publish reaches the server;
+    /// coalescing their low-water notices keeps the local/server pools bounded.
+    mls_key_package_publish_pending: bool,
     mls_file_announcements: HashMap<EventId, MlsFileCache>,
     room_kinds: HashMap<RoomId, RoomKind>,
     pending_device_link: Option<PendingCreatedDeviceLink>,
-    verification_sync_fetching: bool,
-    verification_sync_put: Option<PendingVerificationSyncPut>,
-    verification_sync_retry_at: Option<Instant>,
-    deferred_e2e: HashMap<RoomId, DeferredE2eRoom>,
-    deferred_e2e_bytes: usize,
-    deferred_e2e_items: usize,
-    /// Rooms already warned about pre-key backlog overflow during this network
-    /// session. Overflow placeholders remain visible without spamming notices.
-    deferred_e2e_warned_rooms: HashSet<RoomId>,
+    pending_mls_file_offers: HashMap<RoomId, PendingMlsFileRoom>,
+    pending_mls_file_bytes: usize,
+    pending_mls_file_items: usize,
+    /// Rooms already warned about file offers whose MLS announcement backlog
+    /// overflowed during this network session.
+    pending_mls_file_warned_rooms: HashSet<RoomId>,
     shutdown: bool,
     disconnect_reason: Option<String>,
     auth_failure: Option<(u16, String)>,
     local_identity_failure: Option<String>,
-    e2e_public_only: bool,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -2233,13 +2263,6 @@ struct PendingCreatedDeviceLink {
     transfer_password: String,
 }
 
-struct PendingVerificationSyncPut {
-    expected: Option<VerificationSyncCheckpoint>,
-    snapshot: VerificationSyncSnapshot,
-    encoded: Vec<u8>,
-    checkpoint: VerificationSyncCheckpoint,
-    sent: bool,
-}
 
 #[derive(Debug)]
 struct PendingMlsRoom {
@@ -2281,9 +2304,7 @@ struct PendingAuthentication {
     default_room: RoomId,
 }
 
-enum DeferredE2eInbound {
-    Chat(ChatMessage),
-    History(history::HistoryChunk),
+enum PendingMlsFileOffer {
     FileOffered {
         file: FileMetadata,
         contents: bool,
@@ -2292,58 +2313,27 @@ enum DeferredE2eInbound {
 }
 
 #[derive(Default)]
-struct DeferredE2eRoom {
-    items: VecDeque<DeferredE2eInbound>,
+struct PendingMlsFileRoom {
+    items: VecDeque<PendingMlsFileOffer>,
     bytes: usize,
 }
 
-enum OpenChat {
-    Ready(Option<MessageProvenance>),
-    Deferred,
-    Discarded,
-}
-
-/// Turns an unopenable encrypted record into inert display data. Clearing all
-/// semantic fields is important: a forged or corrupt outer record must never
-/// become an edit/delete, file announcement, or message reference merely
-/// because the client chose to keep a visible placeholder.
-fn sanitize_unavailable_message(message: &mut ChatMessage, body: &str) {
-    message.body = body.to_string();
-    message.file_transfer_id = None;
-    message.flags = MessageFlags::default();
-    message.target = None;
-    message.envelope = None;
-}
-
-impl DeferredE2eInbound {
+impl PendingMlsFileOffer {
     fn room_id(&self) -> Option<RoomId> {
         match self {
-            Self::Chat(message) => Some(message.room_id),
-            Self::History(chunk) => Some(chunk.room_id),
             Self::FileOffered { file, .. } => Some(file.room_id),
         }
     }
 
     fn logical_items(&self) -> usize {
-        match self {
-            Self::History(chunk) => chunk.messages.len(),
-            Self::Chat(_) | Self::FileOffered { .. } => 1,
-        }
+        1
     }
 
     fn retained_bytes(&self) -> usize {
         match self {
-            Self::Chat(message) => history::encoded_message_len(message),
-            Self::History(chunk) => chunk
-                .messages
-                .iter()
-                .map(history::encoded_message_len)
-                .sum::<usize>()
-                .saturating_add(32),
-            Self::FileOffered { file, .. } => file
-                .sealed_meta
-                .as_ref()
-                .map_or(256, |meta| meta.len().saturating_add(256)),
+            Self::FileOffered { file, .. } => {
+                if file.mls_event_id.is_some() { 272 } else { 256 }
+            }
         }
     }
 }
@@ -2745,9 +2735,8 @@ struct UploadSeal {
     /// Zero bytes still owed to reach the Padmé total, computed once the
     /// encoder finishes.
     pad_remaining: Option<u64>,
-    /// The sealed [`rpc::e2e::DmFileMeta`] envelope relayed verbatim by the
-    /// server to recipients.
-    sealed_meta: Vec<u8>,
+    /// The MLS application event id containing authenticated file metadata.
+    mls_event_id: EventId,
 }
 
 #[derive(Default)]
@@ -2904,7 +2893,7 @@ struct IncomingFile {
     next_status_at: u64,
     /// Chunk-opening state for sealed DM transfers; `None` for plain ones.
     /// When set, `metadata` already carries the true (inner) name, size, and
-    /// encoding restored from the sealed metadata envelope.
+    /// encoding restored from the MLS file announcement.
     seal: Option<IncomingSeal>,
     /// The memory-ring claim for a [`DownloadTarget::Memory`] transfer, consumed
     /// by [`DownloadStore::insert_reserved`] on finalize and released if the
@@ -3342,79 +3331,6 @@ impl EncoderFeedbackController {
 }
 
 impl WorkerState {
-    fn fetch_verification_sync(&mut self) -> Result<(), String> {
-        if self.verification_sync_fetching || !self.e2e_bound {
-            return Ok(());
-        }
-        self.queue_control(ClientControl::FetchE2eVerificationSync {
-            known: self.e2e.verification_sync_checkpoint(),
-        })?;
-        self.verification_sync_fetching = true;
-        Ok(())
-    }
-
-    fn queue_verification_sync_put(&mut self) -> Result<(), String> {
-        if !self.e2e_bound || !self.e2e.verification_sync_dirty() {
-            return Ok(());
-        }
-        if self.verification_sync_put.is_none() {
-            let (expected, snapshot, encoded, checkpoint) =
-                self.e2e.create_verification_sync()?;
-            self.verification_sync_put = Some(PendingVerificationSyncPut {
-                expected,
-                snapshot,
-                encoded,
-                checkpoint,
-                sent: false,
-            });
-        }
-        let pending = self.verification_sync_put.as_ref().expect("created above");
-        if pending.sent {
-            return Ok(());
-        }
-        let expected = pending.expected;
-        let encoded = pending.encoded.clone();
-        self.queue_control(ClientControl::PutE2eVerificationSync {
-            expected,
-            envelope: encoded,
-        })?;
-        self.verification_sync_put
-            .as_mut()
-            .expect("queued verification put")
-            .sent = true;
-        self.verification_sync_retry_at = None;
-        Ok(())
-    }
-
-    fn emit_verification_identities(&self, identities: Vec<AcceptedPeerIdentity>) {
-        for identity in identities {
-            let _ = self
-                .events
-                .send(NetworkEvent::E2ePeerPinMatched { identity });
-        }
-    }
-
-    fn verification_sync_wake(&self, now: Instant) -> WakeIntent {
-        self.verification_sync_retry_at.map_or(WakeIntent::Idle, |at| {
-            WakeIntent::After(at.saturating_duration_since(now))
-        })
-    }
-
-    fn poll_verification_sync(&mut self, now: Instant) -> Result<(), String> {
-        if self
-            .verification_sync_retry_at
-            .is_some_and(|retry_at| now >= retry_at)
-        {
-            if self.verification_sync_put.is_some() {
-                self.queue_verification_sync_put()?;
-            } else {
-                self.verification_sync_retry_at = None;
-                self.fetch_verification_sync()?;
-            }
-        }
-        Ok(())
-    }
-
     #[inline]
     fn next_poll_timeout(&mut self, command_drain: CommandDrainOutcome, now: Instant) -> Duration {
         self.queue_runnable_io();
@@ -3429,7 +3345,6 @@ impl WorkerState {
         schedule.include(self.interface_wake(now));
         schedule.include(self.rtt_probe_wake(now));
         schedule.include(self.udp_bind_retry_wake(now));
-        schedule.include(self.verification_sync_wake(now));
         schedule.timeout()
     }
 
@@ -3567,52 +3482,6 @@ impl WorkerState {
         debug_assert_ne!(self.bug_report_wake(), WakeIntent::Now);
         debug_assert_ne!(self.receive_wake(), WakeIntent::Now);
         debug_assert_ne!(self.upload_wake(), WakeIntent::Now);
-    }
-
-    /// Prepares an outbound chat payload for its room: DM rooms get the body
-    /// sealed into an envelope, other rooms pass plaintext through. `Err(())`
-    /// means the send was blocked (peer key missing) and the user has
-    /// already been told.
-    fn seal_dm_body(
-        &mut self,
-        room_id: RoomId,
-        kind: DmContentKind,
-        target: Option<MessageId>,
-        body: String,
-    ) -> Result<(String, Option<Vec<u8>>), ()> {
-        if !self.e2e.requires_e2e(room_id) {
-            return Ok((body, None));
-        }
-        if !self.e2e_bound {
-            let _ = self.events.send(NetworkEvent::Error(
-                "cannot send: the active E2E device roster is still being verified".to_string(),
-            ));
-            return Err(());
-        }
-        match self
-            .e2e
-            .seal_chat(room_id, kind, target, &body, unix_now_ms())
-        {
-            Ok(envelope) => Ok((String::new(), Some(envelope))),
-            Err(blocked) => {
-                let reason = match blocked {
-                    SealBlocked::NoIdentity => {
-                        "cannot send: this connection has no encryption identity".to_string()
-                    }
-                    SealBlocked::PeerKeyMissing => {
-                        "cannot send: this user has not published an encryption key yet".to_string()
-                    }
-                    SealBlocked::Crypto => "cannot send: sealing the message failed".to_string(),
-                };
-                kvlog::warn!(
-                    "dm send blocked",
-                    room_id = room_id.0,
-                    error = reason.as_str()
-                );
-                let _ = self.events.send(NetworkEvent::Error(reason));
-                Err(())
-            }
-        }
     }
 
     fn queue_control(&mut self, control: ClientControl) -> Result<(), String> {
@@ -3982,34 +3851,10 @@ impl WorkerState {
                     room_id = room_id.0,
                     body_size = body.len()
                 );
-                if let Some(installation) = self.mls.as_ref()
-                    && let Some(descriptor) = installation.client.descriptor(room_id)?
-                {
-                    if !self.mls_bound {
-                        let _ = self.events.send(NetworkEvent::Status(
-                            "encrypted message queued until the MLS device is bound".to_string(),
-                        ));
-                        return Ok(());
-                    }
-                    let event_id = random_event_id()?;
-                    let event = rpc::mls::MlsChattEvent {
-                        version: rpc::mls::MLS_PROTOCOL_VERSION,
-                        room_id,
-                        event_id,
-                        sender_account: installation.bootstrap.account_id,
-                        timestamp_ms: unix_now_ms(),
-                        content: rpc::mls::ChattEventContent::Text { body },
-                    };
-                    installation.client.queue_outgoing(event)?;
-                    let (epoch, ciphertext) = installation
-                        .client
-                        .encrypt_outgoing(&descriptor, event_id)?;
-                    self.queue_control(ClientControl::SubmitMlsApplication {
-                        room_id,
-                        epoch,
-                        event_id,
-                        ciphertext,
-                    })?;
+                if self.send_mls_content(
+                    room_id,
+                    rpc::mls::ChattEventContent::Text { body: body.clone() },
+                )? {
                     return Ok(());
                 }
                 if self.room_requires_mls(room_id) {
@@ -4018,16 +3863,7 @@ impl WorkerState {
                     ));
                     return Ok(());
                 }
-                let (body, envelope) =
-                    match self.seal_dm_body(room_id, DmContentKind::Text, None, body) {
-                        Ok(parts) => parts,
-                        Err(()) => return Ok(()),
-                    };
-                self.queue_control(ClientControl::SendChat {
-                    room_id,
-                    body,
-                    envelope,
-                })?;
+                self.queue_control(ClientControl::SendChat { room_id, body })?;
             }
             NetworkCommand::EditChat {
                 room_id,
@@ -4052,16 +3888,10 @@ impl WorkerState {
                     ));
                     return Ok(());
                 }
-                let (body, envelope) =
-                    match self.seal_dm_body(room_id, DmContentKind::Edit, Some(target), body) {
-                        Ok(parts) => parts,
-                        Err(()) => return Ok(()),
-                    };
                 self.queue_control(ClientControl::EditChat {
                     room_id,
                     target,
                     body,
-                    envelope,
                 })?;
             }
             NetworkCommand::DeleteChat { room_id, target } => {
@@ -4082,20 +3912,7 @@ impl WorkerState {
                     ));
                     return Ok(());
                 }
-                let (_, envelope) = match self.seal_dm_body(
-                    room_id,
-                    DmContentKind::Delete,
-                    Some(target),
-                    String::new(),
-                ) {
-                    Ok(parts) => parts,
-                    Err(()) => return Ok(()),
-                };
-                self.queue_control(ClientControl::DeleteChat {
-                    room_id,
-                    target,
-                    envelope,
-                })?;
+                self.queue_control(ClientControl::DeleteChat { room_id, target })?;
             }
             NetworkCommand::UploadFile { room_id, request } => {
                 self.queue_file_upload(room_id, request);
@@ -4220,7 +4037,6 @@ impl WorkerState {
                 if persisted {
                     if manual_verification {
                         self.e2e.record_verification_update(&pin)?;
-                        self.queue_verification_sync_put()?;
                     }
                     if let Some(identity) = self.e2e.accepted_identity(UserId(pin.user_id)) {
                         let _ = self
@@ -4253,10 +4069,28 @@ impl WorkerState {
                 return Err("the MLS installation is unavailable".to_string());
             }
             NetworkCommand::ListE2eDevices => {
-                let devices = self.e2e.device_descriptions()?.join("; ");
+                let installation = self
+                    .mls
+                    .as_ref()
+                    .ok_or_else(|| "the MLS installation is unavailable".to_string())?;
+                let devices = installation
+                    .bootstrap
+                    .own_roster
+                    .body
+                    .active_devices
+                    .iter()
+                    .map(|certificate| {
+                        format!(
+                            "{} ({})",
+                            certificate.body.device_name,
+                            encode_hex(&certificate.body.device_id.0)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 let _ = self
                     .events
-                    .send(NetworkEvent::Error(format!("E2E account devices: {devices}")));
+                    .send(NetworkEvent::Error(format!("MLS account devices: {devices}")));
             }
             NetworkCommand::CreateDeviceLink => {
                 if !self.mls_bound {
@@ -4435,13 +4269,6 @@ impl WorkerState {
                     offset: 0,
                     started: false,
                 });
-            }
-            NetworkCommand::AcknowledgeSyncedVerificationNotice {
-                user_id,
-                account_id,
-            } => {
-                self.e2e
-                    .acknowledge_verification_notice(user_id, account_id)?;
             }
             NetworkCommand::Shutdown => {
                 kvlog::info!("shutdown command handling");
@@ -4634,9 +4461,8 @@ impl WorkerState {
         })
     }
 
-    /// Builds the sealing state for an upload into a DM room: a fresh content
-    /// key and the sealed metadata envelope carrying the transfer's real name,
-    /// size, inner encoding, and that key. `None` outside DM rooms.
+    /// Builds MLS file sealing state: a fresh content key plus an authenticated
+    /// MLS application event carrying the transfer metadata.
     fn prepare_upload_seal(
         &mut self,
         room_id: RoomId,
@@ -4690,7 +4516,7 @@ impl WorkerState {
             counter: 0,
             stream_len: 0,
             pad_remaining: None,
-            sealed_meta: event_id.0.to_vec(),
+            mls_event_id: event_id,
         }))
     }
 
@@ -4770,13 +4596,13 @@ impl WorkerState {
 
         if !upload.started {
             // Sealed uploads advertise a placeholder name and the Padmé size
-            // class; the real metadata rides only inside the sealed envelope.
-            let (name, size, encoding, sealed_meta) = match &upload.seal {
+            // class; the real metadata rides only inside the MLS event.
+            let (name, size, encoding, mls_event_id) = match &upload.seal {
                 Some(seal) => (
                     "sealed.bin".to_string(),
                     rpc::mls::padme_len(upload.size),
                     FileContentEncoding::Sealed,
-                    Some(seal.sealed_meta.clone()),
+                    Some(seal.mls_event_id),
                 ),
                 None => (
                     upload.name.clone(),
@@ -4791,7 +4617,7 @@ impl WorkerState {
                 name,
                 size,
                 encoding,
-                sealed_meta,
+                mls_event_id,
             })?;
             upload.started = true;
             // Keep a local copy of the sender's own upload so the uploader's own
@@ -5342,7 +5168,7 @@ impl WorkerState {
                 self.skip_offered_download(&file);
             }
             self.skipped_untrusted_files.insert(file.transfer_id);
-            self.defer_e2e(DeferredE2eInbound::FileOffered {
+            self.defer_mls_file_offer(PendingMlsFileOffer::FileOffered {
                 file,
                 contents: false,
                 skipped_untrusted: true,
@@ -5369,10 +5195,7 @@ impl WorkerState {
         }
         if is_mls {
             let event_id = file
-                .sealed_meta
-                .as_deref()
-                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-                .map(EventId)
+                .mls_event_id
                 .ok_or_else(|| "MLS transfer omitted its announcement event id".to_string())?;
             return Ok(self.mls_file_announcements.contains_key(&event_id));
         }
@@ -5525,19 +5348,15 @@ impl WorkerState {
         );
     }
 
-    /// Opens a sealed offer's metadata envelope and substitutes the true name,
-    /// size, and inner encoding into `file`, so every downstream consumer sees
-    /// the real file. Returns the chunk-opening state; `Ok(None)` for plain
-    /// transfers.
+    /// Resolves an encrypted offer through its authenticated MLS announcement
+    /// and substitutes the true name, size, and encoding into `file`.
     fn unseal_offer(&mut self, file: &mut FileMetadata) -> Result<Option<IncomingSeal>, String> {
         if file.encoding != FileContentEncoding::Sealed {
             return Ok(None);
         }
         let event_id = file
-            .sealed_meta
+            .mls_event_id
             .take()
-            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-            .map(EventId)
             .ok_or_else(|| "MLS transfer omitted its announcement event id".to_string())?;
         let cached = self
             .mls_file_announcements
@@ -5921,20 +5740,12 @@ impl WorkerState {
             at_start = chunk.at_start,
             complete = chunk.complete
         );
-        let mut opened = Vec::with_capacity(chunk.messages.len());
-        for mut message in chunk.messages.iter().cloned() {
-            match self.open_chat_message(&mut message, false)? {
-                OpenChat::Ready(provenance) => opened.push(AuthenticatedChat {
-                    message,
-                    provenance,
-                }),
-                OpenChat::Deferred => {
-                    self.defer_e2e(DeferredE2eInbound::History(chunk))?;
-                    return Ok(true);
-                }
-                OpenChat::Discarded => {}
-            }
-        }
+        let opened = chunk
+            .messages
+            .iter()
+            .cloned()
+            .map(AuthenticatedChat::from)
+            .collect();
         let _ = self.events.send(NetworkEvent::HistoryChunk {
             room_id: chunk.room_id,
             before: chunk.before,
@@ -5979,19 +5790,9 @@ impl WorkerState {
                     user_id = message.sender.0,
                     body_size = message.body.len()
                 );
-                let mut message = message;
-                match self.open_chat_message(&mut message, true)? {
-                    OpenChat::Ready(provenance) => {
-                        let _ = self.events.send(NetworkEvent::Chat(AuthenticatedChat {
-                            message,
-                            provenance,
-                        }));
-                    }
-                    OpenChat::Deferred => {
-                        self.defer_e2e(DeferredE2eInbound::Chat(message))?;
-                    }
-                    OpenChat::Discarded => {}
-                }
+                let _ = self
+                    .events
+                    .send(NetworkEvent::Chat(AuthenticatedChat::from(message)));
             }
             ServerControl::ChatMutationRejected {
                 room_id,
@@ -6307,16 +6108,6 @@ impl WorkerState {
                         .events
                         .send(NetworkEvent::ShareStartRejected { message });
                 } else {
-                    if code == rpc::control::ERROR_REQUEST_REJECTED
-                        && let Some(user_id) = self.user_id
-                        && !self.e2e_public_only
-                    {
-                        let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
-                            user_id,
-                            after: self.e2e.account_chain_after(user_id),
-                        });
-                        let _ = self.fetch_verification_sync();
-                    }
                     let _ = self.events.send(NetworkEvent::Error(message));
                 }
             }
@@ -6389,169 +6180,6 @@ impl WorkerState {
                 client_transfer_id,
                 reason,
             } => self.handle_upload_declined(client_transfer_id, &reason),
-            ServerControl::AccountKeyChain {
-                user_id,
-                base,
-                statements,
-            } => {
-                let local_user = self
-                    .user_id
-                    .ok_or_else(|| "account ledger arrived before authentication".to_string())?;
-                let ledger = self.e2e.apply_account_chain(user_id, base, statements)?;
-                if user_id == local_user {
-                    let Some(ledger) = ledger else {
-                        let genesis = self
-                            .e2e
-                            .own_genesis()
-                            .ok_or_else(|| "local account genesis is unavailable".to_string())?;
-                        self.queue_control(ClientControl::AppendAccountKeyStatement {
-                            statement: genesis,
-                        })?;
-                        return Ok(());
-                    };
-                    let _ = self.events.send(NetworkEvent::E2eAccountIdentity {
-                        account_id: ledger.account_id,
-                    });
-                    let session_id = self
-                        .session_id
-                        .ok_or_else(|| "account ledger arrived before session id".to_string())?;
-                    let (device_id, key_epoch, ledger_head, signature) =
-                        self.e2e.device_binding(session_id)?;
-                    self.queue_control(ClientControl::BindE2eDevice {
-                        device_id,
-                        key_epoch,
-                        ledger_head,
-                        signature,
-                    })?;
-                } else {
-                    let outcome = match ledger {
-                        Some(ledger) => self
-                            .e2e
-                            .handle_peer_key(user_id, Some(&ledger.account_id.0)),
-                        None => self.e2e.handle_peer_key(user_id, None),
-                    };
-                    self.handle_peer_identity_outcome(user_id, outcome)?;
-                }
-            }
-            ServerControl::AccountKeyHeadChanged {
-                user_id,
-                roster_epoch,
-                head,
-            } => {
-                if self.e2e_public_only {
-                    return Ok(());
-                }
-                let local_user = self.user_id == Some(user_id);
-                if local_user {
-                    self.e2e_bound = false;
-                }
-                let current = self
-                    .e2e
-                    .account_ledger(user_id)
-                    .map(|ledger| (ledger.roster_epoch, ledger.head));
-                let registration_pending =
-                    local_user && !self.e2e.local_account_server_registered();
-                if !account_head_requires_fetch(
-                    current,
-                    registration_pending,
-                    roster_epoch,
-                    head,
-                )? {
-                    return Ok(());
-                }
-                if !local_user
-                    && let Some((room_id, username)) = self.e2e.mark_peer_roster_stale(user_id)
-                {
-                    let _ = self.events.send(NetworkEvent::E2eIdentityFetching {
-                        room_id,
-                        user_id,
-                        username,
-                    });
-                }
-                self.queue_control(ClientControl::FetchAccountKeyChain {
-                    user_id,
-                    after: self.e2e.account_chain_after(user_id),
-                })?;
-            }
-            ServerControl::E2eDeviceBound {
-                device_id,
-                key_epoch,
-            } => {
-                let (expected_device, expected_epoch, _, _) = self.e2e.device_binding(
-                    self.session_id
-                        .ok_or_else(|| "device binding arrived before authentication".to_string())?,
-                )?;
-                if device_id != expected_device || key_epoch != expected_epoch {
-                    return Err("server confirmed the wrong E2E device binding".to_string());
-                }
-                self.e2e_bound = true;
-                self.verification_sync_fetching = false;
-                self.fetch_verification_sync()?;
-                let _ = self
-                    .events
-                    .send(NetworkEvent::E2eDeviceBound { device_id });
-            }
-            ServerControl::E2eVerificationSync {
-                checkpoint,
-                envelope,
-            } => {
-                if !self.verification_sync_fetching {
-                    return Err("server sent an unrequested verification snapshot".to_string());
-                }
-                self.verification_sync_fetching = false;
-                match (checkpoint, envelope) {
-                    (None, None) => {}
-                    (Some(checkpoint), Some(envelope)) => {
-                        if rpc::e2e::verification_sync_checkpoint(&envelope) != checkpoint {
-                            return Err("verification snapshot checkpoint does not match its envelope"
-                                .to_string());
-                        }
-                        let identities = self.e2e.apply_verification_sync(&envelope)?;
-                        self.emit_verification_identities(identities);
-                    }
-                    (Some(checkpoint), None)
-                        if self.e2e.verification_sync_checkpoint() == Some(checkpoint) => {}
-                    _ => {
-                        return Err("server returned an inconsistent verification snapshot"
-                            .to_string());
-                    }
-                }
-                self.queue_verification_sync_put()?;
-            }
-            ServerControl::E2eVerificationSyncChanged { checkpoint } => {
-                if self
-                    .verification_sync_put
-                    .as_ref()
-                    .is_some_and(|pending| pending.checkpoint == checkpoint)
-                {
-                    let pending = self
-                        .verification_sync_put
-                        .take()
-                        .expect("matching pending verification put");
-                    let identities = self
-                        .e2e
-                        .commit_verification_sync(checkpoint, pending.snapshot)?;
-                    self.emit_verification_identities(identities);
-                    self.queue_verification_sync_put()?;
-                } else if self.e2e.verification_sync_checkpoint() != Some(checkpoint) {
-                    self.verification_sync_put = None;
-                    self.fetch_verification_sync()?;
-                }
-            }
-            ServerControl::E2eVerificationSyncConflict { .. } => {
-                self.verification_sync_put = None;
-                self.verification_sync_retry_at = None;
-                self.fetch_verification_sync()?;
-            }
-            ServerControl::E2eVerificationSyncRateLimited { retry_after_ms } => {
-                if let Some(pending) = self.verification_sync_put.as_mut() {
-                    pending.sent = false;
-                } else {
-                    self.verification_sync_fetching = false;
-                }
-                let delay = Duration::from_millis(retry_after_ms.clamp(100, 60_000));
-                self.verification_sync_retry_at = Some(Instant::now() + delay);
-            }
             ServerControl::DeviceLinkCreated {
                 redemption_secret_hash,
                 expires_at_ms,
@@ -6647,7 +6275,9 @@ impl WorkerState {
                 }
                 if user_id != local_user {
                     if let Some(peer_roster) = roster.as_ref() {
+                        let peer_account = peer_roster.body.account_id;
                         self.record_pending_mls_roster(user_id, peer_roster)?;
+                        self.observe_peer_account(user_id, peer_account);
                         self.resume_pending_mls_group_infos(user_id)?;
                         self.resume_pending_mls_event_rosters(user_id)?;
                         self.resume_pending_mls_welcomes(user_id)?;
@@ -6662,6 +6292,9 @@ impl WorkerState {
                     }));
                     return Ok(());
                 }
+                let _ = self.events.send(NetworkEvent::MlsAccountIdentity {
+                    account_id: installation.bootstrap.account_id,
+                });
                 match roster {
                     None if self.mls_new && !initialized => {
                         let local_roster = installation.bootstrap.own_roster.clone();
@@ -6749,9 +6382,8 @@ impl WorkerState {
                     return Err("server bound a different MLS device".to_string());
                 }
                 self.mls_bound = true;
-                const KEY_PACKAGE_TARGET: u16 = 16;
-                let packages = if available_key_packages < KEY_PACKAGE_TARGET {
-                    let count = usize::from(KEY_PACKAGE_TARGET - available_key_packages);
+                let packages = if available_key_packages < MLS_KEY_PACKAGE_TARGET {
+                    let count = usize::from(MLS_KEY_PACKAGE_TARGET - available_key_packages);
                     Some(installation
                         .client
                         .generate_key_packages(device_id, count)?)
@@ -6764,12 +6396,13 @@ impl WorkerState {
                         device_id,
                         packages,
                     })?;
+                    self.mls_key_package_publish_pending = true;
                 }
                 self.queue_control(ClientControl::FetchMlsWelcome { after_sequence })?;
                 self.queue_mls_room_reconciliation()?;
                 self.queue_mls_maintenance()?;
                 self.queue_pending_mls_outbox()?;
-                let _ = self.events.send(NetworkEvent::E2eDeviceBound { device_id });
+                let _ = self.events.send(NetworkEvent::MlsDeviceBound { device_id });
             }
             ServerControl::KeyPackage { device_id, package } => {
                 self.handle_mls_key_package(device_id, package)?;
@@ -7200,7 +6833,41 @@ impl WorkerState {
                     self.process_pending_mls_group_info(room_id)?;
                 }
             }
-            control @ ServerControl::KeyPackagesPublished { .. } => {
+            ServerControl::KeyPackagesLow {
+                device_id,
+                available,
+            } => {
+                if !self.mls_bound
+                    || self.mls_key_package_publish_pending
+                    || available >= MLS_KEY_PACKAGE_TARGET
+                {
+                    return Ok(());
+                }
+                let installation = self
+                    .mls
+                    .as_ref()
+                    .ok_or_else(|| "KeyPackage notification arrived without MLS state".to_string())?;
+                if device_id != installation.bootstrap.device_id {
+                    return Err("server sent another device's KeyPackage count".to_string());
+                }
+                let packages = installation.client.generate_key_packages(
+                    device_id,
+                    usize::from(MLS_KEY_PACKAGE_TARGET - available),
+                )?;
+                self.queue_control(ClientControl::PublishKeyPackages {
+                    device_id,
+                    packages,
+                })?;
+                self.mls_key_package_publish_pending = true;
+            }
+            control @ ServerControl::KeyPackagesPublished { device_id, .. } => {
+                if self
+                    .mls
+                    .as_ref()
+                    .is_some_and(|installation| installation.bootstrap.device_id == device_id)
+                {
+                    self.mls_key_package_publish_pending = false;
+                }
                 if self.mls_bound {
                     self.queue_mls_room_reconciliation()?;
                 }
@@ -7311,6 +6978,43 @@ impl WorkerState {
         Ok(())
     }
 
+    fn observe_peer_account(&mut self, user_id: UserId, account_id: AccountId) {
+        let username = self
+            .user_names
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_else(|| user_id.to_string());
+        let room_ids = self
+            .room_kinds
+            .iter()
+            .filter_map(|(room_id, kind)| match kind {
+                RoomKind::Dm { user_a, user_b }
+                    if (*user_a == user_id && Some(*user_b) == self.user_id)
+                        || (*user_b == user_id && Some(*user_a) == self.user_id) =>
+                {
+                    Some(*room_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for room_id in room_ids {
+            if let Some(pin) =
+                self.e2e
+                    .observe_account(room_id, user_id, &username, account_id)
+            {
+                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed {
+                    pin,
+                    manual_verification: false,
+                });
+            }
+            if let Some(identity) = self.e2e.accepted_identity(user_id) {
+                let _ = self
+                    .events
+                    .send(NetworkEvent::E2ePeerPinMatched { identity });
+            }
+        }
+    }
+
     fn bind_local_mls(&mut self) -> Result<(), String> {
         let session_id = self
             .session_id
@@ -7337,7 +7041,7 @@ impl WorkerState {
         let Some(installation) = self.mls.as_ref() else {
             return Ok(false);
         };
-        let Some(_) = installation.client.descriptor(room_id)? else {
+        let Some(descriptor) = installation.client.descriptor(room_id)? else {
             if self.room_requires_mls(room_id) {
                 let _ = self.events.send(NetworkEvent::Status(
                     "encrypted room setup is still waiting for device KeyPackages".to_string(),
@@ -7346,14 +7050,30 @@ impl WorkerState {
             }
             return Ok(false);
         };
+        let event_id = random_event_id()?;
+        installation.client.queue_outgoing(rpc::mls::MlsChattEvent {
+            version: rpc::mls::MLS_PROTOCOL_VERSION,
+            room_id,
+            event_id,
+            sender_account: installation.bootstrap.account_id,
+            timestamp_ms: unix_now_ms(),
+            content,
+        })?;
         if !self.mls_bound {
             let _ = self.events.send(NetworkEvent::Status(
                 "encrypted message queued until the MLS device is bound".to_string(),
             ));
             return Ok(true);
         }
-        let event_id = random_event_id()?;
-        self.send_mls_content_with_id(room_id, event_id, content)?;
+        let (epoch, ciphertext) = installation
+            .client
+            .encrypt_outgoing(&descriptor, event_id)?;
+        self.queue_control(ClientControl::SubmitMlsApplication {
+            room_id,
+            epoch,
+            event_id,
+            ciphertext,
+        })?;
         Ok(true)
     }
 
@@ -7410,6 +7130,7 @@ impl WorkerState {
                     file: file.clone(),
                 },
             );
+            self.drain_pending_mls_file_offers(event.room_id)?;
         }
         let message = self.mls_chatt_event_to_chat(event)?;
         let _ = self.events.send(NetworkEvent::Chat(message));
@@ -7466,7 +7187,6 @@ impl WorkerState {
             file_transfer_id,
             flags,
             target,
-            envelope: None,
         };
         Ok(message.into())
     }
@@ -7887,202 +7607,33 @@ impl WorkerState {
         })
     }
 
-    fn handle_peer_identity_outcome(
-        &mut self,
-        user_id: UserId,
-        outcome: PeerIdentityOutcome,
-    ) -> Result<(), String> {
-        match outcome {
-            PeerIdentityOutcome::Pending(snapshot) => {
-                let trust_level = snapshot
-                    .current
-                    .as_ref()
-                    .filter(|(current, _)| current.public_key == snapshot.presented.public_key)
-                    .map_or(snapshot.presented.trust_level, |(_, level)| *level);
-                let Some(pin) = self.e2e.proposed_trust(&snapshot, trust_level) else {
-                    return Err(
-                        "peer identity changed during automatic TOFU activation".to_string()
-                    );
-                };
-                // Automatic TOFU is active for this session immediately. This
-                // deliberately applies to replacement keys too: Chatt does not
-                // quarantine authenticated plaintext behind a trust action,
-                // which would add a durable pending-content state machine and
-                // create a perverse incentive to treat trust as an unblock
-                // button: approve first to reveal the conversation, verify
-                // later if ever. Instead, the exact opening key travels with
-                // each message and the app keeps first-use or changed-identity
-                // state visibly unverified, with a persistent continuity
-                // warning when a pin changed. The app still writes the pin
-                // atomically so continuity survives a restart, but a failed
-                // write does not hide content.
-                if !self.e2e.confirm_pin(&pin, true) {
-                    return Err("peer identity could not be activated".to_string());
-                }
-                let _ = self.events.send(NetworkEvent::E2ePeerPinProposed {
-                    pin,
-                    manual_verification: false,
-                });
-                let Some(identity) = self.e2e.accepted_identity(user_id) else {
-                    return Err("activated peer identity is unavailable".to_string());
-                };
-                let room_id = identity.room_id;
-                let _ = self
-                    .events
-                    .send(NetworkEvent::E2ePeerPinMatched { identity });
-                self.drain_deferred_e2e_room(room_id)?;
-            }
-            PeerIdentityOutcome::KeyUnavailable {
-                room_id,
-                user_id,
-                username,
-            } => {
-                let _ = self.events.send(NetworkEvent::E2eKeyUnavailable {
-                    room_id,
-                    user_id,
-                    username,
-                });
-            }
-            PeerIdentityOutcome::PinMatched(identity) => {
-                let room_id = identity.room_id;
-                let identity = self.e2e.accepted_identity(user_id).unwrap_or(identity);
-                let _ = self
-                    .events
-                    .send(NetworkEvent::E2ePeerPinMatched { identity });
-                self.drain_deferred_e2e_room(room_id)?;
-            }
-            PeerIdentityOutcome::Rejected => {}
-        }
-        Ok(())
-    }
-
-    /// Opens a chat record and returns its client-authenticated key provenance.
-    /// `Deferred` is reserved for the short ordering window before a peer key
-    /// response arrives; malformed or forbidden forms fail the connection.
-    fn open_chat_message(
-        &mut self,
-        message: &mut ChatMessage,
-        live: bool,
-    ) -> Result<OpenChat, String> {
-        if self.e2e_public_only && self.e2e.requires_e2e(message.room_id) {
-            sanitize_unavailable_message(
-                message,
-                "Encrypted message unavailable while this installation's identity is disabled.",
-            );
-            return Ok(OpenChat::Ready(None));
-        }
-        let failure = match self
-            .e2e
-            .open_message_with_replay(message, &self.config.username, live)
-        {
-            Ok(provenance) => return Ok(OpenChat::Ready(provenance)),
-            Err(failure) => failure,
-        };
-        kvlog::warn!(
-            "dm envelope failed to open",
-            room_id = message.room_id.0,
-            message_id = message.message_id.0,
-            sender = message.sender.0,
-            failure = match failure {
-                OpenFailure::NoKeys => "no keys",
-                OpenFailure::AwaitingTrust => "awaiting trust",
-                OpenFailure::Policy => "policy",
-                OpenFailure::Crypto => "authentication",
-                OpenFailure::HistoryUnavailable { .. } => "not addressed to this device",
-                OpenFailure::Replay => "replay",
-            }
-        );
-        match failure {
-            OpenFailure::NoKeys | OpenFailure::AwaitingTrust => {
-                if matches!(failure, OpenFailure::NoKeys)
-                    && let Some(user_id) = self.e2e.dm_peer(message.room_id)
-                {
-                    let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
-                        user_id,
-                        after: self.e2e.account_chain_after(user_id),
-                    });
-                }
-                Ok(OpenChat::Deferred)
-            }
-            OpenFailure::Replay => Ok(OpenChat::Discarded),
-            OpenFailure::HistoryUnavailable {
-                created_at_ms,
-                sender_name,
-                peer_public_key,
-            } => {
-                message.timestamp_ms = created_at_ms;
-                message.sender_name = sender_name;
-                sanitize_unavailable_message(
-                    message,
-                    "Encrypted message unavailable on this device (sent before it was linked).",
-                );
-                Ok(OpenChat::Ready(Some(MessageProvenance { peer_public_key })))
-            }
-            OpenFailure::Policy | OpenFailure::Crypto => {
-                sanitize_unavailable_message(
-                    message,
-                    "Encrypted message unavailable (failed authentication).",
-                );
-                Ok(OpenChat::Ready(None))
-            }
-        }
-    }
-
-    fn defer_e2e(&mut self, item: DeferredE2eInbound) -> Result<(), String> {
+    fn defer_mls_file_offer(&mut self, item: PendingMlsFileOffer) -> Result<(), String> {
         let room_id = item
             .room_id()
             .ok_or_else(|| "encrypted DM data arrived without a room".to_string())?;
         let retained = item.retained_bytes();
-        let room_full = self.deferred_e2e.get(&room_id).is_some_and(|room| {
-            room.items.len() >= MAX_DEFERRED_E2E_ITEMS
-                || room.bytes.saturating_add(retained) > MAX_DEFERRED_E2E_BYTES
+        let room_full = self.pending_mls_file_offers.get(&room_id).is_some_and(|room| {
+            room.items.len() >= MAX_PENDING_MLS_FILE_ITEMS
+                || room.bytes.saturating_add(retained) > MAX_PENDING_MLS_FILE_BYTES
         });
-        let global_full = self.deferred_e2e_items >= MAX_DEFERRED_E2E_GLOBAL_ITEMS
-            || self.deferred_e2e_bytes.saturating_add(retained) > MAX_DEFERRED_E2E_GLOBAL_BYTES;
+        let global_full = self.pending_mls_file_items >= MAX_PENDING_MLS_FILE_GLOBAL_ITEMS
+            || self.pending_mls_file_bytes.saturating_add(retained)
+                > MAX_PENDING_MLS_FILE_GLOBAL_BYTES;
         if room_full || global_full {
-            self.degrade_deferred_e2e(room_id, item);
+            self.drop_pending_mls_file_offer(room_id, item);
             return Ok(());
         }
-        let room = self.deferred_e2e.entry(room_id).or_default();
+        let room = self.pending_mls_file_offers.entry(room_id).or_default();
         room.bytes = room.bytes.saturating_add(retained);
-        self.deferred_e2e_bytes = self.deferred_e2e_bytes.saturating_add(retained);
-        self.deferred_e2e_items = self.deferred_e2e_items.saturating_add(1);
+        self.pending_mls_file_bytes = self.pending_mls_file_bytes.saturating_add(retained);
+        self.pending_mls_file_items = self.pending_mls_file_items.saturating_add(1);
         room.items.push_back(item);
         Ok(())
     }
 
-    fn degrade_deferred_e2e(&mut self, room_id: RoomId, item: DeferredE2eInbound) {
-        const PLACEHOLDER: &str =
-            "Encrypted message unavailable while encryption identity keys were loading.";
+    fn drop_pending_mls_file_offer(&mut self, room_id: RoomId, item: PendingMlsFileOffer) {
         match item {
-            DeferredE2eInbound::Chat(mut message) => {
-                sanitize_unavailable_message(&mut message, PLACEHOLDER);
-                let _ = self.events.send(NetworkEvent::Chat(AuthenticatedChat {
-                    message,
-                    provenance: None,
-                }));
-            }
-            DeferredE2eInbound::History(chunk) => {
-                let messages = chunk
-                    .messages
-                    .into_iter()
-                    .map(|mut message| {
-                        sanitize_unavailable_message(&mut message, PLACEHOLDER);
-                        AuthenticatedChat {
-                            message,
-                            provenance: None,
-                        }
-                    })
-                    .collect();
-                let _ = self.events.send(NetworkEvent::HistoryChunk {
-                    room_id: chunk.room_id,
-                    before: chunk.before,
-                    messages,
-                    at_start: chunk.at_start,
-                    complete: chunk.complete,
-                });
-            }
-            DeferredE2eInbound::FileOffered { file, .. } => {
+            PendingMlsFileOffer::FileOffered { file, .. } => {
                 self.skipped_untrusted_files.remove(&file.transfer_id);
                 self.end_transfer_skipped(
                     &file,
@@ -8090,20 +7641,20 @@ impl WorkerState {
                 );
             }
         }
-        if self.deferred_e2e_warned_rooms.insert(room_id) {
+        if self.pending_mls_file_warned_rooms.insert(room_id) {
             let _ = self.events.send(NetworkEvent::Error(
-                "Some encrypted DM items were unavailable because identity keys were still loading. The connection remains active."
+                "Some encrypted file offers were unavailable because their MLS announcements arrived too late. The connection remains active."
                     .to_string(),
             ));
         }
     }
 
-    fn drain_deferred_e2e_room(&mut self, room_id: RoomId) -> Result<usize, String> {
-        let Some(mut room) = self.deferred_e2e.remove(&room_id) else {
+    fn drain_pending_mls_file_offers(&mut self, room_id: RoomId) -> Result<usize, String> {
+        let Some(mut room) = self.pending_mls_file_offers.remove(&room_id) else {
             return Ok(0);
         };
-        self.deferred_e2e_bytes = self.deferred_e2e_bytes.saturating_sub(room.bytes);
-        self.deferred_e2e_items = self.deferred_e2e_items.saturating_sub(room.items.len());
+        self.pending_mls_file_bytes = self.pending_mls_file_bytes.saturating_sub(room.bytes);
+        self.pending_mls_file_items = self.pending_mls_file_items.saturating_sub(room.items.len());
         room.bytes = 0;
         let mut recovered = 0usize;
         let count = room.items.len();
@@ -8113,51 +7664,7 @@ impl WorkerState {
             };
             let logical_items = item.logical_items();
             match item {
-                DeferredE2eInbound::Chat(mut message) => {
-                    match self.open_chat_message(&mut message, true)? {
-                        OpenChat::Ready(provenance) => {
-                            let _ = self.events.send(NetworkEvent::Chat(AuthenticatedChat {
-                                message,
-                                provenance,
-                            }));
-                        }
-                        OpenChat::Deferred => {
-                            room.items.push_front(DeferredE2eInbound::Chat(message));
-                            break;
-                        }
-                        OpenChat::Discarded => {}
-                    }
-                }
-                DeferredE2eInbound::History(chunk) => {
-                    let mut opened = Vec::with_capacity(chunk.messages.len());
-                    let mut ready = true;
-                    for mut message in chunk.messages.iter().cloned() {
-                        match self.open_chat_message(&mut message, false)? {
-                            OpenChat::Ready(provenance) => opened.push(AuthenticatedChat {
-                                message,
-                                provenance,
-                            }),
-                            OpenChat::Deferred => {
-                                ready = false;
-                                break;
-                            }
-                            OpenChat::Discarded => {}
-                        }
-                    }
-                    if ready {
-                        let _ = self.events.send(NetworkEvent::HistoryChunk {
-                            room_id: chunk.room_id,
-                            before: chunk.before,
-                            messages: opened,
-                            at_start: chunk.at_start,
-                            complete: chunk.complete,
-                        });
-                    } else {
-                        room.items.push_front(DeferredE2eInbound::History(chunk));
-                        break;
-                    }
-                }
-                DeferredE2eInbound::FileOffered {
+                PendingMlsFileOffer::FileOffered {
                     file,
                     contents,
                     skipped_untrusted,
@@ -8169,7 +7676,7 @@ impl WorkerState {
                             self.handle_file_offered_ready(file, contents);
                         }
                     } else {
-                        room.items.push_front(DeferredE2eInbound::FileOffered {
+                        room.items.push_front(PendingMlsFileOffer::FileOffered {
                             file,
                             contents,
                             skipped_untrusted,
@@ -8184,11 +7691,11 @@ impl WorkerState {
             room.bytes = room
                 .items
                 .iter()
-                .map(DeferredE2eInbound::retained_bytes)
+                .map(PendingMlsFileOffer::retained_bytes)
                 .sum();
-            self.deferred_e2e_bytes = self.deferred_e2e_bytes.saturating_add(room.bytes);
-            self.deferred_e2e_items = self.deferred_e2e_items.saturating_add(room.items.len());
-            self.deferred_e2e.insert(room_id, room);
+            self.pending_mls_file_bytes = self.pending_mls_file_bytes.saturating_add(room.bytes);
+            self.pending_mls_file_items = self.pending_mls_file_items.saturating_add(room.items.len());
+            self.pending_mls_file_offers.insert(room_id, room);
         }
         Ok(recovered)
     }
@@ -9396,7 +8903,7 @@ fn unseal_own_metadata(
     metadata.original_name = name.to_string();
     metadata.size = size;
     metadata.encoding = inner_encoding;
-    metadata.sealed_meta = None;
+    metadata.mls_event_id = None;
 }
 
 fn compressed_upload_source_read_ahead_is_limited(
@@ -9517,26 +9024,12 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
         NetworkCommand::CancelDeviceLink { .. } => "cancel_device_link",
-        NetworkCommand::AcknowledgeSyncedVerificationNotice { .. } => {
-            "acknowledge_synced_verification_notice"
-        }
         NetworkCommand::Shutdown => "shutdown",
     }
 }
 
 
-fn dm_peer_for_local(room: &RoomInfo, local: UserId) -> Option<UserId> {
-    let RoomKind::Dm { user_a, user_b } = room.kind else {
-        return None;
-    };
-    match (user_a == local, user_b == local) {
-        (true, false) => Some(user_b),
-        (false, true) => Some(user_a),
-        _ => None,
-    }
-}
-
-/// Wall-clock UNIX milliseconds, stamped inside sealed DM payloads.
+/// Wall-clock UNIX milliseconds, stamped inside MLS application events.
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9665,15 +9158,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
         ServerControl::UploadDeclined { .. } => "upload_declined",
-        ServerControl::AccountKeyChain { .. } => "account_key_chain",
-        ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
-        ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
-        ServerControl::E2eVerificationSync { .. } => "e2e_verification_sync",
-        ServerControl::E2eVerificationSyncChanged { .. } => "e2e_verification_sync_changed",
-        ServerControl::E2eVerificationSyncConflict { .. } => "e2e_verification_sync_conflict",
-        ServerControl::E2eVerificationSyncRateLimited { .. } => {
-            "e2e_verification_sync_rate_limited"
-        }
         ServerControl::DeviceLinkCreated { .. } => "device_link_created",
         ServerControl::DeviceLinkCanceled { .. } => "device_link_canceled",
         ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
@@ -9684,6 +9168,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::DeviceRosterConflict { .. } => "device_roster_conflict",
         ServerControl::MlsDeviceBound { .. } => "mls_device_bound",
         ServerControl::KeyPackagesPublished { .. } => "key_packages_published",
+        ServerControl::KeyPackagesLow { .. } => "key_packages_low",
         ServerControl::KeyPackage { .. } => "key_package",
         ServerControl::EncryptedRoomCreated { .. } => "encrypted_room_created",
         ServerControl::GroupInfo { .. } => "group_info",
@@ -9974,27 +9459,6 @@ fn random_u64() -> Result<u64, String> {
     Ok(u64::from_le_bytes(bytes).max(1))
 }
 
-/// Decides whether a signed-ledger head notification needs a directory fetch.
-/// A newly generated local ledger is known before it exists on the server, so
-/// an equal head still needs one confirming response to finish registration.
-fn account_head_requires_fetch(
-    current: Option<(u64, LedgerHash)>,
-    local_registration_pending: bool,
-    announced_epoch: u64,
-    announced_head: LedgerHash,
-) -> Result<bool, String> {
-    let Some((current_epoch, current_head)) = current else {
-        return Ok(true);
-    };
-    if current_head == announced_head {
-        return Ok(local_registration_pending);
-    }
-    if announced_epoch <= current_epoch {
-        return Err("account directory announced a rollback or same-epoch fork".to_string());
-    }
-    Ok(true)
-}
-
 fn configured_nat_kind() -> P2pNatKind {
     match std::env::var("CHATT_P2P_NAT")
         .unwrap_or_default()
@@ -10178,27 +9642,6 @@ mod tests {
 
     fn user(id: u64) -> UserId {
         UserId(id)
-    }
-
-    #[test]
-    fn matching_initial_local_head_is_fetched_until_registration_is_confirmed() {
-        let head = LedgerHash([7; 32]);
-        let current = Some((1, head));
-
-        assert!(account_head_requires_fetch(current, true, 1, head).unwrap());
-        assert!(!account_head_requires_fetch(current, false, 1, head).unwrap());
-    }
-
-    #[test]
-    fn account_head_change_requires_a_strictly_newer_epoch() {
-        let current = Some((4, LedgerHash([4; 32])));
-
-        assert!(
-            account_head_requires_fetch(current, false, 5, LedgerHash([5; 32])).unwrap()
-        );
-        assert!(
-            account_head_requires_fetch(current, false, 4, LedgerHash([6; 32])).is_err()
-        );
     }
 
     fn interface_snapshot(addr: &str) -> InterfaceSnapshot {
@@ -11127,7 +10570,7 @@ mod tests {
         IncomingFile {
             seal: None,
             metadata: FileMetadata {
-                sealed_meta: None,
+                mls_event_id: None,
                 transfer_id: FileTransferId(1),
                 room_id: RoomId(1),
                 sender: UserId(1),
@@ -11212,97 +10655,6 @@ mod tests {
                 assert_eq!(fs::read(path).unwrap(), data);
             }
         }
-    }
-
-    #[test]
-    fn sealed_dm_chunks_stay_within_max_chunk_bytes() {
-        let content_key = vec![5u8; KEY_LEN];
-        let payload = vec![7u8; MAX_FILE_CHUNK_BYTES - rpc::e2e::DM_CHUNK_OVERHEAD];
-        let frame = rpc::e2e::seal_dm_chunk(
-            &content_key,
-            RoomId(4),
-            UserId(7),
-            EventId([1; 16]),
-            0,
-            &payload,
-            0,
-        )
-        .unwrap();
-        assert_eq!(frame.len(), MAX_FILE_CHUNK_BYTES);
-    }
-
-    #[test]
-    fn sealed_zstd_file_round_trips_through_seal_and_open() {
-        let data = b"sealed dm transfer\n".repeat(60_000);
-        let encoded = encode_test_stream(&data, 8192, 4096);
-        let content_key = vec![9u8; KEY_LEN];
-        let room = RoomId(4);
-        let sender = UserId(7);
-        let event_id = EventId([2; 16]);
-        let max_payload = MAX_FILE_CHUNK_BYTES - rpc::e2e::DM_CHUNK_OVERHEAD;
-
-        let mut frames = Vec::new();
-        for chunk in encoded.chunks(max_payload) {
-            let counter = frames.len() as u64;
-            frames.push(
-                rpc::e2e::seal_dm_chunk(
-                    &content_key,
-                    room,
-                    sender,
-                    event_id,
-                    counter,
-                    chunk,
-                    0,
-                )
-                .unwrap(),
-            );
-        }
-        let mut pad = rpc::e2e::padme_len(encoded.len() as u64) - encoded.len() as u64;
-        while pad > 0 {
-            let pad_len = pad.min(max_payload as u64) as usize;
-            let counter = frames.len() as u64;
-            frames.push(
-                rpc::e2e::seal_dm_chunk(
-                    &content_key,
-                    room,
-                    sender,
-                    event_id,
-                    counter,
-                    &[],
-                    pad_len,
-                )
-                .unwrap(),
-            );
-            pad -= pad_len as u64;
-        }
-
-        let mut wire = Vec::new();
-        for (index, frame) in frames.into_iter().enumerate() {
-            let mut frame = frame;
-            let payload =
-                rpc::e2e::open_dm_chunk(
-                    &content_key,
-                    room,
-                    sender,
-                    event_id,
-                    index as u64,
-                    &mut frame,
-                )
-                .unwrap();
-            wire.extend_from_slice(&payload);
-        }
-        assert_eq!(wire, encoded, "padding frames must open to empty payloads");
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("received.bin");
-        let mut incoming =
-            incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
-        pump_test_input(&mut incoming, &wire, 313, 64 * 1024).unwrap();
-        let (_, location, _, _, _) = incoming.finalize().unwrap();
-        let FinalizedLocation::Disk { path, .. } = location else {
-            panic!("disk transfer should finalize to a disk path");
-        };
-        assert_eq!(fs::read(path).unwrap(), data);
     }
 
     #[test]
@@ -11586,7 +10938,7 @@ mod tests {
 
     fn accepted_file_metadata() -> FileMetadata {
         FileMetadata {
-            sealed_meta: None,
+            mls_event_id: None,
             transfer_id: FileTransferId(20),
             room_id: RoomId(1),
             sender: UserId(3),
