@@ -13,6 +13,15 @@ const WORD_COUNT: usize = 6;
 const AAD_LABEL: &[u8] = b"chatt disposable device enrollment v2";
 const WORDLIST: &str = include_str!("../assets/english.txt");
 
+#[cfg(not(test))]
+const KDF_MEMORY_KIB: u32 = 62_500;
+#[cfg(test)]
+const KDF_MEMORY_KIB: u32 = 32;
+#[cfg(not(test))]
+const KDF_ITERATIONS: u32 = 18;
+#[cfg(test)]
+const KDF_ITERATIONS: u32 = 1;
+
 pub(crate) fn seal_enrollment(
     identity: &LocalE2eIdentity,
     ticket_hash: &[u8],
@@ -86,8 +95,8 @@ pub(crate) fn redemption_secret_hash(secret: &str) -> Vec<u8> {
 fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
     let hash = Hasher::new()
         .algorithm(Algorithm::Argon2id)
-        .memory_cost_kib(62_500)
-        .iterations(18)
+        .memory_cost_kib(KDF_MEMORY_KIB)
+        .iterations(KDF_ITERATIONS)
         .threads(1)
         .hash_length(KEY_LEN as u32)
         .custom_salt(salt)

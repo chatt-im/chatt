@@ -907,6 +907,18 @@ impl E2eState {
             .then(|| (room.peer, room.username.clone()))
     }
 
+    /// Suspends sending while a newer signed device roster is being fetched.
+    /// The stable account identity is unchanged, but sealing to the old roster
+    /// would omit newly linked devices (or retain revoked ones).
+    pub fn mark_peer_roster_stale(&mut self, peer_id: UserId) -> Option<(RoomId, String)> {
+        let (room_id, room) = self
+            .rooms
+            .iter_mut()
+            .find(|(_, room)| room.peer == peer_id)?;
+        room.pin_matched_this_session = false;
+        Some((*room_id, room.username.clone()))
+    }
+
     pub fn proposed_trust(
         &self,
         expected: &PendingPeerIdentity,
@@ -1075,11 +1087,14 @@ impl E2eState {
         sent_at_ms: u64,
     ) -> Result<Vec<u8>, SealBlocked> {
         let sender = self.my_id.ok_or(SealBlocked::NoIdentity)?;
-        let peer = self
+        let room = self
             .rooms
             .get(&room_id)
-            .map(|room| room.peer)
             .ok_or(SealBlocked::PeerKeyMissing)?;
+        if !room.pin_matched_this_session {
+            return Err(SealBlocked::PeerKeyMissing);
+        }
+        let peer = room.peer;
         let own_ledger = self
             .account_ledger(sender)
             .ok_or(SealBlocked::NoIdentity)?;
@@ -1555,11 +1570,6 @@ impl E2eState {
         self.stored_pins
             .iter()
             .find(|pin| pin.room_id == room_id.0 && pin.user_id == peer.0)
-            .or_else(|| {
-                self.stored_pins
-                    .iter()
-                    .find(|pin| pin.room_id == 0 && pin.user_id == peer.0)
-            })
     }
 
     fn derive_identity(
@@ -1893,6 +1903,29 @@ mod tests {
     }
 
     #[test]
+    fn roster_change_blocks_sealing_until_the_new_roster_is_loaded() {
+        let (mut alice, bob) = linked_pair();
+
+        assert_eq!(
+            alice.mark_peer_roster_stale(UserId(2)),
+            Some((RoomId(9), "bob".to_string()))
+        );
+        assert_eq!(
+            alice.seal_chat(RoomId(9), DmContentKind::Text, None, "blocked", 1),
+            Err(SealBlocked::PeerKeyMissing)
+        );
+        assert!(matches!(
+            alice.handle_peer_key(UserId(2), Some(&bob.public_key().unwrap())),
+            PeerIdentityOutcome::PinMatched(_)
+        ));
+        assert!(
+            alice
+                .seal_chat(RoomId(9), DmContentKind::Text, None, "current", 2)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn failed_persistence_after_tofu_activation_keeps_key_usable() {
         let mut alice = seeded(1, UserId(1));
         alice
@@ -2162,63 +2195,6 @@ mod tests {
                 .seal_chat(RoomId(9), DmContentKind::Text, None, "still trusted", 1,)
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn legacy_unbound_pin_stages_room_binding_before_releasing_messages() {
-        let bob_public = e2e_public_key(&[2; E2E_SEED_LEN]);
-        let stale_pin = E2ePeerPin {
-            room_id: 0,
-            user_id: 2,
-            username: String::new(),
-            public_key: encode_hex(&bob_public),
-            trust_level: E2eTrustLevel::Accepted,
-            change_from: None,
-            previous: Vec::new(),
-        };
-        let mut alice = E2eState::new(
-            Some(&encode_hex(&[1; E2E_SEED_LEN])),
-            Some(UserId(1)),
-            &[stale_pin],
-            None,
-        );
-        alice.set_local_user(UserId(1)).unwrap();
-        alice
-            .note_room(&dm(RoomId(9), UserId(1), UserId(2)), "bob")
-            .unwrap();
-
-        let mut bob = seeded(2, UserId(2));
-        bob.note_room(&dm(RoomId(9), UserId(1), UserId(2)), "alice")
-            .unwrap();
-        accept_first(&mut bob, UserId(1), &alice.public_key().unwrap());
-        let envelope = bob
-            .seal_chat(RoomId(9), DmContentKind::Text, None, "must wait", 1_000)
-            .unwrap();
-        let mut message = text_message(RoomId(9), UserId(2), Some(envelope));
-        // Even before the served-key response arrives, the authenticated room
-        // tuple already contradicts the stored tuple, so retained keys must
-        // authenticate without releasing plaintext.
-        assert_eq!(
-            alice.open_message(&mut message, "alice"),
-            Err(OpenFailure::AwaitingTrust)
-        );
-        assert!(message.envelope.is_some());
-        assert!(matches!(
-            alice.handle_peer_key(UserId(2), Some(&bob_public)),
-            PeerIdentityOutcome::Pending(_)
-        ));
-        assert_eq!(
-            alice.open_message(&mut message, "alice"),
-            Err(OpenFailure::AwaitingTrust)
-        );
-
-        let snapshot = alice.pending_identity(UserId(2)).unwrap();
-        let pin = alice
-            .proposed_trust(&snapshot, E2eTrustLevel::Accepted)
-            .unwrap();
-        assert!(alice.confirm_pin(&pin, true));
-        alice.open_message(&mut message, "alice").unwrap();
-        assert_eq!(message.body, "must wait");
     }
 
     #[test]

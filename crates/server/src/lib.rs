@@ -3900,6 +3900,17 @@ impl Server {
         {
             return Some("direct message event does not match the bound device session");
         }
+        let peer = match self.rooms.get(&room_id).map(|room| &room.access) {
+            Some(RoomAccess::Dm(a, b)) if *a == session.user_id => *b,
+            Some(RoomAccess::Dm(a, b)) if *b == session.user_id => *a,
+            _ => return Some("direct message room does not contain the sender"),
+        };
+        let Ok(Some(peer_ledger)) = self.device_directory.validated(peer) else {
+            return Some("direct message recipient has no account device roster");
+        };
+        if event.header.recipient_roster != RosterCheckpoint::from(&peer_ledger) {
+            return Some("direct message recipient device roster is stale");
+        }
         None
     }
 
@@ -7979,6 +7990,7 @@ mod tests {
     fn test_dm_event(
         bound: BoundE2eDevice,
         account_id: rpc::ids::AccountId,
+        recipient_roster: RosterCheckpoint,
         sender: UserId,
         room_id: RoomId,
         kind: DmContentKind,
@@ -8003,12 +8015,7 @@ mod tests {
                     roster_epoch: 1,
                     head: bound.ledger_head,
                 },
-                recipient_roster: rpc::e2e::RosterCheckpoint {
-                    account_id: rpc::ids::AccountId::default(),
-                    account_generation: 1,
-                    roster_epoch: 1,
-                    head: LedgerHash::default(),
-                },
+                recipient_roster,
             },
             ephemeral_public_key: vec![1; 32],
             recipient_keys: Vec::new(),
@@ -8184,9 +8191,30 @@ mod tests {
             .expect("dm registered");
         let (bound, account_id) =
             authorize_test_e2e_device(&mut server, requester, UserId(1), 31);
+        let _ = authorize_test_e2e_device(&mut server, SessionId(2), UserId(2), 32);
+        let recipient_roster = RosterCheckpoint::from(
+            server
+                .device_directory
+                .validated(UserId(2))
+                .unwrap()
+                .as_ref()
+                .unwrap(),
+        );
         let text_event = test_dm_event(
             bound,
             account_id,
+            recipient_roster,
+            UserId(1),
+            dm_room,
+            DmContentKind::Text,
+            1,
+        );
+        let mut stale_recipient = recipient_roster;
+        stale_recipient.head = LedgerHash::default();
+        let stale_event = test_dm_event(
+            bound,
+            account_id,
+            stale_recipient,
             UserId(1),
             dm_room,
             DmContentKind::Text,
@@ -8215,6 +8243,16 @@ mod tests {
             message.contains("only accepted in direct messages"),
             "{message}"
         );
+
+        server
+            .send_chat(requester, dm_room, String::new(), Some(stale_event))
+            .unwrap();
+        let ServerControl::Error { message, .. } = read_until(&mut requester_peer, |control| {
+            matches!(control, ServerControl::Error { .. })
+        }) else {
+            unreachable!();
+        };
+        assert!(message.contains("recipient device roster is stale"), "{message}");
 
         server
             .send_chat(requester, dm_room, String::new(), Some(text_event.clone()))
@@ -8259,6 +8297,7 @@ mod tests {
                 Some(test_dm_event(
                     bound,
                     account_id,
+                    recipient_roster,
                     UserId(1),
                     dm_room,
                     DmContentKind::Edit,
@@ -8303,6 +8342,7 @@ mod tests {
                 Some(test_dm_event(
                     bound,
                     account_id,
+                    recipient_roster,
                     UserId(1),
                     dm_room,
                     DmContentKind::Delete,
@@ -8334,9 +8374,19 @@ mod tests {
             .expect("dm registered");
         let (bound, account_id) =
             authorize_test_e2e_device(&mut server, uploader, UserId(1), 41);
+        let _ = authorize_test_e2e_device(&mut server, recipient, UserId(2), 42);
+        let recipient_roster = RosterCheckpoint::from(
+            server
+                .device_directory
+                .validated(UserId(2))
+                .unwrap()
+                .as_ref()
+                .unwrap(),
+        );
         let sealed_meta = test_dm_event(
             bound,
             account_id,
+            recipient_roster,
             UserId(1),
             dm_room,
             DmContentKind::FileAnnounce,
