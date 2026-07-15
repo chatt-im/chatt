@@ -1,8 +1,7 @@
 use jsony::Jsony;
 
 use crate::ids::{
-    BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId, StreamId,
-    UserId,
+    BugReportId, DeviceId, EventId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId,
 };
 
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 224 * 1024;
@@ -145,9 +144,6 @@ pub enum ClientControl {
     SendChat {
         room_id: RoomId,
         body: String,
-        /// Encoded [`crate::e2e::DmEventEnvelope`] replacing `body` in DM rooms;
-        /// exactly one of the two is set.
-        envelope: Option<Vec<u8>>,
     },
     SetVoiceStatus {
         status: ParticipantVoiceStatus,
@@ -168,11 +164,10 @@ pub enum ClientControl {
         /// the server never learns the true size.
         size: u64,
         encoding: FileContentEncoding,
-        /// Encoded [`crate::e2e::DmEventEnvelope`] holding the transfer's real
+        /// MLS application event id carrying the transfer's authenticated
         /// metadata and content key; required for
-        /// [`FileContentEncoding::Sealed`], absent otherwise. The server copies
-        /// it verbatim into the announcement message and [`FileMetadata`].
-        sealed_meta: Option<Vec<u8>>,
+        /// [`FileContentEncoding::Sealed`], absent otherwise.
+        mls_event_id: Option<EventId>,
     },
     UploadFileChunk {
         transfer_id: FileTransferId,
@@ -253,49 +248,12 @@ pub enum ClientControl {
         room_id: RoomId,
         target: MessageId,
         body: String,
-        /// Encoded [`crate::e2e::DmEventEnvelope`] replacing `body` in DM rooms;
-        /// exactly one of the two is set.
-        envelope: Option<Vec<u8>>,
     },
     /// Delete a recent message the sender authored, of any kind. Bounded like
     /// [`ClientControl::EditChat`].
     DeleteChat {
         room_id: RoomId,
         target: MessageId,
-        /// Encoded [`crate::e2e::DmEventEnvelope`] authenticating the deletion and
-        /// target in DM rooms; absent in other rooms.
-        envelope: Option<Vec<u8>>,
-    },
-    /// Appends one authority-signed transition to the authenticated account's
-    /// device ledger. The statement's `previous` hash is the compare-and-swap
-    /// anchor, so concurrent device administration cannot silently overwrite.
-    AppendAccountKeyStatement {
-        statement: crate::e2e::AccountKeyStatement,
-    },
-    /// Fetches a user's signed account/device ledger. When `after` is known the
-    /// server may return only the suffix following that checkpoint.
-    FetchAccountKeyChain {
-        user_id: UserId,
-        after: Option<LedgerHash>,
-    },
-    /// Proves possession of an active device signing key for this authenticated
-    /// transport session. DM sends are unavailable until this succeeds.
-    BindE2eDevice {
-        device_id: DeviceId,
-        key_epoch: u64,
-        ledger_head: LedgerHash,
-        signature: Vec<u8>,
-    },
-    /// Fetches the latest compacted, opaque manual-verification snapshot for
-    /// the authenticated account. A matching checkpoint suppresses the body.
-    FetchE2eVerificationSync {
-        known: Option<crate::e2e::VerificationSyncCheckpoint>,
-    },
-    /// Compare-and-swap replacement of the authenticated account's compacted
-    /// verification snapshot. The server retains only this envelope.
-    PutE2eVerificationSync {
-        expected: Option<crate::e2e::VerificationSyncCheckpoint>,
-        envelope: Vec<u8>,
     },
     /// Fetches the one current authority-signed MLS device roster for an account.
     FetchDeviceRoster {
@@ -518,37 +476,6 @@ pub enum ServerControl {
         client_transfer_id: FileTransferId,
         reason: String,
     },
-    /// Full signed device ledger, or the requested suffix when `base` is set.
-    AccountKeyChain {
-        user_id: UserId,
-        base: Option<LedgerHash>,
-        statements: Vec<crate::e2e::AccountKeyStatement>,
-    },
-    /// Push notification that a user's signed ledger advanced. Recipients fetch
-    /// and validate the chain before changing current sending authorization.
-    AccountKeyHeadChanged {
-        user_id: UserId,
-        roster_epoch: u64,
-        head: LedgerHash,
-    },
-    E2eDeviceBound {
-        device_id: DeviceId,
-        key_epoch: u64,
-    },
-    E2eVerificationSync {
-        checkpoint: Option<crate::e2e::VerificationSyncCheckpoint>,
-        /// `None` when the requester's known checkpoint is current.
-        envelope: Option<Vec<u8>>,
-    },
-    E2eVerificationSyncChanged {
-        checkpoint: crate::e2e::VerificationSyncCheckpoint,
-    },
-    E2eVerificationSyncConflict {
-        current: Option<crate::e2e::VerificationSyncCheckpoint>,
-    },
-    E2eVerificationSyncRateLimited {
-        retry_after_ms: u64,
-    },
     DeviceRoster {
         user_id: UserId,
         /// Sticky account fact, independent of the current roster snapshot.
@@ -566,6 +493,13 @@ pub enum ServerControl {
         available_key_packages: u16,
     },
     KeyPackagesPublished {
+        device_id: DeviceId,
+        available: u16,
+    },
+    /// A package was consumed from this connected device's server pool.
+    /// The owning installation replenishes to its local target without a
+    /// reconnect; publication then wakes room creation waiting on the pool.
+    KeyPackagesLow {
         device_id: DeviceId,
         available: u16,
     },
@@ -765,10 +699,6 @@ pub struct ChatMessage {
     pub flags: MessageFlags,
     /// `Some` marks this record as a mutation of that message id.
     pub target: Option<MessageId>,
-    /// Encoded [`crate::e2e::DmEventEnvelope`] carrying the sealed content in DM
-    /// rooms; `body` is empty then and receiving clients fill it after opening
-    /// the envelope.
-    pub envelope: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -785,10 +715,9 @@ pub struct FileMetadata {
     pub size: u64,
     pub encoding: FileContentEncoding,
     pub timestamp_ms: u64,
-    /// Encoded [`crate::e2e::DmEventEnvelope`] with the transfer's real metadata
-    /// and content key, relayed verbatim from
-    /// [`ClientControl::UploadFileStart`] for sealed transfers.
-    pub sealed_meta: Option<Vec<u8>>,
+    /// MLS application event id containing the transfer's authenticated
+    /// metadata and content key.
+    pub mls_event_id: Option<EventId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -798,7 +727,7 @@ pub enum FileContentEncoding {
     Zstd,
     /// End-to-end encrypted DM transfer: chunks are AEAD frames sealed by the
     /// sender, the true name/size/inner-encoding travel only inside
-    /// `sealed_meta`. The server sees a placeholder name and a padded size.
+    /// an MLS application event. The server sees a placeholder name and a padded size.
     Sealed,
 }
 
@@ -817,8 +746,8 @@ pub fn max_file_wire_bytes(encoding: FileContentEncoding, original_size: u64) ->
             let stream = max_file_wire_bytes(FileContentEncoding::Zstd, original_size);
             // Padmé expands the sealed stream by at most 1/8th.
             let stream = stream.saturating_add(stream / 8);
-            let chunks = stream / (MAX_FILE_CHUNK_BYTES - crate::e2e::DM_CHUNK_OVERHEAD) as u64 + 2;
-            stream.saturating_add(chunks.saturating_mul(crate::e2e::DM_CHUNK_OVERHEAD as u64))
+            let chunks = stream / (MAX_FILE_CHUNK_BYTES - crate::mls::FILE_CHUNK_OVERHEAD) as u64 + 2;
+            stream.saturating_add(chunks.saturating_mul(crate::mls::FILE_CHUNK_OVERHEAD as u64))
         }
     }
 }
@@ -1106,26 +1035,12 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             }
             crate::mls::validate_key_packages(key_packages)?;
         }
-        ClientControl::SendChat { body, envelope, .. }
-        | ClientControl::EditChat { body, envelope, .. } => match envelope {
-            None => {
-                if body.trim().is_empty() {
-                    return Err("chat message is empty".to_string());
-                }
-                if body.len() > MAX_CHAT_BODY_BYTES {
-                    return Err("chat message exceeds maximum length".to_string());
-                }
+        ClientControl::SendChat { body, .. } | ClientControl::EditChat { body, .. } => {
+            if body.trim().is_empty() {
+                return Err("chat message is empty".to_string());
             }
-            Some(envelope) => {
-                if !body.is_empty() {
-                    return Err("chat message carries both text and an envelope".to_string());
-                }
-                validate_dm_envelope(envelope)?;
-            }
-        },
-        ClientControl::DeleteChat { envelope, .. } => {
-            if let Some(envelope) = envelope {
-                validate_dm_envelope(envelope)?;
+            if body.len() > MAX_CHAT_BODY_BYTES {
+                return Err("chat message exceeds maximum length".to_string());
             }
         }
         ClientControl::PublishP2p { candidates, .. } => {
@@ -1141,21 +1056,20 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
         ClientControl::UploadFileStart {
             name,
             encoding,
-            sealed_meta,
+            mls_event_id,
             ..
         } => {
             validate_file_name(name)?;
-            match sealed_meta {
+            match mls_event_id {
                 None => {
                     if *encoding == FileContentEncoding::Sealed {
-                        return Err("sealed upload is missing its metadata envelope".to_string());
+                        return Err("sealed upload is missing its MLS event id".to_string());
                     }
                 }
-                Some(sealed_meta) => {
+                Some(_) => {
                     if *encoding != FileContentEncoding::Sealed {
-                        return Err("metadata envelope on an unsealed upload".to_string());
+                        return Err("MLS event id on an unsealed upload".to_string());
                     }
-                    validate_dm_envelope(sealed_meta)?;
                 }
             }
         }
@@ -1217,35 +1131,6 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("share extradata exceeds maximum length".to_string());
             }
         }
-        ClientControl::AppendAccountKeyStatement { statement } => {
-            if statement.authority_signature.len() != 64
-                || statement
-                    .co_signature
-                    .as_ref()
-                    .is_some_and(|signature| signature.len() != 64)
-            {
-                return Err("account key statement signature has the wrong length".to_string());
-            }
-        }
-        ClientControl::BindE2eDevice {
-            key_epoch,
-            signature,
-            ..
-        } => {
-            if *key_epoch == 0 {
-                return Err("device key epoch is zero".to_string());
-            }
-            if signature.len() != 64 {
-                return Err("device binding signature has the wrong length".to_string());
-            }
-        }
-        ClientControl::PutE2eVerificationSync { envelope, .. } => {
-            if envelope.is_empty()
-                || envelope.len() > crate::e2e::MAX_VERIFICATION_SYNC_ENVELOPE_BYTES
-            {
-                return Err("verification sync envelope length is invalid".to_string());
-            }
-        }
         ClientControl::PutDeviceRoster { roster, .. } => {
             if roster.body.active_devices.is_empty()
                 || roster.body.active_devices.len() > crate::identity::MAX_ACTIVE_DEVICES
@@ -1289,16 +1174,6 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             }
         }
         _ => {}
-    }
-    Ok(())
-}
-
-fn validate_dm_envelope(envelope: &[u8]) -> Result<(), String> {
-    if envelope.is_empty() {
-        return Err("message envelope is empty".to_string());
-    }
-    if envelope.len() > crate::e2e::MAX_DM_ENVELOPE_BYTES {
-        return Err("message envelope exceeds maximum length".to_string());
     }
     Ok(())
 }
@@ -1507,7 +1382,6 @@ mod tests {
     #[test]
     fn client_control_round_trips() {
         let message = ClientControl::SendChat {
-            envelope: None,
             room_id: RoomId(7),
             body: "hello".to_string(),
         };
@@ -1518,7 +1392,6 @@ mod tests {
     #[test]
     fn mutation_controls_round_trip() {
         let edit = ClientControl::EditChat {
-            envelope: None,
             room_id: RoomId(7),
             target: MessageId(42),
             body: "revised".to_string(),
@@ -1529,23 +1402,14 @@ mod tests {
         let delete = ClientControl::DeleteChat {
             room_id: RoomId(7),
             target: MessageId(42),
-            envelope: Some(vec![1u8; 160]),
         };
         let encoded = encode_client_control(&delete).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), delete);
-
-        let invalid_delete = ClientControl::DeleteChat {
-            room_id: RoomId(7),
-            target: MessageId(42),
-            envelope: Some(Vec::new()),
-        };
-        assert!(encode_client_control(&invalid_delete).is_err());
     }
 
     #[test]
     fn edit_chat_rejects_empty_and_oversize_body() {
         let empty = ClientControl::EditChat {
-            envelope: None,
             room_id: RoomId(7),
             target: MessageId(42),
             body: "  \n".to_string(),
@@ -1553,7 +1417,6 @@ mod tests {
         assert!(encode_client_control(&empty).is_err());
 
         let oversize = ClientControl::EditChat {
-            envelope: None,
             room_id: RoomId(7),
             target: MessageId(42),
             body: "x".repeat(MAX_CHAT_BODY_BYTES + 1),
@@ -1562,60 +1425,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_body_and_envelope_together_or_neither() {
-        let both = ClientControl::SendChat {
-            room_id: RoomId(7),
-            body: "hello".to_string(),
-            envelope: Some(vec![1u8; 160]),
-        };
-        assert!(encode_client_control(&both).is_err());
-
-        let neither = ClientControl::SendChat {
+    fn rejects_empty_chat_body() {
+        let message = ClientControl::SendChat {
             room_id: RoomId(7),
             body: String::new(),
-            envelope: None,
         };
-        assert!(encode_client_control(&neither).is_err());
-
-        let sealed = ClientControl::SendChat {
-            room_id: RoomId(7),
-            body: String::new(),
-            envelope: Some(vec![1u8; 160]),
-        };
-        assert!(encode_client_control(&sealed).is_ok());
-
-        let oversize = ClientControl::SendChat {
-            room_id: RoomId(7),
-            body: String::new(),
-            envelope: Some(vec![1u8; crate::e2e::MAX_DM_ENVELOPE_BYTES + 1]),
-        };
-        assert!(encode_client_control(&oversize).is_err());
-
-        let empty = ClientControl::SendChat {
-            room_id: RoomId(7),
-            body: String::new(),
-            envelope: Some(Vec::new()),
-        };
-        assert!(encode_client_control(&empty).is_err());
+        assert!(encode_client_control(&message).is_err());
     }
 
     #[test]
-    fn sealed_upload_start_requires_sealed_meta() {
-        let upload = |encoding, sealed_meta| ClientControl::UploadFileStart {
+    fn sealed_upload_start_requires_mls_event_id() {
+        let upload = |encoding, mls_event_id| ClientControl::UploadFileStart {
             room_id: RoomId(7),
             transfer_id: FileTransferId(1),
             name: "sealed.bin".to_string(),
             size: 4096,
             encoding,
-            sealed_meta,
+            mls_event_id,
         };
         assert!(encode_client_control(&upload(FileContentEncoding::Sealed, None)).is_err());
         assert!(
-            encode_client_control(&upload(FileContentEncoding::Zstd, Some(vec![1u8; 160])))
+            encode_client_control(&upload(FileContentEncoding::Zstd, Some(EventId([1; 16]))))
                 .is_err()
         );
         assert!(
-            encode_client_control(&upload(FileContentEncoding::Sealed, Some(vec![1u8; 160])))
+            encode_client_control(&upload(FileContentEncoding::Sealed, Some(EventId([1; 16]))))
                 .is_ok()
         );
     }
@@ -1624,10 +1458,10 @@ mod tests {
     fn sealed_wire_bound_covers_chunk_overhead_and_padding() {
         for original in [0u64, 1, 1024, 200_000, 5_000_000] {
             let stream =
-                crate::e2e::padme_len(max_file_wire_bytes(FileContentEncoding::Zstd, original));
-            let chunk_payload = (MAX_FILE_CHUNK_BYTES - crate::e2e::DM_CHUNK_OVERHEAD) as u64;
+                crate::mls::padme_len(max_file_wire_bytes(FileContentEncoding::Zstd, original));
+            let chunk_payload = (MAX_FILE_CHUNK_BYTES - crate::mls::FILE_CHUNK_OVERHEAD) as u64;
             let chunks = stream.div_ceil(chunk_payload).max(1);
-            let wire = stream + chunks * crate::e2e::DM_CHUNK_OVERHEAD as u64;
+            let wire = stream + chunks * crate::mls::FILE_CHUNK_OVERHEAD as u64;
             assert!(
                 wire <= max_file_wire_bytes(FileContentEncoding::Sealed, original),
                 "bound too small for original {original}"
@@ -1770,7 +1604,6 @@ mod tests {
     #[test]
     fn rejects_empty_chat() {
         let message = ClientControl::SendChat {
-            envelope: None,
             room_id: RoomId(7),
             body: "  ".to_string(),
         };
@@ -1982,7 +1815,7 @@ mod tests {
     fn file_upload_control_round_trips() {
         for encoding in [FileContentEncoding::Identity, FileContentEncoding::Zstd] {
             let start = ClientControl::UploadFileStart {
-                sealed_meta: None,
+                mls_event_id: None,
                 room_id: RoomId(2),
                 transfer_id: FileTransferId(9),
                 name: "report.bin".to_string(),
@@ -2005,7 +1838,7 @@ mod tests {
             let accepted = ServerControl::UploadFileAccepted {
                 client_transfer_id: FileTransferId(9),
                 file: FileMetadata {
-                    sealed_meta: None,
+                    mls_event_id: None,
                     transfer_id: FileTransferId(17),
                     room_id: RoomId(2),
                     sender: UserId(3),

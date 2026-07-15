@@ -71,14 +71,12 @@ impl ConnectionStrategy for ChattFileConnectionStrategy {
         // SQLCipher logs every denied `mlock` as an error even though it
         // deliberately continues with ordinary guarded allocations. Sandboxed
         // clients and tests commonly lack CAP_IPC_LOCK, turning each database
-        // open into hundreds of misleading stderr lines. Keep actionable core
-        // diagnostics while filtering that global MEMORY diagnostic source;
-        // database and cryptographic failures still propagate as Rust errors.
+        // open into hundreds of misleading stderr lines. SQLCipher also writes
+        // expected wrong-key probes straight to stderr. Disable its global
+        // diagnostic sink; database and cryptographic failures still propagate
+        // through the Rust result returned by each operation.
         connection
             .pragma_update(None, "cipher_log_source", "NONE")
-            .map_err(|error| SqLiteDataStorageError::SqlEngineError(error.into()))?;
-        connection
-            .pragma_update(None, "cipher_log_source", "CORE")
             .map_err(|error| SqLiteDataStorageError::SqlEngineError(error.into()))?;
         Ok(connection)
     }

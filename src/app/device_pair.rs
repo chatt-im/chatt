@@ -340,7 +340,7 @@ fn required(value: &str) -> Option<String> {
 fn device_name_error(value: &str) -> Option<String> {
     let value = value.trim();
     (value.is_empty()
-        || value.len() > rpc::e2e::MAX_DEVICE_NAME_BYTES
+        || value.len() > rpc::identity::MAX_DEVICE_NAME_BYTES
         || value.chars().any(char::is_control))
     .then(|| "must be 1-64 bytes with no control characters".to_string())
 }

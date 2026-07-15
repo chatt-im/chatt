@@ -3,8 +3,8 @@ use crate::{
     ids::{FileTransferId, MessageId, RoomId, UserId},
 };
 
-const RECORD_VERSION: u8 = 3;
-const RECORD_BASE_BYTES: usize = 1 + 8 + 4 + 8 + 8 + 1 + 1 + 8 + 4 + 4 + 4;
+const RECORD_VERSION: u8 = 4;
+const RECORD_BASE_BYTES: usize = 1 + 8 + 4 + 8 + 8 + 1 + 1 + 8 + 4 + 4;
 /// Upper bound on one serialized history record. The durable log writer
 /// rejects larger appends and the log loader treats a larger length prefix as
 /// a corrupt tail, so both sides of the on-disk format share this constant.
@@ -29,7 +29,6 @@ pub struct HistoryMessageRef<'a> {
     pub file_transfer_id: Option<FileTransferId>,
     pub flags: MessageFlags,
     pub target: Option<MessageId>,
-    pub envelope: Option<&'a [u8]>,
     pub raw: &'a [u8],
 }
 
@@ -45,7 +44,6 @@ impl HistoryMessageRef<'_> {
             file_transfer_id: self.file_transfer_id,
             flags: self.flags,
             target: self.target,
-            envelope: self.envelope.map(<[u8]>::to_vec),
         }
     }
 }
@@ -73,8 +71,7 @@ pub struct HistoryChunkRef<'a> {
 
 pub fn encoded_message_len(value: &ChatMessage) -> usize {
     let target = if value.target.is_some() { 8 } else { 0 };
-    let envelope = value.envelope.as_ref().map_or(0, Vec::len);
-    RECORD_BASE_BYTES + target + value.sender_name.len() + value.body.len() + envelope
+    RECORD_BASE_BYTES + target + value.sender_name.len() + value.body.len()
 }
 
 pub fn encode_message(value: &ChatMessage) -> Vec<u8> {
@@ -111,14 +108,6 @@ pub fn write_message(value: &ChatMessage, out: &mut Vec<u8>) {
     }
     write_str(&value.sender_name, out);
     write_str(&value.body, out);
-    match &value.envelope {
-        Some(envelope) => {
-            let len = u32::try_from(envelope.len()).expect("history envelope length fits in u32");
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(envelope);
-        }
-        None => out.extend_from_slice(&0u32.to_le_bytes()),
-    }
 }
 
 pub fn parse_message(bytes: &[u8]) -> Result<HistoryMessageRef<'_>, String> {
@@ -255,15 +244,6 @@ fn read_message<'a>(cursor: &mut HistoryCursor<'a>) -> Result<HistoryMessageRef<
     }
     let sender_name = cursor.read_str()?;
     let body = cursor.read_str()?;
-    let envelope_len = cursor.read_u32()? as usize;
-    let envelope = if envelope_len == 0 {
-        None
-    } else {
-        Some(cursor.take(envelope_len)?)
-    };
-    if envelope.is_some() && !body.is_empty() {
-        return Err("history record carries both text and an envelope".to_string());
-    }
     let raw = &cursor.bytes[start..cursor.offset];
     Ok(HistoryMessageRef {
         message_id,
@@ -275,7 +255,6 @@ fn read_message<'a>(cursor: &mut HistoryCursor<'a>) -> Result<HistoryMessageRef<
         file_transfer_id,
         flags,
         target,
-        envelope,
         raw,
     })
 }
@@ -354,7 +333,6 @@ mod tests {
             file_transfer_id: Some(FileTransferId(55)),
             flags: MessageFlags::default(),
             target: None,
-            envelope: None,
         }
     }
 
@@ -369,7 +347,6 @@ mod tests {
             file_transfer_id: None,
             flags: MessageFlags(MessageFlags::EDITED),
             target: Some(MessageId(42)),
-            envelope: None,
         }
     }
 
@@ -464,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn chunks_have_a_raw_non_jsony_envelope() {
+    fn chunks_use_raw_non_jsony_framing() {
         let first = encode_message(&test_message());
         let mut second_message = test_message();
         second_message.message_id = MessageId(43);
@@ -484,27 +461,6 @@ mod tests {
         assert_eq!(decoded.messages[0].message_id, MessageId(42));
         assert_eq!(decoded.messages[1].message_id, MessageId(43));
         assert!(decode_chunk(&[1, 2, 3]).unwrap().is_none());
-    }
-
-    #[test]
-    fn record_v3_round_trips_envelope() {
-        let mut message = test_message();
-        message.file_transfer_id = None;
-        message.body = String::new();
-        message.envelope = Some(vec![7u8; 320]);
-        let encoded = encode_message(&message);
-        assert_eq!(encoded.len(), encoded_message_len(&message));
-        let parsed = parse_message(&encoded).unwrap();
-        assert_eq!(parsed.envelope, Some(&[7u8; 320][..]));
-        assert_eq!(parsed.to_chat_message(), message);
-    }
-
-    #[test]
-    fn rejects_record_with_both_text_and_envelope() {
-        let mut message = test_message();
-        message.envelope = Some(vec![7u8; 32]);
-        let encoded = encode_message(&message);
-        assert!(parse_message(&encoded).is_err());
     }
 
     #[test]

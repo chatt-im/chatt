@@ -581,7 +581,6 @@ mod tests {
         for (i, (sender, body)) in messages.iter().enumerate() {
             chat.push_chat(
                 ChatMessage {
-                    envelope: None,
                     message_id: MessageId(i as u64 + 1),
                     room_id: RoomId(1),
                     sender: UserId(1),

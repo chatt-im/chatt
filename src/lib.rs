@@ -14,9 +14,10 @@ mod config;
 mod config_diagnostics;
 mod e2e;
 mod e2e_identity;
-mod e2e_store;
 #[cfg(test)]
 mod mls_e2e_test;
+#[cfg(test)]
+mod test_temp;
 mod device_link;
 mod file_compression;
 mod fuzzy;

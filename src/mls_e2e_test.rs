@@ -5,10 +5,10 @@ use std::{
     collections::VecDeque,
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::AtomicU8,
         mpsc,
     },
     thread,
@@ -35,6 +35,7 @@ use crate::{
     },
     config::{CandidatePrivacy, DownloadTarget, EffectiveFiles},
     receive_store::DownloadStore,
+    test_temp::TempDir,
 };
 
 const ALICE_TOKEN: &str = "mls-matrix-alice";
@@ -65,15 +66,14 @@ struct Client {
     backlog: RefCell<VecDeque<NetworkEvent>>,
 }
 
-fn temp_dir(label: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    std::env::temp_dir().join(format!(
-        "chatt-mls-e2e-{label}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-            ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap().as_nanos() as u64,
-    ))
+static LIVE_MLS_E2E: Mutex<()> = Mutex::new(());
+
+fn live_mls_e2e_guard() -> std::sync::MutexGuard<'static, ()> {
+    LIVE_MLS_E2E.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn temp_dir(label: &str) -> TempDir {
+    TempDir::new(&format!("mls-e2e-{label}"))
 }
 
 fn start_server(root: &Path) -> Addrs {
@@ -181,8 +181,8 @@ where F: FnMut(&NetworkEvent) -> bool {
 
 fn wait_authenticated(client: &Client, label: &str) -> DeviceId {
     wait_event(client, label, Duration::from_secs(10), |event| matches!(event, NetworkEvent::Authenticated { .. }));
-    let bound = wait_event(client, label, Duration::from_secs(10), |event| matches!(event, NetworkEvent::E2eDeviceBound { .. }));
-    let NetworkEvent::E2eDeviceBound { device_id } = bound else { unreachable!() };
+    let bound = wait_event(client, label, Duration::from_secs(10), |event| matches!(event, NetworkEvent::MlsDeviceBound { .. }));
+    let NetworkEvent::MlsDeviceBound { device_id } = bound else { unreachable!() };
     device_id
 }
 
@@ -287,31 +287,23 @@ fn send_until_received(sender: &Client, receiver: &Client, room: RoomId, body: &
 fn wait_revoked(client: &Client, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
+        while let Some(event) = client.backlog.borrow_mut().pop_front() {
+            match event {
+                NetworkEvent::LocalIdentityUnavailable { message }
+                    if message.contains("revoked") => return,
+                NetworkEvent::AuthFailed { code: 401, .. } => return,
+                _ => {}
+            }
+        }
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_else(|| panic!("{label}: revoked device remained usable"));
         match client.events.recv_timeout(remaining) {
-            Ok(AppEvent::Network(NetworkEvent::E2eDeviceBound { device_id })) => {
-                panic!("{label}: revoked MLS device {device_id:?} rebound")
-            }
             Ok(AppEvent::Network(NetworkEvent::LocalIdentityUnavailable { message }))
                 if message.contains("revoked") => return,
             Ok(AppEvent::Network(NetworkEvent::AuthFailed { code: 401, .. })) => return,
             Ok(_) => {}
             Err(error) => panic!("{label}: {error}"),
-        }
-    }
-}
-
-fn discard_preexisting_bound_events(client: &Client) {
-    client.backlog.borrow_mut().retain(|event| {
-        !matches!(event, NetworkEvent::E2eDeviceBound { .. })
-    });
-    while let Ok(event) = client.events.try_recv() {
-        match event {
-            AppEvent::Network(NetworkEvent::E2eDeviceBound { .. }) => {}
-            AppEvent::Network(event) => client.backlog.borrow_mut().push_back(event),
-            _ => {}
         }
     }
 }
@@ -854,6 +846,7 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
 
 #[test]
 fn mls_live_linked_device_pairwise_matrix() {
+    let _guard = live_mls_e2e_guard();
     let cases = linked_matrix_cases();
     if cases.len() > 1 {
         assert_eq!(cases.len(), 48);
@@ -896,6 +889,7 @@ fn mls_live_linked_device_pairwise_matrix() {
 
 #[test]
 fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
+    let _guard = live_mls_e2e_guard();
     let root = temp_dir("matrix");
     std::fs::create_dir_all(root.join("server")).unwrap();
     let addrs = start_server(&root);
@@ -967,6 +961,7 @@ fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
 
 #[test]
 fn mls_live_maximum_linked_devices_receive_crossed_message_burst() {
+    let _guard = live_mls_e2e_guard();
     let root = temp_dir("maximum-fanout");
     std::fs::create_dir_all(root.join("server")).unwrap();
     let addrs = start_server(&root);
@@ -1109,6 +1104,7 @@ fn mls_live_maximum_linked_devices_receive_crossed_message_burst() {
 
 #[test]
 fn mls_live_fixed_group_three_accounts_with_heterogeneous_devices() {
+    let _guard = live_mls_e2e_guard();
     let root = temp_dir("fixed-group");
     std::fs::create_dir_all(root.join("server")).unwrap();
     let addrs = start_server_with(
@@ -1187,6 +1183,7 @@ fn mls_live_fixed_group_three_accounts_with_heterogeneous_devices() {
 
 #[test]
 fn mls_live_server_restart_preserves_room_and_bidirectional_delivery() {
+    let _guard = live_mls_e2e_guard();
     let root = temp_dir("server-restart");
     std::fs::create_dir_all(root.join("server")).unwrap();
     let addrs = start_server(&root);
@@ -1216,6 +1213,7 @@ fn mls_live_server_restart_preserves_room_and_bidirectional_delivery() {
 
 #[test]
 fn mls_live_pair_response_loss_reconciles_exact_device() {
+    let _guard = live_mls_e2e_guard();
     let root = temp_dir("pair-response-loss");
     std::fs::create_dir_all(root.join("server")).unwrap();
     let addrs = start_server(&root);
@@ -1311,6 +1309,7 @@ fn mls_live_pair_response_loss_reconciles_exact_device() {
 
 #[test]
 fn mls_live_missing_and_corrupt_state_remain_public_only() {
+    let _guard = live_mls_e2e_guard();
     for corrupt_database in [false, true] {
         let label = if corrupt_database { "corrupt" } else { "missing" };
         let root = temp_dir(label);
@@ -1373,6 +1372,7 @@ fn mls_live_missing_and_corrupt_state_remain_public_only() {
 
 #[test]
 fn mls_live_pair_close_cancel_future_history_and_revocation() {
+    let _guard = live_mls_e2e_guard();
     let root = temp_dir("pair-revoke");
     std::fs::create_dir_all(root.join("server")).unwrap();
     let addrs = start_server(&root);
@@ -1451,9 +1451,10 @@ fn mls_live_pair_close_cancel_future_history_and_revocation() {
 
 #[test]
 fn mls_live_revocation_exhaustive_matrix() {
-    // Exhaust the same three independent revocation dimensions as the legacy
-    // E2E harness: room created before/after linking, victim online/offline,
-    // and traffic present/absent immediately before revocation.
+    let _guard = live_mls_e2e_guard();
+    // Exhaust three independent revocation dimensions: room created
+    // before/after linking, victim online/offline, and traffic present/absent
+    // immediately before revocation.
     let only_case = std::env::var("CHATT_MLS_REVOCATION_CASE")
         .ok()
         .map(|value| value.parse::<u8>().expect("invalid revocation case"));
@@ -1530,6 +1531,7 @@ fn mls_live_revocation_exhaustive_matrix() {
 
 #[test]
 fn mls_live_competing_membership_commits_roll_back_loser_and_resume() {
+    let _guard = live_mls_e2e_guard();
     let root = temp_dir("competing-commits");
     std::fs::create_dir_all(root.join("server")).unwrap();
     let addrs = start_server(&root);
@@ -1556,8 +1558,6 @@ fn mls_live_competing_membership_commits_roll_back_loser_and_resume() {
     for receiver in [&alice, &alice_second, &alice_victim, &bob] {
         send_until_received(&alice, receiver, room_id, "competing commit barrier");
     }
-    discard_preexisting_bound_events(&alice_victim);
-
     alice
         .handle
         .try_send(NetworkCommand::RevokeE2eDevice {

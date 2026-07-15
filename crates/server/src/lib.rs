@@ -12,14 +12,12 @@ use std::{
 
 pub mod config;
 mod config_diagnostics;
-pub mod device_directory;
 mod history_reader;
 pub mod local_admin;
 mod mls_service;
 pub mod room_store;
 pub mod user_store;
 mod username_registry;
-mod verification_sync_store;
 
 use mio::{
     Events, Interest, Poll, Token, Waker,
@@ -45,20 +43,13 @@ use rpc::{
         TransportMode, VideoKeyRole, derive_video_keys, dynamic_user_id_from_recovery_token,
         encode_hex, issue_dynamic_token, respond_to_client_hello, verify_dynamic_token,
     },
-    e2e::{
-        AccountKeyAction, DeviceKeyStatus, DmContentKind, DmEventEnvelope, RosterCheckpoint,
-        VerificationSyncCheckpoint, decode_verification_sync_envelope,
-        verification_sync_checkpoint, verify_dm_event_signature,
-        verify_verification_sync_signature,
-    },
     evented::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
         recv_datagram_with, write_queue_to,
     },
     frame, identity as mls_identity,
     ids::{
-        BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId, StreamId,
-        UserId,
+        BugReportId, DeviceId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId,
     },
     media::{self, MediaPayload},
     recv::RecvBuffer,
@@ -68,14 +59,12 @@ use rpc::{
 use config::{
     Config as ServerConfig, UserConfig, hash_secret, valid_username, value_arg, verify_secret_hash,
 };
-use device_directory::{DeviceDirectory, DirectoryAppend};
 use history_reader::{HistoryReadReply, HistoryReader};
 use local_admin::{AdminCommand, AdminSocket};
 use mls_service::{MlsService, PutRosterError};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
 use username_registry::UsernameRegistry;
-use verification_sync_store::VerificationSyncStore;
 
 #[cfg(test)]
 use rpc::evented::ReadPumpOutcome;
@@ -135,11 +124,6 @@ const DEVICE_LINK_TTL: Duration = Duration::from_secs(10 * 60);
 const OPEN_PAIR_RATE_WINDOW: Duration = Duration::from_secs(60);
 const OPEN_PAIR_PER_IP_LIMIT: usize = 6;
 const OPEN_PAIR_GLOBAL_LIMIT: usize = 30;
-const VERIFICATION_SYNC_RATE_WINDOW: Duration = Duration::from_secs(60);
-const VERIFICATION_SYNC_PUT_ACCOUNT_LIMIT: usize = 8;
-const VERIFICATION_SYNC_PUT_GLOBAL_LIMIT: usize = 256;
-const VERIFICATION_SYNC_FETCH_ACCOUNT_LIMIT: usize = 32;
-const VERIFICATION_SYNC_FETCH_GLOBAL_LIMIT: usize = 2048;
 /// Soft target for retained encoded history carried by one control chunk.
 /// The protocol hard cap is higher; this leaves room for framing, encryption,
 /// and future metadata while allowing one fetch to stream over several chunks.
@@ -420,9 +404,6 @@ pub struct Server {
     /// Server-wide username uniqueness index, backed by `usernames.log.bin` for
     /// dynamic users and seeded from `users` for explicit users.
     usernames: UsernameRegistry,
-    /// Authority-signed account/device ledgers, persisted under the data dir.
-    device_directory: DeviceDirectory,
-    verification_sync: VerificationSyncStore,
     mls: MlsService,
     poll: Poll,
     listener: TcpListener,
@@ -451,10 +432,6 @@ pub struct Server {
     device_links: HashMap<Vec<u8>, DeviceLinkState>,
     open_pair_global_allocations: VecDeque<Instant>,
     open_pair_ip_allocations: HashMap<IpAddr, VecDeque<Instant>>,
-    verification_put_global: VecDeque<Instant>,
-    verification_put_accounts: HashMap<UserId, VecDeque<Instant>>,
-    verification_fetch_global: VecDeque<Instant>,
-    verification_fetch_accounts: HashMap<UserId, VecDeque<Instant>>,
     rng: ring::rand::SystemRandom,
     server_key_pair: ring::signature::Ed25519KeyPair,
     next_media_sweep_at: Option<Instant>,
@@ -610,12 +587,6 @@ impl Server {
         let server_key_pair = config
             .server_key_pair()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let device_directory = DeviceDirectory::open(
-            config.data_dir(),
-            server_key_pair.public_key().as_ref().to_vec(),
-        )
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let verification_sync = VerificationSyncStore::open(config.data_dir());
         let mls = MlsService::open(
             config.data_dir(),
             server_key_pair.public_key().as_ref().to_vec(),
@@ -693,8 +664,6 @@ impl Server {
             config,
             users,
             usernames,
-            device_directory,
-            verification_sync,
             mls,
             poll,
             listener,
@@ -721,10 +690,6 @@ impl Server {
             device_links: HashMap::new(),
             open_pair_global_allocations: VecDeque::new(),
             open_pair_ip_allocations: HashMap::new(),
-            verification_put_global: VecDeque::new(),
-            verification_put_accounts: HashMap::new(),
-            verification_fetch_global: VecDeque::new(),
-            verification_fetch_accounts: HashMap::new(),
             rng: ring::rand::SystemRandom::new(),
             server_key_pair,
             next_media_sweep_at: None,
@@ -1945,11 +1910,10 @@ impl Server {
                 ClientControl::SendChat {
                     room_id,
                     body,
-                    envelope,
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
-                self.send_chat(session_id, room_id, body, envelope)
+                self.send_chat(session_id, room_id, body)
             }
             (
                 ConnState::Ready,
@@ -1957,7 +1921,6 @@ impl Server {
                     room_id,
                     target,
                     body,
-                    envelope,
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
@@ -1967,7 +1930,6 @@ impl Server {
                     target,
                     MutationKind::Edit,
                     body,
-                    envelope,
                 )
             }
             (
@@ -1975,7 +1937,6 @@ impl Server {
                 ClientControl::DeleteChat {
                     room_id,
                     target,
-                    envelope,
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
@@ -1985,47 +1946,7 @@ impl Server {
                     target,
                     MutationKind::Delete,
                     String::new(),
-                    envelope,
                 )
-            }
-            (ConnState::Ready, ClientControl::AppendAccountKeyStatement { statement }) => {
-                let session_id = self.session_for_token(token)?;
-                let result = self.append_account_key_statement(session_id, statement);
-                self.report_request_outcome(token, result)
-            }
-            (ConnState::Ready, ClientControl::FetchAccountKeyChain { user_id, after }) => {
-                self.session_for_token(token)?;
-                let (base, statements) = self.device_directory.chain_after(user_id, after)?;
-                self.send_control_to_token(
-                    token,
-                    &ServerControl::AccountKeyChain {
-                        user_id,
-                        base,
-                        statements,
-                    },
-                )
-            }
-            (
-                ConnState::Ready,
-                ClientControl::BindE2eDevice {
-                    device_id,
-                    key_epoch,
-                    ledger_head,
-                    signature,
-                },
-            ) => {
-                let session_id = self.session_for_token(token)?;
-                let result =
-                    self.bind_e2e_device(session_id, device_id, key_epoch, ledger_head, &signature);
-                self.report_request_outcome(token, result)
-            }
-            (ConnState::Ready, ClientControl::FetchE2eVerificationSync { known }) => {
-                let session_id = self.session_for_token(token)?;
-                self.fetch_e2e_verification_sync(session_id, known)
-            }
-            (ConnState::Ready, ClientControl::PutE2eVerificationSync { expected, envelope }) => {
-                let session_id = self.session_for_token(token)?;
-                self.put_e2e_verification_sync(session_id, expected, envelope)
             }
             (
                 ConnState::Ready,
@@ -2088,7 +2009,7 @@ impl Server {
                     name,
                     size,
                     encoding,
-                    sealed_meta,
+                    mls_event_id,
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
@@ -2099,7 +2020,7 @@ impl Server {
                     name,
                     size,
                     encoding,
-                    sealed_meta,
+                    mls_event_id,
                 )
             }
             (
@@ -2222,7 +2143,7 @@ impl Server {
         session_id: SessionId,
         control: ClientControl,
     ) -> Result<(), String> {
-        let (user_id, token, bound) = self
+        let (user_id, token, bound, bootstrap_credential_hash) = self
             .sessions
             .get(&session_id)
             .map(|session| {
@@ -2230,6 +2151,7 @@ impl Server {
                     session.user_id,
                     session.tcp_token,
                     session.mls_device.clone(),
+                    session.bootstrap_credential_hash.clone(),
                 )
             })
             .ok_or_else(|| "unknown session".to_string())?;
@@ -2266,8 +2188,20 @@ impl Server {
                             .map(|_| session.tcp_token)
                     })
                     .collect::<Vec<_>>();
-                match self.mls.put_roster(user_id, expected, roster) {
+                let bootstrap_credential_hash =
+                    expected.is_none().then_some(bootstrap_credential_hash).flatten();
+                match self.mls.put_roster(
+                    user_id,
+                    expected,
+                    roster,
+                    bootstrap_credential_hash,
+                ) {
                     Ok(checkpoint) => {
+                        if expected.is_none()
+                            && let Some(session) = self.sessions.get_mut(&session_id)
+                        {
+                            session.bootstrap_credential_hash = None;
+                        }
                         for session in self
                             .sessions
                             .values_mut()
@@ -2380,7 +2314,32 @@ impl Server {
             }
             ClientControl::TakeKeyPackage { device_id } => {
                 let package = self.mls.take_key_package(device_id)?;
-                self.send_control_to_token(token, &ServerControl::KeyPackage { device_id, package })
+                let available = self.mls.key_package_count(device_id);
+                let owner_token = self
+                    .sessions
+                    .values()
+                    .filter(|session| {
+                        session
+                            .mls_device
+                            .as_ref()
+                            .is_some_and(|bound| bound.device_id == device_id)
+                    })
+                    .map(|session| session.tcp_token)
+                    .min_by_key(|token| token.0);
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::KeyPackage { device_id, package },
+                )?;
+                if let Some(owner_token) = owner_token {
+                    self.send_control_to_token(
+                        owner_token,
+                        &ServerControl::KeyPackagesLow {
+                            device_id,
+                            available,
+                        },
+                    )?;
+                }
+                Ok(())
             }
             ClientControl::CreateEncryptedRoom {
                 descriptor,
@@ -2899,8 +2858,8 @@ impl Server {
             receive_files,
             file_receive_limit_bytes,
             true,
-            Some(credential_hash),
             Some(IssuedSessionToken::DeviceLink(bearer_token)),
+            None,
         )
     }
 
@@ -2918,7 +2877,7 @@ impl Server {
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
         kvlog::info!("authenticate attempt", token = token.0);
-        if let Some((user_id, _device_id, credential_hash)) =
+        if let Some((user_id, _device_id, _credential_hash)) =
             self.mls.authenticate_credential(auth_token)
         {
             let username = username.trim();
@@ -2942,74 +2901,59 @@ impl Server {
                 receive_files,
                 file_receive_limit_bytes,
                 true,
-                Some(credential_hash),
+                None,
                 None,
             );
         }
-        if let Some((user_id, _device_id, password_epoch, credential_hash)) =
-            self.device_directory.authenticate_credential(auth_token)
-        {
-            let username = username.trim();
-            if !valid_username(username) || !self.usernames.is_available(username, Some(user_id)) {
+        if auth_token.starts_with(DYNAMIC_TOKEN_PREFIX) {
+            let claims = verify_dynamic_token(
+                &self.config.security.server_identity_seed,
+                auth_token,
+            )
+            .ok()
+            .filter(|claims| is_dynamic_user_id(claims.user_id));
+            let Some(claims) = claims else {
                 return self.reject_auth(
                     token,
                     ERROR_AUTH_REJECTED,
-                    "authentication failed: invalid username for this credential".to_string(),
+                    "authentication failed: invalid public bearer token".to_string(),
+                );
+            };
+            if !self.config.is_public() || claims.password_epoch != self.config.password_epoch() {
+                return self.reject_auth(
+                    token,
+                    ERROR_TOKEN_STALE_EPOCH,
+                    "authentication failed: the public-server credential is no longer current"
+                        .to_string(),
                 );
             }
-            let user = if is_dynamic_user_id(user_id) {
-                if !self.config.is_public() {
-                    return self.reject_auth(
-                        token,
-                        ERROR_PUBLIC_DISABLED,
-                        "authentication failed: public dynamic users are disabled on this server"
-                            .to_string(),
-                    );
-                }
-                if password_epoch != self.config.password_epoch() {
-                    return self.reject_auth(
-                        token,
-                        ERROR_TOKEN_STALE_EPOCH,
-                        "authentication failed: the server password changed; re-pair to refresh your token"
-                            .to_string(),
-                    );
-                }
-                self.usernames.claim_dynamic(user_id, username)?;
-                Self::dynamic_user(user_id, username)
-            } else {
-                let user = self
-                    .users
-                    .users
-                    .iter()
-                    .find(|user| user.id == user_id)
-                    .cloned()
-                    .ok_or_else(|| "bearer credential refers to an unknown user".to_string())?;
-                if user.username == username {
-                    user
-                } else {
-                    let updated = self
-                        .users
-                        .set_user_username(user_id, username.to_string())?;
-                    self.usernames.set_explicit(user_id, &updated.username);
-                    updated
-                }
-            };
+            if self.mls.initialized(claims.user_id) {
+                return self.reject_auth(
+                    token,
+                    ERROR_AUTH_REJECTED,
+                    "authentication failed: use an active MLS device credential".to_string(),
+                );
+            }
+            let username = username.trim();
+            if !valid_username(username)
+                || !self.usernames.is_available(username, Some(claims.user_id))
+            {
+                return self.reject_auth(
+                    token,
+                    ERROR_AUTH_REJECTED,
+                    "authentication failed: invalid username for this account".to_string(),
+                );
+            }
+            self.usernames.claim_dynamic(claims.user_id, username)?;
+            let user = Self::dynamic_user(claims.user_id, username);
             return self.establish_session_with_credential(
                 token,
                 &user,
                 receive_files,
                 file_receive_limit_bytes,
                 true,
-                Some(credential_hash),
                 None,
-            );
-        }
-        if auth_token.starts_with(DYNAMIC_TOKEN_PREFIX) {
-            return self.reject_auth(
-                token,
-                ERROR_AUTH_REJECTED,
-                "authentication failed: this bearer token is not registered to a device"
-                    .to_string(),
+                Some(hash_secret(auth_token)),
             );
         }
         let Some(user) = self
@@ -3075,18 +3019,12 @@ impl Server {
                 }
             }
         };
-        let credential_hash = user.token_hash.clone();
-        if self.device_directory.credential(&credential_hash).is_none() {
-            if self.device_directory.validated(user.id)?.is_some() {
-                return self.reject_auth(
-                    token,
-                    ERROR_AUTH_REJECTED,
-                    "authentication failed: this configured bearer was revoked from the E2E account"
-                        .to_string(),
-                );
-            }
-            self.device_directory
-                .add_credential(user.id, credential_hash.clone(), None, 0)?;
+        if self.mls.initialized(user.id) {
+            return self.reject_auth(
+                token,
+                ERROR_AUTH_REJECTED,
+                "authentication failed: use an active MLS device credential".to_string(),
+            );
         }
         self.establish_session_with_credential(
             token,
@@ -3094,8 +3032,8 @@ impl Server {
             receive_files,
             file_receive_limit_bytes,
             true,
-            Some(credential_hash),
             None,
+            Some(user.token_hash.clone()),
         )
     }
 
@@ -3200,7 +3138,7 @@ impl Server {
         let user =
             match self
                 .users
-                .mark_user_paired(&user_name, username.to_string(), String::new())
+                .mark_user_paired(&user_name, username.to_string(), token_hash.clone())
             {
                 Ok(user) => user,
                 Err(error) => {
@@ -3219,16 +3157,6 @@ impl Server {
                     );
                 }
             };
-        if let Err(error) =
-            self.device_directory
-                .add_credential(user.id, token_hash.clone(), None, 0)
-        {
-            return self.reject_auth(
-                token,
-                control::ERROR_INTERNAL,
-                format!("pairing failed: could not persist device credential: {error}"),
-            );
-        }
         self.invites.remove(&user_name);
         self.usernames.set_explicit(user.id, &user.username);
         kvlog::info!(
@@ -3243,8 +3171,8 @@ impl Server {
             receive_files,
             file_receive_limit_bytes,
             false,
-            Some(token_hash),
             None,
+            Some(token_hash),
         )
     }
 
@@ -3315,23 +3243,11 @@ impl Server {
             .then(|| verify_dynamic_token(&seed, existing_token).ok())
             .flatten()
             .filter(|claims| is_dynamic_user_id(claims.user_id));
-        // A self-authenticating dynamic token is only an account credential
-        // while its exact secret remains in the durable credential directory.
-        // In particular, revoking its bound device removes that row and must
-        // not let OpenPair mint a replacement credential from the old token.
-        let registered_existing = verified_claims.and_then(|claims| {
-            self.device_directory
-                .authenticate_credential(existing_token)
-                .filter(|(user_id, _, password_epoch, _)| {
-                    *user_id == claims.user_id && *password_epoch == claims.password_epoch
-                })
-                .map(|(_, device_id, _, _)| (claims, device_id))
-        });
-        let token_user_id = registered_existing
-            .filter(|(claims, _)| {
+        let token_user_id = verified_claims
+            .filter(|claims| {
                 claims.password_epoch == current_epoch || current_password_verified
             })
-            .map(|(claims, _)| claims.user_id);
+            .map(|claims| claims.user_id);
         let recovery_user_id = existing_token
             .starts_with(OPEN_PAIR_RECOVERY_PREFIX)
             .then(|| dynamic_user_id_from_recovery_token(&seed, existing_token).ok())
@@ -3388,29 +3304,17 @@ impl Server {
                 "open pairing failed: the server could not persist state; retry later".to_string(),
             );
         }
-        let credential_hash = hash_secret(&issued);
-        if let Err(error) = self.device_directory.add_credential(
-            user_id,
-            credential_hash.clone(),
-            registered_existing.and_then(|(_, device_id)| device_id),
-            current_epoch,
-        ) {
-            return self.reject_auth(
-                token,
-                control::ERROR_INTERNAL,
-                format!("open pairing failed: could not persist device credential: {error}"),
-            );
-        }
         kvlog::info!("open pair accepted", token = token.0, user_id = user_id.0);
         let user = Self::dynamic_user(user_id, username);
+        let bootstrap_credential_hash = hash_secret(&issued);
         self.establish_session_with_credential(
             token,
             &user,
             receive_files,
             file_receive_limit_bytes,
             false,
-            Some(credential_hash),
             Some(IssuedSessionToken::OpenPair(issued)),
+            Some(bootstrap_credential_hash),
         )
     }
 
@@ -3516,8 +3420,8 @@ impl Server {
             receive_files,
             file_receive_limit_bytes,
             announce,
-            None,
             issued_token.map(IssuedSessionToken::OpenPair),
+            None,
         )
     }
 
@@ -3528,8 +3432,8 @@ impl Server {
         receive_files: bool,
         file_receive_limit_bytes: u64,
         announce: bool,
-        credential_hash: Option<String>,
         issued_token: Option<IssuedSessionToken>,
+        bootstrap_credential_hash: Option<String>,
     ) -> Result<(), String> {
         let user_id = user.user_id();
 
@@ -3564,9 +3468,8 @@ impl Server {
                 announced: announce,
                 connected_at_ms: now_ms(),
                 pending_disk_history_fetches: 0,
-                e2e_device: None,
                 mls_device: None,
-                credential_hash,
+                bootstrap_credential_hash,
             },
         );
 
@@ -3742,310 +3645,6 @@ impl Server {
             .filter(|token| *token != own_token && self.clients.contains_key(token))
             .collect();
         self.send_control_to_tokens(&tokens, &control);
-    }
-
-    fn append_account_key_statement(
-        &mut self,
-        session_id: SessionId,
-        statement: rpc::e2e::AccountKeyStatement,
-    ) -> Result<(), String> {
-        let (user_id, bound) = self
-            .sessions
-            .get(&session_id)
-            .map(|session| (session.user_id, session.e2e_device))
-            .ok_or_else(|| "unknown session".to_string())?;
-        if self
-            .device_directory
-            .chain_for(user_id)?
-            .last()
-            .is_some_and(|current| current == &statement)
-        {
-            return Ok(());
-        }
-        let current = self.device_directory.validated(user_id)?;
-        if current.is_some() {
-            let current = current.as_ref().expect("checked above");
-            let bound = bound.ok_or_else(|| {
-                "bind an active E2E device before changing the account device ledger".to_string()
-            })?;
-            if bound.ledger_head != current.head
-                || current
-                    .device_key(bound.device_id, bound.key_epoch)
-                    .is_none_or(|key| key.status != DeviceKeyStatus::Active)
-            {
-                return Err(
-                    "rebind an active E2E device at the current ledger head before changing the account device ledger"
-                        .to_string(),
-                );
-            }
-        } else if !matches!(statement.body.action, AccountKeyAction::Genesis { .. }) {
-            return Err("an account device ledger must begin with genesis".to_string());
-        }
-        let DirectoryAppend::Advanced {
-            roster_epoch,
-            head,
-            revoked_credentials,
-        } = self.device_directory.append(user_id, statement)?
-        else {
-            return Ok(());
-        };
-        kvlog::info!(
-            "account device ledger advanced",
-            session_id = session_id.0,
-            user_id = user_id.0,
-            roster_epoch,
-            head = encode_hex(&head.0).as_str()
-        );
-        self.announce_account_key_head_changed(user_id, roster_epoch, head);
-        let revoked_tokens = self
-            .sessions
-            .values()
-            .filter(|session| {
-                session
-                    .credential_hash
-                    .as_ref()
-                    .is_some_and(|hash| revoked_credentials.contains(hash))
-            })
-            .map(|session| session.tcp_token)
-            .collect::<Vec<_>>();
-        for token in revoked_tokens {
-            self.disconnect(token);
-        }
-        Ok(())
-    }
-
-    /// Invalidates bindings to the old account checkpoint and publishes the
-    /// new roster to every live account. Peers need additions as well as
-    /// revocations so subsequent DM content keys are wrapped to every active
-    /// device in the new roster.
-    fn announce_account_key_head_changed(
-        &mut self,
-        user_id: UserId,
-        roster_epoch: u64,
-        head: LedgerHash,
-    ) {
-        // A binding covers one exact ledger checkpoint. Advancing the account's
-        // authorization state invalidates every old proof; still-authorized
-        // devices re-fetch and bind to the new head.
-        for session in self
-            .sessions
-            .values_mut()
-            .filter(|session| session.user_id == user_id)
-        {
-            session.e2e_device = None;
-        }
-        let control = ServerControl::AccountKeyHeadChanged {
-            user_id,
-            roster_epoch,
-            head,
-        };
-        let tokens: Vec<Token> = self
-            .sessions
-            .values()
-            .map(|session| session.tcp_token)
-            .filter(|token| self.clients.contains_key(token))
-            .collect();
-        self.send_control_to_tokens(&tokens, &control);
-    }
-
-    fn bind_e2e_device(
-        &mut self,
-        session_id: SessionId,
-        device_id: DeviceId,
-        key_epoch: u64,
-        ledger_head: LedgerHash,
-        signature: &[u8],
-    ) -> Result<(), String> {
-        let (user_id, token, credential_hash) = self
-            .sessions
-            .get(&session_id)
-            .map(|session| {
-                (
-                    session.user_id,
-                    session.tcp_token,
-                    session.credential_hash.clone(),
-                )
-            })
-            .ok_or_else(|| "unknown session".to_string())?;
-        let signing_public_key = self
-            .device_directory
-            .active_device_signing_key(user_id, device_id, key_epoch, ledger_head)?
-            .ok_or_else(|| "device is not active at the named account ledger head".to_string())?;
-        rpc::e2e::verify_device_binding(
-            &signing_public_key,
-            session_id,
-            user_id,
-            device_id,
-            key_epoch,
-            ledger_head,
-            signature,
-        )
-        .map_err(|error| error.to_string())?;
-        if let Some(credential_hash) = credential_hash {
-            self.device_directory
-                .bind_credential(user_id, &credential_hash, device_id)?;
-        }
-        let session = self
-            .sessions
-            .get_mut(&session_id)
-            .ok_or_else(|| "session disappeared during device binding".to_string())?;
-        session.e2e_device = Some(BoundE2eDevice {
-            device_id,
-            key_epoch,
-            ledger_head,
-        });
-        self.send_control_to_token(
-            token,
-            &ServerControl::E2eDeviceBound {
-                device_id,
-                key_epoch,
-            },
-        )
-    }
-
-    fn fetch_e2e_verification_sync(
-        &mut self,
-        session_id: SessionId,
-        known: Option<VerificationSyncCheckpoint>,
-    ) -> Result<(), String> {
-        let (user_id, token) = self
-            .sessions
-            .get(&session_id)
-            .map(|session| (session.user_id, session.tcp_token))
-            .ok_or_else(|| "unknown session".to_string())?;
-        if let Some(retry_after_ms) = rate_limited(
-            &mut self.verification_fetch_global,
-            &mut self.verification_fetch_accounts,
-            user_id,
-            VERIFICATION_SYNC_FETCH_GLOBAL_LIMIT,
-            VERIFICATION_SYNC_FETCH_ACCOUNT_LIMIT,
-        ) {
-            return self.send_control_to_token(
-                token,
-                &ServerControl::E2eVerificationSyncRateLimited { retry_after_ms },
-            );
-        }
-        let current = self.verification_sync.current(user_id)?;
-        let checkpoint = current.as_ref().map(|(checkpoint, _)| *checkpoint);
-        let envelope = current
-            .filter(|(checkpoint, _)| Some(*checkpoint) != known)
-            .map(|(_, envelope)| envelope);
-        self.send_control_to_token(
-            token,
-            &ServerControl::E2eVerificationSync {
-                checkpoint,
-                envelope,
-            },
-        )
-    }
-
-    fn put_e2e_verification_sync(
-        &mut self,
-        session_id: SessionId,
-        expected: Option<VerificationSyncCheckpoint>,
-        encoded: Vec<u8>,
-    ) -> Result<(), String> {
-        let (user_id, token, bound) = self
-            .sessions
-            .get(&session_id)
-            .map(|session| (session.user_id, session.tcp_token, session.e2e_device))
-            .ok_or_else(|| "unknown session".to_string())?;
-        let Some(bound) = bound else {
-            return self.send_control_to_token(
-                token,
-                &ServerControl::Error {
-                    code: control::ERROR_REQUEST_REJECTED,
-                    message: "bind an active E2E device before synchronizing verification"
-                        .to_string(),
-                },
-            );
-        };
-        if let Some(retry_after_ms) = rate_limited(
-            &mut self.verification_put_global,
-            &mut self.verification_put_accounts,
-            user_id,
-            VERIFICATION_SYNC_PUT_GLOBAL_LIMIT,
-            VERIFICATION_SYNC_PUT_ACCOUNT_LIMIT,
-        ) {
-            return self.send_control_to_token(
-                token,
-                &ServerControl::E2eVerificationSyncRateLimited { retry_after_ms },
-            );
-        }
-        let current = self.verification_sync.current(user_id)?;
-        let current_checkpoint = current.as_ref().map(|(checkpoint, _)| *checkpoint);
-        if current_checkpoint != expected {
-            return self.send_control_to_token(
-                token,
-                &ServerControl::E2eVerificationSyncConflict {
-                    current: current_checkpoint,
-                },
-            );
-        }
-
-        let envelope = decode_verification_sync_envelope(&encoded)
-            .map_err(|_| "verification sync envelope is malformed".to_string())?;
-        if envelope.header.previous != expected
-            || envelope.header.author_device != bound.device_id
-            || envelope.header.author_key_epoch != bound.key_epoch
-            || envelope.header.roster.head != bound.ledger_head
-        {
-            return Err("verification sync envelope does not match the bound device".to_string());
-        }
-        let ledger = self
-            .device_directory
-            .validated(user_id)?
-            .ok_or_else(|| "account has no device ledger".to_string())?;
-        if envelope.header.account_id != ledger.account_id
-            || envelope.header.roster != RosterCheckpoint::from(&ledger)
-        {
-            return Err("verification sync envelope names the wrong account roster".to_string());
-        }
-        let signing_public_key = self
-            .device_directory
-            .active_device_signing_key(
-                user_id,
-                bound.device_id,
-                bound.key_epoch,
-                bound.ledger_head,
-            )?
-            .ok_or_else(|| "verification sync author is not active".to_string())?;
-        verify_verification_sync_signature(&envelope, &signing_public_key)
-            .map_err(|_| "verification sync signature is invalid".to_string())?;
-
-        let mut expected_recipients = ledger
-            .active_devices()
-            .map(|device| (device.device_id, device.key_epoch))
-            .collect::<Vec<_>>();
-        expected_recipients.sort_unstable();
-        let mut actual_recipients = envelope
-            .recipient_keys
-            .iter()
-            .map(|recipient| {
-                if recipient.user_id != user_id || recipient.account_id != ledger.account_id {
-                    return Err("verification sync recipient names another account".to_string());
-                }
-                Ok((recipient.device_id, recipient.key_epoch))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        actual_recipients.sort_unstable();
-        if actual_recipients != expected_recipients {
-            return Err("verification sync recipients do not match the active roster".to_string());
-        }
-
-        let checkpoint = verification_sync_checkpoint(&encoded);
-        self.verification_sync.replace(user_id, encoded)?;
-        let tokens = self
-            .sessions
-            .values()
-            .filter(|session| session.user_id == user_id)
-            .map(|session| session.tcp_token)
-            .collect::<Vec<_>>();
-        self.send_control_to_tokens(
-            &tokens,
-            &ServerControl::E2eVerificationSyncChanged { checkpoint },
-        );
-        Ok(())
     }
 
     /// Whether the session's user may access the room. Denials never reveal
@@ -4459,19 +4058,9 @@ impl Server {
             .unwrap_or_default()
     }
 
-    /// Whether the room is a DM, whose messages must be end-to-end sealed.
-    fn room_is_dm(&self, room_id: RoomId) -> bool {
-        self.rooms
-            .get(&room_id)
-            .is_some_and(|room| matches!(room.access, RoomAccess::Dm(..)))
-    }
-
-    /// Legacy custom envelopes are never accepted. Private rooms and DMs use
-    /// the MLS delivery service; the ordinary chat store is public-only.
-    fn envelope_policy_error(&self, room_id: RoomId, has_envelope: bool) -> Option<&'static str> {
-        if has_envelope {
-            return Some("legacy sealed envelopes are no longer accepted");
-        }
+    /// Private rooms and DMs use the MLS delivery service; the ordinary chat
+    /// store is public-only.
+    fn ordinary_chat_policy_error(&self, room_id: RoomId) -> Option<&'static str> {
         match self.rooms.get(&room_id).map(|room| &room.access) {
             Some(RoomAccess::Public) => None,
             Some(RoomAccess::Private(_) | RoomAccess::Dm(..)) => {
@@ -4481,98 +4070,13 @@ impl Server {
         }
     }
 
-    fn dm_event_origin_error(
-        &self,
-        session_id: SessionId,
-        room_id: RoomId,
-        envelope: Option<&[u8]>,
-        expected_kind: DmContentKind,
-        expected_target: Option<MessageId>,
-    ) -> Option<&'static str> {
-        if !self.room_is_dm(room_id) {
-            return None;
-        }
-        let session = self.sessions.get(&session_id)?;
-        let Some(bound) = session.e2e_device else {
-            return Some("bind an active E2E device before sending direct messages");
-        };
-        let Some(envelope) = envelope else {
-            return Some("direct message event envelope is absent");
-        };
-        let Ok(event) = jsony::from_binary::<DmEventEnvelope>(envelope) else {
-            return Some("direct message event envelope is malformed");
-        };
-        if event.header.room_id != room_id
-            || event.header.sender != session.user_id
-            || event.header.author_device != bound.device_id
-            || event.header.author_key_epoch != bound.key_epoch
-            || event.header.sender_roster.head != bound.ledger_head
-            || event.header.kind != expected_kind
-            || event.header.semantic_target != expected_target
-        {
-            return Some("direct message event does not match the bound device session");
-        }
-        let peer = match self.rooms.get(&room_id).map(|room| &room.access) {
-            Some(RoomAccess::Dm(a, b)) if *a == session.user_id => *b,
-            Some(RoomAccess::Dm(a, b)) if *b == session.user_id => *a,
-            _ => return Some("direct message room does not contain the sender"),
-        };
-        let Ok(Some(sender_ledger)) = self.device_directory.validated(session.user_id) else {
-            return Some("direct message sender has no account device roster");
-        };
-        if event.header.sender_roster != RosterCheckpoint::from(&sender_ledger) {
-            return Some("direct message sender device roster is stale");
-        }
-        let Some(author) = sender_ledger
-            .device_key(bound.device_id, bound.key_epoch)
-            .filter(|author| author.status == DeviceKeyStatus::Active)
-        else {
-            return Some("direct message author device is not active");
-        };
-        let Ok(author_key) = author.keys.signing_public_key.as_slice().try_into() else {
-            return Some("direct message author signing key is malformed");
-        };
-        if verify_dm_event_signature(&event, author_key).is_err() {
-            return Some("direct message event signature is invalid");
-        }
-        let Ok(Some(peer_ledger)) = self.device_directory.validated(peer) else {
-            return Some("direct message recipient has no account device roster");
-        };
-        if event.header.recipient_roster != RosterCheckpoint::from(&peer_ledger) {
-            return Some("direct message recipient device roster is stale");
-        }
-        let mut expected_recipients = Vec::new();
-        for (user_id, ledger) in [(session.user_id, &sender_ledger), (peer, &peer_ledger)] {
-            for device in ledger.active_devices() {
-                expected_recipients.push((
-                    user_id,
-                    ledger.account_id,
-                    device.device_id,
-                    device.key_epoch,
-                ));
-            }
-        }
-        expected_recipients.sort_unstable();
-        let mut actual_recipients: Vec<_> = event
-            .recipient_keys
-            .iter()
-            .map(|key| (key.user_id, key.account_id, key.device_id, key.key_epoch))
-            .collect();
-        actual_recipients.sort_unstable();
-        if actual_recipients != expected_recipients {
-            return Some("direct message event recipient set is invalid");
-        }
-        None
-    }
-
     fn send_chat(
         &mut self,
         session_id: SessionId,
         room_id: RoomId,
         body: String,
-        envelope: Option<Vec<u8>>,
     ) -> Result<(), String> {
-        let body_size = envelope.as_ref().map_or(body.len(), Vec::len);
+        let body_size = body.len();
         kvlog::info!(
             "chat send requested",
             session_id = session_id.0,
@@ -4599,7 +4103,7 @@ impl Server {
             );
             return Ok(());
         }
-        if let Some(error) = self.envelope_policy_error(room_id, envelope.is_some()) {
+        if let Some(error) = self.ordinary_chat_policy_error(room_id) {
             kvlog::warn!(
                 "chat send rejected",
                 session_id = session_id.0,
@@ -4627,7 +4131,6 @@ impl Server {
             file_transfer_id: None,
             flags: MessageFlags::default(),
             target: None,
-            envelope,
         };
         let history_len = self.store.append(room_id, &message);
         kvlog::info!(
@@ -4654,7 +4157,6 @@ impl Server {
         target: MessageId,
         kind: MutationKind,
         body: String,
-        envelope: Option<Vec<u8>>,
     ) -> Result<(), String> {
         let (sender, sender_name) = match self.sessions.get(&session_id) {
             Some(session) => (session.user_id, session.username.clone()),
@@ -4682,7 +4184,7 @@ impl Server {
                 "message is unavailable".to_string(),
             );
         }
-        if let Some(error) = self.envelope_policy_error(room_id, envelope.is_some()) {
+        if let Some(error) = self.ordinary_chat_policy_error(room_id) {
             kvlog::warn!(
                 "chat mutation rejected",
                 session_id = session_id.0,
@@ -4744,7 +4246,6 @@ impl Server {
             file_transfer_id: None,
             flags,
             target: Some(target),
-            envelope,
         };
         let history_len = self.store.append(room_id, &message);
         kvlog::info!(
@@ -4794,7 +4295,7 @@ impl Server {
         name: String,
         original_size: u64,
         encoding: FileContentEncoding,
-        sealed_meta: Option<Vec<u8>>,
+        mls_event_id: Option<rpc::ids::EventId>,
     ) -> Result<(), String> {
         kvlog::info!(
             "file upload start requested",
@@ -4815,7 +4316,7 @@ impl Server {
         if encrypted_room && !mls_encrypted {
             return Err("encrypted room file transfer is waiting for MLS setup".into());
         }
-        if sealed_meta.is_some() != (encoding == FileContentEncoding::Sealed) {
+        if mls_event_id.is_some() != (encoding == FileContentEncoding::Sealed) {
             return Err("sealed metadata does not match the upload encoding".into());
         }
         if (encoding == FileContentEncoding::Sealed) != mls_encrypted {
@@ -4824,13 +4325,6 @@ impl Server {
                 _ => "MLS room uploads require end-to-end encryption",
             }
             .into());
-        }
-        if mls_encrypted
-            && sealed_meta
-                .as_ref()
-                .is_none_or(|event_id| event_id.len() != 16)
-        {
-            return Err("MLS file upload has an invalid announcement event id".to_string());
         }
         let key = (session_id, client_transfer_id);
         if self.active_uploads.contains_key(&key) {
@@ -4896,17 +4390,14 @@ impl Server {
             size: original_size,
             encoding,
             timestamp_ms,
-            sealed_meta: sealed_meta.clone(),
+            mls_event_id,
         };
 
-        let body = match &sealed_meta {
-            Some(_) => String::new(),
-            None => format!(
-                "sent file `{}` ({})",
-                file_name,
-                format_bytes(original_size)
-            ),
-        };
+        let body = format!(
+            "sent file `{}` ({})",
+            file_name,
+            format_bytes(original_size)
+        );
         let message = ChatMessage {
             message_id: self.store.allocate_message_id(room_id),
             room_id,
@@ -4917,7 +4408,6 @@ impl Server {
             file_transfer_id: Some(server_transfer_id),
             flags: MessageFlags::default(),
             target: None,
-            envelope: sealed_meta,
         };
         // The upload is registered before anything durable or visible
         // happens, so an uploader torn down by any of the sends below is
@@ -6894,26 +6384,16 @@ struct Session {
     /// History fetches queued on the disk reader thread, bounded by
     /// [`MAX_PENDING_DISK_HISTORY_FETCHES`].
     pending_disk_history_fetches: u8,
-    /// Device possession proof bound to the current signed account-ledger head.
-    /// `None` sessions may fetch/link devices but cannot originate DM events.
-    e2e_device: Option<BoundE2eDevice>,
     /// Active MLS credential proven on this exact authenticated session.
     mls_device: Option<BoundMlsDevice>,
-    /// Persisted bearer credential used by this installation. Revoking the
-    /// corresponding E2E device removes this hash in the same snapshot.
-    credential_hash: Option<String>,
+    /// Credential authenticated before this account created its first MLS
+    /// roster. The initial roster binds it to that roster's sole device.
+    bootstrap_credential_hash: Option<String>,
 }
 
 enum IssuedSessionToken {
     OpenPair(String),
     DeviceLink(String),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BoundE2eDevice {
-    device_id: DeviceId,
-    key_epoch: u64,
-    ledger_head: LedgerHash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7186,39 +6666,6 @@ fn prune_instants(queue: &mut VecDeque<Instant>, now: Instant, window: Duration)
     }
 }
 
-fn rate_limited(
-    global: &mut VecDeque<Instant>,
-    accounts: &mut HashMap<UserId, VecDeque<Instant>>,
-    user_id: UserId,
-    global_limit: usize,
-    account_limit: usize,
-) -> Option<u64> {
-    let now = Instant::now();
-    prune_instants(global, now, VERIFICATION_SYNC_RATE_WINDOW);
-    accounts.retain(|_, queue| {
-        prune_instants(queue, now, VERIFICATION_SYNC_RATE_WINDOW);
-        !queue.is_empty()
-    });
-    let account = accounts.entry(user_id).or_default();
-    if global.len() >= global_limit || account.len() >= account_limit {
-        let oldest = match (global.front(), account.front()) {
-            (Some(global), Some(account)) => Some((*global).min(*account)),
-            (Some(global), None) => Some(*global),
-            (None, Some(account)) => Some(*account),
-            (None, None) => None,
-        };
-        return Some(oldest.map_or(1_000, |oldest| {
-            VERIFICATION_SYNC_RATE_WINDOW
-                .saturating_sub(now.saturating_duration_since(oldest))
-                .as_millis()
-                .max(1) as u64
-        }));
-    }
-    global.push_back(now);
-    account.push_back(now);
-    None
-}
-
 fn now_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as u64,
@@ -7443,11 +6890,6 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::SkipFile { .. } => "skip_file",
         ClientControl::EditChat { .. } => "edit_chat",
         ClientControl::DeleteChat { .. } => "delete_chat",
-        ClientControl::AppendAccountKeyStatement { .. } => "append_account_key_statement",
-        ClientControl::FetchAccountKeyChain { .. } => "fetch_account_key_chain",
-        ClientControl::BindE2eDevice { .. } => "bind_e2e_device",
-        ClientControl::FetchE2eVerificationSync { .. } => "fetch_e2e_verification_sync",
-        ClientControl::PutE2eVerificationSync { .. } => "put_e2e_verification_sync",
         ClientControl::CreateDeviceLink { .. } => "create_device_link",
         ClientControl::CancelDeviceLink { .. } => "cancel_device_link",
         ClientControl::FetchDeviceLink { .. } => "fetch_device_link",
@@ -7505,15 +6947,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
         ServerControl::UploadDeclined { .. } => "upload_declined",
-        ServerControl::AccountKeyChain { .. } => "account_key_chain",
-        ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
-        ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
-        ServerControl::E2eVerificationSync { .. } => "e2e_verification_sync",
-        ServerControl::E2eVerificationSyncChanged { .. } => "e2e_verification_sync_changed",
-        ServerControl::E2eVerificationSyncConflict { .. } => "e2e_verification_sync_conflict",
-        ServerControl::E2eVerificationSyncRateLimited { .. } => {
-            "e2e_verification_sync_rate_limited"
-        }
         ServerControl::DeviceLinkCreated { .. } => "device_link_created",
         ServerControl::DeviceLinkCanceled { .. } => "device_link_canceled",
         ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
@@ -7524,6 +6957,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::DeviceRosterConflict { .. } => "device_roster_conflict",
         ServerControl::MlsDeviceBound { .. } => "mls_device_bound",
         ServerControl::KeyPackagesPublished { .. } => "key_packages_published",
+        ServerControl::KeyPackagesLow { .. } => "key_packages_low",
         ServerControl::KeyPackage { .. } => "key_package",
         ServerControl::EncryptedRoomCreated { .. } => "encrypted_room_created",
         ServerControl::GroupInfo { .. } => "group_info",
@@ -7612,9 +7046,8 @@ mod tests {
             announced: true,
             connected_at_ms: 0,
             pending_disk_history_fetches: 0,
-            e2e_device: None,
             mls_device: None,
-            credential_hash: None,
+            bootstrap_credential_hash: None,
         }
     }
 
@@ -8248,7 +7681,7 @@ mod tests {
         let mut reader_peer = live_user(&mut server, Token(22), reader, UserId(2));
 
         server
-            .send_chat(sender, RoomId(1), "hello everyone".to_string(), None)
+            .send_chat(sender, RoomId(1), "hello everyone".to_string())
             .unwrap();
 
         for peer in [&mut sender_peer, &mut reader_peer] {
@@ -8276,7 +7709,7 @@ mod tests {
         let mut reader_peer = live_user(&mut server, Token(22), reader, UserId(2));
 
         server
-            .send_chat(sender, RoomId(1), "original".to_string(), None)
+            .send_chat(sender, RoomId(1), "original".to_string())
             .unwrap();
         let target = server.store.head(RoomId(1)).expect("stored chat message");
         server
@@ -8286,7 +7719,6 @@ mod tests {
                 target,
                 MutationKind::Edit,
                 "revised".to_string(),
-                None,
             )
             .unwrap();
         for peer in [&mut sender_peer, &mut reader_peer] {
@@ -8310,7 +7742,6 @@ mod tests {
                 target,
                 MutationKind::Edit,
                 "hijacked".to_string(),
-                None,
             )
             .unwrap();
         assert_no_control(&mut sender_peer);
@@ -8334,7 +7765,6 @@ mod tests {
                 target,
                 MutationKind::Delete,
                 String::new(),
-                None,
             )
             .unwrap();
         let rejected = read_until(&mut reader_peer, |control| {
@@ -8357,7 +7787,6 @@ mod tests {
                 target,
                 MutationKind::Delete,
                 String::new(),
-                None,
             )
             .unwrap();
         let control = read_until(
@@ -8380,7 +7809,7 @@ mod tests {
         let mut reader_peer = live_user(&mut server, Token(22), reader, UserId(2));
 
         server
-            .send_chat(sender, RoomId(1), "original".to_string(), None)
+            .send_chat(sender, RoomId(1), "original".to_string())
             .unwrap();
         let target = server.store.head(RoomId(1)).expect("recent chat message");
         server
@@ -8390,7 +7819,6 @@ mod tests {
                 target,
                 MutationKind::Edit,
                 "foreign edit".to_string(),
-                None,
             )
             .unwrap();
 
@@ -8419,7 +7847,7 @@ mod tests {
         let mut outsider_peer = live_user(&mut server, Token(22), outsider, UserId(2));
 
         server
-            .send_chat(outsider, secret, "let me in".to_string(), None)
+            .send_chat(outsider, secret, "let me in".to_string())
             .unwrap();
         let denied = read_until(&mut outsider_peer, |control| {
             matches!(control, ServerControl::Error { .. })
@@ -8438,33 +7866,6 @@ mod tests {
             unreachable!();
         };
         assert_eq!(code, control::ERROR_ROOM_NOT_FOUND);
-    }
-
-    #[test]
-    #[ignore = "private room chat now uses MLS delivery"]
-    fn private_room_chat_reaches_members_only() {
-        let mut server = test_server();
-        let secret = RoomId(3);
-        server
-            .rooms
-            .insert(secret, private_room(secret, &[UserId(1)]));
-        let member = SessionId(1);
-        let outsider = SessionId(2);
-        let mut member_peer = live_user(&mut server, Token(11), member, UserId(1));
-        let mut outsider_peer = live_user(&mut server, Token(22), outsider, UserId(2));
-
-        server
-            .send_chat(member, secret, "members only".to_string(), None)
-            .unwrap();
-
-        let control = read_until(&mut member_peer, |control| {
-            matches!(control, ServerControl::Chat { .. })
-        });
-        let ServerControl::Chat { message } = control else {
-            unreachable!();
-        };
-        assert_eq!(message.body, "members only");
-        assert_no_control(&mut outsider_peer);
     }
 
     #[test]
@@ -8609,64 +8010,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn test_account_genesis(
-        server: &Server,
-        user_id: UserId,
-        tag: u8,
-    ) -> rpc::e2e::AccountKeyStatement {
-        let authority_seed = [tag; 32];
-        let signing_seed = [tag.wrapping_add(1); 32];
-        let encryption_seed = [tag.wrapping_add(2); 32];
-        let authority_public = rpc::e2e::ed25519_public_key(&authority_seed).unwrap();
-        let account_id = rpc::e2e::account_id(
-            server.server_key_pair.public_key().as_ref(),
-            user_id,
-            &authority_public,
-        );
-        rpc::e2e::sign_account_statement(
-            rpc::e2e::AccountKeyStatementBody {
-                account_id,
-                account_generation: 1,
-                roster_epoch: 1,
-                previous: LedgerHash::default(),
-                authority_key_epoch: 1,
-                action: rpc::e2e::AccountKeyAction::Genesis {
-                    authority_public_key: authority_public.to_vec(),
-                    first_device: rpc::e2e::DevicePublicKeys {
-                        device_id: DeviceId([tag; 16]),
-                        name: format!("device-{tag}"),
-                        key_epoch: 1,
-                        signing_public_key: rpc::e2e::ed25519_public_key(&signing_seed)
-                            .unwrap()
-                            .to_vec(),
-                        encryption_public_key: rpc::e2e::e2e_public_key(&encryption_seed).to_vec(),
-                    },
-                },
-            },
-            &authority_seed,
-            None,
-        )
-        .unwrap()
-    }
-
-    fn authorize_test_e2e_device(
-        server: &mut Server,
-        session_id: SessionId,
-        user_id: UserId,
-        tag: u8,
-    ) -> (BoundE2eDevice, rpc::ids::AccountId) {
-        let genesis = test_account_genesis(server, user_id, tag);
-        server.device_directory.append(user_id, genesis).unwrap();
-        let ledger = server.device_directory.validated(user_id).unwrap().unwrap();
-        let bound = BoundE2eDevice {
-            device_id: DeviceId([tag; 16]),
-            key_epoch: 1,
-            ledger_head: ledger.head,
-        };
-        server.sessions.get_mut(&session_id).unwrap().e2e_device = Some(bound);
-        (bound, ledger.account_id)
-    }
-
     fn test_mls_roster(
         server: &Server,
         user_id: UserId,
@@ -8727,7 +8070,7 @@ mod tests {
         let roster = test_mls_roster(server, user_id, [tag; 32], &[(tag, "test")], 1);
         server
             .mls
-            .put_roster(user_id, None, roster.clone())
+            .put_roster(user_id, None, roster.clone(), None)
             .unwrap();
         let certificate = &roster.body.active_devices[0].body;
         server.sessions.get_mut(&session_id).unwrap().mls_device = Some(BoundMlsDevice {
@@ -8735,181 +8078,6 @@ mod tests {
             roster: mls_identity::roster_checkpoint(&roster),
             client_id: certificate.mls_client_id.clone(),
         });
-    }
-
-    fn test_dm_event(
-        server: &Server,
-        bound: BoundE2eDevice,
-        account_id: rpc::ids::AccountId,
-        recipient_roster: RosterCheckpoint,
-        sender: UserId,
-        room_id: RoomId,
-        kind: DmContentKind,
-        semantic_target: Option<MessageId>,
-        tag: u8,
-    ) -> Vec<u8> {
-        let recipient = if sender == UserId(1) {
-            UserId(2)
-        } else {
-            UserId(1)
-        };
-        let sender_ledger = server.device_directory.validated(sender).unwrap().unwrap();
-        let recipient_ledger = server
-            .device_directory
-            .validated(recipient)
-            .unwrap()
-            .unwrap();
-        let mut recipients = Vec::new();
-        for (user_id, ledger) in [(sender, &sender_ledger), (recipient, &recipient_ledger)] {
-            for device in ledger.active_devices() {
-                recipients.push(rpc::e2e::EventRecipient {
-                    user_id,
-                    account_id: ledger.account_id,
-                    device_id: device.device_id,
-                    key_epoch: device.key_epoch,
-                    encryption_public_key: device
-                        .encryption_public_key
-                        .as_slice()
-                        .try_into()
-                        .unwrap(),
-                });
-            }
-        }
-        let header = rpc::e2e::SenderEventHeader {
-            event_id: rpc::ids::EventId([tag; 16]),
-            room_id,
-            sender,
-            sender_account: account_id,
-            author_device: bound.device_id,
-            author_key_epoch: bound.key_epoch,
-            sequence: u64::from(tag).max(1),
-            predecessor: None,
-            kind,
-            created_at_ms: u64::from(tag),
-            semantic_target,
-            sender_roster: rpc::e2e::RosterCheckpoint {
-                account_id,
-                account_generation: 1,
-                roster_epoch: 1,
-                head: bound.ledger_head,
-            },
-            recipient_roster,
-        };
-        let signing_seed = [bound.device_id.0[0].wrapping_add(1); 32];
-        let content = match kind {
-            DmContentKind::Text => rpc::e2e::DmContent::Text {
-                body: "server test".to_string(),
-            },
-            DmContentKind::Edit => rpc::e2e::DmContent::Edit {
-                target: semantic_target.unwrap(),
-                body: "server edit".to_string(),
-            },
-            DmContentKind::Delete => rpc::e2e::DmContent::Delete {
-                target: semantic_target.unwrap(),
-            },
-            DmContentKind::FileAnnounce => rpc::e2e::DmContent::FileAnnounce {
-                file: rpc::e2e::DmFileMeta {
-                    original_name: "server-test.bin".to_string(),
-                    size: 4,
-                    encoding: FileContentEncoding::Identity,
-                    content_key: vec![1; KEY_LEN],
-                },
-            },
-        };
-        rpc::e2e::seal_dm_event(
-            &signing_seed,
-            header,
-            &rpc::e2e::DmPlaintext {
-                sent_at_ms: u64::from(tag),
-                content,
-            },
-            &recipients,
-            &ring::rand::SystemRandom::new(),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn account_key_statement_broadcasts_signed_head() {
-        let mut server = test_server();
-        let publisher = SessionId(1);
-        let mut publisher_peer = live_user(&mut server, Token(11), publisher, UserId(1));
-        let mut reader_peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
-        let genesis = test_account_genesis(&server, UserId(1), 7);
-
-        server
-            .append_account_key_statement(publisher, genesis.clone())
-            .unwrap();
-
-        let control = read_until(&mut reader_peer, |control| {
-            matches!(control, ServerControl::AccountKeyHeadChanged { .. })
-        });
-        let ServerControl::AccountKeyHeadChanged {
-            user_id,
-            roster_epoch,
-            head,
-        } = control
-        else {
-            unreachable!();
-        };
-        assert_eq!(user_id, UserId(1));
-        assert_eq!(roster_epoch, 1);
-        assert_eq!(head, rpc::e2e::account_statement_hash(&genesis));
-        assert!(matches!(
-            read_until(&mut publisher_peer, |control| matches!(
-                control,
-                ServerControl::AccountKeyHeadChanged { .. }
-            )),
-            ServerControl::AccountKeyHeadChanged { .. }
-        ));
-
-        server
-            .append_account_key_statement(publisher, genesis)
-            .unwrap();
-        assert_no_control(&mut reader_peer);
-    }
-
-    #[test]
-    fn rejected_e2e_admin_request_keeps_ready_connection_usable() {
-        let mut server = test_server();
-        let session_id = SessionId(1);
-        let token = Token(11);
-        let mut peer = live_user(&mut server, token, session_id, UserId(1));
-        let client = server.clients.get_mut(&token).unwrap();
-        client.state = ConnState::Ready;
-        client.session_id = Some(session_id);
-        let wrong_account_genesis = test_account_genesis(&server, UserId(2), 7);
-
-        server
-            .handle_control(
-                token,
-                ClientControl::AppendAccountKeyStatement {
-                    statement: wrong_account_genesis,
-                },
-            )
-            .unwrap();
-        assert!(matches!(
-            read_plaintext_server_control(&mut peer),
-            ServerControl::Error {
-                code: control::ERROR_REQUEST_REJECTED,
-                ..
-            }
-        ));
-        assert!(
-            server
-                .device_directory
-                .chain_for(UserId(1))
-                .unwrap()
-                .is_empty()
-        );
-
-        server
-            .handle_control(token, ClientControl::Ping { nonce: 41 })
-            .unwrap();
-        assert_eq!(
-            read_plaintext_server_control(&mut peer),
-            ServerControl::Pong { nonce: 41 }
-        );
     }
 
     #[test]
@@ -8921,7 +8089,7 @@ mod tests {
         let current = test_mls_roster(&server, user_id, authority_seed, &[(7, "first")], 1);
         server
             .mls
-            .put_roster(user_id, None, current.clone())
+            .put_roster(user_id, None, current.clone(), None)
             .unwrap();
         let next = test_mls_roster(
             &server,
@@ -9060,332 +8228,6 @@ mod tests {
     }
 
     #[test]
-    fn account_device_ledger_survives_restart() {
-        let dir = std::env::temp_dir().join(format!("chatt-e2e-restart-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut server = test_server();
-        server.config.storage.data_dir = Some(dir.display().to_string());
-        server.device_directory = DeviceDirectory::open(
-            server.config.data_dir(),
-            server.server_key_pair.public_key().as_ref().to_vec(),
-        )
-        .unwrap();
-        let publisher = SessionId(1);
-        let _peer = live_user(&mut server, Token(11), publisher, UserId(1));
-        let genesis = test_account_genesis(&server, UserId(1), 5);
-        server
-            .append_account_key_statement(publisher, genesis.clone())
-            .unwrap();
-        let mut config = server.config.clone();
-        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
-        drop(server);
-
-        let restarted = Server::bind(config).expect("restarted server");
-
-        assert_eq!(
-            restarted.device_directory.chain_for(UserId(1)).unwrap(),
-            vec![genesis]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    #[ignore = "custom DM envelope protocol was replaced by MLS"]
-    fn dm_room_requires_envelopes_for_chat_and_mutations() {
-        let mut server = test_server();
-        let requester = SessionId(1);
-        let mut requester_peer = live_user(&mut server, Token(11), requester, UserId(1));
-        let mut peer_peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
-        server.open_dm(requester, UserId(2));
-        let dm_room = server
-            .store
-            .dm_room_for(UserId(1), UserId(2))
-            .expect("dm registered");
-        let (bound, account_id) = authorize_test_e2e_device(&mut server, requester, UserId(1), 31);
-        let _ = authorize_test_e2e_device(&mut server, SessionId(2), UserId(2), 32);
-        let recipient_roster = RosterCheckpoint::from(
-            server
-                .device_directory
-                .validated(UserId(2))
-                .unwrap()
-                .as_ref()
-                .unwrap(),
-        );
-        let text_event = test_dm_event(
-            &server,
-            bound,
-            account_id,
-            recipient_roster,
-            UserId(1),
-            dm_room,
-            DmContentKind::Text,
-            None,
-            1,
-        );
-        let mut stale_recipient = recipient_roster;
-        stale_recipient.head = LedgerHash::default();
-        let stale_event = test_dm_event(
-            &server,
-            bound,
-            account_id,
-            stale_recipient,
-            UserId(1),
-            dm_room,
-            DmContentKind::Text,
-            None,
-            1,
-        );
-
-        server
-            .send_chat(requester, dm_room, "plaintext".to_string(), None)
-            .unwrap();
-        let ServerControl::Error { message, .. } = read_until(&mut requester_peer, |control| {
-            matches!(control, ServerControl::Error { .. })
-        }) else {
-            unreachable!();
-        };
-        assert!(message.contains("end-to-end"), "{message}");
-
-        server
-            .send_chat(requester, RoomId(1), String::new(), Some(vec![2u8; 200]))
-            .unwrap();
-        let ServerControl::Error { message, .. } = read_until(&mut requester_peer, |control| {
-            matches!(control, ServerControl::Error { .. })
-        }) else {
-            unreachable!();
-        };
-        assert!(
-            message.contains("only accepted in direct messages"),
-            "{message}"
-        );
-
-        server
-            .send_chat(requester, dm_room, String::new(), Some(stale_event))
-            .unwrap();
-        let ServerControl::Error { message, .. } = read_until(&mut requester_peer, |control| {
-            matches!(control, ServerControl::Error { .. })
-        }) else {
-            unreachable!();
-        };
-        assert!(
-            message.contains("recipient device roster is stale"),
-            "{message}"
-        );
-
-        server
-            .send_chat(requester, dm_room, String::new(), Some(text_event.clone()))
-            .unwrap();
-        let mut sealed_target = MessageId(0);
-        for peer in [&mut requester_peer, &mut peer_peer] {
-            let ServerControl::Chat { message } = read_until(peer, |control| {
-                matches!(control, ServerControl::Chat { .. })
-            }) else {
-                unreachable!();
-            };
-            assert!(message.body.is_empty());
-            assert_eq!(message.envelope, Some(text_event.clone()));
-            sealed_target = message.message_id;
-        }
-
-        server
-            .mutate_chat(
-                requester,
-                dm_room,
-                sealed_target,
-                MutationKind::Edit,
-                String::new(),
-                None,
-            )
-            .unwrap();
-        let control = read_until(&mut requester_peer, |control| {
-            matches!(control, ServerControl::ChatMutationRejected { .. })
-        });
-        let ServerControl::ChatMutationRejected { message, .. } = control else {
-            unreachable!();
-        };
-        assert!(message.contains("end-to-end"), "{message}");
-
-        server
-            .mutate_chat(
-                requester,
-                dm_room,
-                sealed_target,
-                MutationKind::Edit,
-                String::new(),
-                Some(test_dm_event(
-                    &server,
-                    bound,
-                    account_id,
-                    recipient_roster,
-                    UserId(1),
-                    dm_room,
-                    DmContentKind::Edit,
-                    Some(sealed_target),
-                    2,
-                )),
-            )
-            .unwrap();
-        let ServerControl::Chat { message } = read_until(&mut peer_peer, |control| {
-            matches!(control, ServerControl::Chat { .. })
-        }) else {
-            unreachable!();
-        };
-        assert_eq!(message.target, Some(sealed_target));
-        assert!(message.envelope.is_some());
-
-        server
-            .mutate_chat(
-                requester,
-                dm_room,
-                sealed_target,
-                MutationKind::Delete,
-                String::new(),
-                None,
-            )
-            .unwrap();
-        let ServerControl::ChatMutationRejected { message, .. } =
-            read_until(&mut requester_peer, |control| {
-                matches!(control, ServerControl::ChatMutationRejected { .. })
-            })
-        else {
-            unreachable!();
-        };
-        assert!(message.contains("end-to-end"), "{message}");
-
-        server
-            .mutate_chat(
-                requester,
-                dm_room,
-                sealed_target,
-                MutationKind::Delete,
-                String::new(),
-                Some(test_dm_event(
-                    &server,
-                    bound,
-                    account_id,
-                    recipient_roster,
-                    UserId(1),
-                    dm_room,
-                    DmContentKind::Delete,
-                    Some(sealed_target),
-                    3,
-                )),
-            )
-            .unwrap();
-        let ServerControl::Chat { message } = read_until(
-            &mut peer_peer,
-            |control| matches!(control, ServerControl::Chat { message } if message.flags.deleted()),
-        ) else {
-            unreachable!();
-        };
-        assert_eq!(message.target, Some(sealed_target));
-        assert!(message.envelope.is_some());
-    }
-
-    #[test]
-    #[ignore = "custom DM file envelope protocol was replaced by MLS"]
-    fn sealed_dm_upload_relays_sealed_meta_and_envelope_in_announcement() {
-        let mut server = test_server();
-        let uploader = SessionId(1);
-        let recipient = SessionId(2);
-        let mut uploader_peer = live_user(&mut server, Token(11), uploader, UserId(1));
-        let mut recipient_peer = live_receiver(&mut server, Token(22), recipient, UserId(2));
-        server.open_dm(uploader, UserId(2));
-        let dm_room = server
-            .store
-            .dm_room_for(UserId(1), UserId(2))
-            .expect("dm registered");
-        let (bound, account_id) = authorize_test_e2e_device(&mut server, uploader, UserId(1), 41);
-        let _ = authorize_test_e2e_device(&mut server, recipient, UserId(2), 42);
-        let recipient_roster = RosterCheckpoint::from(
-            server
-                .device_directory
-                .validated(UserId(2))
-                .unwrap()
-                .as_ref()
-                .unwrap(),
-        );
-        let sealed_meta = test_dm_event(
-            &server,
-            bound,
-            account_id,
-            recipient_roster,
-            UserId(1),
-            dm_room,
-            DmContentKind::FileAnnounce,
-            None,
-            9,
-        );
-
-        assert!(
-            server
-                .start_file_upload(
-                    uploader,
-                    dm_room,
-                    FileTransferId(1),
-                    "plain.bin".to_string(),
-                    4,
-                    FileContentEncoding::Zstd,
-                    None,
-                )
-                .is_err(),
-            "unsealed uploads must be refused in DM rooms"
-        );
-        assert!(
-            server
-                .start_file_upload(
-                    uploader,
-                    RoomId(1),
-                    FileTransferId(2),
-                    "sealed.bin".to_string(),
-                    4096,
-                    FileContentEncoding::Sealed,
-                    Some(sealed_meta.clone()),
-                )
-                .is_err(),
-            "sealed uploads must be refused outside DM rooms"
-        );
-
-        server
-            .start_file_upload(
-                uploader,
-                dm_room,
-                FileTransferId(3),
-                "sealed.bin".to_string(),
-                4096,
-                FileContentEncoding::Sealed,
-                Some(sealed_meta.clone()),
-            )
-            .unwrap();
-
-        let control = read_until(&mut uploader_peer, |control| {
-            matches!(control, ServerControl::UploadFileAccepted { .. })
-        });
-        let ServerControl::UploadFileAccepted { file, .. } = control else {
-            unreachable!();
-        };
-        assert_eq!(file.sealed_meta, Some(sealed_meta.clone()));
-
-        let ServerControl::Chat { message } = read_until(&mut recipient_peer, |control| {
-            matches!(control, ServerControl::Chat { .. })
-        }) else {
-            unreachable!();
-        };
-        assert!(message.body.is_empty());
-        assert_eq!(message.envelope, Some(sealed_meta.clone()));
-        assert!(message.file_transfer_id.is_some());
-
-        let ServerControl::FileOffered { file, .. } = read_until(&mut recipient_peer, |control| {
-            matches!(control, ServerControl::FileOffered { .. })
-        }) else {
-            unreachable!();
-        };
-        assert_eq!(file.sealed_meta, Some(sealed_meta));
-        assert_eq!(file.encoding, FileContentEncoding::Sealed);
-    }
-
-    #[test]
     fn history_fetch_paginates_backwards() {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
@@ -9398,7 +8240,7 @@ mod tests {
         let mut peer = live_user(&mut server, Token(11), session, UserId(1));
         for index in 0..9 {
             server
-                .send_chat(session, RoomId(1), format!("message {index}"), None)
+                .send_chat(session, RoomId(1), format!("message {index}"))
                 .unwrap();
         }
 
@@ -9440,7 +8282,7 @@ mod tests {
         let body = "x".repeat(rpc::control::MAX_CHAT_BODY_BYTES);
         for _ in 0..80 {
             server
-                .send_chat(session, RoomId(1), body.clone(), None)
+                .send_chat(session, RoomId(1), body.clone())
                 .unwrap();
         }
         let mut peer = live_user(&mut server, Token(11), session, UserId(1));
@@ -9536,7 +8378,7 @@ mod tests {
         let mut peer = live_user(&mut server, Token(11), session, UserId(1));
         for index in 0..30 {
             server
-                .send_chat(session, RoomId(1), format!("message {index}"), None)
+                .send_chat(session, RoomId(1), format!("message {index}"))
                 .unwrap();
         }
 
@@ -9593,7 +8435,7 @@ mod tests {
 
         server.join_voice(talker, room_a);
         server
-            .send_chat(talker, room_b, "reading elsewhere".to_string(), None)
+            .send_chat(talker, room_b, "reading elsewhere".to_string())
             .unwrap();
 
         let session = server.sessions.get(&talker).expect("session exists");
@@ -11358,11 +10200,6 @@ mod tests {
             },
         )
         .unwrap();
-        server
-            .device_directory
-            .add_credential(id, hash_secret(&existing), None, 0)
-            .unwrap();
-
         let _peer = seed_session_client(&mut server, Token(1));
         server
             .open_pair_client(Token(1), "Zoe", "", &existing, true, 0)
@@ -11472,27 +10309,6 @@ mod tests {
     }
 
     #[test]
-    fn open_pair_rejects_unregistered_dynamic_token_even_with_password() {
-        let mut server = open_pair_test_server();
-        server.config.security.password_hash = Some(hash_secret("hunter2"));
-        server.config.security.password_epoch = 7;
-        let seed = server.config.security.server_identity_seed.clone();
-        let existing = issue_dynamic_token(
-            &seed,
-            &DynamicTokenClaims {
-                user_id: UserId(config::FIRST_DYNAMIC_USER_ID + 5),
-                password_epoch: 0,
-            },
-        )
-        .unwrap();
-
-        let _peer = seed_session_client(&mut server, Token(1));
-        let _ = server.open_pair_client(Token(1), "Zoe", "hunter2", &existing, true, 0);
-
-        assert!(session_for(&server, Token(1)).is_none());
-    }
-
-    #[test]
     fn open_pair_rejects_unregistered_stale_token_without_password() {
         let mut server = open_pair_test_server();
         server.config.security.password_epoch = 7;
@@ -11529,11 +10345,6 @@ mod tests {
             },
         )
         .unwrap();
-        let device_id = DeviceId([9; 16]);
-        server
-            .device_directory
-            .add_credential(user_id, hash_secret(&existing), Some(device_id), 0)
-            .unwrap();
         let token = Token(17);
         let (conn, mut peer) = test_live_client();
         server.clients.insert(token, conn);
@@ -11555,11 +10366,6 @@ mod tests {
         let claims = verify_dynamic_token(&seed, &token).unwrap();
         assert_eq!(claims.user_id, user_id);
         assert_eq!(claims.password_epoch, 7);
-        let (_, rebound_device, _, _) = server
-            .device_directory
-            .authenticate_credential(&token)
-            .expect("refreshed token persisted");
-        assert_eq!(rebound_device, Some(device_id));
         assert_eq!(udp_addr, "198.51.100.20:54100");
         assert_eq!(udp_probe_addr.as_deref(), Some("198.51.100.20:54101"));
     }
@@ -11601,16 +10407,6 @@ mod tests {
             },
         )
         .unwrap();
-        server
-            .device_directory
-            .add_credential(
-                UserId(config::FIRST_DYNAMIC_USER_ID),
-                hash_secret(&token),
-                None,
-                0,
-            )
-            .unwrap();
-
         let _peer = seed_session_client(&mut server, Token(1));
         let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
 
@@ -11806,13 +10602,7 @@ mod tests {
             .iter()
             .find(|user| user.internal_reference == "dana")
             .expect("user exists");
-        assert!(user.token_hash.is_empty());
-        let (credential_user, device, _, _) = server
-            .device_directory
-            .authenticate_credential(new_token)
-            .expect("device credential persisted");
-        assert_eq!(credential_user, user.id);
-        assert_eq!(device, None);
+        assert!(verify_secret_hash(&user.token_hash, new_token));
         assert_eq!(user.username, "Dana");
         assert!(server.invites.is_empty());
     }
@@ -12153,25 +10943,4 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn verification_sync_rate_limit_bounds_each_account_and_global_work() {
-        let mut global = VecDeque::new();
-        let mut accounts = HashMap::new();
-        let user = UserId(77);
-        for _ in 0..3 {
-            assert_eq!(rate_limited(&mut global, &mut accounts, user, 10, 3), None);
-        }
-        assert!(rate_limited(&mut global, &mut accounts, user, 10, 3).is_some());
-        assert_eq!(global.len(), 3);
-        assert_eq!(accounts[&user].len(), 3);
-
-        for marker in 1..=7 {
-            assert_eq!(
-                rate_limited(&mut global, &mut accounts, UserId(100 + marker), 10, 3,),
-                None
-            );
-        }
-        assert!(rate_limited(&mut global, &mut accounts, UserId(200), 10, 3).is_some());
-        assert_eq!(global.len(), 10);
-    }
 }

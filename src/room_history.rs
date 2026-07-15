@@ -84,8 +84,8 @@ pub(crate) struct LoadedHistory {
     pub files: HashMap<FileHistoryKey, FileDetail>,
     /// Raw mutation records in id order, for seeding session mutation state.
     pub mutations: Vec<ChatMessage>,
-    /// Exact peer key that authenticated each stored DM record, keyed by that
-    /// record's message id. Missing entries are legacy/unknown provenance.
+    /// Exact MLS account id that authenticated each stored encrypted record,
+    /// keyed by that record's message id.
     pub provenance: HashMap<u64, MessageProvenance>,
 }
 
@@ -706,7 +706,7 @@ fn parse_fields(
             Key::Dynamic(b"e2e_peer_key") => {
                 let encoded = exact_string(value)?;
                 let decoded = decode_hex(&encoded).map_err(|_| MunchError::InvalidValue)?;
-                let key = <[u8; rpc::e2e::E2E_PUBLIC_KEY_LEN]>::try_from(decoded.as_slice())
+                let key = <[u8; rpc::identity::ACCOUNT_ID_LEN]>::try_from(decoded.as_slice())
                     .map_err(|_| MunchError::InvalidValue)?;
                 set_once(
                     &mut e2e_peer_key,
@@ -757,7 +757,6 @@ fn parse_fields(
             };
             Ok(ParsedRecord::Message {
                 message: ChatMessage {
-                    envelope: None,
                     message_id: MessageId(id),
                     room_id: RoomId(room),
                     sender: UserId(user),
@@ -1152,51 +1151,10 @@ fn room_file_name(room_id: RoomId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_temp::{TempDir, TempPath};
 
-    /// Owns a private scratch directory holding one history file. Dropping it
-    /// removes the whole directory, so the file, its backup, and any recovery
-    /// siblings (`.corrupt-*`, `.recovering-*`) are cleaned up even on panic.
-    struct Scratch {
-        dir: PathBuf,
-        path: PathBuf,
-    }
-
-    impl Scratch {
-        fn new(label: &str) -> Scratch {
-            let dir = std::env::temp_dir().join(format!(
-                "chatt-history-{}-{}",
-                std::process::id(),
-                label
-            ));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).expect("scratch dir");
-            let path = dir.join("room-7.kvlog");
-            Scratch { dir, path }
-        }
-    }
-
-    impl std::ops::Deref for Scratch {
-        type Target = Path;
-
-        fn deref(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl AsRef<Path> for Scratch {
-        fn as_ref(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    fn scratch(label: &str) -> Scratch {
-        Scratch::new(label)
+    fn scratch(label: &str) -> TempPath {
+        TempDir::new(&format!("history-{label}")).with_path("room-7.kvlog")
     }
 
     fn fresh_store(path: &Path) -> RoomHistoryStore {
@@ -1207,7 +1165,6 @@ mod tests {
 
     fn text_message(id: u64, timestamp_ms: u64, body: &str) -> ChatMessage {
         ChatMessage {
-            envelope: None,
             message_id: MessageId(id),
             room_id: RoomId(7),
             sender: UserId(3),
@@ -1256,7 +1213,7 @@ mod tests {
         let mut store = fresh_store(&path);
         let original = text_message(12, 1_700_000_000_001, "authenticated dm");
         let provenance = MessageProvenance {
-            peer_public_key: [0x5a; rpc::e2e::E2E_PUBLIC_KEY_LEN],
+            peer_public_key: [0x5a; rpc::identity::ACCOUNT_ID_LEN],
         };
         store.append_authenticated_message(&original, Some(provenance));
         drop(store);
