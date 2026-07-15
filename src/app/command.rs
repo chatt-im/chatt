@@ -133,6 +133,7 @@ pub(crate) enum CoreCommand {
         device_name: String,
         overwrite_existing: bool,
     },
+    GenerateDeviceLink,
     CancelPairing,
     AudioManualReset,
     ReportBug(String),

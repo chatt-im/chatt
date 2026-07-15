@@ -41,8 +41,8 @@ use rpc::{
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims,
         KEY_LEN, KeyMaterial, OPEN_PAIR_RECOVERY_PREFIX, RecordProtection, SessionTransport,
-        TransportMode, VideoKeyRole, derive_video_keys, dynamic_user_id_from_pairing_secret,
-        dynamic_user_id_from_recovery_token, encode_hex, issue_dynamic_token,
+        TransportMode, VideoKeyRole, derive_video_keys, dynamic_user_id_from_recovery_token,
+        encode_hex, issue_dynamic_token,
         respond_to_client_hello, verify_dynamic_token,
     },
     evented::{
@@ -50,9 +50,10 @@ use rpc::{
         recv_datagram_with, write_queue_to,
     },
     e2e::{
-        AccountKeyAction, DmContentKind, DmEventEnvelope, RosterCheckpoint,
+        AccountKeyAction, DeviceKeyStatus, DmContentKind, DmEventEnvelope, RosterCheckpoint,
         VerificationSyncCheckpoint, decode_verification_sync_envelope,
-        verification_sync_checkpoint, verify_verification_sync_signature,
+        verification_sync_checkpoint, verify_dm_event_signature,
+        verify_verification_sync_signature,
     },
     frame,
     ids::{
@@ -1838,6 +1839,7 @@ impl Server {
                 ClientControl::RedeemDeviceLink {
                     redemption_secret,
                     statement,
+                    bearer_token,
                     receive_files,
                     file_receive_limit_bytes,
                 },
@@ -1845,6 +1847,7 @@ impl Server {
                 token,
                 &redemption_secret,
                 statement,
+                bearer_token,
                 receive_files,
                 file_receive_limit_bytes,
             ),
@@ -1873,14 +1876,13 @@ impl Server {
                     verification_checkpoint,
                 )
             }
-            (
-                ConnState::Ready,
-                ClientControl::CancelDeviceLink {
-                    redemption_secret_hash,
-                },
-            ) => {
+            (ConnState::Ready, ClientControl::BeginE2eAccountReset) => {
                 let session_id = self.session_for_token(token)?;
-                self.cancel_device_link(session_id, &redemption_secret_hash)
+                self.begin_e2e_account_reset(session_id)
+            }
+            (ConnState::Ready, ClientControl::ResetE2eAccount { genesis }) => {
+                let session_id = self.session_for_token(token)?;
+                self.reset_e2e_account(session_id, genesis)
             }
             (
                 ConnState::Ready,
@@ -1968,47 +1970,6 @@ impl Server {
                     key_epoch,
                     ledger_head,
                     &signature,
-                )
-            }
-            (
-                ConnState::Ready,
-                ClientControl::PutE2eRecoveryBundle {
-                    ledger_head,
-                    bundle,
-                },
-            ) => {
-                let session_id = self.session_for_token(token)?;
-                let user_id = self
-                    .sessions
-                    .get(&session_id)
-                    .map(|session| session.user_id)
-                    .ok_or_else(|| "unknown session".to_string())?;
-                self.device_directory
-                    .put_recovery_bundle(user_id, ledger_head, &bundle)
-            }
-            (
-                ConnState::Ready,
-                ClientControl::FetchE2eRecoveryBundle { user_id },
-            ) => {
-                let session_id = self.session_for_token(token)?;
-                if self
-                    .sessions
-                    .get(&session_id)
-                    .is_none_or(|session| session.user_id != user_id)
-                {
-                    return self.send_control_to_token(
-                        token,
-                        &ServerControl::Error {
-                            code: control::ERROR_REQUEST_REJECTED,
-                            message: "recovery bundles are available only to their account"
-                                .to_string(),
-                        },
-                    );
-                }
-                let bundle = self.device_directory.recovery_bundle(user_id)?;
-                self.send_control_to_token(
-                    token,
-                    &ServerControl::E2eRecoveryBundle { user_id, bundle },
                 )
             }
             (
@@ -2223,12 +2184,12 @@ impl Server {
                     .to_string(),
             );
         }
-        if self.device_links.values().any(|link| link.user_id == user_id) {
-            return Err("an E2E device link is already active for this account".to_string());
-        }
         if self.device_links.contains_key(&redemption_secret_hash) {
             return Err("device-link redemption secret is already active".to_string());
         }
+        // Creating a link is replacement, not reopening: a newly generated
+        // secret invalidates every older outstanding link for this account.
+        self.device_links.retain(|_, link| link.user_id != user_id);
         let expires_at_ms = now_ms().saturating_add(DEVICE_LINK_TTL.as_millis() as u64);
         self.device_links.insert(
             redemption_secret_hash.clone(),
@@ -2247,24 +2208,91 @@ impl Server {
         )
     }
 
-    fn cancel_device_link(
-        &mut self,
-        session_id: SessionId,
-        redemption_secret_hash: &[u8],
-    ) -> Result<(), String> {
-        let user_id = self
+    fn begin_e2e_account_reset(&mut self, session_id: SessionId) -> Result<(), String> {
+        let session = self
             .sessions
             .get(&session_id)
-            .map(|session| session.user_id)
             .ok_or_else(|| "unknown session".to_string())?;
-        if self
-            .device_links
-            .get(redemption_secret_hash)
-            .is_some_and(|link| link.user_id == user_id)
-        {
-            self.device_links.remove(redemption_secret_hash);
+        let credential_hash = session
+            .credential_hash
+            .as_deref()
+            .ok_or_else(|| "account reset requires a registered bearer credential".to_string())?;
+        let (credential_user, device_id, _) = self
+            .device_directory
+            .credential(credential_hash)
+            .ok_or_else(|| "account reset credential is no longer registered".to_string())?;
+        if credential_user != session.user_id {
+            return Err("account reset credential belongs to another account".to_string());
         }
-        Ok(())
+        let device_id = device_id
+            .ok_or_else(|| "account reset credential is not bound to a device".to_string())?;
+        let ledger = self
+            .device_directory
+            .validated(session.user_id)?
+            .ok_or_else(|| "account has no device ledger".to_string())?;
+        if ledger
+            .active_devices()
+            .all(|device| device.device_id != device_id)
+        {
+            return Err("account reset credential is not bound to an active device".to_string());
+        }
+        self.send_control_to_token(
+            session.tcp_token,
+            &ServerControl::E2eAccountResetPrepared {
+                account_generation: ledger
+                    .account_generation
+                    .checked_add(1)
+                    .ok_or_else(|| "account generation is exhausted".to_string())?,
+            },
+        )
+    }
+
+    fn reset_e2e_account(
+        &mut self,
+        session_id: SessionId,
+        genesis: rpc::e2e::AccountKeyStatement,
+    ) -> Result<(), String> {
+        let (user_id, token, credential_hash) = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| {
+                Some((
+                    session.user_id,
+                    session.tcp_token,
+                    session.credential_hash.clone()?,
+                ))
+            })
+            .ok_or_else(|| "account reset requires a registered bearer credential".to_string())?;
+        let reset = self
+            .device_directory
+            .reset_account(user_id, genesis, &credential_hash)?;
+        // A reset that committed but lost its response is safe to repeat. Keep
+        // cleanup after the durable directory swap so a retry completes it.
+        self.verification_sync.clear(user_id)?;
+        self.device_links.retain(|_, link| link.user_id != user_id);
+        self.announce_account_key_head_changed(user_id, reset.roster_epoch, reset.head);
+        let revoked_tokens: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|session| {
+                session
+                    .credential_hash
+                    .as_ref()
+                    .is_some_and(|hash| reset.revoked_credentials.contains(hash))
+            })
+            .map(|session| session.tcp_token)
+            .collect();
+        for revoked in revoked_tokens {
+            self.disconnect(revoked);
+        }
+        self.send_control_to_token(
+            token,
+            &ServerControl::E2eAccountReset {
+                account_id: reset.account_id,
+                device_id: reset.device_id,
+                key_epoch: 1,
+            },
+        )
     }
 
     fn fetch_device_link(&mut self, token: Token, redemption_secret: &str) -> Result<(), String> {
@@ -2299,6 +2327,7 @@ impl Server {
         token: Token,
         redemption_secret: &str,
         statement: rpc::e2e::AccountKeyStatement,
+        bearer_token: String,
         receive_files: bool,
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
@@ -2322,7 +2351,6 @@ impl Server {
             AccountKeyAction::AddDevice { device } => (device.device_id, device.name.clone()),
             _ => return Err("device-link redemption requires an AddDevice statement".to_string()),
         };
-        let bearer_token = format!("tct2_{}", random_secret_hex(&self.rng)?);
         let credential_hash = hash_secret(&bearer_token);
         let (roster_epoch, head) = self.device_directory.redeem_device(
             user_id,
@@ -2331,9 +2359,10 @@ impl Server {
             device_id,
             0,
         )?;
-        // Consumption follows the durable ledger+credential write. The
-        // single-threaded event loop makes concurrent redeemers serialize.
-        self.device_links.remove(&secret_hash);
+        // Keep the consumed secret until normal expiry so an exact retry can
+        // recover a lost response. The durable ledger+credential operation is
+        // idempotent; any different second redemption fails its old ledger
+        // anchor or bearer/device match.
 
         let account_tokens = self
             .sessions
@@ -2510,12 +2539,34 @@ impl Server {
                 }
             }
         };
-        self.establish_session(
+        let credential_hash = user.token_hash.clone();
+        if self
+            .device_directory
+            .credential(&credential_hash)
+            .is_none()
+        {
+            if self.device_directory.validated(user.id)?.is_some() {
+                return self.reject_auth(
+                    token,
+                    ERROR_AUTH_REJECTED,
+                    "authentication failed: this configured bearer was revoked from the E2E account"
+                        .to_string(),
+                );
+            }
+            self.device_directory.add_credential(
+                user.id,
+                credential_hash.clone(),
+                None,
+                0,
+            )?;
+        }
+        self.establish_session_with_credential(
             token,
             &user,
             receive_files,
             file_receive_limit_bytes,
             true,
+            Some(credential_hash),
             None,
         )
     }
@@ -2735,14 +2786,23 @@ impl Server {
             .then(|| verify_dynamic_token(&seed, existing_token).ok())
             .flatten()
             .filter(|claims| is_dynamic_user_id(claims.user_id));
-        let token_user_id = verified_claims
-            .filter(|claims| claims.password_epoch == current_epoch || current_password_verified)
-            .map(|claims| claims.user_id);
-        let stale_recovery_user_id = verified_claims
-            .filter(|claims| claims.password_epoch != current_epoch && !current_password_verified)
-            .and_then(|_| {
-                dynamic_user_id_from_pairing_secret(&seed, existing_token.as_bytes()).ok()
-            });
+        // A self-authenticating dynamic token is only an account credential
+        // while its exact secret remains in the durable credential directory.
+        // In particular, revoking its bound device removes that row and must
+        // not let OpenPair mint a replacement credential from the old token.
+        let registered_existing = verified_claims.and_then(|claims| {
+            self.device_directory
+                .authenticate_credential(existing_token)
+                .filter(|(user_id, _, password_epoch, _)| {
+                    *user_id == claims.user_id && *password_epoch == claims.password_epoch
+                })
+                .map(|(_, device_id, _, _)| (claims, device_id))
+        });
+        let token_user_id = registered_existing
+            .filter(|(claims, _)| {
+                claims.password_epoch == current_epoch || current_password_verified
+            })
+            .map(|(claims, _)| claims.user_id);
         let recovery_user_id = existing_token
             .starts_with(OPEN_PAIR_RECOVERY_PREFIX)
             .then(|| dynamic_user_id_from_recovery_token(&seed, existing_token).ok())
@@ -2755,8 +2815,7 @@ impl Server {
             );
         }
         let existing_user_id = token_user_id
-            .or(recovery_user_id)
-            .or(stale_recovery_user_id);
+            .or(recovery_user_id);
         let Some(user_id) = existing_user_id else {
             return self.reject_auth(
                 token,
@@ -2805,7 +2864,7 @@ impl Server {
         if let Err(error) = self.device_directory.add_credential(
             user_id,
             credential_hash.clone(),
-            None,
+            registered_existing.and_then(|(_, device_id)| device_id),
             current_epoch,
         ) {
             return self.reject_auth(
@@ -2913,6 +2972,7 @@ impl Server {
         Ok(())
     }
 
+    #[cfg(test)]
     fn establish_session(
         &mut self,
         token: Token,
@@ -3162,11 +3222,38 @@ impl Server {
         session_id: SessionId,
         statement: rpc::e2e::AccountKeyStatement,
     ) -> Result<(), String> {
-        let user_id = self
+        let (user_id, bound) = self
             .sessions
             .get(&session_id)
-            .map(|session| session.user_id)
+            .map(|session| (session.user_id, session.e2e_device))
             .ok_or_else(|| "unknown session".to_string())?;
+        if self
+            .device_directory
+            .chain_for(user_id)?
+            .last()
+            .is_some_and(|current| current == &statement)
+        {
+            return Ok(());
+        }
+        let current = self.device_directory.validated(user_id)?;
+        if current.is_some() {
+            let current = current.as_ref().expect("checked above");
+            let bound = bound.ok_or_else(|| {
+                "bind an active E2E device before changing the account device ledger".to_string()
+            })?;
+            if bound.ledger_head != current.head
+                || current
+                    .device_key(bound.device_id, bound.key_epoch)
+                    .is_none_or(|key| key.status != DeviceKeyStatus::Active)
+            {
+                return Err(
+                    "rebind an active E2E device at the current ledger head before changing the account device ledger"
+                        .to_string(),
+                );
+            }
+        } else if !matches!(statement.body.action, AccountKeyAction::Genesis { .. }) {
+            return Err("an account device ledger must begin with genesis".to_string());
+        }
         let DirectoryAppend::Advanced {
             roster_epoch,
             head,
@@ -3357,14 +3444,6 @@ impl Server {
             return self.send_control_to_token(
                 token,
                 &ServerControl::E2eVerificationSyncRateLimited { retry_after_ms },
-            );
-        }
-        if self.device_links.values().any(|link| link.user_id == user_id) {
-            return self.send_control_to_token(
-                token,
-                &ServerControl::E2eVerificationSyncRateLimited {
-                    retry_after_ms: DEVICE_LINK_TTL.as_millis() as u64,
-                },
             );
         }
         let current = self.verification_sync.current(user_id)?;
@@ -3877,6 +3956,7 @@ impl Server {
         room_id: RoomId,
         envelope: Option<&[u8]>,
         expected_kind: DmContentKind,
+        expected_target: Option<MessageId>,
     ) -> Option<&'static str> {
         if !self.room_is_dm(room_id) {
             return None;
@@ -3897,6 +3977,7 @@ impl Server {
             || event.header.author_key_epoch != bound.key_epoch
             || event.header.sender_roster.head != bound.ledger_head
             || event.header.kind != expected_kind
+            || event.header.semantic_target != expected_target
         {
             return Some("direct message event does not match the bound device session");
         }
@@ -3905,11 +3986,53 @@ impl Server {
             Some(RoomAccess::Dm(a, b)) if *b == session.user_id => *a,
             _ => return Some("direct message room does not contain the sender"),
         };
+        let Ok(Some(sender_ledger)) = self.device_directory.validated(session.user_id) else {
+            return Some("direct message sender has no account device roster");
+        };
+        if event.header.sender_roster != RosterCheckpoint::from(&sender_ledger) {
+            return Some("direct message sender device roster is stale");
+        }
+        let Some(author) = sender_ledger
+            .device_key(bound.device_id, bound.key_epoch)
+            .filter(|author| author.status == DeviceKeyStatus::Active)
+        else {
+            return Some("direct message author device is not active");
+        };
+        let Ok(author_key) = author.keys.signing_public_key.as_slice().try_into() else {
+            return Some("direct message author signing key is malformed");
+        };
+        if verify_dm_event_signature(&event, author_key).is_err() {
+            return Some("direct message event signature is invalid");
+        }
         let Ok(Some(peer_ledger)) = self.device_directory.validated(peer) else {
             return Some("direct message recipient has no account device roster");
         };
         if event.header.recipient_roster != RosterCheckpoint::from(&peer_ledger) {
             return Some("direct message recipient device roster is stale");
+        }
+        let mut expected_recipients = Vec::new();
+        for (user_id, ledger) in [
+            (session.user_id, &sender_ledger),
+            (peer, &peer_ledger),
+        ] {
+            for device in ledger.active_devices() {
+                expected_recipients.push((
+                    user_id,
+                    ledger.account_id,
+                    device.device_id,
+                    device.key_epoch,
+                ));
+            }
+        }
+        expected_recipients.sort_unstable();
+        let mut actual_recipients: Vec<_> = event
+            .recipient_keys
+            .iter()
+            .map(|key| (key.user_id, key.account_id, key.device_id, key.key_epoch))
+            .collect();
+        actual_recipients.sort_unstable();
+        if actual_recipients != expected_recipients {
+            return Some("direct message event recipient set is invalid");
         }
         None
     }
@@ -3971,6 +4094,7 @@ impl Server {
             room_id,
             envelope.as_deref(),
             DmContentKind::Text,
+            None,
         ) {
             let token = self
                 .live_token_for_session(session_id)
@@ -4063,7 +4187,13 @@ impl Server {
             MutationKind::Delete => DmContentKind::Delete,
         };
         if let Some(error) =
-            self.dm_event_origin_error(session_id, room_id, envelope.as_deref(), event_kind)
+            self.dm_event_origin_error(
+                session_id,
+                room_id,
+                envelope.as_deref(),
+                event_kind,
+                Some(target),
+            )
         {
             return self.reject_chat_mutation(
                 session_id,
@@ -4205,6 +4335,7 @@ impl Server {
             room_id,
             sealed_meta.as_deref(),
             DmContentKind::FileAnnounce,
+            None,
         ) {
             return Err(error.to_string());
         }
@@ -6791,12 +6922,11 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::AppendAccountKeyStatement { .. } => "append_account_key_statement",
         ClientControl::FetchAccountKeyChain { .. } => "fetch_account_key_chain",
         ClientControl::BindE2eDevice { .. } => "bind_e2e_device",
-        ClientControl::PutE2eRecoveryBundle { .. } => "put_e2e_recovery_bundle",
-        ClientControl::FetchE2eRecoveryBundle { .. } => "fetch_e2e_recovery_bundle",
         ClientControl::FetchE2eVerificationSync { .. } => "fetch_e2e_verification_sync",
         ClientControl::PutE2eVerificationSync { .. } => "put_e2e_verification_sync",
         ClientControl::CreateDeviceLink { .. } => "create_device_link",
-        ClientControl::CancelDeviceLink { .. } => "cancel_device_link",
+        ClientControl::BeginE2eAccountReset => "begin_e2e_account_reset",
+        ClientControl::ResetE2eAccount { .. } => "reset_e2e_account",
         ClientControl::FetchDeviceLink { .. } => "fetch_device_link",
         ClientControl::RedeemDeviceLink { .. } => "redeem_device_link",
     }
@@ -6843,7 +6973,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::AccountKeyChain { .. } => "account_key_chain",
         ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
         ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
-        ServerControl::E2eRecoveryBundle { .. } => "e2e_recovery_bundle",
         ServerControl::E2eVerificationSync { .. } => "e2e_verification_sync",
         ServerControl::E2eVerificationSyncChanged { .. } => "e2e_verification_sync_changed",
         ServerControl::E2eVerificationSyncConflict { .. } => "e2e_verification_sync_conflict",
@@ -6851,6 +6980,8 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
             "e2e_verification_sync_rate_limited"
         }
         ServerControl::DeviceLinkCreated { .. } => "device_link_created",
+        ServerControl::E2eAccountResetPrepared { .. } => "e2e_account_reset_prepared",
+        ServerControl::E2eAccountReset { .. } => "e2e_account_reset",
         ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
         ServerControl::DeviceLinked { .. } => "device_linked",
         ServerControl::DeviceLinkRedeemed { .. } => "device_link_redeemed",
@@ -7957,7 +8088,6 @@ mod tests {
                             .to_vec(),
                         encryption_public_key: rpc::e2e::e2e_public_key(&encryption_seed).to_vec(),
                     },
-                    recovery_bundle_hash: vec![0; 32],
                 },
             },
             &authority_seed,
@@ -7988,16 +8118,44 @@ mod tests {
     }
 
     fn test_dm_event(
+        server: &Server,
         bound: BoundE2eDevice,
         account_id: rpc::ids::AccountId,
         recipient_roster: RosterCheckpoint,
         sender: UserId,
         room_id: RoomId,
         kind: DmContentKind,
+        semantic_target: Option<MessageId>,
         tag: u8,
     ) -> Vec<u8> {
-        jsony::to_binary(&DmEventEnvelope {
-            header: rpc::e2e::SenderEventHeader {
+        let recipient = if sender == UserId(1) {
+            UserId(2)
+        } else {
+            UserId(1)
+        };
+        let sender_ledger = server.device_directory.validated(sender).unwrap().unwrap();
+        let recipient_ledger = server
+            .device_directory
+            .validated(recipient)
+            .unwrap()
+            .unwrap();
+        let mut recipients = Vec::new();
+        for (user_id, ledger) in [(sender, &sender_ledger), (recipient, &recipient_ledger)] {
+            for device in ledger.active_devices() {
+                recipients.push(rpc::e2e::EventRecipient {
+                    user_id,
+                    account_id: ledger.account_id,
+                    device_id: device.device_id,
+                    key_epoch: device.key_epoch,
+                    encryption_public_key: device
+                        .encryption_public_key
+                        .as_slice()
+                        .try_into()
+                        .unwrap(),
+                });
+            }
+        }
+        let header = rpc::e2e::SenderEventHeader {
                 event_id: rpc::ids::EventId([tag; 16]),
                 room_id,
                 sender,
@@ -8008,7 +8166,7 @@ mod tests {
                 predecessor: None,
                 kind,
                 created_at_ms: u64::from(tag),
-                semantic_target: None,
+                semantic_target,
                 sender_roster: rpc::e2e::RosterCheckpoint {
                     account_id,
                     account_generation: 1,
@@ -8016,12 +8174,39 @@ mod tests {
                     head: bound.ledger_head,
                 },
                 recipient_roster,
+            };
+        let signing_seed = [bound.device_id.0[0].wrapping_add(1); 32];
+        let content = match kind {
+            DmContentKind::Text => rpc::e2e::DmContent::Text {
+                body: "server test".to_string(),
             },
-            ephemeral_public_key: vec![1; 32],
-            recipient_keys: Vec::new(),
-            sealed: vec![tag; 32],
-            signature: vec![tag; 64],
-        })
+            DmContentKind::Edit => rpc::e2e::DmContent::Edit {
+                target: semantic_target.unwrap(),
+                body: "server edit".to_string(),
+            },
+            DmContentKind::Delete => rpc::e2e::DmContent::Delete {
+                target: semantic_target.unwrap(),
+            },
+            DmContentKind::FileAnnounce => rpc::e2e::DmContent::FileAnnounce {
+                file: rpc::e2e::DmFileMeta {
+                    original_name: "server-test.bin".to_string(),
+                    size: 4,
+                    encoding: FileContentEncoding::Identity,
+                    content_key: vec![1; KEY_LEN],
+                },
+            },
+        };
+        rpc::e2e::seal_dm_event(
+            &signing_seed,
+            header,
+            &rpc::e2e::DmPlaintext {
+                sent_at_ms: u64::from(tag),
+                content,
+            },
+            &recipients,
+            &ring::rand::SystemRandom::new(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -8120,6 +8305,7 @@ mod tests {
                 Token(33),
                 redemption_secret,
                 statement,
+                "tct2_test-device-bearer-token-value".to_string(),
                 false,
                 0,
             )
@@ -8144,6 +8330,121 @@ mod tests {
                 ServerControl::DeviceLinked { .. }
             )),
             ServerControl::DeviceLinked { .. }
+        ));
+    }
+
+    #[test]
+    fn creating_device_link_replaces_previous_link_for_account() {
+        let mut server = test_server();
+        let user_id = UserId(config::FIRST_DYNAMIC_USER_ID);
+        let session_id = SessionId(1);
+        let mut peer = live_user(&mut server, Token(11), session_id, user_id);
+        authorize_test_e2e_device(&mut server, session_id, user_id, 7);
+
+        server
+            .create_device_link(session_id, vec![1; 32], vec![1], None)
+            .unwrap();
+        assert!(matches!(
+            read_plaintext_server_control(&mut peer),
+            ServerControl::DeviceLinkCreated { .. }
+        ));
+        server
+            .create_device_link(session_id, vec![2; 32], vec![2], None)
+            .unwrap();
+        assert!(matches!(
+            read_plaintext_server_control(&mut peer),
+            ServerControl::DeviceLinkCreated { .. }
+        ));
+
+        assert_eq!(server.device_links.len(), 1);
+        assert!(!server.device_links.contains_key(&vec![1; 32]));
+        assert_eq!(
+            server
+                .device_links
+                .get(&vec![2; 32])
+                .map(|link| link.enrollment_bundle.as_slice()),
+            Some(&[2][..])
+        );
+    }
+
+    #[test]
+    fn account_reset_rebinds_requester_and_revokes_other_credentials() {
+        let mut server = test_server();
+        let user_id = UserId(config::FIRST_DYNAMIC_USER_ID);
+        let session_id = SessionId(1);
+        let mut peer = live_user(&mut server, Token(11), session_id, user_id);
+        authorize_test_e2e_device(&mut server, session_id, user_id, 7);
+        let requester_hash = hash_secret("requester-token");
+        let other_hash = hash_secret("other-token");
+        server
+            .device_directory
+            .add_credential(user_id, requester_hash.clone(), Some(DeviceId([7; 16])), 0)
+            .unwrap();
+        server
+            .device_directory
+            .add_credential(user_id, other_hash.clone(), Some(DeviceId([7; 16])), 0)
+            .unwrap();
+        server.sessions.get_mut(&session_id).unwrap().credential_hash = Some(requester_hash.clone());
+
+        server.begin_e2e_account_reset(session_id).unwrap();
+        assert!(matches!(
+            read_plaintext_server_control(&mut peer),
+            ServerControl::E2eAccountResetPrepared {
+                account_generation: 2
+            }
+        ));
+
+        let authority = [50; 32];
+        let signing = [51; 32];
+        let encryption = [52; 32];
+        let authority_public = rpc::e2e::ed25519_public_key(&authority).unwrap();
+        let account_id = rpc::e2e::account_id(
+            server.server_key_pair.public_key().as_ref(),
+            user_id,
+            &authority_public,
+        );
+        let replacement_device = DeviceId([53; 16]);
+        let genesis = rpc::e2e::sign_account_statement(
+            rpc::e2e::AccountKeyStatementBody {
+                account_id,
+                account_generation: 2,
+                roster_epoch: 1,
+                previous: LedgerHash::default(),
+                authority_key_epoch: 1,
+                action: AccountKeyAction::Genesis {
+                    authority_public_key: authority_public.to_vec(),
+                    first_device: rpc::e2e::DevicePublicKeys {
+                        device_id: replacement_device,
+                        name: "replacement".to_string(),
+                        key_epoch: 1,
+                        signing_public_key: rpc::e2e::ed25519_public_key(&signing)
+                            .unwrap()
+                            .to_vec(),
+                        encryption_public_key: rpc::e2e::e2e_public_key(&encryption).to_vec(),
+                    },
+                },
+            },
+            &authority,
+            None,
+        )
+        .unwrap();
+        server.reset_e2e_account(session_id, genesis).unwrap();
+
+        let (_, bound, _, _) = server
+            .device_directory
+            .authenticate_credential("requester-token")
+            .unwrap();
+        assert_eq!(bound, Some(replacement_device));
+        assert!(server.device_directory.credential(&other_hash).is_none());
+        let ledger = server.device_directory.validated(user_id).unwrap().unwrap();
+        assert_eq!(ledger.account_generation, 2);
+        assert_eq!(ledger.account_id, account_id);
+        assert!(matches!(
+            read_until(&mut peer, |control| matches!(
+                control,
+                ServerControl::E2eAccountReset { .. }
+            )),
+            ServerControl::E2eAccountReset { .. }
         ));
     }
 
@@ -8201,23 +8502,27 @@ mod tests {
                 .unwrap(),
         );
         let text_event = test_dm_event(
+            &server,
             bound,
             account_id,
             recipient_roster,
             UserId(1),
             dm_room,
             DmContentKind::Text,
+            None,
             1,
         );
         let mut stale_recipient = recipient_roster;
         stale_recipient.head = LedgerHash::default();
         let stale_event = test_dm_event(
+            &server,
             bound,
             account_id,
             stale_recipient,
             UserId(1),
             dm_room,
             DmContentKind::Text,
+            None,
             1,
         );
 
@@ -8295,12 +8600,14 @@ mod tests {
                 MutationKind::Edit,
                 String::new(),
                 Some(test_dm_event(
+                    &server,
                     bound,
                     account_id,
                     recipient_roster,
                     UserId(1),
                     dm_room,
                     DmContentKind::Edit,
+                    Some(sealed_target),
                     2,
                 )),
             )
@@ -8340,12 +8647,14 @@ mod tests {
                 MutationKind::Delete,
                 String::new(),
                 Some(test_dm_event(
+                    &server,
                     bound,
                     account_id,
                     recipient_roster,
                     UserId(1),
                     dm_room,
                     DmContentKind::Delete,
+                    Some(sealed_target),
                     3,
                 )),
             )
@@ -8384,12 +8693,14 @@ mod tests {
                 .unwrap(),
         );
         let sealed_meta = test_dm_event(
+            &server,
             bound,
             account_id,
             recipient_roster,
             UserId(1),
             dm_room,
             DmContentKind::FileAnnounce,
+            None,
             9,
         );
 
@@ -10433,6 +10744,10 @@ mod tests {
             },
         )
         .unwrap();
+        server
+            .device_directory
+            .add_credential(id, hash_secret(&existing), None, 0)
+            .unwrap();
 
         let _peer = seed_session_client(&mut server, Token(1));
         server
@@ -10543,7 +10858,7 @@ mod tests {
     }
 
     #[test]
-    fn open_pair_preserves_identity_on_re_pair() {
+    fn open_pair_rejects_unregistered_dynamic_token_even_with_password() {
         let mut server = open_pair_test_server();
         server.config.security.password_hash = Some(hash_secret("hunter2"));
         server.config.security.password_epoch = 7;
@@ -10560,12 +10875,11 @@ mod tests {
         let _peer = seed_session_client(&mut server, Token(1));
         let _ = server.open_pair_client(Token(1), "Zoe", "hunter2", &existing, true, 0);
 
-        let session = session_for(&server, Token(1)).expect("session established");
-        assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID + 5));
+        assert!(session_for(&server, Token(1)).is_none());
     }
 
     #[test]
-    fn open_pair_without_password_does_not_preserve_stale_identity() {
+    fn open_pair_rejects_unregistered_stale_token_without_password() {
         let mut server = open_pair_test_server();
         server.config.security.password_epoch = 7;
         let seed = server.config.security.server_identity_seed.clone();
@@ -10581,10 +10895,7 @@ mod tests {
         let _peer = seed_session_client(&mut server, Token(1));
         let _ = server.open_pair_client(Token(1), "Zoe", "", &existing, true, 0);
 
-        let session = session_for(&server, Token(1)).expect("session established");
-        let expected = dynamic_user_id_from_pairing_secret(&seed, existing.as_bytes()).unwrap();
-        assert_eq!(session.user_id, expected);
-        assert_ne!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID + 5));
+        assert!(session_for(&server, Token(1)).is_none());
     }
 
     #[test]
@@ -10604,6 +10915,11 @@ mod tests {
             },
         )
         .unwrap();
+        let device_id = DeviceId([9; 16]);
+        server
+            .device_directory
+            .add_credential(user_id, hash_secret(&existing), Some(device_id), 0)
+            .unwrap();
         let token = Token(17);
         let (conn, mut peer) = test_live_client();
         server.clients.insert(token, conn);
@@ -10625,6 +10941,11 @@ mod tests {
         let claims = verify_dynamic_token(&seed, &token).unwrap();
         assert_eq!(claims.user_id, user_id);
         assert_eq!(claims.password_epoch, 7);
+        let (_, rebound_device, _, _) = server
+            .device_directory
+            .authenticate_credential(&token)
+            .expect("refreshed token persisted");
+        assert_eq!(rebound_device, Some(device_id));
         assert_eq!(udp_addr, "198.51.100.20:54100");
         assert_eq!(udp_probe_addr.as_deref(), Some("198.51.100.20:54101"));
     }

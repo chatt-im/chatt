@@ -348,12 +348,16 @@ fn pair_validation(ticket: &str, password: &str, name: &str) -> Option<String> {
 pub(crate) enum DeviceLinkButton {
     CopyTicket,
     CopyPassword,
+    GenerateNew,
     Close,
 }
 
 pub(crate) struct DeviceLinkDialog {
     pairing_string: String,
     transfer_password: String,
+    expires_at_ms: u64,
+    now_ms: u64,
+    generate_armed: bool,
     form: form::State,
 }
 
@@ -361,12 +365,15 @@ impl DeviceLinkDialog {
     pub(crate) fn new(
         pairing_string: String,
         transfer_password: String,
-        _expires_at_ms: u64,
+        expires_at_ms: u64,
         bindings: FormBindings,
     ) -> Self {
         Self {
             pairing_string,
             transfer_password,
+            expires_at_ms,
+            now_ms: 0,
+            generate_armed: false,
             form: form::state_with_focus(bindings, LINK_SECTION, "copy-ticket"),
         }
     }
@@ -381,7 +388,14 @@ impl DeviceLinkDialog {
             .saturating_add(5)
     }
 
-    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+    pub(crate) fn render(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+        now_ms: u64,
+    ) {
+        self.now_ms = now_ms;
         self.form.begin_frame(area);
         let mut form = Form::new(
             &mut self.form,
@@ -394,7 +408,14 @@ impl DeviceLinkDialog {
         )
         .with_label_width(LABEL_WIDTH)
         .with_surface(FormSurface::Dialog);
-        device_link_form(&mut form, &self.pairing_string, &self.transfer_password);
+        device_link_form(
+            &mut form,
+            &self.pairing_string,
+            &self.transfer_password,
+            self.expires_at_ms,
+            self.now_ms,
+            self.generate_armed,
+        );
         self.form.finish_frame();
     }
 
@@ -408,7 +429,10 @@ impl DeviceLinkDialog {
                 self.drive(theme, FieldIntent::None, commit, None);
                 None
             }
-            FormAction::Activate => self.drive(theme, FieldIntent::Activate, event.commit, None),
+            FormAction::Activate => {
+                let button = self.drive(theme, FieldIntent::Activate, event.commit, None);
+                self.activate(button)
+            }
             FormAction::Adjust(delta) => {
                 self.drive(theme, FieldIntent::Adjust(delta), event.commit, None);
                 None
@@ -427,7 +451,8 @@ impl DeviceLinkDialog {
         let event = self.form.handle_mouse(mouse);
         match event.intent {
             FormMouseIntent::Activate(_) => {
-                self.drive(theme, FieldIntent::Activate, event.commit, None)
+                let button = self.drive(theme, FieldIntent::Activate, event.commit, None);
+                self.activate(button)
             }
             FormMouseIntent::Text(_, _, column) => {
                 self.drive(theme, FieldIntent::None, event.commit, Some(column));
@@ -444,10 +469,27 @@ impl DeviceLinkDialog {
         }
     }
     pub(crate) fn value(&self, button: DeviceLinkButton) -> Option<&str> {
+        if self.now_ms >= self.expires_at_ms {
+            return None;
+        }
         match button {
             DeviceLinkButton::CopyTicket => Some(&self.pairing_string),
             DeviceLinkButton::CopyPassword => Some(&self.transfer_password),
-            DeviceLinkButton::Close => None,
+            DeviceLinkButton::GenerateNew | DeviceLinkButton::Close => None,
+        }
+    }
+
+    fn activate(&mut self, button: Option<DeviceLinkButton>) -> Option<DeviceLinkButton> {
+        match button {
+            Some(DeviceLinkButton::GenerateNew) if !self.generate_armed => {
+                self.generate_armed = true;
+                None
+            }
+            Some(button) => {
+                self.generate_armed = false;
+                Some(button)
+            }
+            None => None,
         }
     }
     fn drive(
@@ -471,7 +513,14 @@ impl DeviceLinkDialog {
             )
             .with_label_width(LABEL_WIDTH)
             .with_surface(FormSurface::Dialog);
-            device_link_form(&mut form, &self.pairing_string, &self.transfer_password)
+            device_link_form(
+                &mut form,
+                &self.pairing_string,
+                &self.transfer_password,
+                self.expires_at_ms,
+                self.now_ms,
+                self.generate_armed,
+            )
         };
         self.form.finish_frame();
         activated
@@ -489,12 +538,25 @@ impl Drop for DeviceLinkDialog {
     }
 }
 
-fn device_link_form(form: &mut Form<'_>, ticket: &str, password: &str) -> Option<DeviceLinkButton> {
+fn device_link_form(
+    form: &mut Form<'_>,
+    ticket: &str,
+    password: &str,
+    expires_at_ms: u64,
+    now_ms: u64,
+    generate_armed: bool,
+) -> Option<DeviceLinkButton> {
     form.section_with_id("One-time link", LINK_SECTION);
     form.wrapped_static_row("Pairing string", ticket);
     form.static_row("Password", password);
-    form.static_row("Expires", "10 minutes; one use");
+    let expiry = device_link_expiry(expires_at_ms, now_ms);
+    form.static_row("Expires", &expiry);
     form.spacer(1);
+    let generate_label = if generate_armed {
+        "Confirm new"
+    } else {
+        "Generate new"
+    };
     form.actions(&[
         ActionButton {
             key: "copy-ticket",
@@ -509,6 +571,12 @@ fn device_link_form(form: &mut Form<'_>, ticket: &str, password: &str) -> Option
             help: "Copy the six-word transfer password.",
         },
         ActionButton {
+            key: "generate-new",
+            label: generate_label,
+            value: DeviceLinkButton::GenerateNew,
+            help: "Activate twice to replace this link with a newly generated link.",
+        },
+        ActionButton {
             key: "close",
             label: "Close",
             value: DeviceLinkButton::Close,
@@ -516,6 +584,19 @@ fn device_link_form(form: &mut Form<'_>, ticket: &str, password: &str) -> Option
         },
     ])
     .activated
+}
+
+fn device_link_expiry(expires_at_ms: u64, now_ms: u64) -> String {
+    let remaining_seconds = expires_at_ms.saturating_sub(now_ms).div_ceil(1_000);
+    if remaining_seconds == 0 {
+        "Expired — generate a new link".to_string()
+    } else {
+        format!(
+            "{:02}:{:02} remaining; one use",
+            remaining_seconds / 60,
+            remaining_seconds % 60
+        )
+    }
 }
 
 #[cfg(test)]
@@ -531,6 +612,33 @@ mod tests {
     fn render_pair(dialog: &mut DevicePairDialog, theme: &Theme) {
         let mut buf = Buffer::new(80, dialog.form_height(80));
         dialog.render(buf.rect(), &mut buf, theme);
+    }
+
+    #[test]
+    fn device_link_countdown_rounds_up_and_expires() {
+        assert_eq!(device_link_expiry(70_001, 10_000), "01:01 remaining; one use");
+        assert_eq!(device_link_expiry(70_000, 10_000), "01:00 remaining; one use");
+        assert_eq!(
+            device_link_expiry(70_000, 70_000),
+            "Expired — generate a new link"
+        );
+    }
+
+    #[test]
+    fn generating_a_replacement_link_requires_two_activations() {
+        let mut dialog = DeviceLinkDialog::new(
+            "ticket".to_string(),
+            "password".to_string(),
+            60_000,
+            FormBindings::Standard,
+        );
+        assert_eq!(dialog.activate(Some(DeviceLinkButton::GenerateNew)), None);
+        assert!(dialog.generate_armed);
+        assert_eq!(
+            dialog.activate(Some(DeviceLinkButton::GenerateNew)),
+            Some(DeviceLinkButton::GenerateNew)
+        );
+        assert!(!dialog.generate_armed);
     }
 
     #[test]

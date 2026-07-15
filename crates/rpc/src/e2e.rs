@@ -151,7 +151,6 @@ pub enum AccountKeyAction {
     Genesis {
         authority_public_key: Vec<u8>,
         first_device: DevicePublicKeys,
-        recovery_bundle_hash: Vec<u8>,
     },
     AddDevice {
         device: DevicePublicKeys,
@@ -171,9 +170,6 @@ pub enum AccountKeyAction {
     },
     RotateAccountAuthority {
         new_authority_public_key: Vec<u8>,
-    },
-    UpdateRecoveryBundle {
-        recovery_bundle_hash: Vec<u8>,
     },
 }
 
@@ -224,7 +220,6 @@ pub struct ValidatedAccountLedger {
     pub authority_key_epoch: u64,
     pub authority_public_key: [u8; ACCOUNT_AUTHORITY_KEY_LEN],
     pub device_keys: Vec<ValidatedDeviceKey>,
-    pub recovery_bundle_hash: Vec<u8>,
 }
 
 impl ValidatedAccountLedger {
@@ -258,7 +253,6 @@ impl ValidatedAccountLedger {
         let AccountKeyAction::Genesis {
             authority_public_key,
             first_device,
-            recovery_bundle_hash,
         } = &first.body.action
         else {
             return Err("account key ledger does not begin with genesis".to_string());
@@ -273,7 +267,6 @@ impl ValidatedAccountLedger {
             || first.body.previous != LedgerHash::default()
             || first.body.authority_key_epoch != 1
             || first_device.key_epoch != 1
-            || recovery_bundle_hash.len() != 32
         {
             return Err("account genesis counters are invalid".to_string());
         }
@@ -303,7 +296,6 @@ impl ValidatedAccountLedger {
                 ended_at: None,
                 final_event_heads: Vec::new(),
             }],
-            recovery_bundle_hash: recovery_bundle_hash.clone(),
         };
         for statement in &statements[1..] {
             state.apply(statement)?;
@@ -424,20 +416,26 @@ impl ValidatedAccountLedger {
                 if statement.co_signature.is_some() {
                     return Err("device revocation carries an unexpected co-signature".to_string());
                 }
-                let mut found = false;
+                let active_count = self.active_devices().count();
+                let found_active = self.device_keys.iter().any(|key| {
+                    key.keys.device_id == *device_id && key.status == DeviceKeyStatus::Active
+                });
+                if !found_active {
+                    return Err("device revocation names a non-active device".to_string());
+                }
+                if active_count == 1 {
+                    return Err("device revocation would leave the account with no active device"
+                        .to_string());
+                }
                 for key in self
                     .device_keys
                     .iter_mut()
                     .filter(|key| key.keys.device_id == *device_id)
                 {
-                    found = true;
                     if key.status == DeviceKeyStatus::Active {
                         key.status = DeviceKeyStatus::Revoked;
                         key.ended_at = Some(body.roster_epoch);
                     }
-                }
-                if !found {
-                    return Err("device revocation names an unknown device".to_string());
                 }
             }
             AccountKeyAction::RotateAccountAuthority {
@@ -453,19 +451,6 @@ impl ValidatedAccountLedger {
                 verify_ed25519(&new_authority, &signing_bytes, co_signature)?;
                 self.authority_public_key = new_authority;
                 self.authority_key_epoch += 1;
-            }
-            AccountKeyAction::UpdateRecoveryBundle {
-                recovery_bundle_hash,
-            } => {
-                if statement.co_signature.is_some() {
-                    return Err(
-                        "recovery-bundle update carries an unexpected co-signature".to_string()
-                    );
-                }
-                if recovery_bundle_hash.len() != 32 {
-                    return Err("recovery-bundle hash has the wrong length".to_string());
-                }
-                self.recovery_bundle_hash.clone_from(recovery_bundle_hash);
             }
         }
         self.roster_epoch = body.roster_epoch;
@@ -774,7 +759,9 @@ pub struct SenderEventHeader {
     pub predecessor: Option<EventId>,
     pub kind: DmContentKind,
     pub created_at_ms: u64,
-    pub semantic_target: Option<EventId>,
+    /// Outer chat mutation target, signed so the relay-visible operation and
+    /// encrypted payload cannot be spliced onto a different message.
+    pub semantic_target: Option<MessageId>,
     pub sender_roster: RosterCheckpoint,
     pub recipient_roster: RosterCheckpoint,
 }
@@ -809,6 +796,33 @@ pub struct DmEventEnvelope {
     pub recipient_keys: Vec<EventKeyWrap>,
     pub sealed: Vec<u8>,
     pub signature: Vec<u8>,
+}
+
+/// Verifies the author signature over the complete event envelope. Relays use
+/// this without access to plaintext so malformed records never enter history.
+pub fn verify_dm_event_signature(
+    envelope: &DmEventEnvelope,
+    author_signing_public_key: &[u8; DEVICE_SIGNING_KEY_LEN],
+) -> Result<(), CryptoError> {
+    if envelope.ephemeral_public_key.len() != E2E_PUBLIC_KEY_LEN
+        || envelope.recipient_keys.is_empty()
+        || envelope.recipient_keys.len() > MAX_ACTIVE_ACCOUNT_DEVICES * 2
+    {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    let signature_input = EventSignatureInput {
+        label: DM_EVENT_SIGNATURE_LABEL.to_vec(),
+        header: envelope.header,
+        ephemeral_public_key: envelope.ephemeral_public_key.clone(),
+        recipient_keys: envelope.recipient_keys.clone(),
+        sealed: envelope.sealed.clone(),
+    };
+    signature::UnparsedPublicKey::new(&signature::ED25519, author_signing_public_key)
+        .verify(
+            &jsony::to_binary(&signature_input),
+            &envelope.signature,
+        )
+        .map_err(|_| CryptoError::InvalidSignature)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1051,25 +1065,7 @@ pub fn open_dm_event(
     }
     let envelope: DmEventEnvelope =
         jsony::from_binary(encoded).map_err(|_| CryptoError::InvalidEncoding)?;
-    if envelope.ephemeral_public_key.len() != E2E_PUBLIC_KEY_LEN
-        || envelope.recipient_keys.is_empty()
-        || envelope.recipient_keys.len() > MAX_ACTIVE_ACCOUNT_DEVICES * 2
-    {
-        return Err(CryptoError::InvalidEncoding);
-    }
-    let signature_input = EventSignatureInput {
-        label: DM_EVENT_SIGNATURE_LABEL.to_vec(),
-        header: envelope.header,
-        ephemeral_public_key: envelope.ephemeral_public_key.clone(),
-        recipient_keys: envelope.recipient_keys.clone(),
-        sealed: envelope.sealed.clone(),
-    };
-    signature::UnparsedPublicKey::new(&signature::ED25519, author_signing_public_key)
-        .verify(
-            &jsony::to_binary(&signature_input),
-            &envelope.signature,
-        )
-        .map_err(|_| CryptoError::InvalidSignature)?;
+    verify_dm_event_signature(&envelope, author_signing_public_key)?;
 
     let addressed = envelope
         .recipient_keys
@@ -1939,7 +1935,6 @@ mod tests {
                 action: AccountKeyAction::Genesis {
                     authority_public_key: authority_public.to_vec(),
                     first_device: first.clone(),
-                    recovery_bundle_hash: vec![3; 32],
                 },
             },
             &authority,
@@ -2005,6 +2000,49 @@ mod tests {
         )
         .unwrap();
         assert!(ledger.apply(&unsigned_rotation).is_err());
+    }
+
+    #[test]
+    fn account_ledger_rejects_revoking_last_or_inactive_device() {
+        let server = [9u8; 32];
+        let user = UserId(7);
+        let authority = [1u8; 32];
+        let authority_public = ed25519_public_key(&authority).unwrap();
+        let (first, _, _) = test_device(2, 1);
+        let account = account_id(&server, user, &authority_public);
+        let genesis = sign_account_statement(
+            AccountKeyStatementBody {
+                account_id: account,
+                account_generation: 1,
+                roster_epoch: 1,
+                previous: LedgerHash::default(),
+                authority_key_epoch: 1,
+                action: AccountKeyAction::Genesis {
+                    authority_public_key: authority_public.to_vec(),
+                    first_device: first.clone(),
+                },
+            },
+            &authority,
+            None,
+        )
+        .unwrap();
+        let ledger = ValidatedAccountLedger::validate(&server, user, &[genesis.clone()]).unwrap();
+        let revoke = sign_account_statement(
+            AccountKeyStatementBody {
+                account_id: account,
+                account_generation: 1,
+                roster_epoch: 2,
+                previous: ledger.head,
+                authority_key_epoch: 1,
+                action: AccountKeyAction::RevokeDevice {
+                    device_id: first.device_id,
+                },
+            },
+            &authority,
+            None,
+        )
+        .unwrap();
+        assert!(ValidatedAccountLedger::validate(&server, user, &[genesis, revoke]).is_err());
     }
 
     #[test]

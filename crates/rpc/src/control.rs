@@ -1,8 +1,8 @@
 use jsony::Jsony;
 
 use crate::ids::{
-    BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId, StreamId,
-    UserId,
+    AccountId, BugReportId, DeviceId, FileTransferId, LedgerHash, MessageId, RoomId, SessionId,
+    StreamId, UserId,
 };
 
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 224 * 1024;
@@ -119,8 +119,13 @@ pub enum ClientControl {
         enrollment_bundle: Vec<u8>,
         verification_checkpoint: Option<crate::e2e::VerificationSyncCheckpoint>,
     },
-    CancelDeviceLink {
-        redemption_secret_hash: Vec<u8>,
+    /// Requests the next account generation before a destructive E2E reset.
+    /// The authenticated bearer must still be bound to an active device.
+    BeginE2eAccountReset,
+    /// Atomically replaces the account ledger and rebinds only the requesting
+    /// credential to the new genesis device.
+    ResetE2eAccount {
+        genesis: crate::e2e::AccountKeyStatement,
     },
     /// Fetches an opaque enrollment bundle before authentication. Fetching is
     /// non-consuming so a mistyped transfer password can be retried.
@@ -132,6 +137,9 @@ pub enum ClientControl {
     RedeemDeviceLink {
         redemption_secret: String,
         statement: crate::e2e::AccountKeyStatement,
+        /// Client-generated bearer, staged locally with the replacement
+        /// identity so a lost response can be reconciled by authentication.
+        bearer_token: String,
         receive_files: bool,
         file_receive_limit_bytes: u64,
     },
@@ -278,15 +286,6 @@ pub enum ClientControl {
         key_epoch: u64,
         ledger_head: LedgerHash,
         signature: Vec<u8>,
-    },
-    /// Stores the opaque recovery bundle named by the signed ledger head. The
-    /// server never receives the recovery secret or account authority seed.
-    PutE2eRecoveryBundle {
-        ledger_head: LedgerHash,
-        bundle: Vec<u8>,
-    },
-    FetchE2eRecoveryBundle {
-        user_id: UserId,
     },
     /// Fetches the latest compacted, opaque manual-verification snapshot for
     /// the authenticated account. A matching checkpoint suppresses the body.
@@ -484,10 +483,6 @@ pub enum ServerControl {
         device_id: DeviceId,
         key_epoch: u64,
     },
-    E2eRecoveryBundle {
-        user_id: UserId,
-        bundle: Option<Vec<u8>>,
-    },
     E2eVerificationSync {
         checkpoint: Option<crate::e2e::VerificationSyncCheckpoint>,
         /// `None` when the requester's known checkpoint is current.
@@ -505,6 +500,14 @@ pub enum ServerControl {
     DeviceLinkCreated {
         redemption_secret_hash: Vec<u8>,
         expires_at_ms: u64,
+    },
+    E2eAccountResetPrepared {
+        account_generation: u64,
+    },
+    E2eAccountReset {
+        account_id: AccountId,
+        device_id: DeviceId,
+        key_epoch: u64,
     },
     DeviceLinkBundle {
         enrollment_bundle: Vec<u8>,
@@ -965,20 +968,24 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("device enrollment bundle length is invalid".to_string());
             }
         }
-        ClientControl::CancelDeviceLink {
-            redemption_secret_hash,
-        } => {
-            if redemption_secret_hash.len() != 32 {
-                return Err("device-link secret hash has the wrong length".to_string());
+        ClientControl::FetchDeviceLink { redemption_secret } => {
+            validate_auth_field("device-link redemption secret", redemption_secret)?;
+            if redemption_secret.len() < MIN_PAIRING_SECRET_BYTES {
+                return Err("device-link redemption secret is too short".to_string());
             }
         }
-        ClientControl::FetchDeviceLink { redemption_secret }
-        | ClientControl::RedeemDeviceLink {
-            redemption_secret, ..
+        ClientControl::RedeemDeviceLink {
+            redemption_secret,
+            bearer_token,
+            ..
         } => {
             validate_auth_field("device-link redemption secret", redemption_secret)?;
             if redemption_secret.len() < MIN_PAIRING_SECRET_BYTES {
                 return Err("device-link redemption secret is too short".to_string());
+            }
+            validate_auth_field("device-link bearer token", bearer_token)?;
+            if !bearer_token.starts_with("tct2_") || bearer_token.len() < MIN_PAIRED_TOKEN_BYTES {
+                return Err("device-link bearer token is invalid".to_string());
             }
         }
         ClientControl::SendChat { body, envelope, .. }
@@ -1092,7 +1099,8 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("share extradata exceeds maximum length".to_string());
             }
         }
-        ClientControl::AppendAccountKeyStatement { statement } => {
+        ClientControl::AppendAccountKeyStatement { statement }
+        | ClientControl::ResetE2eAccount { genesis: statement } => {
             if statement.authority_signature.len() != 64
                 || statement
                     .co_signature
@@ -1112,11 +1120,6 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             }
             if signature.len() != 64 {
                 return Err("device binding signature has the wrong length".to_string());
-            }
-        }
-        ClientControl::PutE2eRecoveryBundle { bundle, .. } => {
-            if bundle.is_empty() || bundle.len() > 16 * 1024 {
-                return Err("recovery bundle length is invalid".to_string());
             }
         }
         ClientControl::PutE2eVerificationSync { envelope, .. } => {

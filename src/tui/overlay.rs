@@ -1715,18 +1715,26 @@ impl AppMode for DevicePairMode {
 
 pub(crate) struct DeviceLinkMode {
     dialog: DeviceLinkDialog,
+    now_ms: u64,
 }
 
 impl DeviceLinkMode {
     pub(crate) fn new(dialog: DeviceLinkDialog) -> Self {
-        Self { dialog }
+        Self { dialog, now_ms: 0 }
     }
 
     fn handle_button(&mut self, cx: &mut ViewCx<'_>, button: DeviceLinkButton) {
-        if let Some(value) = self.dialog.value(button) {
-            cx.queue_clipboard(value.to_string());
-        } else {
-            cx.request_transition(ModeTransition::Pop);
+        match button {
+            DeviceLinkButton::CopyTicket | DeviceLinkButton::CopyPassword => {
+                if let Some(value) = self.dialog.value(button) {
+                    cx.queue_clipboard(value.to_string());
+                }
+            }
+            DeviceLinkButton::GenerateNew => {
+                cx.send(CoreCommand::GenerateDeviceLink);
+                cx.request_transition(ModeTransition::Pop);
+            }
+            DeviceLinkButton::Close => cx.request_transition(ModeTransition::Pop),
         }
     }
 }
@@ -1736,7 +1744,7 @@ impl AppMode for DeviceLinkMode {
         &mut self,
         cx: &mut ViewCx<'_>,
         buf: &mut Buffer,
-        _now_ms: u64,
+        now_ms: u64,
         _dirty: DirtySections,
     ) {
         let mut app = crate::tui::render::RenderState::new(cx);
@@ -1751,7 +1759,8 @@ impl AppMode for DeviceLinkMode {
             &app.view.theme,
             "Device link created",
         );
-        self.dialog.render(body, buf, &app.view.theme);
+        self.now_ms = now_ms;
+        self.dialog.render(body, buf, &app.view.theme, now_ms);
         crate::tui::render::draw_overlay_key_preview(&mut app, bindings::FORM_LAYER, buf);
     }
 

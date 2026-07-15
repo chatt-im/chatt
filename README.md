@@ -364,8 +364,6 @@ token = "alice-dev-token"
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
 room-id = 1
-# Set only while enrolling a new installation into an existing E2E account:
-# e2e-recovery-code = "<64 hex digits from /devices recovery>"
 ```
 
 `active-server` selects one `[[servers]]` entry. `label` is the local name for
@@ -375,11 +373,16 @@ there is no separate user field. `username` is the name shown in chat.
 falls back to the compiled development server key.
 
 Each installation creates independent DM signing and delivery keys in an
-owner-only local identity store. Use `/devices recovery` on an authorized
-installation to display the high-entropy enrollment code, set
-`e2e-recovery-code` on the new installation for its first connection, then
-clear the config field. `/devices` lists authorized device ids and
-`/devices revoke <device-id>` publishes a terminal signed revocation.
+owner-only local identity store. Run `/devices link` on an authorized
+installation, then enter the displayed one-time pairing string and transfer
+password through `/device-pair` on the new installation. Starting another
+`/devices link` replaces the previous outstanding link; closing the dialog
+leaves it usable until its displayed expiry. `/devices` lists authorized
+device ids and `/devices revoke <device-id>` publishes a terminal signed
+revocation after an explicit confirmation. If the local identity cannot be
+recovered or re-linked, `/devices reset` explains the destructive fallback;
+`/devices reset CONFIRM` creates a new account generation, signs out every
+other device, and archives the previous local identity file.
 
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.
