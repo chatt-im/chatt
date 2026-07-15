@@ -95,6 +95,18 @@ const MAX_PENDING_MLS_FILE_ITEMS: usize = 1024;
 const MAX_PENDING_MLS_FILE_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_MLS_FILE_GLOBAL_ITEMS: usize = 8192;
 const MLS_KEY_PACKAGE_TARGET: u16 = 16;
+
+pub(super) fn mls_installation_dir(
+    data_dir: &Path,
+    server_public_key: &[u8; 32],
+    user_id: UserId,
+) -> PathBuf {
+    data_dir
+        .join("mls")
+        .join(encode_hex(server_public_key))
+        .join(format!("{:016x}", user_id.0))
+}
+
 const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a direct path must stay healthy before the client stops relaying
 /// voice through the server.
@@ -1104,7 +1116,7 @@ fn device_pair_once(
         ));
     }
     let rng = ring::rand::SystemRandom::new();
-    let mls_dir = data_dir.join("mls");
+    let mls_dir = mls_installation_dir(data_dir, &trusted, user_id);
     let bootstrap_path = mls_dir.join("mls-bootstrap.bin");
     let attempt_id = rpc::ids::PairAttemptId(
         secret_hash[..16]
@@ -3941,15 +3953,17 @@ impl WorkerState {
                     let end = before
                         .and_then(|before| {
                             history.iter().position(|event| {
-                                mls_message_id(event.event_id) == before
+                                mls_message_id(event.sequence) == before
                             })
                         })
                         .unwrap_or(history.len());
                     let start = end.saturating_sub(usize::from(limit));
                     let selected = history[start..end].to_vec();
                     let mut messages = Vec::with_capacity(selected.len());
-                    for event in selected {
-                        messages.push(self.mls_chatt_event_to_chat(event)?);
+                    for cached in selected {
+                        messages.push(
+                            self.mls_chatt_event_to_chat(cached.event, cached.sequence)?,
+                        );
                     }
                     let _ = self.events.send(NetworkEvent::HistoryChunk {
                         room_id,
@@ -6244,7 +6258,11 @@ impl WorkerState {
                             .as_deref()
                             .ok_or_else(|| "MLS requires a persistent client data directory".to_string())?;
                         let (installation, created) = LocalInstallation::open_or_create(
-                            &data_dir.join("mls"),
+                            &mls_installation_dir(
+                                data_dir,
+                                &self.server_public_key,
+                                local_user,
+                            ),
                             self.server_public_key,
                             local_user,
                             DEFAULT_INITIAL_DEVICE_NAME,
@@ -6548,11 +6566,11 @@ impl WorkerState {
                         })?
                     {
                         chatt_mls::ProcessedDelivery::Application(cached) => {
-                            opened.push(cached.event);
+                            opened.push((cached.sequence, cached.event));
                         }
-                        chatt_mls::ProcessedDelivery::Outgoing { event, .. } => {
+                        chatt_mls::ProcessedDelivery::Outgoing { sequence, event } => {
                             if let Some(event) = event {
-                                opened.push(event);
+                                opened.push((sequence, event));
                             }
                         }
                         chatt_mls::ProcessedDelivery::Commit { .. } => saw_commit = true,
@@ -6564,8 +6582,8 @@ impl WorkerState {
                 } else {
                     None
                 };
-                for event in opened {
-                    self.emit_mls_chatt_event(event)?;
+                for (sequence, event) in opened {
+                    self.emit_mls_chatt_event(event, sequence)?;
                 }
                 if saw_commit && self.mls_bound {
                     self.queue_mls_maintenance()?;
@@ -6599,7 +6617,7 @@ impl WorkerState {
                             .client
                             .mark_outgoing_delivered(room_id, event_id, sequence)?;
                         if should_emit {
-                            self.emit_mls_chatt_event(entry.event)?;
+                            self.emit_mls_chatt_event(entry.event, sequence)?;
                         }
                     }
                     rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { .. } => {
@@ -6927,7 +6945,11 @@ impl WorkerState {
         if self.mls.is_none() {
             match self.config.data_dir.as_deref() {
                 Some(data_dir) => {
-                    let mls_dir = data_dir.join("mls");
+                    let mls_dir = mls_installation_dir(
+                        data_dir,
+                        &self.server_public_key,
+                        user_id,
+                    );
                     match chatt_mls::load_bootstrap(&mls_dir.join("mls-bootstrap.bin")) {
                         chatt_mls::BootstrapLoad::Missing => {
                             // Creation is deferred until the server proves this
@@ -7119,7 +7141,11 @@ impl WorkerState {
         })
     }
 
-    fn emit_mls_chatt_event(&mut self, event: rpc::mls::MlsChattEvent) -> Result<(), String> {
+    fn emit_mls_chatt_event(
+        &mut self,
+        event: rpc::mls::MlsChattEvent,
+        sequence: u64,
+    ) -> Result<(), String> {
         if let rpc::mls::ChattEventContent::File(file) = &event.content {
             self.mls_file_announcements.insert(
                 event.event_id,
@@ -7132,7 +7158,7 @@ impl WorkerState {
             );
             self.drain_pending_mls_file_offers(event.room_id)?;
         }
-        let message = self.mls_chatt_event_to_chat(event)?;
+        let message = self.mls_chatt_event_to_chat(event, sequence)?;
         let _ = self.events.send(NetworkEvent::Chat(message));
         Ok(())
     }
@@ -7140,6 +7166,7 @@ impl WorkerState {
     fn mls_chatt_event_to_chat(
         &self,
         event: rpc::mls::MlsChattEvent,
+        sequence: u64,
     ) -> Result<AuthenticatedChat, String> {
         let installation = self
             .mls
@@ -7178,7 +7205,7 @@ impl WorkerState {
             ),
         };
         let message = ChatMessage {
-            message_id: mls_message_id(event.event_id),
+            message_id: mls_message_id(sequence),
             room_id: event.room_id,
             sender,
             sender_name,
@@ -9044,10 +9071,8 @@ fn random_event_id() -> Result<rpc::ids::EventId, String> {
     Ok(rpc::ids::EventId(bytes))
 }
 
-fn mls_message_id(event_id: rpc::ids::EventId) -> MessageId {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&event_id.0[..8]);
-    MessageId(u64::from_be_bytes(bytes) | (1 << 63))
+fn mls_message_id(sequence: u64) -> MessageId {
+    MessageId(sequence | (1 << 63))
 }
 
 /// Records an outstanding RTT probe, evicting the oldest entry once the queue
@@ -11069,6 +11094,15 @@ mod tests {
 
         let _file = open_upload_source(&path, false).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn mls_message_ids_follow_delivery_sequence() {
+        let first = mls_message_id(2);
+        let second = mls_message_id(3);
+        assert!(first < second);
+        assert_eq!(first.0, (1 << 63) | 2);
+        assert_eq!(second.0, (1 << 63) | 3);
     }
 
     fn feedback_window(

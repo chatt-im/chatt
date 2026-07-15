@@ -73,6 +73,9 @@ avx2 = ["opus-codec/presume-avx2", "nnnoiseless/presume-avx2"]
 # committed `web/embedded` bundle and its asset resolver. Refresh them
 # deliberately with `cd web && bun run build:embedded` when shipping web changes.
 embed-web = []
+# Propagate kvlog spans through all threads spawned by the exhaustive MLS
+# matrix. This is test-only because `std::thread::add_spawn_hook` is nightly.
+nightly-test-spans = []
 
 [dev-dependencies]
 portable-pty = "0.9"

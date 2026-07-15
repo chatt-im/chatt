@@ -29,11 +29,16 @@ env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
 sh = '''
+RUNTIME_CONFIG=/tmp/chatt-dev/config/alice.toml
+if [ ! -e "$RUNTIME_CONFIG" ]; then
+  mkdir -p "$(dirname "$RUNTIME_CONFIG")"
+  cp dev/chatt-alice.toml "$RUNTIME_CONFIG"
+fi
 if [ "$#" -gt 0 ]; then
-  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-alice.toml "$@"
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" "$@"
 else
   rm -f /tmp/chatt-alice.kvlog
-  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice.kvlog
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" --logfile /tmp/chatt-alice.kvlog
 fi
 '''
 info = "Run the Alice client; trailing args run a chatt subcommand against it"
@@ -51,11 +56,16 @@ env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
 sh = '''
+RUNTIME_CONFIG=/tmp/chatt-dev/config/alice.toml
+if [ ! -e "$RUNTIME_CONFIG" ]; then
+  mkdir -p "$(dirname "$RUNTIME_CONFIG")"
+  cp dev/chatt-alice.toml "$RUNTIME_CONFIG"
+fi
 if [ "$#" -gt 0 ]; then
-  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-alice.toml "$@"
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" "$@"
 else
   rm -f /tmp/chatt-alice-2.kvlog
-  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice-2.kvlog
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" --logfile /tmp/chatt-alice-2.kvlog
 fi
 '''
 info = "Run the Alice client; trailing args run a chatt subcommand against it"
@@ -72,11 +82,16 @@ env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
 env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-bob-playback.wav", or_else = "" }
 sh = '''
+RUNTIME_CONFIG=/tmp/chatt-dev/config/bob.toml
+if [ ! -e "$RUNTIME_CONFIG" ]; then
+  mkdir -p "$(dirname "$RUNTIME_CONFIG")"
+  cp dev/chatt-bob.toml "$RUNTIME_CONFIG"
+fi
 if [ "$#" -gt 0 ]; then
-  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-bob.toml "$@"
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" "$@"
 else
   rm -f /tmp/chatt-bob.kvlog
-  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-bob.toml --logfile /tmp/chatt-bob.kvlog
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" --logfile /tmp/chatt-bob.kvlog
 fi
 '''
 info = "Run the Bob client; trailing args run a chatt subcommand against it"
@@ -93,11 +108,16 @@ env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
 env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-soundboard-playback.wav", or_else = "" }
 sh = '''
+RUNTIME_CONFIG=/tmp/chatt-dev/config/soundboard.toml
+if [ ! -e "$RUNTIME_CONFIG" ]; then
+  mkdir -p "$(dirname "$RUNTIME_CONFIG")"
+  cp dev/chatt-soundboard.toml "$RUNTIME_CONFIG"
+fi
 if [ "$#" -gt 0 ]; then
-  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-soundboard.toml "$@"
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" "$@"
 else
   rm -f /tmp/chatt-soundboard.kvlog
-  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-soundboard.toml --logfile /tmp/chatt-soundboard.kvlog
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" --logfile /tmp/chatt-soundboard.kvlog
 fi
 '''
 info = "Run the Carol prerecorded-audio soundboard client; trailing args run a chatt subcommand against it"
@@ -112,10 +132,7 @@ sh = '''
 set -eu
 
 git restore --source=HEAD -- \
-  'dev/*-server-data/users.toml' \
-  dev/chatt-alice.toml \
-  dev/chatt-bob.toml \
-  dev/chatt-soundboard.toml
+  'dev/*-server-data/users.toml'
 for data_dir in dev/*-server-data; do
   find "$data_dir" -depth -mindepth 1 ! -path "$data_dir/users.toml" -delete
 done

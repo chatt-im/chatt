@@ -6,21 +6,6 @@ server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
 udp-addr = "127.0.0.1:41000"
 
-[[servers.e2e-peer-pins]]
-room-id = 2147483648
-user-id = 2
-username = "Bob"
-public-key = "86121986ea08d629ddeb6f70f4f1cdf9cd4016c506ff0d27fb617e985c277bbd"
-trust-level = "accepted"
-change-from = "accepted"
-
-[[servers.e2e-peer-pins.previous]]
-room-id = 2147483648
-user-id = 2
-username = "Bob"
-public-key = "8459743cea8cefff2d2f43457ef1d1ead25e48d50a100cce63359c325122ca97"
-trust-level = "accepted"
-
 [ui]
 room-height = 4
 max-composer-height = 6

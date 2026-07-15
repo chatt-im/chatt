@@ -43,6 +43,78 @@ const BOB_TOKEN: &str = "mls-matrix-bob";
 const CAROL_TOKEN: &str = "mls-matrix-carol";
 const PUBLIC_ROOM: RoomId = RoomId(1);
 const GROUP_ROOM: RoomId = RoomId(2);
+const LINKED_MATRIX_LOG: &str = "/tmp/chatt-e2e-matrix.kvlog";
+
+#[cfg(feature = "nightly-test-spans")]
+fn init_linked_matrix_logging() -> kvlog::collector::LoggerGuard {
+    match std::fs::remove_file(LINKED_MATRIX_LOG) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove previous MLS matrix log: {error}"),
+    }
+    std::thread::add_spawn_hook(|_| {
+        let parent = kvlog::SpanID::current();
+        move || {
+            if let Some(parent) = parent {
+                kvlog::set_global_span_id(parent);
+            }
+        }
+    });
+    kvlog::collector::init_file_logger(LINKED_MATRIX_LOG)
+}
+
+#[cfg(not(feature = "nightly-test-spans"))]
+fn init_linked_matrix_logging() {
+    panic!(
+        "the exhaustive MLS matrix requires nightly-test-spans; run it alone with a nightly toolchain"
+    );
+}
+
+#[cfg(feature = "nightly-test-spans")]
+struct LinkedMatrixSpan {
+    id: kvlog::SpanID,
+    _entered: kvlog::EnteredSpan,
+}
+
+#[cfg(feature = "nightly-test-spans")]
+impl LinkedMatrixSpan {
+    fn enter(case: LinkedMatrixCase) -> Self {
+        let raw_id = if case.bits == 0 {
+            1_u64 << LINKED_MATRIX_BITS
+        } else {
+            u64::from(case.bits)
+        };
+        let id = kvlog::SpanID::from(std::num::NonZeroU64::new(raw_id).unwrap());
+        let entered = id.enter();
+        kvlog::info!(
+            "MLS linked-device matrix case started",
+            matrix_case = case.bits,
+            matrix_span = id.as_u64()
+        );
+        Self {
+            id,
+            _entered: entered,
+        }
+    }
+
+    fn id(&self) -> u64 {
+        self.id.as_u64()
+    }
+}
+
+#[cfg(not(feature = "nightly-test-spans"))]
+struct LinkedMatrixSpan;
+
+#[cfg(not(feature = "nightly-test-spans"))]
+impl LinkedMatrixSpan {
+    fn enter(_case: LinkedMatrixCase) -> Self {
+        Self
+    }
+
+    fn id(&self) -> u64 {
+        0
+    }
+}
 
 struct Addrs {
     tcp: String,
@@ -845,8 +917,10 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
 }
 
 #[test]
+#[ignore = "exhaustive MLS matrix; run alone with nightly-test-spans"]
 fn mls_live_linked_device_pairwise_matrix() {
     let _guard = live_mls_e2e_guard();
+    let _logger = init_linked_matrix_logging();
     let cases = linked_matrix_cases();
     if cases.len() > 1 {
         assert_eq!(cases.len(), 48);
@@ -863,6 +937,7 @@ fn mls_live_linked_device_pairwise_matrix() {
                     if failure.lock().unwrap().is_some() {
                         return;
                     }
+                    let span = LinkedMatrixSpan::enter(case);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         run_linked_matrix_case(case)
                     }));
@@ -873,8 +948,9 @@ fn mls_live_linked_device_pairwise_matrix() {
                             .or_else(|| payload.downcast_ref::<&str>().copied())
                             .unwrap_or("non-string panic");
                         *failure.lock().unwrap() = Some(format!(
-                            "MLS linked-device matrix case {:#06x} failed ({case:?}): {message}",
-                            case.bits
+                            "MLS linked-device matrix case {:#06x} failed ({case:?}): {message}; kvlog span {:#x} in {LINKED_MATRIX_LOG}",
+                            case.bits,
+                            span.id()
                         ));
                         return;
                     }
@@ -1212,6 +1288,27 @@ fn mls_live_server_restart_preserves_room_and_bidirectional_delivery() {
 }
 
 #[test]
+fn mls_live_shared_client_data_root_separates_accounts() {
+    let _guard = live_mls_e2e_guard();
+    let root = temp_dir("shared-client-root");
+    std::fs::create_dir_all(root.join("server")).unwrap();
+    let addrs = start_server(&root);
+    let shared = root.join("shared-client-state");
+    let mut alice_config = config(&addrs, &root, "shared-Alice", ALICE_TOKEN, false);
+    alice_config.data_dir = Some(shared.clone());
+    let mut bob_config = config(&addrs, &root, "shared-Bob", BOB_TOKEN, false);
+    bob_config.data_dir = Some(shared);
+    let alice = spawn(alice_config);
+    let bob = spawn(bob_config);
+    wait_authenticated(&alice, "shared root Alice");
+    wait_authenticated(&bob, "shared root Bob");
+    let room_id = open_dm(&alice);
+    wait_room_upsert(&bob, room_id, "shared root Bob room");
+    send_until_received(&alice, &bob, room_id, "shared root account isolation");
+    send_until_received(&bob, &alice, room_id, "shared root reverse isolation");
+}
+
+#[test]
 fn mls_live_pair_response_loss_reconciles_exact_device() {
     let _guard = live_mls_e2e_guard();
     let root = temp_dir("pair-response-loss");
@@ -1332,7 +1429,11 @@ fn mls_live_missing_and_corrupt_state_remain_public_only() {
         let alice = spawn(alice_config.clone());
         wait_authenticated(&alice, &format!("state {label} Alice initial"));
         drop(alice);
-        let mls_dir = alice_config.data_dir.as_ref().unwrap().join("mls");
+        let mls_dir = crate::client_net::mls_installation_dir(
+            alice_config.data_dir.as_ref().unwrap(),
+            &rpc::crypto::dev_server_public_key(),
+            UserId(1),
+        );
         let database = mls_dir.join("mls.db");
         let corrupt_bytes = b"deliberately corrupt SQLCipher database";
         if corrupt_database {

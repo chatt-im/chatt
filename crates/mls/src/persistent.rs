@@ -101,6 +101,12 @@ pub struct CachedIncomingEvent {
     pub event: MlsChattEvent,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedApplicationEvent {
+    pub sequence: u64,
+    pub event: MlsChattEvent,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub struct OutboxEntry {
@@ -837,7 +843,7 @@ impl PersistentClient {
 
     /// Normalized local plaintext history. Incoming and outgoing records share
     /// the same event-id namespace and are merged idempotently.
-    pub fn cached_history(&self, room_id: RoomId) -> Result<Vec<MlsChattEvent>, String> {
+    pub fn cached_history(&self, room_id: RoomId) -> Result<Vec<CachedApplicationEvent>, String> {
         let mut events = HashMap::new();
         for item in self
             .application
@@ -846,7 +852,13 @@ impl PersistentClient {
         {
             let cached: CachedIncomingEvent =
                 jsony::from_binary(item.value()).map_err(|error| error.to_string())?;
-            events.insert(cached.event.event_id, cached.event);
+            events.insert(
+                cached.event.event_id,
+                CachedApplicationEvent {
+                    sequence: cached.sequence,
+                    event: cached.event,
+                },
+            );
         }
         for item in self
             .application
@@ -855,12 +867,17 @@ impl PersistentClient {
         {
             let outgoing: OutboxEntry =
                 jsony::from_binary(item.value()).map_err(|error| error.to_string())?;
-            events
-                .entry(outgoing.event.event_id)
-                .or_insert(outgoing.event);
+            if let OutboxState::Delivered { sequence } = outgoing.state {
+                events
+                    .entry(outgoing.event.event_id)
+                    .or_insert(CachedApplicationEvent {
+                        sequence,
+                        event: outgoing.event,
+                    });
+            }
         }
         let mut events = events.into_values().collect::<Vec<_>>();
-        events.sort_by_key(|event| (event.timestamp_ms, event.event_id.0));
+        events.sort_by_key(|event| event.sequence);
         Ok(events)
     }
 
@@ -1200,6 +1217,9 @@ mod tests {
                 .unwrap(),
             ProcessedDelivery::AlreadyProcessed { sequence: 2 }
         ));
-        assert_eq!(bob.client.cached_history(descriptor.room_id).unwrap().len(), 1);
+        let history = bob.client.cached_history(descriptor.room_id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].sequence, 2);
+        assert_eq!(history[0].event, event);
     }
 }
