@@ -74,6 +74,20 @@ impl VerificationSyncStore {
         Ok(())
     }
 
+    pub(crate) fn clear(&mut self, user_id: UserId) -> Result<(), String> {
+        if let Some(path) = self.path(user_id) {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("failed to remove {}: {error}", path.display()));
+                }
+            }
+        }
+        self.snapshots.remove(&user_id);
+        Ok(())
+    }
+
     fn path(&self, user_id: UserId) -> Option<PathBuf> {
         self.dir
             .as_ref()

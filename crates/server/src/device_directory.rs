@@ -35,8 +35,6 @@ struct AccountEntry {
     user_id: u64,
     statements: Vec<String>,
     #[toml(default)]
-    recovery_bundle: String,
-    #[toml(default)]
     credentials: Vec<DeviceCredentialEntry>,
 }
 
@@ -65,6 +63,15 @@ pub enum DirectoryAppend {
         head: LedgerHash,
         revoked_credentials: Vec<String>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryReset {
+    pub roster_epoch: u64,
+    pub head: LedgerHash,
+    pub account_id: rpc::ids::AccountId,
+    pub device_id: DeviceId,
+    pub revoked_credentials: Vec<String>,
 }
 
 impl DeviceDirectory {
@@ -195,7 +202,6 @@ impl DeviceDirectory {
             None => accounts.push(AccountEntry {
                 user_id: user_id.0,
                 statements: encoded,
-                recovery_bundle: String::new(),
                 credentials: Vec::new(),
             }),
         }
@@ -316,12 +322,29 @@ impl DeviceDirectory {
         password_epoch: u32,
     ) -> Result<(u64, LedgerHash), String> {
         let mut accounts = self.accounts.clone();
-        if accounts.iter().any(|account| {
+        if let Some(account) = accounts.iter().find(|account| {
             account
                 .credentials
                 .iter()
                 .any(|credential| credential.token_hash == token_hash)
         }) {
+            let credential = account
+                .credentials
+                .iter()
+                .find(|credential| credential.token_hash == token_hash)
+                .expect("found above");
+            let statements = Self::decode_statements(account)?;
+            if account.user_id == user_id.0
+                && credential.device_id == encode_hex(&device_id.0)
+                && statements.last() == Some(&statement)
+            {
+                let validated = ValidatedAccountLedger::validate(
+                    &self.server_public_key,
+                    user_id,
+                    &statements,
+                )?;
+                return Ok((validated.roster_epoch, validated.head));
+            }
             return Err("device bearer token is already registered".to_string());
         }
         let linked_device = match &statement.body.action {
@@ -371,6 +394,91 @@ impl DeviceDirectory {
         Ok((validated.roster_epoch, validated.head))
     }
 
+    pub fn reset_account(
+        &mut self,
+        user_id: UserId,
+        genesis: AccountKeyStatement,
+        credential_hash: &str,
+    ) -> Result<DirectoryReset, String> {
+        let mut accounts = self.accounts.clone();
+        let account = accounts
+            .iter_mut()
+            .find(|account| account.user_id == user_id.0)
+            .ok_or_else(|| "account has no device directory entry".to_string())?;
+        let current_statements = Self::decode_statements(account)?;
+        let current = ValidatedAccountLedger::validate(
+            &self.server_public_key,
+            user_id,
+            &current_statements,
+        )?;
+        let replacement = ValidatedAccountLedger::validate(
+            &self.server_public_key,
+            user_id,
+            std::slice::from_ref(&genesis),
+        )?;
+        let device_id = replacement
+            .active_devices()
+            .next()
+            .ok_or_else(|| "replacement account has no active device".to_string())?
+            .device_id;
+
+        let idempotent = current_statements.as_slice() == std::slice::from_ref(&genesis);
+        if !idempotent {
+            let next_generation = current
+                .account_generation
+                .checked_add(1)
+                .ok_or_else(|| "account generation is exhausted".to_string())?;
+            if replacement.account_generation != next_generation {
+                return Err(
+                    "replacement account generation is not the next generation".to_string(),
+                );
+            }
+        }
+        let credential = account
+            .credentials
+            .iter()
+            .find(|credential| credential.token_hash == credential_hash)
+            .ok_or_else(|| "reset credential is no longer registered".to_string())?;
+        if !idempotent {
+            let credential_device = decode_device_id(&credential.device_id)
+                .ok_or_else(|| "reset credential is not bound to a device".to_string())?;
+            if current
+                .active_devices()
+                .all(|device| device.device_id != credential_device)
+            {
+                return Err("reset credential is not bound to an active device".to_string());
+            }
+        }
+        if idempotent && credential.device_id != encode_hex(&device_id.0) {
+            return Err("replacement account credential is not bound to its genesis device"
+                .to_string());
+        }
+
+        let mut revoked_credentials = Vec::new();
+        account.credentials.retain(|credential| {
+            let keep = credential.token_hash == credential_hash;
+            if !keep {
+                revoked_credentials.push(credential.token_hash.clone());
+            }
+            keep
+        });
+        let credential = account
+            .credentials
+            .first_mut()
+            .ok_or_else(|| "reset credential disappeared".to_string())?;
+        credential.device_id = encode_hex(&device_id.0);
+        account.statements = vec![encode_hex(&jsony::to_binary(&genesis))];
+        self.save_state(&accounts)?;
+        self.accounts = accounts;
+        Ok(DirectoryReset {
+            roster_epoch: replacement.roster_epoch,
+            head: replacement.head,
+            account_id: replacement.account_id,
+            device_id,
+            revoked_credentials,
+        })
+    }
+
     pub fn active_device_signing_key(
         &self,
         user_id: UserId,
@@ -397,45 +505,6 @@ impl DeviceDirectory {
             .try_into()
             .map_err(|_| "validated device signing key has the wrong length".to_string())?;
         Ok(Some(key))
-    }
-
-    pub fn put_recovery_bundle(
-        &mut self,
-        user_id: UserId,
-        expected_head: LedgerHash,
-        bundle: &[u8],
-    ) -> Result<(), String> {
-        let ledger = self
-            .validated(user_id)?
-            .ok_or_else(|| "account has no device ledger".to_string())?;
-        if ledger.head != expected_head {
-            return Err("recovery bundle ledger head is stale".to_string());
-        }
-        let digest = ring::digest::digest(&ring::digest::SHA256, bundle);
-        if ledger.recovery_bundle_hash.as_slice() != digest.as_ref() {
-            return Err("recovery bundle does not match the signed ledger hash".to_string());
-        }
-        let mut accounts = self.accounts.clone();
-        let entry = accounts
-            .iter_mut()
-            .find(|entry| entry.user_id == user_id.0)
-            .ok_or_else(|| "account device ledger disappeared".to_string())?;
-        entry.recovery_bundle = encode_hex(bundle);
-        self.save_state(&accounts)?;
-        self.accounts = accounts;
-        Ok(())
-    }
-
-    pub fn recovery_bundle(&self, user_id: UserId) -> Result<Option<Vec<u8>>, String> {
-        let Some(entry) = self.entry(user_id) else {
-            return Ok(None);
-        };
-        if entry.recovery_bundle.is_empty() {
-            return Ok(None);
-        }
-        decode_hex(&entry.recovery_bundle)
-            .map(Some)
-            .map_err(|_| "stored recovery bundle is invalid hex".to_string())
     }
 
     fn entry(&self, user_id: UserId) -> Option<&AccountEntry> {
@@ -473,11 +542,6 @@ impl DeviceDirectory {
                     &statements,
                 )
                 .map_err(|error| format!("{source}: user {}: {error}", entry.user_id))?;
-            }
-            if !entry.recovery_bundle.is_empty() {
-                decode_hex(&entry.recovery_bundle).map_err(|_| {
-                    format!("{source}: user {} recovery bundle is invalid hex", entry.user_id)
-                })?;
             }
             for credential in &entry.credentials {
                 if credential.token_hash.trim().is_empty() {
@@ -527,12 +591,6 @@ impl DeviceDirectory {
                 out.push_str(&format!("  \"{statement}\",\n"));
             }
             out.push_str("]\n");
-            if !account.recovery_bundle.is_empty() {
-                out.push_str(&format!(
-                    "recovery-bundle = \"{}\"\n",
-                    account.recovery_bundle
-                ));
-            }
             for credential in &account.credentials {
                 out.push_str("[[accounts.credentials]]\n");
                 out.push_str(&format!("token-hash = \"{}\"\n", credential.token_hash));
@@ -569,7 +627,6 @@ fn account_mut_or_insert(accounts: &mut Vec<AccountEntry>, user_id: UserId) -> &
     accounts.push(AccountEntry {
         user_id: user_id.0,
         statements: Vec::new(),
-        recovery_bundle: String::new(),
         credentials: Vec::new(),
     });
     accounts.last_mut().unwrap()

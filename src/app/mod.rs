@@ -1738,6 +1738,9 @@ impl App {
                 device_name,
                 overwrite_existing,
             ),
+            CoreCommand::GenerateDeviceLink => {
+                self.send_network_command(NetworkCommand::CreateDeviceLink, true);
+            }
             CoreCommand::CancelPairing => self.cancel_open_pairing(),
             CoreCommand::AudioManualReset => self.audio_manual_reset(),
             CoreCommand::ReportBug(description) => self.start_bug_report(description),
@@ -4278,11 +4281,6 @@ impl App {
                     ));
                 }
             }
-            NetworkEvent::E2eRecoveryCode { code } => {
-                self.set_error(format!(
-                    "Store this E2E recovery code securely; it can authorize another device: {code}"
-                ));
-            }
             NetworkEvent::E2eAccountIdentity { account_id } => {
                 self.e2e_account_id = Some(account_id);
             }
@@ -4959,20 +4957,6 @@ impl App {
                 ));
             }
             NetworkEvent::LocalIdentityUnavailable { message } => {
-                self.room.network_disconnected = true;
-                self.room.udp_unreachable = false;
-                self.stop_audio();
-                self.stop_all_shares();
-                self.reset_room_for_disconnect();
-                // This is a persistent local-state failure, not a transient
-                // network outage. Remove the finished worker so supervision
-                // cannot turn it into another automatic reconnect loop.
-                self.active_network_generation = None;
-                self.connection_attempt = None;
-                if let Some(network) = self.network.take() {
-                    network.stop();
-                }
-                self.supervisor.network.reset();
                 self.push_network_notice("e2e", &message);
                 self.set_error(message);
             }
@@ -7201,21 +7185,39 @@ impl App {
                 self.send_network_command(NetworkCommand::CreateDeviceLink, true);
             }
             "/devices recovery" => {
-                self.send_network_command(NetworkCommand::ShowE2eRecoveryCode, true);
+                self.set_error(
+                    "offline recovery codes are not supported; use /devices link from an active device"
+                        .to_string(),
+                );
+            }
+            "/devices reset" => {
+                self.set_error(
+                    "This permanently replaces the encrypted account identity, signs out every other device, and makes old DMs unavailable. Run /devices reset CONFIRM to continue."
+                        .to_string(),
+                );
+            }
+            "/devices reset CONFIRM" => {
+                self.send_network_command(NetworkCommand::ResetE2eAccount, true);
             }
             command if command.starts_with("/devices revoke ") => {
-                let encoded = command.trim_start_matches("/devices revoke ").trim();
+                let requested = command.trim_start_matches("/devices revoke ").trim();
+                let (encoded, confirmed) = requested
+                    .strip_suffix(" CONFIRM")
+                    .map_or((requested, false), |encoded| (encoded.trim(), true));
                 let device_id = rpc::crypto::decode_hex(encoded)
                     .ok()
                     .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
                     .map(rpc::ids::DeviceId);
                 match device_id {
-                    Some(device_id) => {
+                    Some(device_id) if confirmed => {
                         self.send_network_command(
                             NetworkCommand::RevokeE2eDevice { device_id },
                             true,
                         );
                     }
+                    Some(_) => self.set_error(format!(
+                        "Revoking device {encoded} permanently signs it out. Run /devices revoke {encoded} CONFIRM to continue."
+                    )),
                     None => self.set_error("device id must be exactly 16 bytes of hex"),
                 }
             }
@@ -8834,7 +8836,6 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::TransferEnded { .. } => "transfer_ended",
         NetworkEvent::TransferComplete { .. } => "transfer_complete",
         NetworkEvent::Presence { .. } => "presence",
-        NetworkEvent::E2eRecoveryCode { .. } => "e2e_recovery_code",
         NetworkEvent::E2eAccountIdentity { .. } => "e2e_account_identity",
         NetworkEvent::E2eDeviceBound { .. } => "e2e_device_bound",
         NetworkEvent::DeviceLinkCreated { .. } => "device_link_created",
@@ -8906,9 +8907,9 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::ForgetPeerIdentity { .. } => "forget_peer_identity",
         NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
         NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
-        NetworkCommand::ShowE2eRecoveryCode => "show_e2e_recovery_code",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
+        NetworkCommand::ResetE2eAccount => "reset_e2e_account",
         NetworkCommand::AcknowledgeSyncedVerificationNotice { .. } => {
             "acknowledge_synced_verification_notice"
         }
@@ -9963,7 +9964,7 @@ mod tests {
     }
 
     #[test]
-    fn local_identity_failure_disables_automatic_network_recovery() {
+    fn local_identity_failure_keeps_public_connection_available() {
         let mut app = test_app();
         let (tx, _rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
@@ -9974,8 +9975,8 @@ mod tests {
             message: message.clone(),
         });
 
-        assert!(app.network.is_none());
-        assert_eq!(app.active_network_generation, None);
+        assert!(app.network.is_some());
+        assert_eq!(app.active_network_generation, Some(7));
         assert!(!app.supervisor.network.is_pending());
         assert!(!app.supervise_network(Instant::now()));
         assert_eq!(app.last_network_notice.as_deref(), Some(message.as_str()));

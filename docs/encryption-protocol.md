@@ -61,14 +61,20 @@ useful as the code moves.
   plaintexts retain length padding; sealed file streams retain Padmé padding.
 
   A new account identity is stored in an owner-only, atomic local identity file
-  scoped by server public key and authenticated user id. The server stores only
-  an opaque recovery bundle whose SHA-256 is committed by the signed ledger.
-  `/devices recovery` displays the high-entropy recovery/link code. Supplying
-  that code as `[[servers]].e2e-recovery-code` on a new installation decrypts
-  the bundle locally, signs an `AddDevice` transition, and retains independent
-  device keys; neither code nor authority seed is sent to the server. `/devices`
-  lists device ids and states, and `/devices revoke <device-id-hex>` creates a
-  terminal signed revocation.
+  scoped by server public key and authenticated user id. `/devices link`
+  creates a short-lived one-time link and encrypted authority-transfer bundle;
+  `/device-pair` on the new installation opens it locally, signs an `AddDevice`
+  transition, and retains independent device keys. Each new link replaces the
+  prior outstanding link, while closing its dialog does not cancel it. The
+  server never receives the authority seed. `/devices` lists device ids and
+  states, and `/devices revoke <device-id-hex>` creates a terminal signed
+  revocation. Offline recovery codes are intentionally not supported. A
+  confirmed `/devices reset` is the destructive recovery boundary: the server
+  accepts it only from a still-registered bearer bound to an active device,
+  advances the account generation, rebinds that bearer to the replacement
+  genesis device, removes other credentials and outstanding links, and clears
+  verification sync. The client stages the replacement identity before the
+  request and archives the old file only after confirmation.
 
   `/identity` verification now compares the stable account id, so legitimate
   device addition or rotation does not change the human-verified fingerprint.

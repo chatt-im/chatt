@@ -33,6 +33,7 @@ use rpc::{
         ERROR_PAIRING_CODE_MISMATCH, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
         ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, FileContentEncoding, FileMetadata,
+        MessageFlags,
         MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey,
         P2pNatKind, P2pPeerInfo, P2pRole, ParticipantVoiceStatus, RoomInfo, RoomKind,
         ServerControl, UserSummary, DeviceLinkTicket, decode_server_control, decode_server_hello,
@@ -527,9 +528,9 @@ pub enum NetworkCommand {
     RevokeE2eDevice {
         device_id: DeviceId,
     },
-    ShowE2eRecoveryCode,
     ListE2eDevices,
     CreateDeviceLink,
+    ResetE2eAccount,
     AcknowledgeSyncedVerificationNotice {
         user_id: UserId,
         account_id: AccountId,
@@ -600,12 +601,6 @@ pub enum NetworkEvent {
     DmOpened {
         room_id: RoomId,
         peer: UserId,
-    },
-    /// Shown once when a new account identity is created. This high-entropy
-    /// code can enroll another installation without revealing the account
-    /// authority to the server.
-    E2eRecoveryCode {
-        code: String,
     },
     E2eAccountIdentity {
         account_id: AccountId,
@@ -800,9 +795,10 @@ pub enum NetworkEvent {
         code: u16,
         message: String,
     },
-    /// Durable local account/device state could not be loaded. Retrying the
-    /// same bytes cannot recover, so the worker stops until the user repairs or
-    /// replaces the file explicitly.
+    /// Durable local account/device state could not be loaded. The connection
+    /// remains available for public rooms, while DMs and device administration
+    /// are disabled until the identity is repaired or this installation is
+    /// linked again from an active device.
     LocalIdentityUnavailable {
         message: String,
     },
@@ -1081,22 +1077,41 @@ fn device_pair_once(
         });
     }
     let rng = ring::rand::SystemRandom::new();
-    let (identity, statement) = LocalE2eIdentity::prepare_linked_device(
+    let (identity, statement, bearer_token) = match LocalE2eIdentity::pending_linked_device(
         data_dir,
         &trusted,
         user_id,
-        device_name,
+        &secret_hash,
         &account_chain,
-        &enrollment,
-        overwrite_existing,
-        &rng,
-    )?;
+    )? {
+        Some(pending) => pending,
+        None => {
+            let (mut identity, statement) = LocalE2eIdentity::prepare_linked_device(
+                data_dir,
+                &trusted,
+                user_id,
+                device_name,
+                &account_chain,
+                &enrollment,
+                overwrite_existing,
+                &rng,
+            )?;
+            let mut bearer_secret = [0u8; KEY_LEN];
+            rng.fill(&mut bearer_secret).map_err(|_| {
+                DevicePairFailure::Other("failed to generate device bearer".to_string())
+            })?;
+            let bearer_token = format!("tct2_{}", encode_hex(&bearer_secret));
+            identity.stage_linked_device(&secret_hash, &bearer_token)?;
+            (identity, statement, bearer_token)
+        }
+    };
     write_blocking_control(
         &mut stream,
         &mut control,
         ClientControl::RedeemDeviceLink {
             redemption_secret: ticket.redemption_secret.clone(),
             statement,
+            bearer_token: bearer_token.clone(),
             receive_files: config.file_policy.receives_any(),
             file_receive_limit_bytes: config.file_policy.advertised_limit(),
         },
@@ -1122,6 +1137,11 @@ fn device_pair_once(
                             .to_string()
                             .into(),
                     );
+                }
+                if token != bearer_token {
+                    return Err("server confirmed a different device bearer token"
+                        .to_string()
+                        .into());
                 }
                 identity.commit_linked_device()?;
                 return Ok((
@@ -1466,6 +1486,7 @@ fn run_worker_inner(
         ),
         e2e_bound: false,
         pending_device_link: None,
+        pending_account_reset: None,
         verification_sync_fetching: false,
         verification_sync_put: None,
         verification_sync_retry_at: None,
@@ -1476,6 +1497,7 @@ fn run_worker_inner(
         disconnect_reason: None,
         auth_failure: None,
         local_identity_failure: None,
+        e2e_public_only: false,
     };
     worker.loop_work.queue_tcp_read();
 
@@ -2044,6 +2066,7 @@ struct WorkerState {
     e2e: E2eState,
     e2e_bound: bool,
     pending_device_link: Option<PendingCreatedDeviceLink>,
+    pending_account_reset: Option<LocalE2eIdentity>,
     verification_sync_fetching: bool,
     verification_sync_put: Option<PendingVerificationSyncPut>,
     verification_sync_retry_at: Option<Instant>,
@@ -2054,6 +2077,7 @@ struct WorkerState {
     disconnect_reason: Option<String>,
     auth_failure: Option<(u16, String)>,
     local_identity_failure: Option<String>,
+    e2e_public_only: bool,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -2099,6 +2123,18 @@ enum OpenChat {
     Ready(Option<MessageProvenance>),
     Deferred,
     Discarded,
+}
+
+/// Turns an unopenable encrypted record into inert display data. Clearing all
+/// semantic fields is important: a forged or corrupt outer record must never
+/// become an edit/delete, file announcement, or message reference merely
+/// because the client chose to keep a visible placeholder.
+fn sanitize_unavailable_message(message: &mut ChatMessage, body: &str) {
+    message.body = body.to_string();
+    message.file_transfer_id = None;
+    message.flags = MessageFlags::default();
+    message.target = None;
+    message.envelope = None;
 }
 
 impl DeferredE2eInbound {
@@ -3909,13 +3945,6 @@ impl WorkerState {
                 let statement = self.e2e.revoke_device_statement(device_id)?;
                 self.queue_control(ClientControl::AppendAccountKeyStatement { statement })?;
             }
-            NetworkCommand::ShowE2eRecoveryCode => {
-                let code = self
-                    .e2e
-                    .recovery_code()
-                    .ok_or_else(|| "local E2E recovery code is unavailable".to_string())?;
-                let _ = self.events.send(NetworkEvent::E2eRecoveryCode { code });
-            }
             NetworkCommand::ListE2eDevices => {
                 let devices = self.e2e.device_descriptions()?.join("; ");
                 let _ = self
@@ -3925,9 +3954,6 @@ impl WorkerState {
             NetworkCommand::CreateDeviceLink => {
                 if !self.e2e_bound {
                     return Err("the local E2E device is not bound yet; retry shortly".to_string());
-                }
-                if self.pending_device_link.is_some() {
-                    return Err("a device link is already being created".to_string());
                 }
                 let rng = ring::rand::SystemRandom::new();
                 let mut secret = [0u8; KEY_LEN];
@@ -3955,6 +3981,14 @@ impl WorkerState {
                     pairing_string,
                     transfer_password,
                 });
+            }
+            NetworkCommand::ResetE2eAccount => {
+                if let Some(identity) = self.pending_account_reset.as_ref() {
+                    let genesis = identity.reset_genesis();
+                    self.queue_control(ClientControl::ResetE2eAccount { genesis })?;
+                } else {
+                    self.queue_control(ClientControl::BeginE2eAccountReset)?;
+                }
             }
             NetworkCommand::SetP2pEnabled(enabled) => {
                 // P2P would bypass an outer secure link, so it stays off in
@@ -4969,6 +5003,16 @@ impl WorkerState {
     }
 
     fn handle_file_offered(&mut self, file: FileMetadata, contents: bool) -> Result<(), String> {
+        if self.e2e_public_only && self.e2e.requires_e2e(file.room_id) {
+            if contents {
+                self.skip_offered_download(&file);
+            }
+            let _ = self.events.send(NetworkEvent::Error(
+                "Encrypted file unavailable while this installation's identity is disabled."
+                    .to_string(),
+            ));
+            return Ok(());
+        }
         if !self.file_offer_ready(&file)? {
             if contents {
                 self.skip_offered_download(&file);
@@ -5020,6 +5064,9 @@ impl WorkerState {
                 }
                 Err(OpenFailure::Crypto) => {
                     return Err("DM transfer metadata failed authentication".to_string());
+                }
+                Err(OpenFailure::HistoryUnavailable { .. }) => {
+                    return Ok(false);
                 }
                 Err(OpenFailure::Replay) => {
                     return Err("DM transfer metadata was replayed".to_string());
@@ -6057,12 +6104,6 @@ impl WorkerState {
                         ledger_head,
                         signature,
                     })?;
-                    if let Some((ledger_head, bundle)) = self.e2e.recovery_bundle() {
-                        self.queue_control(ClientControl::PutE2eRecoveryBundle {
-                            ledger_head,
-                            bundle,
-                        })?;
-                    }
                 } else {
                     let outcome = match ledger {
                         Some(ledger) => self
@@ -6078,6 +6119,9 @@ impl WorkerState {
                 roster_epoch,
                 head,
             } => {
+                if self.e2e_public_only {
+                    return Ok(());
+                }
                 let local_user = self.user_id == Some(user_id);
                 if local_user {
                     self.e2e_bound = false;
@@ -6127,9 +6171,6 @@ impl WorkerState {
                 let _ = self
                     .events
                     .send(NetworkEvent::E2eDeviceBound { device_id });
-            }
-            ServerControl::E2eRecoveryBundle { .. } => {
-                return Err("server sent an unrequested recovery bundle".to_string());
             }
             ServerControl::E2eVerificationSync {
                 checkpoint,
@@ -6196,18 +6237,70 @@ impl WorkerState {
                 redemption_secret_hash,
                 expires_at_ms,
             } => {
-                let mut pending = self
-                    .pending_device_link
-                    .take()
-                    .ok_or_else(|| "server confirmed an unrequested device link".to_string())?;
+                let Some(pending) = self.pending_device_link.as_ref() else {
+                    return Ok(());
+                };
                 if pending.secret_hash != redemption_secret_hash {
-                    return Err("server confirmed the wrong device link".to_string());
+                    // A replacement request can overtake the prior response.
+                    // Its acknowledgement must not consume or fail the latest
+                    // request (and therefore must not disconnect the client).
+                    return Ok(());
                 }
+                let mut pending = self.pending_device_link.take().expect("checked above");
                 let _ = self.events.send(NetworkEvent::DeviceLinkCreated {
                     pairing_string: std::mem::take(&mut pending.pairing_string),
                     transfer_password: std::mem::take(&mut pending.transfer_password),
                     expires_at_ms,
                 });
+            }
+            ServerControl::E2eAccountResetPrepared { account_generation } => {
+                let user_id = self
+                    .user_id
+                    .ok_or_else(|| "account reset prepared before authentication".to_string())?;
+                let identity = self.e2e.prepare_account_reset(
+                    &self.server_public_key,
+                    user_id,
+                    DEFAULT_INITIAL_DEVICE_NAME,
+                    account_generation,
+                )?;
+                let genesis = identity.reset_genesis();
+                self.pending_account_reset = Some(identity);
+                self.queue_control(ClientControl::ResetE2eAccount { genesis })?;
+            }
+            ServerControl::E2eAccountReset {
+                account_id,
+                device_id,
+                key_epoch,
+            } => {
+                let identity = self
+                    .pending_account_reset
+                    .take()
+                    .ok_or_else(|| "server confirmed an unrequested account reset".to_string())?;
+                if identity.account_id() != account_id
+                    || identity.device_id() != device_id
+                    || identity.device_key_epoch() != key_epoch
+                {
+                    self.pending_account_reset = Some(identity);
+                    return Err("server confirmed the wrong replacement identity".to_string());
+                }
+                self.e2e.install_account_reset(identity)?;
+                self.e2e_public_only = false;
+                self.e2e_bound = false;
+                let session_id = self
+                    .session_id
+                    .ok_or_else(|| "account reset completed before session id".to_string())?;
+                let (device_id, key_epoch, ledger_head, signature) =
+                    self.e2e.device_binding(session_id)?;
+                self.queue_control(ClientControl::BindE2eDevice {
+                    device_id,
+                    key_epoch,
+                    ledger_head,
+                    signature,
+                })?;
+                let _ = self.events.send(NetworkEvent::E2eAccountIdentity { account_id });
+                let _ = self.events.send(NetworkEvent::Status(
+                    "encrypted account identity reset; other devices were signed out".to_string(),
+                ));
             }
             ServerControl::DeviceLinkRedeemed {
                 device_id,
@@ -6251,16 +6344,31 @@ impl WorkerState {
             room_count = rooms.len(),
             user_count = users.len()
         );
-        let local_device_is_new = match self.e2e.initialize_device(
-            &self.server_public_key,
-            user_id,
-            device_name,
-        ) {
-            Ok(created) => created,
-            Err(error) => {
-                self.local_identity_failure = Some(error);
-                self.shutdown = true;
-                return Ok(());
+        let staged_reset = self
+            .e2e
+            .pending_account_reset(&self.server_public_key, user_id)?;
+        let local_device_is_new = if let Some(identity) = staged_reset {
+            self.e2e.enter_public_only(user_id);
+            self.e2e_public_only = true;
+            self.pending_account_reset = Some(identity);
+            false
+        } else {
+            match self.e2e.initialize_device(
+                &self.server_public_key,
+                user_id,
+                device_name,
+            ) {
+                Ok(created) => created,
+                Err(error) => {
+                    self.e2e.enter_public_only(user_id);
+                    self.e2e_public_only = true;
+                    let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
+                        message: format!(
+                            "{error} Public rooms remain available, but encrypted DMs and device administration are disabled. Preserve the identity file; to recover this installation, move it aside and run /device-pair using a fresh link from another active device, or use /devices reset for a destructive new identity."
+                        ),
+                    });
+                    false
+                }
             }
         };
         self.e2e_bound = false;
@@ -6312,19 +6420,22 @@ impl WorkerState {
             let _ = self.events.send(NetworkEvent::Status(
                 "created a new encrypted account device identity".to_string(),
             ));
-            if let Some(code) = self.e2e.recovery_code() {
-                let _ = self.events.send(NetworkEvent::E2eRecoveryCode { code });
-            }
         }
-        let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
-            user_id,
-            after: self.e2e.account_chain_after(user_id),
-        });
-        for (user_id, _, _) in dm_peers {
+        if let Some(identity) = self.pending_account_reset.as_ref() {
+            self.queue_control(ClientControl::ResetE2eAccount {
+                genesis: identity.reset_genesis(),
+            })?;
+        } else if !self.e2e_public_only {
             let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
                 user_id,
                 after: self.e2e.account_chain_after(user_id),
             });
+            for (user_id, _, _) in dm_peers {
+                let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
+                    user_id,
+                    after: self.e2e.account_chain_after(user_id),
+                });
+            }
         }
         Ok(())
     }
@@ -6406,6 +6517,13 @@ impl WorkerState {
         message: &mut ChatMessage,
         live: bool,
     ) -> Result<OpenChat, String> {
+        if self.e2e_public_only && self.e2e.requires_e2e(message.room_id) {
+            sanitize_unavailable_message(
+                message,
+                "Encrypted message unavailable while this installation's identity is disabled.",
+            );
+            return Ok(OpenChat::Ready(None));
+        }
         let failure = match self
             .e2e
             .open_message_with_replay(message, &self.config.username, live)
@@ -6423,12 +6541,13 @@ impl WorkerState {
                 OpenFailure::AwaitingTrust => "awaiting trust",
                 OpenFailure::Policy => "policy",
                 OpenFailure::Crypto => "authentication",
+                OpenFailure::HistoryUnavailable { .. } => "not addressed to this device",
                 OpenFailure::Replay => "replay",
             }
         );
         match failure {
             OpenFailure::NoKeys | OpenFailure::AwaitingTrust => {
-                if failure == OpenFailure::NoKeys
+                if matches!(failure, OpenFailure::NoKeys)
                     && let Some(user_id) = self.e2e.dm_peer(message.room_id)
                 {
                     let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
@@ -6439,14 +6558,26 @@ impl WorkerState {
                 Ok(OpenChat::Deferred)
             }
             OpenFailure::Replay => Ok(OpenChat::Discarded),
-            OpenFailure::Policy => Err(format!(
-                "server sent a forbidden plaintext/envelope form for room {}",
-                message.room_id.0
-            )),
-            OpenFailure::Crypto => Err(format!(
-                "server sent an unauthentic DM envelope for room {}",
-                message.room_id.0
-            )),
+            OpenFailure::HistoryUnavailable {
+                created_at_ms,
+                sender_name,
+                peer_public_key,
+            } => {
+                message.timestamp_ms = created_at_ms;
+                message.sender_name = sender_name;
+                sanitize_unavailable_message(
+                    message,
+                    "Encrypted message unavailable on this device (sent before it was linked).",
+                );
+                Ok(OpenChat::Ready(Some(MessageProvenance { peer_public_key })))
+            }
+            OpenFailure::Policy | OpenFailure::Crypto => {
+                sanitize_unavailable_message(
+                    message,
+                    "Encrypted message unavailable (failed authentication).",
+                );
+                Ok(OpenChat::Ready(None))
+            }
         }
     }
 
@@ -7886,9 +8017,9 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::ForgetPeerIdentity { .. } => "forget_peer_identity",
         NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
         NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
-        NetworkCommand::ShowE2eRecoveryCode => "show_e2e_recovery_code",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
+        NetworkCommand::ResetE2eAccount => "reset_e2e_account",
         NetworkCommand::AcknowledgeSyncedVerificationNotice { .. } => {
             "acknowledge_synced_verification_notice"
         }
@@ -8025,7 +8156,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::AccountKeyChain { .. } => "account_key_chain",
         ServerControl::AccountKeyHeadChanged { .. } => "account_key_head_changed",
         ServerControl::E2eDeviceBound { .. } => "e2e_device_bound",
-        ServerControl::E2eRecoveryBundle { .. } => "e2e_recovery_bundle",
         ServerControl::E2eVerificationSync { .. } => "e2e_verification_sync",
         ServerControl::E2eVerificationSyncChanged { .. } => "e2e_verification_sync_changed",
         ServerControl::E2eVerificationSyncConflict { .. } => "e2e_verification_sync_conflict",
@@ -8033,6 +8163,8 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
             "e2e_verification_sync_rate_limited"
         }
         ServerControl::DeviceLinkCreated { .. } => "device_link_created",
+        ServerControl::E2eAccountResetPrepared { .. } => "e2e_account_reset_prepared",
+        ServerControl::E2eAccountReset { .. } => "e2e_account_reset",
         ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
         ServerControl::DeviceLinked { .. } => "device_linked",
         ServerControl::DeviceLinkRedeemed { .. } => "device_link_redeemed",

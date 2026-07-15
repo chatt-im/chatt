@@ -632,7 +632,7 @@ fn relay_voice(
 }
 
 #[test]
-fn unreadable_local_identity_stops_without_reconnecting_or_replacing_it() {
+fn unreadable_local_identity_keeps_public_session_without_replacing_it() {
     let world = TestWorld::new();
     let mut alice = world.device("alice-unreadable-identity", ALICE, ALICE_TOKEN);
     let data_dir = alice.config.data_dir.as_deref().unwrap();
@@ -643,32 +643,24 @@ fn unreadable_local_identity_stops_without_reconnecting_or_replacing_it() {
     std::fs::write(&identity_path, original).unwrap();
 
     alice.connect();
-    let event = alice.wait_for("fatal local identity error", |event| {
+    let event = alice.wait_for("public-only local identity error", |event| {
         matches!(event, NetworkEvent::LocalIdentityUnavailable { .. })
     });
     let NetworkEvent::LocalIdentityUnavailable { message } = event else {
         unreachable!()
     };
     assert!(message.contains(&identity_path.display().to_string()));
-    assert!(message.contains("stopped reconnecting"));
+    assert!(message.contains("Public rooms remain available"));
+    assert!(message.contains("encrypted DMs and device administration are disabled"));
     assert!(message.contains("left the file unchanged"));
     assert_eq!(std::fs::read(&identity_path).unwrap(), original);
     assert!(!alice
         .backlog
         .iter()
         .any(|event| matches!(event, NetworkEvent::ReconnectScheduled { .. })));
-    match alice
-        .events
-        .as_ref()
-        .unwrap()
-        .recv_timeout(Duration::from_millis(200))
-    {
-        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
-        Ok(AppEvent::Network(NetworkEvent::ReconnectScheduled { .. })) => {
-            panic!("unreadable identity scheduled a reconnect")
-        }
-        Ok(_) => panic!("unexpected event after fatal identity failure"),
-    }
+    alice.wait_for("public-only authentication", |event| {
+        matches!(event, NetworkEvent::Authenticated { .. })
+    });
 }
 
 #[test]
@@ -1198,6 +1190,31 @@ fn linked_device_opens_messages_sent_while_it_was_offline() {
             .iter()
             .any(|body| body == "own message while secondary offline")
     );
+}
+
+#[test]
+fn linked_device_shows_placeholder_for_messages_sent_before_linking() {
+    let world = TestWorld::new();
+    let mut alice = world.device("alice-primary", ALICE, ALICE_TOKEN);
+    let mut bob = world.device("bob", BOB, BOB_TOKEN);
+    let mut alice_second = world.device("alice-secondary", ALICE, "");
+    alice.connect_ready();
+    bob.connect_ready();
+    let room_id = open_dm(&mut alice, &mut bob);
+
+    send_chat(&bob, room_id, "before the second device existed");
+    bob.wait_chat("before the second device existed");
+    alice.wait_chat("before the second device existed");
+
+    pair_device(&mut alice, &mut alice_second);
+    bob.wait_peer_refresh(ALICE);
+    alice_second.connect_ready();
+    alice_second.wait_peer_ready(BOB);
+    let bodies = alice_second.fetch_history(room_id);
+    assert!(bodies.iter().any(|body| {
+        body == "Encrypted message unavailable on this device (sent before it was linked)."
+    }));
+    assert!(!bodies.iter().any(|body| body == "before the second device existed"));
 }
 
 #[test]

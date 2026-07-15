@@ -28,7 +28,7 @@ use hashbrown::HashMap;
 use ring::rand::SystemRandom;
 use std::path::PathBuf;
 use rpc::control::{ChatMessage, RoomInfo, RoomKind};
-use rpc::crypto::{decode_hex, encode_hex};
+use rpc::crypto::{CryptoError, decode_hex, encode_hex};
 use rpc::e2e::{
     AccountKeyAction, AccountKeyStatement, DeviceKeyStatus, DmContent, DmContentKind,
     DmEventEnvelope, DmPairKeys, DmPlaintext, E2E_PUBLIC_KEY_LEN, E2E_SEED_LEN, EventRecipient,
@@ -183,7 +183,7 @@ impl From<ChatMessage> for AuthenticatedChat {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenFailure {
     /// The server's key response is still pending.
     NoKeys,
@@ -193,6 +193,13 @@ pub enum OpenFailure {
     /// to the DM is a protocol violation.
     Policy,
     Crypto,
+    /// The envelope and historical roster authenticate, but this device was
+    /// linked after the event and therefore has no addressed content-key wrap.
+    HistoryUnavailable {
+        created_at_ms: u64,
+        sender_name: String,
+        peer_public_key: [u8; E2E_PUBLIC_KEY_LEN],
+    },
     /// The authenticated sender event was already applied or is stale.
     Replay,
 }
@@ -263,6 +270,61 @@ impl E2eState {
         self.configured_local_user = Some(user_id);
         self.local_user_persisted = true;
         Ok(created)
+    }
+
+    /// Keeps authenticated public-room state usable when the durable local
+    /// device identity cannot be loaded. No private key is synthesized and no
+    /// E2E operation can silently fall back to a new identity.
+    pub fn enter_public_only(&mut self, user_id: UserId) {
+        self.device_identity = None;
+        self.seed = None;
+        self.my_id = Some(user_id);
+        self.configured_local_user = Some(user_id);
+        self.local_user_persisted = false;
+    }
+
+    pub(crate) fn pending_account_reset(
+        &self,
+        server_public_key: &[u8],
+        user_id: UserId,
+    ) -> Result<Option<LocalE2eIdentity>, String> {
+        let data_dir = self.data_dir.as_deref().ok_or_else(|| {
+            "HOME is not set; cannot load a staged E2E account reset".to_string()
+        })?;
+        LocalE2eIdentity::pending_account_reset(data_dir, server_public_key, user_id)
+    }
+
+    pub(crate) fn prepare_account_reset(
+        &self,
+        server_public_key: &[u8],
+        user_id: UserId,
+        device_name: &str,
+        account_generation: u64,
+    ) -> Result<LocalE2eIdentity, String> {
+        let data_dir = self.data_dir.as_deref().ok_or_else(|| {
+            "HOME is not set; cannot stage an E2E account reset".to_string()
+        })?;
+        LocalE2eIdentity::prepare_account_reset(
+            data_dir,
+            server_public_key,
+            user_id,
+            device_name,
+            account_generation,
+            &self.rng,
+        )
+    }
+
+    pub(crate) fn install_account_reset(
+        &mut self,
+        identity: LocalE2eIdentity,
+    ) -> Result<(), String> {
+        let identity = identity.commit_account_reset()?;
+        let user_id = identity.user_id();
+        self.device_identity = Some(identity);
+        self.my_id = Some(user_id);
+        self.configured_local_user = Some(user_id);
+        self.local_user_persisted = true;
+        Ok(())
     }
 
     pub fn account_chain_after(&self, user_id: UserId) -> Option<LedgerHash> {
@@ -534,15 +596,6 @@ impl E2eState {
             .acknowledge_verification_notice(user_id, account_id)
     }
 
-    pub fn recovery_bundle(&self) -> Option<(LedgerHash, Vec<u8>)> {
-        let identity = self.device_identity.as_ref()?;
-        Some((identity.own_ledger().head, identity.recovery_bundle().to_vec()))
-    }
-
-    pub fn recovery_code(&self) -> Option<String> {
-        Some(self.device_identity.as_ref()?.recovery_code())
-    }
-
     pub fn create_device_enrollment(
         &self,
         ticket_hash: &[u8],
@@ -563,12 +616,20 @@ impl E2eState {
             .as_ref()
             .ok_or_else(|| "local E2E device is unavailable".to_string())?;
         let ledger = identity.own_ledger();
+        if device_id == identity.device_id() {
+            return Err("cannot revoke the device currently in use".to_string());
+        }
         if !ledger
             .device_keys
             .iter()
-            .any(|key| key.keys.device_id == device_id)
+            .any(|key| {
+                key.keys.device_id == device_id && key.status == DeviceKeyStatus::Active
+            })
         {
-            return Err("cannot revoke an unknown account device".to_string());
+            return Err("cannot revoke an unknown or inactive account device".to_string());
+        }
+        if ledger.active_devices().count() <= 1 {
+            return Err("cannot revoke the account's last active device".to_string());
         }
         identity.sign_next_account_action(AccountKeyAction::RevokeDevice { device_id })
     }
@@ -1101,6 +1162,10 @@ impl E2eState {
         let peer_ledger = self
             .account_ledger(peer)
             .ok_or(SealBlocked::PeerKeyMissing)?;
+        let semantic_target = match &content {
+            DmContent::Edit { target, .. } | DmContent::Delete { target } => Some(*target),
+            DmContent::Text { .. } | DmContent::FileAnnounce { .. } => None,
+        };
         let mut recipients = Vec::new();
         for (user_id, ledger) in [(sender, &own_ledger), (peer, &peer_ledger)] {
             for device in ledger.active_devices() {
@@ -1136,7 +1201,7 @@ impl E2eState {
             predecessor: reserved.predecessor,
             kind: content.kind(),
             created_at_ms: sent_at_ms,
-            semantic_target: None,
+            semantic_target,
             sender_roster: RosterCheckpoint::from(&own_ledger),
             recipient_roster: RosterCheckpoint::from(&peer_ledger),
         };
@@ -1331,7 +1396,7 @@ impl E2eState {
             return Err(OpenFailure::Crypto);
         }
 
-        let opened = open_dm_event(
+        let opened = match open_dm_event(
             encoded,
             author_signing_public_key,
             my_id,
@@ -1339,8 +1404,25 @@ impl E2eState {
             identity.device_id(),
             identity.device_key_epoch(),
             identity.encryption_seed(),
-        )
-        .map_err(|_| OpenFailure::Crypto)?;
+        ) {
+            Ok(opened) => opened,
+            Err(CryptoError::WrongKeyId) if !live => {
+                return Err(OpenFailure::HistoryUnavailable {
+                    created_at_ms: header.created_at_ms,
+                    sender_name: if sender == my_id {
+                        own_username.to_string()
+                    } else {
+                        room.username.clone()
+                    },
+                    peer_public_key: if sender == my_id {
+                        recipient_ledger.account_id.0
+                    } else {
+                        sender_ledger.account_id.0
+                    },
+                });
+            }
+            Err(_) => return Err(OpenFailure::Crypto),
+        };
         if opened.header != header || opened.plaintext.sent_at_ms != header.created_at_ms {
             return Err(OpenFailure::Crypto);
         }
@@ -1493,6 +1575,13 @@ impl E2eState {
             }
         };
         let plaintext = opened.plaintext;
+        if opened
+            .event
+            .is_some_and(|header| header.semantic_target != message.target)
+        {
+            message.envelope = Some(envelope);
+            return Err(OpenFailure::Crypto);
+        }
         const DRIFT_WARN_MS: u64 = 5 * 60 * 1000;
         if message.timestamp_ms.abs_diff(plaintext.sent_at_ms) > DRIFT_WARN_MS {
             kvlog::warn!(
