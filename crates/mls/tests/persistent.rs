@@ -242,10 +242,23 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         .generate_key_packages(bob.id, 1)
         .unwrap()
         .remove(0);
-    alice_client
+    let initial = alice_client
         .create_room(&descriptor, &[(bob.id, package.package)])
         .unwrap();
     alice_client.accept_pending_commit(&descriptor, 1).unwrap();
+    let shared = initial.welcome.as_ref().unwrap();
+    bob_client
+        .join_welcome(
+            &descriptor,
+            &MlsWelcome {
+                delivery_id: 1,
+                sequence: 1,
+                device_id: bob.id,
+                descriptor: shared.descriptor.clone(),
+                welcome: shared.welcome.clone(),
+            },
+        )
+        .unwrap();
     let event = MlsChattEvent {
         version: MLS_PROTOCOL_VERSION,
         room_id: descriptor.room_id,
@@ -298,16 +311,110 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
         chatt_mls::OutboxState::PendingDelivery { epoch, .. } if epoch == reencrypted.0
     ));
-    alice_client
+    assert!(alice_client
         .mark_outgoing_delivered(descriptor.room_id, event.event_id, 2)
-        .unwrap();
+        .unwrap());
     alice_client
         .retry_stale_outgoing(descriptor.room_id, event.event_id, encrypted.0 + 1)
         .unwrap();
     assert!(matches!(
         alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
-        chatt_mls::OutboxState::Delivered { sequence: 2 }
+        chatt_mls::OutboxState::Delivered {
+            sequence: 2,
+            epoch: _,
+            ciphertext_hash: _,
+            emitted: true
+        }
     ));
+
+    let delayed = MlsChattEvent {
+        event_id: EventId([11; 16]),
+        timestamp_ms: 202,
+        content: ChattEventContent::Text {
+            body: "acknowledged behind a delivery gap".to_string(),
+        },
+        ..event.clone()
+    };
+    alice_client.queue_outgoing(delayed.clone()).unwrap();
+    let (delayed_epoch, delayed_ciphertext) = alice_client
+        .encrypt_outgoing(&descriptor, delayed.event_id)
+        .unwrap();
+    assert!(!alice_client
+        .mark_outgoing_delivered(descriptor.room_id, delayed.event_id, 4)
+        .unwrap());
+    assert_eq!(alice_client.cursor(descriptor.room_id).unwrap(), 2);
+    assert!(matches!(
+        alice_client
+            .outbox(descriptor.room_id, delayed.event_id)
+            .unwrap()
+            .state,
+        chatt_mls::OutboxState::Delivered {
+            sequence: 4,
+            epoch: _,
+            ciphertext_hash: _,
+            emitted: false
+        }
+    ));
+    assert!(
+        alice_client
+            .cached_history(descriptor.room_id)
+            .unwrap()
+            .iter()
+            .all(|cached| cached.event.event_id != delayed.event_id)
+    );
+
+    let preceding = MlsChattEvent {
+        version: MLS_PROTOCOL_VERSION,
+        room_id: descriptor.room_id,
+        event_id: EventId([12; 16]),
+        sender_account: bob.roster.body.account_id,
+        timestamp_ms: 203,
+        content: ChattEventContent::Text {
+            body: "the missing predecessor".to_string(),
+        },
+    };
+    bob_client.queue_outgoing(preceding.clone()).unwrap();
+    let (preceding_epoch, preceding_ciphertext) = bob_client
+        .encrypt_outgoing(&descriptor, preceding.event_id)
+        .unwrap();
+    assert!(matches!(
+        alice_client
+            .process_delivery(
+                &descriptor,
+                &MlsDeliveryEvent::Application {
+                    sequence: 3,
+                    epoch: preceding_epoch,
+                    event_id: preceding.event_id,
+                    ciphertext: preceding_ciphertext,
+                },
+            )
+            .unwrap(),
+        ProcessedDelivery::Application(ref cached) if cached.event == preceding
+    ));
+    assert!(matches!(
+        alice_client
+            .process_delivery(
+                &descriptor,
+                &MlsDeliveryEvent::Application {
+                    sequence: 4,
+                    epoch: delayed_epoch,
+                    event_id: delayed.event_id,
+                    ciphertext: delayed_ciphertext,
+                },
+            )
+            .unwrap(),
+        ProcessedDelivery::Outgoing {
+            sequence: 4,
+            event: Some(ref emitted)
+        } if emitted == &delayed
+    ));
+    assert!(
+        alice_client
+            .cached_history(descriptor.room_id)
+            .unwrap()
+            .iter()
+            .any(|cached| cached.event == delayed)
+    );
 }
 
 #[test]

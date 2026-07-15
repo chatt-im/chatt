@@ -61,10 +61,15 @@ pub(super) struct MlsService {
     rosters: HashMap<UserId, SignedDeviceRoster>,
     key_packages: HashMap<DeviceId, VecDeque<Vec<u8>>>,
     retired_key_packages: HashSet<[u8; 32]>,
+    issued_key_packages: HashSet<Vec<u8>>,
+    used_key_packages: HashSet<Vec<u8>>,
     rooms: HashMap<RoomId, RoomRecord>,
     welcomes: Vec<StoredWelcome>,
     next_welcome_delivery_id: u64,
     credentials: Vec<DeviceCredential>,
+    /// Device ids route KeyPackages and Welcome inboxes globally, so they can
+    /// never be reassigned to another account, even after revocation.
+    device_owners: HashMap<DeviceId, UserId>,
 }
 
 #[derive(Clone, Debug, Default, Jsony)]
@@ -73,10 +78,13 @@ struct DurableState {
     rosters: Vec<(UserId, SignedDeviceRoster)>,
     key_packages: Vec<(DeviceId, Vec<Vec<u8>>)>,
     retired_key_packages: Vec<[u8; 32]>,
+    issued_key_packages: Vec<Vec<u8>>,
+    used_key_packages: Vec<Vec<u8>>,
     rooms: Vec<RoomRecord>,
     welcomes: Vec<StoredWelcome>,
     next_welcome_delivery_id: u64,
     credentials: Vec<DeviceCredential>,
+    device_owners: Vec<(DeviceId, UserId)>,
 }
 
 impl MlsService {
@@ -93,10 +101,13 @@ impl MlsService {
             rosters: HashMap::new(),
             key_packages: HashMap::new(),
             retired_key_packages: HashSet::new(),
+            issued_key_packages: HashSet::new(),
+            used_key_packages: HashSet::new(),
             rooms: HashMap::new(),
             welcomes: Vec::new(),
             next_welcome_delivery_id: 1,
             credentials: Vec::new(),
+            device_owners: HashMap::new(),
         }
     }
 
@@ -199,6 +210,13 @@ impl MlsService {
         {
             return Err("paired roster does not add a fresh MLS device".to_string());
         }
+        if self
+            .device_owners
+            .get(&device_id)
+            .is_some_and(|owner| *owner != user_id)
+        {
+            return Err("MLS device id is already owned by another account".to_string());
+        }
         validate_key_packages(&packages)?;
         self.validate_fresh_key_packages(&packages)?;
         if packages.is_empty()
@@ -217,6 +235,7 @@ impl MlsService {
             return Err("paired device credential is already registered".to_string());
         }
         let before = self.snapshot();
+        self.device_owners.insert(device_id, user_id);
         self.identities
             .install_roster(&roster)
             .map_err(|error| error.to_string())?;
@@ -262,11 +281,26 @@ impl MlsService {
             user_id,
         )
         .map_err(PutRosterError::Invalid)?;
+        for certificate in &roster.body.active_devices {
+            if self
+                .device_owners
+                .get(&certificate.body.device_id)
+                .is_some_and(|owner| *owner != user_id)
+            {
+                return Err(PutRosterError::Invalid(
+                    "MLS device id is already owned by another account".to_string(),
+                ));
+            }
+        }
         if initial {
             self.mark_initialized(user_id)
                 .map_err(PutRosterError::Invalid)?;
         }
         let before = self.snapshot();
+        for certificate in &roster.body.active_devices {
+            self.device_owners
+                .insert(certificate.body.device_id, user_id);
+        }
         if initial && let Some(token_hash) = bootstrap_credential_hash {
             let [certificate] = roster.body.active_devices.as_slice() else {
                 return Err(PutRosterError::Invalid(
@@ -358,6 +392,9 @@ impl MlsService {
         let mut batch_hashes = HashSet::new();
         let mut new_packages = Vec::new();
         for package in packages {
+            self.validator
+                .key_package_reference(&package.package)
+                .map_err(|error| error.to_string())?;
             let hash = key_package_hash(&package.package);
             if self.retired_key_packages.contains(&hash) {
                 return Err("KeyPackage was already consumed".to_string());
@@ -399,6 +436,11 @@ impl MlsService {
             .and_then(VecDeque::pop_front);
         if let Some(package) = &package {
             self.retired_key_packages.insert(key_package_hash(package));
+            let reference = match self.validator.key_package_reference(package) {
+                Ok(reference) => reference,
+                Err(error) => return Err(self.rollback(before, error.to_string())),
+            };
+            self.issued_key_packages.insert(reference);
         }
         if package.is_some()
             && let Err(error) = self.persist()
@@ -420,6 +462,9 @@ impl MlsService {
     ) -> Result<(), String> {
         let mut hashes = HashSet::new();
         for package in packages {
+            self.validator
+                .key_package_reference(&package.package)
+                .map_err(|error| error.to_string())?;
             let hash = key_package_hash(&package.package);
             if self.retired_key_packages.contains(&hash) {
                 return Err("KeyPackage was already consumed".to_string());
@@ -498,6 +543,11 @@ impl MlsService {
             .validator
             .apply_commit(&parent, &bundle)
             .map_err(|error| error.to_string())?;
+        Self::validate_added_key_packages(
+            &self.issued_key_packages,
+            &self.used_key_packages,
+            &applied.added_key_package_refs,
+        )?;
         let next = applied.state;
         if applied.committer_client_id != creator_client_id {
             return Err("initial commit was not signed by the authenticated device".to_string());
@@ -520,6 +570,8 @@ impl MlsService {
                 bundle: welcome.clone(),
             });
         }
+        self.used_key_packages
+            .extend(applied.added_key_package_refs);
         self.rooms.insert(
             descriptor.room_id,
             RoomRecord {
@@ -606,6 +658,15 @@ impl MlsService {
             Ok(applied) => applied,
             Err(_) => return Ok(MlsCommitOutcome::PolicyRejected),
         };
+        if Self::validate_added_key_packages(
+            &self.issued_key_packages,
+            &self.used_key_packages,
+            &applied.added_key_package_refs,
+        )
+        .is_err()
+        {
+            return Ok(MlsCommitOutcome::PolicyRejected);
+        }
         if applied.committer_client_id != committer_client_id {
             return Ok(MlsCommitOutcome::PolicyRejected);
         }
@@ -646,6 +707,8 @@ impl MlsService {
                 bundle: welcome.clone(),
             });
         }
+        self.used_key_packages
+            .extend(applied.added_key_package_refs);
         room.events.push(MlsDeliveryEvent::Commit {
             sequence,
             parent_epoch: expected_epoch,
@@ -711,6 +774,14 @@ impl MlsService {
         descriptor: &EncryptedRoomDescriptor,
         state: &PublicGroupState,
     ) -> Result<(), String> {
+        let unique_clients = state
+            .member_client_ids
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<HashSet<_>>();
+        if unique_clients.len() != state.member_client_ids.len() {
+            return Err("MLS roster contains a duplicate client leaf".to_string());
+        }
         let represented = state
             .member_client_ids
             .iter()
@@ -731,6 +802,26 @@ impl MlsService {
         Ok(())
     }
 
+    fn validate_added_key_packages(
+        issued: &HashSet<Vec<u8>>,
+        used: &HashSet<Vec<u8>>,
+        additions: &[Vec<u8>],
+    ) -> Result<(), String> {
+        let mut unique = HashSet::new();
+        for reference in additions {
+            if !unique.insert(reference.as_slice()) {
+                return Err("MLS commit reuses a KeyPackage within one commit".to_string());
+            }
+            if !issued.contains(reference) {
+                return Err("MLS commit adds a KeyPackage not issued by this server".to_string());
+            }
+            if used.contains(reference) {
+                return Err("MLS commit reuses an already committed KeyPackage".to_string());
+            }
+        }
+        Ok(())
+    }
+
     pub fn submit_application(
         &mut self,
         room_id: RoomId,
@@ -746,10 +837,25 @@ impl MlsService {
             .rooms
             .get_mut(&room_id)
             .ok_or_else(|| "encrypted room does not exist".to_string())?;
-        if let Some(sequence) = room.event_ids.get(&event_id) {
-            return Ok(MlsSubmitOutcome::AlreadyStored {
-                sequence: *sequence,
+        if let Some(sequence) = room.event_ids.get(&event_id).copied() {
+            let exact_retry = room.events.iter().any(|event| {
+                matches!(
+                    event,
+                    MlsDeliveryEvent::Application {
+                        sequence: stored_sequence,
+                        epoch: stored_epoch,
+                        event_id: stored_event_id,
+                        ciphertext: stored_ciphertext,
+                    } if *stored_sequence == sequence
+                        && *stored_epoch == epoch
+                        && *stored_event_id == event_id
+                        && stored_ciphertext == &ciphertext
+                )
             });
+            if !exact_retry {
+                return Err("MLS event id was reused for a different application".to_string());
+            }
+            return Ok(MlsSubmitOutcome::AlreadyStored { sequence });
         }
         if room.revocation_pending {
             return Ok(MlsSubmitOutcome::RevocationPending);
@@ -848,10 +954,17 @@ impl MlsService {
                 hashes.sort_unstable();
                 hashes
             },
+            issued_key_packages: self.issued_key_packages.iter().cloned().collect(),
+            used_key_packages: self.used_key_packages.iter().cloned().collect(),
             rooms: self.rooms.values().cloned().collect(),
             welcomes: self.welcomes.clone(),
             next_welcome_delivery_id: self.next_welcome_delivery_id,
             credentials: self.credentials.clone(),
+            device_owners: self
+                .device_owners
+                .iter()
+                .map(|(device_id, user_id)| (*device_id, *user_id))
+                .collect(),
         }
     }
 
@@ -882,10 +995,27 @@ impl MlsService {
             .map(|(device_id, packages)| (device_id, packages.into()))
             .collect();
         self.retired_key_packages = state.retired_key_packages.into_iter().collect();
+        self.issued_key_packages = state.issued_key_packages.into_iter().collect();
+        self.used_key_packages = state.used_key_packages.into_iter().collect();
+        if !self.used_key_packages.is_subset(&self.issued_key_packages) {
+            return Err("persisted MLS KeyPackage usage is inconsistent".to_string());
+        }
         self.rooms = rooms;
         self.welcomes = state.welcomes;
         self.next_welcome_delivery_id = state.next_welcome_delivery_id.max(1);
         self.credentials = state.credentials;
+        let device_owner_count = state.device_owners.len();
+        self.device_owners = state.device_owners.into_iter().collect();
+        if self.device_owners.len() != device_owner_count {
+            return Err("persisted MLS device ownership contains duplicates".to_string());
+        }
+        for (user_id, roster) in &self.rosters {
+            for certificate in &roster.body.active_devices {
+                if self.device_owners.get(&certificate.body.device_id) != Some(user_id) {
+                    return Err("persisted MLS device ownership does not match its roster".to_string());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -980,7 +1110,9 @@ fn key_package_hash(package: &[u8]) -> [u8; 32] {
 mod tests {
     use chatt_mls::LocalInstallation;
     use rpc::{
-        identity::roster_checkpoint,
+        identity::{
+            mls_client_id, roster_checkpoint, sign_device_certificate, sign_device_roster,
+        },
         ids::{EventId, RoomId, UserId},
         mls::{
             ChattEventContent, EncryptedRoomDescriptor, MLS_PROTOCOL_VERSION, MlsChattEvent,
@@ -1055,6 +1187,59 @@ mod tests {
             service.authenticate_credential(bearer).map(|value| value.1),
             Some(device_id)
         );
+    }
+
+    #[test]
+    fn device_ids_are_globally_reserved_across_accounts_and_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [17u8; 32];
+        let (alice, _) = LocalInstallation::open_or_create(
+            &temp.path().join("device-owner-alice"),
+            server_id,
+            UserId(20),
+            "alice",
+        )
+        .unwrap();
+        let (bob, _) = LocalInstallation::open_or_create(
+            &temp.path().join("device-owner-bob"),
+            server_id,
+            UserId(21),
+            "bob",
+        )
+        .unwrap();
+        let mut bob_certificate = bob.bootstrap.device_certificate.body.clone();
+        bob_certificate.device_id = alice.bootstrap.device_id;
+        bob_certificate.mls_client_id = mls_client_id(
+            &server_id,
+            bob.bootstrap.account_id,
+            alice.bootstrap.device_id,
+        )
+        .unwrap();
+        let bob_certificate =
+            sign_device_certificate(bob_certificate, &bob.bootstrap.authority_seed).unwrap();
+        let mut bob_roster = bob.bootstrap.own_roster.body.clone();
+        bob_roster.active_devices = vec![bob_certificate];
+        let bob_roster = sign_device_roster(bob_roster, &bob.bootstrap.authority_seed).unwrap();
+
+        let state_dir = temp.path().join("device-owner-server");
+        std::fs::create_dir(&state_dir).unwrap();
+        let mut service = MlsService::open(Some(state_dir.clone()), server_id.to_vec()).unwrap();
+        service
+            .put_roster(
+                UserId(20),
+                None,
+                alice.bootstrap.own_roster.clone(),
+                None,
+            )
+            .unwrap();
+        drop(service);
+
+        let mut service = MlsService::open(Some(state_dir), server_id.to_vec()).unwrap();
+        assert!(matches!(
+            service.put_roster(UserId(21), None, bob_roster, None),
+            Err(PutRosterError::Invalid(ref error))
+                if error.contains("already owned by another account")
+        ));
     }
 
     #[test]
@@ -1154,11 +1339,22 @@ mod tests {
         service
             .put_roster(UserId(2), None, bob.bootstrap.own_roster.clone(), None)
             .unwrap();
-        let package = bob
+        let published_package = bob
             .client
             .generate_key_packages(bob.bootstrap.device_id, 1)
             .unwrap()
             .remove(0);
+        service
+            .publish_key_packages(
+                UserId(2),
+                bob.bootstrap.device_id,
+                vec![published_package.clone()],
+            )
+            .unwrap();
+        let package = service
+            .take_key_package(bob.bootstrap.device_id)
+            .unwrap()
+            .unwrap();
         let descriptor = EncryptedRoomDescriptor::new(
             RoomId(50),
             alice.bootstrap.account_id,
@@ -1168,7 +1364,7 @@ mod tests {
         .unwrap();
         let bundle = alice
             .client
-            .create_room(&descriptor, &[(bob.bootstrap.device_id, package.package)])
+            .create_room(&descriptor, &[(bob.bootstrap.device_id, package.clone())])
             .unwrap();
         let initial_group_info = bundle.group_info.clone();
         service
@@ -1184,6 +1380,35 @@ mod tests {
             )
             .unwrap();
         alice.client.accept_pending_commit(&descriptor, 1).unwrap();
+        let reused_descriptor = EncryptedRoomDescriptor::new(
+            RoomId(51),
+            alice.bootstrap.account_id,
+            vec![alice.bootstrap.account_id, bob.bootstrap.account_id],
+            11,
+        )
+        .unwrap();
+        let reused_bundle = alice
+            .client
+            .create_room(
+                &reused_descriptor,
+                &[(bob.bootstrap.device_id, package)],
+            )
+            .unwrap();
+        assert!(
+            service
+                .create_room(
+                    alice.bootstrap.account_id,
+                    &alice.bootstrap.device_certificate.body.mls_client_id,
+                    reused_descriptor,
+                    &[
+                        roster_checkpoint(&alice.bootstrap.own_roster),
+                        roster_checkpoint(&bob.bootstrap.own_roster),
+                    ],
+                    reused_bundle,
+                )
+                .unwrap_err()
+                .contains("already committed KeyPackage")
+        );
         let event = MlsChattEvent {
             version: MLS_PROTOCOL_VERSION,
             room_id: descriptor.room_id,
@@ -1216,9 +1441,27 @@ mod tests {
         assert_eq!(service.events(descriptor.room_id, 0, 10).unwrap().len(), 2);
         assert_eq!(
             service
-                .submit_application(descriptor.room_id, epoch, event.event_id, ciphertext,)
+                .submit_application(
+                    descriptor.room_id,
+                    epoch,
+                    event.event_id,
+                    ciphertext.clone(),
+                )
                 .unwrap(),
             MlsSubmitOutcome::AlreadyStored { sequence: 2 },
+        );
+        let mut conflicting_ciphertext = ciphertext.clone();
+        *conflicting_ciphertext.last_mut().unwrap() ^= 1;
+        assert!(
+            service
+                .submit_application(
+                    descriptor.room_id,
+                    epoch,
+                    event.event_id,
+                    conflicting_ciphertext,
+                )
+                .unwrap_err()
+                .contains("event id was reused")
         );
         assert_eq!(
             service.roster(UserId(1)).map(roster_checkpoint),
@@ -1242,6 +1485,17 @@ mod tests {
                 sequence: 3,
                 epoch: 2,
             }
+        );
+        assert!(
+            service
+                .submit_application(
+                    descriptor.room_id,
+                    2,
+                    EventId([6; 16]),
+                    ciphertext,
+                )
+                .unwrap_err()
+                .contains("current group epoch")
         );
         assert_eq!(
             service
@@ -1311,6 +1565,28 @@ mod tests {
             .generate_key_packages(carol.bootstrap.device_id, 1)
             .unwrap()
             .remove(0);
+        service
+            .publish_key_packages(
+                UserId(12),
+                bob.bootstrap.device_id,
+                vec![bob_package],
+            )
+            .unwrap();
+        service
+            .publish_key_packages(
+                UserId(13),
+                carol.bootstrap.device_id,
+                vec![carol_package],
+            )
+            .unwrap();
+        let bob_package = service
+            .take_key_package(bob.bootstrap.device_id)
+            .unwrap()
+            .unwrap();
+        let carol_package = service
+            .take_key_package(carol.bootstrap.device_id)
+            .unwrap()
+            .unwrap();
         let descriptor = EncryptedRoomDescriptor::new(
             RoomId(60),
             alice.bootstrap.account_id,
@@ -1327,8 +1603,8 @@ mod tests {
             .create_room(
                 &descriptor,
                 &[
-                    (bob.bootstrap.device_id, bob_package.package),
-                    (carol.bootstrap.device_id, carol_package.package),
+                    (bob.bootstrap.device_id, bob_package),
+                    (carol.bootstrap.device_id, carol_package),
                 ],
             )
             .unwrap();

@@ -263,6 +263,61 @@ fn public_server_observer_accepts_only_one_commit_for_an_epoch() {
 }
 
 #[test]
+fn fixed_room_policy_rejects_removing_an_accounts_last_leaf() {
+    let server_id = b"fixed account leaf test server";
+    let alice = device(server_id, 1, 1, 1);
+    let bob = device(server_id, 2, 2, 2);
+    let identities = ChattIdentityProvider::new(server_id.to_vec());
+    identities.install_roster(&alice.roster).unwrap();
+    identities.install_roster(&bob.roster).unwrap();
+    let descriptor = EncryptedRoomDescriptor::new(
+        RoomId(11),
+        alice.roster.body.account_id,
+        vec![alice.roster.body.account_id, bob.roster.body.account_id],
+        100,
+    )
+    .unwrap();
+    identities.install_room(descriptor.clone()).unwrap();
+
+    let alice_client = client(identities.clone(), &alice);
+    let bob_client = client(identities.clone(), &bob);
+    let mut alice_group = alice_client
+        .create_group_with_id(
+            descriptor.mls_group_id.clone(),
+            ExtensionList::new(),
+            ExtensionList::new(),
+            None,
+        )
+        .unwrap();
+    let bob_key_package = bob_client
+        .generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None)
+        .unwrap();
+    let _initial = alice_group
+        .commit_builder()
+        .add_member(bob_key_package)
+        .unwrap()
+        .build()
+        .unwrap();
+    alice_group.apply_pending_commit().unwrap();
+
+    // Once Bob's old device is revoked it may be removed, but not until a
+    // replacement leaf represents Bob's fixed room account.
+    let replacement = device(server_id, 2, 2, 3);
+    let mut replacement_roster = replacement.roster;
+    replacement_roster.body.revision = 2;
+    replacement_roster = sign_device_roster(replacement_roster.body, &[2; 32]).unwrap();
+    identities.install_roster(&replacement_roster).unwrap();
+    assert!(
+        alice_group
+            .commit_builder()
+            .remove_member(1)
+            .unwrap()
+            .build()
+            .is_err()
+    );
+}
+
+#[test]
 fn two_multi_device_accounts_receive_constant_size_application_messages() {
     let server_id = b"four device test server";
     let alice = account_devices(server_id, 1, 1, &[1, 2]);
