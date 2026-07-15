@@ -112,6 +112,7 @@ pub struct CachedApplicationEvent {
 pub struct OutboxEntry {
     pub event: MlsChattEvent,
     pub state: OutboxState,
+    queued_order: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -643,7 +644,20 @@ impl PersistentClient {
     }
 
     pub fn queue_outgoing(&self, event: MlsChattEvent) -> Result<(), String> {
-        validate_event(&event, event.room_id, event.event_id, event.sender_account)?;
+        let own_client_id = self
+            .client
+            .signing_identity()
+            .map_err(|error| error.to_string())?
+            .0
+            .credential
+            .as_basic()
+            .map(|credential| credential.identifier.as_slice())
+            .ok_or_else(|| "local MLS credential is not Basic".to_string())?;
+        let own_account = self
+            .identities
+            .account_for_client(own_client_id)
+            .map_err(|error| error.to_string())?;
+        validate_event(&event, event.room_id, event.event_id, own_account)?;
         let key = outbox_key(event.room_id, event.event_id);
         if self
             .application
@@ -653,14 +667,27 @@ impl PersistentClient {
         {
             return Err("outgoing MLS event id already exists".to_string());
         }
+        let queued_order = self
+            .application
+            .get(outbox_order_key())
+            .map_err(|error| error.to_string())?
+            .map(|bytes| jsony::from_binary(&bytes).map_err(|error| error.to_string()))
+            .transpose()?
+            .unwrap_or(0_u64)
+            .checked_add(1)
+            .ok_or_else(|| "MLS outbox enqueue order is exhausted".to_string())?;
         self.application
-            .insert(
-                &key,
-                &jsony::to_binary(&OutboxEntry {
+            .transact_insert(&[
+                Item::new(
+                    key,
+                    jsony::to_binary(&OutboxEntry {
                     event,
                     state: OutboxState::PendingEncryption,
-                }),
-            )
+                        queued_order,
+                    }),
+                ),
+                Item::new(outbox_order_key().to_string(), jsony::to_binary(&queued_order)),
+            ])
             .map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -736,12 +763,19 @@ impl PersistentClient {
                 return Err("unencrypted MLS event was acknowledged as delivered".to_string());
             }
         };
+        if already_emitted && cursor < sequence {
+            return Err("emitted MLS outbox event is ahead of the delivery cursor".to_string());
+        }
+        if !already_emitted && cursor >= sequence {
+            return Err("unemitted MLS outbox event is behind the delivery cursor".to_string());
+        }
         let emit_now = at_ordered_head && !already_emitted;
+        debug_assert!(!emit_now || cursor.checked_add(1) == Some(sequence));
         entry.state = OutboxState::Delivered {
             sequence,
             epoch,
             ciphertext_hash,
-            emitted: already_emitted || emit_now || cursor >= sequence,
+            emitted: already_emitted || emit_now,
         };
         let encoded = jsony::to_binary(&entry);
         if at_ordered_head {
@@ -935,6 +969,23 @@ impl PersistentClient {
                             return Ok(ProcessedDelivery::Commit { sequence, epoch });
                         }
                         DeliveryMarker::Application { .. } => {
+                            let event_id = outer_event_id.ok_or_else(|| {
+                                "application delivery marker matched a commit".to_string()
+                            })?;
+                            let cached = self.cached_event(descriptor.room_id, event_id)?;
+                            if let Some(cached) = cached {
+                                if cached.sequence != sequence
+                                    || cached.event.room_id != descriptor.room_id
+                                    || cached.event.event_id != event_id
+                                {
+                                    return Err(
+                                        "cached MLS application does not match its delivery marker"
+                                            .to_string(),
+                                    );
+                                }
+                                self.set_cursor(descriptor.room_id, sequence)?;
+                                return Ok(ProcessedDelivery::Application(cached));
+                            }
                             self.set_cursor(descriptor.room_id, sequence)?;
                             return Ok(ProcessedDelivery::AlreadyProcessed { sequence });
                         }
@@ -1132,7 +1183,10 @@ impl PersistentClient {
             .map(|item| jsony::from_binary(item.value()).map_err(|error| error.to_string()))
             .collect::<Result<Vec<OutboxEntry>, String>>()?;
         entries.retain(|entry| !matches!(entry.state, OutboxState::Delivered { .. }));
-        entries.sort_by_key(|entry| (entry.event.timestamp_ms, entry.event.event_id.0));
+        entries.sort_by_key(|entry| entry.queued_order);
+        debug_assert!(entries.windows(2).all(|entries| {
+            entries[0].queued_order < entries[1].queued_order
+        }));
         Ok(entries)
     }
 
@@ -1294,9 +1348,23 @@ impl PersistentClient {
     }
 
     fn set_cursor(&self, room_id: RoomId, sequence: u64) -> Result<(), String> {
+        let current = self.cursor(room_id)?;
+        if sequence < current {
+            return Err(format!(
+                "MLS delivery cursor cannot regress from {current} to {sequence}"
+            ));
+        }
+        if sequence > current
+            && current.checked_add(1) != Some(sequence)
+        {
+            return Err(format!(
+                "MLS delivery cursor cannot skip from {current} to {sequence}"
+            ));
+        }
         self.application
             .transact_insert(&[Item::new(cursor_key(room_id), jsony::to_binary(&sequence))])
             .map_err(|error| error.to_string())?;
+        debug_assert_eq!(self.cursor(room_id).ok(), Some(sequence));
         Ok(())
     }
 
@@ -1373,6 +1441,12 @@ impl PersistentClient {
         {
             return Err("encrypted room descriptor is immutable".to_string());
         }
+        let current = self.cursor(descriptor.room_id)?;
+        if sequence < current {
+            return Err(format!(
+                "MLS room installation cannot regress cursor from {current} to {sequence}"
+            ));
+        }
         self.application
             .transact_insert(&[
                 Item::new(
@@ -1385,6 +1459,7 @@ impl PersistentClient {
                 ),
             ])
             .map_err(|error| error.to_string())?;
+        debug_assert_eq!(self.cursor(descriptor.room_id).ok(), Some(sequence));
         Ok(())
     }
 }
@@ -1453,6 +1528,10 @@ fn delivery_marker_key(room_id: RoomId) -> String {
 
 fn pending_commit_key(room_id: RoomId) -> String {
     format!("pending-commit/{:08x}", room_id.0)
+}
+
+fn outbox_order_key() -> &'static str {
+    "counter/outbox-order"
 }
 
 impl DeliveryMarker {
@@ -1628,9 +1707,48 @@ mod tests {
             bob.client.process_delivery(&descriptor, &delivery).unwrap(),
             ProcessedDelivery::AlreadyProcessed { sequence: 2 }
         ));
+        let crash_after_write = MlsChattEvent {
+            event_id: EventId([46; 16]),
+            timestamp_ms: 3,
+            content: ChattEventContent::Text {
+                body: "recover dispatch after ratchet write".to_string(),
+            },
+            ..event.clone()
+        };
+        alice
+            .client
+            .queue_outgoing(crash_after_write.clone())
+            .unwrap();
+        let (epoch, ciphertext) = alice
+            .client
+            .encrypt_outgoing(&descriptor, crash_after_write.event_id)
+            .unwrap();
+        let crash_after_write_delivery = MlsDeliveryEvent::Application {
+            sequence: 3,
+            epoch,
+            event_id: crash_after_write.event_id,
+            ciphertext,
+        };
+        assert_eq!(
+            bob.client.process_delivery_with_hooks(
+                &descriptor,
+                &crash_after_write_delivery,
+                || Ok(()),
+                || Err("injected crash after application group write".to_string()),
+            ),
+            Err("injected crash after application group write".to_string()),
+        );
+        assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 2);
+        assert!(matches!(
+            bob.client
+                .process_delivery(&descriptor, &crash_after_write_delivery)
+                .unwrap(),
+            ProcessedDelivery::Application(cached) if cached.event == crash_after_write
+        ));
+        assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 3);
         let mismatched = MlsChattEvent {
             event_id: EventId([43; 16]),
-            timestamp_ms: 3,
+            timestamp_ms: 4,
             content: ChattEventContent::Text {
                 body: "valid MLS, mismatched envelope".to_string(),
             },
@@ -1646,16 +1764,16 @@ mod tests {
                 .process_delivery(
                     &descriptor,
                     &MlsDeliveryEvent::Application {
-                        sequence: 3,
+                        sequence: 4,
                         epoch,
                         event_id: EventId([44; 16]),
                         ciphertext,
                     },
                 )
                 .unwrap(),
-            ProcessedDelivery::RejectedApplication { sequence: 3, .. }
+            ProcessedDelivery::RejectedApplication { sequence: 4, .. }
         ));
-        assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 3);
+        assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 4);
         let MlsDeliveryEvent::Application {
             ciphertext: replayed,
             ..
@@ -1668,18 +1786,18 @@ mod tests {
                 .process_delivery(
                     &descriptor,
                     &MlsDeliveryEvent::Application {
-                        sequence: 4,
+                        sequence: 5,
                         epoch,
                         event_id: EventId([45; 16]),
                         ciphertext: replayed.clone(),
                     },
                 )
                 .unwrap(),
-            ProcessedDelivery::RejectedApplication { sequence: 4, .. }
+            ProcessedDelivery::RejectedApplication { sequence: 5, .. }
         ));
-        assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 4);
+        assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 5);
         let duplicate_commit = MlsDeliveryEvent::Commit {
-            sequence: 4,
+            sequence: 5,
             parent_epoch: epoch,
             epoch: epoch + 1,
             commit: vec![0xff],
@@ -1688,12 +1806,14 @@ mod tests {
             bob.client
                 .process_delivery(&descriptor, &duplicate_commit)
                 .unwrap(),
-            ProcessedDelivery::AlreadyProcessed { sequence: 4 }
+            ProcessedDelivery::AlreadyProcessed { sequence: 5 }
         ));
         let history = bob.client.cached_history(descriptor.room_id).unwrap();
-        assert_eq!(history.len(), 1);
+        assert_eq!(history.len(), 2);
         assert_eq!(history[0].sequence, 2);
         assert_eq!(history[0].event, event);
+        assert_eq!(history[1].sequence, 3);
+        assert_eq!(history[1].event, crash_after_write);
     }
 
     #[test]

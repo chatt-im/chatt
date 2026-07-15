@@ -17,8 +17,8 @@ use mls_rs::{
 use mls_rs_core::identity::MemberValidationContext;
 use rpc::{
     identity::{
-        SignedDeviceCertificate, SignedDeviceRoster, parse_mls_client_id,
-        validate_device_roster,
+        RosterCheckpoint, SignedDeviceCertificate, SignedDeviceRoster, parse_mls_client_id,
+        roster_checkpoint, validate_device_roster,
     },
     ids::{AccountId, DeviceId, UserId},
     mls::EncryptedRoomDescriptor,
@@ -88,6 +88,12 @@ struct PolicyState {
     /// Certificates in the current authority-signed roster, used for all new
     /// MLS membership decisions.
     devices: HashMap<Vec<u8>, CertifiedDevice>,
+    /// Highest authenticated roster revision installed for each account.
+    ///
+    /// The delivery service can replay an older, still-valid signed roster.
+    /// Keeping this checkpoint prevents such a replay from reactivating a
+    /// revoked credential in the MLS authorization view.
+    rosters: HashMap<AccountId, RosterCheckpoint>,
     rooms: HashMap<Vec<u8>, EncryptedRoomDescriptor>,
 }
 
@@ -122,7 +128,18 @@ impl ChattIdentityProvider {
     pub fn install_roster(&self, roster: &SignedDeviceRoster) -> Result<(), PolicyError> {
         validate_device_roster(roster, &self.server_id, roster.body.user_id)
             .map_err(PolicyError::InvalidRoster)?;
+        let checkpoint = roster_checkpoint(roster);
         let mut state = self.state.write().map_err(|_| PolicyError::LockPoisoned)?;
+        if let Some(current) = state.rosters.get(&roster.body.account_id) {
+            if *current == checkpoint {
+                return Ok(());
+            }
+            if checkpoint.revision <= current.revision {
+                return Err(PolicyError::InvalidRoster(
+                    "device roster revision rolls back or equivocates".to_string(),
+                ));
+            }
+        }
         state
             .devices
             .retain(|_, device| device.account_id != roster.body.account_id);
@@ -131,6 +148,15 @@ impl ChattIdentityProvider {
             let device = certified_device(certificate);
             state.devices.insert(client_id, device);
         }
+        state.rosters.insert(roster.body.account_id, checkpoint);
+        debug_assert_eq!(
+            state
+                .devices
+                .values()
+                .filter(|device| device.account_id == roster.body.account_id)
+                .count(),
+            roster.body.active_devices.len(),
+        );
         Ok(())
     }
 
@@ -144,6 +170,20 @@ impl ChattIdentityProvider {
             .rooms
             .insert(descriptor.mls_group_id.clone(), descriptor);
         Ok(())
+    }
+
+    /// Returns the room descriptors currently published to MLS policy.
+    /// Server recovery uses this to verify that speculative validation never
+    /// leaked a descriptor into the live authorization view.
+    pub fn room_descriptors(&self) -> Result<Vec<EncryptedRoomDescriptor>, PolicyError> {
+        Ok(self
+            .state
+            .read()
+            .map_err(|_| PolicyError::LockPoisoned)?
+            .rooms
+            .values()
+            .cloned()
+            .collect())
     }
 
     fn certificate_for(
@@ -604,7 +644,33 @@ mod tests {
         second.body.revision = 2;
         second = sign_device_roster(second.body, &[1; 32]).unwrap();
         identities.install_roster(&second).unwrap();
+        identities.install_roster(&second).unwrap();
         assert!(!identities.is_active(&old_identity).unwrap());
+        let current_identity = signing_identity(&second);
+        assert!(identities.is_active(&current_identity).unwrap());
+        assert!(matches!(
+            identities.install_roster(&first),
+            Err(PolicyError::InvalidRoster(message))
+                if message.contains("rolls back")
+        ));
+        assert!(!identities.is_active(&old_identity).unwrap());
+        assert!(identities.is_active(&current_identity).unwrap());
+
+        let mut equivocation = roster(
+            server,
+            UserId(1),
+            &[1; 32],
+            DeviceId([3; 16]),
+            &[13; 32],
+        );
+        equivocation.body.revision = 2;
+        let equivocation = sign_device_roster(equivocation.body, &[1; 32]).unwrap();
+        assert!(matches!(
+            identities.install_roster(&equivocation),
+            Err(PolicyError::InvalidRoster(message))
+                if message.contains("equivocates")
+        ));
+        assert!(identities.is_active(&current_identity).unwrap());
         assert_eq!(
             identities
                 .account_for_client(basic_client_id(&old_identity).unwrap())

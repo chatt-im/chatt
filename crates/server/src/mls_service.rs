@@ -218,7 +218,7 @@ impl MlsService {
             return Err("MLS device id is already owned by another account".to_string());
         }
         validate_key_packages(&packages)?;
-        self.validate_fresh_key_packages(&packages)?;
+        self.validate_fresh_key_packages(&roster, &packages)?;
         if packages.is_empty()
             || packages
                 .iter()
@@ -377,12 +377,13 @@ impl MlsService {
             .rosters
             .get(&user_id)
             .ok_or_else(|| "account has no MLS device roster".to_string())?;
-        if !roster
+        let certificate = roster
             .body
             .active_devices
             .iter()
-            .any(|certificate| certificate.body.device_id == device_id)
-            || packages
+            .find(|certificate| certificate.body.device_id == device_id)
+            .ok_or_else(|| "KeyPackages do not belong to an active session device".to_string())?;
+        if packages
                 .iter()
                 .any(|package| package.device_id != device_id)
         {
@@ -392,9 +393,13 @@ impl MlsService {
         let mut batch_hashes = HashSet::new();
         let mut new_packages = Vec::new();
         for package in packages {
-            self.validator
-                .key_package_reference(&package.package)
+            let (_, client_id) = self
+                .validator
+                .validate_key_package(&package.package)
                 .map_err(|error| error.to_string())?;
+            if client_id != certificate.body.mls_client_id {
+                return Err("KeyPackage credential does not match its device".to_string());
+            }
             let hash = key_package_hash(&package.package);
             if self.retired_key_packages.contains(&hash) {
                 return Err("KeyPackage was already consumed".to_string());
@@ -458,13 +463,33 @@ impl MlsService {
 
     fn validate_fresh_key_packages(
         &self,
+        roster: &SignedDeviceRoster,
         packages: &[PublishedKeyPackage],
     ) -> Result<(), String> {
+        let identities = ChattIdentityProvider::new(self.server_id.clone());
+        for current in self.rosters.values() {
+            identities
+                .install_roster(current)
+                .map_err(|error| error.to_string())?;
+        }
+        identities
+            .install_roster(roster)
+            .map_err(|error| error.to_string())?;
+        let validator = PublicGroupValidator::new(identities);
         let mut hashes = HashSet::new();
         for package in packages {
-            self.validator
-                .key_package_reference(&package.package)
+            let certificate = roster
+                .body
+                .active_devices
+                .iter()
+                .find(|certificate| certificate.body.device_id == package.device_id)
+                .ok_or_else(|| "KeyPackage does not name a device in the roster".to_string())?;
+            let (_, client_id) = validator
+                .validate_key_package(&package.package)
                 .map_err(|error| error.to_string())?;
+            if client_id != certificate.body.mls_client_id {
+                return Err("KeyPackage credential does not match its device".to_string());
+            }
             let hash = key_package_hash(&package.package);
             if self.retired_key_packages.contains(&hash) {
                 return Err("KeyPackage was already consumed".to_string());
@@ -493,11 +518,6 @@ impl MlsService {
     ) -> Result<u64, String> {
         descriptor.validate()?;
         validate_commit_bundle(&bundle)?;
-        if let Some(welcome) = &bundle.welcome {
-            self.validator
-                .validate_welcome(&welcome.welcome)
-                .map_err(|error| error.to_string())?;
-        }
         if bundle
             .welcome
             .as_ref()
@@ -521,16 +541,30 @@ impl MlsService {
                 return Err("encrypted room roster checkpoint is stale".to_string());
             }
         }
-        let before = self.snapshot();
-        self.identities
+        // Initial-commit validation needs the descriptor installed in its
+        // MLS policy. Keep that speculative state isolated: publishing it to
+        // the live provider before validation would let every rejected room
+        // attempt leak a caller-chosen group id into long-lived policy state.
+        let validation_identities = ChattIdentityProvider::new(self.server_id.clone());
+        for roster in self.rosters.values() {
+            validation_identities
+                .install_roster(roster)
+                .map_err(|error| error.to_string())?;
+        }
+        validation_identities
             .install_room(descriptor.clone())
             .map_err(|error| error.to_string())?;
+        let validation_validator = PublicGroupValidator::new(validation_identities.clone());
+        if let Some(welcome) = &bundle.welcome {
+            validation_validator
+                .validate_welcome(&welcome.welcome)
+                .map_err(|error| error.to_string())?;
+        }
         let prior = bundle
             .prior_group_info
             .as_deref()
             .ok_or_else(|| "room creation is missing prior GroupInfo".to_string())?;
-        let parent = self
-            .validator
+        let parent = validation_validator
             .observe_group_info(prior)
             .map_err(|error| error.to_string())?;
         if parent.epoch != 0 || parent.group_id != descriptor.mls_group_id {
@@ -539,8 +573,7 @@ impl MlsService {
         if parent.member_client_ids.as_slice() != [creator_client_id] {
             return Err("room creation parent must contain only the authenticated creator".to_string());
         }
-        let applied = self
-            .validator
+        let applied = validation_validator
             .apply_commit(&parent, &bundle)
             .map_err(|error| error.to_string())?;
         Self::validate_added_key_packages(
@@ -552,22 +585,38 @@ impl MlsService {
         if applied.committer_client_id != creator_client_id {
             return Err("initial commit was not signed by the authenticated device".to_string());
         }
-        Self::validate_room_accounts(&self.identities, &descriptor, &next)?;
+        Self::validate_room_accounts(&validation_identities, &descriptor, &next)?;
         Self::validate_welcome_targets(
-            &self.identities,
+            &validation_identities,
             &parent,
             &next,
             &applied.committer_client_id,
             &bundle,
         )?;
         let sequence = 1;
-        if let Some(welcome) = &bundle.welcome {
-            let delivery_id = self.next_welcome_delivery_id;
-            self.next_welcome_delivery_id = self.next_welcome_delivery_id.saturating_add(1);
+        let welcome_delivery = bundle
+            .welcome
+            .as_ref()
+            .map(|welcome| {
+                let delivery_id = self.next_welcome_delivery_id;
+                let next_delivery_id = self
+                .next_welcome_delivery_id
+                .checked_add(1)
+                .ok_or_else(|| "MLS Welcome delivery id is exhausted".to_string())?;
+                Ok::<_, String>((delivery_id, next_delivery_id, welcome.clone()))
+            })
+            .transpose()?;
+
+        let before = self.snapshot();
+        self.identities
+            .install_room(descriptor.clone())
+            .map_err(|error| error.to_string())?;
+        if let Some((delivery_id, next_delivery_id, welcome)) = welcome_delivery {
+            self.next_welcome_delivery_id = next_delivery_id;
             self.welcomes.push(StoredWelcome {
                 delivery_id,
                 sequence,
-                bundle: welcome.clone(),
+                bundle: welcome,
             });
         }
         self.used_key_packages
@@ -700,7 +749,10 @@ impl MlsService {
             .ok_or_else(|| "MLS delivery sequence is exhausted".to_string())?;
         if let Some(welcome) = &bundle.welcome {
             let delivery_id = self.next_welcome_delivery_id;
-            self.next_welcome_delivery_id = self.next_welcome_delivery_id.saturating_add(1);
+            self.next_welcome_delivery_id = self
+                .next_welcome_delivery_id
+                .checked_add(1)
+                .ok_or_else(|| "MLS Welcome delivery id is exhausted".to_string())?;
             self.welcomes.push(StoredWelcome {
                 delivery_id,
                 sequence,
@@ -970,17 +1022,25 @@ impl MlsService {
 
     fn restore(&mut self, state: DurableState) -> Result<(), String> {
         let identities = ChattIdentityProvider::new(self.server_id.clone());
+        let roster_count = state.rosters.len();
         let rosters: HashMap<_, _> = state.rosters.into_iter().collect();
+        if rosters.len() != roster_count {
+            return Err("persisted MLS state contains duplicate roster users".to_string());
+        }
         for roster in rosters.values() {
             identities
                 .install_roster(roster)
                 .map_err(|error| format!("invalid persisted MLS roster: {error}"))?;
         }
+        let room_count = state.rooms.len();
         let rooms: HashMap<_, _> = state
             .rooms
             .into_iter()
             .map(|room| (room.descriptor.room_id, room))
             .collect();
+        if rooms.len() != room_count {
+            return Err("persisted MLS state contains duplicate room ids".to_string());
+        }
         for room in rooms.values() {
             identities
                 .install_room(room.descriptor.clone())
@@ -1016,14 +1076,133 @@ impl MlsService {
                 }
             }
         }
-        Ok(())
+        self.validate_invariants()
     }
 
     fn persist(&self) -> Result<(), String> {
+        debug_assert!(
+            self.validate_invariants().is_ok(),
+            "in-memory MLS service state violated its structural invariants"
+        );
         let Some(path) = &self.state_path else {
             return Ok(());
         };
         atomic_write(path, &jsony::to_binary(&self.snapshot()))
+    }
+
+    fn validate_invariants(&self) -> Result<(), String> {
+        if !self.used_key_packages.is_subset(&self.issued_key_packages) {
+            return Err("MLS KeyPackage usage is inconsistent".to_string());
+        }
+        for (device_id, packages) in &self.key_packages {
+            if packages.len() > MAX_KEY_PACKAGES_PER_DEVICE {
+                return Err("MLS device has too many queued KeyPackages".to_string());
+            }
+            if !self.device_owners.contains_key(device_id) {
+                return Err("MLS KeyPackage queue has no device owner".to_string());
+            }
+        }
+        let mut account_ids = HashSet::new();
+        for (user_id, roster) in &self.rosters {
+            if !account_ids.insert(roster.body.account_id) {
+                return Err("MLS rosters reuse an account id".to_string());
+            }
+            for certificate in &roster.body.active_devices {
+                if certificate.body.user_id != *user_id
+                    || self.device_owners.get(&certificate.body.device_id) != Some(user_id)
+                {
+                    return Err("MLS roster device ownership is inconsistent".to_string());
+                }
+            }
+        }
+        let mut credential_devices = HashSet::new();
+        for credential in &self.credentials {
+            if !credential_devices.insert(credential.device_id)
+                || self.device_owners.get(&credential.device_id) != Some(&credential.user_id)
+            {
+                return Err("MLS device credential ownership is inconsistent".to_string());
+            }
+        }
+        let policy_rooms = self
+            .identities
+            .room_descriptors()
+            .map_err(|error| error.to_string())?;
+        if policy_rooms.len() != self.rooms.len()
+            || policy_rooms.iter().any(|descriptor| {
+                self.rooms
+                    .get(&descriptor.room_id)
+                    .is_none_or(|room| room.descriptor != *descriptor)
+            })
+        {
+            return Err("MLS policy room descriptors do not match durable rooms".to_string());
+        }
+        for (room_id, room) in &self.rooms {
+            if room.descriptor.room_id != *room_id {
+                return Err("MLS room map key does not match its descriptor".to_string());
+            }
+            if room.events.first().map(MlsDeliveryEvent::sequence) != Some(1)
+                || room.events.windows(2).any(|events| {
+                    events[0].sequence().checked_add(1) != Some(events[1].sequence())
+                })
+            {
+                return Err("MLS room delivery sequence is not contiguous".to_string());
+            }
+            let mut event_ids = HashMap::new();
+            let mut last_commit_epoch = None;
+            for event in &room.events {
+                match event {
+                    MlsDeliveryEvent::Application {
+                        sequence,
+                        epoch,
+                        event_id,
+                        ..
+                    } => {
+                        if *epoch > room.public_state.epoch
+                            || event_ids.insert(*event_id, *sequence).is_some()
+                        {
+                            return Err("MLS room application index is inconsistent".to_string());
+                        }
+                    }
+                    MlsDeliveryEvent::Commit {
+                        parent_epoch,
+                        epoch,
+                        ..
+                    } => {
+                        if parent_epoch.checked_add(1) != Some(*epoch) {
+                            return Err("MLS room commit epoch is not consecutive".to_string());
+                        }
+                        last_commit_epoch = Some(*epoch);
+                    }
+                }
+            }
+            if event_ids != room.event_ids
+                || last_commit_epoch != Some(room.public_state.epoch)
+            {
+                return Err("MLS room public state does not match its event log".to_string());
+            }
+        }
+        let mut previous_delivery_id = 0;
+        for welcome in &self.welcomes {
+            if welcome.delivery_id <= previous_delivery_id
+                || welcome.delivery_id >= self.next_welcome_delivery_id
+            {
+                return Err("MLS Welcome delivery ids are not strictly ordered".to_string());
+            }
+            let room = self
+                .rooms
+                .get(&welcome.bundle.descriptor.room_id)
+                .ok_or_else(|| "MLS Welcome references an unknown room".to_string())?;
+            if room.descriptor != welcome.bundle.descriptor
+                || !room.events.iter().any(|event| {
+                    matches!(event, MlsDeliveryEvent::Commit { sequence, .. }
+                        if *sequence == welcome.sequence)
+                })
+            {
+                return Err("MLS Welcome does not match its room commit".to_string());
+            }
+            previous_delivery_id = welcome.delivery_id;
+        }
+        Ok(())
     }
 
     fn mark_initialized(&mut self, user_id: UserId) -> Result<(), String> {
@@ -1344,6 +1523,19 @@ mod tests {
             .generate_key_packages(bob.bootstrap.device_id, 1)
             .unwrap()
             .remove(0);
+        let mut mislabeled_package = published_package.clone();
+        mislabeled_package.device_id = alice.bootstrap.device_id;
+        assert!(
+            service
+                .publish_key_packages(
+                    UserId(1),
+                    alice.bootstrap.device_id,
+                    vec![mislabeled_package],
+                )
+                .unwrap_err()
+                .contains("credential does not match")
+        );
+        assert_eq!(service.key_package_count(alice.bootstrap.device_id), 0);
         service
             .publish_key_packages(
                 UserId(2),
@@ -1631,6 +1823,8 @@ mod tests {
                 )
                 .is_err()
         );
+        service.validate_invariants().unwrap();
+        assert!(service.identities.room_descriptors().unwrap().is_empty());
         let state = service
             .create_room(
                 alice.bootstrap.account_id,

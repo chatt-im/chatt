@@ -2736,6 +2736,10 @@ struct OutgoingUpload {
 struct UploadSeal {
     content_key: KeyMaterial,
     event_id: EventId,
+    /// The server has durably assigned the announcement a delivery sequence.
+    /// File relay must not start before this, or its offer can overtake the
+    /// MLS event carrying the authenticated key and metadata.
+    announcement_delivered: bool,
     digest: [u8; 32],
     /// The encoding of the sealed payloads, hidden from the server behind
     /// [`FileContentEncoding::Sealed`].
@@ -3429,6 +3433,14 @@ impl WorkerState {
         let Some(front) = self.outgoing_uploads.front() else {
             return WakeIntent::Idle;
         };
+        if !front.started
+            && front
+                .seal
+                .as_ref()
+                .is_some_and(|seal| !seal.announcement_delivered)
+        {
+            return WakeIntent::Idle;
+        }
         let pending = front.body.pending().len();
         if upload_ready_now(front, pending, &self.upload_throttle) {
             WakeIntent::Now
@@ -4495,9 +4507,9 @@ impl WorkerState {
         if descriptor.is_none() && !self.room_requires_mls(room_id) {
             return Ok(None);
         }
-        if descriptor.is_none() || !self.mls_bound {
+        if self.mls.is_none() {
             return Err(
-                "cannot send file: encrypted room MLS setup is not ready".to_string(),
+                "cannot send file: this installation has no encrypted-room identity".to_string(),
             );
         }
         let mut content_key = [0u8; KEY_LEN];
@@ -4525,6 +4537,7 @@ impl WorkerState {
                 bytes: content_key,
             },
             event_id,
+            announcement_delivered: false,
             digest,
             inner_encoding,
             counter: 0,
@@ -4609,6 +4622,14 @@ impl WorkerState {
         };
 
         if !upload.started {
+            if upload
+                .seal
+                .as_ref()
+                .is_some_and(|seal| !seal.announcement_delivered)
+            {
+                self.outgoing_uploads.push_front(upload);
+                return Ok(false);
+            }
             // Sealed uploads advertise a placeholder name and the Padmé size
             // class; the real metadata rides only inside the MLS event.
             let (name, size, encoding, mls_event_id) = match &upload.seal {
@@ -6442,6 +6463,7 @@ impl WorkerState {
                 installation
                     .client
                     .accept_pending_commit(&descriptor, 1)?;
+                self.queue_pending_mls_outbox()?;
                 self.queue_control(ClientControl::FetchMlsEvents {
                     room_id,
                     after_sequence: 1,
@@ -6509,6 +6531,7 @@ impl WorkerState {
                         limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
                     })?;
                 }
+                self.queue_pending_mls_outbox()?;
             }
             ServerControl::MlsEvents { room_id, mut events } => {
                 if self.pending_mls_commits.contains_key(&room_id) {
@@ -6517,6 +6540,11 @@ impl WorkerState {
                     // remove this client even when its external replacement
                     // was the winner. The outcome path advances or refetches
                     // from the authoritative cursor.
+                    kvlog::info!(
+                        "MLS delivery deferred behind pending commit",
+                        room_id = room_id.0,
+                        event_count = events.len(),
+                    );
                     return Ok(());
                 }
                 let missing_rosters = self.missing_mls_room_rosters(room_id)?;
@@ -6541,7 +6569,16 @@ impl WorkerState {
                     return Ok(());
                 };
                 events.sort_by_key(rpc::mls::MlsDeliveryEvent::sequence);
+                debug_assert!(events.windows(2).all(|window| {
+                    window[0].sequence() < window[1].sequence()
+                }), "MLS delivery response repeated a sequence");
                 let cursor = installation.client.cursor(room_id)?;
+                kvlog::info!(
+                    "MLS delivery batch processing",
+                    room_id = room_id.0,
+                    cursor,
+                    event_count = events.len(),
+                );
                 events.retain(|event| event.sequence() > cursor);
                 if let Some(first) = events.first()
                     && first.sequence() != cursor.saturating_add(1)
@@ -6554,6 +6591,7 @@ impl WorkerState {
                     return Ok(());
                 }
                 let mut opened = Vec::new();
+                let mut recovered_outgoing = Vec::new();
                 let mut saw_commit = false;
                 for event in &events {
                     match installation
@@ -6572,6 +6610,7 @@ impl WorkerState {
                         }
                         chatt_mls::ProcessedDelivery::Outgoing { sequence, event } => {
                             if let Some(event) = event {
+                                recovered_outgoing.push(event.event_id);
                                 opened.push((sequence, event));
                             }
                         }
@@ -6592,6 +6631,9 @@ impl WorkerState {
                 } else {
                     None
                 };
+                for event_id in recovered_outgoing {
+                    self.mark_mls_upload_announcement_delivered(room_id, event_id);
+                }
                 for (sequence, event) in opened {
                     self.emit_mls_chatt_event(event, sequence)?;
                 }
@@ -6628,8 +6670,26 @@ impl WorkerState {
                         let should_emit = installation
                             .client
                             .mark_outgoing_delivered(room_id, event_id, sequence)?;
+                        let cursor = installation.client.cursor(room_id)?;
+                        kvlog::info!(
+                            "MLS application acknowledgement persisted",
+                            room_id = room_id.0,
+                            sequence,
+                            cursor,
+                            should_emit,
+                        );
+                        self.mark_mls_upload_announcement_delivered(room_id, event_id);
                         if should_emit {
                             self.emit_mls_chatt_event(entry.event, sequence)?;
+                        } else {
+                            let after_sequence = cursor;
+                            if after_sequence < sequence {
+                                self.queue_control(ClientControl::FetchMlsEvents {
+                                    room_id,
+                                    after_sequence,
+                                    limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
+                                })?;
+                            }
                         }
                     }
                     rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { current_epoch } => {
@@ -6716,17 +6776,32 @@ impl WorkerState {
                     }
                     rpc::mls::MlsCommitOutcome::MissingKeyPackage { .. }
                     | rpc::mls::MlsCommitOutcome::TemporarilyBlocked => {
+                        let mut resume_outbox = false;
+                        let mut refetch_group_info = false;
                         if let Some(pending) = self.pending_mls_commits.remove(&room_id)
                             && let Some(installation) = self.mls.as_ref()
                         {
                             match pending {
                                 PendingMlsCommit::MemberUpdate(descriptor) => {
                                     installation.client.reject_pending_commit(&descriptor)?;
+                                    resume_outbox = true;
                                 }
                                 PendingMlsCommit::ExternalRejoin(_) => {
                                     installation.client.reject_external_rejoin(room_id)?;
+                                    refetch_group_info = true;
                                 }
                             }
+                        }
+                        if refetch_group_info {
+                            self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
+                        }
+                        if resume_outbox {
+                            // The server did not append this commit. Once the
+                            // speculative local state is rolled back, queued
+                            // applications are safe to encrypt at the still-
+                            // current epoch instead of waiting forever for a
+                            // commit that will never enter the ordered stream.
+                            self.queue_pending_mls_outbox()?;
                         }
                         let _ = self.events.send(NetworkEvent::Status(
                             "MLS membership update is waiting for current device state"
@@ -6740,23 +6815,34 @@ impl WorkerState {
                         // cursor. Roll back the pending state and process the
                         // ordered winner; this is room-scoped, not a network
                         // session failure.
+                        let mut resume_outbox = false;
+                        let mut refetch_events = false;
                         if let Some(pending) = self.pending_mls_commits.remove(&room_id)
                             && let Some(installation) = self.mls.as_ref()
                         {
                             match pending {
                                 PendingMlsCommit::MemberUpdate(descriptor) => {
                                     installation.client.reject_pending_commit(&descriptor)?;
+                                    resume_outbox = true;
+                                    refetch_events = true;
                                 }
                                 PendingMlsCommit::ExternalRejoin(_) => {
                                     installation.client.reject_external_rejoin(room_id)?;
                                 }
                             }
+                        }
+                        if refetch_events
+                            && let Some(installation) = self.mls.as_ref()
+                        {
                             let after_sequence = installation.client.cursor(room_id)?;
                             self.queue_control(ClientControl::FetchMlsEvents {
                                 room_id,
                                 after_sequence,
                                 limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
                             })?;
+                        }
+                        if resume_outbox {
+                            self.queue_pending_mls_outbox()?;
                         }
                         let _ = self.events.send(NetworkEvent::Status(
                             "MLS membership changed concurrently; applying the winning update"
@@ -6816,6 +6902,7 @@ impl WorkerState {
                         after_sequence: 1,
                         limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
                     })?;
+                    self.queue_pending_mls_outbox()?;
                     return Ok(());
                 }
                 if let Some(PendingMlsCommit::MemberUpdate(pending_descriptor)) =
@@ -7101,15 +7188,10 @@ impl WorkerState {
         let Some(installation) = self.mls.as_ref() else {
             return Ok(false);
         };
-        let Some(descriptor) = installation.client.descriptor(room_id)? else {
-            if self.room_requires_mls(room_id) {
-                let _ = self.events.send(NetworkEvent::Status(
-                    "encrypted room setup is still waiting for device KeyPackages".to_string(),
-                ));
-                return Ok(true);
-            }
+        let descriptor = installation.client.descriptor(room_id)?;
+        if descriptor.is_none() && !self.room_requires_mls(room_id) {
             return Ok(false);
-        };
+        }
         let event_id = random_event_id()?;
         installation.client.queue_outgoing(rpc::mls::MlsChattEvent {
             version: rpc::mls::MLS_PROTOCOL_VERSION,
@@ -7119,6 +7201,13 @@ impl WorkerState {
             timestamp_ms: unix_now_ms(),
             content,
         })?;
+        let Some(descriptor) = descriptor else {
+            let _ = self.events.send(NetworkEvent::Status(
+                "encrypted message queued while room setup waits for device KeyPackages"
+                    .to_string(),
+            ));
+            return Ok(true);
+        };
         if !self.mls_bound {
             let _ = self.events.send(NetworkEvent::Status(
                 "encrypted message queued until the MLS device is bound".to_string(),
@@ -7161,21 +7250,7 @@ impl WorkerState {
             .mls
             .as_ref()
             .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        let descriptor = installation
-            .client
-            .descriptor(room_id)?
-            .ok_or_else(|| "encrypted room MLS setup is not ready".to_string())?;
-        if !self.mls_bound {
-            return Err("local MLS device is not bound".to_string());
-        }
-        if self.pending_mls_commits.contains_key(&room_id)
-            || installation.client.has_pending_commit(&descriptor)?
-        {
-            return Err(
-                "cannot send file while encrypted room membership is being reconciled"
-                    .to_string(),
-            );
-        }
+        let descriptor = installation.client.descriptor(room_id)?;
         installation.client.queue_outgoing(rpc::mls::MlsChattEvent {
             version: rpc::mls::MLS_PROTOCOL_VERSION,
             room_id,
@@ -7184,6 +7259,27 @@ impl WorkerState {
             timestamp_ms: unix_now_ms(),
             content,
         })?;
+        let Some(descriptor) = descriptor else {
+            let _ = self.events.send(NetworkEvent::Status(
+                "encrypted file queued while room setup waits for device KeyPackages"
+                    .to_string(),
+            ));
+            return Ok(());
+        };
+        if !self.mls_bound {
+            let _ = self.events.send(NetworkEvent::Status(
+                "encrypted file queued until the MLS device is bound".to_string(),
+            ));
+            return Ok(());
+        }
+        if self.pending_mls_commits.contains_key(&room_id)
+            || installation.client.has_pending_commit(&descriptor)?
+        {
+            let _ = self.events.send(NetworkEvent::Status(
+                "encrypted file queued while room membership is reconciled".to_string(),
+            ));
+            return Ok(());
+        }
         let (epoch, ciphertext) = installation
             .client
             .encrypt_outgoing(&descriptor, event_id)?;
@@ -7193,6 +7289,26 @@ impl WorkerState {
             event_id,
             ciphertext,
         })
+    }
+
+    fn mark_mls_upload_announcement_delivered(
+        &mut self,
+        room_id: RoomId,
+        event_id: EventId,
+    ) {
+        let mut matched = 0;
+        for upload in &mut self.outgoing_uploads {
+            if upload.room_id == room_id
+                && let Some(seal) = upload
+                    .seal
+                    .as_mut()
+                    .filter(|seal| seal.event_id == event_id)
+            {
+                seal.announcement_delivered = true;
+                matched += 1;
+            }
+        }
+        debug_assert!(matched <= 1, "one MLS event unlocked multiple file uploads");
     }
 
     fn emit_mls_chatt_event(
@@ -7302,10 +7418,11 @@ impl WorkerState {
         let (expected_epoch, bundle) = installation
             .client
             .prepare_external_rejoin(&pending.descriptor, &pending.group_info)?;
-        self.pending_mls_commits.insert(
+        let replaced = self.pending_mls_commits.insert(
             room_id,
             PendingMlsCommit::ExternalRejoin(pending.descriptor),
         );
+        debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
         self.queue_control(ClientControl::SubmitCommitBundle {
             room_id,
             expected_epoch,
@@ -7503,10 +7620,11 @@ impl WorkerState {
         }
         for (descriptor, expected_epoch, bundle) in maintenance {
             let room_id = descriptor.room_id;
-            self.pending_mls_commits.insert(
+            let replaced = self.pending_mls_commits.insert(
                 room_id,
                 PendingMlsCommit::MemberUpdate(descriptor),
             );
+            debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
             self.queue_control(ClientControl::SubmitCommitBundle {
                 room_id,
                 expected_epoch,
@@ -7524,10 +7642,9 @@ impl WorkerState {
         for entry in installation.client.pending_outbox()? {
             let room_id = entry.event.room_id;
             let event_id = entry.event.event_id;
-            let descriptor = installation
-                .client
-                .descriptor(room_id)?
-                .ok_or_else(|| "MLS outbox room descriptor is missing".to_string())?;
+            let Some(descriptor) = installation.client.descriptor(room_id)? else {
+                continue;
+            };
             if self.pending_mls_commits.contains_key(&room_id)
                 || installation.client.has_pending_commit(&descriptor)?
             {
@@ -7684,8 +7801,10 @@ impl WorkerState {
         let initial_commit = installation
             .client
             .create_room(&descriptor, &pending.packages)?;
-        self.pending_mls_commits
+        let replaced = self
+            .pending_mls_commits
             .insert(room_id, PendingMlsCommit::MemberUpdate(descriptor.clone()));
+        debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
         self.queue_control(ClientControl::CreateEncryptedRoom {
             descriptor,
             roster_checkpoints: pending.checkpoints,
@@ -9018,8 +9137,13 @@ fn upload_should_flush_source_read_ahead(
 }
 
 fn upload_ready_now(upload: &OutgoingUpload, pending: usize, throttle: &UploadThrottle) -> bool {
-    !upload.started
-        || (!upload.source_finished
+    if !upload.started {
+        return upload
+            .seal
+            .as_ref()
+            .is_none_or(|seal| seal.announcement_delivered);
+    }
+    (!upload.source_finished
             && pending < MAX_QUEUED_FILE_BYTES
             && upload_source_read_capacity(upload, throttle) > 0)
         || upload_should_flush_source_read_ahead(upload, throttle)
@@ -9131,6 +9255,7 @@ fn random_event_id() -> Result<rpc::ids::EventId, String> {
 }
 
 fn mls_message_id(sequence: u64) -> MessageId {
+    debug_assert_eq!(sequence & (1 << 63), 0, "MLS delivery sequence exhausted its message-id namespace");
     MessageId(sequence | (1 << 63))
 }
 
@@ -10852,6 +10977,52 @@ mod tests {
         assert_eq!(wire_budget, 0);
         assert_eq!(incoming.body.sink().decoded, 4096);
         assert_eq!(incoming.pending_wire_offset, 4096);
+    }
+
+    #[test]
+    fn sealed_upload_waits_for_canonical_mls_announcement() {
+        let source = tempfile::tempfile().unwrap();
+        let event_id = EventId([7; 16]);
+        let mut upload = OutgoingUpload {
+            transfer_id: FileTransferId(1),
+            server_metadata: None,
+            room_id: RoomId(1),
+            name: "sealed.bin".to_string(),
+            size: 0,
+            file: source,
+            source_offset: 0,
+            source_read_ahead: 0,
+            wire_offset: 0,
+            source_prefix: Vec::new(),
+            source_prefix_offset: 0,
+            body: UploadBody::Identity(PendingWire::default()),
+            source_finished: true,
+            encoder_finished: false,
+            started: false,
+            next_status_at: 0,
+            local_copy: None,
+            dimensions: None,
+            image_prefix: Vec::new(),
+            seal: Some(UploadSeal {
+                content_key: KeyMaterial {
+                    id: 1,
+                    bytes: [3; KEY_LEN],
+                },
+                event_id,
+                announcement_delivered: false,
+                digest: [4; 32],
+                inner_encoding: FileContentEncoding::Identity,
+                counter: 0,
+                stream_len: 0,
+                pad_remaining: None,
+                mls_event_id: event_id,
+            }),
+        };
+        let throttle = UploadThrottle::new(0);
+
+        assert!(!upload_ready_now(&upload, 0, &throttle));
+        upload.seal.as_mut().unwrap().announcement_delivered = true;
+        assert!(upload_ready_now(&upload, 0, &throttle));
     }
 
     #[test]

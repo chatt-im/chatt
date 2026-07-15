@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     path::Path,
@@ -18,7 +18,7 @@ use std::{
 use rpc::{
     control::decode_device_link_ticket,
     crypto::dev_server_seed_hex,
-    ids::{DeviceId, RoomId, StreamId, UserId},
+    ids::{DeviceId, MessageId, RoomId, StreamId, UserId},
 };
 use server::{
     Server,
@@ -136,6 +136,78 @@ struct Client {
     handle: NetworkClient,
     events: mpsc::Receiver<AppEvent>,
     backlog: RefCell<VecDeque<NetworkEvent>>,
+    observed_mls_messages: RefCell<HashMap<(RoomId, MessageId), crate::e2e::AuthenticatedChat>>,
+    last_mls_sequence: RefCell<HashMap<RoomId, u64>>,
+}
+
+impl Client {
+    fn observe_network_event(&self, event: &NetworkEvent) {
+        let NetworkEvent::Chat(chat) = event else {
+            return;
+        };
+        let message_id = chat.message.message_id;
+        if message_id.0 & (1 << 63) == 0 {
+            return;
+        }
+        let room_id = chat.message.room_id;
+        let sequence = message_id.0 & !(1 << 63);
+        assert!(
+            self.observed_mls_messages
+                .borrow_mut()
+                .insert((room_id, message_id), chat.clone())
+                .is_none(),
+            "client emitted MLS message {} in room {} more than once",
+            message_id.0,
+            room_id.0,
+        );
+        let previous = self
+            .last_mls_sequence
+            .borrow_mut()
+            .insert(room_id, sequence);
+        assert!(
+            previous.is_none_or(|previous| previous < sequence),
+            "client emitted MLS room {} out of order: sequence {sequence} after {previous:?}",
+            room_id.0,
+        );
+    }
+
+    fn pending_statuses(&self) -> Vec<String> {
+        self.backlog
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                NetworkEvent::Status(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn observed_mls_chats(&self) -> Vec<(u64, String)> {
+        let mut chats = self
+            .observed_mls_messages
+            .borrow()
+            .values()
+            .map(|chat| (chat.message.message_id.0, chat.message.body.clone()))
+            .collect::<Vec<_>>();
+        chats.sort_unstable();
+        chats
+    }
+
+    fn assert_never_observed_chat(&self, body: &str) {
+        assert!(
+            self.observed_mls_messages
+                .borrow()
+                .values()
+                .all(|chat| chat.message.body != body),
+            "client observed MLS message {body:?} outside its permitted history window",
+        );
+        assert!(
+            self.backlog.borrow().iter().all(
+                |event| !matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body)
+            ),
+            "client retained MLS message {body:?} outside its permitted history window",
+        );
+    }
 }
 
 static LIVE_MLS_E2E: Mutex<()> = Mutex::new(());
@@ -221,7 +293,13 @@ fn config(addrs: &Addrs, root: &Path, name: &str, token: &str, receive: bool) ->
 fn spawn(config: ClientConfig) -> Client {
     let (tx, events) = mpsc::channel();
     let handle = NetworkClient::spawn(config, NetworkEventSender::for_test(tx)).unwrap();
-    Client { handle, events, backlog: RefCell::new(VecDeque::new()) }
+    Client {
+        handle,
+        events,
+        backlog: RefCell::new(VecDeque::new()),
+        observed_mls_messages: RefCell::new(HashMap::new()),
+        last_mls_sequence: RefCell::new(HashMap::new()),
+    }
 }
 
 fn wait_event<F>(client: &Client, label: &str, timeout: Duration, mut predicate: F) -> NetworkEvent
@@ -233,9 +311,16 @@ where F: FnMut(&NetworkEvent) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.checked_duration_since(Instant::now())
-            .unwrap_or_else(|| panic!("{label}: timed out"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: timed out; statuses: {:?}; observed MLS chats: {:?}",
+                    client.pending_statuses(),
+                    client.observed_mls_chats(),
+                )
+            });
         match client.events.recv_timeout(remaining) {
             Ok(AppEvent::Network(event)) => {
+                client.observe_network_event(&event);
                 match &event {
                     NetworkEvent::AuthFailed { message, .. }
                     | NetworkEvent::WorkerStopped { reason: message }
@@ -246,7 +331,11 @@ where F: FnMut(&NetworkEvent) -> bool {
                 client.backlog.borrow_mut().push_back(event);
             }
             Ok(_) => {}
-            Err(error) => panic!("{label}: {error}"),
+            Err(error) => panic!(
+                "{label}: {error}; statuses: {:?}; observed MLS chats: {:?}",
+                client.pending_statuses(),
+                client.observed_mls_chats(),
+            ),
         }
     }
 }
@@ -330,36 +419,20 @@ fn spawn_pair_response_loss_proxy(server_addr: &str) -> (String, thread::JoinHan
     (addr, worker)
 }
 
-fn send_until_received(sender: &Client, receiver: &Client, room: RoomId, body: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut next_send = Instant::now();
-    loop {
-        let backlog_match = receiver.backlog.borrow().iter().position(|event| {
-            matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body)
-        });
-        if let Some(index) = backlog_match {
-            receiver.backlog.borrow_mut().remove(index);
-            return;
-        }
-        let now = Instant::now();
-        if now >= next_send {
-            sender.handle.try_send(NetworkCommand::SendChat { room_id: room, body: body.into() }).unwrap();
-            next_send = now + Duration::from_millis(250);
-        }
-        let slice = deadline
-            .checked_duration_since(now)
-            .unwrap_or_else(|| panic!("message {body:?} was not delivered"))
-            .min(next_send.saturating_duration_since(now));
-        match receiver.events.recv_timeout(slice) {
-            Ok(AppEvent::Network(NetworkEvent::Chat(chat))) if chat.message.body == body => return,
-            Ok(AppEvent::Network(NetworkEvent::AuthFailed { message, .. })) => panic!("auth failed: {message}"),
-            Ok(AppEvent::Network(NetworkEvent::WorkerStopped { reason })) => panic!("worker stopped: {reason}"),
-            Ok(AppEvent::Network(NetworkEvent::Error(message))) => panic!("network error: {message}"),
-            Ok(AppEvent::Network(event)) => receiver.backlog.borrow_mut().push_back(event),
-            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(error) => panic!("receiver disconnected: {error}"),
-        }
-    }
+fn send_until_received(
+    sender: &Client,
+    receiver: &Client,
+    room: RoomId,
+    body: &str,
+) -> crate::e2e::AuthenticatedChat {
+    sender
+        .handle
+        .try_send(NetworkCommand::SendChat {
+            room_id: room,
+            body: body.into(),
+        })
+        .unwrap();
+    wait_chat(receiver, body)
 }
 
 fn wait_revoked(client: &Client, label: &str) {
@@ -377,19 +450,80 @@ fn wait_revoked(client: &Client, label: &str) {
             .checked_duration_since(Instant::now())
             .unwrap_or_else(|| panic!("{label}: revoked device remained usable"));
         match client.events.recv_timeout(remaining) {
-            Ok(AppEvent::Network(NetworkEvent::LocalIdentityUnavailable { message }))
-                if message.contains("revoked") => return,
-            Ok(AppEvent::Network(NetworkEvent::AuthFailed { code: 401, .. })) => return,
+            Ok(AppEvent::Network(event)) => {
+                client.observe_network_event(&event);
+                match event {
+                    NetworkEvent::LocalIdentityUnavailable { message }
+                        if message.contains("revoked") => return,
+                    NetworkEvent::AuthFailed { code: 401, .. } => return,
+                    _ => {}
+                }
+            }
             Ok(_) => {}
             Err(error) => panic!("{label}: {error}"),
         }
     }
 }
 
-fn wait_chat(client: &Client, body: &str) {
-    wait_event(client, body, Duration::from_secs(10), |event| {
+fn wait_chat(client: &Client, body: &str) -> crate::e2e::AuthenticatedChat {
+    wait_chat_labeled(client, body, body)
+}
+
+fn wait_chat_labeled(
+    client: &Client,
+    body: &str,
+    label: &str,
+) -> crate::e2e::AuthenticatedChat {
+    let event = wait_event(client, label, Duration::from_secs(10), |event| {
         matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body)
     });
+    let NetworkEvent::Chat(chat) = event else {
+        unreachable!()
+    };
+    chat
+}
+
+fn assert_same_chat(
+    expected: &crate::e2e::AuthenticatedChat,
+    observed: &crate::e2e::AuthenticatedChat,
+    body: &str,
+) {
+    assert_eq!(
+        observed.message, expected.message,
+        "MLS message {body:?} differed between installations",
+    );
+}
+
+fn send_to_all(
+    sender: &Client,
+    receivers: &[&Client],
+    room: RoomId,
+    body: &str,
+) -> crate::e2e::AuthenticatedChat {
+    if receivers.is_empty() {
+        panic!("send_to_all requires at least one receiver")
+    }
+    sender
+        .handle
+        .try_send(NetworkCommand::SendChat {
+            room_id: room,
+            body: body.into(),
+        })
+        .unwrap();
+    let mut expected = None;
+    for (index, receiver) in receivers.iter().enumerate() {
+        let observed = wait_chat_labeled(
+            receiver,
+            body,
+            &format!("{body} receiver {index}"),
+        );
+        if let Some(expected) = &expected {
+            assert_same_chat(expected, &observed, body);
+        } else {
+            expected = Some(observed);
+        }
+    }
+    expected.unwrap()
 }
 
 fn restart_client(client: Client, config: &ClientConfig, label: &str) -> Client {
@@ -465,15 +599,11 @@ fn wait_room_upsert(client: &Client, room_id: RoomId, label: &str) {
 }
 
 fn send_alice_to_all(sender: &Client, primary: &Client, linked: &Client, bob: &Client, room: RoomId, body: &str) {
-    send_until_received(sender, bob, room, body);
-    send_until_received(sender, primary, room, body);
-    send_until_received(sender, linked, room, body);
+    send_to_all(sender, &[bob, primary, linked], room, body);
 }
 
 fn send_bob_to_all(bob: &Client, primary: &Client, linked: &Client, room: RoomId, body: &str) {
-    send_until_received(bob, primary, room, body);
-    send_until_received(bob, linked, room, body);
-    send_until_received(bob, bob, room, body);
+    send_to_all(bob, &[primary, linked, bob], room, body);
 }
 
 fn join_voice(client: &Client, room_id: RoomId, user_id: UserId) -> StreamId {
@@ -524,20 +654,25 @@ fn relay_voice(sender: &Client, receiver: &Client, stream_id: StreamId, payload:
             .unwrap_or_else(|| panic!("voice stream {} was not relayed", stream_id.0))
             .min(Duration::from_millis(100));
         match receiver.events.recv_timeout(slice) {
-            Ok(AppEvent::Network(NetworkEvent::VoicePacketObserved {
-                stream_id: observed,
-                payload_size,
-            })) if observed == stream_id.0 && payload_size == payload.len() => return,
-            Ok(AppEvent::Network(NetworkEvent::AuthFailed { message, .. })) => {
-                panic!("voice receiver authentication failed: {message}")
+            Ok(AppEvent::Network(event)) => {
+                receiver.observe_network_event(&event);
+                match event {
+                    NetworkEvent::VoicePacketObserved {
+                        stream_id: observed,
+                        payload_size,
+                    } if observed == stream_id.0 && payload_size == payload.len() => return,
+                    NetworkEvent::AuthFailed { message, .. } => {
+                        panic!("voice receiver authentication failed: {message}")
+                    }
+                    NetworkEvent::WorkerStopped { reason } => {
+                        panic!("voice receiver stopped: {reason}")
+                    }
+                    NetworkEvent::Error(message) => {
+                        panic!("voice receiver failed: {message}")
+                    }
+                    event => receiver.backlog.borrow_mut().push_back(event),
+                }
             }
-            Ok(AppEvent::Network(NetworkEvent::WorkerStopped { reason })) => {
-                panic!("voice receiver stopped: {reason}")
-            }
-            Ok(AppEvent::Network(NetworkEvent::Error(message))) => {
-                panic!("voice receiver failed: {message}")
-            }
-            Ok(AppEvent::Network(event)) => receiver.backlog.borrow_mut().push_back(event),
             Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(error) => panic!("voice receiver disconnected: {error}"),
         }
@@ -709,14 +844,16 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
     let mut pre_link_bodies = Vec::new();
     if case.pre_link_message_from_alice {
         let body = format!("pre-link Alice {:04x}", case.bits);
-        send_until_received(&primary, &bob, room_id.unwrap(), &body);
-        wait_chat(&primary, &body);
+        let expected = send_until_received(&primary, &bob, room_id.unwrap(), &body);
+        let observed = wait_chat(&primary, &body);
+        assert_same_chat(&expected, &observed, &body);
         pre_link_bodies.push(body);
     }
     if case.pre_link_message_from_bob {
         let body = format!("pre-link Bob {:04x}", case.bits);
-        send_until_received(&bob, &primary, room_id.unwrap(), &body);
-        wait_chat(&bob, &body);
+        let expected = send_until_received(&bob, &primary, room_id.unwrap(), &body);
+        let observed = wait_chat(&bob, &body);
+        assert_same_chat(&expected, &observed, &body);
         pre_link_bodies.push(body);
     }
 
@@ -772,15 +909,20 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
     // This delivery is also a membership barrier: pairing is not considered
     // settled until the linked installation has externally joined the room.
     let joined = format!("linked membership barrier {:04x}", case.bits);
-    send_bob_to_all(&bob, &primary, &linked, room_id, &joined);
+    send_alice_to_all(&linked, &primary, &linked, &bob, room_id, &joined);
+    for body in &pre_link_bodies {
+        linked.assert_never_observed_chat(body);
+    }
     if case.linked_offline_for_first_message {
         drop(linked);
         let offline = format!("linked offline {:04x}", case.bits);
-        send_until_received(&bob, &primary, room_id, &offline);
-        wait_chat(&bob, &offline);
+        let expected = send_until_received(&bob, &primary, room_id, &offline);
+        let observed = wait_chat(&bob, &offline);
+        assert_same_chat(&expected, &observed, &offline);
         linked = spawn(linked_config.clone());
         wait_authenticated(&linked, "matrix linked offline restart");
-        wait_chat(&linked, &offline);
+        let observed = wait_chat(&linked, &offline);
+        assert_same_chat(&expected, &observed, &offline);
     }
 
     if case.restart_primary_before_text {
@@ -816,9 +958,16 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
                 body: bob_text.clone(),
             })
             .unwrap();
+        let mut expected = None;
         for client in [&primary, &linked, &bob] {
-            wait_chat(client, &alice_text);
-            wait_chat(client, &bob_text);
+            let observed_alice = wait_chat(client, &alice_text);
+            let observed_bob = wait_chat(client, &bob_text);
+            if let Some((expected_alice, expected_bob)) = &expected {
+                assert_same_chat(expected_alice, &observed_alice, &alice_text);
+                assert_same_chat(expected_bob, &observed_bob, &bob_text);
+            } else {
+                expected = Some((observed_alice, observed_bob));
+            }
         }
     } else {
         send_alice_to_all(alice_sender, &primary, &linked, &bob, room_id, &alice_text);
@@ -1122,11 +1271,17 @@ fn mls_live_maximum_linked_devices_receive_crossed_message_burst() {
     let room_id = open_dm(&alice);
     wait_room_upsert(&bob, room_id, "fanout Bob room");
     let barrier = "fanout membership barrier";
-    send_until_received(&alice, &alice, room_id, barrier);
-    send_until_received(&alice, &bob, room_id, barrier);
-    for client in alice_linked.iter().chain(&bob_linked) {
-        send_until_received(&alice, client, room_id, barrier);
-    }
+    let barrier_receivers = std::iter::once(&alice)
+        .chain(&alice_linked)
+        .chain(std::iter::once(&bob))
+        .chain(&bob_linked)
+        .collect::<Vec<_>>();
+    send_to_all(
+        bob_linked.last().unwrap(),
+        &barrier_receivers,
+        room_id,
+        barrier,
+    );
 
     let mut bodies = Vec::with_capacity(rpc::identity::MAX_ACTIVE_DEVICES * 2);
     bodies.push(format!("fanout-event-{:02}-{}", 0, "x".repeat(32)));
@@ -1173,15 +1328,32 @@ fn mls_live_maximum_linked_devices_receive_crossed_message_burst() {
             .unwrap();
     }
 
-    for receiver in std::iter::once(&alice)
+    let mut canonical = HashMap::new();
+    for (receiver_index, receiver) in std::iter::once(&alice)
         .chain(&alice_linked)
         .chain(std::iter::once(&bob))
         .chain(&bob_linked)
+        .enumerate()
     {
         for body in &bodies {
-            wait_chat(receiver, body);
+            let observed = wait_chat_labeled(
+                receiver,
+                body,
+                &format!("fanout receiver {receiver_index} waiting for {body}"),
+            );
+            if let Some(expected) = canonical.get(body) {
+                assert_same_chat(expected, &observed, body);
+            } else {
+                canonical.insert(body.clone(), observed);
+            }
         }
+        assert_eq!(
+            receiver.observed_mls_chats().len(),
+            bodies.len() + 1,
+            "fanout receiver {receiver_index} observed an unexpected MLS chat count",
+        );
     }
+    assert_eq!(canonical.len(), bodies.len());
 }
 
 #[test]
@@ -1229,12 +1401,24 @@ fn mls_live_fixed_group_three_accounts_with_heterogeneous_devices() {
         "group-Alice-second",
         "Alice group second",
     );
+    send_to_all(
+        &alice_second,
+        &[&alice, &alice_second, &bob, &carol],
+        GROUP_ROOM,
+        "Alice second joined fixed group",
+    );
     let alice_third = link_device(
         &addrs,
         &root,
         &alice,
         "group-Alice-third",
         "Alice group third",
+    );
+    send_to_all(
+        &alice_third,
+        &[&alice, &alice_second, &alice_third, &bob, &carol],
+        GROUP_ROOM,
+        "Alice third joined fixed group",
     );
     let bob_second = link_device(
         &addrs,
@@ -1252,14 +1436,13 @@ fn mls_live_fixed_group_three_accounts_with_heterogeneous_devices() {
         &bob_second,
         &carol,
     ];
+    send_to_all(&bob_second, &receivers, GROUP_ROOM, "Bob second joined fixed group");
     for (sender, body) in [
         (&alice, "fixed group from Alice"),
         (&bob, "fixed group from Bob"),
         (&carol, "fixed group from Carol"),
     ] {
-        for receiver in receivers {
-            send_until_received(sender, receiver, GROUP_ROOM, body);
-        }
+        send_to_all(sender, &receivers, GROUP_ROOM, body);
     }
 }
 
@@ -1509,7 +1692,12 @@ fn mls_live_pair_close_cancel_future_history_and_revocation() {
         "Alice linked",
     );
     assert_ne!(linked_device, original_alice_device);
-    send_until_received(&bob, &linked, room_id, "future after pairing");
+    send_to_all(
+        &linked,
+        &[&linked, &bob],
+        room_id,
+        "future after pairing",
+    );
 
     // Reopen the original installation, revoke it from the linked device, and
     // prove the affected room automatically removes the old leaf and resumes.
@@ -1573,7 +1761,7 @@ fn mls_live_revocation_exhaustive_matrix() {
         std::fs::create_dir_all(root.join("server")).unwrap();
         let addrs = start_server(&root);
         let alice_config = config(&addrs, &root, "Alice", ALICE_TOKEN, false);
-        let bob_config = config(&addrs, &root, "Bob", BOB_TOKEN, false);
+        let bob_config = config(&addrs, &root, "Bob", BOB_TOKEN, bits == 0);
         let alice = spawn(alice_config);
         let bob = spawn(bob_config);
         wait_authenticated(&alice, "revocation alice");
@@ -1609,13 +1797,12 @@ fn mls_live_revocation_exhaustive_matrix() {
                 alice.handle.try_send(NetworkCommand::OpenDm(UserId(2))).unwrap();
                 let opened = wait_event(&alice, "post-link dm", Duration::from_secs(10), |event| matches!(event, NetworkEvent::DmOpened { .. }));
                 let NetworkEvent::DmOpened { room_id, .. } = opened else { unreachable!() };
-                send_until_received(&alice, &bob, room_id, &format!("post-link {bits}"));
                 room_id
             }
         };
-        send_until_received(
-            &bob,
+        send_to_all(
             victim.as_ref().unwrap(),
+            &[victim.as_ref().unwrap(), &alice, &bob],
             room_id,
             &format!("victim joined {bits}"),
         );
@@ -1627,12 +1814,44 @@ fn mls_live_revocation_exhaustive_matrix() {
         }
 
         alice.handle.try_send(NetworkCommand::RevokeE2eDevice { device_id: victim_id }).unwrap();
-        send_until_received(&alice, &bob, room_id, &format!("after revoke {bits}"));
+        let queued_file = if bits == 0 {
+            let payload = b"file announcement queued behind revocation".repeat(4096);
+            let source = root.join("queued-behind-revocation.bin");
+            std::fs::write(&source, &payload).unwrap();
+            alice
+                .handle
+                .try_send(NetworkCommand::UploadFile {
+                    room_id: Some(room_id),
+                    request: UploadFileRequest::new(source),
+                })
+                .unwrap();
+            Some(payload)
+        } else {
+            None
+        };
+        let after_revoke = format!("after revoke {bits}");
+        send_until_received(&alice, &bob, room_id, &after_revoke);
+        if let Some(payload) = queued_file {
+            let received = wait_event(
+                &bob,
+                "file queued behind revocation",
+                Duration::from_secs(20),
+                |event| matches!(event, NetworkEvent::FileReceived { .. }),
+            );
+            let NetworkEvent::FileReceived { served_name, .. } = received else {
+                unreachable!()
+            };
+            assert_eq!(
+                std::fs::read(root.join("bob-downloads").join(served_name)).unwrap(),
+                payload,
+            );
+        }
         let revoked = match victim {
             Some(victim) => victim,
             None => spawn(victim_config),
         };
         wait_revoked(&revoked, &format!("revocation case {bits}"));
+        revoked.assert_never_observed_chat(&after_revoke);
     }
 }
 
@@ -1653,6 +1872,14 @@ fn mls_live_competing_membership_commits_roll_back_loser_and_resume() {
         "compete-Alice-second",
         "competing Alice second",
     );
+    let room_id = open_dm(&alice);
+    wait_room_upsert(&bob, room_id, "competing Bob room");
+    send_to_all(
+        &alice_second,
+        &[&alice, &alice_second, &bob],
+        room_id,
+        "competing Alice second joined",
+    );
     let (alice_victim, victim_id) = link_device_with_id(
         &addrs,
         &root,
@@ -1660,11 +1887,12 @@ fn mls_live_competing_membership_commits_roll_back_loser_and_resume() {
         "compete-Alice-victim",
         "competing Alice victim",
     );
-    let room_id = open_dm(&alice);
-    wait_room_upsert(&bob, room_id, "competing Bob room");
-    for receiver in [&alice, &alice_second, &alice_victim, &bob] {
-        send_until_received(&alice, receiver, room_id, "competing commit barrier");
-    }
+    send_to_all(
+        &alice_victim,
+        &[&alice, &alice_second, &alice_victim, &bob],
+        room_id,
+        "competing commit barrier",
+    );
     alice
         .handle
         .try_send(NetworkCommand::RevokeE2eDevice {
