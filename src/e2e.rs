@@ -283,50 +283,6 @@ impl E2eState {
         self.local_user_persisted = false;
     }
 
-    pub(crate) fn pending_account_reset(
-        &self,
-        server_public_key: &[u8],
-        user_id: UserId,
-    ) -> Result<Option<LocalE2eIdentity>, String> {
-        let data_dir = self.data_dir.as_deref().ok_or_else(|| {
-            "HOME is not set; cannot load a staged E2E account reset".to_string()
-        })?;
-        LocalE2eIdentity::pending_account_reset(data_dir, server_public_key, user_id)
-    }
-
-    pub(crate) fn prepare_account_reset(
-        &self,
-        server_public_key: &[u8],
-        user_id: UserId,
-        device_name: &str,
-        account_generation: u64,
-    ) -> Result<LocalE2eIdentity, String> {
-        let data_dir = self.data_dir.as_deref().ok_or_else(|| {
-            "HOME is not set; cannot stage an E2E account reset".to_string()
-        })?;
-        LocalE2eIdentity::prepare_account_reset(
-            data_dir,
-            server_public_key,
-            user_id,
-            device_name,
-            account_generation,
-            &self.rng,
-        )
-    }
-
-    pub(crate) fn install_account_reset(
-        &mut self,
-        identity: LocalE2eIdentity,
-    ) -> Result<(), String> {
-        let identity = identity.commit_account_reset()?;
-        let user_id = identity.user_id();
-        self.device_identity = Some(identity);
-        self.my_id = Some(user_id);
-        self.configured_local_user = Some(user_id);
-        self.local_user_persisted = true;
-        Ok(())
-    }
-
     pub fn account_chain_after(&self, user_id: UserId) -> Option<LedgerHash> {
         let identity = self.device_identity.as_ref()?;
         let statements = if user_id == identity.user_id() {

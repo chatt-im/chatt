@@ -558,6 +558,9 @@ fn pair_device(primary: &mut TestDevice, linked: &mut TestDevice) -> DeviceId {
         transfer_password,
         linked.label.clone(),
         false,
+        std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            crate::client_net::PAIRING_CANCELABLE,
+        )),
         NetworkEventSender::for_test(tx),
     );
     let paired = match rx.recv_timeout(WAIT) {

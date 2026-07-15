@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
+        atomic::{AtomicU8, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -530,7 +531,9 @@ pub enum NetworkCommand {
     },
     ListE2eDevices,
     CreateDeviceLink,
-    ResetE2eAccount,
+    CancelDeviceLink {
+        redemption_secret_hash: Vec<u8>,
+    },
     AcknowledgeSyncedVerificationNotice {
         user_id: UserId,
         account_id: AccountId,
@@ -611,6 +614,7 @@ pub enum NetworkEvent {
         device_id: DeviceId,
     },
     DeviceLinkCreated {
+        redemption_secret_hash: Vec<u8>,
         pairing_string: String,
         transfer_password: String,
         expires_at_ms: u64,
@@ -619,6 +623,7 @@ pub enum NetworkEvent {
         device_id: DeviceId,
         device_name: String,
     },
+    DeviceLinkCanceled,
     DevicePairingSucceeded {
         token: String,
         username: String,
@@ -627,6 +632,10 @@ pub enum NetworkEvent {
         server_public_key: String,
     },
     DevicePairingIdentityExists {
+        message: String,
+        transfer_password: String,
+    },
+    DevicePairingFailed {
         message: String,
         transfer_password: String,
     },
@@ -977,12 +986,17 @@ pub fn spawn_pair_once(
         .expect("failed to spawn pairing worker")
 }
 
+pub(crate) const PAIRING_CANCELABLE: u8 = 0;
+pub(crate) const PAIRING_COMMITTING: u8 = 1;
+pub(crate) const PAIRING_CANCELED: u8 = 2;
+
 pub fn spawn_device_pair_once(
     config: ClientConfig,
     ticket: DeviceLinkTicket,
     transfer_password: String,
     device_name: String,
     overwrite_existing: bool,
+    cancellation: Arc<AtomicU8>,
     events: NetworkEventSender,
 ) -> JoinHandle<()> {
     thread::Builder::new()
@@ -997,6 +1011,7 @@ pub fn spawn_device_pair_once(
                 &transfer_password,
                 &device_name,
                 overwrite_existing,
+                &cancellation,
             ) {
                 Ok((token, username, udp_addr, udp_probe_addr, server_public_key)) => {
                     NetworkEvent::DevicePairingSucceeded {
@@ -1013,7 +1028,10 @@ pub fn spawn_device_pair_once(
                         transfer_password: std::mem::take(&mut transfer_password),
                     }
                 }
-                Err(DevicePairFailure::Other(error)) => NetworkEvent::PairingFailed(error),
+                Err(DevicePairFailure::Other(message)) => NetworkEvent::DevicePairingFailed {
+                    message,
+                    transfer_password: std::mem::take(&mut transfer_password),
+                },
             };
             ticket.redemption_secret.zeroize();
             transfer_password.zeroize();
@@ -1028,6 +1046,7 @@ fn device_pair_once(
     transfer_password: &str,
     device_name: &str,
     overwrite_existing: bool,
+    cancellation: &AtomicU8,
 ) -> Result<(String, String, String, Option<String>, String), DevicePairFailure> {
     let (mut stream, transport, trusted) = connect_and_handshake(config, false)?;
     let mut control = transport.control_record();
@@ -1062,6 +1081,9 @@ fn device_pair_once(
         &trusted,
         &secret_hash,
     )?;
+    if cancellation.load(Ordering::Acquire) == PAIRING_CANCELED {
+        return Err(DevicePairFailure::Other("pairing canceled".to_string()));
+    }
     let data_dir = config.data_dir.as_deref().ok_or_else(|| {
         DevicePairFailure::Other(
             "HOME is not set; cannot store the E2E device identity".to_string(),
@@ -1090,6 +1112,7 @@ fn device_pair_once(
                 data_dir,
                 &trusted,
                 user_id,
+                &secret_hash,
                 device_name,
                 &account_chain,
                 &enrollment,
@@ -1105,6 +1128,18 @@ fn device_pair_once(
             (identity, statement, bearer_token)
         }
     };
+    if cancellation
+        .compare_exchange(
+            PAIRING_CANCELABLE,
+            PAIRING_COMMITTING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        identity.discard_staged_link();
+        return Err(DevicePairFailure::Other("pairing canceled".to_string()));
+    }
     write_blocking_control(
         &mut stream,
         &mut control,
@@ -1486,13 +1521,13 @@ fn run_worker_inner(
         ),
         e2e_bound: false,
         pending_device_link: None,
-        pending_account_reset: None,
         verification_sync_fetching: false,
         verification_sync_put: None,
         verification_sync_retry_at: None,
         deferred_e2e: HashMap::new(),
         deferred_e2e_bytes: 0,
         deferred_e2e_items: 0,
+        deferred_e2e_warned_rooms: HashSet::new(),
         shutdown: false,
         disconnect_reason: None,
         auth_failure: None,
@@ -1780,8 +1815,44 @@ fn connect_and_handshake(
         tcp_addr = %config.tcp_addr,
         username = config.username.as_str()
     );
-    let mut stream = StdTcpStream::connect(config.tcp_addr.as_str())
-        .map_err(|error| format!("failed to connect to server: {error}"))?;
+    let addresses = config
+        .tcp_addr
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve server address: {error}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("server address resolved to no endpoints".to_string());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_error = None;
+    let mut connected = None;
+    for address in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match StdTcpStream::connect_timeout(&address, remaining.min(Duration::from_secs(10))) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let mut stream = connected.ok_or_else(|| {
+        format!(
+            "failed to connect to server: {}",
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "connection deadline exceeded".to_string())
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| format!("failed to set TCP read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| format!("failed to set TCP write timeout: {error}"))?;
     stream
         .set_nodelay(true)
         .map_err(|error| format!("failed to set TCP_NODELAY: {error}"))?;
@@ -2066,13 +2137,15 @@ struct WorkerState {
     e2e: E2eState,
     e2e_bound: bool,
     pending_device_link: Option<PendingCreatedDeviceLink>,
-    pending_account_reset: Option<LocalE2eIdentity>,
     verification_sync_fetching: bool,
     verification_sync_put: Option<PendingVerificationSyncPut>,
     verification_sync_retry_at: Option<Instant>,
     deferred_e2e: HashMap<RoomId, DeferredE2eRoom>,
     deferred_e2e_bytes: usize,
     deferred_e2e_items: usize,
+    /// Rooms already warned about pre-key backlog overflow during this network
+    /// session. Overflow placeholders remain visible without spamming notices.
+    deferred_e2e_warned_rooms: HashSet<RoomId>,
     shutdown: bool,
     disconnect_reason: Option<String>,
     auth_failure: Option<(u16, String)>,
@@ -3982,13 +4055,12 @@ impl WorkerState {
                     transfer_password,
                 });
             }
-            NetworkCommand::ResetE2eAccount => {
-                if let Some(identity) = self.pending_account_reset.as_ref() {
-                    let genesis = identity.reset_genesis();
-                    self.queue_control(ClientControl::ResetE2eAccount { genesis })?;
-                } else {
-                    self.queue_control(ClientControl::BeginE2eAccountReset)?;
-                }
+            NetworkCommand::CancelDeviceLink {
+                redemption_secret_hash,
+            } => {
+                self.queue_control(ClientControl::CancelDeviceLink {
+                    redemption_secret_hash,
+                })?;
             }
             NetworkCommand::SetP2pEnabled(enabled) => {
                 // P2P would bypass an outer secure link, so it stays off in
@@ -6010,6 +6082,16 @@ impl WorkerState {
                         .events
                         .send(NetworkEvent::ShareStartRejected { message });
                 } else {
+                    if code == rpc::control::ERROR_REQUEST_REJECTED
+                        && let Some(user_id) = self.user_id
+                        && !self.e2e_public_only
+                    {
+                        let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
+                            user_id,
+                            after: self.e2e.account_chain_after(user_id),
+                        });
+                        let _ = self.fetch_verification_sync();
+                    }
                     let _ = self.events.send(NetworkEvent::Error(message));
                 }
             }
@@ -6248,59 +6330,23 @@ impl WorkerState {
                 }
                 let mut pending = self.pending_device_link.take().expect("checked above");
                 let _ = self.events.send(NetworkEvent::DeviceLinkCreated {
+                    redemption_secret_hash,
                     pairing_string: std::mem::take(&mut pending.pairing_string),
                     transfer_password: std::mem::take(&mut pending.transfer_password),
                     expires_at_ms,
                 });
             }
-            ServerControl::E2eAccountResetPrepared { account_generation } => {
-                let user_id = self
-                    .user_id
-                    .ok_or_else(|| "account reset prepared before authentication".to_string())?;
-                let identity = self.e2e.prepare_account_reset(
-                    &self.server_public_key,
-                    user_id,
-                    DEFAULT_INITIAL_DEVICE_NAME,
-                    account_generation,
-                )?;
-                let genesis = identity.reset_genesis();
-                self.pending_account_reset = Some(identity);
-                self.queue_control(ClientControl::ResetE2eAccount { genesis })?;
-            }
-            ServerControl::E2eAccountReset {
-                account_id,
-                device_id,
-                key_epoch,
+            ServerControl::DeviceLinkCanceled {
+                redemption_secret_hash,
             } => {
-                let identity = self
-                    .pending_account_reset
-                    .take()
-                    .ok_or_else(|| "server confirmed an unrequested account reset".to_string())?;
-                if identity.account_id() != account_id
-                    || identity.device_id() != device_id
-                    || identity.device_key_epoch() != key_epoch
+                if self
+                    .pending_device_link
+                    .as_ref()
+                    .is_some_and(|pending| pending.secret_hash == redemption_secret_hash)
                 {
-                    self.pending_account_reset = Some(identity);
-                    return Err("server confirmed the wrong replacement identity".to_string());
+                    self.pending_device_link = None;
                 }
-                self.e2e.install_account_reset(identity)?;
-                self.e2e_public_only = false;
-                self.e2e_bound = false;
-                let session_id = self
-                    .session_id
-                    .ok_or_else(|| "account reset completed before session id".to_string())?;
-                let (device_id, key_epoch, ledger_head, signature) =
-                    self.e2e.device_binding(session_id)?;
-                self.queue_control(ClientControl::BindE2eDevice {
-                    device_id,
-                    key_epoch,
-                    ledger_head,
-                    signature,
-                })?;
-                let _ = self.events.send(NetworkEvent::E2eAccountIdentity { account_id });
-                let _ = self.events.send(NetworkEvent::Status(
-                    "encrypted account identity reset; other devices were signed out".to_string(),
-                ));
+                let _ = self.events.send(NetworkEvent::DeviceLinkCanceled);
             }
             ServerControl::DeviceLinkRedeemed {
                 device_id,
@@ -6336,6 +6382,7 @@ impl WorkerState {
         self.session_id = Some(session_id);
         self.user_id = Some(user_id);
         self.active_room = Some(default_room);
+        self.deferred_e2e_warned_rooms.clear();
         self.room_server_rtts.clear();
         kvlog::info!(
             "client authenticated",
@@ -6344,16 +6391,7 @@ impl WorkerState {
             room_count = rooms.len(),
             user_count = users.len()
         );
-        let staged_reset = self
-            .e2e
-            .pending_account_reset(&self.server_public_key, user_id)?;
-        let local_device_is_new = if let Some(identity) = staged_reset {
-            self.e2e.enter_public_only(user_id);
-            self.e2e_public_only = true;
-            self.pending_account_reset = Some(identity);
-            false
-        } else {
-            match self.e2e.initialize_device(
+        let local_device_is_new = match self.e2e.initialize_device(
                 &self.server_public_key,
                 user_id,
                 device_name,
@@ -6364,12 +6402,11 @@ impl WorkerState {
                     self.e2e_public_only = true;
                     let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
                         message: format!(
-                            "{error} Public rooms remain available, but encrypted DMs and device administration are disabled. Preserve the identity file; to recover this installation, move it aside and run /device-pair using a fresh link from another active device, or use /devices reset for a destructive new identity."
+                            "{error} Public rooms remain available, but encrypted DMs and device administration are disabled. Preserve the identity file; to recover this installation, move it aside and run /device-pair using a fresh link from another active device. If no active device remains, the existing encrypted identity and old DMs cannot be recovered."
                         ),
                     });
                     false
                 }
-            }
         };
         self.e2e_bound = false;
         self.user_names.clear();
@@ -6421,11 +6458,7 @@ impl WorkerState {
                 "created a new encrypted account device identity".to_string(),
             ));
         }
-        if let Some(identity) = self.pending_account_reset.as_ref() {
-            self.queue_control(ClientControl::ResetE2eAccount {
-                genesis: identity.reset_genesis(),
-            })?;
-        } else if !self.e2e_public_only {
+        if !self.e2e_public_only {
             let _ = self.queue_control(ClientControl::FetchAccountKeyChain {
                 user_id,
                 after: self.e2e.account_chain_after(user_id),
@@ -6586,19 +6619,69 @@ impl WorkerState {
             .room_id()
             .ok_or_else(|| "encrypted DM data arrived without a room".to_string())?;
         let retained = item.retained_bytes();
-        let room = self.deferred_e2e.entry(room_id).or_default();
-        let room_full = room.items.len() >= MAX_DEFERRED_E2E_ITEMS
-            || room.bytes.saturating_add(retained) > MAX_DEFERRED_E2E_BYTES;
+        let room_full = self.deferred_e2e.get(&room_id).is_some_and(|room| {
+            room.items.len() >= MAX_DEFERRED_E2E_ITEMS
+                || room.bytes.saturating_add(retained) > MAX_DEFERRED_E2E_BYTES
+        });
         let global_full = self.deferred_e2e_items >= MAX_DEFERRED_E2E_GLOBAL_ITEMS
             || self.deferred_e2e_bytes.saturating_add(retained) > MAX_DEFERRED_E2E_GLOBAL_BYTES;
         if room_full || global_full {
-            return Err("encrypted DM pre-key ordering buffer exceeded its bound".to_string());
+            self.degrade_deferred_e2e(room_id, item);
+            return Ok(());
         }
+        let room = self.deferred_e2e.entry(room_id).or_default();
         room.bytes = room.bytes.saturating_add(retained);
         self.deferred_e2e_bytes = self.deferred_e2e_bytes.saturating_add(retained);
         self.deferred_e2e_items = self.deferred_e2e_items.saturating_add(1);
         room.items.push_back(item);
         Ok(())
+    }
+
+    fn degrade_deferred_e2e(&mut self, room_id: RoomId, item: DeferredE2eInbound) {
+        const PLACEHOLDER: &str =
+            "Encrypted message unavailable while encryption identity keys were loading.";
+        match item {
+            DeferredE2eInbound::Chat(mut message) => {
+                sanitize_unavailable_message(&mut message, PLACEHOLDER);
+                let _ = self.events.send(NetworkEvent::Chat(AuthenticatedChat {
+                    message,
+                    provenance: None,
+                }));
+            }
+            DeferredE2eInbound::History(chunk) => {
+                let messages = chunk
+                    .messages
+                    .into_iter()
+                    .map(|mut message| {
+                        sanitize_unavailable_message(&mut message, PLACEHOLDER);
+                        AuthenticatedChat {
+                            message,
+                            provenance: None,
+                        }
+                    })
+                    .collect();
+                let _ = self.events.send(NetworkEvent::HistoryChunk {
+                    room_id: chunk.room_id,
+                    before: chunk.before,
+                    messages,
+                    at_start: chunk.at_start,
+                    complete: chunk.complete,
+                });
+            }
+            DeferredE2eInbound::FileOffered { file, .. } => {
+                self.skipped_untrusted_files.remove(&file.transfer_id);
+                self.end_transfer_skipped(
+                    &file,
+                    "encryption identity backlog was full".to_string(),
+                );
+            }
+        }
+        if self.deferred_e2e_warned_rooms.insert(room_id) {
+            let _ = self.events.send(NetworkEvent::Error(
+                "Some encrypted DM items were unavailable because identity keys were still loading. The connection remains active."
+                    .to_string(),
+            ));
+        }
     }
 
     fn drain_deferred_e2e_room(&mut self, room_id: RoomId) -> Result<usize, String> {
@@ -8019,7 +8102,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
-        NetworkCommand::ResetE2eAccount => "reset_e2e_account",
+        NetworkCommand::CancelDeviceLink { .. } => "cancel_device_link",
         NetworkCommand::AcknowledgeSyncedVerificationNotice { .. } => {
             "acknowledge_synced_verification_notice"
         }
@@ -8163,8 +8246,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
             "e2e_verification_sync_rate_limited"
         }
         ServerControl::DeviceLinkCreated { .. } => "device_link_created",
-        ServerControl::E2eAccountResetPrepared { .. } => "e2e_account_reset_prepared",
-        ServerControl::E2eAccountReset { .. } => "e2e_account_reset",
+        ServerControl::DeviceLinkCanceled { .. } => "device_link_canceled",
         ServerControl::DeviceLinkBundle { .. } => "device_link_bundle",
         ServerControl::DeviceLinked { .. } => "device_linked",
         ServerControl::DeviceLinkRedeemed { .. } => "device_link_redeemed",

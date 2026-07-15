@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -39,7 +39,8 @@ use crate::{
     },
     client_net::{
         NetworkClient, NetworkCommand, NetworkEvent, TerminalVerb, TransferDirection,
-        UploadFileRequest, spawn_device_pair_once, spawn_open_pair_once, spawn_pair_once,
+        PAIRING_CANCELABLE, PAIRING_CANCELED, PAIRING_COMMITTING, UploadFileRequest,
+        spawn_device_pair_once, spawn_open_pair_once, spawn_pair_once,
     },
     config::{
         self, Config, NotificationSoundMode, ServerEntry, SoundboardClip, ThemeSelection,
@@ -383,6 +384,8 @@ pub(crate) struct App {
     connection_attempt: Option<ConnectionAttempt>,
     next_connection_generation: u64,
     active_network_generation: Option<u64>,
+    next_pairing_attempt: u64,
+    active_pairing_attempt: Option<u64>,
     password_prompt_active: bool,
     pub room: CoreRw<RoomSession>,
     /// The primary terminal's exclusive UI state: composer, scrollback
@@ -404,6 +407,7 @@ pub(crate) struct App {
     voice_left: bool,
 
     pub pending_pair: Option<PendingPair>,
+    pairing_cancellation: Option<Arc<AtomicU8>>,
     /// A pairing attempt whose username the server rejected as taken. Retained so
     /// the reopened server-edit form's Save & Join can retry the same pairing
     /// with the edited username instead of a plain connect.
@@ -788,6 +792,10 @@ pub(crate) enum AppEvent {
     Network(NetworkEvent),
     NetworkFor {
         generation: u64,
+        event: NetworkEvent,
+    },
+    PairingFor {
+        attempt: u64,
         event: NetworkEvent,
     },
     AudioDeviceRefresh(AudioDeviceRefresh),
@@ -1180,6 +1188,7 @@ pub(crate) struct EventSender(pub(crate) Sender<AppEvent>);
 pub(crate) struct NetworkEventSender {
     tx: Sender<AppEvent>,
     generation: Option<u64>,
+    pairing_attempt: Option<u64>,
 }
 
 impl EventSender {
@@ -1194,13 +1203,15 @@ impl EventSender {
         NetworkEventSender {
             tx: self.0.clone(),
             generation: Some(generation),
+            pairing_attempt: None,
         }
     }
 
-    fn for_unscoped_network(&self) -> NetworkEventSender {
+    fn for_pairing(&self, attempt: u64) -> NetworkEventSender {
         NetworkEventSender {
             tx: self.0.clone(),
             generation: None,
+            pairing_attempt: Some(attempt),
         }
     }
 }
@@ -1211,13 +1222,16 @@ impl NetworkEventSender {
         Self {
             tx,
             generation: None,
+            pairing_attempt: None,
         }
     }
 
     pub(crate) fn send(&self, event: NetworkEvent) -> Result<(), mpsc::SendError<AppEvent>> {
-        match self.generation {
-            Some(generation) => self.tx.send(AppEvent::NetworkFor { generation, event }),
-            None => self.tx.send(AppEvent::Network(event)),
+        match (self.generation, self.pairing_attempt) {
+            (Some(generation), None) => self.tx.send(AppEvent::NetworkFor { generation, event }),
+            (None, Some(attempt)) => self.tx.send(AppEvent::PairingFor { attempt, event }),
+            (None, None) => self.tx.send(AppEvent::Network(event)),
+            (Some(_), Some(_)) => unreachable!("event sender has conflicting scopes"),
         }
     }
 }
@@ -1324,6 +1338,8 @@ impl App {
             connection_attempt: None,
             next_connection_generation: 0,
             active_network_generation: None,
+            next_pairing_attempt: 0,
+            active_pairing_attempt: None,
             password_prompt_active: false,
             room: CoreRw::new(room),
             view: CoreMutex::new(view),
@@ -1339,6 +1355,7 @@ impl App {
             requested_voice_room: None,
             voice_left: false,
             pending_pair: None,
+            pairing_cancellation: None,
             username_retry: None,
             mic_muted: Arc::new(AtomicBool::new(false)),
             deafened: Arc::new(AtomicBool::new(false)),
@@ -1741,7 +1758,19 @@ impl App {
             CoreCommand::GenerateDeviceLink => {
                 self.send_network_command(NetworkCommand::CreateDeviceLink, true);
             }
+            CoreCommand::CancelDeviceLink(redemption_secret_hash) => {
+                self.send_network_command(
+                    NetworkCommand::CancelDeviceLink {
+                        redemption_secret_hash,
+                    },
+                    true,
+                );
+            }
             CoreCommand::CancelPairing => self.cancel_open_pairing(),
+            CoreCommand::ClosePairing => {
+                self.password_prompt_active = false;
+                self.pairing_owner = None;
+            }
             CoreCommand::AudioManualReset => self.audio_manual_reset(),
             CoreCommand::ReportBug(description) => self.start_bug_report(description),
             CoreCommand::Quit => self.request_quit(),
@@ -1982,6 +2011,17 @@ impl App {
                     self.handle_network_event(event);
                 } else {
                     kvlog::debug!("ignored stale network event", generation);
+                }
+            }
+            AppEvent::PairingFor { attempt, event } => {
+                if self.active_pairing_attempt == Some(attempt) {
+                    let terminal = pairing_worker_event(&event);
+                    self.handle_network_event(event);
+                    if terminal && self.active_pairing_attempt == Some(attempt) {
+                        self.active_pairing_attempt = None;
+                    }
+                } else {
+                    kvlog::debug!("ignored stale pairing event", attempt);
                 }
             }
             AppEvent::AudioDeviceRefresh(refresh) => self.handle_audio_device_refresh(refresh),
@@ -3332,6 +3372,10 @@ impl App {
     }
 
     fn start_device_pairing_prompt(&mut self, ticket: Option<DeviceLinkTicket>) {
+        if self.active_pairing_attempt.is_some() {
+            self.set_status("a pairing attempt is already in progress; wait for it to finish");
+            return;
+        }
         self.pairing_owner = Some(self.issuing_client);
         self.password_prompt_active = true;
         let pairing_string = ticket
@@ -3347,6 +3391,13 @@ impl App {
         self.set_status("enter the one-time device link details");
     }
 
+    fn begin_pairing_attempt(&mut self) -> NetworkEventSender {
+        self.next_pairing_attempt = self.next_pairing_attempt.wrapping_add(1).max(1);
+        let attempt = self.next_pairing_attempt;
+        self.active_pairing_attempt = Some(attempt);
+        self.events.sender().for_pairing(attempt)
+    }
+
     fn submit_device_pairing(
         &mut self,
         pairing_string: String,
@@ -3354,6 +3405,10 @@ impl App {
         device_name: String,
         overwrite_existing: bool,
     ) {
+        if self.active_pairing_attempt.is_some() {
+            self.set_status("a pairing attempt is already in progress");
+            return;
+        }
         let result = (|| -> Result<(), String> {
             let ticket = rpc::control::decode_device_link_ticket(pairing_string.trim())?;
             let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&ticket.tcp_addr));
@@ -3368,14 +3423,17 @@ impl App {
                 ..ServerEntry::default()
             };
             let client_config = server.client_config(&self.config, self.download_store.clone());
+            let cancellation = Arc::new(AtomicU8::new(PAIRING_CANCELABLE));
             spawn_device_pair_once(
                 client_config,
                 ticket,
                 transfer_password,
                 device_name,
                 overwrite_existing,
-                self.events.sender().for_unscoped_network(),
+                cancellation.clone(),
+                self.begin_pairing_attempt(),
             );
+            self.pairing_cancellation = Some(cancellation);
             self.pending_pair = Some(PendingPair {
                 server,
                 open: None,
@@ -3424,7 +3482,7 @@ impl App {
         spawn_pair_once(
             server.client_config(&self.config, self.download_store.clone()),
             ticket.pairing_code,
-            self.events.sender().for_unscoped_network(),
+            self.begin_pairing_attempt(),
         );
         self.pending_pair = Some(PendingPair {
             server,
@@ -3470,7 +3528,7 @@ impl App {
             server.client_config(&self.config, self.download_store.clone()),
             String::new(),
             recovery_token.clone(),
-            self.events.sender().for_unscoped_network(),
+            self.begin_pairing_attempt(),
         );
         self.pending_pair = Some(PendingPair {
             server,
@@ -3538,7 +3596,7 @@ impl App {
             server.client_config(&self.config, self.download_store.clone()),
             String::new(),
             recovery_token.clone(),
-            self.events.sender().for_unscoped_network(),
+            self.begin_pairing_attempt(),
         );
         self.pending_pair = Some(PendingPair {
             server,
@@ -3615,7 +3673,7 @@ impl App {
             client_config,
             password,
             existing_token,
-            self.events.sender().for_unscoped_network(),
+            self.begin_pairing_attempt(),
         );
         self.set_status(format!("pairing {alias}"));
     }
@@ -3706,6 +3764,23 @@ impl App {
     /// Cancels an in-progress open pairing when the user dismisses the password
     /// prompt.
     pub(crate) fn cancel_open_pairing(&mut self) {
+        if let Some(cancellation) = self.pairing_cancellation.as_ref() {
+            match cancellation.compare_exchange(
+                PAIRING_CANCELABLE,
+                PAIRING_CANCELED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {}
+                Err(PAIRING_COMMITTING) => {
+                    self.set_status("pairing is committing and can no longer be canceled");
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        self.active_pairing_attempt = None;
+        self.pairing_cancellation = None;
         self.password_prompt_active = false;
         self.pairing_owner = None;
         self.navigate_owner(NavigationEvent::CloseOverlay);
@@ -3767,7 +3842,7 @@ impl App {
             client_config,
             String::new(),
             existing_token.clone(),
-            self.events.sender().for_unscoped_network(),
+            self.begin_pairing_attempt(),
         );
         self.pending_pair = Some(PendingPair {
             server,
@@ -3808,7 +3883,7 @@ impl App {
             return false;
         }
         let client_config = server.client_config(&self.config, self.download_store.clone());
-        let events = self.events.sender().for_unscoped_network();
+        let events = self.begin_pairing_attempt();
         let pairing_code = pending.pairing_code.clone();
         let _ = match pairing_code {
             Some(code) => spawn_pair_once(client_config, code, events),
@@ -4761,12 +4836,14 @@ impl App {
                 self.set_error("server is not using native encryption");
             }
             NetworkEvent::DeviceLinkCreated {
+                redemption_secret_hash,
                 pairing_string,
                 transfer_password,
                 expires_at_ms,
             } => {
                 self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::DeviceLink(
                     device_pair::DeviceLinkDialog::new(
+                        redemption_secret_hash,
                         pairing_string,
                         transfer_password,
                         expires_at_ms,
@@ -4783,6 +4860,10 @@ impl App {
                 self.navigate_owner(NavigationEvent::CloseOverlay);
                 self.set_status(format!("device linked: {device_name}"));
             }
+            NetworkEvent::DeviceLinkCanceled => {
+                self.navigate_owner(NavigationEvent::CloseOverlay);
+                self.set_status("device link canceled");
+            }
             NetworkEvent::DevicePairingSucceeded {
                 token,
                 username,
@@ -4790,6 +4871,7 @@ impl App {
                 udp_probe_addr,
                 server_public_key,
             } => {
+                self.pairing_cancellation = None;
                 self.password_prompt_active = false;
                 self.run_as_pairing_owner(|app| {
                     let Some(mut pair) = app.pending_pair.take() else {
@@ -4810,6 +4892,7 @@ impl App {
                 message,
                 transfer_password,
             } => {
+                self.pairing_cancellation = None;
                 if let Some(channel) = self
                     .pairing_owner
                     .and_then(|owner| self.channel_for(owner))
@@ -4823,6 +4906,25 @@ impl App {
                     self.pending_pair.take();
                     self.pairing_owner = None;
                     self.set_error("device pairing confirmation owner is no longer connected");
+                }
+            }
+            NetworkEvent::DevicePairingFailed {
+                message,
+                transfer_password,
+            } => {
+                self.pairing_cancellation = None;
+                if let Some(channel) = self
+                    .pairing_owner
+                    .and_then(|owner| self.channel_for(owner))
+                {
+                    channel.push(TerminalEvent::DevicePairingFailed {
+                        message: message.clone(),
+                        transfer_password,
+                    });
+                    self.set_error(message);
+                } else {
+                    self.pending_pair.take();
+                    self.set_error(message);
                 }
             }
             NetworkEvent::PairingSucceeded => {
@@ -5524,10 +5626,6 @@ impl App {
         if self.pairing_owner == Some(client_id) {
             self.pairing_owner = None;
             self.password_prompt_active = false;
-            self.pending_pair.take();
-            if let Some(pending) = self.username_retry.take() {
-                self.discard_provisional_open_pair(&pending);
-            }
         }
         if self.room.settings_owner != Some(client_id) {
             return;
@@ -7190,15 +7288,6 @@ impl App {
                         .to_string(),
                 );
             }
-            "/devices reset" => {
-                self.set_error(
-                    "This permanently replaces the encrypted account identity, signs out every other device, and makes old DMs unavailable. Run /devices reset CONFIRM to continue."
-                        .to_string(),
-                );
-            }
-            "/devices reset CONFIRM" => {
-                self.send_network_command(NetworkCommand::ResetE2eAccount, true);
-            }
             command if command.starts_with("/devices revoke ") => {
                 let requested = command.trim_start_matches("/devices revoke ").trim();
                 let (encoded, confirmed) = requested
@@ -8840,10 +8929,12 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::E2eDeviceBound { .. } => "e2e_device_bound",
         NetworkEvent::DeviceLinkCreated { .. } => "device_link_created",
         NetworkEvent::DeviceLinkRedeemed { .. } => "device_link_redeemed",
+        NetworkEvent::DeviceLinkCanceled => "device_link_canceled",
         NetworkEvent::DevicePairingSucceeded { .. } => "device_pairing_succeeded",
         NetworkEvent::DevicePairingIdentityExists { .. } => {
             "device_pairing_identity_exists"
         }
+        NetworkEvent::DevicePairingFailed { .. } => "device_pairing_failed",
         NetworkEvent::E2ePeerPinProposed { .. } => "e2e_peer_pin_proposed",
         NetworkEvent::E2eIdentityFetching { .. } => "e2e_identity_fetching",
         NetworkEvent::E2eKeyUnavailable { .. } => "e2e_key_unavailable",
@@ -8879,6 +8970,20 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
     }
 }
 
+fn pairing_worker_event(event: &NetworkEvent) -> bool {
+    matches!(
+        event,
+        NetworkEvent::PairingSucceeded
+            | NetworkEvent::PairingFailed(_)
+            | NetworkEvent::UsernameTaken { .. }
+            | NetworkEvent::OpenPairingSucceeded { .. }
+            | NetworkEvent::OpenPairingNeedsPassword { .. }
+            | NetworkEvent::DevicePairingSucceeded { .. }
+            | NetworkEvent::DevicePairingIdentityExists { .. }
+            | NetworkEvent::DevicePairingFailed { .. }
+    )
+}
+
 fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat { .. } => "send_chat",
@@ -8909,7 +9014,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
-        NetworkCommand::ResetE2eAccount => "reset_e2e_account",
+        NetworkCommand::CancelDeviceLink { .. } => "cancel_device_link",
         NetworkCommand::AcknowledgeSyncedVerificationNotice { .. } => {
             "acknowledge_synced_verification_notice"
         }
@@ -8972,6 +9077,21 @@ mod tests {
             app.pairing_owner,
             Some(crate::client_channel::ClientId::PRIMARY)
         );
+    }
+
+    #[test]
+    fn stale_pairing_worker_event_cannot_replace_current_attempt() {
+        let mut app = test_app();
+        app.active_pairing_attempt = Some(2);
+        app.view.status.set("current pairing");
+
+        app.handle_app_event(AppEvent::PairingFor {
+            attempt: 1,
+            event: NetworkEvent::PairingFailed("stale failure".to_string()),
+        });
+
+        assert_eq!(app.active_pairing_attempt, Some(2));
+        assert_eq!(app.view.status.text(), "current pairing");
     }
 
     #[test]

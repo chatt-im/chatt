@@ -1635,6 +1635,10 @@ impl DevicePairMode {
         match event {
             DevicePairEvent::Consumed => {}
             DevicePairEvent::Cancel => cx.send(CoreCommand::CancelPairing),
+            DevicePairEvent::Close => {
+                cx.send(CoreCommand::ClosePairing);
+                cx.request_transition(ModeTransition::Pop);
+            }
             DevicePairEvent::Submit {
                 pairing_string,
                 transfer_password,
@@ -1704,6 +1708,12 @@ impl AppMode for DevicePairMode {
                 message,
                 transfer_password,
             } => self.dialog.identity_exists(message, transfer_password),
+            crate::client_channel::TerminalEvent::DevicePairingFailed {
+                message,
+                transfer_password,
+            } => self
+                .dialog
+                .device_pairing_failed(message, transfer_password),
             _ => {}
         }
     }
@@ -1733,6 +1743,11 @@ impl DeviceLinkMode {
             DeviceLinkButton::GenerateNew => {
                 cx.send(CoreCommand::GenerateDeviceLink);
                 cx.request_transition(ModeTransition::Pop);
+            }
+            DeviceLinkButton::CancelLink => {
+                cx.send(CoreCommand::CancelDeviceLink(
+                    self.dialog.redemption_secret_hash().to_vec(),
+                ));
             }
             DeviceLinkButton::Close => cx.request_transition(ModeTransition::Pop),
         }
@@ -1954,6 +1969,7 @@ impl AppMode for PasswordPromptMode {
             }
             TerminalEvent::PairingFailed(error) => self.apply_error(error),
             TerminalEvent::DevicePairingIdentityExists { .. } => {}
+            TerminalEvent::DevicePairingFailed { .. } => {}
             TerminalEvent::Navigation(_) => {}
         }
     }

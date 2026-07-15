@@ -87,6 +87,10 @@ pub(crate) enum TerminalEvent {
         message: String,
         transfer_password: String,
     },
+    DevicePairingFailed {
+        message: String,
+        transfer_password: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
