@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use rpc::control::{ChatMessage, RoomInfo, RoomKind};
 use rpc::crypto::{CryptoError, decode_hex, encode_hex};
 use rpc::e2e::{
-    AccountKeyAction, AccountKeyStatement, DeviceKeyStatus, DmContent, DmContentKind,
+    AccountKeyStatement, DeviceKeyStatus, DmContent, DmContentKind,
     DmEventEnvelope, DmPairKeys, DmPlaintext, E2E_PUBLIC_KEY_LEN, E2E_SEED_LEN, EventRecipient,
     RosterCheckpoint, SenderEventHeader, ValidatedAccountLedger, account_statement_hash,
     dm_pair_keys, open_dm_envelope, open_dm_event, seal_dm_envelope, seal_dm_event,
@@ -550,44 +550,6 @@ impl E2eState {
             .as_mut()
             .ok_or_else(|| "local E2E device is unavailable".to_string())?
             .acknowledge_verification_notice(user_id, account_id)
-    }
-
-    pub fn create_device_enrollment(
-        &self,
-        ticket_hash: &[u8],
-    ) -> Result<(Vec<u8>, String), String> {
-        let identity = self
-            .device_identity
-            .as_ref()
-            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
-        crate::device_link::seal_enrollment(identity, ticket_hash, &self.rng)
-    }
-
-    pub fn revoke_device_statement(
-        &self,
-        device_id: rpc::ids::DeviceId,
-    ) -> Result<AccountKeyStatement, String> {
-        let identity = self
-            .device_identity
-            .as_ref()
-            .ok_or_else(|| "local E2E device is unavailable".to_string())?;
-        let ledger = identity.own_ledger();
-        if device_id == identity.device_id() {
-            return Err("cannot revoke the device currently in use".to_string());
-        }
-        if !ledger
-            .device_keys
-            .iter()
-            .any(|key| {
-                key.keys.device_id == device_id && key.status == DeviceKeyStatus::Active
-            })
-        {
-            return Err("cannot revoke an unknown or inactive account device".to_string());
-        }
-        if ledger.active_devices().count() <= 1 {
-            return Err("cannot revoke the account's last active device".to_string());
-        }
-        identity.sign_next_account_action(AccountKeyAction::RevokeDevice { device_id })
     }
 
     pub fn device_descriptions(&self) -> Result<Vec<String>, String> {

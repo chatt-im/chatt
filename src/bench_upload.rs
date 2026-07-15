@@ -200,7 +200,9 @@ fn upload_50mb_loopback() {
     const PAYLOAD_BYTES: usize = 50 * 1024 * 1024;
 
     let mut server = Server::bind(server_config()).expect("bind server");
-    server.seed_users(server_users()).expect("seed benchmark users");
+    server
+        .seed_users(server_users())
+        .expect("seed benchmark users");
     let tcp = server
         .tcp_local_addr()
         .expect("server tcp addr")

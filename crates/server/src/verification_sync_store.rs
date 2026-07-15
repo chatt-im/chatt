@@ -12,8 +12,7 @@ use std::{
 use hashbrown::HashMap;
 use rpc::{
     e2e::{
-        VerificationSyncCheckpoint, decode_verification_sync_envelope,
-        verification_sync_checkpoint,
+        VerificationSyncCheckpoint, decode_verification_sync_envelope, verification_sync_checkpoint,
     },
     ids::UserId,
 };
@@ -45,7 +44,10 @@ impl VerificationSyncStore {
             match fs::read(&path) {
                 Ok(bytes) => {
                     decode_verification_sync_envelope(&bytes).map_err(|_| {
-                        format!("{} contains an invalid verification snapshot", path.display())
+                        format!(
+                            "{} contains an invalid verification snapshot",
+                            path.display()
+                        )
                     })?;
                     self.snapshots.insert(user_id, bytes);
                 }
@@ -55,9 +57,10 @@ impl VerificationSyncStore {
                 }
             }
         }
-        Ok(self.snapshots.get(&user_id).map(|bytes| {
-            (verification_sync_checkpoint(bytes), bytes.clone())
-        }))
+        Ok(self
+            .snapshots
+            .get(&user_id)
+            .map(|bytes| (verification_sync_checkpoint(bytes), bytes.clone())))
     }
 
     pub(crate) fn replace(&mut self, user_id: UserId, envelope: Vec<u8>) -> Result<(), String> {

@@ -425,7 +425,9 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             let pending = if target.is_empty() {
                 crate::app::PendingJoin::Device { ticket: None }
             } else if target.starts_with(rpc::control::DEVICE_LINK_STRING_PREFIX) {
-                eprintln!("warning: passing a device pairing string as an argument may expose it in shell history or process listings");
+                eprintln!(
+                    "warning: passing a device pairing string as an argument may expose it in shell history or process listings"
+                );
                 crate::app::PendingJoin::Device {
                     ticket: Some(rpc::control::decode_device_link_ticket(target)?),
                 }

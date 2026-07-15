@@ -81,7 +81,9 @@ pub(crate) enum NavigationEvent {
 /// Ordered, data-only effects published by the core to one terminal.
 pub(crate) enum TerminalEvent {
     Navigation(NavigationEvent),
-    PairingPasswordChallenge { retry: bool },
+    PairingPasswordChallenge {
+        retry: bool,
+    },
     PairingFailed(String),
     DevicePairingIdentityExists {
         message: String,

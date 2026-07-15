@@ -148,9 +148,7 @@ impl DeviceDirectory {
         statement: AccountKeyStatement,
     ) -> Result<DirectoryAppend, String> {
         let mut accounts = self.accounts.clone();
-        let existing = accounts
-            .iter_mut()
-            .find(|entry| entry.user_id == user_id.0);
+        let existing = accounts.iter_mut().find(|entry| entry.user_id == user_id.0);
         let mut statements = match existing.as_ref() {
             Some(entry) => Self::decode_statements(entry)?,
             None => Vec::new(),
@@ -166,11 +164,8 @@ impl DeviceDirectory {
             _ => None,
         };
         statements.push(statement);
-        let validated = ValidatedAccountLedger::validate(
-            &self.server_public_key,
-            user_id,
-            &statements,
-        )?;
+        let validated =
+            ValidatedAccountLedger::validate(&self.server_public_key, user_id, &statements)?;
         let encoded: Vec<String> = statements
             .iter()
             .map(|statement| encode_hex(&jsony::to_binary(statement)))
@@ -224,10 +219,7 @@ impl DeviceDirectory {
         })
     }
 
-    pub fn credential(
-        &self,
-        token_hash: &str,
-    ) -> Option<(UserId, Option<DeviceId>, u32)> {
+    pub fn credential(&self, token_hash: &str) -> Option<(UserId, Option<DeviceId>, u32)> {
         self.accounts.iter().find_map(|account| {
             account
                 .credentials
@@ -293,9 +285,7 @@ impl DeviceDirectory {
             .iter_mut()
             .find(|credential| credential.token_hash == token_hash)
             .ok_or_else(|| "session credential disappeared".to_string())?;
-        if !credential.device_id.is_empty()
-            && credential.device_id != encode_hex(&device_id.0)
-        {
+        if !credential.device_id.is_empty() && credential.device_id != encode_hex(&device_id.0) {
             return Err("bearer token is bound to another device".to_string());
         }
         credential.device_id = encode_hex(&device_id.0);
@@ -363,11 +353,8 @@ impl DeviceDirectory {
             return Err("device-link account has no device ledger".to_string());
         }
         statements.push(statement);
-        let validated = ValidatedAccountLedger::validate(
-            &self.server_public_key,
-            user_id,
-            &statements,
-        )?;
+        let validated =
+            ValidatedAccountLedger::validate(&self.server_public_key, user_id, &statements)?;
         let device = validated
             .device_keys
             .iter()
@@ -445,7 +432,10 @@ impl DeviceDirectory {
         let mut credential_hashes = HashSet::new();
         for entry in &self.accounts {
             if !users.insert(entry.user_id) {
-                return Err(format!("{source}: duplicate account for user {}", entry.user_id));
+                return Err(format!(
+                    "{source}: duplicate account for user {}",
+                    entry.user_id
+                ));
             }
             let statements = Self::decode_statements(entry)
                 .map_err(|error| format!("{source}: user {}: {error}", entry.user_id))?;
@@ -465,9 +455,7 @@ impl DeviceDirectory {
                     ));
                 }
                 if !credential_hashes.insert(credential.token_hash.as_str()) {
-                    return Err(format!(
-                        "{source}: duplicate device bearer credential"
-                    ));
+                    return Err(format!("{source}: duplicate device bearer credential"));
                 }
                 if !credential.device_id.is_empty()
                     && decode_device_id(&credential.device_id).is_none()
@@ -512,10 +500,7 @@ impl DeviceDirectory {
                     out.push_str(&format!("device-id = \"{}\"\n", credential.device_id));
                 }
                 if credential.password_epoch != 0 {
-                    out.push_str(&format!(
-                        "password-epoch = {}\n",
-                        credential.password_epoch
-                    ));
+                    out.push_str(&format!("password-epoch = {}\n", credential.password_epoch));
                 }
             }
         }
@@ -563,15 +548,11 @@ mod tests {
         let token_hash = crate::config::hash_secret("device-token");
         let device_id = DeviceId([3; 16]);
 
-        let mut directory =
-            DeviceDirectory::open(Some(dir.clone()), server_key.clone()).unwrap();
+        let mut directory = DeviceDirectory::open(Some(dir.clone()), server_key.clone()).unwrap();
         directory
             .add_credential(user_id, token_hash, None, 0)
             .unwrap();
-        let stored_hash = directory
-            .authenticate_credential("device-token")
-            .unwrap()
-            .3;
+        let stored_hash = directory.authenticate_credential("device-token").unwrap().3;
         directory
             .bind_credential(user_id, &stored_hash, device_id)
             .unwrap();

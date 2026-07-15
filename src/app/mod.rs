@@ -2,8 +2,8 @@ pub(crate) mod audio_diagnostics;
 pub(crate) mod audio_supervisor;
 pub(crate) mod command;
 pub(crate) mod commands;
-pub(crate) mod dialogs;
 pub(crate) mod device_pair;
+pub(crate) mod dialogs;
 pub(crate) mod participants;
 pub(crate) mod room;
 pub(crate) mod room_settings;
@@ -38,8 +38,8 @@ use crate::{
         BaseScreen, DirtySections, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
     },
     client_net::{
-        NetworkClient, NetworkCommand, NetworkEvent, TerminalVerb, TransferDirection,
-        PAIRING_CANCELABLE, PAIRING_CANCELED, PAIRING_COMMITTING, UploadFileRequest,
+        NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE, PAIRING_CANCELED,
+        PAIRING_COMMITTING, TerminalVerb, TransferDirection, UploadFileRequest,
         spawn_device_pair_once, spawn_open_pair_once, spawn_pair_once,
     },
     config::{
@@ -3383,10 +3383,7 @@ impl App {
             .and_then(|ticket| rpc::control::encode_device_link_ticket(ticket).ok())
             .unwrap_or_default();
         self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::DevicePair(
-            device_pair::DevicePairDialog::new(
-                pairing_string,
-                self.config.ui.default_bindings,
-            ),
+            device_pair::DevicePairDialog::new(pairing_string, self.config.ui.default_bindings),
         )));
         self.set_status("enter the one-time device link details");
     }
@@ -3445,10 +3442,7 @@ impl App {
             Ok(())
         })();
         if let Err(error) = result {
-            if let Some(channel) = self
-                .pairing_owner
-                .and_then(|owner| self.channel_for(owner))
-            {
+            if let Some(channel) = self.pairing_owner.and_then(|owner| self.channel_for(owner)) {
                 channel.push(TerminalEvent::PairingFailed(error.clone()));
             }
             self.set_error(error);
@@ -4477,9 +4471,8 @@ impl App {
                         .and_then(|bytes| bytes.try_into().ok())
                         .map(rpc::ids::AccountId);
                     if let Some(account_id) = account_id
-                        && let Some((user_id, account_id)) = self
-                            .room
-                            .set_synced_verification_notice(
+                        && let Some((user_id, account_id)) =
+                            self.room.set_synced_verification_notice(
                                 identity.room_id,
                                 identity.user_id,
                                 account_id,
@@ -4506,23 +4499,24 @@ impl App {
                     } else {
                         identity.identity.username.clone()
                     };
-                    self.set_status(if identity.synced_verification_notice
-                        && identity.trust_level
-                            == crate::config::E2eTrustLevel::Verified
-                    {
-                        format!(
-                            "Synced verification for {username} from another account device"
-                        )
-                    } else {
-                        match identity.trust_level {
-                        crate::config::E2eTrustLevel::Accepted => {
-                            format!("Forgot independent verification for {username}")
-                        }
-                        crate::config::E2eTrustLevel::Verified => {
-                            format!("Verified {username}'s encryption identity")
-                        }
-                        }
-                    });
+                    self.set_status(
+                        if identity.synced_verification_notice
+                            && identity.trust_level == crate::config::E2eTrustLevel::Verified
+                        {
+                            format!(
+                                "Synced verification for {username} from another account device"
+                            )
+                        } else {
+                            match identity.trust_level {
+                                crate::config::E2eTrustLevel::Accepted => {
+                                    format!("Forgot independent verification for {username}")
+                                }
+                                crate::config::E2eTrustLevel::Verified => {
+                                    format!("Verified {username}'s encryption identity")
+                                }
+                            }
+                        },
+                    );
                 }
                 let stale_clients: Vec<_> = self
                     .open_e2e_reviews
@@ -4893,9 +4887,7 @@ impl App {
                 transfer_password,
             } => {
                 self.pairing_cancellation = None;
-                if let Some(channel) = self
-                    .pairing_owner
-                    .and_then(|owner| self.channel_for(owner))
+                if let Some(channel) = self.pairing_owner.and_then(|owner| self.channel_for(owner))
                 {
                     channel.push(TerminalEvent::DevicePairingIdentityExists {
                         message,
@@ -4913,9 +4905,7 @@ impl App {
                 transfer_password,
             } => {
                 self.pairing_cancellation = None;
-                if let Some(channel) = self
-                    .pairing_owner
-                    .and_then(|owner| self.channel_for(owner))
+                if let Some(channel) = self.pairing_owner.and_then(|owner| self.channel_for(owner))
                 {
                     channel.push(TerminalEvent::DevicePairingFailed {
                         message: message.clone(),
@@ -5061,6 +5051,9 @@ impl App {
             NetworkEvent::LocalIdentityUnavailable { message } => {
                 self.push_network_notice("e2e", &message);
                 self.set_error(message);
+            }
+            NetworkEvent::Mls(_control) => {
+                kvlog::debug!("MLS transport response", control = ?_control);
             }
             NetworkEvent::WorkerStopped { reason } => {
                 self.stop_audio();
@@ -8931,9 +8924,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::DeviceLinkRedeemed { .. } => "device_link_redeemed",
         NetworkEvent::DeviceLinkCanceled => "device_link_canceled",
         NetworkEvent::DevicePairingSucceeded { .. } => "device_pairing_succeeded",
-        NetworkEvent::DevicePairingIdentityExists { .. } => {
-            "device_pairing_identity_exists"
-        }
+        NetworkEvent::DevicePairingIdentityExists { .. } => "device_pairing_identity_exists",
         NetworkEvent::DevicePairingFailed { .. } => "device_pairing_failed",
         NetworkEvent::E2ePeerPinProposed { .. } => "e2e_peer_pin_proposed",
         NetworkEvent::E2eIdentityFetching { .. } => "e2e_identity_fetching",
@@ -8967,6 +8958,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::ShareAvailable { .. } => "share_available",
         NetworkEvent::ShareEnded { .. } => "share_ended",
         NetworkEvent::ShareStartRejected { .. } => "share_start_rejected",
+        NetworkEvent::Mls(_) => "mls",
     }
 }
 

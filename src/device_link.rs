@@ -1,11 +1,13 @@
 //! Disposable, password-protected enrollment bundles for linking devices.
 
 use argon2_kdf::{Algorithm, Hasher};
+use jsony::Jsony;
 use ring::rand::SecureRandom;
 use rpc::crypto::{KEY_LEN, KeyMaterial, open_in_place_with_aad, seal_in_place_append_tag};
 use zeroize::Zeroizing;
 
-use crate::e2e_store::LocalE2eIdentity;
+use chatt_mls::E2eBootstrap;
+use rpc::identity::SignedDeviceRoster;
 
 const BUNDLE_VERSION: u8 = 2;
 const SALT_LEN: usize = 16;
@@ -22,14 +24,24 @@ const KDF_ITERATIONS: u32 = 18;
 #[cfg(test)]
 const KDF_ITERATIONS: u32 = 1;
 
+#[derive(Clone, Debug, Jsony)]
+#[jsony(Binary, version)]
+pub(crate) struct MlsEnrollment {
+    pub authority_seed: [u8; 32],
+    pub current_roster: SignedDeviceRoster,
+}
+
 pub(crate) fn seal_enrollment(
-    identity: &LocalE2eIdentity,
+    bootstrap: &E2eBootstrap,
     ticket_hash: &[u8],
     rng: &dyn SecureRandom,
 ) -> Result<(Vec<u8>, String), String> {
     seal_plaintext(
-        identity.enrollment_authority()?,
-        identity.server_public_key(),
+        jsony::to_binary(&MlsEnrollment {
+            authority_seed: bootstrap.authority_seed,
+            current_roster: bootstrap.own_roster.clone(),
+        }),
+        &bootstrap.server_public_key,
         ticket_hash,
         rng,
     )
@@ -67,7 +79,7 @@ pub(crate) fn open_enrollment(
     password: &str,
     server_public_key: &[u8],
     ticket_hash: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, String> {
+) -> Result<MlsEnrollment, String> {
     if bundle.len() <= 1 + SALT_LEN || bundle[0] != BUNDLE_VERSION {
         return Err("device enrollment bundle has an unsupported format".to_string());
     }
@@ -83,7 +95,8 @@ pub(crate) fn open_enrollment(
     )
     .map_err(|_| "transfer password is incorrect or the enrollment bundle was altered".to_string())?;
     plaintext.truncate(len);
-    Ok(plaintext)
+    jsony::from_binary(&plaintext)
+        .map_err(|error| format!("invalid MLS device enrollment bundle: {error}"))
 }
 
 pub(crate) fn redemption_secret_hash(secret: &str) -> Vec<u8> {
@@ -158,12 +171,16 @@ mod tests {
         let (bundle, password) =
             seal_plaintext(plaintext.clone(), &server_key, &ticket_hash, &rng).unwrap();
 
-        assert_eq!(
-            open_enrollment(&bundle, &password, &server_key, &ticket_hash)
-                .unwrap()
-                .as_slice(),
-            plaintext
-        );
+        let mut encrypted = Zeroizing::new(bundle[1 + SALT_LEN..].to_vec());
+        let key = derive_key(&password, &bundle[1..1 + SALT_LEN]).unwrap();
+        let len = open_in_place_with_aad(
+            &KeyMaterial { id: 1, bytes: *key },
+            0,
+            &enrollment_aad(&server_key, &ticket_hash),
+            &mut encrypted,
+        )
+        .unwrap();
+        assert_eq!(&encrypted[..len], plaintext);
         assert!(open_enrollment(&bundle, "wrong-password", &server_key, &ticket_hash).is_err());
         assert!(open_enrollment(&bundle, &password, &[8; 32], &ticket_hash).is_err());
     }

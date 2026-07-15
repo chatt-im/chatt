@@ -112,8 +112,8 @@ impl DevicePairDialog {
             }
             FormAction::TextChanged => {
                 self.confirm_overwrite = false;
-                self.feedback = "Details changed; retry pairing to check local identity state"
-                    .to_string();
+                self.feedback =
+                    "Details changed; retry pairing to check local identity state".to_string();
                 self.feedback_error = false;
                 self.drive(theme, FieldIntent::None, event.commit, None);
             }
@@ -401,13 +401,7 @@ impl DeviceLinkDialog {
             .saturating_add(5)
     }
 
-    pub(crate) fn render(
-        &mut self,
-        area: Rect,
-        buf: &mut Buffer,
-        theme: &Theme,
-        now_ms: u64,
-    ) {
+    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme, now_ms: u64) {
         self.now_ms = now_ms;
         self.form.begin_frame(area);
         let mut form = Form::new(
@@ -641,8 +635,14 @@ mod tests {
 
     #[test]
     fn device_link_countdown_rounds_up_and_expires() {
-        assert_eq!(device_link_expiry(70_001, 10_000), "01:01 remaining; one use");
-        assert_eq!(device_link_expiry(70_000, 10_000), "01:00 remaining; one use");
+        assert_eq!(
+            device_link_expiry(70_001, 10_000),
+            "01:01 remaining; one use"
+        );
+        assert_eq!(
+            device_link_expiry(70_000, 10_000),
+            "01:00 remaining; one use"
+        );
         assert_eq!(
             device_link_expiry(70_000, 70_000),
             "Expired — generate a new link"
@@ -707,8 +707,7 @@ mod tests {
     #[test]
     fn standard_bindings_move_through_shared_form_before_submitting() {
         let theme = Theme::tomorrow_night();
-        let mut dialog =
-            DevicePairDialog::new("tcd1_ticket".to_string(), FormBindings::Standard);
+        let mut dialog = DevicePairDialog::new("tcd1_ticket".to_string(), FormBindings::Standard);
         render_pair(&mut dialog, &theme);
 
         dialog.paste("coral-lantern", &theme);
@@ -737,8 +736,7 @@ mod tests {
     #[test]
     fn vim_bindings_drive_the_same_fields_and_actions() {
         let theme = Theme::tomorrow_night();
-        let mut dialog =
-            DevicePairDialog::new("tcd1_ticket".to_string(), FormBindings::Vim);
+        let mut dialog = DevicePairDialog::new("tcd1_ticket".to_string(), FormBindings::Vim);
         render_pair(&mut dialog, &theme);
 
         dialog.paste("coral-lantern", &theme);
@@ -777,8 +775,7 @@ mod tests {
 
     #[test]
     fn existing_identity_requires_explicit_overwrite_submission() {
-        let mut dialog =
-            DevicePairDialog::new("tcd1_ticket".to_string(), FormBindings::Standard);
+        let mut dialog = DevicePairDialog::new("tcd1_ticket".to_string(), FormBindings::Standard);
         dialog.transfer_password = "coral-lantern".to_string();
         dialog.device_name = "Alice's laptop".to_string();
         dialog.identity_exists(

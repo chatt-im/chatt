@@ -3,8 +3,6 @@ mod attach;
 pub mod audio;
 #[cfg(test)]
 mod bench_upload;
-#[cfg(test)]
-mod e2e_test;
 mod bindings;
 mod chat_buffer;
 pub mod cli;
@@ -17,6 +15,8 @@ mod config_diagnostics;
 mod e2e;
 mod e2e_identity;
 mod e2e_store;
+#[cfg(test)]
+mod mls_e2e_test;
 mod device_link;
 mod file_compression;
 mod fuzzy;

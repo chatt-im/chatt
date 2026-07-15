@@ -21,11 +21,12 @@ ring = "0.17.14"
 jsony = "0.1.10"
 rpc.path = "crates/rpc"
 chatt-p2p.path = "crates/p2p"
+chatt-mls.path = "crates/mls"
 darkhttp.path = "crates/darkhttp"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
 sendfd = "0.4.4"
 parking_lot = { version = "0.12.5", features = ["arc_lock"] }
-kvlog = "0.1.5"
+kvlog = { git = "https://github.com/exrok/kvlog", rev = "0e3092abc1a0be07683b42e689a2acef7cf6014b" }
 annotate-snippets = "0.12.10"
 toml-spanner = { version = "1.0.3", features = [
     "to-toml",
@@ -85,6 +86,7 @@ members = [
     "crates/benchmark",
     "crates/p2p",
     "crates/rpc",
+    "crates/mls",
     "crates/server",
     "crates/bwrap",
     "crates/opus-codec",
