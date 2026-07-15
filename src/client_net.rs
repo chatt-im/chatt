@@ -6587,6 +6587,12 @@ impl WorkerState {
                 }
                 if saw_commit && self.mls_bound {
                     self.queue_mls_maintenance()?;
+                    // Application submissions rejected at the old epoch stay
+                    // in the durable outbox as PendingEncryption. Resume them
+                    // only after the ordered commit has advanced our local
+                    // group; retrying from the submit response would encrypt
+                    // against the same stale epoch in a tight loop.
+                    self.queue_pending_mls_outbox()?;
                 }
                 if let Some(after_sequence) = next_after {
                     self.queue_control(ClientControl::FetchMlsEvents {
@@ -6622,18 +6628,11 @@ impl WorkerState {
                     }
                     rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { .. } => {
                         installation.client.retry_stale_outgoing(room_id, event_id)?;
-                        let descriptor = installation
-                            .client
-                            .descriptor(room_id)?
-                            .ok_or_else(|| "MLS outbox room descriptor is missing".to_string())?;
-                        let (epoch, ciphertext) = installation
-                            .client
-                            .encrypt_outgoing(&descriptor, event_id)?;
-                        self.queue_control(ClientControl::SubmitMlsApplication {
+                        let after_sequence = installation.client.cursor(room_id)?;
+                        self.queue_control(ClientControl::FetchMlsEvents {
                             room_id,
-                            epoch,
-                            event_id,
-                            ciphertext,
+                            after_sequence,
+                            limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
                         })?;
                     }
                     rpc::mls::MlsSubmitOutcome::RevocationPending

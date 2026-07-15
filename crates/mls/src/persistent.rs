@@ -633,20 +633,22 @@ impl PersistentClient {
         Ok(())
     }
 
-    /// Called only after `StaleEpochNotStored`, which proves the old exact
-    /// ciphertext was not appended by the delivery service.
+    /// Handles `StaleEpochNotStored`, which proves the old exact ciphertext
+    /// was not appended by the delivery service. Submit responses can be
+    /// duplicated or reordered, so resetting an already-pending entry and a
+    /// stale response arriving after delivery are both harmless no-ops.
     pub fn retry_stale_outgoing(&self, room_id: RoomId, event_id: EventId) -> Result<(), String> {
         let key = outbox_key(room_id, event_id);
         let mut entry = self.outbox_entry(room_id, event_id)?;
-        if !matches!(entry.state, OutboxState::PendingDelivery { .. }) {
-            return Err(
-                "only a pending-delivery event can be retried after a stale epoch".to_string(),
-            );
+        match entry.state {
+            OutboxState::PendingDelivery { .. } => {
+                entry.state = OutboxState::PendingEncryption;
+                self.application
+                    .insert(&key, &jsony::to_binary(&entry))
+                    .map_err(|error| error.to_string())?;
+            }
+            OutboxState::PendingEncryption | OutboxState::Delivered { .. } => {}
         }
-        entry.state = OutboxState::PendingEncryption;
-        self.application
-            .insert(&key, &jsony::to_binary(&entry))
-            .map_err(|error| error.to_string())?;
         Ok(())
     }
 

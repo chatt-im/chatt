@@ -267,6 +267,29 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
             .unwrap(),
         encrypted,
     );
+    alice_client
+        .retry_stale_outgoing(descriptor.room_id, event.event_id)
+        .unwrap();
+    alice_client
+        .retry_stale_outgoing(descriptor.room_id, event.event_id)
+        .unwrap();
+    assert!(matches!(
+        alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
+        chatt_mls::OutboxState::PendingEncryption
+    ));
+    alice_client
+        .encrypt_outgoing(&descriptor, event.event_id)
+        .unwrap();
+    alice_client
+        .mark_outgoing_delivered(descriptor.room_id, event.event_id, 2)
+        .unwrap();
+    alice_client
+        .retry_stale_outgoing(descriptor.room_id, event.event_id)
+        .unwrap();
+    assert!(matches!(
+        alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
+        chatt_mls::OutboxState::Delivered { sequence: 2 }
+    ));
 }
 
 #[test]

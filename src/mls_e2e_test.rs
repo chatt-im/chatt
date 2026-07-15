@@ -332,6 +332,7 @@ fn spawn_pair_response_loss_proxy(server_addr: &str) -> (String, thread::JoinHan
 
 fn send_until_received(sender: &Client, receiver: &Client, room: RoomId, body: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut next_send = Instant::now();
     loop {
         let backlog_match = receiver.backlog.borrow().iter().position(|event| {
             matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body)
@@ -340,10 +341,15 @@ fn send_until_received(sender: &Client, receiver: &Client, room: RoomId, body: &
             receiver.backlog.borrow_mut().remove(index);
             return;
         }
-        sender.handle.try_send(NetworkCommand::SendChat { room_id: room, body: body.into() }).unwrap();
-        let slice = deadline.checked_duration_since(Instant::now())
+        let now = Instant::now();
+        if now >= next_send {
+            sender.handle.try_send(NetworkCommand::SendChat { room_id: room, body: body.into() }).unwrap();
+            next_send = now + Duration::from_millis(250);
+        }
+        let slice = deadline
+            .checked_duration_since(now)
             .unwrap_or_else(|| panic!("message {body:?} was not delivered"))
-            .min(Duration::from_millis(250));
+            .min(next_send.saturating_duration_since(now));
         match receiver.events.recv_timeout(slice) {
             Ok(AppEvent::Network(NetworkEvent::Chat(chat))) if chat.message.body == body => return,
             Ok(AppEvent::Network(NetworkEvent::AuthFailed { message, .. })) => panic!("auth failed: {message}"),
