@@ -7,6 +7,7 @@
 
 use std::{
     collections::VecDeque,
+    net::{TcpListener, UdpSocket},
     path::PathBuf,
     sync::mpsc,
     thread::{self, JoinHandle},
@@ -16,7 +17,7 @@ use std::{
 use rpc::{
     control::{DeviceLinkTicket, RoomInfo, decode_device_link_ticket},
     crypto::{dev_server_public_key, dev_server_seed_hex},
-    ids::{DeviceId, MessageId, RoomId, UserId},
+    ids::{DeviceId, MessageId, RoomId, StreamId, UserId},
 };
 use server::{
     Server,
@@ -26,6 +27,7 @@ use server::{
 
 use crate::{
     app::{AppEvent, NetworkEventSender},
+    audio::{LocalVoiceFrame, VoicePayload},
     client_net::{
         ClientConfig, FilePolicy, NetworkClient, NetworkCommand, NetworkEvent,
         UploadFileRequest, spawn_device_pair_once,
@@ -50,10 +52,16 @@ struct TestServer {
 
 impl TestServer {
     fn spawn(data_dir: PathBuf) -> (Self, String, String) {
+        let tcp_reservation = TcpListener::bind("127.0.0.1:0").expect("reserve E2E TCP port");
+        let tcp_addr = tcp_reservation.local_addr().unwrap();
+        let udp_reservation = UdpSocket::bind("127.0.0.1:0").expect("reserve E2E UDP port");
+        let udp_addr = udp_reservation.local_addr().unwrap();
         let mut config = ServerConfig::default();
-        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.network.tcp_addr = tcp_addr;
+        config.network.udp_addr = Some(udp_addr);
         config.network.udp_probe_addr = None;
+        config.network.public_tcp_addr = tcp_addr.to_string();
+        config.network.public_udp_addr = udp_addr.to_string();
         config.network.p2p_enabled = false;
         config.security.server_identity_seed = dev_server_seed_hex();
         config.security.transport_mode = TransportModeConfig::NativeEncrypted;
@@ -61,6 +69,7 @@ impl TestServer {
         config.rooms[0].persistence = RoomPersistenceConfig::Memory;
         config.rooms[0].memory_limit = Some(64);
 
+        drop((tcp_reservation, udp_reservation));
         let mut server = Server::bind(config).expect("bind E2E server");
         server.seed_users(vec![
             UserConfig {
@@ -314,16 +323,10 @@ impl TestDevice {
     }
 
     fn persist_and_confirm_pin(&mut self, pin: E2ePeerPin, manual_verification: bool) {
-        if let Some(existing) = self
-            .config
-            .e2e_peer_pins
-            .iter_mut()
-            .find(|existing| existing.user_id == pin.user_id)
-        {
-            *existing = pin.clone();
-        } else {
-            self.config.e2e_peer_pins.push(pin.clone());
-        }
+        self.config.e2e_peer_pins.retain(|existing| {
+            existing.room_id != pin.room_id && existing.user_id != pin.user_id
+        });
+        self.config.e2e_peer_pins.push(pin.clone());
         self.send(NetworkCommand::ConfirmE2ePeerPin {
             pin,
             persisted: true,
@@ -331,14 +334,33 @@ impl TestDevice {
         });
     }
 
-    fn wait_peer_ready(&mut self, peer: UserId) {
-        self.wait_for("peer identity", |event| {
+    fn wait_peer_identity(&mut self, peer: UserId) -> crate::e2e::AcceptedPeerIdentity {
+        let event = self.wait_for("peer identity", |event| {
             matches!(
                 event,
                 NetworkEvent::E2ePeerPinMatched { identity }
                     if identity.user_id == peer
             )
         });
+        let NetworkEvent::E2ePeerPinMatched { identity } = event else {
+            unreachable!()
+        };
+        identity
+    }
+
+    fn wait_peer_ready(&mut self, peer: UserId) {
+        self.wait_peer_identity(peer);
+    }
+
+    fn wait_peer_refresh(&mut self, peer: UserId) -> crate::e2e::AcceptedPeerIdentity {
+        self.wait_for("peer roster refresh start", |event| {
+            matches!(
+                event,
+                NetworkEvent::E2eIdentityFetching { user_id, .. }
+                    if *user_id == peer
+            )
+        });
+        self.wait_peer_identity(peer)
     }
 
     fn wait_chat(&mut self, body: &str) -> MessageId {
@@ -381,6 +403,107 @@ impl TestDevice {
             panic!("{}: received file is absent from memory", self.label)
         };
         assert_eq!(bytes.as_slice(), expected, "{}: file contents", self.label);
+    }
+
+    fn join_voice(&mut self, room_id: RoomId) -> StreamId {
+        self.send(NetworkCommand::JoinVoice(room_id));
+        let local_user = self.user;
+        let event = self.wait_for("own voice stream", |event| {
+            matches!(
+                event,
+                NetworkEvent::VoiceStarted {
+                    room_id: id,
+                    user_id,
+                    ..
+                } if *id == room_id && *user_id == local_user
+            )
+        });
+        let NetworkEvent::VoiceStarted { stream_id, .. } = event else {
+            unreachable!()
+        };
+        stream_id
+    }
+
+    fn send_voice(&self, payload: Vec<u8>) {
+        // UDP is intentionally lossy. A short burst still exercises encrypted
+        // media routing without making one dropped datagram fail 4,096 cases.
+        for timestamp in 0..3 {
+            self.send(NetworkCommand::LocalVoicePacket(LocalVoiceFrame {
+                flags: 0,
+                payload: VoicePayload::Opus(payload.clone()),
+                timestamp,
+            }));
+        }
+    }
+
+    fn wait_voice(&mut self, stream_id: StreamId, payload_size: usize) {
+        self.wait_for("voice packet", |event| {
+            matches!(
+                event,
+                NetworkEvent::VoicePacketObserved {
+                    stream_id: observed,
+                    payload_size: size,
+                } if *observed == stream_id.0 && *size == payload_size
+            )
+        });
+    }
+
+    fn wait_voice_for(
+        &mut self,
+        stream_id: StreamId,
+        payload_size: usize,
+        timeout: Duration,
+    ) -> bool {
+        let matches_packet = |event: &NetworkEvent| {
+            matches!(
+                event,
+                NetworkEvent::VoicePacketObserved {
+                    stream_id: observed,
+                    payload_size: size,
+                } if *observed == stream_id.0 && *size == payload_size
+            )
+        };
+        if let Some(index) = self.backlog.iter().position(matches_packet) {
+            self.backlog.remove(index);
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let event = match self
+                .events
+                .as_ref()
+                .expect("connected client event receiver")
+                .recv_timeout(remaining)
+            {
+                Ok(AppEvent::Network(event)) => event,
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => return false,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("{}: network event channel disconnected", self.label)
+                }
+            };
+            match &event {
+                NetworkEvent::Error(message) => {
+                    panic!("{}: error while waiting for voice packet: {message}", self.label)
+                }
+                NetworkEvent::AuthFailed { code, message } => panic!(
+                    "{}: authentication failed while waiting for voice packet ({code}): {message}",
+                    self.label
+                ),
+                NetworkEvent::WorkerStopped { reason } => panic!(
+                    "{}: worker stopped while waiting for voice packet: {reason}",
+                    self.label
+                ),
+                _ => {}
+            }
+            if matches_packet(&event) {
+                return true;
+            }
+            self.backlog.push_back(event);
+        }
     }
 
     fn fetch_history(&mut self, room_id: RoomId) -> Vec<String> {
@@ -493,6 +616,21 @@ fn send_chat(sender: &TestDevice, room_id: RoomId, body: &str) {
     });
 }
 
+fn relay_voice(
+    sender: &TestDevice,
+    receiver: &mut TestDevice,
+    stream_id: StreamId,
+    payload: Vec<u8>,
+) {
+    for _ in 0..10 {
+        sender.send_voice(payload.clone());
+        if receiver.wait_voice_for(stream_id, payload.len(), Duration::from_millis(100)) {
+            return;
+        }
+    }
+    receiver.wait_voice(stream_id, payload.len());
+}
+
 #[test]
 fn unreadable_local_identity_stops_without_reconnecting_or_replacing_it() {
     let world = TestWorld::new();
@@ -547,7 +685,7 @@ fn sealed_dm_files_reach_every_device_after_pairing() {
     let room_id = open_dm(&mut alice, &mut bob);
 
     pair_device(&mut alice, &mut alice_second);
-    bob.wait_peer_ready(ALICE);
+    bob.wait_peer_refresh(ALICE);
     alice_second.connect_ready();
     alice_second.wait_peer_ready(BOB);
 
@@ -700,6 +838,308 @@ fn linked_device_first_dm_treats_peer_as_unverified_not_changed() {
     }
 }
 
+const LINKED_DEVICE_MATRIX_BITS: u16 = 12;
+const LINKED_DEVICE_MATRIX_CASES: u16 = 1 << LINKED_DEVICE_MATRIX_BITS;
+const LINKED_DEVICE_MATRIX_SHARDS: u16 = 16;
+
+#[derive(Clone, Copy, Debug)]
+struct LinkedDeviceMatrixCase {
+    bits: u16,
+    bob_connects_first: bool,
+    dm_before_link: bool,
+    linked_offline_for_first_message: bool,
+    unrelated_reused_room_pin: bool,
+    restart_primary_before_text: bool,
+    restart_linked_before_text: bool,
+    restart_bob_before_text: bool,
+    alice_text_from_linked: bool,
+    alice_media_from_linked: bool,
+    restart_primary_between_media: bool,
+    restart_linked_between_media: bool,
+    restart_bob_between_media: bool,
+}
+
+impl LinkedDeviceMatrixCase {
+    fn from_bits(bits: u16) -> Self {
+        let bit = |index| bits & (1u16 << index) != 0u16;
+        Self {
+            bits,
+            bob_connects_first: bit(0),
+            dm_before_link: bit(1),
+            linked_offline_for_first_message: bit(2),
+            unrelated_reused_room_pin: bit(3),
+            restart_primary_before_text: bit(4),
+            restart_linked_before_text: bit(5),
+            restart_bob_before_text: bit(6),
+            alice_text_from_linked: bit(7),
+            alice_media_from_linked: bit(8),
+            restart_primary_between_media: bit(9),
+            restart_linked_between_media: bit(10),
+            restart_bob_between_media: bit(11),
+        }
+    }
+}
+
+fn assert_standard_unverified(
+    case: LinkedDeviceMatrixCase,
+    device: &str,
+    identity: &crate::e2e::AcceptedPeerIdentity,
+) {
+    assert_eq!(
+        identity.trust_level,
+        E2eTrustLevel::Accepted,
+        "matrix case {case:?}: {device} unexpectedly verified its first-contact peer"
+    );
+    assert_eq!(
+        identity.change_from, None,
+        "matrix case {case:?}: {device} treated a first-contact peer as an identity change"
+    );
+}
+
+fn restart_with_peer(
+    case: LinkedDeviceMatrixCase,
+    device: &mut TestDevice,
+    peer: UserId,
+) {
+    device.stop();
+    device.connect_ready();
+    let label = device.label.clone();
+    let identity = device.wait_peer_identity(peer);
+    assert_standard_unverified(case, &label, &identity);
+}
+
+fn run_linked_device_matrix_case(case: LinkedDeviceMatrixCase) {
+    let world = TestWorld::new();
+    let suffix = format!("{:03x}", case.bits);
+    let mut alice_primary = world.device(
+        &format!("alice-matrix-primary-{suffix}"),
+        ALICE,
+        ALICE_TOKEN,
+    );
+    let mut alice_linked = world.device(&format!("alice-matrix-linked-{suffix}"), ALICE, "");
+    let mut bob = world.device(&format!("bob-matrix-{suffix}"), BOB, BOB_TOKEN);
+    alice_primary.receive_files_in_memory();
+    alice_linked.receive_files_in_memory();
+    bob.receive_files_in_memory();
+    if case.unrelated_reused_room_pin {
+        alice_linked.config.e2e_peer_pins.push(E2ePeerPin {
+            room_id: 0x8000_0000,
+            user_id: 3,
+            username: "carol".to_string(),
+            public_key: "11".repeat(rpc::e2e::E2E_PUBLIC_KEY_LEN),
+            trust_level: E2eTrustLevel::Accepted,
+            change_from: None,
+            previous: Vec::new(),
+        });
+    }
+
+    if case.bob_connects_first {
+        bob.connect_ready();
+        alice_primary.connect_ready();
+    } else {
+        alice_primary.connect_ready();
+        bob.connect_ready();
+    }
+
+    let room_id = if case.dm_before_link {
+        open_dm(&mut alice_primary, &mut bob)
+    } else {
+        RoomId(0)
+    };
+    pair_device(&mut alice_primary, &mut alice_linked);
+
+    let room_id = if case.dm_before_link {
+        let bob_identity = bob.wait_peer_refresh(ALICE);
+        assert_standard_unverified(case, "bob after Alice linked", &bob_identity);
+        room_id
+    } else {
+        alice_linked.connect_ready();
+        alice_linked.send(NetworkCommand::OpenDm(BOB));
+        let opened = alice_linked.wait_for("matrix DM open", |event| {
+            matches!(event, NetworkEvent::DmOpened { peer, .. } if *peer == BOB)
+        });
+        let NetworkEvent::DmOpened { room_id, .. } = opened else {
+            unreachable!()
+        };
+        for device in [&mut alice_primary, &mut bob] {
+            device.wait_for("matrix DM room", |event| {
+                matches!(
+                    event,
+                    NetworkEvent::RoomUpserted(RoomInfo { room_id: id, .. })
+                        if *id == room_id
+                )
+            });
+        }
+        let linked_identity = alice_linked.wait_peer_identity(BOB);
+        let primary_identity = alice_primary.wait_peer_identity(BOB);
+        let bob_identity = bob.wait_peer_identity(ALICE);
+        assert_standard_unverified(case, "Alice linked", &linked_identity);
+        assert_standard_unverified(case, "Alice primary", &primary_identity);
+        assert_standard_unverified(case, "bob", &bob_identity);
+        room_id
+    };
+
+    let bootstrap = format!("matrix bootstrap {}", case.bits);
+    if case.dm_before_link && case.linked_offline_for_first_message {
+        send_chat(&bob, room_id, &bootstrap);
+        bob.wait_chat(&bootstrap);
+        alice_primary.wait_chat(&bootstrap);
+        alice_linked.connect_ready();
+        let identity = alice_linked.wait_peer_identity(BOB);
+        assert_standard_unverified(case, "Alice linked after offline bootstrap", &identity);
+        let history = alice_linked.fetch_history(room_id);
+        assert!(
+            history.iter().any(|body| body == &bootstrap),
+            "matrix case {case:?}: linked device missed pre-connect history"
+        );
+    } else {
+        if case.dm_before_link {
+            alice_linked.connect_ready();
+            let identity = alice_linked.wait_peer_identity(BOB);
+            assert_standard_unverified(case, "Alice linked", &identity);
+        } else if case.linked_offline_for_first_message {
+            alice_linked.stop();
+        }
+        send_chat(&bob, room_id, &bootstrap);
+        bob.wait_chat(&bootstrap);
+        alice_primary.wait_chat(&bootstrap);
+        if case.linked_offline_for_first_message {
+            alice_linked.connect_ready();
+            let identity = alice_linked.wait_peer_identity(BOB);
+            assert_standard_unverified(case, "Alice linked after offline bootstrap", &identity);
+            let history = alice_linked.fetch_history(room_id);
+            assert!(
+                history.iter().any(|body| body == &bootstrap),
+                "matrix case {case:?}: linked device missed offline history"
+            );
+        } else {
+            alice_linked.wait_chat(&bootstrap);
+        }
+    }
+
+    if case.restart_primary_before_text {
+        restart_with_peer(case, &mut alice_primary, BOB);
+    }
+    if case.restart_linked_before_text {
+        restart_with_peer(case, &mut alice_linked, BOB);
+    }
+    if case.restart_bob_before_text {
+        restart_with_peer(case, &mut bob, ALICE);
+    }
+
+    let alice_text = format!("matrix Alice text {}", case.bits);
+    if case.alice_text_from_linked {
+        send_chat(&alice_linked, room_id, &alice_text);
+    } else {
+        send_chat(&alice_primary, room_id, &alice_text);
+    }
+    alice_primary.wait_chat(&alice_text);
+    alice_linked.wait_chat(&alice_text);
+    bob.wait_chat(&alice_text);
+
+    let bob_text = format!("matrix Bob text {}", case.bits);
+    send_chat(&bob, room_id, &bob_text);
+    alice_primary.wait_chat(&bob_text);
+    alice_linked.wait_chat(&bob_text);
+    bob.wait_chat(&bob_text);
+
+    if case.restart_primary_between_media {
+        restart_with_peer(case, &mut alice_primary, BOB);
+    }
+    if case.restart_linked_between_media {
+        restart_with_peer(case, &mut alice_linked, BOB);
+    }
+    if case.restart_bob_between_media {
+        restart_with_peer(case, &mut bob, ALICE);
+    }
+
+    let alice_file_name = format!("matrix-alice-{suffix}.bin");
+    let alice_file_contents = format!("Alice matrix media {}", case.bits).into_bytes();
+    let alice_file_path = world.root.path().join(&alice_file_name);
+    std::fs::write(&alice_file_path, &alice_file_contents).unwrap();
+    if case.alice_media_from_linked {
+        alice_linked.upload(room_id, alice_file_path);
+        alice_primary.wait_file(&alice_file_name, &alice_file_contents);
+    } else {
+        alice_primary.upload(room_id, alice_file_path);
+        alice_linked.wait_file(&alice_file_name, &alice_file_contents);
+    }
+    bob.wait_file(&alice_file_name, &alice_file_contents);
+
+    let bob_file_name = format!("matrix-bob-{suffix}.bin");
+    let bob_file_contents = format!("Bob matrix media {}", case.bits).into_bytes();
+    let bob_file_path = world.root.path().join(&bob_file_name);
+    std::fs::write(&bob_file_path, &bob_file_contents).unwrap();
+    bob.upload(room_id, bob_file_path);
+    alice_primary.wait_file(&bob_file_name, &bob_file_contents);
+    alice_linked.wait_file(&bob_file_name, &bob_file_contents);
+
+    let alice_voice = if case.alice_media_from_linked {
+        &mut alice_linked
+    } else {
+        &mut alice_primary
+    };
+    let alice_stream = alice_voice.join_voice(room_id);
+    let bob_stream = bob.join_voice(room_id);
+    let alice_payload = vec![0xa1, (case.bits & 0xff) as u8, 1, 2, 3];
+    relay_voice(alice_voice, &mut bob, alice_stream, alice_payload);
+    let bob_payload = vec![0xb0, (case.bits >> 4) as u8, 4, 5, 6, 7, 8];
+    relay_voice(&bob, alice_voice, bob_stream, bob_payload);
+}
+
+fn run_linked_device_matrix_shard(shard: u16) {
+    assert!(shard < LINKED_DEVICE_MATRIX_SHARDS);
+    let cases_per_shard = LINKED_DEVICE_MATRIX_CASES / LINKED_DEVICE_MATRIX_SHARDS;
+    let start = shard * cases_per_shard;
+    for bits in start..start + cases_per_shard {
+        let case = LinkedDeviceMatrixCase::from_bits(bits);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_linked_device_matrix_case(case)
+        }));
+        if let Err(payload) = result {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic");
+            panic!("linked-device E2E matrix case {bits:#05x} failed ({case:?}): {message}");
+        }
+    }
+}
+
+#[test]
+fn linked_device_offline_history_survives_stale_pin_and_restarts() {
+    run_linked_device_matrix_case(LinkedDeviceMatrixCase::from_bits(0x0c2e));
+}
+
+macro_rules! linked_device_matrix_shards {
+    ($($name:ident: $shard:literal),+ $(,)?) => {$(
+        #[test]
+        fn $name() {
+            run_linked_device_matrix_shard($shard);
+        }
+    )+};
+}
+
+linked_device_matrix_shards!(
+    linked_device_matrix_00: 0,
+    linked_device_matrix_01: 1,
+    linked_device_matrix_02: 2,
+    linked_device_matrix_03: 3,
+    linked_device_matrix_04: 4,
+    linked_device_matrix_05: 5,
+    linked_device_matrix_06: 6,
+    linked_device_matrix_07: 7,
+    linked_device_matrix_08: 8,
+    linked_device_matrix_09: 9,
+    linked_device_matrix_10: 10,
+    linked_device_matrix_11: 11,
+    linked_device_matrix_12: 12,
+    linked_device_matrix_13: 13,
+    linked_device_matrix_14: 14,
+    linked_device_matrix_15: 15,
+);
+
 #[test]
 fn linked_device_rebuilds_live_dm_messages_from_history_after_restart() {
     let world = TestWorld::new();
@@ -711,7 +1151,7 @@ fn linked_device_rebuilds_live_dm_messages_from_history_after_restart() {
     let room_id = open_dm(&mut alice, &mut bob);
 
     pair_device(&mut alice, &mut alice_second);
-    bob.wait_peer_ready(ALICE);
+    bob.wait_peer_refresh(ALICE);
     alice_second.connect_ready();
     alice_second.wait_peer_ready(BOB);
 
@@ -739,7 +1179,7 @@ fn linked_device_opens_messages_sent_while_it_was_offline() {
     let room_id = open_dm(&mut alice, &mut bob);
 
     pair_device(&mut alice, &mut alice_second);
-    bob.wait_peer_ready(ALICE);
+    bob.wait_peer_refresh(ALICE);
     send_chat(&bob, room_id, "peer message while secondary offline");
     bob.wait_chat("peer message while secondary offline");
     send_chat(&alice, room_id, "own message while secondary offline");
@@ -771,7 +1211,7 @@ fn revoked_linked_device_is_disconnected_and_remaining_devices_keep_messaging() 
     let room_id = open_dm(&mut alice, &mut bob);
 
     let second_id = pair_device(&mut alice, &mut alice_second);
-    bob.wait_peer_ready(ALICE);
+    bob.wait_peer_refresh(ALICE);
     alice_second.connect_ready();
     alice_second.wait_peer_ready(BOB);
 
@@ -789,7 +1229,7 @@ fn revoked_linked_device_is_disconnected_and_remaining_devices_keep_messaging() 
     alice.wait_for("primary rebind after revocation", |event| {
         matches!(event, NetworkEvent::E2eDeviceBound { .. })
     });
-    bob.wait_peer_ready(ALICE);
+    bob.wait_peer_refresh(ALICE);
 
     send_chat(&alice, room_id, "from remaining alice device");
     bob.wait_chat("from remaining alice device");

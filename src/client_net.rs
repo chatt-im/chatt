@@ -6096,6 +6096,15 @@ impl WorkerState {
                 )? {
                     return Ok(());
                 }
+                if !local_user
+                    && let Some((room_id, username)) = self.e2e.mark_peer_roster_stale(user_id)
+                {
+                    let _ = self.events.send(NetworkEvent::E2eIdentityFetching {
+                        room_id,
+                        user_id,
+                        username,
+                    });
+                }
                 self.queue_control(ClientControl::FetchAccountKeyChain {
                     user_id,
                     after: self.e2e.account_chain_after(user_id),
