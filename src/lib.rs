@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(test, feature = "nightly-test-spans"),
+    feature(thread_spawn_hook)
+)]
+
 mod app;
 mod attach;
 pub mod audio;
