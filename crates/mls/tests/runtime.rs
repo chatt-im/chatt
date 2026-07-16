@@ -143,7 +143,7 @@ fn client(identities: ChattIdentityProvider, device: &Device) -> Client<impl Mls
 }
 
 #[test]
-fn welcome_messages_duplicates_and_out_of_order_delivery_are_recoverable() {
+fn same_epoch_application_generations_decrypt_in_reverse_order() {
     let server_id = b"test server";
     let alice = device(server_id, 1, 1, 1);
     let bob = device(server_id, 2, 2, 2);
@@ -189,6 +189,12 @@ fn welcome_messages_duplicates_and_out_of_order_delivery_are_recoverable() {
     let second = alice_group
         .encrypt_application_message(b"second", Vec::new())
         .unwrap();
+
+    // These are consecutive secret-tree generations from the same sender in
+    // the same epoch. Opening the later generation first requires mls-rs's
+    // `out_of_order` support to retain the skipped generation key.
+    assert_eq!(first.epoch(), second.epoch());
+
     let ReceivedMessage::ApplicationMessage(opened_second) =
         bob_group.process_incoming_message(second).unwrap()
     else {

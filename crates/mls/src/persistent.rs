@@ -107,6 +107,27 @@ pub struct CachedApplicationEvent {
     pub event: MlsChattEvent,
 }
 
+/// An application event whose durable delivery cursor has advanced but whose
+/// UI notification has not yet been acknowledged by the network worker.
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct PendingUiDispatch {
+    pub sequence: u64,
+    pub event: MlsChattEvent,
+}
+
+/// The source needed to reconstruct an encrypted file upload after reconnect.
+/// The authenticated metadata and content key remain in the matching outbox
+/// event, so this record deliberately carries only local source ownership.
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct DurableFileUpload {
+    pub room_id: RoomId,
+    pub event_id: EventId,
+    pub source_path: Vec<u8>,
+    pub delete_after_upload: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub struct OutboxEntry {
@@ -124,7 +145,7 @@ pub enum OutboxState {
         sequence: u64,
         epoch: u64,
         ciphertext_hash: [u8; 32],
-        emitted: bool,
+        dispatch_queued: bool,
     },
 }
 
@@ -644,6 +665,35 @@ impl PersistentClient {
     }
 
     pub fn queue_outgoing(&self, event: MlsChattEvent) -> Result<(), String> {
+        self.queue_outgoing_with(event, None)
+    }
+
+    /// Atomically records a file announcement and the local source required to
+    /// fulfill it. An accepted announcement can therefore never outlive the
+    /// only record from which the in-memory upload queue is reconstructed.
+    pub fn queue_file_outgoing(
+        &self,
+        event: MlsChattEvent,
+        source_path: Vec<u8>,
+        delete_after_upload: bool,
+    ) -> Result<(), String> {
+        if !matches!(event.content, rpc::mls::ChattEventContent::File(_)) {
+            return Err("durable file upload requires an MLS file event".to_string());
+        }
+        let upload = DurableFileUpload {
+            room_id: event.room_id,
+            event_id: event.event_id,
+            source_path,
+            delete_after_upload,
+        };
+        self.queue_outgoing_with(event, Some(upload))
+    }
+
+    fn queue_outgoing_with(
+        &self,
+        event: MlsChattEvent,
+        upload: Option<DurableFileUpload>,
+    ) -> Result<(), String> {
         let own_client_id = self
             .client
             .signing_identity()
@@ -676,18 +726,25 @@ impl PersistentClient {
             .unwrap_or(0_u64)
             .checked_add(1)
             .ok_or_else(|| "MLS outbox enqueue order is exhausted".to_string())?;
-        self.application
-            .transact_insert(&[
-                Item::new(
-                    key,
-                    jsony::to_binary(&OutboxEntry {
+        let mut items = vec![
+            Item::new(
+                key,
+                jsony::to_binary(&OutboxEntry {
                     event,
                     state: OutboxState::PendingEncryption,
-                        queued_order,
-                    }),
-                ),
-                Item::new(outbox_order_key().to_string(), jsony::to_binary(&queued_order)),
-            ])
+                    queued_order,
+                }),
+            ),
+            Item::new(outbox_order_key().to_string(), jsony::to_binary(&queued_order)),
+        ];
+        if let Some(upload) = upload {
+            items.push(Item::new(
+                file_upload_key(upload.room_id, upload.event_id),
+                jsony::to_binary(&upload),
+            ));
+        }
+        self.application
+            .transact_insert(&items)
             .map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -744,17 +801,17 @@ impl PersistentClient {
         let mut entry = self.outbox_entry(room_id, event_id)?;
         let cursor = self.cursor(room_id)?;
         let at_ordered_head = cursor.checked_add(1) == Some(sequence);
-        let (epoch, ciphertext_hash, already_emitted) = match entry.state {
+        let (epoch, ciphertext_hash, dispatch_already_queued) = match entry.state {
             OutboxState::Delivered {
                 sequence: stored_sequence,
                 epoch,
                 ciphertext_hash,
-                emitted,
+                dispatch_queued,
             } => {
                 if stored_sequence != sequence {
                     return Err("MLS event was acknowledged at two delivery sequences".to_string());
                 }
-                (epoch, ciphertext_hash, emitted)
+                (epoch, ciphertext_hash, dispatch_queued)
             }
             OutboxState::PendingDelivery { epoch, ciphertext } => {
                 (epoch, message_hash(&ciphertext), false)
@@ -763,19 +820,23 @@ impl PersistentClient {
                 return Err("unencrypted MLS event was acknowledged as delivered".to_string());
             }
         };
-        if already_emitted && cursor < sequence {
-            return Err("emitted MLS outbox event is ahead of the delivery cursor".to_string());
+        if dispatch_already_queued && cursor < sequence {
+            return Err("queued MLS UI dispatch is ahead of the delivery cursor".to_string());
         }
-        if !already_emitted && cursor >= sequence {
-            return Err("unemitted MLS outbox event is behind the delivery cursor".to_string());
+        if !dispatch_already_queued && cursor >= sequence {
+            return Err("MLS outbox event lacks a UI dispatch behind the delivery cursor".to_string());
         }
-        let emit_now = at_ordered_head && !already_emitted;
+        let emit_now = at_ordered_head && !dispatch_already_queued;
         debug_assert!(!emit_now || cursor.checked_add(1) == Some(sequence));
         entry.state = OutboxState::Delivered {
             sequence,
             epoch,
             ciphertext_hash,
-            emitted: already_emitted || emit_now,
+            dispatch_queued: dispatch_already_queued || emit_now,
+        };
+        let dispatch = PendingUiDispatch {
+            sequence,
+            event: entry.event.clone(),
         };
         let encoded = jsony::to_binary(&entry);
         if at_ordered_head {
@@ -783,6 +844,10 @@ impl PersistentClient {
                 .transact_insert(&[
                     Item::new(key, encoded),
                     Item::new(cursor_key(room_id), jsony::to_binary(&sequence)),
+                    Item::new(
+                        ui_dispatch_key(room_id, sequence),
+                        jsony::to_binary(&dispatch),
+                    ),
                 ])
                 .map_err(|error| error.to_string())?;
         } else {
@@ -904,24 +969,24 @@ impl PersistentClient {
                     sequence: stored_sequence,
                     epoch: stored_epoch,
                     ciphertext_hash,
-                    emitted,
+                    dispatch_queued,
                 } => (
                     stored_sequence == &sequence
                         && stored_epoch == epoch
                         && ciphertext_hash == &message_hash(ciphertext),
-                    !emitted,
+                    !dispatch_queued,
                 ),
                 OutboxState::PendingEncryption => (false, false),
             };
             if is_own_delivery {
-                let emitted = self.mark_outgoing_delivered(
+                let dispatch_queued = self.mark_outgoing_delivered(
                     descriptor.room_id,
                     *event_id,
                     sequence,
                 )?;
                 return Ok(ProcessedDelivery::Outgoing {
                     sequence,
-                    event: (should_emit && emitted).then_some(entry.event),
+                    event: (should_emit && dispatch_queued).then_some(entry.event),
                 });
             }
         }
@@ -983,7 +1048,11 @@ impl PersistentClient {
                                             .to_string(),
                                     );
                                 }
-                                self.set_cursor(descriptor.room_id, sequence)?;
+                                self.set_cursor_with_dispatch(
+                                    descriptor.room_id,
+                                    sequence,
+                                    &cached.event,
+                                )?;
                                 return Ok(ProcessedDelivery::Application(cached));
                             }
                             self.set_cursor(descriptor.room_id, sequence)?;
@@ -1052,7 +1121,15 @@ impl PersistentClient {
                     .write_to_storage()
                     .map_err(|error| error.to_string())?;
                 after_group_write()?;
-                self.set_cursor(descriptor.room_id, sequence)?;
+                if let Ok(cached) = &opened {
+                    self.set_cursor_with_dispatch(
+                        descriptor.room_id,
+                        sequence,
+                        &cached.event,
+                    )?;
+                } else {
+                    self.set_cursor(descriptor.room_id, sequence)?;
+                }
                 match opened {
                     Ok(cached) => Ok(ProcessedDelivery::Application(cached)),
                     Err(reason) => Ok(ProcessedDelivery::RejectedApplication { sequence, reason }),
@@ -1154,7 +1231,7 @@ impl PersistentClient {
                 jsony::from_binary(item.value()).map_err(|error| error.to_string())?;
             if let OutboxState::Delivered {
                 sequence,
-                emitted: true,
+                dispatch_queued: true,
                 ..
             } = outgoing.state
             {
@@ -1188,6 +1265,48 @@ impl PersistentClient {
             entries[0].queued_order < entries[1].queued_order
         }));
         Ok(entries)
+    }
+
+    /// UI work is removed only after the network worker successfully queues it
+    /// to the app. Reopening the database therefore yields every cursor-committed
+    /// application whose dispatch was interrupted by a crash.
+    pub fn pending_ui_dispatches(&self) -> Result<Vec<PendingUiDispatch>, String> {
+        let mut pending = self
+            .application
+            .get_by_prefix("ui-dispatch/")
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|item| jsony::from_binary(item.value()).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<PendingUiDispatch>, String>>()?;
+        pending.sort_by_key(|dispatch| dispatch.sequence);
+        Ok(pending)
+    }
+
+    pub fn acknowledge_ui_dispatch(
+        &self,
+        room_id: RoomId,
+        sequence: u64,
+    ) -> Result<(), String> {
+        self.application
+            .delete(&ui_dispatch_key(room_id, sequence))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn pending_file_uploads(&self) -> Result<Vec<DurableFileUpload>, String> {
+        self.application
+            .get_by_prefix("file-upload/")
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|item| jsony::from_binary(item.value()).map_err(|error| error.to_string()))
+            .collect()
+    }
+
+    pub fn finish_file_upload(&self, room_id: RoomId, event_id: EventId) -> Result<(), String> {
+        self.application
+            .delete(&file_upload_key(room_id, event_id))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub fn descriptor(&self, room_id: RoomId) -> Result<Option<EncryptedRoomDescriptor>, String> {
@@ -1368,6 +1487,34 @@ impl PersistentClient {
         Ok(())
     }
 
+    fn set_cursor_with_dispatch(
+        &self,
+        room_id: RoomId,
+        sequence: u64,
+        event: &MlsChattEvent,
+    ) -> Result<(), String> {
+        let current = self.cursor(room_id)?;
+        if current.checked_add(1) != Some(sequence) {
+            return Err(format!(
+                "MLS UI dispatch cursor cannot skip from {current} to {sequence}"
+            ));
+        }
+        let dispatch = PendingUiDispatch {
+            sequence,
+            event: event.clone(),
+        };
+        self.application
+            .transact_insert(&[
+                Item::new(cursor_key(room_id), jsony::to_binary(&sequence)),
+                Item::new(
+                    ui_dispatch_key(room_id, sequence),
+                    jsony::to_binary(&dispatch),
+                ),
+            ])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     fn delivery_marker(&self, room_id: RoomId) -> Result<Option<DeliveryMarker>, String> {
         self.application
             .get(&delivery_marker_key(room_id))
@@ -1520,6 +1667,14 @@ fn incoming_key(room_id: RoomId, event_id: EventId) -> String {
 
 fn outbox_key(room_id: RoomId, event_id: EventId) -> String {
     format!("outbox/{:08x}/{}", room_id.0, hex(&event_id.0))
+}
+
+fn file_upload_key(room_id: RoomId, event_id: EventId) -> String {
+    format!("file-upload/{:08x}/{}", room_id.0, hex(&event_id.0))
+}
+
+fn ui_dispatch_key(room_id: RoomId, sequence: u64) -> String {
+    format!("ui-dispatch/{:08x}/{sequence:016x}", room_id.0)
 }
 
 fn delivery_marker_key(room_id: RoomId) -> String {
