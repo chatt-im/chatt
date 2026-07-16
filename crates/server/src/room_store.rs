@@ -1556,6 +1556,7 @@ mod tests {
             members: None,
             persistence: RoomPersistenceConfig::Durable,
             memory_limit: None,
+            mls_retention_days: None,
             is_default: false,
         }
     }
@@ -1567,6 +1568,7 @@ mod tests {
             members: None,
             persistence: RoomPersistenceConfig::Memory,
             memory_limit: Some(limit),
+            mls_retention_days: None,
             is_default: false,
         }
     }
@@ -1578,6 +1580,7 @@ mod tests {
             members: None,
             persistence: RoomPersistenceConfig::None,
             memory_limit: None,
+            mls_retention_days: None,
             is_default: false,
         }
     }
@@ -1720,6 +1723,7 @@ mod tests {
                 members: None,
                 persistence: RoomPersistenceConfig::None,
                 memory_limit: None,
+                mls_retention_days: None,
                 is_default: true,
             }],
         );

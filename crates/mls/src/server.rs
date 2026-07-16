@@ -40,6 +40,7 @@ pub struct AppliedPublicCommit {
     pub state: PublicGroupState,
     pub committer_client_id: Vec<u8>,
     pub added_key_package_refs: Vec<Vec<u8>>,
+    pub is_external: bool,
 }
 
 #[derive(Debug)]
@@ -208,6 +209,7 @@ impl PublicGroupValidator {
                     state: next,
                     committer_client_id,
                     added_key_package_refs,
+                    is_external: description.is_external,
                 })
             }
             Ok(_) => Err(PublicValidationError::UnexpectedMessage),

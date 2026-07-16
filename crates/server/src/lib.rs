@@ -15,6 +15,7 @@ mod config_diagnostics;
 mod history_reader;
 pub mod local_admin;
 mod mls_service;
+mod mls_store;
 pub mod room_store;
 pub mod user_store;
 mod username_registry;
@@ -315,6 +316,14 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             println!("{join_string}");
             return Ok(());
         }
+        ["mls", "storage-status"] => {
+            println!("{}", local_admin::mls_storage_status().map_err(invalid_config)?);
+            return Ok(());
+        }
+        ["mls", "compact"] => {
+            println!("{}", local_admin::mls_compact().map_err(invalid_config)?);
+            return Ok(());
+        }
         ["init-config", path] if !path.trim().is_empty() => {
             config::write_generated_template(Path::new(path)).map_err(invalid_config)?;
             println!("wrote chatt server config template to {path}");
@@ -437,6 +446,8 @@ pub struct Server {
     next_media_sweep_at: Option<Instant>,
     next_rtt_snapshot_at: Instant,
     next_idle_sweep_at: Instant,
+    next_mls_cleanup_at: Instant,
+    next_mls_compaction_at: Instant,
     /// Local work that must run before the loop parks in `poll`. Producers
     /// register here instead of teaching the core loop each local no-sleep
     /// condition.
@@ -587,9 +598,16 @@ impl Server {
         let server_key_pair = config
             .server_key_pair()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let mls = MlsService::open(
+        let room_retention_days = config
+            .rooms
+            .iter()
+            .filter_map(|room| room.mls_retention_days.map(|days| (room.room_id(), days)))
+            .collect();
+        let mls = MlsService::open_with_retention(
             config.data_dir(),
             server_key_pair.public_key().as_ref().to_vec(),
+            config.storage.mls_retention_days,
+            room_retention_days,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mut rooms = HashMap::new();
@@ -659,6 +677,10 @@ impl Server {
             );
         }
         let file_size_limit_bytes = config.security.max_file_size_bytes();
+        let next_mls_cleanup_at = Instant::now()
+            + Duration::from_secs(config.storage.mls_cleanup_interval_minutes * 60);
+        let next_mls_compaction_at = Instant::now()
+            + Duration::from_secs(config.storage.mls_compaction_min_interval_hours * 60 * 60);
 
         Ok(Self {
             config,
@@ -695,6 +717,8 @@ impl Server {
             next_media_sweep_at: None,
             next_rtt_snapshot_at: Instant::now() + RTT_SNAPSHOT_INTERVAL,
             next_idle_sweep_at: Instant::now() + IDLE_SWEEP_INTERVAL,
+            next_mls_cleanup_at,
+            next_mls_compaction_at,
             loop_work: LoopWork::default(),
             history_reader,
             history_replies,
@@ -789,7 +813,112 @@ impl Server {
             self.sweep_idle_connections(now);
             self.sweep_stale_media_routes(now);
             self.poll_room_rtt_snapshots(now);
+            self.run_mls_cleanup(now);
+            self.run_mls_compaction(now);
         }
+    }
+
+    fn run_mls_cleanup(&mut self, now: Instant) {
+        if now < self.next_mls_cleanup_at {
+            return;
+        }
+        let interval = Duration::from_secs(
+            self.config.storage.mls_cleanup_interval_minutes.saturating_mul(60),
+        );
+        match self
+            .mls
+            .cleanup(self.config.storage.mls_cleanup_batch_events)
+        {
+            Ok(report) => {
+                if report.deleted_events > 0 || report.lagging_devices > 0 {
+                    kvlog::info!(
+                        "MLS retention cleanup",
+                        deleted_events = report.deleted_events,
+                        lagging_devices = report.lagging_devices,
+                        more_work = report.more_work,
+                    );
+                }
+                self.next_mls_cleanup_at = if report.more_work {
+                    now
+                } else {
+                    now + interval
+                };
+            }
+            Err(error) => {
+                kvlog::warn!("MLS retention cleanup failed", error = error.as_str());
+                self.next_mls_cleanup_at = now + interval;
+            }
+        }
+    }
+
+    fn run_mls_compaction(&mut self, now: Instant) {
+        if now < self.next_mls_compaction_at {
+            return;
+        }
+        let retry = Duration::from_secs(
+            self.config.storage.mls_cleanup_interval_minutes.saturating_mul(60),
+        );
+        // Compaction is exclusive. Defer while any client could be affected;
+        // deleted pages remain reusable in the meantime.
+        if !self.clients.is_empty() {
+            self.next_mls_compaction_at = now + retry;
+            return;
+        }
+        let status = match self.mls.storage_status() {
+            Ok(status) => status,
+            Err(error) => {
+                kvlog::warn!("failed to inspect MLS storage", error = error.as_str());
+                self.next_mls_compaction_at = now + retry;
+                return;
+            }
+        };
+        let minimum = self
+            .config
+            .storage
+            .mls_compaction_min_fragmented_mib
+            .saturating_mul(1024 * 1024);
+        let percent = if status.allocated_bytes == 0 {
+            0
+        } else {
+            status.fragmented_bytes.saturating_mul(100) / status.allocated_bytes
+        };
+        if status.fragmented_bytes >= minimum
+            && percent
+                >= u64::from(
+                    self.config
+                        .storage
+                        .mls_compaction_min_fragmented_percent,
+                )
+        {
+            let before = status.file_bytes;
+            let started = Instant::now();
+            match self.mls.compact() {
+                Ok(compacted) => {
+                    let after = self
+                        .mls
+                        .storage_status()
+                        .ok()
+                        .and_then(|status| status.file_bytes);
+                    kvlog::info!(
+                        "MLS database compaction completed",
+                        compacted,
+                        before_bytes = before,
+                        after_bytes = after,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                    );
+                }
+                Err(error) => {
+                    kvlog::warn!("MLS database compaction failed", error = error.as_str());
+                }
+            }
+        }
+        self.next_mls_compaction_at = now
+            + Duration::from_secs(
+                self.config
+                    .storage
+                    .mls_compaction_min_interval_hours
+                    .saturating_mul(60 * 60),
+            );
     }
 
     /// Returns true when an embedded owner requested a clean shutdown.
@@ -798,6 +927,37 @@ impl Server {
             match admin_rx.try_recv() {
                 Ok(AdminCommand::Invite { user, reply }) => {
                     let result = self.create_invite(&user);
+                    let _ = reply.send(result);
+                }
+                Ok(AdminCommand::MlsStorageStatus { reply }) => {
+                    let result = self.mls.storage_status().map(|status| {
+                        format!(
+                            "allocated={} stored={} fragmented={} file={}",
+                            status.allocated_bytes,
+                            status.stored_bytes,
+                            status.fragmented_bytes,
+                            status
+                                .file_bytes
+                                .map(|bytes| bytes.to_string())
+                                .unwrap_or_else(|| "memory".to_string())
+                        )
+                    });
+                    let _ = reply.send(result);
+                }
+                Ok(AdminCommand::MlsCompact { reply }) => {
+                    let before = self.mls.storage_status().ok().and_then(|status| status.file_bytes);
+                    let result = self.mls.compact().and_then(|compacted| {
+                        let after = self
+                            .mls
+                            .storage_status()
+                            .ok()
+                            .and_then(|status| status.file_bytes);
+                        Ok(format!(
+                            "compacted={compacted} before={} after={}",
+                            before.map_or_else(|| "memory".to_string(), |v| v.to_string()),
+                            after.map_or_else(|| "memory".to_string(), |v| v.to_string())
+                        ))
+                    });
                     let _ = reply.send(result);
                 }
                 Ok(AdminCommand::Shutdown) => return true,
@@ -2095,7 +2255,8 @@ impl Server {
                 | ClientControl::SubmitMlsApplication { .. }
                 | ClientControl::FetchMlsEvents { .. }
                 | ClientControl::FetchMlsWelcome { .. }
-                | ClientControl::AckMlsEvent { .. }),
+                | ClientControl::AckMlsEvent { .. }
+                | ClientControl::AckMlsWelcome { .. }),
             ) => {
                 let session_id = self.session_for_token(token)?;
                 self.handle_mls_control(session_id, control)
@@ -2427,7 +2588,13 @@ impl Server {
                     .unwrap_or_default();
                 let outcome =
                     self.mls
-                        .submit_commit(room_id, &bound.client_id, expected_epoch, bundle)?;
+                        .submit_commit_for_device(
+                            room_id,
+                            bound.device_id,
+                            &bound.client_id,
+                            expected_epoch,
+                            bundle,
+                        )?;
                 if matches!(outcome, rpc::mls::MlsCommitOutcome::Accepted { .. }) {
                     self.push_latest_mls_welcomes(&welcome_devices);
                 }
@@ -2439,12 +2606,17 @@ impl Server {
                     },
                 )?;
                 if let rpc::mls::MlsCommitOutcome::Accepted { sequence, .. } = outcome
-                    && let Some(events) = self.mls.events(room_id, sequence - 1, 1)
+                    && let Ok(batch) = self.mls.event_batch(room_id, sequence - 1, 1)
                 {
                     let tokens = self.mls_room_tokens(room_id);
                     self.send_control_to_tokens(
                         &tokens,
-                        &ServerControl::MlsEvents { room_id, events },
+                        &ServerControl::MlsEvents {
+                            room_id,
+                            events: batch.events,
+                            oldest_available_sequence: batch.oldest_available_sequence,
+                            head_sequence: batch.head_sequence,
+                        },
                     );
                 }
                 Ok(())
@@ -2455,13 +2627,31 @@ impl Server {
                 event_id,
                 ciphertext,
             } => {
-                bound
+                let bound = bound
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 self.require_mls_room_member(user_id, room_id)?;
                 let outcome = self
                     .mls
-                    .submit_application(room_id, epoch, event_id, ciphertext)?;
+                    .submit_application_for_device(
+                        room_id,
+                        bound.device_id,
+                        epoch,
+                        event_id,
+                        ciphertext,
+                    )?;
+                kvlog::info!(
+                    "MLS application submission decided",
+                    room_id = room_id.0,
+                    outcome = match outcome {
+                        rpc::mls::MlsSubmitOutcome::Stored { .. } => "stored",
+                        rpc::mls::MlsSubmitOutcome::AlreadyStored { .. } => "already_stored",
+                        rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { .. } => "stale_epoch",
+                        rpc::mls::MlsSubmitOutcome::RevocationPending => "revocation_pending",
+                        rpc::mls::MlsSubmitOutcome::RejoinRequired => "rejoin_required",
+                        rpc::mls::MlsSubmitOutcome::TemporarilyBlocked => "temporarily_blocked",
+                    },
+                );
                 self.send_control_to_token(
                     token,
                     &ServerControl::MlsApplicationSubmitted {
@@ -2471,12 +2661,17 @@ impl Server {
                     },
                 )?;
                 if let rpc::mls::MlsSubmitOutcome::Stored { sequence } = outcome
-                    && let Some(events) = self.mls.events(room_id, sequence - 1, 1)
+                    && let Ok(batch) = self.mls.event_batch(room_id, sequence - 1, 1)
                 {
                     let tokens = self.mls_room_tokens(room_id);
                     self.send_control_to_tokens(
                         &tokens,
-                        &ServerControl::MlsEvents { room_id, events },
+                        &ServerControl::MlsEvents {
+                            room_id,
+                            events: batch.events,
+                            oldest_available_sequence: batch.oldest_available_sequence,
+                            head_sequence: batch.head_sequence,
+                        },
                     );
                 }
                 Ok(())
@@ -2486,19 +2681,37 @@ impl Server {
                 after_sequence,
                 limit,
             } => {
+                let bound = bound
+                    .as_ref()
+                    .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 self.require_mls_room_member(user_id, room_id)?;
-                let events = self
+                if after_sequence > 0 {
+                    self.mls
+                        .acknowledge(room_id, bound.device_id, after_sequence)?;
+                }
+                let batch = self
                     .mls
-                    .events(room_id, after_sequence, usize::from(limit))
-                    .ok_or_else(|| "encrypted room does not exist".to_string())?;
-                self.send_control_to_token(token, &ServerControl::MlsEvents { room_id, events })
+                    .event_batch(room_id, after_sequence, usize::from(limit))?;
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::MlsEvents {
+                        room_id,
+                        events: batch.events,
+                        oldest_available_sequence: batch.oldest_available_sequence,
+                        head_sequence: batch.head_sequence,
+                    },
+                )
             }
             ClientControl::FetchMlsWelcome { after_sequence } => {
                 let bound = bound
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
-                let welcomes = self.mls.welcomes(bound.device_id, after_sequence);
-                let head_sequence = self.mls.welcome_head(bound.device_id);
+                if after_sequence > 0 {
+                    self.mls
+                        .acknowledge_welcome(bound.device_id, after_sequence)?;
+                }
+                let welcomes = self.mls.welcomes(bound.device_id, after_sequence)?;
+                let head_sequence = self.mls.welcome_head(bound.device_id)?;
                 self.send_control_to_token(
                     token,
                     &ServerControl::MlsWelcomes {
@@ -2508,11 +2721,19 @@ impl Server {
                 )
             }
             ClientControl::AckMlsEvent { room_id, sequence } => {
+                let bound = bound
+                    .as_ref()
+                    .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 self.require_mls_room_member(user_id, room_id)?;
-                self.send_control_to_token(
-                    token,
-                    &ServerControl::MlsEventAcked { room_id, sequence },
-                )
+                self.mls
+                    .acknowledge(room_id, bound.device_id, sequence)
+            }
+            ClientControl::AckMlsWelcome { delivery_id } => {
+                let bound = bound
+                    .as_ref()
+                    .ok_or_else(|| "bind an active MLS device first".to_string())?;
+                self.mls
+                    .acknowledge_welcome(bound.device_id, delivery_id)
             }
             _ => unreachable!("non-MLS control routed to MLS handler"),
         }
@@ -2589,12 +2810,13 @@ impl Server {
             .filter_map(|session| {
                 let bound = session.mls_device.as_ref()?;
                 devices.contains(&bound.device_id).then(|| {
-                    let head_sequence = self.mls.welcome_head(bound.device_id);
+                    let head_sequence = self.mls.welcome_head(bound.device_id).ok()?;
                     let welcomes = self
                         .mls
-                        .welcomes(bound.device_id, head_sequence.saturating_sub(1));
-                    (session.tcp_token, welcomes, head_sequence)
-                })
+                        .welcomes(bound.device_id, head_sequence.saturating_sub(1))
+                        .ok()?;
+                    Some((session.tcp_token, welcomes, head_sequence))
+                })?
             })
             .collect::<Vec<_>>();
         for (token, welcomes, head_sequence) in deliveries {
@@ -6681,7 +6903,7 @@ fn invalid_config(error: String) -> io::Error {
 }
 
 fn server_usage() -> String {
-    "usage: chatt-server serve CONFIG_PATH | chatt-server init-config CONFIG_PATH | chatt-server invite USER".to_string()
+    "usage: chatt-server serve CONFIG_PATH | chatt-server init-config CONFIG_PATH | chatt-server invite USER | chatt-server mls storage-status | chatt-server mls compact".to_string()
 }
 
 fn positional_args(args: &[String]) -> Vec<&str> {
@@ -6906,6 +7128,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::FetchMlsEvents { .. } => "fetch_mls_events",
         ClientControl::FetchMlsWelcome { .. } => "fetch_mls_welcome",
         ClientControl::AckMlsEvent { .. } => "ack_mls_event",
+        ClientControl::AckMlsWelcome { .. } => "ack_mls_welcome",
     }
 }
 
@@ -6965,7 +7188,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::MlsApplicationSubmitted { .. } => "mls_application_submitted",
         ServerControl::MlsEvents { .. } => "mls_events",
         ServerControl::MlsWelcomes { .. } => "mls_welcomes",
-        ServerControl::MlsEventAcked { .. } => "mls_event_acked",
     }
 }
 
