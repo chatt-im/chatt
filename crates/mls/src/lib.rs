@@ -11,8 +11,8 @@ mod policy;
 mod server;
 
 pub use persistent::{
-    CachedApplicationEvent, CachedIncomingEvent, OutboxEntry, OutboxState, PersistentClient,
-    ProcessedDelivery,
+    CachedApplicationEvent, CachedIncomingEvent, DurableFileUpload, OutboxEntry, OutboxState,
+    PendingUiDispatch, PersistentClient, ProcessedDelivery,
 };
 pub use policy::{ChattIdentityProvider, ChattMlsPolicy, PolicyError};
 pub use server::{

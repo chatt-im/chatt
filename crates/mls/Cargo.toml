@@ -11,7 +11,6 @@ mls-rs = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928
     "std",
     "private_message",
     "out_of_order",
-    "by_ref_proposal",
     "external_client",
     "sqlcipher-bundled",
 ] }

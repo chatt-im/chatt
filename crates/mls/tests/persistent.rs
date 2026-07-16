@@ -10,10 +10,11 @@ use rpc::{
         DeviceCertificateBody, DeviceRosterBody, SignedDeviceRoster, account_id,
         authority_public_key, mls_client_id, sign_device_certificate, sign_device_roster,
     },
-    ids::{DeviceId, EventId, RoomId, UserId},
+    control::FileContentEncoding,
+    ids::{DeviceId, EventId, FileTransferId, RoomId, UserId},
     mls::{
         ChattEventContent, EncryptedRoomDescriptor, MLS_PROTOCOL_VERSION, MlsChattEvent,
-        MlsDeliveryEvent, MlsWelcome,
+        MlsDeliveryEvent, MlsFileAnnouncement, MlsWelcome,
     },
 };
 
@@ -321,7 +322,8 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         .unwrap();
     drop(alice_client);
 
-    let alice_client = PersistentClient::reopen(&alice_path, [31; 32], identities).unwrap();
+    let alice_client =
+        PersistentClient::reopen(&alice_path, [31; 32], identities.clone()).unwrap();
     assert_eq!(
         alice_client
             .encrypt_outgoing(&descriptor, event.event_id)
@@ -360,9 +362,20 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
             sequence: 2,
             epoch: _,
             ciphertext_hash: _,
-            emitted: true
+            dispatch_queued: true
         }
     ));
+    drop(alice_client);
+    let alice_client =
+        PersistentClient::reopen(&alice_path, [31; 32], identities.clone()).unwrap();
+    assert!(matches!(
+        alice_client.pending_ui_dispatches().unwrap().as_slice(),
+        [dispatch] if dispatch.sequence == 2 && dispatch.event == event
+    ));
+    alice_client
+        .acknowledge_ui_dispatch(descriptor.room_id, 2)
+        .unwrap();
+    assert!(alice_client.pending_ui_dispatches().unwrap().is_empty());
 
     let delayed = MlsChattEvent {
         event_id: EventId([11; 16]),
@@ -389,7 +402,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
             sequence: 4,
             epoch: _,
             ciphertext_hash: _,
-            emitted: false
+            dispatch_queued: false
         }
     ));
     assert!(
@@ -482,6 +495,44 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
             .collect::<Vec<_>>(),
         vec![&first_same_timestamp, &second_same_timestamp],
     );
+
+    let file = MlsChattEvent {
+        event_id: EventId([13; 16]),
+        timestamp_ms: 205,
+        content: ChattEventContent::File(MlsFileAnnouncement {
+            transfer_id: FileTransferId(9),
+            name: "resume.bin".to_string(),
+            size: 3,
+            chunk_size: 1024,
+            encoding: FileContentEncoding::Identity,
+            file_key: [7; 32],
+            digest: [8; 32],
+        }),
+        ..event
+    };
+    alice_client
+        .queue_file_outgoing(file.clone(), b"/tmp/resume.bin".to_vec(), true)
+        .unwrap();
+    drop(alice_client);
+
+    let alice_client = PersistentClient::reopen(&alice_path, [31; 32], identities).unwrap();
+    assert!(alice_client
+        .pending_outbox()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.event == file));
+    assert!(matches!(
+        alice_client.pending_file_uploads().unwrap().as_slice(),
+        [upload]
+            if upload.room_id == descriptor.room_id
+                && upload.event_id == file.event_id
+                && upload.source_path == b"/tmp/resume.bin"
+                && upload.delete_after_upload
+    ));
+    alice_client
+        .finish_file_upload(descriptor.room_id, file.event_id)
+        .unwrap();
+    assert!(alice_client.pending_file_uploads().unwrap().is_empty());
 }
 
 #[test]

@@ -15,6 +15,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use chatt_p2p::{
     Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole,
@@ -99,6 +100,8 @@ const MAX_PENDING_MLS_FILE_GLOBAL_ITEMS: usize = 8192;
 /// notifies the owner after every consume, so this is a latency reserve rather
 /// than a long-lived prekey inventory.
 const MLS_KEY_PACKAGE_TARGET: u16 = 4;
+const MLS_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const MLS_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub(super) fn mls_installation_dir(
     data_dir: &Path,
@@ -535,6 +538,13 @@ pub enum NetworkCommand {
         pin: E2ePeerPin,
         persisted: bool,
         manual_verification: bool,
+    },
+    /// App-thread acknowledgement for a cursor-committed MLS event. Kept
+    /// separate from channel enqueue so a crash before UI application leaves
+    /// the durable dispatch available on restart.
+    AcknowledgeMlsUiDispatch {
+        room_id: RoomId,
+        sequence: u64,
     },
     /// Authority-signs a terminal roster revocation. The removed device can
     /// never bind again.
@@ -1611,6 +1621,7 @@ fn run_worker_inner(
         pending_mls_welcome_rosters: None,
         mls_installed_rosters: HashSet::new(),
         pending_mls_commits: HashMap::new(),
+        delayed_mls_retries: HashMap::new(),
         pending_mls_roster: None,
         mls_key_package_publish_pending: false,
         mls_file_announcements: HashMap::new(),
@@ -1780,6 +1791,9 @@ fn run_worker_inner(
         worker.poll_udp_bind_retry(now);
         worker.poll_relay_keepalive(now);
         worker.poll_rtt_probe(now);
+        if let Err(error) = worker.poll_delayed_mls_retries(now) {
+            return SessionEnd::Disconnected(error);
+        }
         poll_timeout = worker.next_poll_timeout(command_drain, now);
         #[cfg(debug_assertions)]
         if poll_timeout != Duration::ZERO {
@@ -2255,6 +2269,7 @@ struct WorkerState {
     pending_mls_welcome_rosters: Option<HashSet<UserId>>,
     mls_installed_rosters: HashSet<UserId>,
     pending_mls_commits: HashMap<RoomId, PendingMlsCommit>,
+    delayed_mls_retries: HashMap<MlsRetryKey, DelayedMlsRetry>,
     pending_mls_roster: Option<rpc::identity::SignedDeviceRoster>,
     /// A replenishment batch has been queued but not yet acknowledged. Several
     /// consumers may drain packages before that publish reaches the server;
@@ -2319,8 +2334,28 @@ struct MlsFileCache {
 
 #[derive(Debug)]
 enum PendingMlsCommit {
-    MemberUpdate(rpc::mls::EncryptedRoomDescriptor),
-    ExternalRejoin(rpc::mls::EncryptedRoomDescriptor),
+    RoomCreation(rpc::mls::EncryptedRoomDescriptor),
+    MemberUpdate {
+        descriptor: rpc::mls::EncryptedRoomDescriptor,
+        request: ClientControl,
+    },
+    ExternalRejoin {
+        descriptor: rpc::mls::EncryptedRoomDescriptor,
+        request: ClientControl,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MlsRetryKey {
+    Application(RoomId, EventId),
+    Commit(RoomId),
+}
+
+#[derive(Clone, Debug)]
+struct DelayedMlsRetry {
+    request: ClientControl,
+    failures: u32,
+    retry_at: Option<Instant>,
 }
 
 struct PendingAuthentication {
@@ -2720,6 +2755,10 @@ struct OutgoingUpload {
     name: String,
     size: u64,
     file: File,
+    /// Source path retained for durable encrypted-upload recovery. Staged
+    /// sources are unlinked only once their durable intent is completed.
+    source_path: PathBuf,
+    delete_source_when_done: bool,
     source_offset: u64,
     /// Raw source bytes fed to the compressor since its encoded output was last
     /// fully queued. Used only for throttled compressed uploads to prevent
@@ -3376,6 +3415,7 @@ impl WorkerState {
         schedule.include(self.interface_wake(now));
         schedule.include(self.rtt_probe_wake(now));
         schedule.include(self.udp_bind_retry_wake(now));
+        schedule.include(self.mls_retry_wake(now));
         schedule.timeout()
     }
 
@@ -3511,6 +3551,16 @@ impl WorkerState {
         }
     }
 
+    #[inline]
+    fn mls_retry_wake(&self, now: Instant) -> WakeIntent {
+        self.delayed_mls_retries
+            .values()
+            .filter_map(|retry| retry.retry_at)
+            .min()
+            .map(|retry_at| WakeIntent::After(retry_at.saturating_duration_since(now)))
+            .unwrap_or(WakeIntent::Idle)
+    }
+
     #[cfg(debug_assertions)]
     fn debug_assert_no_immediate_work(&self, command_drain: CommandDrainOutcome) {
         debug_assert!(!self.loop_work.has_immediate_work());
@@ -3521,6 +3571,24 @@ impl WorkerState {
         debug_assert_ne!(self.bug_report_wake(), WakeIntent::Now);
         debug_assert_ne!(self.receive_wake(), WakeIntent::Now);
         debug_assert_ne!(self.upload_wake(), WakeIntent::Now);
+        debug_assert_ne!(self.mls_retry_wake(Instant::now()), WakeIntent::Now);
+    }
+
+    fn defer_mls_retry(
+        &mut self,
+        key: MlsRetryKey,
+        request: ClientControl,
+        now: Instant,
+    ) -> Duration {
+        defer_mls_retry_in(&mut self.delayed_mls_retries, key, request, now)
+    }
+
+    fn poll_delayed_mls_retries(&mut self, now: Instant) -> Result<(), String> {
+        let ready = take_ready_mls_retries(&mut self.delayed_mls_retries, now);
+        for request in ready {
+            self.queue_control(request)?;
+        }
+        Ok(())
     }
 
     fn queue_control(&mut self, control: ClientControl) -> Result<(), String> {
@@ -4091,6 +4159,15 @@ impl WorkerState {
                     ));
                 }
             }
+            NetworkCommand::AcknowledgeMlsUiDispatch { room_id, sequence } => {
+                let installation = self
+                    .mls
+                    .as_ref()
+                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
+                installation
+                    .client
+                    .acknowledge_ui_dispatch(room_id, sequence)?;
+            }
             NetworkCommand::RevokeE2eDevice { device_id } => {
                 if let Some(installation) = self.mls.as_ref() {
                     if !self.mls_bound {
@@ -4363,7 +4440,14 @@ impl WorkerState {
             Ok(upload) => {
                 let name = upload.name.clone();
                 let size = upload.size;
+                if let Err(error) = self.persist_and_submit_file_announcement(&upload) {
+                    let _ = self.events.send(NetworkEvent::Error(error));
+                    return;
+                }
                 self.outgoing_uploads.push_back(upload);
+                if let Err(error) = self.submit_queued_file_announcement() {
+                    let _ = self.events.send(NetworkEvent::Error(error));
+                }
                 let _ = self.events.send(NetworkEvent::Status(format!(
                     "queued upload {name} ({})",
                     format_bytes(size)
@@ -4401,7 +4485,7 @@ impl WorkerState {
         }
         let name = upload_username(name_override, &path)?;
         let digest = file_sha256(&path)?;
-        let mut file = open_upload_source(&path, delete_after_open)
+        let mut file = open_upload_source(&path, false)
             .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
         let mut source_prefix = Vec::new();
         let mut _probe_encoded_len = None;
@@ -4472,9 +4556,6 @@ impl WorkerState {
             .ok_or_else(|| "no active room for upload".to_string())?;
         let seal = self.prepare_upload_seal(
             room_id,
-            transfer_id,
-            &name,
-            size,
             body.encoding(),
             digest,
         )?;
@@ -4485,6 +4566,8 @@ impl WorkerState {
             name,
             size,
             file,
+            source_path: path.clone(),
+            delete_source_when_done: delete_after_open && seal.is_some(),
             source_offset: 0,
             source_read_ahead: 0,
             wire_offset: 0,
@@ -4500,16 +4583,18 @@ impl WorkerState {
             image_prefix: Vec::new(),
             seal,
         })
+        .inspect(|upload| {
+            if delete_after_open && upload.seal.is_none() {
+                let _ = fs::remove_file(&path);
+            }
+        })
     }
 
-    /// Builds MLS file sealing state: a fresh content key plus an authenticated
-    /// MLS application event carrying the transfer metadata.
+    /// Builds MLS file sealing state. Persistence and submission happen only
+    /// after the complete upload has been installed in the in-memory queue.
     fn prepare_upload_seal(
         &mut self,
         room_id: RoomId,
-        transfer_id: FileTransferId,
-        name: &str,
-        size: u64,
         inner_encoding: FileContentEncoding,
         digest: [u8; 32],
     ) -> Result<Option<UploadSeal>, String> {
@@ -4532,20 +4617,6 @@ impl WorkerState {
             .fill(&mut content_key)
             .map_err(|_| "failed to generate a file content key".to_string())?;
         let event_id = random_event_id()?;
-        let announcement = rpc::mls::MlsFileAnnouncement {
-            transfer_id,
-            name: name.to_string(),
-            size,
-            chunk_size: MAX_FILE_CHUNK_BYTES as u32,
-            encoding: inner_encoding,
-            file_key: content_key,
-            digest,
-        };
-        self.send_mls_content_with_id(
-            room_id,
-            event_id,
-            rpc::mls::ChattEventContent::File(announcement),
-        )?;
         Ok(Some(UploadSeal {
             content_key: KeyMaterial {
                 id: 1,
@@ -4560,6 +4631,64 @@ impl WorkerState {
             pad_remaining: None,
             mls_event_id: event_id,
         }))
+    }
+
+    fn persist_and_submit_file_announcement(
+        &self,
+        upload: &OutgoingUpload,
+    ) -> Result<(), String> {
+        let Some(seal) = upload.seal.as_ref() else {
+            return Ok(());
+        };
+        let installation = self
+            .mls
+            .as_ref()
+            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
+        let announcement = rpc::mls::MlsFileAnnouncement {
+            transfer_id: upload.transfer_id,
+            name: upload.name.clone(),
+            size: upload.size,
+            chunk_size: MAX_FILE_CHUNK_BYTES as u32,
+            encoding: seal.inner_encoding,
+            file_key: seal.content_key.bytes,
+            digest: seal.digest,
+        };
+        installation.client.queue_file_outgoing(
+            rpc::mls::MlsChattEvent {
+                version: rpc::mls::MLS_PROTOCOL_VERSION,
+                room_id: upload.room_id,
+                event_id: seal.event_id,
+                sender_account: installation.bootstrap.account_id,
+                timestamp_ms: unix_now_ms(),
+                content: rpc::mls::ChattEventContent::File(announcement),
+            },
+            upload.source_path.as_os_str().as_bytes().to_vec(),
+            upload.delete_source_when_done,
+        )
+    }
+
+    fn submit_queued_file_announcement(&mut self) -> Result<(), String> {
+        if self.mls_bound {
+            self.queue_pending_mls_outbox()?;
+        }
+        Ok(())
+    }
+
+    fn finish_durable_file_upload(&self, upload: &OutgoingUpload) -> Result<(), String> {
+        let Some(seal) = upload.seal.as_ref() else {
+            return Ok(());
+        };
+        let installation = self
+            .mls
+            .as_ref()
+            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
+        installation
+            .client
+            .finish_file_upload(upload.room_id, seal.event_id)?;
+        if upload.delete_source_when_done {
+            let _ = fs::remove_file(&upload.source_path);
+        }
+        Ok(())
     }
 
     fn poll_uploads(&mut self) -> Result<(), String> {
@@ -4984,6 +5113,7 @@ impl WorkerState {
             });
         }
         self.finish_local_copy(&mut upload);
+        self.finish_durable_file_upload(&upload)?;
         Ok(true)
     }
 
@@ -5081,7 +5211,7 @@ impl WorkerState {
             ),
             UploadAbort::Failure(error) => (TerminalVerb::Failed, Some(error.clone())),
         };
-        if let Some(metadata) = upload.server_metadata {
+        if let Some(metadata) = upload.server_metadata.as_ref() {
             let _ = self.events.send(NetworkEvent::TransferEnded {
                 room_id: metadata.room_id,
                 transfer_id: metadata.transfer_id,
@@ -5095,6 +5225,7 @@ impl WorkerState {
                 .events
                 .send(NetworkEvent::Error(format!("{error} {}", upload.name)));
         }
+        self.finish_durable_file_upload(&upload)?;
         Ok(true)
     }
 
@@ -6347,6 +6478,9 @@ impl WorkerState {
                         initialized,
                         roster,
                     }));
+                    if self.mls_bound {
+                        self.restore_pending_ui_dispatches()?;
+                    }
                     return Ok(());
                 }
                 let _ = self.events.send(NetworkEvent::MlsAccountIdentity {
@@ -6455,6 +6589,8 @@ impl WorkerState {
                     })?;
                     self.mls_key_package_publish_pending = true;
                 }
+                self.restore_pending_file_uploads()?;
+                self.restore_pending_ui_dispatches()?;
                 self.queue_control(ClientControl::FetchMlsWelcome { after_sequence })?;
                 self.queue_mls_room_reconciliation()?;
                 self.queue_mls_maintenance()?;
@@ -6475,7 +6611,7 @@ impl WorkerState {
                     }
                     return Err("server created an unrequested encrypted room".to_string());
                 };
-                let PendingMlsCommit::MemberUpdate(descriptor) = pending else {
+                let PendingMlsCommit::RoomCreation(descriptor) = pending else {
                     return Err("room creation matched an external rejoin".to_string());
                 };
                 installation
@@ -6520,11 +6656,19 @@ impl WorkerState {
                     }
                     if matches!(
                         self.pending_mls_commits.get(&welcome.descriptor.room_id),
-                        Some(PendingMlsCommit::MemberUpdate(_))
-                    ) && let Some(PendingMlsCommit::MemberUpdate(descriptor)) = self
+                        Some(PendingMlsCommit::RoomCreation(_)
+                            | PendingMlsCommit::MemberUpdate { .. })
+                    ) && let Some(pending) = self
                         .pending_mls_commits
                         .remove(&welcome.descriptor.room_id)
                     {
+                        self.delayed_mls_retries
+                            .remove(&MlsRetryKey::Commit(welcome.descriptor.room_id));
+                        let descriptor = match pending {
+                            PendingMlsCommit::RoomCreation(descriptor)
+                            | PendingMlsCommit::MemberUpdate { descriptor, .. } => descriptor,
+                            PendingMlsCommit::ExternalRejoin { .. } => unreachable!(),
+                        };
                         installation.client.reject_pending_commit(&descriptor)?;
                     }
                     self.pending_mls_group_infos
@@ -6669,6 +6813,8 @@ impl WorkerState {
                     None
                 };
                 for event_id in recovered_outgoing {
+                    self.delayed_mls_retries
+                        .remove(&MlsRetryKey::Application(room_id, event_id));
                     self.mark_mls_upload_announcement_delivered(room_id, event_id);
                 }
                 for (sequence, event) in opened {
@@ -6703,6 +6849,8 @@ impl WorkerState {
                 match outcome {
                     rpc::mls::MlsSubmitOutcome::Stored { sequence }
                     | rpc::mls::MlsSubmitOutcome::AlreadyStored { sequence } => {
+                        self.delayed_mls_retries
+                            .remove(&MlsRetryKey::Application(room_id, event_id));
                         let entry = installation.client.outbox(room_id, event_id)?;
                         let should_emit = installation
                             .client
@@ -6730,6 +6878,8 @@ impl WorkerState {
                         }
                     }
                     rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { current_epoch } => {
+                        self.delayed_mls_retries
+                            .remove(&MlsRetryKey::Application(room_id, event_id));
                         installation.client.retry_stale_outgoing(
                             room_id,
                             event_id,
@@ -6742,12 +6892,34 @@ impl WorkerState {
                             limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
                         })?;
                     }
-                    rpc::mls::MlsSubmitOutcome::RevocationPending
-                    | rpc::mls::MlsSubmitOutcome::TemporarilyBlocked => {
+                    rpc::mls::MlsSubmitOutcome::RevocationPending => {
+                        self.delayed_mls_retries
+                            .remove(&MlsRetryKey::Application(room_id, event_id));
                         let _ = self.events.send(NetworkEvent::Status(
                             "encrypted message queued while room membership is reconciled"
                                 .to_string(),
                         ));
+                    }
+                    rpc::mls::MlsSubmitOutcome::TemporarilyBlocked => {
+                        let entry = installation.client.outbox(room_id, event_id)?;
+                        if let chatt_mls::OutboxState::PendingDelivery { epoch, ciphertext } =
+                            entry.state
+                        {
+                            let delay = self.defer_mls_retry(
+                                MlsRetryKey::Application(room_id, event_id),
+                                ClientControl::SubmitMlsApplication {
+                                    room_id,
+                                    epoch,
+                                    event_id,
+                                    ciphertext,
+                                },
+                                Instant::now(),
+                            );
+                            let _ = self.events.send(NetworkEvent::Status(format!(
+                                "encrypted message temporarily blocked; retrying in {} ms",
+                                delay.as_millis()
+                            )));
+                        }
                     }
                 }
             }
@@ -6755,13 +6927,16 @@ impl WorkerState {
                 match outcome {
                     rpc::mls::MlsCommitOutcome::Accepted { sequence, .. }
                     | rpc::mls::MlsCommitOutcome::AlreadyAccepted { sequence, .. } => {
+                        self.delayed_mls_retries
+                            .remove(&MlsRetryKey::Commit(room_id));
                         let mut refetch_after = None;
                         let mut resume_outbox = false;
                         if let Some(pending) = self.pending_mls_commits.remove(&room_id)
                             && let Some(installation) = self.mls.as_ref()
                         {
                             match pending {
-                                PendingMlsCommit::MemberUpdate(_) => {
+                                PendingMlsCommit::RoomCreation(_)
+                                | PendingMlsCommit::MemberUpdate { .. } => {
                                     // Keep the exact commit pending until it
                                     // reaches its position in the ordered
                                     // stream. Applying it here and setting the
@@ -6769,7 +6944,7 @@ impl WorkerState {
                                     // applications appended earlier in the
                                     // same epoch.
                                 }
-                                PendingMlsCommit::ExternalRejoin(descriptor) => {
+                                PendingMlsCommit::ExternalRejoin { descriptor, .. } => {
                                     installation
                                         .client
                                         .accept_external_rejoin(&descriptor, sequence)?;
@@ -6791,11 +6966,14 @@ impl WorkerState {
                         }
                     }
                     rpc::mls::MlsCommitOutcome::StaleEpoch { .. } => {
+                        self.delayed_mls_retries
+                            .remove(&MlsRetryKey::Commit(room_id));
                         if let Some(pending) = self.pending_mls_commits.remove(&room_id)
                             && let Some(installation) = self.mls.as_ref()
                         {
                             match pending {
-                                PendingMlsCommit::MemberUpdate(descriptor) => {
+                                PendingMlsCommit::RoomCreation(descriptor)
+                                | PendingMlsCommit::MemberUpdate { descriptor, .. } => {
                                     installation.client.reject_pending_commit(&descriptor)?;
                                     let after_sequence = installation.client.cursor(room_id)?;
                                     self.queue_control(ClientControl::FetchMlsEvents {
@@ -6804,26 +6982,50 @@ impl WorkerState {
                                         limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
                                     })?;
                                 }
-                                PendingMlsCommit::ExternalRejoin(_) => {
+                                PendingMlsCommit::ExternalRejoin { .. } => {
                                     installation.client.reject_external_rejoin(room_id)?;
                                     self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
                                 }
                             }
                         }
                     }
-                    rpc::mls::MlsCommitOutcome::MissingKeyPackage { .. }
-                    | rpc::mls::MlsCommitOutcome::TemporarilyBlocked => {
+                    rpc::mls::MlsCommitOutcome::TemporarilyBlocked => {
+                        let request = self.pending_mls_commits.get(&room_id).and_then(|pending| {
+                            match pending {
+                                PendingMlsCommit::MemberUpdate { request, .. }
+                                | PendingMlsCommit::ExternalRejoin { request, .. } => {
+                                    Some(request.clone())
+                                }
+                                PendingMlsCommit::RoomCreation(_) => None,
+                            }
+                        });
+                        if let Some(request) = request {
+                            let delay = self.defer_mls_retry(
+                                MlsRetryKey::Commit(room_id),
+                                request,
+                                Instant::now(),
+                            );
+                            let _ = self.events.send(NetworkEvent::Status(format!(
+                                "MLS membership update temporarily blocked; retrying in {} ms",
+                                delay.as_millis()
+                            )));
+                        }
+                    }
+                    rpc::mls::MlsCommitOutcome::MissingKeyPackage { .. } => {
+                        self.delayed_mls_retries
+                            .remove(&MlsRetryKey::Commit(room_id));
                         let mut resume_outbox = false;
                         let mut refetch_group_info = false;
                         if let Some(pending) = self.pending_mls_commits.remove(&room_id)
                             && let Some(installation) = self.mls.as_ref()
                         {
                             match pending {
-                                PendingMlsCommit::MemberUpdate(descriptor) => {
+                                PendingMlsCommit::RoomCreation(descriptor)
+                                | PendingMlsCommit::MemberUpdate { descriptor, .. } => {
                                     installation.client.reject_pending_commit(&descriptor)?;
                                     resume_outbox = true;
                                 }
-                                PendingMlsCommit::ExternalRejoin(_) => {
+                                PendingMlsCommit::ExternalRejoin { .. } => {
                                     installation.client.reject_external_rejoin(room_id)?;
                                     refetch_group_info = true;
                                 }
@@ -6846,6 +7048,8 @@ impl WorkerState {
                         ));
                     }
                     rpc::mls::MlsCommitOutcome::PolicyRejected => {
+                        self.delayed_mls_retries
+                            .remove(&MlsRetryKey::Commit(room_id));
                         // A concurrently accepted membership commit can make
                         // a locally prepared commit invalid even when its
                         // advertised parent epoch raced ahead of our delivery
@@ -6858,12 +7062,13 @@ impl WorkerState {
                             && let Some(installation) = self.mls.as_ref()
                         {
                             match pending {
-                                PendingMlsCommit::MemberUpdate(descriptor) => {
+                                PendingMlsCommit::RoomCreation(descriptor)
+                                | PendingMlsCommit::MemberUpdate { descriptor, .. } => {
                                     installation.client.reject_pending_commit(&descriptor)?;
                                     resume_outbox = true;
                                     refetch_events = true;
                                 }
-                                PendingMlsCommit::ExternalRejoin(_) => {
+                                PendingMlsCommit::ExternalRejoin { .. } => {
                                     installation.client.reject_external_rejoin(room_id)?;
                                     self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
                                 }
@@ -6925,7 +7130,7 @@ impl WorkerState {
                 };
                 if matches!(
                     self.pending_mls_commits.get(&room_id),
-                    Some(PendingMlsCommit::ExternalRejoin(_))
+                    Some(PendingMlsCommit::ExternalRejoin { .. })
                 ) {
                     return Ok(());
                 }
@@ -6937,6 +7142,8 @@ impl WorkerState {
                     .recover_accepted_room_creation(&descriptor, &group_info)?
                 {
                     self.pending_mls_commits.remove(&room_id);
+                    self.delayed_mls_retries
+                        .remove(&MlsRetryKey::Commit(room_id));
                     self.pending_mls_rooms.remove(&room_id);
                     self.pending_mls_group_infos.remove(&room_id);
                     self.queue_control(ClientControl::FetchMlsEvents {
@@ -6947,9 +7154,10 @@ impl WorkerState {
                     self.queue_pending_mls_outbox()?;
                     return Ok(());
                 }
-                if let Some(PendingMlsCommit::MemberUpdate(pending_descriptor)) =
-                    self.pending_mls_commits.remove(&room_id)
+                if let Some(pending) = self.pending_mls_commits.remove(&room_id)
                 {
+                    self.delayed_mls_retries
+                        .remove(&MlsRetryKey::Commit(room_id));
                     // A canonical GroupInfo while room creation is pending is
                     // the server's response to losing a linked-device genesis
                     // race. The speculative group was never accepted; clear
@@ -6960,7 +7168,13 @@ impl WorkerState {
                             "GroupInfo arrived without a local MLS installation".to_string()
                         })?
                         .client
-                        .reject_pending_commit(&pending_descriptor)?;
+                        .reject_pending_commit(match &pending {
+                            PendingMlsCommit::RoomCreation(descriptor)
+                            | PendingMlsCommit::MemberUpdate { descriptor, .. } => descriptor,
+                            PendingMlsCommit::ExternalRejoin { .. } => {
+                                return Err("canonical GroupInfo crossed an external rejoin".to_string());
+                            }
+                        })?;
                 }
                 if self
                     .mls
@@ -7303,57 +7517,6 @@ impl WorkerState {
             .is_some_and(|kind| !matches!(kind, RoomKind::Public))
     }
 
-    fn send_mls_content_with_id(
-        &mut self,
-        room_id: RoomId,
-        event_id: EventId,
-        content: rpc::mls::ChattEventContent,
-    ) -> Result<(), String> {
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        let descriptor = installation.client.descriptor(room_id)?;
-        installation.client.queue_outgoing(rpc::mls::MlsChattEvent {
-            version: rpc::mls::MLS_PROTOCOL_VERSION,
-            room_id,
-            event_id,
-            sender_account: installation.bootstrap.account_id,
-            timestamp_ms: unix_now_ms(),
-            content,
-        })?;
-        let Some(descriptor) = descriptor else {
-            let _ = self.events.send(NetworkEvent::Status(
-                "encrypted file queued while room setup waits for device KeyPackages"
-                    .to_string(),
-            ));
-            return Ok(());
-        };
-        if !self.mls_bound {
-            let _ = self.events.send(NetworkEvent::Status(
-                "encrypted file queued until the MLS device is bound".to_string(),
-            ));
-            return Ok(());
-        }
-        if self.pending_mls_commits.contains_key(&room_id)
-            || installation.client.has_pending_commit(&descriptor)?
-        {
-            let _ = self.events.send(NetworkEvent::Status(
-                "encrypted file queued while room membership is reconciled".to_string(),
-            ));
-            return Ok(());
-        }
-        let (epoch, ciphertext) = installation
-            .client
-            .encrypt_outgoing(&descriptor, event_id)?;
-        self.queue_control(ClientControl::SubmitMlsApplication {
-            room_id,
-            epoch,
-            event_id,
-            ciphertext,
-        })
-    }
-
     fn mark_mls_upload_announcement_delivered(
         &mut self,
         room_id: RoomId,
@@ -7393,6 +7556,24 @@ impl WorkerState {
         }
         let message = self.mls_chatt_event_to_chat(event, sequence)?;
         let _ = self.events.send(NetworkEvent::Chat(message));
+        Ok(())
+    }
+
+    fn restore_pending_ui_dispatches(&mut self) -> Result<(), String> {
+        let pending = self
+            .mls
+            .as_ref()
+            .ok_or_else(|| "local MLS installation is unavailable".to_string())?
+            .client
+            .pending_ui_dispatches()?;
+        for dispatch in pending {
+            if let Err(error) = self.emit_mls_chatt_event(dispatch.event, dispatch.sequence) {
+                kvlog::info!(
+                    "durable MLS UI dispatch is waiting for sender identity",
+                    error = error.as_str()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -7520,16 +7701,20 @@ impl WorkerState {
         let (expected_epoch, bundle) = installation
             .client
             .prepare_external_rejoin(&pending.descriptor, &pending.group_info)?;
-        let replaced = self.pending_mls_commits.insert(
-            room_id,
-            PendingMlsCommit::ExternalRejoin(pending.descriptor),
-        );
-        debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
-        self.queue_control(ClientControl::SubmitCommitBundle {
+        let request = ClientControl::SubmitCommitBundle {
             room_id,
             expected_epoch,
             bundle,
-        })?;
+        };
+        let replaced = self.pending_mls_commits.insert(
+            room_id,
+            PendingMlsCommit::ExternalRejoin {
+                descriptor: pending.descriptor,
+                request: request.clone(),
+            },
+        );
+        debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
+        self.queue_control(request)?;
         Ok(())
     }
 
@@ -7722,16 +7907,20 @@ impl WorkerState {
         }
         for (descriptor, expected_epoch, bundle) in maintenance {
             let room_id = descriptor.room_id;
-            let replaced = self.pending_mls_commits.insert(
-                room_id,
-                PendingMlsCommit::MemberUpdate(descriptor),
-            );
-            debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
-            self.queue_control(ClientControl::SubmitCommitBundle {
+            let request = ClientControl::SubmitCommitBundle {
                 room_id,
                 expected_epoch,
                 bundle,
-            })?;
+            };
+            let replaced = self.pending_mls_commits.insert(
+                room_id,
+                PendingMlsCommit::MemberUpdate {
+                    descriptor,
+                    request: request.clone(),
+                },
+            );
+            debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
+            self.queue_control(request)?;
         }
         Ok(())
     }
@@ -7744,6 +7933,25 @@ impl WorkerState {
         for entry in installation.client.pending_outbox()? {
             let room_id = entry.event.room_id;
             let event_id = entry.event.event_id;
+            if self
+                .delayed_mls_retries
+                .contains_key(&MlsRetryKey::Application(room_id, event_id))
+            {
+                continue;
+            }
+            if matches!(entry.event.content, rpc::mls::ChattEventContent::File(_))
+                && !self.outgoing_uploads.iter().any(|upload| {
+                    upload.room_id == room_id
+                        && upload
+                            .seal
+                            .as_ref()
+                            .is_some_and(|seal| seal.event_id == event_id)
+                })
+            {
+                // Never make a file announcement durable at the server unless
+                // the corresponding source has been reconstructed locally.
+                continue;
+            }
             let Some(descriptor) = installation.client.descriptor(room_id)? else {
                 continue;
             };
@@ -7770,6 +7978,98 @@ impl WorkerState {
                 event_id,
                 ciphertext,
             })?;
+        }
+        Ok(())
+    }
+
+    fn restore_pending_file_uploads(&mut self) -> Result<(), String> {
+        let Some(installation) = self.mls.as_ref() else {
+            return Ok(());
+        };
+        let intents = installation.client.pending_file_uploads()?;
+        for intent in intents {
+            if self.outgoing_uploads.iter().any(|upload| {
+                upload.room_id == intent.room_id
+                    && upload
+                        .seal
+                        .as_ref()
+                        .is_some_and(|seal| seal.event_id == intent.event_id)
+            }) {
+                continue;
+            }
+            let entry = match self
+                .mls
+                .as_ref()
+                .expect("MLS installation checked above")
+                .client
+                .outbox(intent.room_id, intent.event_id)
+            {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let _ = self.events.send(NetworkEvent::Error(format!(
+                        "cannot resume encrypted upload: {error}"
+                    )));
+                    continue;
+                }
+            };
+            let rpc::mls::ChattEventContent::File(announcement) = &entry.event.content else {
+                let _ = self.events.send(NetworkEvent::Error(
+                    "cannot resume encrypted upload: durable announcement is not a file"
+                        .to_string(),
+                ));
+                continue;
+            };
+            let path = PathBuf::from(std::ffi::OsString::from_vec(intent.source_path.clone()));
+            let request = UploadFileRequest {
+                path,
+                name_override: Some(announcement.name.clone()),
+                delete_after_open: false,
+            };
+            let mut upload = match self.prepare_file_upload(Some(intent.room_id), request) {
+                Ok(upload) => upload,
+                Err(error) => {
+                    let _ = self.events.send(NetworkEvent::Error(format!(
+                        "cannot resume encrypted upload {}: {error}",
+                        announcement.name
+                    )));
+                    continue;
+                }
+            };
+            let Some(seal) = upload.seal.as_mut() else {
+                let _ = self.events.send(NetworkEvent::Error(format!(
+                    "cannot resume encrypted upload {}: room is no longer encrypted",
+                    announcement.name
+                )));
+                continue;
+            };
+            if upload.size != announcement.size
+                || seal.digest != announcement.digest
+                || seal.inner_encoding != announcement.encoding
+            {
+                let _ = self.events.send(NetworkEvent::Error(format!(
+                    "cannot resume encrypted upload {}: source file changed",
+                    announcement.name
+                )));
+                continue;
+            }
+            upload.transfer_id = announcement.transfer_id;
+            upload.delete_source_when_done = intent.delete_after_upload;
+            seal.content_key.bytes = announcement.file_key;
+            seal.event_id = intent.event_id;
+            seal.mls_event_id = intent.event_id;
+            seal.announcement_delivered = matches!(
+                entry.state,
+                chatt_mls::OutboxState::Delivered { .. }
+            );
+            self.next_file_transfer = self
+                .next_file_transfer
+                .max(announcement.transfer_id.0.wrapping_add(1).max(1));
+            let _ = self.events.send(NetworkEvent::Status(format!(
+                "resuming upload {} ({})",
+                upload.name,
+                format_bytes(upload.size)
+            )));
+            self.outgoing_uploads.push_back(upload);
         }
         Ok(())
     }
@@ -7913,7 +8213,7 @@ impl WorkerState {
             .create_room(&descriptor, &pending.packages)?;
         let replaced = self
             .pending_mls_commits
-            .insert(room_id, PendingMlsCommit::MemberUpdate(descriptor.clone()));
+            .insert(room_id, PendingMlsCommit::RoomCreation(descriptor.clone()));
         debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
         self.queue_control(ClientControl::CreateEncryptedRoom {
             descriptor,
@@ -9362,6 +9662,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::VerifyPeerIdentity { .. } => "verify_peer_identity",
         NetworkCommand::ForgetPeerIdentity { .. } => "forget_peer_identity",
         NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
+        NetworkCommand::AcknowledgeMlsUiDispatch { .. } => "acknowledge_mls_ui_dispatch",
         NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
@@ -9604,6 +9905,50 @@ fn upload_username(name_override: Option<String>, path: &Path) -> Result<String,
         return Err("file name exceeds maximum length".to_string());
     }
     Ok(name)
+}
+
+fn mls_retry_backoff(failures: u32) -> Duration {
+    let multiplier = 1_u32.checked_shl(failures.min(16)).unwrap_or(u32::MAX);
+    MLS_RETRY_INITIAL_BACKOFF
+        .checked_mul(multiplier)
+        .unwrap_or(MLS_RETRY_MAX_BACKOFF)
+        .min(MLS_RETRY_MAX_BACKOFF)
+}
+
+fn defer_mls_retry_in(
+    retries: &mut HashMap<MlsRetryKey, DelayedMlsRetry>,
+    key: MlsRetryKey,
+    request: ClientControl,
+    now: Instant,
+) -> Duration {
+    let retry = retries.entry(key).or_insert(DelayedMlsRetry {
+        request: request.clone(),
+        failures: 0,
+        retry_at: None,
+    });
+    retry.request = request;
+    let delay = mls_retry_backoff(retry.failures);
+    retry.failures = retry.failures.saturating_add(1);
+    retry.retry_at = Some(now + delay);
+    delay
+}
+
+fn take_ready_mls_retries(
+    retries: &mut HashMap<MlsRetryKey, DelayedMlsRetry>,
+    now: Instant,
+) -> Vec<ClientControl> {
+    retries
+        .values_mut()
+        .filter_map(|retry| {
+            retry
+                .retry_at
+                .filter(|retry_at| *retry_at <= now)
+                .map(|_| {
+                    retry.retry_at = None;
+                    retry.request.clone()
+                })
+        })
+        .collect()
 }
 
 /// Opens the upload source, then unlinks it when `delete_after_open` is set. The
@@ -11122,6 +11467,8 @@ mod tests {
             name: "sealed.bin".to_string(),
             size: 0,
             file: source,
+            source_path: PathBuf::new(),
+            delete_source_when_done: false,
             source_offset: 0,
             source_read_ahead: 0,
             wire_offset: 0,
@@ -11175,6 +11522,8 @@ mod tests {
             name: "source.bin".to_string(),
             size: data.len() as u64,
             file,
+            source_path: PathBuf::new(),
+            delete_source_when_done: false,
             source_offset: 0,
             source_read_ahead: 0,
             wire_offset: 0,
@@ -11213,6 +11562,8 @@ mod tests {
             name: "source.bin".to_string(),
             size: raw.len() as u64,
             file: File::open(source_path).unwrap(),
+            source_path: PathBuf::new(),
+            delete_source_when_done: false,
             source_offset: 0,
             source_read_ahead: 0,
             wire_offset: 0,
@@ -11263,6 +11614,8 @@ mod tests {
             name: "source.bin".to_string(),
             size: 16 * 1024 * 1024,
             file: File::open(source_path).unwrap(),
+            source_path: PathBuf::new(),
+            delete_source_when_done: false,
             source_offset: 0,
             source_read_ahead: MAX_COMPRESSED_UPLOAD_SOURCE_AHEAD_BYTES - 1,
             wire_offset: 0,
@@ -11352,6 +11705,8 @@ mod tests {
             name: "report.pdf".to_string(),
             size: 10,
             file,
+            source_path: PathBuf::new(),
+            delete_source_when_done: false,
             source_offset: 0,
             source_read_ahead: 0,
             wire_offset: 0,
@@ -11456,6 +11811,42 @@ mod tests {
 
         let _file = open_upload_source(&path, false).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn temporarily_blocked_mls_requests_retry_only_after_exponential_backoff() {
+        let room_id = RoomId(17);
+        let request = ClientControl::FetchGroupInfo { room_id };
+        let key = MlsRetryKey::Commit(room_id);
+        let start = Instant::now();
+        let mut retries = HashMap::new();
+
+        assert_eq!(
+            defer_mls_retry_in(&mut retries, key, request.clone(), start),
+            MLS_RETRY_INITIAL_BACKOFF
+        );
+        assert!(take_ready_mls_retries(&mut retries, start).is_empty());
+        assert!(take_ready_mls_retries(
+            &mut retries,
+            start + MLS_RETRY_INITIAL_BACKOFF - Duration::from_millis(1)
+        )
+        .is_empty());
+        assert_eq!(
+            take_ready_mls_retries(&mut retries, start + MLS_RETRY_INITIAL_BACKOFF),
+            vec![request.clone()]
+        );
+        assert!(take_ready_mls_retries(
+            &mut retries,
+            start + MLS_RETRY_INITIAL_BACKOFF
+        )
+        .is_empty());
+
+        let second_start = start + MLS_RETRY_INITIAL_BACKOFF;
+        assert_eq!(
+            defer_mls_retry_in(&mut retries, key, request, second_start),
+            MLS_RETRY_INITIAL_BACKOFF * 2
+        );
+        assert_eq!(mls_retry_backoff(32), MLS_RETRY_MAX_BACKOFF);
     }
 
     #[test]

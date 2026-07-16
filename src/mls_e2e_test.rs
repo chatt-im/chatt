@@ -169,6 +169,9 @@ impl Client {
             "client emitted MLS room {} out of order: sequence {sequence} after {previous:?}",
             room_id.0,
         );
+        self.handle
+            .try_send(NetworkCommand::AcknowledgeMlsUiDispatch { room_id, sequence })
+            .unwrap();
     }
 
     fn pending_statuses(&self) -> Vec<String> {
@@ -1182,9 +1185,24 @@ fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
     let payload = b"MLS file payload survives encrypted chunk relay".repeat(4096);
     let source = root.join("payload.bin");
     std::fs::write(&source, &payload).unwrap();
+    alice
+        .as_ref()
+        .unwrap()
+        .handle
+        .try_send(NetworkCommand::SetUploadRate(1))
+        .unwrap();
     alice.as_ref().unwrap().handle.try_send(NetworkCommand::UploadFile {
         room_id: Some(room_id), request: UploadFileRequest::new(source),
     }).unwrap();
+    wait_event(
+        alice.as_ref().unwrap(),
+        "durably queued MLS file",
+        Duration::from_secs(10),
+        |event| matches!(event, NetworkEvent::Status(status) if status.starts_with("queued upload payload.bin")),
+    );
+    drop(alice.take());
+    alice = Some(spawn(alice_config));
+    wait_authenticated(alice.as_ref().unwrap(), "file sender restart");
     let received = wait_event(bob.as_ref().unwrap(), "MLS file", Duration::from_secs(20), |event| matches!(event, NetworkEvent::FileReceived { .. }));
     let NetworkEvent::FileReceived { served_name, .. } = received else { unreachable!() };
     assert_eq!(std::fs::read(root.join("bob-downloads").join(served_name)).unwrap(), payload);

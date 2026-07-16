@@ -4145,6 +4145,11 @@ impl App {
                 }
             }
             NetworkEvent::Chat(record) => {
+                let room_id = record.message.room_id;
+                let raw_message_id = record.message.message_id.0;
+                let mls_sequence = (raw_message_id & (1 << 63) != 0)
+                    .then_some(raw_message_id & !(1 << 63));
+                (|| {
                 let message = &record.message;
                 let viewed = self.room.viewed_room == Some(message.room_id);
                 if message.target.is_some() {
@@ -4225,6 +4230,13 @@ impl App {
                 }
                 if !update.local {
                     self.play_notification(NotificationSound::MessageReceived);
+                }
+                })();
+                if let Some(sequence) = mls_sequence {
+                    self.send_network_command(
+                        NetworkCommand::AcknowledgeMlsUiDispatch { room_id, sequence },
+                        false,
+                    );
                 }
             }
             NetworkEvent::FileReceived {
@@ -8886,6 +8898,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::VerifyPeerIdentity { .. } => "verify_peer_identity",
         NetworkCommand::ForgetPeerIdentity { .. } => "forget_peer_identity",
         NetworkCommand::ConfirmE2ePeerPin { .. } => "confirm_e2e_peer_pin",
+        NetworkCommand::AcknowledgeMlsUiDispatch { .. } => "acknowledge_mls_ui_dispatch",
         NetworkCommand::RevokeE2eDevice { .. } => "revoke_e2e_device",
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
@@ -11415,6 +11428,39 @@ mod tests {
             notice.notice_kind,
             Some(crate::chat_buffer::NoticeKind::Error)
         );
+    }
+
+    #[test]
+    fn applied_mls_chat_acknowledges_the_durable_ui_dispatch() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[test_room_info(1)],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+
+        let mut record = test_chat_record(RoomId(1), MessageId(7));
+        record.message.message_id = MessageId((1 << 63) | 7);
+        app.handle_network_event(NetworkEvent::Chat(record));
+
+        let acknowledged = (0..4).any(|_| {
+            matches!(
+                rx.recv_timeout(Duration::from_secs(1)),
+                Ok(NetworkCommand::AcknowledgeMlsUiDispatch {
+                    room_id: RoomId(1),
+                    sequence: 7,
+                })
+            )
+        });
+        assert!(acknowledged);
     }
 
     #[test]
