@@ -94,7 +94,11 @@ const MAX_PENDING_MLS_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PENDING_MLS_FILE_ITEMS: usize = 1024;
 const MAX_PENDING_MLS_FILE_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_MLS_FILE_GLOBAL_ITEMS: usize = 8192;
-const MLS_KEY_PACKAGE_TARGET: u16 = 16;
+/// Keep a small burst reserve without making every fresh installation perform
+/// dozens of public-key operations before it can join a room. The server
+/// notifies the owner after every consume, so this is a latency reserve rather
+/// than a long-lived prekey inventory.
+const MLS_KEY_PACKAGE_TARGET: u16 = 4;
 
 pub(super) fn mls_installation_dir(
     data_dir: &Path,
@@ -1193,7 +1197,10 @@ fn device_pair_once(
     )?;
     let key_packages = installation
         .client
-        .pending_pair_key_packages(installation.bootstrap.device_id, 16)?;
+        .pending_pair_key_packages(
+            installation.bootstrap.device_id,
+            usize::from(MLS_KEY_PACKAGE_TARGET),
+        )?;
     if cancellation
         .compare_exchange(
             PAIRING_CANCELABLE,
@@ -2282,7 +2289,11 @@ struct PendingMlsRoom {
     rosters: HashMap<UserId, rpc::identity::SignedDeviceRoster>,
     descriptor: Option<rpc::mls::EncryptedRoomDescriptor>,
     checkpoints: Vec<rpc::identity::RosterCheckpoint>,
+    /// KeyPackage requests currently in flight.
     awaiting_packages: HashSet<DeviceId>,
+    /// Devices whose last request found an empty pool. The room remains
+    /// intact so a later publication can retry just these devices.
+    missing_packages: HashSet<DeviceId>,
     device_accounts: HashMap<DeviceId, AccountId>,
     packages: Vec<(DeviceId, Vec<u8>)>,
 }
@@ -2292,6 +2303,10 @@ struct PendingMlsGroupInfo {
     descriptor: rpc::mls::EncryptedRoomDescriptor,
     group_info: Vec<u8>,
     awaiting_rosters: HashSet<UserId>,
+    /// A Welcome fetch issued after this canonical GroupInfo is waiting for
+    /// its response. External rejoin is only a fallback after that response
+    /// proves this device has no usable Welcome.
+    awaiting_welcome_check: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -6173,9 +6188,9 @@ impl WorkerState {
                             limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
                         })?;
                     } else {
-                        self.pending_mls_rooms.insert(
-                            room_id,
-                            PendingMlsRoom {
+                        let inserted = !self.pending_mls_rooms.contains_key(&room_id);
+                        if inserted {
+                            self.pending_mls_rooms.insert(room_id, PendingMlsRoom {
                                 member_users: vec![
                                     self.user_id.ok_or_else(|| {
                                         "DM opened before authentication".to_string()
@@ -6186,11 +6201,14 @@ impl WorkerState {
                                 descriptor: None,
                                 checkpoints: Vec::new(),
                                 awaiting_packages: HashSet::new(),
+                                missing_packages: HashSet::new(),
                                 device_accounts: HashMap::new(),
                                 packages: Vec::new(),
-                            },
-                        );
-                        self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
+                            });
+                        }
+                        if inserted {
+                            self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
+                        }
                     }
                 }
                 let _ = self.events.send(NetworkEvent::DmOpened { room_id, peer });
@@ -6474,6 +6492,7 @@ impl WorkerState {
                 welcomes,
                 head_sequence,
             } => {
+                let delivered_any = !welcomes.is_empty();
                 let mut missing_rosters = HashSet::new();
                 for welcome in &welcomes {
                     missing_rosters.extend(
@@ -6524,6 +6543,7 @@ impl WorkerState {
                     fetches.push((welcome.descriptor.room_id, welcome.sequence));
                 }
                 installation.client.set_welcome_cursor(head_sequence)?;
+                let welcome_cursor = installation.client.welcome_cursor()?;
                 for (room_id, after_sequence) in fetches {
                     self.queue_control(ClientControl::FetchMlsEvents {
                         room_id,
@@ -6532,6 +6552,23 @@ impl WorkerState {
                     })?;
                 }
                 self.queue_pending_mls_outbox()?;
+                if delivered_any {
+                    // A push can contain only the newest Welcome, so a
+                    // non-empty batch is not proof that another pending room
+                    // has no Welcome. Fetch once more from the advanced cursor;
+                    // an empty response is the authoritative fallback signal.
+                    if self
+                        .pending_mls_group_infos
+                        .values()
+                        .any(|pending| pending.awaiting_welcome_check)
+                    {
+                        self.queue_control(ClientControl::FetchMlsWelcome {
+                            after_sequence: welcome_cursor,
+                        })?;
+                    }
+                } else {
+                    self.finish_pending_mls_group_infos_after_welcome()?;
+                }
             }
             ServerControl::MlsEvents { room_id, mut events } => {
                 if self.pending_mls_commits.contains_key(&room_id) {
@@ -6828,6 +6865,7 @@ impl WorkerState {
                                 }
                                 PendingMlsCommit::ExternalRejoin(_) => {
                                     installation.client.reject_external_rejoin(room_id)?;
+                                    self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
                                 }
                             }
                         }
@@ -6876,7 +6914,11 @@ impl WorkerState {
                     let mut members = pending.member_users.clone();
                     members.sort_unstable();
                     members.dedup();
-                    for user_id in members {
+                    let local_user = self.user_id;
+                    for user_id in members
+                        .into_iter()
+                        .filter(|user_id| Some(*user_id) != local_user)
+                    {
                         self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
                     }
                     return Ok(());
@@ -6954,7 +6996,10 @@ impl WorkerState {
                 };
                 let awaiting_rosters = member_users
                     .into_iter()
-                    .filter(|user_id| *user_id != local_user)
+                    .filter(|user_id| {
+                        *user_id != local_user
+                            && !self.mls_installed_rosters.contains(user_id)
+                    })
                     .collect::<HashSet<_>>();
                 let roster_requests = awaiting_rosters.iter().copied().collect::<Vec<_>>();
                 self.pending_mls_group_infos.insert(
@@ -6963,6 +7008,7 @@ impl WorkerState {
                         descriptor,
                         group_info,
                         awaiting_rosters,
+                        awaiting_welcome_check: false,
                     },
                 );
                 for user_id in roster_requests {
@@ -7003,16 +7049,33 @@ impl WorkerState {
                 })?;
                 self.mls_key_package_publish_pending = true;
             }
-            control @ ServerControl::KeyPackagesPublished { device_id, .. } => {
-                if self
+            control @ ServerControl::KeyPackagesPublished {
+                device_id,
+                available,
+            } => {
+                let local_device = self
                     .mls
                     .as_ref()
-                    .is_some_and(|installation| installation.bootstrap.device_id == device_id)
-                {
+                    .is_some_and(|installation| installation.bootstrap.device_id == device_id);
+                if local_device {
                     self.mls_key_package_publish_pending = false;
+                    if self.mls_bound && available < MLS_KEY_PACKAGE_TARGET {
+                        let installation = self.mls.as_ref().ok_or_else(|| {
+                            "KeyPackage acknowledgement arrived without MLS state".to_string()
+                        })?;
+                        let packages = installation.client.generate_key_packages(
+                            device_id,
+                            usize::from(MLS_KEY_PACKAGE_TARGET - available),
+                        )?;
+                        self.queue_control(ClientControl::PublishKeyPackages {
+                            device_id,
+                            packages,
+                        })?;
+                        self.mls_key_package_publish_pending = true;
+                    }
                 }
-                if self.mls_bound {
-                    self.queue_mls_room_reconciliation()?;
+                if available > 0 {
+                    self.retry_missing_mls_key_packages(device_id, available)?;
                 }
                 let _ = self.events.send(NetworkEvent::Mls(control));
             }
@@ -7404,6 +7467,45 @@ impl WorkerState {
     }
 
     fn process_pending_mls_group_info(&mut self, room_id: RoomId) -> Result<(), String> {
+        let Some(pending) = self.pending_mls_group_infos.get(&room_id) else {
+            return Ok(());
+        };
+        if !pending.awaiting_rosters.is_empty() || pending.awaiting_welcome_check {
+            return Ok(());
+        }
+        let installation = self
+            .mls
+            .as_ref()
+            .ok_or_else(|| "GroupInfo arrived without a local MLS installation".to_string())?;
+        if installation.client.descriptor(room_id)?.is_some() {
+            self.pending_mls_group_infos.remove(&room_id);
+            return Ok(());
+        }
+        self.pending_mls_group_infos
+            .get_mut(&room_id)
+            .expect("pending GroupInfo checked above")
+            .awaiting_welcome_check = true;
+        let after_sequence = installation.client.welcome_cursor()?;
+        self.queue_control(ClientControl::FetchMlsWelcome { after_sequence })?;
+        Ok(())
+    }
+
+    fn finish_pending_mls_group_infos_after_welcome(&mut self) -> Result<(), String> {
+        let ready = self
+            .pending_mls_group_infos
+            .iter()
+            .filter_map(|(room_id, pending)| {
+                (pending.awaiting_welcome_check && pending.awaiting_rosters.is_empty())
+                    .then_some(*room_id)
+            })
+            .collect::<Vec<_>>();
+        for room_id in ready {
+            self.finish_pending_mls_group_info(room_id)?;
+        }
+        Ok(())
+    }
+
+    fn finish_pending_mls_group_info(&mut self, room_id: RoomId) -> Result<(), String> {
         let Some(pending) = self.pending_mls_group_infos.remove(&room_id) else {
             return Ok(());
         };
@@ -7696,7 +7798,6 @@ impl WorkerState {
                 continue;
             }
             if self.pending_mls_rooms.contains_key(room_id) {
-                requests.push(*room_id);
                 continue;
             }
             let mut member_users = match kind {
@@ -7718,6 +7819,7 @@ impl WorkerState {
                     descriptor: None,
                     checkpoints: Vec::new(),
                     awaiting_packages: HashSet::new(),
+                    missing_packages: HashSet::new(),
                     device_accounts: HashMap::new(),
                     packages: Vec::new(),
                 },
@@ -7726,7 +7828,9 @@ impl WorkerState {
         }
         roster_requests.sort_unstable();
         roster_requests.dedup();
-        roster_requests.retain(|user_id| *user_id != local_user);
+        roster_requests.retain(|user_id| {
+            *user_id != local_user && !self.mls_installed_rosters.contains(user_id)
+        });
         for user_id in roster_requests {
             self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
         }
@@ -7761,10 +7865,16 @@ impl WorkerState {
             .get_mut(&room_id)
             .expect("pending MLS room selected above");
         pending.awaiting_packages.remove(&device_id);
-        if let Some(package) = package {
-            pending.packages.push((device_id, package));
-        }
-        if !pending.awaiting_packages.is_empty() {
+        let Some(package) = package else {
+            pending.missing_packages.insert(device_id);
+            let _ = self.events.send(NetworkEvent::Status(
+                "encrypted room is waiting for a KeyPackage from one of its accounts"
+                    .to_string(),
+            ));
+            return Ok(());
+        };
+        pending.packages.push((device_id, package));
+        if !pending.awaiting_packages.is_empty() || !pending.missing_packages.is_empty() {
             return Ok(());
         }
         let pending = self
@@ -7810,6 +7920,28 @@ impl WorkerState {
             roster_checkpoints: pending.checkpoints,
             initial_commit,
         })
+    }
+
+    fn retry_missing_mls_key_packages(
+        &mut self,
+        device_id: DeviceId,
+        available: u16,
+    ) -> Result<(), String> {
+        let mut retries = 0usize;
+        for pending in self.pending_mls_rooms.values_mut() {
+            if retries == usize::from(available) {
+                break;
+            }
+            if pending.missing_packages.remove(&device_id) {
+                let inserted = pending.awaiting_packages.insert(device_id);
+                debug_assert!(inserted, "missing KeyPackage was still in flight");
+                retries += 1;
+            }
+        }
+        for _ in 0..retries {
+            self.queue_control(ClientControl::TakeKeyPackage { device_id })?;
+        }
+        Ok(())
     }
 
     fn defer_mls_file_offer(&mut self, item: PendingMlsFileOffer) -> Result<(), String> {

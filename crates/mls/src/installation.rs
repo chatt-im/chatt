@@ -132,6 +132,9 @@ impl LocalInstallation {
     }
 
     pub fn replace_own_roster(&mut self, roster: SignedDeviceRoster) -> Result<(), String> {
+        if roster_checkpoint(&roster) == self.roster_checkpoint() {
+            return Ok(());
+        }
         self.install_roster(&roster)?;
         self.bootstrap.own_roster = roster;
         self.bootstrap.store_atomic(&self.bootstrap_path)
