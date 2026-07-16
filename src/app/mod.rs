@@ -4706,7 +4706,7 @@ impl App {
                 self.disconnect_network();
                 self.navigate_all(BaseScreen::Servers { query: None });
                 self.push_network_notice("auth", &message);
-                self.set_error(auth_failure_status(&message));
+                self.set_error(message);
             }
             NetworkEvent::NativeEncryptionRequired => {
                 let Some(attempt) = self.connection_attempt.clone() else {
@@ -8907,16 +8907,6 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
     }
 }
 
-fn auth_failure_status(detail: &str) -> &'static str {
-    if detail.starts_with("pairing failed") {
-        "pairing failed; see chat"
-    } else if detail.starts_with("authentication failed") {
-        "authentication failed; see chat"
-    } else {
-        "server rejected login; see chat"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9395,6 +9385,27 @@ mod tests {
             app.pairing_owner,
             Some(crate::client_channel::ClientId::PRIMARY)
         );
+    }
+
+    #[test]
+    fn auth_failure_shows_detail_after_returning_to_server_list() {
+        let mut app = test_app();
+        app.room.server_alias = "public".to_string();
+        let mut h = Harness::new(app);
+        let message = "authentication failed: invalid public bearer token";
+
+        h.app.handle_app_event(
+            NetworkEvent::AuthFailed {
+                code: 1,
+                message: message.to_string(),
+            }
+            .into(),
+        );
+        h.apply();
+
+        assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
+        assert_eq!(h.app.view.status.text(), message);
+        assert_eq!(h.app.view.status.kind(), StatusKind::Error);
     }
 
     #[test]

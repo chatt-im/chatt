@@ -4,7 +4,7 @@
 //! Chatt accounts and are deliberately independent of MLS serialization.
 
 use jsony::Jsony;
-use ring::{
+use aws_lc_rs::{
     digest,
     signature::{self, KeyPair},
 };

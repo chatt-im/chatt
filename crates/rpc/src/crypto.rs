@@ -1,4 +1,4 @@
-use ring::{
+use aws_lc_rs::{
     aead::{self, Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey},
     agreement, digest, hkdf, hmac, rand,
     rand::SecureRandom,
@@ -294,7 +294,8 @@ pub fn respond_to_client_hello(
     let shared = agreement::agree_ephemeral(
         private,
         &agreement::UnparsedPublicKey::new(&agreement::X25519, &client_hello.client_ephemeral),
-        |shared| shared.to_vec(),
+        (),
+        |shared| Ok(shared.to_vec()),
     )
     .map_err(|_| CryptoError::InvalidHandshake)?;
 
@@ -358,7 +359,8 @@ pub fn complete_client_transport_handshake(
     let shared = agreement::agree_ephemeral(
         handshake.private,
         &agreement::UnparsedPublicKey::new(&agreement::X25519, &server_hello.server_ephemeral),
-        |shared| shared.to_vec(),
+        (),
+        |shared| Ok(shared.to_vec()),
     )
     .map_err(|_| CryptoError::InvalidHandshake)?;
 

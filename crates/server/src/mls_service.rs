@@ -1429,7 +1429,7 @@ pub(super) enum PutRosterError {
 }
 
 fn key_package_hash(package: &[u8]) -> [u8; 32] {
-    ring::digest::digest(&ring::digest::SHA256, package)
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, package)
         .as_ref()
         .try_into()
         .expect("SHA-256 output has a fixed length")

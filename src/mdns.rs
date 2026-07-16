@@ -21,7 +21,7 @@ use chatt_p2p::{
     socket::{UdpSocketOptions, bind_udp_socket},
 };
 use mio::{Interest, Registry, Token, net::UdpSocket as MioUdpSocket};
-use ring::rand::SecureRandom;
+use aws_lc_rs::rand::SecureRandom;
 use rpc::evented::recv_datagram_with;
 
 const MDNS_PORT: u16 = 5353;
@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn generated_name_is_valid_local() {
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let name = generate_mdns_name(&rng).unwrap();
         assert!(name.ends_with(".local"));
         assert!(rpc::control::is_valid_mdns_candidate_name(&name));

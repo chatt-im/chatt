@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ring::{digest, rand::SecureRandom, signature::KeyPair};
+use aws_lc_rs::{digest, rand::SecureRandom, signature::KeyPair};
 use rpc::{
     control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
     crypto::{encode_hex, server_key_pair_from_seed_hex},
@@ -439,7 +439,7 @@ impl Config {
         }
     }
 
-    pub fn server_key_pair(&self) -> Result<ring::signature::Ed25519KeyPair, String> {
+    pub fn server_key_pair(&self) -> Result<aws_lc_rs::signature::Ed25519KeyPair, String> {
         server_key_pair_from_seed_hex(&self.security.server_identity_seed)
             .map_err(|error| format!("invalid security.server-identity-seed: {error}"))
     }
@@ -903,7 +903,7 @@ fn default_rooms() -> Vec<RoomConfig> {
 
 fn generate_identity_seed_hex() -> Result<String, String> {
     let mut bytes = [0u8; 32];
-    ring::rand::SystemRandom::new()
+    aws_lc_rs::rand::SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| "failed to generate server identity seed".to_string())?;
     Ok(encode_hex(&bytes))

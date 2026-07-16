@@ -7,7 +7,7 @@ use crate::crypto::{
     CryptoError, KEY_LEN, KeyMaterial, TAG_LEN, open_in_place_with_aad, seal_in_place_append_tag,
 };
 use jsony::Jsony;
-use ring::digest;
+use aws_lc_rs::digest;
 
 use crate::ids::{AccountId, DeviceId, EventId, FileTransferId, MessageId, RoomId};
 
