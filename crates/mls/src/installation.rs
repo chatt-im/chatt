@@ -25,8 +25,6 @@ use crate::{
     E2eBootstrap, PersistentClient, load_bootstrap,
 };
 
-const DATABASE_KEY_LABEL: &[u8] = b"chatt mls state and event cache v1";
-
 pub struct LocalInstallation {
     pub bootstrap: E2eBootstrap,
     pub client: PersistentClient,
@@ -53,7 +51,7 @@ impl LocalInstallation {
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("failed to create {}: {error}", data_dir.display()))?;
         let bootstrap_path = data_dir.join("mls-bootstrap.bin");
-        let database_path = data_dir.join("mls.db");
+        let database_path = data_dir.join("mls.redb");
         let (bootstrap, created, signing) = match load_bootstrap(&bootstrap_path) {
             BootstrapLoad::Missing => {
                 let (bootstrap, identity, secret) =
@@ -78,16 +76,14 @@ impl LocalInstallation {
         identities
             .install_roster(&bootstrap.own_roster)
             .map_err(|error| error.to_string())?;
-        let database_key = bootstrap.database_key(DATABASE_KEY_LABEL)?;
         let client = match signing {
             Some((identity, secret)) => PersistentClient::open(
                 &database_path,
-                database_key,
                 identities.clone(),
                 identity,
                 secret,
             )?,
-            None => PersistentClient::reopen(&database_path, database_key, identities.clone())?,
+            None => PersistentClient::reopen(&database_path, identities.clone())?,
         };
         Ok((
             Self {
@@ -236,10 +232,8 @@ impl LocalInstallation {
         identities
             .install_roster(&bootstrap.own_roster)
             .map_err(|error| error.to_string())?;
-        let database_key = bootstrap.database_key(DATABASE_KEY_LABEL)?;
         let client = PersistentClient::open(
-            &data_dir.join("mls.db"),
-            database_key,
+            &data_dir.join("mls.redb"),
             identities.clone(),
             identity,
             secret,
@@ -276,10 +270,7 @@ fn create_paired_bootstrap(
     String,
 > {
     let rng = SystemRandom::new();
-    let mut database_root_key = [0u8; 32];
     let mut device_bytes = [0u8; 16];
-    rng.fill(&mut database_root_key)
-        .map_err(|_| "failed to generate MLS database key".to_string())?;
     rng.fill(&mut device_bytes)
         .map_err(|_| "failed to generate MLS device id".to_string())?;
     let authority_public_key = authority_public_key(&authority_seed)?;
@@ -331,7 +322,6 @@ fn create_paired_bootstrap(
         device_name: device_name.to_string(),
         device_certificate: certificate,
         own_roster: roster,
-        database_root_key,
         state: BootstrapState::Active,
     };
     let identity = SigningIdentity::new(
@@ -355,12 +345,9 @@ fn create_bootstrap(
 > {
     let rng = SystemRandom::new();
     let mut authority_seed = [0u8; 32];
-    let mut database_root_key = [0u8; 32];
     let mut device_bytes = [0u8; 16];
     rng.fill(&mut authority_seed)
         .map_err(|_| "failed to generate MLS account authority".to_string())?;
-    rng.fill(&mut database_root_key)
-        .map_err(|_| "failed to generate MLS database key".to_string())?;
     rng.fill(&mut device_bytes)
         .map_err(|_| "failed to generate MLS device id".to_string())?;
     let authority_public_key = authority_public_key(&authority_seed)?;
@@ -405,7 +392,6 @@ fn create_bootstrap(
         device_name: device_name.to_string(),
         device_certificate: certificate,
         own_roster: roster,
-        database_root_key,
         state: BootstrapState::Active,
     };
     let identity = SigningIdentity::new(

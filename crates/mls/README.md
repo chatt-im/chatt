@@ -19,7 +19,13 @@ dependencies and exposes the policy points Chatt needs:
 - explicit `write_to_storage`, allowing crash-safe cache/ratchet ordering;
 - an `ExternalClient` for the server's public-group observer;
 - out-of-order private-message handling;
-- SQLCipher-backed group, KeyPackage, and application storage.
+- redb-backed group, KeyPackage, and application storage.
+
+The redb database is owner-only but currently unencrypted. The previous
+SQLCipher key was derived from key material stored in plaintext in the adjacent
+owner-only bootstrap file, so it did not create an independent at-rest security
+boundary. A future storage design must use authenticated encryption with an
+externally protected key.
 
 The initial cipher suite is
 `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`. Handshakes are public and
@@ -33,6 +39,6 @@ and treats a provider/runtime upgrade as a security-sensitive change requiring
 the policy and interoperability tests in this crate to be rerun and reviewed.
 
 `policy.rs` is the shared client/server authorization layer. `persistent.rs`
-owns explicit MLS persistence and the encrypted event/outbox cache. `server.rs`
+owns explicit MLS persistence and the durable event/outbox cache. `server.rs`
 contains the secret-free public group validator. Protocol wire types remain in
 `crates/rpc`.

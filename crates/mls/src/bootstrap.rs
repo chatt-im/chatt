@@ -4,7 +4,6 @@ use std::{
     path::Path,
 };
 
-use aws_lc_rs::hkdf;
 use jsony::Jsony;
 use rpc::{
     identity::{SignedDeviceCertificate, SignedDeviceRoster},
@@ -25,7 +24,6 @@ pub struct E2eBootstrap {
     pub device_name: String,
     pub device_certificate: SignedDeviceCertificate,
     pub own_roster: SignedDeviceRoster,
-    pub database_root_key: [u8; 32],
     pub state: BootstrapState,
 }
 
@@ -90,10 +88,6 @@ impl E2eBootstrap {
     pub fn store_atomic(&self, path: &Path) -> Result<(), String> {
         self.validate()?;
         atomic_write(path, &jsony::to_binary(self))
-    }
-
-    pub fn database_key(&self, label: &'static [u8]) -> Result<[u8; 32], String> {
-        derive_database_key(&self.database_root_key, label)
     }
 }
 
@@ -166,25 +160,6 @@ pub fn classify_installation(
     } else {
         InstallationState::Revoked(bootstrap)
     }
-}
-
-pub fn derive_database_key(root_key: &[u8; 32], label: &'static [u8]) -> Result<[u8; 32], String> {
-    struct KeyLen;
-    impl hkdf::KeyType for KeyLen {
-        fn len(&self) -> usize {
-            32
-        }
-    }
-    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"chatt mls database keys v1");
-    let key = salt.extract(root_key);
-    let info = [label];
-    let okm = key
-        .expand(&info, KeyLen)
-        .map_err(|_| "failed to derive MLS database key".to_string())?;
-    let mut output = [0u8; 32];
-    okm.fill(&mut output)
-        .map_err(|_| "failed to derive MLS database key".to_string())?;
-    Ok(output)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {

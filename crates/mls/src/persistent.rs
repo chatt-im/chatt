@@ -1,14 +1,20 @@
-//! SQLCipher-backed MLS state and application event cache.
+//! redb-backed MLS state and application event cache.
 //!
 //! `mls-rs` deliberately keeps a processed group's mutations in memory until
 //! `write_to_storage`. That lets this wrapper durably insert decrypted
 //! plaintext first, persist the MLS ratchet second, and advance the delivery
 //! cursor last.
+//!
+//! The redb file is owner-only but is not encrypted. The replaced SQLCipher
+//! setup derived its key from key material stored in plaintext in the adjacent
+//! owner-only bootstrap file, so it did not provide an independent at-rest
+//! security boundary. MLS storage still needs authenticated encryption backed
+//! by an externally protected key; that is intentionally deferred.
 
 use std::{
     collections::HashMap,
     fs::OpenOptions,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Mutex,
 };
 
@@ -17,21 +23,21 @@ use jsony::Jsony;
 use mls_rs::{
     CipherSuiteProvider, Client, CryptoProvider, ExtensionList, MlsMessage,
     client_builder::{
-        BaseSqlConfig, ClientBuilder, WithCryptoProvider, WithIdentityProvider, WithMlsRules,
+        BaseConfig, WithCryptoProvider, WithGroupStateStorage, WithIdentityProvider,
+        WithKeyPackageRepo, WithMlsRules, WithPskStore,
     },
     group::{CommitEffect, ReceivedMessage},
     identity::{SigningIdentity, basic::BasicCredential},
 };
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs_crypto_awslc::AwsLcCryptoProvider;
-use mls_rs_provider_sqlite::{
-    JournalMode, SqLiteDataStorageEngine, SqLiteDataStorageError,
-    connection_strategy::{
-        CipheredConnectionStrategy, ConnectionStrategy, SqlCipherConfig, SqlCipherKey,
+use mls_rs_provider_redb::{
+    RedbDataStorageEngine,
+    storage::{
+        Item, RedbApplicationStorage, RedbGroupStateStorage, RedbKeyPackageStorage,
+        RedbPreSharedKeyStorage,
     },
-    storage::{Item, SqLiteApplicationStorage},
 };
-use rusqlite::Connection;
 use rpc::{
     ids::{AccountId, DeviceId, EventId, RoomId},
     mls::{
@@ -46,42 +52,18 @@ type PersistentConfig = WithMlsRules<
     ChattMlsPolicy,
     WithIdentityProvider<
         ChattIdentityProvider,
-        WithCryptoProvider<AwsLcCryptoProvider, BaseSqlConfig>,
+        WithCryptoProvider<
+            AwsLcCryptoProvider,
+            WithGroupStateStorage<
+                RedbGroupStateStorage,
+                WithPskStore<
+                    RedbPreSharedKeyStorage,
+                    WithKeyPackageRepo<RedbKeyPackageStorage, BaseConfig>,
+                >,
+            >,
+        >,
     >,
 >;
-
-type SqlCipherStorage =
-    SqLiteDataStorageEngine<CipheredConnectionStrategy<ChattFileConnectionStrategy>>;
-
-struct ChattFileConnectionStrategy {
-    path: PathBuf,
-}
-
-impl ChattFileConnectionStrategy {
-    fn new(path: &Path) -> Self {
-        Self {
-            path: path.to_owned(),
-        }
-    }
-}
-
-impl ConnectionStrategy for ChattFileConnectionStrategy {
-    fn make_connection(&self) -> Result<Connection, SqLiteDataStorageError> {
-        let connection = Connection::open(&self.path)
-            .map_err(|error| SqLiteDataStorageError::SqlEngineError(error.into()))?;
-        // SQLCipher logs every denied `mlock` as an error even though it
-        // deliberately continues with ordinary guarded allocations. Sandboxed
-        // clients and tests commonly lack CAP_IPC_LOCK, turning each database
-        // open into hundreds of misleading stderr lines. SQLCipher also writes
-        // expected wrong-key probes straight to stderr. Disable its global
-        // diagnostic sink; database and cryptographic failures still propagate
-        // through the Rust result returned by each operation.
-        connection
-            .pragma_update(None, "cipher_log_source", "NONE")
-            .map_err(|error| SqLiteDataStorageError::SqlEngineError(error.into()))?;
-        Ok(connection)
-    }
-}
 
 const SIGNING_MATERIAL_KEY: &str = "installation/signing-material";
 const PENDING_PAIR_KEY_PACKAGES_KEY: &str = "installation/pending-pair-key-packages";
@@ -197,7 +179,7 @@ struct PendingCommitRecord {
 /// One installation's MLS client and encrypted application cache.
 pub struct PersistentClient {
     client: Client<PersistentConfig>,
-    application: SqLiteApplicationStorage,
+    application: RedbApplicationStorage,
     identities: ChattIdentityProvider,
     signing_secret: SignatureSecretKey,
     pending_external_rejoins: Mutex<HashMap<RoomId, mls_rs::group::Group<PersistentConfig>>>,
@@ -212,15 +194,12 @@ impl std::fmt::Debug for PersistentClient {
 impl PersistentClient {
     pub fn open(
         path: &Path,
-        database_key: [u8; 32],
         identities: ChattIdentityProvider,
         signing_identity: SigningIdentity,
         signing_secret: SignatureSecretKey,
     ) -> Result<Self, String> {
-        let storage = open_storage(path, database_key)?;
-        let application = storage
-            .application_data_storage()
-            .map_err(|error| error.to_string())?;
+        let storage = open_storage(path)?;
+        let application = storage.application_data_storage();
         let client_id = signing_identity
             .credential
             .as_basic()
@@ -247,7 +226,7 @@ impl PersistentClient {
                     || stored.public_key != material.public_key
                     || stored.secret_key != material.secret_key
                 {
-                    return Err("SQLCipher database belongs to another MLS credential".to_string());
+                    return Err("redb database belongs to another MLS credential".to_string());
                 }
             }
         }
@@ -262,17 +241,14 @@ impl PersistentClient {
 
     pub fn reopen(
         path: &Path,
-        database_key: [u8; 32],
         identities: ChattIdentityProvider,
     ) -> Result<Self, String> {
-        let storage = open_storage(path, database_key)?;
-        let application = storage
-            .application_data_storage()
-            .map_err(|error| error.to_string())?;
+        let storage = open_storage(path)?;
+        let application = storage.application_data_storage();
         let bytes = application
             .get(SIGNING_MATERIAL_KEY)
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "SQLCipher database has no MLS signing material".to_string())?;
+            .ok_or_else(|| "redb database has no MLS signing material".to_string())?;
         let material: SigningMaterial =
             jsony::from_binary(&bytes).map_err(|error| error.to_string())?;
         let signing_identity = SigningIdentity::new(
@@ -290,14 +266,16 @@ impl PersistentClient {
     }
 
     fn build(
-        storage: SqlCipherStorage,
-        application: SqLiteApplicationStorage,
+        storage: RedbDataStorageEngine,
+        application: RedbApplicationStorage,
         identities: ChattIdentityProvider,
         signing_identity: SigningIdentity,
         signing_secret: SignatureSecretKey,
     ) -> Result<Self, String> {
-        let client = ClientBuilder::<BaseSqlConfig>::new_sqlite(storage)
-            .map_err(|error| error.to_string())?
+        let client = Client::builder()
+            .key_package_repo(storage.key_package_storage())
+            .psk_store(storage.pre_shared_key_storage())
+            .group_state_storage(storage.group_state_storage())
             .crypto_provider(AwsLcCryptoProvider::default())
             .identity_provider(identities.historical_group_info_observer())
             .mls_rules(ChattMlsPolicy::new(identities.clone()))
@@ -1643,15 +1621,9 @@ fn prepare_database_file(path: &Path) -> Result<(), String> {
     }
 }
 
-fn open_storage(path: &Path, database_key: [u8; 32]) -> Result<SqlCipherStorage, String> {
+fn open_storage(path: &Path) -> Result<RedbDataStorageEngine, String> {
     prepare_database_file(path)?;
-    let strategy = CipheredConnectionStrategy::new(
-        ChattFileConnectionStrategy::new(path),
-        SqlCipherConfig::new(SqlCipherKey::RawKey(database_key)),
-    );
-    SqLiteDataStorageEngine::new(strategy)
-        .map(|storage| storage.with_journal_mode(Some(JournalMode::Wal)))
-        .map_err(|error| error.to_string())
+    RedbDataStorageEngine::open(path).map_err(|error| error.to_string())
 }
 
 fn cursor_key(room_id: RoomId) -> String {

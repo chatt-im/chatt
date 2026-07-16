@@ -1,0 +1,27 @@
+[package]
+name = "mls-rs-provider-redb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "redb based state storage for mls-rs"
+homepage = "https://github.com/awslabs/mls-rs"
+repository = "https://github.com/awslabs/mls-rs"
+keywords = ["mls", "mls-rs", "redb"]
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+mls-rs-core = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = ["std"] }
+redb = "4.1"
+thiserror = "2"
+maybe-async = "0.2.10"
+async-trait = "0.1.74"
+zeroize = "1"
+
+[dev-dependencies]
+assert_matches = "1.5"
+mls-rs = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = ["std", "private_message"] }
+mls-rs-crypto-rustcrypto = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = ["std"] }
+tempfile = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mls_build_async)'] }
