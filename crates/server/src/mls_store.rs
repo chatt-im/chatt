@@ -5,7 +5,11 @@
 //! different ordered KV implementation can replace this module without
 //! leaking database keys or transactions into protocol and policy code.
 
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use chatt_mls::PublicGroupState;
 use jsony::Jsony;
@@ -107,7 +111,11 @@ pub(super) struct LoadedState {
 
 #[derive(Debug)]
 pub(super) enum AppendApplicationResult {
-    Stored { sequence: u64, room: RoomRecord },
+    Stored {
+        sequence: u64,
+        room: RoomRecord,
+        event: MlsDeliveryEvent,
+    },
     AlreadyStored { sequence: u64 },
     Conflict,
     StaleEpoch { current_epoch: u64 },
@@ -137,7 +145,7 @@ pub(super) struct StorageStatus {
 }
 
 pub(super) struct MlsStore {
-    database: Database,
+    database: Arc<Database>,
     path: Option<PathBuf>,
     cleanup_after_room: u32,
 }
@@ -168,7 +176,7 @@ impl MlsStore {
             }
         };
         let store = Self {
-            database,
+            database: Arc::new(database),
             path,
             cleanup_after_room: 0,
         };
@@ -176,8 +184,31 @@ impl MlsStore {
         Ok(store)
     }
 
+    /// A read-only-capable handle sharing redb's transaction engine. Each
+    /// delivery reader owns one handle and opens independent read
+    /// transactions, which redb permits to execute concurrently.
+    pub(super) fn read_handle(&self) -> Self {
+        Self {
+            database: Arc::clone(&self.database),
+            path: self.path.clone(),
+            cleanup_after_room: 0,
+        }
+    }
+
+    fn begin_read(&self) -> Result<redb::ReadTransaction, String> {
+        self.database
+            .begin_read()
+            .map_err(db_error)
+    }
+
+    fn begin_write(&self) -> Result<redb::WriteTransaction, String> {
+        self.database
+            .begin_write()
+            .map_err(db_error)
+    }
+
     fn initialize(&self) -> Result<(), String> {
-        let mut tx = self.database.begin_write().map_err(db_error)?;
+        let mut tx = self.begin_write()?;
         tx.set_durability(Durability::Immediate).map_err(db_error)?;
         {
             let mut meta = tx.open_table(META).map_err(db_error)?;
@@ -217,7 +248,7 @@ impl MlsStore {
     }
 
     pub fn load(&self) -> Result<LoadedState, String> {
-        let tx = self.database.begin_read().map_err(db_error)?;
+        let tx = self.begin_read()?;
         let global = {
             let table = tx.open_table(GLOBAL).map_err(db_error)?;
             match table.get(0).map_err(db_error)? {
@@ -243,6 +274,12 @@ impl MlsStore {
         Ok(LoadedState { global, rooms })
     }
 
+    pub fn replace_global(&self, global: &GlobalRecord) -> Result<(), String> {
+        self.replace_global_and_rooms(global, &[])
+    }
+
+    /// Atomically replaces global state and the room records changed by the
+    /// same service operation. Unlisted rooms remain untouched.
     pub fn replace_global_and_rooms(
         &self,
         global: &GlobalRecord,
@@ -251,36 +288,35 @@ impl MlsStore {
         let global_bytes = jsony::to_binary(global);
         let room_bytes = rooms
             .iter()
-            .map(|room| (room.descriptor.room_id.0, jsony::to_binary(room)))
+            .map(|room| (room, jsony::to_binary(room)))
             .collect::<Vec<_>>();
-        let mut tx = self.database.begin_write().map_err(db_error)?;
+        let mut tx = self.begin_write()?;
         tx.set_durability(Durability::Immediate).map_err(db_error)?;
         {
             tx.open_table(GLOBAL)
                 .map_err(db_error)?
                 .insert(0, global_bytes.as_slice())
                 .map_err(db_error)?;
-            let mut table = tx.open_table(ROOMS).map_err(db_error)?;
-            for (room_id, bytes) in room_bytes {
-                let previous = table
-                    .get(room_id)
-                    .map_err(db_error)?
-                    .map(|value| decode_room(value.value()))
-                    .transpose()?;
-                if let Some(previous) = previous {
-                    let room = rooms
-                        .iter()
-                        .find(|room| room.descriptor.room_id.0 == room_id)
-                        .expect("room bytes were built from the same slice");
-                    reconcile_cursors(
-                        &tx,
-                        RoomId(room_id),
-                        &previous.required_devices,
-                        room,
-                        room.head_sequence,
-                    )?;
+            if !room_bytes.is_empty() {
+                let mut table = tx.open_table(ROOMS).map_err(db_error)?;
+                for (room, bytes) in room_bytes {
+                    let room_id = room.descriptor.room_id.0;
+                    let previous = table
+                        .get(room_id)
+                        .map_err(db_error)?
+                        .map(|value| decode_room(value.value()))
+                        .transpose()?;
+                    if let Some(previous) = previous {
+                        reconcile_cursors(
+                            &tx,
+                            RoomId(room_id),
+                            &previous.required_devices,
+                            room,
+                            room.head_sequence,
+                        )?;
+                    }
+                    table.insert(room_id, bytes.as_slice()).map_err(db_error)?;
                 }
-                table.insert(room_id, bytes.as_slice()).map_err(db_error)?;
             }
         }
         tx.commit().map_err(db_error)
@@ -300,7 +336,7 @@ impl MlsStore {
             stored_at_unix_ms: room.last_event_time_unix_ms,
         };
         let event_bytes = jsony::to_binary(&stored);
-        let mut tx = self.database.begin_write().map_err(db_error)?;
+        let mut tx = self.begin_write()?;
         tx.set_durability(Durability::Immediate).map_err(db_error)?;
         {
             let mut rooms = tx.open_table(ROOMS).map_err(db_error)?;
@@ -340,7 +376,7 @@ impl MlsStore {
             event: event.clone(),
             stored_at_unix_ms: room.last_event_time_unix_ms,
         });
-        let mut tx = self.database.begin_write().map_err(db_error)?;
+        let mut tx = self.begin_write()?;
         tx.set_durability(Durability::Immediate).map_err(db_error)?;
         {
             let mut rooms = tx.open_table(ROOMS).map_err(db_error)?;
@@ -387,7 +423,7 @@ impl MlsStore {
         parent_epoch: u64,
         commit: &[u8],
     ) -> Result<Option<(u64, u64)>, String> {
-        let tx = self.database.begin_read().map_err(db_error)?;
+        let tx = self.begin_read()?;
         let index = tx.open_table(COMMIT_EPOCHS).map_err(db_error)?;
         let Some(sequence) = index
             .get((room_id.0, parent_epoch))
@@ -420,7 +456,7 @@ impl MlsStore {
         ciphertext: &[u8],
         now_unix_ms: u64,
     ) -> Result<AppendApplicationResult, String> {
-        let mut tx = self.database.begin_write().map_err(db_error)?;
+        let mut tx = self.begin_write()?;
         tx.set_durability(Durability::Immediate).map_err(db_error)?;
         let result = {
             let existing = {
@@ -499,7 +535,11 @@ impl MlsStore {
                         rooms
                             .insert(room_id.0, room_bytes.as_slice())
                             .map_err(db_error)?;
-                        AppendApplicationResult::Stored { sequence, room }
+                        AppendApplicationResult::Stored {
+                            sequence,
+                            room,
+                            event,
+                        }
                     }
                 }
             }
@@ -518,7 +558,7 @@ impl MlsStore {
         epoch: u64,
         ciphertext: &[u8],
     ) -> Result<Option<Result<u64, ()>>, String> {
-        let tx = self.database.begin_read().map_err(db_error)?;
+        let tx = self.begin_read()?;
         let ids = tx.open_table(EVENT_IDS).map_err(db_error)?;
         let Some(sequence) = ids
             .get((room_id.0, event_id.0))
@@ -546,7 +586,7 @@ impl MlsStore {
     }
 
     pub fn events(&self, room_id: RoomId, after: u64, limit: usize) -> Result<EventBatch, String> {
-        let tx = self.database.begin_read().map_err(db_error)?;
+        let tx = self.begin_read()?;
         let rooms = tx.open_table(ROOMS).map_err(db_error)?;
         let room = rooms
             .get(room_id.0)
@@ -578,8 +618,12 @@ impl MlsStore {
         sequence: u64,
         now_unix_ms: u64,
     ) -> Result<(), String> {
-        let mut tx = self.database.begin_write().map_err(db_error)?;
-        tx.set_durability(Durability::Immediate).map_err(db_error)?;
+        let mut tx = self.begin_write()?;
+        // Cursor progress is monotonic, advisory retention metadata. Losing
+        // the newest value in a crash can only cause replay and delay cleanup;
+        // it cannot discard an event. A later immediate transaction flushes
+        // this commit along with authoritative delivery state.
+        tx.set_durability(Durability::None).map_err(db_error)?;
         let changed = {
             let rooms = tx.open_table(ROOMS).map_err(db_error)?;
             let room = rooms
@@ -627,7 +671,7 @@ impl MlsStore {
     }
 
     pub fn requires_rejoin(&self, room_id: RoomId, device_id: DeviceId) -> Result<bool, String> {
-        let tx = self.database.begin_read().map_err(db_error)?;
+        let tx = self.begin_read()?;
         let cursors = tx.open_table(DEVICE_CURSORS).map_err(db_error)?;
         Ok(cursors
             .get((room_id.0, device_id.0))
@@ -638,7 +682,7 @@ impl MlsStore {
     }
 
     pub fn welcomes(&self, device_id: DeviceId, after: u64) -> Result<Vec<MlsWelcome>, String> {
-        let tx = self.database.begin_read().map_err(db_error)?;
+        let tx = self.begin_read()?;
         let targets = tx.open_table(DEVICE_WELCOMES).map_err(db_error)?;
         let welcomes = tx.open_table(WELCOMES).map_err(db_error)?;
         targets
@@ -664,7 +708,7 @@ impl MlsStore {
     }
 
     pub fn welcome_head(&self, device_id: DeviceId) -> Result<u64, String> {
-        let tx = self.database.begin_read().map_err(db_error)?;
+        let tx = self.begin_read()?;
         let targets = tx.open_table(DEVICE_WELCOMES).map_err(db_error)?;
         let mut range = targets
             .range((device_id.0, 0)..=(device_id.0, u64::MAX))
@@ -677,8 +721,11 @@ impl MlsStore {
     }
 
     pub fn acknowledge_welcome(&self, device_id: DeviceId, delivery_id: u64) -> Result<(), String> {
-        let mut tx = self.database.begin_write().map_err(db_error)?;
-        tx.set_durability(Durability::Immediate).map_err(db_error)?;
+        let mut tx = self.begin_write()?;
+        // As with event cursors, stale Welcome progress is safe after a crash:
+        // the client may receive an already-seen Welcome again, while the
+        // server remains conservative about deleting it.
+        tx.set_durability(Durability::None).map_err(db_error)?;
         let changed = {
             let mut cursors = tx.open_table(WELCOME_CURSORS).map_err(db_error)?;
             let current = cursors
@@ -728,7 +775,7 @@ impl MlsStore {
         now_unix_ms: u64,
         batch_limit: usize,
     ) -> Result<bool, String> {
-        let mut tx = self.database.begin_write().map_err(db_error)?;
+        let mut tx = self.begin_write()?;
         tx.set_durability(Durability::Immediate).map_err(db_error)?;
         let more = cleanup_welcomes(&tx, now_unix_ms, batch_limit)?;
         tx.commit().map_err(db_error)?;
@@ -741,7 +788,7 @@ impl MlsStore {
         now_unix_ms: u64,
         batch_limit: usize,
     ) -> Result<Option<CleanupReport>, String> {
-        let mut tx = self.database.begin_write().map_err(db_error)?;
+        let mut tx = self.begin_write()?;
         tx.set_durability(Durability::Immediate).map_err(db_error)?;
         let mut report = CleanupReport::default();
         {
@@ -847,7 +894,7 @@ impl MlsStore {
     }
 
     pub fn status(&self) -> Result<StorageStatus, String> {
-        let tx = self.database.begin_write().map_err(db_error)?;
+        let tx = self.begin_write()?;
         let stats = tx.stats().map_err(db_error)?;
         let allocated_bytes = stats
             .allocated_pages()
@@ -868,7 +915,10 @@ impl MlsStore {
     }
 
     pub fn compact(&mut self) -> Result<bool, String> {
-        self.database.compact().map_err(db_error)
+        Arc::get_mut(&mut self.database)
+            .ok_or_else(|| "MLS database compaction requires stopped delivery readers".to_string())?
+            .compact()
+            .map_err(db_error)
     }
 
     fn validate(&self, tx: &redb::ReadTransaction, rooms: &[RoomRecord]) -> Result<(), String> {
@@ -1201,6 +1251,42 @@ mod tests {
     }
 
     #[test]
+    fn delivery_handles_hold_concurrent_redb_read_transactions() {
+        let store = MlsStore::open(None).unwrap();
+        create(&store, &room(1, Vec::new(), 100));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let readers = [store.read_handle(), store.read_handle()]
+            .into_iter()
+            .map(|reader| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let tx = reader.begin_read().unwrap();
+                    let rooms = tx.open_table(ROOMS).unwrap();
+                    assert!(rooms.get(1).unwrap().is_some());
+                    barrier.wait();
+                    barrier.wait();
+                    drop(rooms);
+                    drop(tx);
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        barrier.wait();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn compaction_requires_delivery_read_handles_to_stop() {
+        let mut store = MlsStore::open(None).unwrap();
+        let reader = store.read_handle();
+        assert!(store.compact().unwrap_err().contains("stopped delivery readers"));
+        drop(reader);
+        store.compact().unwrap();
+    }
+
+    #[test]
     fn unsupported_schema_version_is_rejected_clearly() {
         let temp = tempfile::tempdir().unwrap();
         let store = MlsStore::open(Some(temp.path())).unwrap();
@@ -1271,6 +1357,73 @@ mod tests {
         ));
         assert_eq!(store.events(RoomId(10), 0, 10).unwrap().head_sequence, 3);
         assert_eq!(store.events(RoomId(11), 0, 10).unwrap().events.len(), 2);
+    }
+
+    #[test]
+    fn global_and_selected_room_replacement_leaves_other_rooms_untouched() {
+        let store = MlsStore::open(None).unwrap();
+        let first_device = DeviceId([6; 16]);
+        let second_device = DeviceId([7; 16]);
+        let mut first = room(12, vec![first_device], 100);
+        let second = room(13, vec![second_device], 100);
+        create(&store, &first);
+        create(&store, &second);
+
+        first.revocation_pending = true;
+        first.required_devices.clear();
+        store
+            .replace_global_and_rooms(
+                &GlobalRecord {
+                    initialized_accounts: vec![UserId(4)],
+                    next_welcome_delivery_id: 1,
+                    ..GlobalRecord::default()
+                },
+                &[first],
+            )
+            .unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.global.initialized_accounts, vec![UserId(4)]);
+        let first = loaded
+            .rooms
+            .iter()
+            .find(|room| room.descriptor.room_id == RoomId(12))
+            .unwrap();
+        assert!(first.revocation_pending);
+        assert!(first.required_devices.is_empty());
+        let second = loaded
+            .rooms
+            .iter()
+            .find(|room| room.descriptor.room_id == RoomId(13))
+            .unwrap();
+        assert_eq!(second.required_devices, vec![second_device]);
+        store
+            .acknowledge(RoomId(13), second_device, 1, 200)
+            .unwrap();
+    }
+
+    #[test]
+    fn later_durable_write_flushes_non_durable_acknowledgement() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = DeviceId([8; 16]);
+        let store = MlsStore::open(Some(temp.path())).unwrap();
+        create(&store, &room(14, vec![device], 100));
+        store
+            .append_application(RoomId(14), device, 1, EventId([1; 16]), &[1], 200)
+            .unwrap();
+        store.acknowledge(RoomId(14), device, 2, 300).unwrap();
+        store
+            .replace_global(&GlobalRecord {
+                next_welcome_delivery_id: 1,
+                ..GlobalRecord::default()
+            })
+            .unwrap();
+        drop(store);
+
+        let mut reopened = MlsStore::open(Some(temp.path())).unwrap();
+        let report = reopened.cleanup(300, 10).unwrap();
+        assert_eq!(report.deleted_events, 2);
+        assert!(reopened.events(RoomId(14), 0, 10).unwrap().events.is_empty());
     }
 
     #[test]
