@@ -48,7 +48,7 @@ pub(super) struct MlsService {
 }
 
 #[derive(Clone, Debug)]
-struct CacheState {
+pub(super) struct CacheState {
     global: GlobalRecord,
     rooms: Vec<RoomRecord>,
 }
@@ -97,6 +97,59 @@ impl MlsService {
             rooms: loaded.rooms,
         })?;
         Ok(service)
+    }
+
+    /// Builds an in-memory read view of this service for the network loop.
+    /// The durable instance can then move to the delivery worker while the
+    /// loop continues to answer cache-only authorization queries without
+    /// touching the database.
+    pub(super) fn in_memory_view(&self) -> Result<Self, String> {
+        let mut view = Self::open_with_retention(
+            None,
+            self.server_id.clone(),
+            self.default_retention_days,
+            self.room_retention_days.clone(),
+        )?;
+        view.restore(self.snapshot())?;
+        Ok(view)
+    }
+
+    pub(super) fn delivery_read_handle(&self) -> MlsStore {
+        self.store.read_handle()
+    }
+
+    pub(super) fn cache_state(&self) -> CacheState {
+        self.snapshot()
+    }
+
+    pub(super) fn install_cache_state(&mut self, state: CacheState) -> Result<(), String> {
+        self.restore(state)
+    }
+
+    /// Returns the small room cache record needed by the network loop after a
+    /// delivery mutation. Delivery events, indexes, and cursor state remain
+    /// exclusively on the worker.
+    pub(super) fn cached_room(&self, room_id: RoomId) -> Option<RoomRecord> {
+        self.rooms.get(&room_id).cloned()
+    }
+
+    pub(super) fn install_cached_room(&mut self, room: RoomRecord) {
+        self.rooms.insert(room.descriptor.room_id, room);
+    }
+
+    pub(super) fn cached_key_packages(&self, device_id: DeviceId) -> Vec<Vec<u8>> {
+        self.key_packages
+            .get(&device_id)
+            .map(|packages| packages.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn install_cached_key_packages(
+        &mut self,
+        device_id: DeviceId,
+        packages: Vec<Vec<u8>>,
+    ) {
+        self.key_packages.insert(device_id, packages.into());
     }
 
     pub fn roster(&self, user_id: UserId) -> Option<&SignedDeviceRoster> {
@@ -202,7 +255,7 @@ impl MlsService {
             device_id,
             token_hash,
         });
-        if let Err(error) = self.persist() {
+        if let Err(error) = self.persist_global() {
             return Err(self.rollback(before, error));
         }
         Ok(checkpoint)
@@ -308,8 +361,9 @@ impl MlsService {
                 credential.device_id != certificate.body.device_id || credential.user_id != user_id
             });
         }
+        let mut changed_rooms = Vec::new();
         if !removed.is_empty() {
-            for room in self.rooms.values_mut() {
+            for (room_id, room) in &mut self.rooms {
                 if room
                     .public_state
                     .member_client_ids
@@ -319,12 +373,13 @@ impl MlsService {
                     room.revocation_pending = true;
                     room.required_devices
                         .retain(|device| !removed_devices.contains(device));
+                    changed_rooms.push(*room_id);
                 }
             }
         }
         let checkpoint = roster_checkpoint(&roster);
         self.rosters.insert(user_id, roster);
-        if let Err(error) = self.persist() {
+        if let Err(error) = self.persist_global_and_rooms(&changed_rooms) {
             return Err(PutRosterError::Invalid(self.rollback(before, error)));
         }
         Ok(checkpoint)
@@ -391,7 +446,7 @@ impl MlsService {
             pool.push_back(package);
         }
         let available = pool.len() as u16;
-        if let Err(error) = self.persist() {
+        if let Err(error) = self.persist_global() {
             return Err(self.rollback(before, error));
         }
         Ok(available)
@@ -412,7 +467,7 @@ impl MlsService {
             self.issued_key_packages.insert(reference);
         }
         if package.is_some()
-            && let Err(error) = self.persist()
+            && let Err(error) = self.persist_global()
         {
             return Err(self.rollback(before, error));
         }
@@ -932,11 +987,29 @@ impl MlsService {
         event_id: EventId,
         ciphertext: Vec<u8>,
     ) -> Result<MlsSubmitOutcome, String> {
+        self.submit_application_for_device_with_event(
+            room_id,
+            device_id,
+            epoch,
+            event_id,
+            ciphertext,
+        )
+        .map(|(outcome, _)| outcome)
+    }
+
+    pub(super) fn submit_application_for_device_with_event(
+        &mut self,
+        room_id: RoomId,
+        device_id: DeviceId,
+        epoch: u64,
+        event_id: EventId,
+        ciphertext: Vec<u8>,
+    ) -> Result<(MlsSubmitOutcome, Option<crate::mls_store::EventBatch>), String> {
         if ciphertext.is_empty() || ciphertext.len() > rpc::mls::MAX_MLS_MESSAGE_BYTES {
             return Err("invalid MLS application message length".to_string());
         }
         if device_id != DeviceId([0; 16]) && !self.device_is_active(device_id) {
-            return Ok(MlsSubmitOutcome::RevocationPending);
+            return Ok((MlsSubmitOutcome::RevocationPending, None));
         }
         if let Some(retry) = self
             .store
@@ -944,6 +1017,7 @@ impl MlsService {
         {
             return retry
                 .map(|sequence| MlsSubmitOutcome::AlreadyStored { sequence })
+                .map(|outcome| (outcome, None))
                 .map_err(|()| "MLS event id was reused for a different application".to_string());
         }
         let room = self
@@ -951,15 +1025,18 @@ impl MlsService {
             .get(&room_id)
             .ok_or_else(|| "encrypted room does not exist".to_string())?;
         if device_id != DeviceId([0; 16]) && self.store.requires_rejoin(room_id, device_id)? {
-            return Ok(MlsSubmitOutcome::RejoinRequired);
+            return Ok((MlsSubmitOutcome::RejoinRequired, None));
         }
         if room.revocation_pending {
-            return Ok(MlsSubmitOutcome::RevocationPending);
+            return Ok((MlsSubmitOutcome::RevocationPending, None));
         }
         if epoch != room.public_state.epoch {
-            return Ok(MlsSubmitOutcome::StaleEpochNotStored {
-                current_epoch: room.public_state.epoch,
-            });
+            return Ok((
+                MlsSubmitOutcome::StaleEpochNotStored {
+                    current_epoch: room.public_state.epoch,
+                },
+                None,
+            ));
         }
         self.validator
             .validate_application(&room.public_state, &ciphertext)
@@ -972,21 +1049,34 @@ impl MlsService {
             &ciphertext,
             unix_time_ms(),
         )? {
-            AppendApplicationResult::Stored { sequence, room } => {
+            AppendApplicationResult::Stored {
+                sequence,
+                room,
+                event,
+            } => {
+                let batch = crate::mls_store::EventBatch {
+                    events: vec![event],
+                    oldest_available_sequence: room.oldest_available_sequence,
+                    head_sequence: room.head_sequence,
+                };
                 self.rooms.insert(room_id, room);
-                Ok(MlsSubmitOutcome::Stored { sequence })
+                Ok((MlsSubmitOutcome::Stored { sequence }, Some(batch)))
             }
             AppendApplicationResult::AlreadyStored { sequence } => {
-                Ok(MlsSubmitOutcome::AlreadyStored { sequence })
+                Ok((MlsSubmitOutcome::AlreadyStored { sequence }, None))
             }
             AppendApplicationResult::Conflict => {
                 Err("MLS event id was reused for a different application".to_string())
             }
             AppendApplicationResult::StaleEpoch { current_epoch } => {
-                Ok(MlsSubmitOutcome::StaleEpochNotStored { current_epoch })
+                Ok((MlsSubmitOutcome::StaleEpochNotStored { current_epoch }, None))
             }
-            AppendApplicationResult::RevocationPending => Ok(MlsSubmitOutcome::RevocationPending),
-            AppendApplicationResult::RejoinRequired => Ok(MlsSubmitOutcome::RejoinRequired),
+            AppendApplicationResult::RevocationPending => {
+                Ok((MlsSubmitOutcome::RevocationPending, None))
+            }
+            AppendApplicationResult::RejoinRequired => {
+                Ok((MlsSubmitOutcome::RejoinRequired, None))
+            }
         }
     }
 
@@ -1082,7 +1172,13 @@ impl MlsService {
 
     fn snapshot(&self) -> CacheState {
         CacheState {
-            global: GlobalRecord {
+            global: self.snapshot_global(),
+            rooms: self.rooms.values().cloned().collect(),
+        }
+    }
+
+    fn snapshot_global(&self) -> GlobalRecord {
+        GlobalRecord {
             initialized_accounts: {
                 let mut users = self.initialized_accounts.iter().copied().collect::<Vec<_>>();
                 users.sort_unstable();
@@ -1112,8 +1208,6 @@ impl MlsService {
                 .iter()
                 .map(|(device_id, user_id)| (*device_id, *user_id))
                 .collect(),
-            },
-            rooms: self.rooms.values().cloned().collect(),
         }
     }
 
@@ -1176,14 +1270,30 @@ impl MlsService {
         self.validate_invariants()
     }
 
-    fn persist(&self) -> Result<(), String> {
+    fn persist_global(&self) -> Result<(), String> {
         debug_assert!(
             self.validate_invariants().is_ok(),
             "in-memory MLS service state violated its structural invariants"
         );
-        let snapshot = self.snapshot();
+        self.store.replace_global(&self.snapshot_global())
+    }
+
+    fn persist_global_and_rooms(&self, room_ids: &[RoomId]) -> Result<(), String> {
+        debug_assert!(
+            self.validate_invariants().is_ok(),
+            "in-memory MLS service state violated its structural invariants"
+        );
+        let rooms = room_ids
+            .iter()
+            .map(|room_id| {
+                self.rooms
+                    .get(room_id)
+                    .expect("changed MLS room must remain cached")
+                    .clone()
+            })
+            .collect::<Vec<_>>();
         self.store
-            .replace_global_and_rooms(&snapshot.global, &snapshot.rooms)
+            .replace_global_and_rooms(&self.snapshot_global(), &rooms)
     }
 
     fn validate_invariants(&self) -> Result<(), String> {

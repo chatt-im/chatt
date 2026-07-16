@@ -14,6 +14,7 @@ pub mod config;
 mod config_diagnostics;
 mod history_reader;
 pub mod local_admin;
+mod mls_delivery;
 mod mls_service;
 mod mls_store;
 pub mod room_store;
@@ -62,7 +63,8 @@ use config::{
 };
 use history_reader::{HistoryReadReply, HistoryReader};
 use local_admin::{AdminCommand, AdminSocket};
-use mls_service::{MlsService, PutRosterError};
+use mls_delivery::{MlsEventQueue, MlsReadPool};
+use mls_service::{CacheState as MlsCacheState, MlsService, PutRosterError};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
 use username_registry::UsernameRegistry;
@@ -414,6 +416,13 @@ pub struct Server {
     /// dynamic users and seeded from `users` for explicit users.
     usernames: UsernameRegistry,
     mls: MlsService,
+    mls_worker: MlsWorker,
+    mls_readers: Option<MlsReadPool>,
+    mls_events: Arc<MlsEventQueue>,
+    /// Control connections waiting for a durability-sensitive MLS operation.
+    /// Their already-buffered later frames remain parked until the ordered
+    /// worker reply is applied.
+    pending_mls: HashSet<Token>,
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
@@ -448,6 +457,8 @@ pub struct Server {
     next_idle_sweep_at: Instant,
     next_mls_cleanup_at: Instant,
     next_mls_compaction_at: Instant,
+    mls_cleanup_pending: bool,
+    mls_compaction_pending: bool,
     /// Local work that must run before the loop parks in `poll`. Producers
     /// register here instead of teaching the core loop each local no-sleep
     /// condition.
@@ -461,6 +472,574 @@ pub struct Server {
     /// Reusable recipient list for [`Self::relay_voice`].
     relay_recipients: Vec<SessionId>,
     video_copy_stats: VideoCopyStats,
+}
+
+enum MlsReply {
+    RosterStored {
+        token: Token,
+        session_id: SessionId,
+        user_id: UserId,
+        initial: bool,
+        roster: mls_identity::SignedDeviceRoster,
+        result: Result<(mls_identity::RosterCheckpoint, MlsCacheState), PutRosterError>,
+    },
+    RoomCreated {
+        token: Token,
+        room_id: RoomId,
+        result: Result<(
+            u64,
+            mls_store::RoomRecord,
+            Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>,
+        ), String>,
+    },
+    CommitSubmitted {
+        token: Token,
+        room_id: RoomId,
+        result: Result<(
+            rpc::mls::MlsCommitOutcome,
+            Option<mls_store::RoomRecord>,
+            Option<(
+                mls_store::EventBatch,
+                Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>,
+            )>,
+        ), String>,
+    },
+    DeviceLinkRedeemed {
+        token: Token,
+        secret_hash: Vec<u8>,
+        user_id: UserId,
+        username: String,
+        device_id: DeviceId,
+        device_name: String,
+        credential_hash: String,
+        attempt_id: rpc::ids::PairAttemptId,
+        bearer_token: String,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+        result: Result<MlsCacheState, String>,
+    },
+    EventBatch {
+        token: Token,
+        room_id: RoomId,
+        result: Result<mls_store::EventBatch, String>,
+    },
+    Welcomes {
+        token: Token,
+        result: Result<(Vec<rpc::mls::MlsWelcome>, u64), String>,
+    },
+    ApplicationSubmitted {
+        token: Token,
+        room_id: RoomId,
+        event_id: rpc::ids::EventId,
+        result: Result<(
+            rpc::mls::MlsSubmitOutcome,
+            Option<mls_store::EventBatch>,
+        ), String>,
+    },
+    Background(Result<(), String>),
+    DispatchRead(MlsReadRequest),
+    Compacted {
+        admin_reply: Option<mpsc::Sender<Result<String, String>>>,
+        result: Result<Option<(bool, Option<u64>, Option<u64>)>, String>,
+        read_handles: Vec<mls_store::MlsStore>,
+        started: Instant,
+    },
+    Cleanup {
+        interval: Duration,
+        result: Result<mls_store::CleanupReport, String>,
+    },
+    StorageStatus {
+        reply: mpsc::Sender<Result<String, String>>,
+        result: Result<String, String>,
+    },
+    KeyPackagesPublished {
+        token: Token,
+        device_id: DeviceId,
+        result: Result<(u16, Vec<Vec<u8>>), String>,
+    },
+    KeyPackageTaken {
+        token: Token,
+        device_id: DeviceId,
+        result: Result<(Option<Vec<u8>>, u16, Vec<Vec<u8>>), String>,
+    },
+}
+
+/// The sole owner of the durable MLS service. redb transactions and fsyncs
+/// run here; the mio loop owns only an in-memory authorization view.
+struct MlsWorker {
+    requests: Option<mpsc::Sender<MlsWriteRequest>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+enum MlsWriteRequest {
+    #[cfg(test)]
+    BlockForTest {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    },
+    PutRoster {
+        token: Token,
+        session_id: SessionId,
+        user_id: UserId,
+        expected: Option<mls_identity::RosterCheckpoint>,
+        roster: mls_identity::SignedDeviceRoster,
+        bootstrap_credential_hash: Option<String>,
+    },
+    CreateRoom {
+        token: Token,
+        creator: rpc::ids::AccountId,
+        creator_client_id: Vec<u8>,
+        descriptor: rpc::mls::EncryptedRoomDescriptor,
+        checkpoints: Vec<mls_identity::RosterCheckpoint>,
+        bundle: rpc::mls::MlsCommitBundle,
+        welcome_devices: Vec<DeviceId>,
+    },
+    SubmitCommit {
+        token: Token,
+        room_id: RoomId,
+        device_id: DeviceId,
+        committer_client_id: Vec<u8>,
+        expected_epoch: u64,
+        bundle: rpc::mls::MlsCommitBundle,
+        welcome_devices: Vec<DeviceId>,
+    },
+    RedeemDeviceLink {
+        token: Token,
+        secret_hash: Vec<u8>,
+        user_id: UserId,
+        username: String,
+        expected: mls_identity::RosterCheckpoint,
+        roster: mls_identity::SignedDeviceRoster,
+        device_id: DeviceId,
+        device_name: String,
+        credential_hash: String,
+        attempt_id: rpc::ids::PairAttemptId,
+        packages: Vec<rpc::mls::PublishedKeyPackage>,
+        bearer_token: String,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+    },
+    SubmitApplication {
+        token: Token,
+        room_id: RoomId,
+        device_id: DeviceId,
+        epoch: u64,
+        event_id: rpc::ids::EventId,
+        ciphertext: Vec<u8>,
+    },
+    AckEvent {
+        room_id: RoomId,
+        device_id: DeviceId,
+        sequence: u64,
+    },
+    AckWelcome {
+        device_id: DeviceId,
+        delivery_id: u64,
+    },
+    AckThenReadEvents {
+        token: Token,
+        room_id: RoomId,
+        device_id: DeviceId,
+        after_sequence: u64,
+        limit: usize,
+    },
+    AckThenReadWelcomes {
+        token: Token,
+        device_id: DeviceId,
+        after_sequence: u64,
+    },
+    Compact {
+        scheduled: bool,
+        minimum_fragmented_bytes: u64,
+        minimum_fragmented_percent: u8,
+        admin_reply: Option<mpsc::Sender<Result<String, String>>>,
+        started: Instant,
+    },
+    Cleanup {
+        batch_events: usize,
+        interval: Duration,
+    },
+    StorageStatus {
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    PublishKeyPackages {
+        token: Token,
+        user_id: UserId,
+        device_id: DeviceId,
+        packages: Vec<rpc::mls::PublishedKeyPackage>,
+    },
+    TakeKeyPackage {
+        token: Token,
+        device_id: DeviceId,
+    },
+}
+
+impl MlsWorker {
+    fn spawn(
+        mut service: MlsService,
+        events: Arc<MlsEventQueue>,
+    ) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<MlsWriteRequest>();
+        let thread = thread::Builder::new()
+            .name("chatt-mls-delivery".to_string())
+            .spawn(move || {
+                while let Ok(request) = request_rx.recv() {
+                    match request {
+                        #[cfg(test)]
+                        MlsWriteRequest::BlockForTest { started, release } => {
+                            let result = started
+                                .send(())
+                                .map_err(|error| error.to_string())
+                                .and_then(|_| release.recv().map_err(|error| error.to_string()));
+                            events.push(MlsReply::Background(result));
+                        }
+                        MlsWriteRequest::PutRoster {
+                            token,
+                            session_id,
+                            user_id,
+                            expected,
+                            roster,
+                            bootstrap_credential_hash,
+                        } => {
+                            let initial = expected.is_none();
+                            let stored_roster = roster.clone();
+                            let result = service
+                                .put_roster(
+                                    user_id,
+                                    expected,
+                                    roster,
+                                    bootstrap_credential_hash,
+                                )
+                                .map(|checkpoint| (checkpoint, service.cache_state()));
+                            events.push(MlsReply::RosterStored {
+                                token,
+                                session_id,
+                                user_id,
+                                initial,
+                                roster: stored_roster,
+                                result,
+                            });
+                        }
+                        MlsWriteRequest::CreateRoom {
+                            token,
+                            creator,
+                            creator_client_id,
+                            descriptor,
+                            checkpoints,
+                            bundle,
+                            welcome_devices,
+                        } => {
+                            let room_id = descriptor.room_id;
+                            let result = service
+                                .create_room(
+                                    creator,
+                                    &creator_client_id,
+                                    descriptor,
+                                    &checkpoints,
+                                    bundle,
+                                )
+                                .and_then(|epoch| {
+                                    Ok((
+                                        epoch,
+                                        service.cached_room(room_id).expect("created room cache"),
+                                        collect_latest_welcomes(&service, &welcome_devices)?,
+                                    ))
+                                });
+                            events.push(MlsReply::RoomCreated { token, room_id, result });
+                        }
+                        MlsWriteRequest::SubmitCommit {
+                            token,
+                            room_id,
+                            device_id,
+                            committer_client_id,
+                            expected_epoch,
+                            bundle,
+                            welcome_devices,
+                        } => {
+                            let result = service
+                                .submit_commit_for_device(
+                                    room_id,
+                                    device_id,
+                                    &committer_client_id,
+                                    expected_epoch,
+                                    bundle,
+                                )
+                                .and_then(|outcome| {
+                                    let accepted = match &outcome {
+                                        rpc::mls::MlsCommitOutcome::Accepted { sequence, .. } => {
+                                            Some(*sequence)
+                                        }
+                                        _ => None,
+                                    };
+                                    let room = accepted.and_then(|_| service.cached_room(room_id));
+                                    let pushed = if let Some(sequence) = accepted {
+                                        Some((
+                                            service.event_batch(
+                                                room_id,
+                                                sequence.saturating_sub(1),
+                                                1,
+                                            )?,
+                                            collect_latest_welcomes(
+                                                &service,
+                                                &welcome_devices,
+                                            )?,
+                                        ))
+                                    } else {
+                                        None
+                                    };
+                                    Ok((outcome, room, pushed))
+                                });
+                            events.push(MlsReply::CommitSubmitted { token, room_id, result });
+                        }
+                        MlsWriteRequest::RedeemDeviceLink {
+                            token,
+                            secret_hash,
+                            user_id,
+                            username,
+                            expected,
+                            roster,
+                            device_id,
+                            device_name,
+                            credential_hash,
+                            attempt_id,
+                            packages,
+                            bearer_token,
+                            receive_files,
+                            file_receive_limit_bytes,
+                        } => {
+                            let result = service
+                                .redeem_pair(
+                                    user_id,
+                                    expected,
+                                    roster,
+                                    device_id,
+                                    credential_hash.clone(),
+                                    packages,
+                                )
+                                .map(|_| service.cache_state());
+                            events.push(MlsReply::DeviceLinkRedeemed {
+                                token,
+                                secret_hash,
+                                user_id,
+                                username,
+                                device_id,
+                                device_name,
+                                credential_hash,
+                                attempt_id,
+                                bearer_token,
+                                receive_files,
+                                file_receive_limit_bytes,
+                                result,
+                            });
+                        }
+                        MlsWriteRequest::SubmitApplication {
+                            token,
+                            room_id,
+                            device_id,
+                            epoch,
+                            event_id,
+                            ciphertext,
+                        } => events.push(MlsReply::ApplicationSubmitted {
+                            token,
+                            room_id,
+                            event_id,
+                            result: service.submit_application_for_device_with_event(
+                                room_id,
+                                device_id,
+                                epoch,
+                                event_id,
+                                ciphertext,
+                            ),
+                        }),
+                        MlsWriteRequest::AckEvent {
+                            room_id,
+                            device_id,
+                            sequence,
+                        } => events.push(MlsReply::Background(
+                            service.acknowledge(room_id, device_id, sequence),
+                        )),
+                        MlsWriteRequest::AckWelcome {
+                            device_id,
+                            delivery_id,
+                        } => events.push(MlsReply::Background(
+                            service.acknowledge_welcome(device_id, delivery_id),
+                        )),
+                        MlsWriteRequest::AckThenReadEvents {
+                            token,
+                            room_id,
+                            device_id,
+                            after_sequence,
+                            limit,
+                        } => match service.acknowledge(
+                            room_id,
+                            device_id,
+                            after_sequence,
+                        ) {
+                            Ok(()) => events.push(MlsReply::DispatchRead(
+                                MlsReadRequest::Events {
+                                    token,
+                                    room_id,
+                                    after_sequence,
+                                    limit,
+                                },
+                            )),
+                            Err(error) => events.push(MlsReply::EventBatch {
+                                token,
+                                room_id,
+                                result: Err(error),
+                            }),
+                        },
+                        MlsWriteRequest::AckThenReadWelcomes {
+                            token,
+                            device_id,
+                            after_sequence,
+                        } => match service.acknowledge_welcome(device_id, after_sequence) {
+                            Ok(()) => events.push(MlsReply::DispatchRead(
+                                MlsReadRequest::Welcomes {
+                                    token,
+                                    device_id,
+                                    after_sequence,
+                                },
+                            )),
+                            Err(error) => events.push(MlsReply::Welcomes {
+                                token,
+                                result: Err(error),
+                            }),
+                        },
+                        MlsWriteRequest::Compact {
+                            scheduled,
+                            minimum_fragmented_bytes,
+                            minimum_fragmented_percent,
+                            admin_reply,
+                            started,
+                        } => {
+                            let result = (|| {
+                                let status = service.storage_status()?;
+                                let percent = if status.allocated_bytes == 0 {
+                                    0
+                                } else {
+                                    status.fragmented_bytes.saturating_mul(100)
+                                        / status.allocated_bytes
+                                };
+                                if scheduled
+                                    && (status.fragmented_bytes < minimum_fragmented_bytes
+                                        || percent
+                                            < u64::from(minimum_fragmented_percent))
+                                {
+                                    return Ok(None);
+                                }
+                                let before = status.file_bytes;
+                                let compacted = service.compact()?;
+                                let after = service
+                                    .storage_status()
+                                    .ok()
+                                    .and_then(|status| status.file_bytes);
+                                Ok(Some((compacted, before, after)))
+                            })();
+                            let read_handles = vec![
+                                service.delivery_read_handle(),
+                                service.delivery_read_handle(),
+                            ];
+                            events.push(MlsReply::Compacted {
+                                admin_reply,
+                                result,
+                                read_handles,
+                                started,
+                            });
+                        }
+                        MlsWriteRequest::Cleanup {
+                            batch_events,
+                            interval,
+                        } => events.push(MlsReply::Cleanup {
+                            interval,
+                            result: service.cleanup(batch_events),
+                        }),
+                        MlsWriteRequest::StorageStatus { reply } => {
+                            let result = service.storage_status().map(|status| {
+                                format!(
+                                    "allocated={} stored={} fragmented={} file={}",
+                                    status.allocated_bytes,
+                                    status.stored_bytes,
+                                    status.fragmented_bytes,
+                                    status.file_bytes.map_or_else(
+                                        || "memory".to_string(),
+                                        |bytes| bytes.to_string()
+                                    )
+                                )
+                            });
+                            events.push(MlsReply::StorageStatus { reply, result });
+                        }
+                        MlsWriteRequest::PublishKeyPackages {
+                            token,
+                            user_id,
+                            device_id,
+                            packages,
+                        } => {
+                            let result = service
+                                .publish_key_packages(user_id, device_id, packages)
+                                .map(|available| {
+                                    (available, service.cached_key_packages(device_id))
+                                });
+                            events.push(MlsReply::KeyPackagesPublished {
+                                token,
+                                device_id,
+                                result,
+                            });
+                        }
+                        MlsWriteRequest::TakeKeyPackage { token, device_id } => {
+                            let result = service.take_key_package(device_id).map(|package| {
+                                (
+                                    package,
+                                    service.key_package_count(device_id),
+                                    service.cached_key_packages(device_id),
+                                )
+                            });
+                            events.push(MlsReply::KeyPackageTaken {
+                                token,
+                                device_id,
+                                result,
+                            });
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn MLS delivery worker");
+        Self {
+            requests: Some(request_tx),
+            thread: Some(thread),
+        }
+    }
+
+    fn enqueue_typed(&self, request: MlsWriteRequest) -> bool {
+        self.requests
+            .as_ref()
+            .is_some_and(|requests| requests.send(request).is_ok())
+    }
+}
+
+enum MlsReadRequest {
+    Events {
+        token: Token,
+        room_id: RoomId,
+        after_sequence: u64,
+        limit: usize,
+    },
+    Welcomes {
+        token: Token,
+        device_id: DeviceId,
+        after_sequence: u64,
+    },
+}
+
+impl Drop for MlsWorker {
+    fn drop(&mut self) {
+        // Closing the request channel lets the worker finish every operation
+        // already accepted before a clean server shutdown returns.
+        self.requests.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Rolling per-second counters for video ingest copy cost and ring retention,
@@ -603,13 +1182,20 @@ impl Server {
             .iter()
             .filter_map(|room| room.mls_retention_days.map(|days| (room.room_id(), days)))
             .collect();
-        let mls = MlsService::open_with_retention(
+        let durable_mls = MlsService::open_with_retention(
             config.data_dir(),
             server_key_pair.public_key().as_ref().to_vec(),
             config.storage.mls_retention_days,
             room_retention_days,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mls = durable_mls
+            .in_memory_view()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mls_read_handles = vec![
+            durable_mls.delivery_read_handle(),
+            durable_mls.delivery_read_handle(),
+        ];
         let mut rooms = HashMap::new();
         for room in &config.rooms {
             let access = match &room.members {
@@ -665,7 +1251,10 @@ impl Server {
         }
 
         let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
-        let (history_reader, history_replies) = HistoryReader::spawn(waker);
+        let (history_reader, history_replies) = HistoryReader::spawn(Arc::clone(&waker));
+        let mls_events = Arc::new(MlsEventQueue::new(waker));
+        let mls_worker = MlsWorker::spawn(durable_mls, Arc::clone(&mls_events));
+        let mls_readers = MlsReadPool::spawn(mls_read_handles, Arc::clone(&mls_events));
 
         kvlog::info!(
             "server identity loaded",
@@ -687,6 +1276,10 @@ impl Server {
             users,
             usernames,
             mls,
+            mls_worker,
+            mls_readers: Some(mls_readers),
+            mls_events,
+            pending_mls: HashSet::new(),
             poll,
             listener,
             udp,
@@ -719,6 +1312,8 @@ impl Server {
             next_idle_sweep_at: Instant::now() + IDLE_SWEEP_INTERVAL,
             next_mls_cleanup_at,
             next_mls_compaction_at,
+            mls_cleanup_pending: false,
+            mls_compaction_pending: false,
             loop_work: LoopWork::default(),
             history_reader,
             history_replies,
@@ -805,6 +1400,7 @@ impl Server {
             }
             self.requeue_unclogged_uploaders();
             self.drain_history_replies();
+            self.drain_mls_replies();
             if self.handle_admin_commands(admin_rx) {
                 return Ok(());
             }
@@ -819,40 +1415,26 @@ impl Server {
     }
 
     fn run_mls_cleanup(&mut self, now: Instant) {
-        if now < self.next_mls_cleanup_at {
+        if self.mls_cleanup_pending || now < self.next_mls_cleanup_at {
             return;
         }
         let interval = Duration::from_secs(
             self.config.storage.mls_cleanup_interval_minutes.saturating_mul(60),
         );
-        match self
-            .mls
-            .cleanup(self.config.storage.mls_cleanup_batch_events)
-        {
-            Ok(report) => {
-                if report.deleted_events > 0 || report.lagging_devices > 0 {
-                    kvlog::info!(
-                        "MLS retention cleanup",
-                        deleted_events = report.deleted_events,
-                        lagging_devices = report.lagging_devices,
-                        more_work = report.more_work,
-                    );
-                }
-                self.next_mls_cleanup_at = if report.more_work {
-                    now
-                } else {
-                    now + interval
-                };
-            }
-            Err(error) => {
-                kvlog::warn!("MLS retention cleanup failed", error = error.as_str());
-                self.next_mls_cleanup_at = now + interval;
-            }
+        let batch = self.config.storage.mls_cleanup_batch_events;
+        let queued = self.mls_worker.enqueue_typed(MlsWriteRequest::Cleanup {
+            batch_events: batch,
+            interval,
+        });
+        if queued {
+            self.mls_cleanup_pending = true;
+        } else {
+            self.next_mls_cleanup_at = now + interval;
         }
     }
 
     fn run_mls_compaction(&mut self, now: Instant) {
-        if now < self.next_mls_compaction_at {
+        if self.mls_compaction_pending || now < self.next_mls_compaction_at {
             return;
         }
         let retry = Duration::from_secs(
@@ -864,61 +1446,25 @@ impl Server {
             self.next_mls_compaction_at = now + retry;
             return;
         }
-        let status = match self.mls.storage_status() {
-            Ok(status) => status,
-            Err(error) => {
-                kvlog::warn!("failed to inspect MLS storage", error = error.as_str());
-                self.next_mls_compaction_at = now + retry;
-                return;
-            }
-        };
         let minimum = self
             .config
             .storage
             .mls_compaction_min_fragmented_mib
             .saturating_mul(1024 * 1024);
-        let percent = if status.allocated_bytes == 0 {
-            0
+        let minimum_percent = self.config.storage.mls_compaction_min_fragmented_percent;
+        drop(self.mls_readers.take());
+        let queued = self.mls_worker.enqueue_typed(MlsWriteRequest::Compact {
+            scheduled: true,
+            minimum_fragmented_bytes: minimum,
+            minimum_fragmented_percent: minimum_percent,
+            admin_reply: None,
+            started: Instant::now(),
+        });
+        if queued {
+            self.mls_compaction_pending = true;
         } else {
-            status.fragmented_bytes.saturating_mul(100) / status.allocated_bytes
-        };
-        if status.fragmented_bytes >= minimum
-            && percent
-                >= u64::from(
-                    self.config
-                        .storage
-                        .mls_compaction_min_fragmented_percent,
-                )
-        {
-            let before = status.file_bytes;
-            let started = Instant::now();
-            match self.mls.compact() {
-                Ok(compacted) => {
-                    let after = self
-                        .mls
-                        .storage_status()
-                        .ok()
-                        .and_then(|status| status.file_bytes);
-                    kvlog::info!(
-                        "MLS database compaction completed",
-                        compacted,
-                        before_bytes = before,
-                        after_bytes = after,
-                        duration_ms = started.elapsed().as_millis() as u64,
-                    );
-                }
-                Err(error) => {
-                    kvlog::warn!("MLS database compaction failed", error = error.as_str());
-                }
-            }
+            self.next_mls_compaction_at = now + retry;
         }
-        self.next_mls_compaction_at = now
-            + Duration::from_secs(
-                self.config
-                    .storage
-                    .mls_compaction_min_interval_hours
-                    .saturating_mul(60 * 60),
-            );
     }
 
     /// Returns true when an embedded owner requested a clean shutdown.
@@ -930,35 +1476,34 @@ impl Server {
                     let _ = reply.send(result);
                 }
                 Ok(AdminCommand::MlsStorageStatus { reply }) => {
-                    let result = self.mls.storage_status().map(|status| {
-                        format!(
-                            "allocated={} stored={} fragmented={} file={}",
-                            status.allocated_bytes,
-                            status.stored_bytes,
-                            status.fragmented_bytes,
-                            status
-                                .file_bytes
-                                .map(|bytes| bytes.to_string())
-                                .unwrap_or_else(|| "memory".to_string())
-                        )
-                    });
-                    let _ = reply.send(result);
+                    if !self.mls_worker.enqueue_typed(MlsWriteRequest::StorageStatus {
+                        reply: reply.clone(),
+                    }) {
+                        kvlog::warn!("MLS storage status worker unavailable");
+                        let _ = reply.send(Err("MLS delivery worker is unavailable".into()));
+                    }
                 }
                 Ok(AdminCommand::MlsCompact { reply }) => {
-                    let before = self.mls.storage_status().ok().and_then(|status| status.file_bytes);
-                    let result = self.mls.compact().and_then(|compacted| {
-                        let after = self
-                            .mls
-                            .storage_status()
-                            .ok()
-                            .and_then(|status| status.file_bytes);
-                        Ok(format!(
-                            "compacted={compacted} before={} after={}",
-                            before.map_or_else(|| "memory".to_string(), |v| v.to_string()),
-                            after.map_or_else(|| "memory".to_string(), |v| v.to_string())
-                        ))
-                    });
-                    let _ = reply.send(result);
+                    if self.mls_compaction_pending || !self.clients.is_empty() {
+                        let _ = reply.send(Err(
+                            "MLS compaction requires an idle server; try again after clients disconnect"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+                    drop(self.mls_readers.take());
+                    if self.mls_worker.enqueue_typed(MlsWriteRequest::Compact {
+                        scheduled: false,
+                        minimum_fragmented_bytes: 0,
+                        minimum_fragmented_percent: 0,
+                        admin_reply: Some(reply.clone()),
+                        started: Instant::now(),
+                    }) {
+                        self.mls_compaction_pending = true;
+                    } else {
+                        kvlog::warn!("MLS compaction worker unavailable");
+                        let _ = reply.send(Err("MLS delivery worker is unavailable".into()));
+                    }
                 }
                 Ok(AdminCommand::Shutdown) => return true,
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
@@ -1185,6 +1730,9 @@ impl Server {
             // further frame processing; pipelined frames must not spend crypto
             // or rate-limit work on its behalf.
             if client.is_closing() {
+                return;
+            }
+            if self.pending_mls.contains(&token) {
                 return;
             }
             match control_conn_step(token, client) {
@@ -2330,81 +2878,19 @@ impl Server {
                 )
             }
             ClientControl::PutDeviceRoster { expected, roster } => {
-                let stored_roster = roster.clone();
-                let active_devices = roster
-                    .body
-                    .active_devices
-                    .iter()
-                    .map(|certificate| certificate.body.device_id)
-                    .collect::<Vec<_>>();
-                let revoked_tokens = self
-                    .sessions
-                    .values()
-                    .filter(|session| session.user_id == user_id)
-                    .filter_map(|session| {
-                        session
-                            .mls_device
-                            .as_ref()
-                            .filter(|bound| !active_devices.contains(&bound.device_id))
-                            .map(|_| session.tcp_token)
-                    })
-                    .collect::<Vec<_>>();
                 let bootstrap_credential_hash =
                     expected.is_none().then_some(bootstrap_credential_hash).flatten();
-                match self.mls.put_roster(
-                    user_id,
-                    expected,
-                    roster,
-                    bootstrap_credential_hash,
-                ) {
-                    Ok(checkpoint) => {
-                        if expected.is_none()
-                            && let Some(session) = self.sessions.get_mut(&session_id)
-                        {
-                            session.bootstrap_credential_hash = None;
-                        }
-                        for session in self
-                            .sessions
-                            .values_mut()
-                            .filter(|session| session.user_id == user_id)
-                        {
-                            if let Some(bound) = session.mls_device.as_mut() {
-                                if active_devices.contains(&bound.device_id) {
-                                    bound.roster = checkpoint;
-                                } else {
-                                    session.mls_device = None;
-                                }
-                            }
-                        }
-                        self.send_control_to_token(
-                            token,
-                            &ServerControl::DeviceRosterStored { checkpoint },
-                        )?;
-                        let tokens = self
-                            .sessions
-                            .values()
-                            .map(|session| session.tcp_token)
-                            .filter(|token| self.clients.contains_key(token))
-                            .collect::<Vec<_>>();
-                        self.send_control_to_tokens(
-                            &tokens,
-                            &ServerControl::DeviceRoster {
-                                user_id,
-                                initialized: true,
-                                roster: Some(stored_roster),
-                            },
-                        );
-                        for revoked in revoked_tokens {
-                            self.disconnect(revoked);
-                        }
-                        Ok(())
-                    }
-                    Err(PutRosterError::Conflict(current)) => self.send_control_to_token(
+                self.enqueue_mls_write(
+                    token,
+                    MlsWriteRequest::PutRoster {
                         token,
-                        &ServerControl::DeviceRosterConflict { current },
-                    ),
-                    Err(PutRosterError::Invalid(error)) => Err(error),
-                }
+                        session_id,
+                        user_id,
+                        expected,
+                        roster,
+                        bootstrap_credential_hash,
+                    },
+                )
             }
             ClientControl::BindMlsDevice {
                 device_id,
@@ -2455,52 +2941,34 @@ impl Server {
                 packages,
             } => {
                 let bound = require_mls_device(bound.as_ref(), device_id)?;
-                let available =
-                    self.mls
-                        .publish_key_packages(user_id, bound.device_id, packages)?;
-                let tokens = self
-                    .sessions
-                    .values()
-                    .map(|session| session.tcp_token)
-                    .filter(|token| self.clients.contains_key(token))
-                    .collect::<Vec<_>>();
-                self.send_control_to_tokens(
-                    &tokens,
-                    &ServerControl::KeyPackagesPublished {
-                        device_id,
-                        available,
-                    },
-                );
-                Ok(())
+                if !self.pending_mls.insert(token) {
+                    return Err("connection already has an MLS delivery operation pending".into());
+                }
+                if self.mls_worker.enqueue_typed(MlsWriteRequest::PublishKeyPackages {
+                    token,
+                    user_id,
+                    device_id: bound.device_id,
+                    packages,
+                }) {
+                    Ok(())
+                } else {
+                    self.pending_mls.remove(&token);
+                    Err("MLS delivery worker is unavailable".into())
+                }
             }
             ClientControl::TakeKeyPackage { device_id } => {
-                let package = self.mls.take_key_package(device_id)?;
-                let available = self.mls.key_package_count(device_id);
-                let owner_token = self
-                    .sessions
-                    .values()
-                    .filter(|session| {
-                        session
-                            .mls_device
-                            .as_ref()
-                            .is_some_and(|bound| bound.device_id == device_id)
-                    })
-                    .map(|session| session.tcp_token)
-                    .min_by_key(|token| token.0);
-                self.send_control_to_token(
-                    token,
-                    &ServerControl::KeyPackage { device_id, package },
-                )?;
-                if let Some(owner_token) = owner_token {
-                    self.send_control_to_token(
-                        owner_token,
-                        &ServerControl::KeyPackagesLow {
-                            device_id,
-                            available,
-                        },
-                    )?;
+                if !self.pending_mls.insert(token) {
+                    return Err("connection already has an MLS delivery operation pending".into());
                 }
-                Ok(())
+                if self
+                    .mls_worker
+                    .enqueue_typed(MlsWriteRequest::TakeKeyPackage { token, device_id })
+                {
+                    Ok(())
+                } else {
+                    self.pending_mls.remove(&token);
+                    Err("MLS delivery worker is unavailable".into())
+                }
             }
             ClientControl::CreateEncryptedRoom {
                 descriptor,
@@ -2538,17 +3006,18 @@ impl Server {
                     .as_ref()
                     .map(|welcome| welcome.device_ids.clone())
                     .unwrap_or_default();
-                let epoch = self.mls.create_room(
-                    account_id,
-                    &bound.client_id,
-                    descriptor,
-                    &roster_checkpoints,
-                    initial_commit,
-                )?;
-                self.push_latest_mls_welcomes(&welcome_devices);
-                self.send_control_to_token(
+                let client_id = bound.client_id.clone();
+                self.enqueue_mls_write(
                     token,
-                    &ServerControl::EncryptedRoomCreated { room_id, epoch },
+                    MlsWriteRequest::CreateRoom {
+                        token,
+                        creator: account_id,
+                        creator_client_id: client_id,
+                        descriptor,
+                        checkpoints: roster_checkpoints,
+                        bundle: initial_commit,
+                        welcome_devices,
+                    },
                 )
             }
             ClientControl::FetchGroupInfo { room_id } => {
@@ -2586,40 +3055,20 @@ impl Server {
                     .as_ref()
                     .map(|welcome| welcome.device_ids.clone())
                     .unwrap_or_default();
-                let outcome =
-                    self.mls
-                        .submit_commit_for_device(
-                            room_id,
-                            bound.device_id,
-                            &bound.client_id,
-                            expected_epoch,
-                            bundle,
-                        )?;
-                if matches!(outcome, rpc::mls::MlsCommitOutcome::Accepted { .. }) {
-                    self.push_latest_mls_welcomes(&welcome_devices);
-                }
-                self.send_control_to_token(
+                let device_id = bound.device_id;
+                let client_id = bound.client_id.clone();
+                self.enqueue_mls_write(
                     token,
-                    &ServerControl::MlsCommitSubmitted {
+                    MlsWriteRequest::SubmitCommit {
+                        token,
                         room_id,
-                        outcome: outcome.clone(),
+                        device_id,
+                        committer_client_id: client_id,
+                        expected_epoch,
+                        bundle,
+                        welcome_devices,
                     },
-                )?;
-                if let rpc::mls::MlsCommitOutcome::Accepted { sequence, .. } = outcome
-                    && let Ok(batch) = self.mls.event_batch(room_id, sequence - 1, 1)
-                {
-                    let tokens = self.mls_room_tokens(room_id);
-                    self.send_control_to_tokens(
-                        &tokens,
-                        &ServerControl::MlsEvents {
-                            room_id,
-                            events: batch.events,
-                            oldest_available_sequence: batch.oldest_available_sequence,
-                            head_sequence: batch.head_sequence,
-                        },
-                    );
-                }
-                Ok(())
+                )
             }
             ClientControl::SubmitMlsApplication {
                 room_id,
@@ -2631,50 +3080,23 @@ impl Server {
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 self.require_mls_room_member(user_id, room_id)?;
-                let outcome = self
-                    .mls
-                    .submit_application_for_device(
-                        room_id,
-                        bound.device_id,
-                        epoch,
-                        event_id,
-                        ciphertext,
-                    )?;
-                kvlog::info!(
-                    "MLS application submission decided",
-                    room_id = room_id.0,
-                    outcome = match outcome {
-                        rpc::mls::MlsSubmitOutcome::Stored { .. } => "stored",
-                        rpc::mls::MlsSubmitOutcome::AlreadyStored { .. } => "already_stored",
-                        rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { .. } => "stale_epoch",
-                        rpc::mls::MlsSubmitOutcome::RevocationPending => "revocation_pending",
-                        rpc::mls::MlsSubmitOutcome::RejoinRequired => "rejoin_required",
-                        rpc::mls::MlsSubmitOutcome::TemporarilyBlocked => "temporarily_blocked",
-                    },
-                );
-                self.send_control_to_token(
-                    token,
-                    &ServerControl::MlsApplicationSubmitted {
-                        room_id,
-                        event_id,
-                        outcome,
-                    },
-                )?;
-                if let rpc::mls::MlsSubmitOutcome::Stored { sequence } = outcome
-                    && let Ok(batch) = self.mls.event_batch(room_id, sequence - 1, 1)
-                {
-                    let tokens = self.mls_room_tokens(room_id);
-                    self.send_control_to_tokens(
-                        &tokens,
-                        &ServerControl::MlsEvents {
-                            room_id,
-                            events: batch.events,
-                            oldest_available_sequence: batch.oldest_available_sequence,
-                            head_sequence: batch.head_sequence,
-                        },
-                    );
+                let device_id = bound.device_id;
+                if !self.pending_mls.insert(token) {
+                    return Err("connection already has an MLS delivery operation pending".into());
                 }
-                Ok(())
+                if self.mls_worker.enqueue_typed(MlsWriteRequest::SubmitApplication {
+                    token,
+                    room_id,
+                    device_id,
+                    epoch,
+                    event_id,
+                    ciphertext,
+                }) {
+                    Ok(())
+                } else {
+                    self.pending_mls.remove(&token);
+                    Err("MLS delivery worker is unavailable".into())
+                }
             }
             ClientControl::FetchMlsEvents {
                 room_id,
@@ -2685,55 +3107,105 @@ impl Server {
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 self.require_mls_room_member(user_id, room_id)?;
-                if after_sequence > 0 {
-                    self.mls
-                        .acknowledge(room_id, bound.device_id, after_sequence)?;
+                let device_id = bound.device_id;
+                if after_sequence == 0 {
+                    if !self.pending_mls.insert(token) {
+                        return Err("connection already has an MLS delivery operation pending".into());
+                    }
+                    if self.mls_readers.as_ref().is_some_and(|readers| {
+                        readers.enqueue(MlsReadRequest::Events {
+                            token,
+                            room_id,
+                            after_sequence,
+                            limit: usize::from(limit),
+                        })
+                    }) {
+                        return Ok(());
+                    }
+                    self.pending_mls.remove(&token);
+                    return Err("MLS delivery readers are unavailable".into());
                 }
-                let batch = self
-                    .mls
-                    .event_batch(room_id, after_sequence, usize::from(limit))?;
-                self.send_control_to_token(
+                if !self.pending_mls.insert(token) {
+                    return Err("connection already has an MLS delivery operation pending".into());
+                }
+                if self.mls_worker.enqueue_typed(MlsWriteRequest::AckThenReadEvents {
                     token,
-                    &ServerControl::MlsEvents {
-                        room_id,
-                        events: batch.events,
-                        oldest_available_sequence: batch.oldest_available_sequence,
-                        head_sequence: batch.head_sequence,
-                    },
-                )
+                    room_id,
+                    device_id,
+                    after_sequence,
+                    limit: usize::from(limit),
+                }) {
+                    Ok(())
+                } else {
+                    self.pending_mls.remove(&token);
+                    Err("MLS delivery worker is unavailable".into())
+                }
             }
             ClientControl::FetchMlsWelcome { after_sequence } => {
                 let bound = bound
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
-                if after_sequence > 0 {
-                    self.mls
-                        .acknowledge_welcome(bound.device_id, after_sequence)?;
+                let device_id = bound.device_id;
+                if after_sequence == 0 {
+                    if !self.pending_mls.insert(token) {
+                        return Err("connection already has an MLS delivery operation pending".into());
+                    }
+                    if self.mls_readers.as_ref().is_some_and(|readers| {
+                        readers.enqueue(MlsReadRequest::Welcomes {
+                            token,
+                            device_id,
+                            after_sequence,
+                        })
+                    }) {
+                        return Ok(());
+                    }
+                    self.pending_mls.remove(&token);
+                    return Err("MLS delivery readers are unavailable".into());
                 }
-                let welcomes = self.mls.welcomes(bound.device_id, after_sequence)?;
-                let head_sequence = self.mls.welcome_head(bound.device_id)?;
-                self.send_control_to_token(
-                    token,
-                    &ServerControl::MlsWelcomes {
-                        welcomes,
-                        head_sequence,
-                    },
-                )
+                if !self.pending_mls.insert(token) {
+                    return Err("connection already has an MLS delivery operation pending".into());
+                }
+                if self
+                    .mls_worker
+                    .enqueue_typed(MlsWriteRequest::AckThenReadWelcomes {
+                        token,
+                        device_id,
+                        after_sequence,
+                    })
+                {
+                    Ok(())
+                } else {
+                    self.pending_mls.remove(&token);
+                    Err("MLS delivery worker is unavailable".into())
+                }
             }
             ClientControl::AckMlsEvent { room_id, sequence } => {
                 let bound = bound
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 self.require_mls_room_member(user_id, room_id)?;
-                self.mls
-                    .acknowledge(room_id, bound.device_id, sequence)
+                let device_id = bound.device_id;
+                if !self.mls_worker.enqueue_typed(MlsWriteRequest::AckEvent {
+                    room_id,
+                    device_id,
+                    sequence,
+                }) {
+                    return Err("MLS delivery worker is unavailable".to_string());
+                }
+                Ok(())
             }
             ClientControl::AckMlsWelcome { delivery_id } => {
                 let bound = bound
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
-                self.mls
-                    .acknowledge_welcome(bound.device_id, delivery_id)
+                let device_id = bound.device_id;
+                if !self.mls_worker.enqueue_typed(MlsWriteRequest::AckWelcome {
+                    device_id,
+                    delivery_id,
+                }) {
+                    return Err("MLS delivery worker is unavailable".to_string());
+                }
+                Ok(())
             }
             _ => unreachable!("non-MLS control routed to MLS handler"),
         }
@@ -2803,30 +3275,31 @@ impl Server {
         Ok(())
     }
 
-    fn push_latest_mls_welcomes(&mut self, devices: &[DeviceId]) {
-        let deliveries = self
-            .sessions
-            .values()
-            .filter_map(|session| {
-                let bound = session.mls_device.as_ref()?;
-                devices.contains(&bound.device_id).then(|| {
-                    let head_sequence = self.mls.welcome_head(bound.device_id).ok()?;
-                    let welcomes = self
-                        .mls
-                        .welcomes(bound.device_id, head_sequence.saturating_sub(1))
-                        .ok()?;
-                    Some((session.tcp_token, welcomes, head_sequence))
-                })?
-            })
-            .collect::<Vec<_>>();
-        for (token, welcomes, head_sequence) in deliveries {
-            let _ = self.send_control_to_token(
-                token,
-                &ServerControl::MlsWelcomes {
-                    welcomes,
-                    head_sequence,
-                },
-            );
+    fn push_mls_welcome_deliveries(
+        &mut self,
+        deliveries: Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>,
+    ) {
+        for (device_id, welcomes, head_sequence) in deliveries {
+            let tokens = self
+                .sessions
+                .values()
+                .filter_map(|session| {
+                    (session
+                        .mls_device
+                        .as_ref()
+                        .is_some_and(|bound| bound.device_id == device_id))
+                    .then_some(session.tcp_token)
+                })
+                .collect::<Vec<_>>();
+            for token in tokens {
+                let _ = self.send_control_to_token(
+                    token,
+                    &ServerControl::MlsWelcomes {
+                        welcomes: welcomes.clone(),
+                        head_sequence,
+                    },
+                );
+            }
         }
     }
 
@@ -3015,25 +3488,55 @@ impl Server {
             }
         };
         if first_redemption {
-            self.mls.redeem_pair(
-                user_id,
-                expected_roster,
-                roster,
-                device_id,
-                credential_hash.clone(),
-                key_packages,
-            )?;
-            let link = self
-                .device_links
-                .get_mut(&secret_hash)
-                .ok_or_else(|| "device link disappeared during redemption".to_string())?;
-            link.redemption = DeviceLinkRedemption::Redeemed {
-                device_id,
-                credential_hash: credential_hash.clone(),
-                attempt_id,
-            };
+            return self.enqueue_mls_write(
+                token,
+                MlsWriteRequest::RedeemDeviceLink {
+                    token,
+                    secret_hash,
+                    user_id,
+                    username,
+                    expected: expected_roster,
+                    roster,
+                    device_id,
+                    device_name,
+                    credential_hash,
+                    attempt_id,
+                    packages: key_packages,
+                    bearer_token,
+                    receive_files,
+                    file_receive_limit_bytes,
+                },
+            );
         }
 
+        self.finish_device_link_redemption(
+            token,
+            secret_hash,
+            user_id,
+            username,
+            device_id,
+            device_name,
+            bearer_token,
+            receive_files,
+            file_receive_limit_bytes,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_device_link_redemption(
+        &mut self,
+        token: Token,
+        secret_hash: Vec<u8>,
+        user_id: UserId,
+        username: String,
+        device_id: DeviceId,
+        device_name: String,
+        bearer_token: String,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+        first_redemption: bool,
+    ) -> Result<(), String> {
         let account_tokens = self
             .sessions
             .values()
@@ -4155,6 +4658,438 @@ impl Server {
                 }
             }
         }
+    }
+
+    fn enqueue_mls_write(
+        &mut self,
+        token: Token,
+        request: MlsWriteRequest,
+    ) -> Result<(), String> {
+        if !self.pending_mls.insert(token) {
+            return Err("connection already has an MLS delivery operation pending".to_string());
+        }
+        if self.mls_worker.enqueue_typed(request) {
+            Ok(())
+        } else {
+            self.pending_mls.remove(&token);
+            Err("MLS delivery worker is unavailable".to_string())
+        }
+    }
+
+    /// Applies finished delivery work and resumes only the connection that
+    /// initiated it. A failed request follows the normal protocol-error path
+    /// and disconnects that client; unrelated sockets continue to run while
+    /// the worker is blocked in storage I/O.
+    fn drain_mls_replies(&mut self) {
+        let mut events = self.mls_events.drain();
+        while let Some(reply) = events.pop_front() {
+            let (token, result) = match reply {
+                MlsReply::RosterStored {
+                    token,
+                    session_id,
+                    user_id,
+                    initial,
+                    roster,
+                    result,
+                } => {
+                    let result = match result {
+                        Ok((checkpoint, state)) => (|| {
+                            self.install_mls_cache(state)?;
+                            if initial
+                                && let Some(session) = self.sessions.get_mut(&session_id)
+                            {
+                                session.bootstrap_credential_hash = None;
+                            }
+                            let active_devices = roster
+                                .body
+                                .active_devices
+                                .iter()
+                                .map(|certificate| certificate.body.device_id)
+                                .collect::<Vec<_>>();
+                            let revoked_tokens = self
+                                .sessions
+                                .values()
+                                .filter(|session| session.user_id == user_id)
+                                .filter_map(|session| {
+                                    session
+                                        .mls_device
+                                        .as_ref()
+                                        .filter(|bound| {
+                                            !active_devices.contains(&bound.device_id)
+                                        })
+                                        .map(|_| session.tcp_token)
+                                })
+                                .collect::<Vec<_>>();
+                            for session in self
+                                .sessions
+                                .values_mut()
+                                .filter(|session| session.user_id == user_id)
+                            {
+                                if let Some(bound) = session.mls_device.as_mut() {
+                                    if active_devices.contains(&bound.device_id) {
+                                        bound.roster = checkpoint;
+                                    } else {
+                                        session.mls_device = None;
+                                    }
+                                }
+                            }
+                            self.send_control_to_token(
+                                token,
+                                &ServerControl::DeviceRosterStored { checkpoint },
+                            )?;
+                            let tokens = self
+                                .sessions
+                                .values()
+                                .map(|session| session.tcp_token)
+                                .filter(|token| self.clients.contains_key(token))
+                                .collect::<Vec<_>>();
+                            self.send_control_to_tokens(
+                                &tokens,
+                                &ServerControl::DeviceRoster {
+                                    user_id,
+                                    initialized: true,
+                                    roster: Some(roster),
+                                },
+                            );
+                            for revoked in revoked_tokens {
+                                self.disconnect(revoked);
+                            }
+                            Ok(())
+                        })(),
+                        Err(PutRosterError::Conflict(current)) => self.send_control_to_token(
+                            token,
+                            &ServerControl::DeviceRosterConflict { current },
+                        ),
+                        Err(PutRosterError::Invalid(error)) => Err(error),
+                    };
+                    (Some(token), result)
+                }
+                MlsReply::RoomCreated {
+                    token,
+                    room_id,
+                    result,
+                } => {
+                    let result = result.and_then(|(epoch, room, deliveries)| {
+                        self.mls.install_cached_room(room);
+                        self.push_mls_welcome_deliveries(deliveries);
+                        self.send_control_to_token(
+                            token,
+                            &ServerControl::EncryptedRoomCreated { room_id, epoch },
+                        )
+                    });
+                    (Some(token), result)
+                }
+                MlsReply::CommitSubmitted {
+                    token,
+                    room_id,
+                    result,
+                } => {
+                    let result = result.and_then(|(outcome, room, pushed)| {
+                        if let Some(room) = room {
+                            self.mls.install_cached_room(room);
+                        }
+                        self.send_control_to_token(
+                            token,
+                            &ServerControl::MlsCommitSubmitted {
+                                room_id,
+                                outcome: outcome.clone(),
+                            },
+                        )?;
+                        if let Some((batch, deliveries)) = pushed {
+                            self.push_mls_welcome_deliveries(deliveries);
+                            let tokens = self.mls_room_tokens(room_id);
+                            self.send_control_to_tokens(
+                                &tokens,
+                                &ServerControl::MlsEvents {
+                                    room_id,
+                                    events: batch.events,
+                                    oldest_available_sequence: batch.oldest_available_sequence,
+                                    head_sequence: batch.head_sequence,
+                                },
+                            );
+                        }
+                        Ok(())
+                    });
+                    (Some(token), result)
+                }
+                MlsReply::DeviceLinkRedeemed {
+                    token,
+                    secret_hash,
+                    user_id,
+                    username,
+                    device_id,
+                    device_name,
+                    credential_hash,
+                    attempt_id,
+                    bearer_token,
+                    receive_files,
+                    file_receive_limit_bytes,
+                    result,
+                } => {
+                    let result = result.and_then(|state| {
+                        self.install_mls_cache(state)?;
+                        let link = self.device_links.get_mut(&secret_hash).ok_or_else(|| {
+                            "device link disappeared during redemption".to_string()
+                        })?;
+                        link.redemption = DeviceLinkRedemption::Redeemed {
+                            device_id,
+                            credential_hash,
+                            attempt_id,
+                        };
+                        self.finish_device_link_redemption(
+                            token,
+                            secret_hash,
+                            user_id,
+                            username,
+                            device_id,
+                            device_name,
+                            bearer_token,
+                            receive_files,
+                            file_receive_limit_bytes,
+                            true,
+                        )
+                    });
+                    (Some(token), result)
+                }
+                MlsReply::EventBatch {
+                    token,
+                    room_id,
+                    result,
+                } => {
+                    let result = result.and_then(|batch| {
+                        self.send_control_to_token(
+                            token,
+                            &ServerControl::MlsEvents {
+                                room_id,
+                                events: batch.events,
+                                oldest_available_sequence: batch.oldest_available_sequence,
+                                head_sequence: batch.head_sequence,
+                            },
+                        )
+                    });
+                    (Some(token), result)
+                }
+                MlsReply::Welcomes { token, result } => {
+                    let result = result.and_then(|(welcomes, head_sequence)| {
+                        self.send_control_to_token(
+                            token,
+                            &ServerControl::MlsWelcomes {
+                                welcomes,
+                                head_sequence,
+                            },
+                        )
+                    });
+                    (Some(token), result)
+                }
+                MlsReply::ApplicationSubmitted {
+                    token,
+                    room_id,
+                    event_id,
+                    result,
+                } => {
+                    let result = result.and_then(|(outcome, batch)| {
+                        kvlog::info!(
+                            "MLS application submission decided",
+                            room_id = room_id.0,
+                            outcome = mls_submit_outcome_name(&outcome),
+                        );
+                        self.send_control_to_token(
+                            token,
+                            &ServerControl::MlsApplicationSubmitted {
+                                room_id,
+                                event_id,
+                                outcome,
+                            },
+                        )?;
+                        if let Some(batch) = batch {
+                            let tokens = self.mls_room_tokens(room_id);
+                            self.send_control_to_tokens(
+                                &tokens,
+                                &ServerControl::MlsEvents {
+                                    room_id,
+                                    events: batch.events,
+                                    oldest_available_sequence: batch.oldest_available_sequence,
+                                    head_sequence: batch.head_sequence,
+                                },
+                            );
+                        }
+                        Ok(())
+                    });
+                    (Some(token), result)
+                }
+                MlsReply::Background(result) => (None, result),
+                MlsReply::DispatchRead(request) => {
+                    let token = match &request {
+                        MlsReadRequest::Events { token, .. }
+                        | MlsReadRequest::Welcomes { token, .. } => *token,
+                    };
+                    if self
+                        .mls_readers
+                        .as_ref()
+                        .is_some_and(|readers| readers.enqueue(request))
+                    {
+                        continue;
+                    }
+                    (
+                        Some(token),
+                        Err("MLS delivery readers are unavailable".to_string()),
+                    )
+                }
+                MlsReply::Compacted {
+                    admin_reply,
+                    result,
+                    read_handles,
+                    started,
+                } => {
+                    self.mls_readers = Some(MlsReadPool::spawn(
+                        read_handles,
+                        Arc::clone(&self.mls_events),
+                    ));
+                    self.mls_compaction_pending = false;
+                    self.next_mls_compaction_at = Instant::now()
+                        + Duration::from_secs(
+                            self.config
+                                .storage
+                                .mls_compaction_min_interval_hours
+                                .saturating_mul(60 * 60),
+                        );
+                    match &result {
+                        Ok(Some((compacted, before, after))) => kvlog::info!(
+                            "MLS database compaction completed",
+                            compacted = *compacted,
+                            before_bytes = *before,
+                            after_bytes = *after,
+                            duration_ms = started.elapsed().as_millis() as u64,
+                        ),
+                        Ok(None) => {}
+                        Err(error) => {
+                            kvlog::warn!("MLS database compaction failed", error = error.as_str())
+                        }
+                    }
+                    if let Some(reply) = admin_reply {
+                        let response = result.map(|compacted| match compacted {
+                            Some((compacted, before, after)) => format!(
+                                "compacted={compacted} before={} after={}",
+                                before.map_or_else(|| "memory".to_string(), |v| v.to_string()),
+                                after.map_or_else(|| "memory".to_string(), |v| v.to_string())
+                            ),
+                            None => "compacted=false before=memory after=memory".to_string(),
+                        });
+                        let _ = reply.send(response);
+                    }
+                    (None, Ok(()))
+                }
+                MlsReply::Cleanup { interval, result } => {
+                    self.mls_cleanup_pending = false;
+                    match result {
+                        Ok(report) => {
+                            if report.deleted_events > 0 || report.lagging_devices > 0 {
+                                kvlog::info!(
+                                    "MLS retention cleanup",
+                                    deleted_events = report.deleted_events,
+                                    lagging_devices = report.lagging_devices,
+                                    more_work = report.more_work,
+                                );
+                            }
+                            self.next_mls_cleanup_at = if report.more_work {
+                                Instant::now()
+                            } else {
+                                Instant::now() + interval
+                            };
+                            (None, Ok(()))
+                        }
+                        Err(error) => {
+                            self.next_mls_cleanup_at = Instant::now() + interval;
+                            (None, Err(error))
+                        }
+                    }
+                }
+                MlsReply::StorageStatus { reply, result } => {
+                    let _ = reply.send(result);
+                    (None, Ok(()))
+                }
+                MlsReply::KeyPackagesPublished {
+                    token,
+                    device_id,
+                    result,
+                } => {
+                    let result = result.map(|(available, cached)| {
+                        self.mls.install_cached_key_packages(device_id, cached);
+                        let tokens = self
+                            .sessions
+                            .values()
+                            .map(|session| session.tcp_token)
+                            .filter(|token| self.clients.contains_key(token))
+                            .collect::<Vec<_>>();
+                        self.send_control_to_tokens(
+                            &tokens,
+                            &ServerControl::KeyPackagesPublished {
+                                device_id,
+                                available,
+                            },
+                        );
+                    });
+                    (Some(token), result)
+                }
+                MlsReply::KeyPackageTaken {
+                    token,
+                    device_id,
+                    result,
+                } => {
+                    let result = result.and_then(|(package, available, cached)| {
+                        self.mls.install_cached_key_packages(device_id, cached);
+                        self.send_control_to_token(
+                            token,
+                            &ServerControl::KeyPackage { device_id, package },
+                        )?;
+                        let owner_token = self
+                            .sessions
+                            .values()
+                            .filter(|session| {
+                                session
+                                    .mls_device
+                                    .as_ref()
+                                    .is_some_and(|bound| bound.device_id == device_id)
+                            })
+                            .map(|session| session.tcp_token)
+                            .min_by_key(|token| token.0);
+                        if let Some(owner_token) = owner_token {
+                            self.send_control_to_token(
+                                owner_token,
+                                &ServerControl::KeyPackagesLow {
+                                    device_id,
+                                    available,
+                                },
+                            )?;
+                        }
+                        Ok(())
+                    });
+                    (Some(token), result)
+                }
+            };
+            if let Err(error) = result {
+                if let Some(token) = token {
+                    kvlog::warn!(
+                        "MLS delivery operation failed",
+                        token = token.0,
+                        error = error.as_str()
+                    );
+                    self.disconnect(token);
+                } else {
+                    kvlog::warn!("MLS background operation failed", error = error.as_str());
+                }
+            }
+            if let Some(token) = token {
+                self.pending_mls.remove(&token);
+                if self.clients.contains_key(&token) {
+                    self.loop_work.queue_client_read(token);
+                }
+            }
+        }
+    }
+
+    fn install_mls_cache(&mut self, state: MlsCacheState) -> Result<(), String> {
+        self.mls.install_cache_state(state)
     }
 
     /// Opens (or returns) the DM room between the requesting session's user
@@ -6044,7 +6979,10 @@ impl Server {
         let Some(client) = self.clients.get(&token) else {
             return false;
         };
-        if client.is_closing() || self.relay_clogged_for_reader(token) {
+        if client.is_closing()
+            || self.pending_mls.contains(&token)
+            || self.relay_clogged_for_reader(token)
+        {
             return false;
         }
         if client.readiness.is_ready() {
@@ -7191,12 +8129,111 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
     }
 }
 
+fn collect_latest_welcomes(
+    mls: &MlsService,
+    devices: &[DeviceId],
+) -> Result<Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>, String> {
+    devices
+        .iter()
+        .map(|device_id| {
+            let head = mls.welcome_head(*device_id)?;
+            let welcomes = mls.welcomes(*device_id, head.saturating_sub(1))?;
+            Ok((*device_id, welcomes, head))
+        })
+        .collect()
+}
+
+fn mls_submit_outcome_name(outcome: &rpc::mls::MlsSubmitOutcome) -> &'static str {
+    match outcome {
+        rpc::mls::MlsSubmitOutcome::Stored { .. } => "stored",
+        rpc::mls::MlsSubmitOutcome::AlreadyStored { .. } => "already_stored",
+        rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { .. } => "stale_epoch",
+        rpc::mls::MlsSubmitOutcome::RevocationPending => "revocation_pending",
+        rpc::mls::MlsSubmitOutcome::RejoinRequired => "rejoin_required",
+        rpc::mls::MlsSubmitOutcome::TemporarilyBlocked => "temporarily_blocked",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rpc::crypto::{SessionSecrets, TAG_LEN, TRANSPORT_HEADER_LEN, TransportCipher};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    fn finish_test_roster(server: &mut Server) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut events = server.mls_events.drain();
+            while let Some(event) = events.pop_front() {
+                if let MlsReply::RosterStored { result, .. } = event {
+                    let (_, state) = result.expect("test roster stored");
+                    server.install_mls_cache(state).expect("test roster cache");
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "MLS worker reply");
+            thread::yield_now();
+        }
+    }
+
+    fn finish_mls_for_token(server: &mut Server, token: Token) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.pending_mls.contains(&token) {
+            server.drain_mls_replies();
+            assert!(Instant::now() < deadline, "MLS worker reply");
+            thread::yield_now();
+        }
+    }
+
+    fn put_test_roster(
+        server: &mut Server,
+        user_id: UserId,
+        roster: mls_identity::SignedDeviceRoster,
+    ) {
+        assert!(server.mls_worker.enqueue_typed(MlsWriteRequest::PutRoster {
+            token: Token(usize::MAX),
+            session_id: SessionId(u64::MAX),
+            user_id,
+            expected: None,
+            roster,
+            bootstrap_credential_hash: None,
+        }));
+        finish_test_roster(server);
+    }
+
+    #[test]
+    fn delivery_worker_does_not_block_other_connections() {
+        let mut server = test_server();
+        let _blocked_peer = seed_session_client(&mut server, Token(30));
+        let mut responsive_peer = seed_session_client(&mut server, Token(31));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        assert!(server
+            .mls_worker
+            .enqueue_typed(MlsWriteRequest::BlockForTest {
+                started: started_tx,
+                release: release_rx,
+            }));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        server
+            .send_control_to_token(Token(31), &ServerControl::Pong { nonce: 77 })
+            .unwrap();
+        server.write_client(Token(31));
+        assert!(matches!(
+            read_plaintext_server_control(&mut responsive_peer),
+            ServerControl::Pong { nonce: 77 }
+        ));
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.mls_events.drain().is_empty() {
+            assert!(Instant::now() < deadline, "MLS worker reply");
+            thread::yield_now();
+        }
+    }
 
     #[test]
     fn write_bug_report_creates_paired_files() {
@@ -8290,10 +9327,7 @@ mod tests {
         tag: u8,
     ) {
         let roster = test_mls_roster(server, user_id, [tag; 32], &[(tag, "test")], 1);
-        server
-            .mls
-            .put_roster(user_id, None, roster.clone(), None)
-            .unwrap();
+        put_test_roster(server, user_id, roster.clone());
         let certificate = &roster.body.active_devices[0].body;
         server.sessions.get_mut(&session_id).unwrap().mls_device = Some(BoundMlsDevice {
             device_id: certificate.device_id,
@@ -8309,10 +9343,7 @@ mod tests {
         server.usernames.claim_dynamic(user_id, "Alice").unwrap();
         let authority_seed = [7; 32];
         let current = test_mls_roster(&server, user_id, authority_seed, &[(7, "first")], 1);
-        server
-            .mls
-            .put_roster(user_id, None, current.clone(), None)
-            .unwrap();
+        put_test_roster(&mut server, user_id, current.clone());
         let attempt_id = rpc::ids::PairAttemptId([5; 16]);
         let redemption_secret = "single-use-device-link-secret";
         let bearer = "tct2_test-device-bearer-token-value".to_string();
@@ -8367,9 +9398,10 @@ mod tests {
                 0,
             )
             .unwrap();
+        finish_mls_for_token(&mut server, Token(33));
         assert_eq!(server.mls.roster(user_id), Some(&next));
         assert!(server.mls.authenticate_credential(&bearer).is_some());
-        assert!(server.mls.take_key_package(device_id).unwrap().is_some());
+        assert_eq!(server.mls.key_package_count(device_id), 1);
         assert!(matches!(
             read_until(&mut linking_peer, |control| matches!(
                 control,
@@ -8392,6 +9424,7 @@ mod tests {
                 0,
             )
             .unwrap();
+        // Retry redemption is cache-only and completes inline.
         assert!(matches!(
             read_until(&mut retry_peer, |control| matches!(
                 control,
