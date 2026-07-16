@@ -29,6 +29,41 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const UDP_DRAIN_BUDGET: usize = 64;
 const ACTIVITY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
+#[cfg(target_os = "linux")]
+fn request_realtime_priority() -> io::Result<()> {
+    let mut policy = 0;
+    let mut parameters = libc::sched_param { sched_priority: 0 };
+
+    // SAFETY: Both pointers refer to initialized, writable values for the
+    // duration of the call, and pthread_self() identifies the calling thread.
+    let result = unsafe {
+        libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut parameters)
+    };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    if policy != libc::SCHED_OTHER {
+        return Ok(());
+    }
+
+    parameters.sched_priority = 1;
+    // SAFETY: parameters is valid for the duration of the call and applies to
+    // the calling thread. Linux reports permission failures in `result`.
+    let result = unsafe {
+        libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &parameters)
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn request_realtime_priority() -> io::Result<()> {
+    Ok(())
+}
+
 /// A waker-backed, allocation-reusing event submission queue.
 ///
 /// Producers hold the mutex only long enough to append. The receiving event
@@ -190,6 +225,13 @@ impl VoiceRelayHandle {
         let thread = thread::Builder::new()
             .name("chatt-voice-relay".to_string())
             .spawn(move || {
+                if let Err(_error) = request_realtime_priority() {
+                    kvlog::debug!(
+                        "voice relay realtime priority unavailable",
+                        error = %_error,
+                        hint = "grant CAP_SYS_NICE to chatt-server to allow SCHED_FIFO"
+                    );
+                }
                 let mut relay = VoiceRelay::new(
                     poll,
                     udp,
