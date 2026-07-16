@@ -152,7 +152,7 @@ echo "Reset dev server state, user fixtures, client history, and downloads"
 info = "Reset all generated server and client development data"
 
 [test.cargo]
-cmd = ["cargo", "nextest", "run", "--workspace", {var = "args"}]
+cmd = ["cargo", "nextest", "run", "--workspace", { var = "args" }]
 cli.forward_arguments = true
 env.CARGO_TERM_COLOR = "never"
 
@@ -190,4 +190,32 @@ echo "Profile output to $PROFILE_OUTPUT for: benchmark profile $*"
 env.DEBUGINFOD_URLS = "https://debuginfod.archlinux.org"
 env.SAMPLY_USE_DEBUGINFOD = "1"
 cli.forward_arguments = true
+allow_multiple = true
+
+
+[action.bench-e2e]
+pwd = "crates/benchmark"
+sh = '''
+set -e
+echo "> cargo build --release -p benchmark"
+BENCH=$(cargo +nightly test -p chatt --features nightly-test-spans --release --lib --config "target.'cfg(unix)'.runner = 'echo'" run -q)
+perf stat -r 3 $BENCH mls_e2e_test::mls_live_linked_device_pairwise_matrix --ignored --exact >> /tmp/profile-e2e-output.log
+'''
+cli.forward_arguments = true
+allow_multiple = true
+
+[action.profile-e2e]
+pwd = "crates/benchmark"
+sh = '''
+set -e
+echo "> cargo build --release -p benchmark"
+BENCH=$(cargo +nightly test -p chatt --features nightly-test-spans --release --lib --config "target.'cfg(unix)'.runner = 'echo'" run -q)
+ROUTE=${1:-profile}
+PROFILE_ROUTE=$(printf '%s' "$ROUTE" | sed 's#[^A-Za-z0-9_.-]#-#g')
+PROFILE_OUTPUT="/tmp/profile-e2e.json"
+samply record -r 5000 --presymbolicate --save-only --output "$PROFILE_OUTPUT" $BENCH mls_e2e_test::mls_live_linked_device_pairwise_matrix --ignored --exact || exit 1
+echo "Profile output to $PROFILE_OUTPUT for: benchmark profile test e2e matrix"
+'''
+env.DEBUGINFOD_URLS = "https://debuginfod.archlinux.org"
+env.SAMPLY_USE_DEBUGINFOD = "1"
 allow_multiple = true

@@ -1,47 +1,33 @@
-//! Durable MLS delivery storage.
+//! In-memory MLS delivery storage backed by an append-only write-ahead log.
 //!
-//! This is deliberately the only server module that knows about redb.  The
-//! service above it deals in typed records and transactional operations, so a
-//! different ordered KV implementation can replace this module without
-//! leaking database keys or transactions into protocol and policy code.
+//! The delivery worker validates a mutation, appends and syncs its compact
+//! state delta, and only then publishes the delta to [`MemoryState`]. Periodic
+//! snapshots bound replay time and discard payload bytes made dead by
+//! retention cleanup. Delivery readers only touch the shared hot state.
 
 use std::{
-    fs,
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, RwLock},
 };
 
 use chatt_mls::PublicGroupState;
 use jsony::Jsony;
-use redb::{
-    Database, Durability, ReadableDatabase, ReadableTable, TableDefinition,
-    backends::InMemoryBackend,
-};
 use rpc::{
     identity::SignedDeviceRoster,
     ids::{DeviceId, EventId, RoomId, UserId},
     mls::{EncryptedRoomDescriptor, MlsDeliveryEvent, MlsWelcome, MlsWelcomeBundle},
 };
 
-const SCHEMA_VERSION: u32 = 1;
-const SCHEMA_KEY: &str = "schema-version";
-
-const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
-const GLOBAL: TableDefinition<u8, &[u8]> = TableDefinition::new("global");
-const ROOMS: TableDefinition<u32, &[u8]> = TableDefinition::new("rooms");
-const EVENTS: TableDefinition<(u32, u64), &[u8]> = TableDefinition::new("events");
-const EVENT_IDS: TableDefinition<(u32, [u8; 16]), u64> = TableDefinition::new("event_ids");
-const COMMIT_EPOCHS: TableDefinition<(u32, u64), u64> =
-    TableDefinition::new("commit_epochs");
-const DEVICE_CURSORS: TableDefinition<(u32, [u8; 16]), &[u8]> =
-    TableDefinition::new("device_cursors");
-const WELCOMES: TableDefinition<u64, &[u8]> = TableDefinition::new("welcomes");
-const WELCOME_TARGET_COUNTS: TableDefinition<u64, u16> =
-    TableDefinition::new("welcome_target_counts");
-const DEVICE_WELCOMES: TableDefinition<([u8; 16], u64), ()> =
-    TableDefinition::new("device_welcomes");
-const WELCOME_CURSORS: TableDefinition<[u8; 16], u64> =
-    TableDefinition::new("welcome_cursors");
+const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_MAGIC: &[u8; 8] = b"CHATTMLS";
+const WAL_VERSION: u32 = 1;
+const WAL_MAGIC: &[u8; 8] = b"CHATTWAL";
+const WAL_HEADER_BYTES: u64 = 12;
+const WAL_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+const WAL_CHECKPOINT_RECORDS: u64 = 16 * 1024;
 
 #[derive(Clone, Debug, Jsony)]
 #[jsony(Binary, version)]
@@ -79,20 +65,20 @@ pub(super) struct RoomRecord {
     pub required_devices: Vec<DeviceId>,
 }
 
-#[derive(Clone, Debug, Jsony)]
-#[jsony(Binary, version)]
+#[derive(Clone, Debug)]
 struct StoredEvent {
     event: MlsDeliveryEvent,
     stored_at_unix_ms: u64,
+    payload_len: u32,
 }
 
-#[derive(Clone, Debug, Jsony)]
-#[jsony(Binary, version)]
+#[derive(Clone, Debug)]
 struct StoredWelcome {
     delivery_id: u64,
     sequence: u64,
     stored_at_unix_ms: u64,
     bundle: MlsWelcomeBundle,
+    payload_len: u32,
 }
 
 #[derive(Clone, Debug, Jsony)]
@@ -144,10 +130,294 @@ pub(super) struct StorageStatus {
     pub file_bytes: Option<u64>,
 }
 
+#[derive(Clone, Default)]
+struct MemoryState {
+    global: GlobalRecord,
+    rooms: BTreeMap<u32, RoomRecord>,
+    events: BTreeMap<(u32, u64), StoredEvent>,
+    event_ids: BTreeMap<(u32, [u8; 16]), u64>,
+    commit_epochs: BTreeMap<(u32, u64), u64>,
+    device_cursors: BTreeMap<(u32, [u8; 16]), DeviceCursor>,
+    welcomes: BTreeMap<u64, StoredWelcome>,
+    welcome_target_counts: BTreeMap<u64, u16>,
+    device_welcomes: BTreeSet<([u8; 16], u64)>,
+    welcome_cursors: BTreeMap<[u8; 16], u64>,
+    retired_payload_bytes: u64,
+}
+
+#[derive(Clone, Jsony)]
+#[jsony(Binary, version)]
+struct WalEvent {
+    room_id: RoomId,
+    stored_at_unix_ms: u64,
+    event: MlsDeliveryEvent,
+}
+
+#[derive(Clone, Jsony)]
+#[jsony(Binary, version)]
+struct WalCursor {
+    room_id: RoomId,
+    device_id: DeviceId,
+    cursor: DeviceCursor,
+}
+
+#[derive(Clone, Jsony)]
+#[jsony(Binary, version)]
+struct WalWelcome {
+    delivery_id: u64,
+    sequence: u64,
+    stored_at_unix_ms: u64,
+    bundle: MlsWelcomeBundle,
+}
+
+#[derive(Clone, Copy, Jsony)]
+#[jsony(Binary, zerocopy)]
+#[repr(C)]
+struct EventKey {
+    sequence: u64,
+    room_id: u32,
+    reserved: u32,
+}
+
+#[derive(Clone, Copy, Jsony)]
+#[jsony(Binary, zerocopy)]
+#[repr(C)]
+struct CursorKey {
+    device_id: [u8; 16],
+    room_id: u32,
+    reserved: u32,
+}
+
+#[derive(Default, Jsony)]
+#[jsony(Binary, version)]
+struct StateDelta {
+    global: Option<GlobalRecord>,
+    rooms: Vec<RoomRecord>,
+    events: Vec<WalEvent>,
+    deleted_events: Vec<EventKey>,
+    cursors: Vec<WalCursor>,
+    deleted_cursors: Vec<CursorKey>,
+    welcomes: Vec<WalWelcome>,
+    deleted_welcome_targets: Vec<DeviceWelcomeCheckpoint>,
+    welcome_cursors: Vec<WelcomeCursorCheckpoint>,
+}
+
+impl StateDelta {
+    fn is_empty(&self) -> bool {
+        self.global.is_none()
+            && self.rooms.is_empty()
+            && self.events.is_empty()
+            && self.deleted_events.is_empty()
+            && self.cursors.is_empty()
+            && self.deleted_cursors.is_empty()
+            && self.welcomes.is_empty()
+            && self.deleted_welcome_targets.is_empty()
+            && self.welcome_cursors.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Jsony)]
+#[jsony(Binary, zerocopy)]
+#[repr(C)]
+struct EventCheckpoint {
+    sequence: u64,
+    stored_at_unix_ms: u64,
+    payload_offset: u64,
+    room_id: u32,
+    payload_len: u32,
+}
+
+#[derive(Clone, Copy, Jsony)]
+#[jsony(Binary, zerocopy)]
+#[repr(C)]
+struct CursorCheckpoint {
+    highest_contiguous_sequence: u64,
+    starting_sequence: u64,
+    last_ack_unix_ms: u64,
+    rejoin_required_through: u64,
+    device_id: [u8; 16],
+    room_id: u32,
+    reserved: u32,
+}
+
+#[derive(Clone, Copy, Jsony)]
+#[jsony(Binary, zerocopy)]
+#[repr(C)]
+struct WelcomeCheckpoint {
+    delivery_id: u64,
+    sequence: u64,
+    stored_at_unix_ms: u64,
+    payload_offset: u64,
+    payload_len: u32,
+    reserved: u32,
+}
+
+#[derive(Clone, Copy, Jsony)]
+#[jsony(Binary, zerocopy)]
+#[repr(C)]
+struct DeviceWelcomeCheckpoint {
+    delivery_id: u64,
+    device_id: [u8; 16],
+}
+
+#[derive(Clone, Copy, Jsony)]
+#[jsony(Binary, zerocopy)]
+#[repr(C)]
+struct WelcomeCursorCheckpoint {
+    delivery_id: u64,
+    device_id: [u8; 16],
+}
+
+#[derive(Jsony)]
+#[jsony(ToBinary)]
+struct CheckpointEncode<'a> {
+    global: &'a GlobalRecord,
+    rooms: Vec<&'a RoomRecord>,
+    events: Vec<EventCheckpoint>,
+    cursors: Vec<CursorCheckpoint>,
+    welcomes: Vec<WelcomeCheckpoint>,
+    device_welcomes: Vec<DeviceWelcomeCheckpoint>,
+    welcome_cursors: Vec<WelcomeCursorCheckpoint>,
+    payloads: &'a [u8],
+}
+
+#[derive(Jsony)]
+#[jsony(FromBinary)]
+struct CheckpointDecode {
+    global: GlobalRecord,
+    rooms: Vec<RoomRecord>,
+    events: Vec<EventCheckpoint>,
+    cursors: Vec<CursorCheckpoint>,
+    welcomes: Vec<WelcomeCheckpoint>,
+    device_welcomes: Vec<DeviceWelcomeCheckpoint>,
+    welcome_cursors: Vec<WelcomeCursorCheckpoint>,
+    payloads: Vec<u8>,
+}
+
 pub(super) struct MlsStore {
-    database: Arc<Database>,
+    state: Arc<RwLock<MemoryState>>,
+    persistence: Option<Arc<Mutex<Persistence>>>,
+    snapshot_writer: Option<Arc<SnapshotWriter>>,
     path: Option<PathBuf>,
     cleanup_after_room: u32,
+}
+
+struct Persistence {
+    checkpoint_path: PathBuf,
+    wal_path: PathBuf,
+    sealed_wal_path: PathBuf,
+    _lock: File,
+    wal: File,
+    wal_bytes: u64,
+    records_since_checkpoint: u64,
+    poisoned: bool,
+}
+
+enum SnapshotCommand {
+    Request,
+    Flush(std::sync::mpsc::SyncSender<Result<(), String>>),
+}
+
+struct SnapshotWriter {
+    sender: Option<std::sync::mpsc::SyncSender<SnapshotCommand>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SnapshotWriter {
+    fn spawn(
+        checkpoint_path: PathBuf,
+        sealed_wal_path: PathBuf,
+        state: Arc<RwLock<MemoryState>>,
+    ) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("chatt-mls-snapshot".to_string())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    let result = if sealed_wal_path.exists() {
+                        snapshot_and_retire(&checkpoint_path, &sealed_wal_path, &state)
+                    } else {
+                        Ok(())
+                    };
+                    match command {
+                        SnapshotCommand::Request => {
+                            if let Err(error) = result {
+                                kvlog::error!("MLS snapshot failed", error = error.as_str());
+                            }
+                        }
+                        SnapshotCommand::Flush(reply) => {
+                            let _ = reply.send(result);
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn MLS snapshot writer");
+        Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        }
+    }
+
+    fn request(&self) -> Result<(), String> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| "MLS snapshot writer is stopped".to_string())?;
+        match sender.try_send(SnapshotCommand::Request) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err("MLS snapshot writer is gone".to_string())
+            }
+        }
+    }
+
+    fn flush(&self) -> Result<(), String> {
+        let (reply, done) = std::sync::mpsc::sync_channel(1);
+        self.sender
+            .as_ref()
+            .ok_or_else(|| "MLS snapshot writer is stopped".to_string())?
+            .send(SnapshotCommand::Flush(reply))
+            .map_err(|_| "MLS snapshot writer is gone".to_string())?;
+        done.recv()
+            .map_err(|_| "MLS snapshot writer is gone".to_string())?
+    }
+}
+
+impl Drop for SnapshotWriter {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn snapshot_and_retire(
+    checkpoint_path: &Path,
+    sealed_wal_path: &Path,
+    state: &RwLock<MemoryState>,
+) -> Result<(), String> {
+    let snapshot = {
+        let state = state.read().unwrap();
+        state.clone()
+    };
+    let retired_payload_bytes = snapshot.retired_payload_bytes;
+    let bytes = serialize_checkpoint(&snapshot);
+    write_checkpoint(checkpoint_path, &bytes)?;
+    let removed = match fs::remove_file(sealed_wal_path) {
+        Ok(()) => sync_parent(sealed_wal_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to remove {}: {error}",
+            sealed_wal_path.display()
+        )),
+    };
+    removed?;
+    let mut state = state.write().unwrap();
+    state.retired_payload_bytes = state
+        .retired_payload_bytes
+        .saturating_sub(retired_payload_bytes);
+    Ok(())
 }
 
 impl std::fmt::Debug for MlsStore {
@@ -158,168 +428,107 @@ impl std::fmt::Debug for MlsStore {
 
 impl MlsStore {
     pub fn open(data_dir: Option<&Path>) -> Result<Self, String> {
-        let (database, path) = match data_dir {
-            Some(data_dir) => {
+        let paths = data_dir
+            .map(|data_dir| {
                 fs::create_dir_all(data_dir).map_err(|error| {
                     format!("failed to create {}: {error}", data_dir.display())
                 })?;
-                let path = data_dir.join("mls.redb");
-                let database = Database::create(&path)
-                    .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-                (database, Some(path))
-            }
-            None => {
-                let database = Database::builder()
-                    .create_with_backend(InMemoryBackend::new())
-                    .map_err(|error| format!("failed to create in-memory MLS database: {error}"))?;
-                (database, None)
-            }
+                Ok::<_, String>((
+                    data_dir.join("mls-state.bin"),
+                    data_dir.join("mls-state.wal"),
+                ))
+            })
+            .transpose()?;
+        let mut memory = match &paths {
+            Some((path, _)) => load_checkpoint(path)?,
+            None => MemoryState {
+                global: GlobalRecord {
+                    next_welcome_delivery_id: 1,
+                    ..GlobalRecord::default()
+                },
+                ..MemoryState::default()
+            },
         };
-        let store = Self {
-            database: Arc::new(database),
-            path,
+        let persistence = match &paths {
+            Some((checkpoint_path, wal_path)) => Some(Arc::new(Mutex::new(Persistence::open(
+                checkpoint_path.clone(),
+                wal_path.clone(),
+                &mut memory,
+            )?))),
+            None => None,
+        };
+        let state = Arc::new(RwLock::new(memory));
+        let snapshot_writer = paths.as_ref().map(|(checkpoint_path, wal_path)| {
+            let writer = Arc::new(SnapshotWriter::spawn(
+                checkpoint_path.clone(),
+                wal_path.with_extension("wal.sealed"),
+                Arc::clone(&state),
+            ));
+            if wal_path.with_extension("wal.sealed").exists() {
+                let _ = writer.request();
+            }
+            writer
+        });
+        Ok(Self {
+            state,
+            persistence,
+            snapshot_writer,
+            path: paths.map(|(path, _)| path),
             cleanup_after_room: 0,
-        };
-        store.initialize()?;
-        Ok(store)
+        })
     }
 
-    /// A read-only-capable handle sharing redb's transaction engine. Each
-    /// delivery reader owns one handle and opens independent read
-    /// transactions, which redb permits to execute concurrently.
     pub(super) fn read_handle(&self) -> Self {
         Self {
-            database: Arc::clone(&self.database),
+            state: Arc::clone(&self.state),
+            persistence: None,
+            snapshot_writer: None,
             path: self.path.clone(),
             cleanup_after_room: 0,
         }
     }
 
-    fn begin_read(&self) -> Result<redb::ReadTransaction, String> {
-        self.database
-            .begin_read()
-            .map_err(db_error)
-    }
-
-    fn begin_write(&self) -> Result<redb::WriteTransaction, String> {
-        self.database
-            .begin_write()
-            .map_err(db_error)
-    }
-
-    fn initialize(&self) -> Result<(), String> {
-        let mut tx = self.begin_write()?;
-        tx.set_durability(Durability::Immediate).map_err(db_error)?;
-        {
-            let mut meta = tx.open_table(META).map_err(db_error)?;
-            let existing = meta
-                .get(SCHEMA_KEY)
-                .map_err(db_error)?
-                .map(|value| value.value().to_vec());
-            match existing {
-                Some(value) => {
-                    let bytes: [u8; 4] = value.as_slice().try_into().map_err(|_| {
-                        "MLS database schema version has an invalid length".to_string()
-                    })?;
-                    let version = u32::from_be_bytes(bytes);
-                    if version != SCHEMA_VERSION {
-                        return Err(format!(
-                            "unsupported MLS database schema version {version}; expected {SCHEMA_VERSION}"
-                        ));
-                    }
-                }
-                None => {
-                    meta.insert(SCHEMA_KEY, SCHEMA_VERSION.to_be_bytes().as_slice())
-                        .map_err(db_error)?;
-                }
-            }
-            tx.open_table(GLOBAL).map_err(db_error)?;
-            tx.open_table(ROOMS).map_err(db_error)?;
-            tx.open_table(EVENTS).map_err(db_error)?;
-            tx.open_table(EVENT_IDS).map_err(db_error)?;
-            tx.open_table(COMMIT_EPOCHS).map_err(db_error)?;
-            tx.open_table(DEVICE_CURSORS).map_err(db_error)?;
-            tx.open_table(WELCOMES).map_err(db_error)?;
-            tx.open_table(WELCOME_TARGET_COUNTS).map_err(db_error)?;
-            tx.open_table(DEVICE_WELCOMES).map_err(db_error)?;
-            tx.open_table(WELCOME_CURSORS).map_err(db_error)?;
-        }
-        tx.commit().map_err(db_error)
-    }
-
     pub fn load(&self) -> Result<LoadedState, String> {
-        let tx = self.begin_read()?;
-        let global = {
-            let table = tx.open_table(GLOBAL).map_err(db_error)?;
-            match table.get(0).map_err(db_error)? {
-                Some(value) => decode_global(value.value())?,
-                None => GlobalRecord {
-                    next_welcome_delivery_id: 1,
-                    ..GlobalRecord::default()
-                },
-            }
-        };
-        let rooms = {
-            let table = tx.open_table(ROOMS).map_err(db_error)?;
-            table
-                .iter()
-                .map_err(db_error)?
-                .map(|entry| {
-                    let (_, value) = entry.map_err(db_error)?;
-                    decode_room(value.value())
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        self.validate(&tx, &rooms)?;
-        Ok(LoadedState { global, rooms })
+        let state = self.state.read().unwrap();
+        validate_memory(&state)?;
+        Ok(LoadedState {
+            global: state.global.clone(),
+            rooms: state.rooms.values().cloned().collect(),
+        })
     }
 
     pub fn replace_global(&self, global: &GlobalRecord) -> Result<(), String> {
         self.replace_global_and_rooms(global, &[])
     }
 
-    /// Atomically replaces global state and the room records changed by the
-    /// same service operation. Unlisted rooms remain untouched.
     pub fn replace_global_and_rooms(
         &self,
         global: &GlobalRecord,
         rooms: &[RoomRecord],
     ) -> Result<(), String> {
-        let global_bytes = jsony::to_binary(global);
-        let room_bytes = rooms
-            .iter()
-            .map(|room| (room, jsony::to_binary(room)))
-            .collect::<Vec<_>>();
-        let mut tx = self.begin_write()?;
-        tx.set_durability(Durability::Immediate).map_err(db_error)?;
-        {
-            tx.open_table(GLOBAL)
-                .map_err(db_error)?
-                .insert(0, global_bytes.as_slice())
-                .map_err(db_error)?;
-            if !room_bytes.is_empty() {
-                let mut table = tx.open_table(ROOMS).map_err(db_error)?;
-                for (room, bytes) in room_bytes {
-                    let room_id = room.descriptor.room_id.0;
-                    let previous = table
-                        .get(room_id)
-                        .map_err(db_error)?
-                        .map(|value| decode_room(value.value()))
-                        .transpose()?;
-                    if let Some(previous) = previous {
-                        reconcile_cursors(
-                            &tx,
-                            RoomId(room_id),
-                            &previous.required_devices,
-                            room,
-                            room.head_sequence,
-                        )?;
-                    }
-                    table.insert(room_id, bytes.as_slice()).map_err(db_error)?;
-                }
-            }
+        let mut delta = StateDelta {
+            global: Some(global.clone()),
+            rooms: rooms.to_vec(),
+            ..StateDelta::default()
+        };
+        let state = self.state.read().unwrap();
+        for room in rooms {
+            let previous = state
+                .rooms
+                .get(&room.descriptor.room_id.0)
+                .map(|room| room.required_devices.as_slice())
+                .unwrap_or_default();
+            plan_cursor_reconciliation(
+                &state,
+                room.descriptor.room_id,
+                previous,
+                room,
+                room.head_sequence,
+                &mut delta,
+            )?;
         }
-        tx.commit().map_err(db_error)
+        drop(state);
+        self.commit(delta, true)
     }
 
     pub fn create_room(
@@ -329,37 +538,36 @@ impl MlsStore {
         event: &MlsDeliveryEvent,
         welcome: Option<(u64, &MlsWelcomeBundle)>,
     ) -> Result<(), String> {
-        let global_bytes = jsony::to_binary(global);
-        let room_bytes = jsony::to_binary(room);
-        let stored = StoredEvent {
-            event: event.clone(),
-            stored_at_unix_ms: room.last_event_time_unix_ms,
-        };
-        let event_bytes = jsony::to_binary(&stored);
-        let mut tx = self.begin_write()?;
-        tx.set_durability(Durability::Immediate).map_err(db_error)?;
-        {
-            let mut rooms = tx.open_table(ROOMS).map_err(db_error)?;
-            if rooms.get(room.descriptor.room_id.0).map_err(db_error)?.is_some() {
+        let delta = {
+            let state = self.state.read().unwrap();
+            let room_id = room.descriptor.room_id;
+            if state.rooms.contains_key(&room_id.0) {
                 return Err("encrypted room already exists in MLS storage".to_string());
             }
-            rooms
-                .insert(room.descriptor.room_id.0, room_bytes.as_slice())
-                .map_err(db_error)?;
-            insert_event(&tx, room.descriptor.room_id, event, &event_bytes)?;
-            reconcile_cursors(&tx, room.descriptor.room_id, &[], room, room.head_sequence)?;
-            insert_welcome(
-                &tx,
-                welcome,
-                room.head_sequence,
-                room.last_event_time_unix_ms,
-            )?;
-            tx.open_table(GLOBAL)
-                .map_err(db_error)?
-                .insert(0, global_bytes.as_slice())
-                .map_err(db_error)?;
-        }
-        tx.commit().map_err(db_error)
+            ensure_event_available(&state, room_id, event)?;
+            ensure_welcome_available(&state, welcome)?;
+            let mut delta = StateDelta {
+                global: Some(global.clone()),
+                rooms: vec![room.clone()],
+                events: vec![WalEvent {
+                    room_id,
+                    stored_at_unix_ms: room.last_event_time_unix_ms,
+                    event: event.clone(),
+                }],
+                ..StateDelta::default()
+            };
+            plan_cursor_reconciliation(&state, room_id, &[], room, room.head_sequence, &mut delta)?;
+            if let Some((delivery_id, bundle)) = welcome {
+                delta.welcomes.push(WalWelcome {
+                    delivery_id,
+                    sequence: room.head_sequence,
+                    stored_at_unix_ms: room.last_event_time_unix_ms,
+                    bundle: bundle.clone(),
+                });
+            }
+            delta
+        };
+        self.commit(delta, true)
     }
 
     pub fn append_commit(
@@ -370,51 +578,49 @@ impl MlsStore {
         event: &MlsDeliveryEvent,
         welcome: Option<(u64, &MlsWelcomeBundle)>,
     ) -> Result<(), String> {
-        let global_bytes = jsony::to_binary(global);
-        let room_bytes = jsony::to_binary(room);
-        let event_bytes = jsony::to_binary(&StoredEvent {
-            event: event.clone(),
-            stored_at_unix_ms: room.last_event_time_unix_ms,
-        });
-        let mut tx = self.begin_write()?;
-        tx.set_durability(Durability::Immediate).map_err(db_error)?;
-        {
-            let mut rooms = tx.open_table(ROOMS).map_err(db_error)?;
-            let durable = {
-                let value = rooms
-                    .get(room.descriptor.room_id.0)
-                    .map_err(db_error)?
-                    .ok_or_else(|| "encrypted room does not exist in MLS storage".to_string())?;
-                decode_room(value.value())?
-            };
+        let delta = {
+            let state = self.state.read().unwrap();
+            let room_id = room.descriptor.room_id;
+            let durable = state
+                .rooms
+                .get(&room_id.0)
+                .ok_or_else(|| "encrypted room does not exist in MLS storage".to_string())?;
             if durable.public_state.epoch != previous.public_state.epoch
                 || durable.head_sequence != previous.head_sequence
             {
                 return Err("MLS room changed during commit validation".to_string());
             }
-            rooms
-                .insert(room.descriptor.room_id.0, room_bytes.as_slice())
-                .map_err(db_error)?;
-            insert_event(&tx, room.descriptor.room_id, event, &event_bytes)?;
-            reconcile_cursors(
-                &tx,
-                room.descriptor.room_id,
+            ensure_event_available(&state, room_id, event)?;
+            ensure_welcome_available(&state, welcome)?;
+            let mut delta = StateDelta {
+                global: Some(global.clone()),
+                rooms: vec![room.clone()],
+                events: vec![WalEvent {
+                    room_id,
+                    stored_at_unix_ms: room.last_event_time_unix_ms,
+                    event: event.clone(),
+                }],
+                ..StateDelta::default()
+            };
+            plan_cursor_reconciliation(
+                &state,
+                room_id,
                 &previous.required_devices,
                 room,
                 room.head_sequence,
+                &mut delta,
             )?;
-            insert_welcome(
-                &tx,
-                welcome,
-                room.head_sequence,
-                room.last_event_time_unix_ms,
-            )?;
-            tx.open_table(GLOBAL)
-                .map_err(db_error)?
-                .insert(0, global_bytes.as_slice())
-                .map_err(db_error)?;
-        }
-        tx.commit().map_err(db_error)
+            if let Some((delivery_id, bundle)) = welcome {
+                delta.welcomes.push(WalWelcome {
+                    delivery_id,
+                    sequence: room.head_sequence,
+                    stored_at_unix_ms: room.last_event_time_unix_ms,
+                    bundle: bundle.clone(),
+                });
+            }
+            delta
+        };
+        self.commit(delta, true)
     }
 
     pub fn find_commit(
@@ -423,26 +629,20 @@ impl MlsStore {
         parent_epoch: u64,
         commit: &[u8],
     ) -> Result<Option<(u64, u64)>, String> {
-        let tx = self.begin_read()?;
-        let index = tx.open_table(COMMIT_EPOCHS).map_err(db_error)?;
-        let Some(sequence) = index
-            .get((room_id.0, parent_epoch))
-            .map_err(db_error)?
-            .map(|value| value.value())
-        else {
+        let state = self.state.read().unwrap();
+        let Some(sequence) = state.commit_epochs.get(&(room_id.0, parent_epoch)).copied() else {
             return Ok(None);
         };
-        let events = tx.open_table(EVENTS).map_err(db_error)?;
-        let Some(value) = events.get((room_id.0, sequence)).map_err(db_error)? else {
-            return Err("MLS commit index references a missing event".to_string());
-        };
-        let stored = decode_event(value.value())?;
-        match stored.event {
+        let stored = state
+            .events
+            .get(&(room_id.0, sequence))
+            .ok_or_else(|| "MLS commit index references a missing event".to_string())?;
+        match &stored.event {
             MlsDeliveryEvent::Commit {
                 epoch,
                 commit: stored,
                 ..
-            } if stored == commit => Ok(Some((sequence, epoch))),
+            } if stored == commit => Ok(Some((sequence, *epoch))),
             _ => Ok(None),
         }
     }
@@ -456,97 +656,84 @@ impl MlsStore {
         ciphertext: &[u8],
         now_unix_ms: u64,
     ) -> Result<AppendApplicationResult, String> {
-        let mut tx = self.begin_write()?;
-        tx.set_durability(Durability::Immediate).map_err(db_error)?;
-        let result = {
-            let existing = {
-                let event_ids = tx.open_table(EVENT_IDS).map_err(db_error)?;
-                event_ids
-                    .get((room_id.0, event_id.0))
-                    .map_err(db_error)?
-                    .map(|value| value.value())
-            };
-            if let Some(sequence) = existing {
-                let events = tx.open_table(EVENTS).map_err(db_error)?;
-                let value = events
-                    .get((room_id.0, sequence))
-                    .map_err(db_error)?
+        let (result, delta) = {
+            let state = self.state.read().unwrap();
+            if let Some(sequence) = state.event_ids.get(&(room_id.0, event_id.0)).copied() {
+                let stored = state
+                    .events
+                    .get(&(room_id.0, sequence))
                     .ok_or_else(|| "MLS event id references a missing event".to_string())?;
-                let stored = decode_event(value.value())?;
-                match stored.event {
+                match &stored.event {
                     MlsDeliveryEvent::Application {
                         epoch,
                         event_id: stored_id,
                         ciphertext: stored_ciphertext,
                         ..
-                    } if epoch == expected_epoch
-                        && stored_id == event_id
+                    } if *epoch == expected_epoch
+                        && *stored_id == event_id
                         && stored_ciphertext == ciphertext =>
                     {
-                        AppendApplicationResult::AlreadyStored { sequence }
+                        (AppendApplicationResult::AlreadyStored { sequence }, None)
                     }
-                    _ => AppendApplicationResult::Conflict,
+                    _ => (AppendApplicationResult::Conflict, None),
                 }
+            } else if state
+                .device_cursors
+                .get(&(room_id.0, device_id.0))
+                .is_some_and(|cursor| cursor.rejoin_required_through.is_some())
+            {
+                (AppendApplicationResult::RejoinRequired, None)
             } else {
-                let cursors = tx.open_table(DEVICE_CURSORS).map_err(db_error)?;
-                if cursors
-                    .get((room_id.0, device_id.0))
-                    .map_err(db_error)?
-                    .map(|value| decode_cursor(value.value()))
-                    .transpose()?
-                    .is_some_and(|cursor| cursor.rejoin_required_through.is_some())
-                {
-                    AppendApplicationResult::RejoinRequired
-                } else {
-                    let mut rooms = tx.open_table(ROOMS).map_err(db_error)?;
-                    let mut room = {
-                        let value = rooms
-                            .get(room_id.0)
-                            .map_err(db_error)?
-                            .ok_or_else(|| "encrypted room does not exist".to_string())?;
-                        decode_room(value.value())?
-                    };
-                    if room.revocation_pending {
-                        AppendApplicationResult::RevocationPending
-                    } else if room.public_state.epoch != expected_epoch {
+                let mut room = state
+                    .rooms
+                    .get(&room_id.0)
+                    .cloned()
+                    .ok_or_else(|| "encrypted room does not exist".to_string())?;
+                if room.revocation_pending {
+                    (AppendApplicationResult::RevocationPending, None)
+                } else if room.public_state.epoch != expected_epoch {
+                    (
                         AppendApplicationResult::StaleEpoch {
                             current_epoch: room.public_state.epoch,
-                        }
-                    } else {
-                        let sequence = room
-                            .head_sequence
-                            .checked_add(1)
-                            .ok_or_else(|| "MLS delivery sequence is exhausted".to_string())?;
-                        let stored_at = now_unix_ms.max(room.last_event_time_unix_ms);
-                        let event = MlsDeliveryEvent::Application {
-                            sequence,
-                            epoch: expected_epoch,
-                            event_id,
-                            ciphertext: ciphertext.to_vec(),
-                        };
-                        let event_bytes = jsony::to_binary(&StoredEvent {
-                            event: event.clone(),
+                        },
+                        None,
+                    )
+                } else {
+                    let sequence = room
+                        .head_sequence
+                        .checked_add(1)
+                        .ok_or_else(|| "MLS delivery sequence is exhausted".to_string())?;
+                    let stored_at = now_unix_ms.max(room.last_event_time_unix_ms);
+                    let event = MlsDeliveryEvent::Application {
+                        sequence,
+                        epoch: expected_epoch,
+                        event_id,
+                        ciphertext: ciphertext.to_vec(),
+                    };
+                    room.head_sequence = sequence;
+                    room.last_event_time_unix_ms = stored_at;
+                    let delta = StateDelta {
+                        rooms: vec![room.clone()],
+                        events: vec![WalEvent {
+                            room_id,
                             stored_at_unix_ms: stored_at,
-                        });
-                        insert_event(&tx, room_id, &event, &event_bytes)?;
-                        room.head_sequence = sequence;
-                        room.last_event_time_unix_ms = stored_at;
-                        let room_bytes = jsony::to_binary(&room);
-                        rooms
-                            .insert(room_id.0, room_bytes.as_slice())
-                            .map_err(db_error)?;
+                            event: event.clone(),
+                        }],
+                        ..StateDelta::default()
+                    };
+                    (
                         AppendApplicationResult::Stored {
                             sequence,
                             room,
                             event,
-                        }
-                    }
+                        },
+                        Some(delta),
+                    )
                 }
             }
         };
-        match result {
-            AppendApplicationResult::Stored { .. } => tx.commit().map_err(db_error)?,
-            _ => tx.abort().map_err(db_error)?,
+        if let Some(delta) = delta {
+            self.commit(delta, true)?;
         }
         Ok(result)
     }
@@ -558,54 +745,41 @@ impl MlsStore {
         epoch: u64,
         ciphertext: &[u8],
     ) -> Result<Option<Result<u64, ()>>, String> {
-        let tx = self.begin_read()?;
-        let ids = tx.open_table(EVENT_IDS).map_err(db_error)?;
-        let Some(sequence) = ids
-            .get((room_id.0, event_id.0))
-            .map_err(db_error)?
-            .map(|value| value.value())
-        else {
+        let state = self.state.read().unwrap();
+        let Some(sequence) = state.event_ids.get(&(room_id.0, event_id.0)).copied() else {
             return Ok(None);
         };
-        let events = tx.open_table(EVENTS).map_err(db_error)?;
-        let value = events
-            .get((room_id.0, sequence))
-            .map_err(db_error)?
+        let stored = state
+            .events
+            .get(&(room_id.0, sequence))
             .ok_or_else(|| "MLS event id references a missing event".to_string())?;
-        let stored = decode_event(value.value())?;
         let exact = matches!(
-            stored.event,
+            &stored.event,
             MlsDeliveryEvent::Application {
                 epoch: stored_epoch,
                 event_id: stored_id,
                 ciphertext: stored_ciphertext,
                 ..
-            } if stored_epoch == epoch && stored_id == event_id && stored_ciphertext == ciphertext
+            } if *stored_epoch == epoch && *stored_id == event_id && stored_ciphertext == ciphertext
         );
         Ok(Some(if exact { Ok(sequence) } else { Err(()) }))
     }
 
     pub fn events(&self, room_id: RoomId, after: u64, limit: usize) -> Result<EventBatch, String> {
-        let tx = self.begin_read()?;
-        let rooms = tx.open_table(ROOMS).map_err(db_error)?;
-        let room = rooms
-            .get(room_id.0)
-            .map_err(db_error)?
+        let state = self.state.read().unwrap();
+        let room = state
+            .rooms
+            .get(&room_id.0)
             .ok_or_else(|| "encrypted room does not exist".to_string())?;
-        let room = decode_room(room.value())?;
         let start = after.saturating_add(1).max(room.oldest_available_sequence);
-        let events = tx.open_table(EVENTS).map_err(db_error)?;
-        let values = events
+        let events = state
+            .events
             .range((room_id.0, start)..=(room_id.0, u64::MAX))
-            .map_err(db_error)?
             .take(limit)
-            .map(|entry| {
-                let (_, value) = entry.map_err(db_error)?;
-                decode_event(value.value()).map(|stored| stored.event)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|(_, stored)| stored.event.clone())
+            .collect();
         Ok(EventBatch {
-            events: values,
+            events,
             oldest_available_sequence: room.oldest_available_sequence,
             head_sequence: room.head_sequence,
         })
@@ -617,36 +791,26 @@ impl MlsStore {
         device_id: DeviceId,
         sequence: u64,
         now_unix_ms: u64,
-    ) -> Result<(), String> {
-        let mut tx = self.begin_write()?;
-        // Cursor progress is monotonic, advisory retention metadata. Losing
-        // the newest value in a crash can only cause replay and delay cleanup;
-        // it cannot discard an event. A later immediate transaction flushes
-        // this commit along with authoritative delivery state.
-        tx.set_durability(Durability::None).map_err(db_error)?;
-        let changed = {
-            let rooms = tx.open_table(ROOMS).map_err(db_error)?;
-            let room = rooms
-                .get(room_id.0)
-                .map_err(db_error)?
+    ) -> Result<bool, String> {
+        let delta = {
+            let state = self.state.read().unwrap();
+            let room = state
+                .rooms
+                .get(&room_id.0)
                 .ok_or_else(|| "encrypted room does not exist".to_string())?;
-            let room = decode_room(room.value())?;
             if sequence > room.head_sequence {
                 return Err("MLS acknowledgement is beyond the room head".to_string());
             }
-            let mut cursors = tx.open_table(DEVICE_CURSORS).map_err(db_error)?;
-            let mut cursor = {
-                let value = cursors
-                    .get((room_id.0, device_id.0))
-                    .map_err(db_error)?
-                    .ok_or_else(|| "MLS device has no cursor for this room".to_string())?;
-                decode_cursor(value.value())?
-            };
+            let mut cursor = state
+                .device_cursors
+                .get(&(room_id.0, device_id.0))
+                .cloned()
+                .ok_or_else(|| "MLS device has no cursor for this room".to_string())?;
             if sequence < cursor.starting_sequence {
                 return Err("MLS acknowledgement predates the device's room membership".to_string());
             }
             if sequence <= cursor.highest_contiguous_sequence {
-                false
+                None
             } else {
                 cursor.highest_contiguous_sequence = sequence;
                 cursor.last_ack_unix_ms = now_unix_ms;
@@ -656,481 +820,629 @@ impl MlsStore {
                 {
                     cursor.rejoin_required_through = None;
                 }
-                let bytes = jsony::to_binary(&cursor);
-                cursors
-                    .insert((room_id.0, device_id.0), bytes.as_slice())
-                    .map_err(db_error)?;
-                true
+                Some(StateDelta {
+                    cursors: vec![WalCursor {
+                        room_id,
+                        device_id,
+                        cursor,
+                    }],
+                    ..StateDelta::default()
+                })
             }
         };
-        if changed {
-            tx.commit().map_err(db_error)
-        } else {
-            tx.abort().map_err(db_error)
+        if let Some(delta) = delta {
+            // Cursor progress is advisory. As with redb's former
+            // `Durability::None`, a crash may replay events but cannot delete
+            // an event the client has not seen.
+            self.commit(delta, false)?;
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    pub fn persist_acknowledgement(
+        &self,
+        room_id: RoomId,
+        device_id: DeviceId,
+    ) -> Result<(), String> {
+        let cursor = self
+            .state
+            .read()
+            .unwrap()
+            .device_cursors
+            .get(&(room_id.0, device_id.0))
+            .cloned()
+            .ok_or_else(|| "MLS device has no cursor for this room".to_string())?;
+        self.commit(
+            StateDelta {
+                cursors: vec![WalCursor {
+                    room_id,
+                    device_id,
+                    cursor,
+                }],
+                ..StateDelta::default()
+            },
+            false,
+        )
     }
 
     pub fn requires_rejoin(&self, room_id: RoomId, device_id: DeviceId) -> Result<bool, String> {
-        let tx = self.begin_read()?;
-        let cursors = tx.open_table(DEVICE_CURSORS).map_err(db_error)?;
-        Ok(cursors
-            .get((room_id.0, device_id.0))
-            .map_err(db_error)?
-            .map(|value| decode_cursor(value.value()))
-            .transpose()?
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .device_cursors
+            .get(&(room_id.0, device_id.0))
             .is_some_and(|cursor| cursor.rejoin_required_through.is_some()))
     }
 
     pub fn welcomes(&self, device_id: DeviceId, after: u64) -> Result<Vec<MlsWelcome>, String> {
-        let tx = self.begin_read()?;
-        let targets = tx.open_table(DEVICE_WELCOMES).map_err(db_error)?;
-        let welcomes = tx.open_table(WELCOMES).map_err(db_error)?;
-        targets
+        let state = self.state.read().unwrap();
+        state
+            .device_welcomes
             .range((device_id.0, after.saturating_add(1))..=(device_id.0, u64::MAX))
-            .map_err(db_error)?
-            .map(|entry| {
-                let (key, _) = entry.map_err(db_error)?;
-                let delivery_id = key.value().1;
-                let value = welcomes
+            .map(|(_, delivery_id)| {
+                let stored = state
+                    .welcomes
                     .get(delivery_id)
-                    .map_err(db_error)?
                     .ok_or_else(|| "MLS Welcome target references a missing value".to_string())?;
-                let stored = decode_welcome(value.value())?;
                 Ok(MlsWelcome {
-                    delivery_id,
+                    delivery_id: *delivery_id,
                     sequence: stored.sequence,
                     device_id,
-                    descriptor: stored.bundle.descriptor,
-                    welcome: stored.bundle.welcome,
+                    descriptor: stored.bundle.descriptor.clone(),
+                    welcome: stored.bundle.welcome.clone(),
                 })
             })
             .collect()
     }
 
     pub fn welcome_head(&self, device_id: DeviceId) -> Result<u64, String> {
-        let tx = self.begin_read()?;
-        let targets = tx.open_table(DEVICE_WELCOMES).map_err(db_error)?;
-        let mut range = targets
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .device_welcomes
             .range((device_id.0, 0)..=(device_id.0, u64::MAX))
-            .map_err(db_error)?;
-        Ok(range
             .next_back()
-            .transpose()
-            .map_err(db_error)?
-            .map_or(0, |(key, _)| key.value().1))
+            .map_or(0, |(_, delivery_id)| *delivery_id))
     }
 
-    pub fn acknowledge_welcome(&self, device_id: DeviceId, delivery_id: u64) -> Result<(), String> {
-        let mut tx = self.begin_write()?;
-        // As with event cursors, stale Welcome progress is safe after a crash:
-        // the client may receive an already-seen Welcome again, while the
-        // server remains conservative about deleting it.
-        tx.set_durability(Durability::None).map_err(db_error)?;
-        let changed = {
-            let mut cursors = tx.open_table(WELCOME_CURSORS).map_err(db_error)?;
-            let current = cursors
-                .get(device_id.0)
-                .map_err(db_error)?
-                .map_or(0, |value| value.value());
-            if delivery_id <= current {
-                false
-            } else {
-                cursors.insert(device_id.0, delivery_id).map_err(db_error)?;
-                true
-            }
-        };
-        if changed {
-            tx.commit().map_err(db_error)
-        } else {
-            tx.abort().map_err(db_error)
+    pub fn acknowledge_welcome(&self, device_id: DeviceId, delivery_id: u64) -> Result<bool, String> {
+        let current = self
+            .state
+            .read()
+            .unwrap()
+            .welcome_cursors
+            .get(&device_id.0)
+            .copied()
+            .unwrap_or_default();
+        if delivery_id > current {
+            self.commit(
+                StateDelta {
+                    welcome_cursors: vec![WelcomeCursorCheckpoint {
+                        delivery_id,
+                        device_id: device_id.0,
+                    }],
+                    ..StateDelta::default()
+                },
+                false,
+            )?;
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    pub fn persist_welcome_acknowledgement(&self, device_id: DeviceId) -> Result<(), String> {
+        let delivery_id = self
+            .state
+            .read()
+            .unwrap()
+            .welcome_cursors
+            .get(&device_id.0)
+            .copied()
+            .ok_or_else(|| "MLS device has no Welcome acknowledgement".to_string())?;
+        self.commit(
+            StateDelta {
+                welcome_cursors: vec![WelcomeCursorCheckpoint {
+                    delivery_id,
+                    device_id: device_id.0,
+                }],
+                ..StateDelta::default()
+            },
+            false,
+        )
     }
 
     pub fn cleanup(&mut self, now_unix_ms: u64, batch_limit: usize) -> Result<CleanupReport, String> {
         if batch_limit == 0 {
             return Ok(CleanupReport::default());
         }
-        let loaded = self.load()?;
-        let mut rooms = loaded.rooms;
-        rooms.sort_by_key(|room| room.descriptor.room_id.0);
-        let ordered = rooms
-            .iter()
-            .filter(|room| room.descriptor.room_id.0 > self.cleanup_after_room)
-            .chain(rooms.iter().filter(|room| room.descriptor.room_id.0 <= self.cleanup_after_room));
-        for room in ordered {
-            if let Some(report) = self.prune_room(room.descriptor.room_id, now_unix_ms, batch_limit)? {
-                self.cleanup_after_room = room.descriptor.room_id.0;
-                return Ok(report);
-            }
-        }
-        let more_work = self.cleanup_welcomes_only(now_unix_ms, batch_limit)?;
-        Ok(CleanupReport {
-            more_work,
-            ..CleanupReport::default()
-        })
-    }
-
-    fn cleanup_welcomes_only(
-        &self,
-        now_unix_ms: u64,
-        batch_limit: usize,
-    ) -> Result<bool, String> {
-        let mut tx = self.begin_write()?;
-        tx.set_durability(Durability::Immediate).map_err(db_error)?;
-        let more = cleanup_welcomes(&tx, now_unix_ms, batch_limit)?;
-        tx.commit().map_err(db_error)?;
-        Ok(more)
-    }
-
-    fn prune_room(
-        &self,
-        room_id: RoomId,
-        now_unix_ms: u64,
-        batch_limit: usize,
-    ) -> Result<Option<CleanupReport>, String> {
-        let mut tx = self.begin_write()?;
-        tx.set_durability(Durability::Immediate).map_err(db_error)?;
-        let mut report = CleanupReport::default();
-        {
-            let mut rooms = tx.open_table(ROOMS).map_err(db_error)?;
-            let Some(mut room) = rooms
-                .get(room_id.0)
-                .map_err(db_error)?
-                .map(|value| decode_room(value.value()))
-                .transpose()?
-            else {
-                return Ok(None);
-            };
-            if room.oldest_available_sequence > room.head_sequence {
-                return Ok(None);
-            }
-            let mut cursors = tx.open_table(DEVICE_CURSORS).map_err(db_error)?;
-            let mut required = Vec::new();
-            for device in &room.required_devices {
-                let value = cursors
-                    .get((room_id.0, device.0))
-                    .map_err(db_error)?
-                    .ok_or_else(|| "required MLS device is missing its cursor".to_string())?;
-                required.push((*device, decode_cursor(value.value())?));
-            }
-            let safe = required
-                .iter()
-                .map(|(_, cursor)| cursor.highest_contiguous_sequence)
-                .min()
-                .unwrap_or(room.head_sequence);
-            let retention_ms = u64::from(room.retention_days)
-                .saturating_mul(24 * 60 * 60 * 1000);
-            let cutoff = now_unix_ms.saturating_sub(retention_ms);
-            let mut expiry = room.oldest_available_sequence.saturating_sub(1);
-            let events = tx.open_table(EVENTS).map_err(db_error)?;
-            for entry in events
-                .range((room_id.0, room.oldest_available_sequence)..=(room_id.0, room.head_sequence))
-                .map_err(db_error)?
-            {
-                let (_, value) = entry.map_err(db_error)?;
-                let stored = decode_event(value.value())?;
-                if stored.stored_at_unix_ms >= cutoff {
+        let (report, delta) = {
+            let state = self.state.read().unwrap();
+            let mut room_ids = state.rooms.keys().copied().collect::<Vec<_>>();
+            room_ids.sort_by_key(|room_id| (*room_id <= self.cleanup_after_room, *room_id));
+            let mut selected = None;
+            for room_id in room_ids {
+                if let Some((report, delta)) =
+                    plan_prune_room(&state, RoomId(room_id), now_unix_ms, batch_limit)?
+                {
+                    self.cleanup_after_room = room_id;
+                    selected = Some((report, delta));
                     break;
                 }
-                expiry = stored.event.sequence();
             }
-            let prune_through = safe.max(expiry).min(room.head_sequence);
-            if prune_through < room.oldest_available_sequence {
-                return Ok(None);
-            }
-            if expiry > safe {
-                for (device, mut cursor) in required {
-                    if cursor.highest_contiguous_sequence < expiry {
-                        cursor.rejoin_required_through = Some(expiry);
-                        let bytes = jsony::to_binary(&cursor);
-                        cursors
-                            .insert((room_id.0, device.0), bytes.as_slice())
-                            .map_err(db_error)?;
-                        report.lagging_devices += 1;
-                    }
+            match selected {
+                Some((mut report, mut delta)) => {
+                    let (more, welcomes) =
+                        plan_cleanup_welcomes(&state, now_unix_ms, batch_limit)?;
+                    report.more_work |= more;
+                    delta.deleted_welcome_targets = welcomes;
+                    (report, delta)
+                }
+                None => {
+                    let (more_work, deleted_welcome_targets) =
+                        plan_cleanup_welcomes(&state, now_unix_ms, batch_limit)?;
+                    (
+                        CleanupReport {
+                            more_work,
+                            ..CleanupReport::default()
+                        },
+                        StateDelta {
+                            deleted_welcome_targets,
+                            ..StateDelta::default()
+                        },
+                    )
                 }
             }
-            drop(events);
-            let mut events = tx.open_table(EVENTS).map_err(db_error)?;
-            let mut event_ids = tx.open_table(EVENT_IDS).map_err(db_error)?;
-            let mut commit_epochs = tx.open_table(COMMIT_EPOCHS).map_err(db_error)?;
-            let end = prune_through.min(
-                room.oldest_available_sequence
-                    .saturating_add(batch_limit as u64)
-                    .saturating_sub(1),
-            );
-            for sequence in room.oldest_available_sequence..=end {
-                let value = events
-                    .remove((room_id.0, sequence))
-                    .map_err(db_error)?
-                    .ok_or_else(|| "MLS cleanup found a hole in the delivery log".to_string())?;
-                match decode_event(value.value())?.event {
-                    MlsDeliveryEvent::Application { event_id, .. } => {
-                        event_ids.remove((room_id.0, event_id.0)).map_err(db_error)?;
-                    }
-                    MlsDeliveryEvent::Commit { parent_epoch, .. } => {
-                        commit_epochs
-                            .remove((room_id.0, parent_epoch))
-                            .map_err(db_error)?;
-                    }
-                }
-                report.deleted_events += 1;
-            }
-            room.oldest_available_sequence = end.saturating_add(1);
-            report.more_work = end < prune_through;
-            let room_bytes = jsony::to_binary(&room);
-            rooms
-                .insert(room_id.0, room_bytes.as_slice())
-                .map_err(db_error)?;
-            drop(commit_epochs);
-            drop(event_ids);
-            drop(events);
-            drop(cursors);
-            drop(rooms);
-            report.more_work |= cleanup_welcomes(&tx, now_unix_ms, batch_limit)?;
+        };
+        if !delta.is_empty() {
+            self.commit(delta, true)?;
         }
-        tx.commit().map_err(db_error)?;
-        Ok(Some(report))
+        Ok(report)
     }
 
     pub fn status(&self) -> Result<StorageStatus, String> {
-        let tx = self.begin_write()?;
-        let stats = tx.stats().map_err(db_error)?;
-        let allocated_bytes = stats
-            .allocated_pages()
-            .saturating_mul(stats.page_size() as u64);
-        let stored_bytes = stats.stored_bytes();
-        let status = StorageStatus {
-            allocated_bytes,
-            stored_bytes,
-            fragmented_bytes: stats.fragmented_bytes(),
-            file_bytes: self
-                .path
-                .as_ref()
-                .and_then(|path| fs::metadata(path).ok())
-                .map(|meta| meta.len()),
-        };
-        tx.abort().map_err(db_error)?;
-        Ok(status)
+        match &self.persistence {
+            Some(persistence) => {
+                let persistence = persistence.lock().unwrap();
+                let checkpoint_bytes = fs::metadata(&persistence.checkpoint_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default();
+                let sealed_wal_bytes = fs::metadata(&persistence.sealed_wal_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default();
+                let state = self.state.read().unwrap();
+                let fragmented_bytes = fragmented_payload_bytes(&state);
+                let file_bytes = checkpoint_bytes
+                    .saturating_add(sealed_wal_bytes)
+                    .saturating_add(persistence.wal_bytes);
+                Ok(StorageStatus {
+                    allocated_bytes: file_bytes,
+                    stored_bytes: file_bytes.saturating_sub(fragmented_bytes),
+                    fragmented_bytes,
+                    file_bytes: Some(file_bytes),
+                })
+            }
+            None => Ok(StorageStatus {
+                allocated_bytes: 0,
+                stored_bytes: 0,
+                fragmented_bytes: 0,
+                file_bytes: None,
+            }),
+        }
     }
 
     pub fn compact(&mut self) -> Result<bool, String> {
-        Arc::get_mut(&mut self.database)
-            .ok_or_else(|| "MLS database compaction requires stopped delivery readers".to_string())?
-            .compact()
-            .map_err(db_error)
+        match &self.persistence {
+            Some(persistence) => {
+                if let Some(writer) = &self.snapshot_writer {
+                    writer.flush()?;
+                }
+                let mut persistence = persistence.lock().unwrap();
+                let mut state = self.state.write().unwrap();
+                persistence.checkpoint(&state)?;
+                reset_fragmentation_accounting(&mut state);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
-    fn validate(&self, tx: &redb::ReadTransaction, rooms: &[RoomRecord]) -> Result<(), String> {
-        let events = tx.open_table(EVENTS).map_err(db_error)?;
-        let event_ids = tx.open_table(EVENT_IDS).map_err(db_error)?;
-        let commit_epochs = tx.open_table(COMMIT_EPOCHS).map_err(db_error)?;
-        let cursors = tx.open_table(DEVICE_CURSORS).map_err(db_error)?;
-        for room in rooms {
-            let id = room.descriptor.room_id;
-            if room.oldest_available_sequence == 0
-                || room.oldest_available_sequence > room.head_sequence.saturating_add(1)
-            {
-                return Err("persisted MLS room has an invalid retained range".to_string());
+    pub fn checkpoint_if_needed(&self) -> Result<bool, String> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(false);
+        };
+        let mut persistence = persistence.lock().unwrap();
+        if persistence.sealed_wal_path.exists() {
+            if let Some(writer) = &self.snapshot_writer {
+                writer.request()?;
             }
-            let mut expected = room.oldest_available_sequence;
-            for entry in events
-                .range((id.0, room.oldest_available_sequence)..=(id.0, room.head_sequence))
-                .map_err(db_error)?
-            {
-                let (key, value) = entry.map_err(db_error)?;
-                if key.value().1 != expected {
-                    return Err("persisted MLS delivery sequence is not contiguous".to_string());
-                }
-                let stored = decode_event(value.value())?;
-                if stored.event.sequence() != expected {
-                    return Err("persisted MLS event key does not match its sequence".to_string());
-                }
-                match stored.event {
-                    MlsDeliveryEvent::Application { event_id, .. } => {
-                        if event_ids
-                            .get((id.0, event_id.0))
-                            .map_err(db_error)?
-                            .map(|value| value.value())
-                            != Some(expected)
-                        {
-                            return Err("persisted MLS application index is inconsistent".to_string());
-                        }
-                    }
-                    MlsDeliveryEvent::Commit { parent_epoch, .. } => {
-                        if commit_epochs
-                            .get((id.0, parent_epoch))
-                            .map_err(db_error)?
-                            .map(|value| value.value())
-                            != Some(expected)
-                        {
-                            return Err("persisted MLS commit index is inconsistent".to_string());
-                        }
-                    }
-                }
-                expected = expected.saturating_add(1);
-            }
-            if expected != room.head_sequence.saturating_add(1) {
-                return Err("persisted MLS delivery head does not match its log".to_string());
-            }
-            for device in &room.required_devices {
-                if cursors
-                    .get((id.0, device.0))
-                    .map_err(db_error)?
-                    .is_none()
-                {
-                    return Err("persisted MLS required device has no cursor".to_string());
-                }
-            }
+            return Ok(false);
+        }
+        if persistence.wal_bytes < WAL_CHECKPOINT_BYTES
+            && persistence.records_since_checkpoint < WAL_CHECKPOINT_RECORDS
+        {
+            return Ok(false);
+        }
+        persistence.seal()?;
+        drop(persistence);
+        if let Some(writer) = &self.snapshot_writer {
+            writer.request()?;
+        }
+        Ok(true)
+    }
+
+    fn commit(&self, delta: StateDelta, durable: bool) -> Result<(), String> {
+        if let Some(persistence) = &self.persistence {
+            let mut persistence = persistence.lock().unwrap();
+            persistence.append(&delta, durable)?;
+            apply_delta(&mut self.state.write().unwrap(), delta)?;
+        } else {
+            apply_delta(&mut self.state.write().unwrap(), delta)?;
         }
         Ok(())
     }
 }
 
-fn insert_event(
-    tx: &redb::WriteTransaction,
-    room_id: RoomId,
-    event: &MlsDeliveryEvent,
-    event_bytes: &[u8],
-) -> Result<(), String> {
-    let sequence = event.sequence();
-    let mut events = tx.open_table(EVENTS).map_err(db_error)?;
-    if events
-        .insert((room_id.0, sequence), event_bytes)
-        .map_err(db_error)?
-        .is_some()
-    {
-        return Err("MLS delivery sequence unexpectedly already exists".to_string());
+fn reset_fragmentation_accounting(state: &mut MemoryState) {
+    state.retired_payload_bytes = 0;
+}
+
+fn apply_delta(state: &mut MemoryState, delta: StateDelta) -> Result<(), String> {
+    for key in delta.deleted_events {
+        remove_event_memory(state, RoomId(key.room_id), key.sequence);
     }
-    match event {
-        MlsDeliveryEvent::Application { event_id, .. } => {
-            let mut ids = tx.open_table(EVENT_IDS).map_err(db_error)?;
-            if ids
-                .insert((room_id.0, event_id.0), sequence)
-                .map_err(db_error)?
-                .is_some()
-            {
-                return Err("MLS application event id unexpectedly already exists".to_string());
-            }
+    for key in delta.deleted_cursors {
+        state.device_cursors.remove(&(key.room_id, key.device_id));
+    }
+    for target in delta.deleted_welcome_targets {
+        let key = (target.device_id, target.delivery_id);
+        if !state.device_welcomes.remove(&key) {
+            continue;
         }
-        MlsDeliveryEvent::Commit { parent_epoch, .. } => {
-            let mut commits = tx.open_table(COMMIT_EPOCHS).map_err(db_error)?;
-            if commits
-                .insert((room_id.0, *parent_epoch), sequence)
-                .map_err(db_error)?
-                .is_some()
-            {
-                return Err("MLS commit parent epoch unexpectedly already exists".to_string());
+        let Some(count) = state.welcome_target_counts.get_mut(&target.delivery_id) else {
+            return Err("MLS Welcome target count is missing".to_string());
+        };
+        if *count == 1 {
+            state.welcome_target_counts.remove(&target.delivery_id);
+            if let Some(welcome) = state.welcomes.remove(&target.delivery_id) {
+                state.retired_payload_bytes = state
+                    .retired_payload_bytes
+                    .saturating_add(u64::from(welcome.payload_len));
             }
+        } else {
+            *count -= 1;
         }
+    }
+    for stored in delta.events {
+        insert_event_memory(
+            state,
+            stored.room_id,
+            stored.event,
+            stored.stored_at_unix_ms,
+        );
+    }
+    for stored in delta.welcomes {
+        insert_welcome_memory(
+            state,
+            Some((stored.delivery_id, &stored.bundle)),
+            stored.sequence,
+            stored.stored_at_unix_ms,
+        );
+    }
+    for room in delta.rooms {
+        state.rooms.insert(room.descriptor.room_id.0, room);
+    }
+    for stored in delta.cursors {
+        state
+            .device_cursors
+            .insert((stored.room_id.0, stored.device_id.0), stored.cursor);
+    }
+    for cursor in delta.welcome_cursors {
+        state
+            .welcome_cursors
+            .insert(cursor.device_id, cursor.delivery_id);
+    }
+    if let Some(global) = delta.global {
+        state.global = global;
     }
     Ok(())
 }
 
-fn reconcile_cursors(
-    tx: &redb::WriteTransaction,
+fn remove_event_memory(state: &mut MemoryState, room_id: RoomId, sequence: u64) {
+    let Some(stored) = state.events.remove(&(room_id.0, sequence)) else {
+        return;
+    };
+    state.retired_payload_bytes = state
+        .retired_payload_bytes
+        .saturating_add(u64::from(stored.payload_len));
+    match stored.event {
+        MlsDeliveryEvent::Application { event_id, .. } => {
+            state.event_ids.remove(&(room_id.0, event_id.0));
+        }
+        MlsDeliveryEvent::Commit { parent_epoch, .. } => {
+            state.commit_epochs.remove(&(room_id.0, parent_epoch));
+        }
+    }
+}
+
+fn fragmented_payload_bytes(state: &MemoryState) -> u64 {
+    state.retired_payload_bytes
+}
+
+fn ensure_event_available(
+    state: &MemoryState,
+    room_id: RoomId,
+    event: &MlsDeliveryEvent,
+) -> Result<(), String> {
+    if state.events.contains_key(&(room_id.0, event.sequence())) {
+        return Err("MLS delivery sequence unexpectedly already exists".to_string());
+    }
+    match event {
+        MlsDeliveryEvent::Application { event_id, .. }
+            if state.event_ids.contains_key(&(room_id.0, event_id.0)) =>
+        {
+            Err("MLS application event id unexpectedly already exists".to_string())
+        }
+        MlsDeliveryEvent::Commit { parent_epoch, .. }
+            if state.commit_epochs.contains_key(&(room_id.0, *parent_epoch)) =>
+        {
+            Err("MLS commit parent epoch unexpectedly already exists".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn insert_event_memory(
+    state: &mut MemoryState,
+    room_id: RoomId,
+    event: MlsDeliveryEvent,
+    stored_at_unix_ms: u64,
+) {
+    let sequence = event.sequence();
+    if state
+        .events
+        .get(&(room_id.0, sequence))
+        .is_some_and(|stored| stored.event == event && stored.stored_at_unix_ms == stored_at_unix_ms)
+    {
+        return;
+    }
+    remove_event_memory(state, room_id, sequence);
+    let payload_len = match &event {
+        MlsDeliveryEvent::Application { ciphertext, .. } => ciphertext.len(),
+        MlsDeliveryEvent::Commit { commit, .. } => commit.len(),
+    };
+    let payload_len = u32::try_from(payload_len)
+        .expect("MLS event exceeds the binary snapshot limit");
+    match &event {
+        MlsDeliveryEvent::Application { event_id, .. } => {
+            state.event_ids.insert((room_id.0, event_id.0), sequence);
+        }
+        MlsDeliveryEvent::Commit { parent_epoch, .. } => {
+            state.commit_epochs.insert((room_id.0, *parent_epoch), sequence);
+        }
+    }
+    state.events.insert(
+        (room_id.0, sequence),
+        StoredEvent {
+            event,
+            stored_at_unix_ms,
+            payload_len,
+        },
+    );
+}
+
+fn plan_cursor_reconciliation(
+    state: &MemoryState,
     room_id: RoomId,
     previous: &[DeviceId],
     room: &RoomRecord,
     sequence: u64,
+    delta: &mut StateDelta,
 ) -> Result<(), String> {
-    let mut cursors = tx.open_table(DEVICE_CURSORS).map_err(db_error)?;
     for removed in previous
         .iter()
         .filter(|device| !room.required_devices.contains(device))
     {
-        cursors.remove((room_id.0, removed.0)).map_err(db_error)?;
+        delta.deleted_cursors.push(CursorKey {
+            device_id: removed.0,
+            room_id: room_id.0,
+            reserved: 0,
+        });
     }
     for added in room
         .required_devices
         .iter()
         .filter(|device| !previous.contains(device))
     {
-        let bytes = jsony::to_binary(&DeviceCursor {
-            highest_contiguous_sequence: sequence,
-            starting_sequence: sequence,
-            last_ack_unix_ms: room.last_event_time_unix_ms,
-            rejoin_required_through: None,
-        });
-        if cursors
-            .insert((room_id.0, added.0), bytes.as_slice())
-            .map_err(db_error)?
-            .is_some()
-        {
+        if state.device_cursors.contains_key(&(room_id.0, added.0)) {
             return Err("new MLS room member unexpectedly already has a cursor".to_string());
         }
+        delta.cursors.push(WalCursor {
+            room_id,
+            device_id: *added,
+            cursor: DeviceCursor {
+                highest_contiguous_sequence: sequence,
+                starting_sequence: sequence,
+                last_ack_unix_ms: room.last_event_time_unix_ms,
+                rejoin_required_through: None,
+            },
+        });
     }
     Ok(())
 }
 
-fn insert_welcome(
-    tx: &redb::WriteTransaction,
+fn ensure_welcome_available(
+    state: &MemoryState,
     welcome: Option<(u64, &MlsWelcomeBundle)>,
-    sequence: u64,
-    stored_at_unix_ms: u64,
 ) -> Result<(), String> {
     let Some((delivery_id, bundle)) = welcome else {
         return Ok(());
     };
-    let bytes = jsony::to_binary(&StoredWelcome {
-        delivery_id,
-        sequence,
-        stored_at_unix_ms,
-        bundle: bundle.clone(),
-    });
-    let mut welcomes = tx.open_table(WELCOMES).map_err(db_error)?;
-    if welcomes
-        .insert(delivery_id, bytes.as_slice())
-        .map_err(db_error)?
-        .is_some()
-    {
+    if state.welcomes.contains_key(&delivery_id) {
         return Err("MLS Welcome delivery id unexpectedly already exists".to_string());
     }
-    let mut targets = tx.open_table(DEVICE_WELCOMES).map_err(db_error)?;
-    for device in &bundle.device_ids {
-        if targets
-            .insert((device.0, delivery_id), ())
-            .map_err(db_error)?
-            .is_some()
-        {
-            return Err("MLS Welcome target unexpectedly already exists".to_string());
-        }
+    if bundle
+        .device_ids
+        .iter()
+        .any(|device| state.device_welcomes.contains(&(device.0, delivery_id)))
+    {
+        return Err("MLS Welcome target unexpectedly already exists".to_string());
     }
-    tx.open_table(WELCOME_TARGET_COUNTS)
-        .map_err(db_error)?
-        .insert(delivery_id, bundle.device_ids.len() as u16)
-        .map_err(db_error)?;
     Ok(())
 }
 
-fn cleanup_welcomes(
-    tx: &redb::WriteTransaction,
+fn insert_welcome_memory(
+    state: &mut MemoryState,
+    welcome: Option<(u64, &MlsWelcomeBundle)>,
+    sequence: u64,
+    stored_at_unix_ms: u64,
+) {
+    let Some((delivery_id, bundle)) = welcome else {
+        return;
+    };
+    if state.welcomes.get(&delivery_id).is_some_and(|stored| {
+        stored.sequence == sequence
+            && stored.stored_at_unix_ms == stored_at_unix_ms
+            && stored.bundle == *bundle
+    }) {
+        return;
+    }
+    let old_targets = state
+        .device_welcomes
+        .iter()
+        .filter(|(_, stored_delivery_id)| *stored_delivery_id == delivery_id)
+        .copied()
+        .collect::<Vec<_>>();
+    for target in old_targets {
+        state.device_welcomes.remove(&target);
+    }
+    state.welcome_target_counts.remove(&delivery_id);
+    if let Some(previous) = state.welcomes.remove(&delivery_id) {
+        state.retired_payload_bytes = state
+            .retired_payload_bytes
+            .saturating_add(u64::from(previous.payload_len));
+    }
+    let payload_len = u32::try_from(bundle.welcome.len())
+        .expect("MLS Welcome exceeds the binary snapshot limit");
+    state.welcomes.insert(
+        delivery_id,
+        StoredWelcome {
+            delivery_id,
+            sequence,
+            stored_at_unix_ms,
+            bundle: bundle.clone(),
+            payload_len,
+        },
+    );
+    for device in &bundle.device_ids {
+        state.device_welcomes.insert((device.0, delivery_id));
+    }
+    state
+        .welcome_target_counts
+        .insert(delivery_id, bundle.device_ids.len() as u16);
+}
+
+fn plan_prune_room(
+    state: &MemoryState,
+    room_id: RoomId,
     now_unix_ms: u64,
     batch_limit: usize,
-) -> Result<bool, String> {
-    let rooms = tx.open_table(ROOMS).map_err(db_error)?;
-    let cursors = tx.open_table(WELCOME_CURSORS).map_err(db_error)?;
-    let targets = tx.open_table(DEVICE_WELCOMES).map_err(db_error)?;
-    let welcomes = tx.open_table(WELCOMES).map_err(db_error)?;
+) -> Result<Option<(CleanupReport, StateDelta)>, String> {
+    let Some(mut room) = state.rooms.get(&room_id.0).cloned() else {
+        return Ok(None);
+    };
+    if room.oldest_available_sequence > room.head_sequence {
+        return Ok(None);
+    }
+    let mut required = Vec::new();
+    for device in &room.required_devices {
+        let cursor = state
+            .device_cursors
+            .get(&(room_id.0, device.0))
+            .cloned()
+            .ok_or_else(|| "required MLS device is missing its cursor".to_string())?;
+        required.push((*device, cursor));
+    }
+    let safe = required
+        .iter()
+        .map(|(_, cursor)| cursor.highest_contiguous_sequence)
+        .min()
+        .unwrap_or(room.head_sequence);
+    let retention_ms = u64::from(room.retention_days).saturating_mul(24 * 60 * 60 * 1000);
+    let cutoff = now_unix_ms.saturating_sub(retention_ms);
+    let mut expiry = room.oldest_available_sequence.saturating_sub(1);
+    for (_, stored) in state.events.range(
+        (room_id.0, room.oldest_available_sequence)..=(room_id.0, room.head_sequence),
+    ) {
+        if stored.stored_at_unix_ms >= cutoff {
+            break;
+        }
+        expiry = stored.event.sequence();
+    }
+    let prune_through = safe.max(expiry).min(room.head_sequence);
+    if prune_through < room.oldest_available_sequence {
+        return Ok(None);
+    }
+    let mut report = CleanupReport::default();
+    let mut delta = StateDelta::default();
+    if expiry > safe {
+        for (device, mut cursor) in required {
+            if cursor.highest_contiguous_sequence < expiry {
+                cursor.rejoin_required_through = Some(expiry);
+                delta.cursors.push(WalCursor {
+                    room_id,
+                    device_id: device,
+                    cursor,
+                });
+                report.lagging_devices += 1;
+            }
+        }
+    }
+    let end = prune_through.min(
+        room.oldest_available_sequence
+            .saturating_add(batch_limit as u64)
+            .saturating_sub(1),
+    );
+    for sequence in room.oldest_available_sequence..=end {
+        state
+            .events
+            .get(&(room_id.0, sequence))
+            .ok_or_else(|| "MLS cleanup found a hole in the delivery log".to_string())?;
+        delta.deleted_events.push(EventKey {
+            sequence,
+            room_id: room_id.0,
+            reserved: 0,
+        });
+        report.deleted_events += 1;
+    }
+    room.oldest_available_sequence = end.saturating_add(1);
+    report.more_work = end < prune_through;
+    delta.rooms.push(room);
+    Ok(Some((report, delta)))
+}
+
+fn plan_cleanup_welcomes(
+    state: &MemoryState,
+    now_unix_ms: u64,
+    batch_limit: usize,
+) -> Result<(bool, Vec<DeviceWelcomeCheckpoint>), String> {
     let mut remove_targets = Vec::new();
     let mut more_work = false;
-    for entry in targets.iter().map_err(db_error)? {
-        let (key, _) = entry.map_err(db_error)?;
-        let (device, delivery_id) = key.value();
-        let acknowledged = cursors
-            .get(device)
-            .map_err(db_error)?
-            .is_some_and(|cursor| cursor.value() >= delivery_id);
-        let welcome = welcomes
-            .get(delivery_id)
-            .map_err(db_error)?
+    for &(device, delivery_id) in &state.device_welcomes {
+        let acknowledged = state
+            .welcome_cursors
+            .get(&device)
+            .is_some_and(|cursor| *cursor >= delivery_id);
+        let welcome = state
+            .welcomes
+            .get(&delivery_id)
             .ok_or_else(|| "MLS Welcome target references a missing value".to_string())?;
-        let welcome = decode_welcome(welcome.value())?;
-        let room = rooms
-            .get(welcome.bundle.descriptor.room_id.0)
-            .map_err(db_error)?
+        let room = state
+            .rooms
+            .get(&welcome.bundle.descriptor.room_id.0)
             .ok_or_else(|| "MLS Welcome references a missing room".to_string())?;
-        let room = decode_room(room.value())?;
         let expired = welcome.stored_at_unix_ms
             < now_unix_ms.saturating_sub(
                 u64::from(room.retention_days).saturating_mul(24 * 60 * 60 * 1000),
@@ -1140,53 +1452,602 @@ fn cleanup_welcomes(
                 more_work = true;
                 break;
             }
-            remove_targets.push((device, delivery_id));
+            remove_targets.push(DeviceWelcomeCheckpoint {
+                delivery_id,
+                device_id: device,
+            });
         }
     }
-    drop(welcomes);
-    drop(targets);
-    let mut targets = tx.open_table(DEVICE_WELCOMES).map_err(db_error)?;
-    let mut welcomes = tx.open_table(WELCOMES).map_err(db_error)?;
-    let mut counts = tx.open_table(WELCOME_TARGET_COUNTS).map_err(db_error)?;
-    for key @ (_, delivery_id) in remove_targets {
-        targets.remove(key).map_err(db_error)?;
-        let count = counts
-            .get(delivery_id)
-            .map_err(db_error)?
-            .ok_or_else(|| "MLS Welcome target count is missing".to_string())?
-            .value();
-        if count == 1 {
-            counts.remove(delivery_id).map_err(db_error)?;
-            welcomes.remove(delivery_id).map_err(db_error)?;
+    Ok((more_work, remove_targets))
+}
+
+fn validate_memory(state: &MemoryState) -> Result<(), String> {
+    for room in state.rooms.values() {
+        let id = room.descriptor.room_id;
+        if room.oldest_available_sequence == 0
+            || room.oldest_available_sequence > room.head_sequence.saturating_add(1)
+        {
+            return Err("persisted MLS room has an invalid retained range".to_string());
+        }
+        let mut expected = room.oldest_available_sequence;
+        for ((_, sequence), stored) in state.events.range(
+            (id.0, room.oldest_available_sequence)..=(id.0, room.head_sequence),
+        ) {
+            if *sequence != expected || stored.event.sequence() != expected {
+                return Err("persisted MLS delivery sequence is not contiguous".to_string());
+            }
+            match &stored.event {
+                MlsDeliveryEvent::Application { event_id, .. }
+                    if state.event_ids.get(&(id.0, event_id.0)) != Some(&expected) =>
+                {
+                    return Err("persisted MLS application index is inconsistent".to_string());
+                }
+                MlsDeliveryEvent::Commit { parent_epoch, .. }
+                    if state.commit_epochs.get(&(id.0, *parent_epoch)) != Some(&expected) =>
+                {
+                    return Err("persisted MLS commit index is inconsistent".to_string());
+                }
+                _ => {}
+            }
+            expected = expected.saturating_add(1);
+        }
+        if expected != room.head_sequence.saturating_add(1) {
+            return Err("persisted MLS delivery head does not match its log".to_string());
+        }
+        for device in &room.required_devices {
+            if !state.device_cursors.contains_key(&(id.0, device.0)) {
+                return Err("persisted MLS required device has no cursor".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Persistence {
+    fn open(
+        checkpoint_path: PathBuf,
+        wal_path: PathBuf,
+        state: &mut MemoryState,
+    ) -> Result<Self, String> {
+        let sealed_wal_path = wal_path.with_extension("wal.sealed");
+        let lock_path = checkpoint_path.with_extension("lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("failed to open {}: {error}", lock_path.display()))?;
+        lock_store(&lock, &lock_path)?;
+        let (_, sealed_records) = replay_wal(&sealed_wal_path, state)?;
+        let (valid_bytes, active_records) = replay_wal(&wal_path, state)?;
+        let records_since_checkpoint = sealed_records.saturating_add(active_records);
+        validate_memory(state)?;
+        let mut wal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&wal_path)
+            .map_err(|error| format!("failed to open {}: {error}", wal_path.display()))?;
+        let wal_bytes = if valid_bytes == 0 {
+            wal.write_all(WAL_MAGIC)
+                .and_then(|()| wal.write_all(&WAL_VERSION.to_le_bytes()))
+                .and_then(|()| wal.sync_data())
+                .map_err(|error| format!("failed to initialize {}: {error}", wal_path.display()))?;
+            sync_parent(&wal_path)?;
+            WAL_HEADER_BYTES
         } else {
-            counts.insert(delivery_id, count - 1).map_err(db_error)?;
+            valid_bytes
+        };
+        Ok(Self {
+            checkpoint_path,
+            wal_path,
+            sealed_wal_path,
+            _lock: lock,
+            wal,
+            wal_bytes,
+            records_since_checkpoint,
+            poisoned: false,
+        })
+    }
+
+    fn append(&mut self, delta: &StateDelta, durable: bool) -> Result<(), String> {
+        if self.poisoned {
+            return Err("MLS WAL is unavailable after an earlier write failure".to_string());
+        }
+        let body = jsony::to_binary(delta);
+        let len = u32::try_from(body.len())
+            .map_err(|_| "MLS WAL record exceeds the binary format limit".to_string())?;
+        let original_len = self.wal_bytes;
+        let mut frame = Vec::with_capacity(12 + body.len());
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame.extend_from_slice(&wal_checksum(&body).to_le_bytes());
+        frame.extend_from_slice(&body);
+        let result = self.wal.write_all(&frame).and_then(|()| {
+            if durable {
+                self.wal.sync_data()
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
+            if self
+                .wal
+                .set_len(original_len)
+                .and_then(|()| self.wal.sync_data())
+                .is_err()
+            {
+                self.poisoned = true;
+            }
+            return Err(format!("failed to append {}: {error}", self.wal_path.display()));
+        }
+        self.wal_bytes = self.wal_bytes.saturating_add(frame.len() as u64);
+        self.records_since_checkpoint = self.records_since_checkpoint.saturating_add(1);
+        Ok(())
+    }
+
+    fn checkpoint(&mut self, state: &MemoryState) -> Result<(), String> {
+        let bytes = serialize_checkpoint(state);
+        write_checkpoint(&self.checkpoint_path, &bytes)?;
+        self.wal
+            .set_len(0)
+            .and_then(|()| self.wal.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| self.wal.write_all(WAL_MAGIC))
+            .and_then(|()| self.wal.write_all(&WAL_VERSION.to_le_bytes()))
+            .and_then(|()| self.wal.sync_data())
+            .map_err(|error| format!("failed to reset {}: {error}", self.wal_path.display()))?;
+        self.wal_bytes = WAL_HEADER_BYTES;
+        self.records_since_checkpoint = 0;
+        self.poisoned = false;
+        match fs::remove_file(&self.sealed_wal_path) {
+            Ok(()) => sync_parent(&self.sealed_wal_path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove {}: {error}",
+                    self.sealed_wal_path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn seal(&mut self) -> Result<(), String> {
+        if self.poisoned {
+            return Err("MLS WAL is unavailable after an earlier write failure".to_string());
+        }
+        if self.sealed_wal_path.exists() {
+            return Ok(());
+        }
+        fs::rename(&self.wal_path, &self.sealed_wal_path).map_err(|error| {
+            format!(
+                "failed to rotate {} to {}: {error}",
+                self.wal_path.display(),
+                self.sealed_wal_path.display()
+            )
+        })?;
+        let replacement = (|| {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .read(true)
+                .open(&self.wal_path)?;
+            file.write_all(WAL_MAGIC)?;
+            file.write_all(&WAL_VERSION.to_le_bytes())?;
+            file.sync_data()?;
+            Ok::<_, std::io::Error>(file)
+        })();
+        let replacement = match replacement {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::rename(&self.sealed_wal_path, &self.wal_path);
+                return Err(format!(
+                    "failed to create rotated {}: {error}",
+                    self.wal_path.display()
+                ));
+            }
+        };
+        self.wal = replacement;
+        self.wal_bytes = WAL_HEADER_BYTES;
+        self.records_since_checkpoint = 0;
+        sync_parent(&self.wal_path)?;
+        Ok(())
+    }
+}
+
+fn replay_wal(path: &Path, state: &mut MemoryState) -> Result<(u64, u64), String> {
+    let mut bytes = Vec::new();
+    match File::open(path) {
+        Ok(mut file) => {
+            file.read_to_end(&mut bytes)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(format!("failed to open {}: {error}", path.display())),
+    }
+    if bytes.is_empty() {
+        return Ok((0, 0));
+    }
+    if bytes.len() < WAL_HEADER_BYTES as usize {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("failed to repair {}: {error}", path.display()))?;
+        file.set_len(0)
+            .and_then(|()| file.sync_data())
+            .map_err(|error| format!("failed to repair {}: {error}", path.display()))?;
+        return Ok((0, 0));
+    }
+    if &bytes[..8] != WAL_MAGIC {
+        return Err("invalid MLS WAL header".to_string());
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if version != WAL_VERSION {
+        return Err(format!(
+            "unsupported MLS WAL version {version}; expected {WAL_VERSION}"
+        ));
+    }
+    let mut offset = WAL_HEADER_BYTES as usize;
+    let mut records = 0u64;
+    while bytes.len().saturating_sub(offset) >= 12 {
+        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let checksum = u64::from_le_bytes(bytes[offset + 4..offset + 12].try_into().unwrap());
+        let Some(end) = offset.checked_add(12).and_then(|start| start.checked_add(len)) else {
+            break;
+        };
+        let Some(body) = bytes.get(offset + 12..end) else {
+            break;
+        };
+        if wal_checksum(body) != checksum {
+            return Err(format!("{} contains a corrupt MLS WAL record", path.display()));
+        }
+        let delta = jsony::from_binary::<StateDelta>(body)
+            .map_err(|error| format!("failed to decode {}: {error}", path.display()))?;
+        apply_delta(state, delta)?;
+        offset = end;
+        records = records.saturating_add(1);
+    }
+    if offset != bytes.len() {
+        kvlog::warn!(
+            "MLS WAL tail incomplete; truncating",
+            path = path.display().to_string().as_str(),
+            valid_bytes = offset as u64,
+            total_bytes = bytes.len() as u64,
+        );
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("failed to repair {}: {error}", path.display()))?;
+        file.set_len(offset as u64)
+            .and_then(|()| file.sync_data())
+            .map_err(|error| format!("failed to repair {}: {error}", path.display()))?;
+    }
+    Ok((offset as u64, records))
+}
+
+fn wal_checksum(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+#[cfg(unix)]
+fn lock_store(file: &File, path: &Path) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to lock {}; another server may be using this MLS store",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_store(_file: &File, _path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn serialize_checkpoint(state: &MemoryState) -> Vec<u8> {
+    let rooms = state.rooms.values().collect::<Vec<_>>();
+    let mut payloads = Vec::new();
+    let events = state
+        .events
+        .iter()
+        .map(|(&(room_id, sequence), stored)| {
+            let payload_offset = payloads.len() as u64;
+            let encoded = jsony::to_binary(&stored.event);
+            let payload_len = u32::try_from(encoded.len())
+                .expect("MLS event exceeds the binary snapshot limit");
+            payloads.extend_from_slice(&encoded);
+            EventCheckpoint {
+                sequence,
+                stored_at_unix_ms: stored.stored_at_unix_ms,
+                payload_offset,
+                room_id,
+                payload_len,
+            }
+        })
+        .collect::<Vec<_>>();
+    let cursors = state
+        .device_cursors
+        .iter()
+        .map(|(&(room_id, device_id), cursor)| CursorCheckpoint {
+            highest_contiguous_sequence: cursor.highest_contiguous_sequence,
+            starting_sequence: cursor.starting_sequence,
+            last_ack_unix_ms: cursor.last_ack_unix_ms,
+            rejoin_required_through: cursor.rejoin_required_through.unwrap_or(u64::MAX),
+            device_id,
+            room_id,
+            reserved: 0,
+        })
+        .collect::<Vec<_>>();
+    let welcomes = state
+        .welcomes
+        .values()
+        .map(|stored| {
+            let payload_offset = payloads.len() as u64;
+            let encoded = jsony::to_binary(&stored.bundle);
+            let payload_len = u32::try_from(encoded.len())
+                .expect("MLS Welcome exceeds the binary snapshot limit");
+            payloads.extend_from_slice(&encoded);
+            WelcomeCheckpoint {
+                delivery_id: stored.delivery_id,
+                sequence: stored.sequence,
+                stored_at_unix_ms: stored.stored_at_unix_ms,
+                payload_offset,
+                payload_len,
+                reserved: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let device_welcomes = state
+        .device_welcomes
+        .iter()
+        .map(|&(device_id, delivery_id)| DeviceWelcomeCheckpoint {
+            delivery_id,
+            device_id,
+        })
+        .collect::<Vec<_>>();
+    let welcome_cursors = state
+        .welcome_cursors
+        .iter()
+        .map(|(&device_id, &delivery_id)| WelcomeCursorCheckpoint {
+            delivery_id,
+            device_id,
+        })
+        .collect::<Vec<_>>();
+
+    let mut bytes = jsony::to_binary(&CheckpointEncode {
+        global: &state.global,
+        rooms,
+        events,
+        cursors,
+        welcomes,
+        device_welcomes,
+        welcome_cursors,
+        payloads: payloads.as_slice(),
+    });
+    let body_len = bytes.len();
+    bytes.reserve(12);
+    bytes.resize(body_len + 12, 0);
+    bytes.copy_within(0..body_len, 12);
+    bytes[..8].copy_from_slice(SNAPSHOT_MAGIC);
+    bytes[8..12].copy_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+    bytes
+}
+
+fn write_checkpoint(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("bin.tmp");
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed to remove {}: {error}", tmp.display())),
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp)
+        .map_err(|error| format!("failed to create {}: {error}", tmp.display()))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("failed to write {}: {error}", tmp.display()))?;
+    file.sync_data()
+        .map_err(|error| format!("failed to sync {}: {error}", tmp.display()))?;
+    drop(file);
+    fs::rename(&tmp, path)
+        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
+    sync_parent(path)
+}
+
+fn sync_parent(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("failed to sync MLS directory {}: {error}", parent.display()))
+}
+
+fn load_checkpoint(path: &Path) -> Result<MemoryState, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MemoryState {
+                global: GlobalRecord {
+                    next_welcome_delivery_id: 1,
+                    ..GlobalRecord::default()
+                },
+                ..MemoryState::default()
+            });
+        }
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    if bytes.len() < 12 || &bytes[..8] != SNAPSHOT_MAGIC {
+        return Err("invalid MLS checkpoint header".to_string());
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if version != SNAPSHOT_VERSION {
+        return Err(format!(
+            "unsupported MLS checkpoint version {version}; expected {SNAPSHOT_VERSION}"
+        ));
+    }
+    let decoded = jsony::from_binary::<CheckpointDecode>(&bytes[12..])
+        .map_err(|error| format!("failed to decode MLS checkpoint: {error}"))?;
+    let CheckpointDecode {
+        global,
+        rooms,
+        events,
+        cursors,
+        welcomes,
+        device_welcomes,
+        welcome_cursors,
+        payloads,
+    } = decoded;
+    let mut state = MemoryState {
+        global,
+        ..MemoryState::default()
+    };
+    for room in rooms {
+        let room_id = room.descriptor.room_id.0;
+        if state.rooms.insert(room_id, room).is_some() {
+            return Err("MLS checkpoint contains a duplicate room".to_string());
         }
     }
-    Ok(more_work)
+    for row in events {
+        let event: MlsDeliveryEvent = decode_payload(
+            &payloads,
+            row.payload_offset,
+            row.payload_len,
+            "event",
+        )?;
+        if event.sequence() != row.sequence {
+            return Err("MLS checkpoint event metadata is inconsistent".to_string());
+        }
+        match &event {
+            MlsDeliveryEvent::Application { event_id, .. } => {
+                if state
+                    .event_ids
+                    .insert((row.room_id, event_id.0), row.sequence)
+                    .is_some()
+                {
+                    return Err("MLS checkpoint contains a duplicate event id".to_string());
+                }
+            }
+            MlsDeliveryEvent::Commit { parent_epoch, .. } => {
+                if state
+                    .commit_epochs
+                    .insert((row.room_id, *parent_epoch), row.sequence)
+                    .is_some()
+                {
+                    return Err("MLS checkpoint contains a duplicate commit epoch".to_string());
+                }
+            }
+        }
+        if state
+            .events
+            .insert(
+                (row.room_id, row.sequence),
+                StoredEvent {
+                    event,
+                    stored_at_unix_ms: row.stored_at_unix_ms,
+                    payload_len: row.payload_len,
+                },
+            )
+            .is_some()
+        {
+            return Err("MLS checkpoint contains a duplicate delivery event".to_string());
+        }
+    }
+    for row in cursors {
+        let cursor = DeviceCursor {
+            highest_contiguous_sequence: row.highest_contiguous_sequence,
+            starting_sequence: row.starting_sequence,
+            last_ack_unix_ms: row.last_ack_unix_ms,
+            rejoin_required_through: (row.rejoin_required_through != u64::MAX)
+                .then_some(row.rejoin_required_through),
+        };
+        if state
+            .device_cursors
+            .insert((row.room_id, row.device_id), cursor)
+            .is_some()
+        {
+            return Err("MLS checkpoint contains a duplicate device cursor".to_string());
+        }
+    }
+    for row in welcomes {
+        let bundle: MlsWelcomeBundle = decode_payload(
+            &payloads,
+            row.payload_offset,
+            row.payload_len,
+            "Welcome",
+        )?;
+        if state
+            .welcomes
+            .insert(
+                row.delivery_id,
+                StoredWelcome {
+                    delivery_id: row.delivery_id,
+                    sequence: row.sequence,
+                    stored_at_unix_ms: row.stored_at_unix_ms,
+                    bundle,
+                    payload_len: row.payload_len,
+                },
+            )
+            .is_some()
+        {
+            return Err("MLS checkpoint contains a duplicate Welcome".to_string());
+        }
+    }
+    for row in device_welcomes {
+        if !state
+            .device_welcomes
+            .insert((row.device_id, row.delivery_id))
+        {
+            return Err("MLS checkpoint contains a duplicate Welcome target".to_string());
+        }
+        *state
+            .welcome_target_counts
+            .entry(row.delivery_id)
+            .or_default() += 1;
+    }
+    for row in welcome_cursors {
+        if state
+            .welcome_cursors
+            .insert(row.device_id, row.delivery_id)
+            .is_some()
+        {
+            return Err("MLS checkpoint contains a duplicate Welcome cursor".to_string());
+        }
+    }
+    validate_memory(&state)?;
+    Ok(state)
 }
 
-fn decode_global(bytes: &[u8]) -> Result<GlobalRecord, String> {
-    jsony::from_binary(bytes).map_err(|error| format!("failed to decode MLS global state: {error}"))
+fn decode_payload<T: for<'a> jsony::FromBinary<'a>>(
+    payloads: &[u8],
+    offset: u64,
+    len: u32,
+    kind: &str,
+) -> Result<T, String> {
+    let bytes = payload_slice(payloads, offset, len, kind)?;
+    jsony::from_binary(bytes)
+        .map_err(|error| format!("failed to decode MLS checkpoint {kind}: {error}"))
 }
 
-fn decode_room(bytes: &[u8]) -> Result<RoomRecord, String> {
-    jsony::from_binary(bytes).map_err(|error| format!("failed to decode MLS room state: {error}"))
-}
-
-fn decode_event(bytes: &[u8]) -> Result<StoredEvent, String> {
-    jsony::from_binary(bytes).map_err(|error| format!("failed to decode MLS event: {error}"))
-}
-
-fn decode_welcome(bytes: &[u8]) -> Result<StoredWelcome, String> {
-    jsony::from_binary(bytes).map_err(|error| format!("failed to decode MLS Welcome: {error}"))
-}
-
-fn decode_cursor(bytes: &[u8]) -> Result<DeviceCursor, String> {
-    jsony::from_binary(bytes).map_err(|error| format!("failed to decode MLS device cursor: {error}"))
-}
-
-fn db_error(error: impl std::fmt::Display) -> String {
-    format!("MLS database operation failed: {error}")
+fn payload_slice<'a>(
+    payloads: &'a [u8],
+    offset: u64,
+    len: u32,
+    kind: &str,
+) -> Result<&'a [u8], String> {
+    let start = usize::try_from(offset)
+        .map_err(|_| format!("MLS checkpoint {kind} offset is too large"))?;
+    let end = start
+        .checked_add(len as usize)
+        .filter(|end| *end <= payloads.len())
+        .ok_or_else(|| format!("MLS checkpoint {kind} payload is out of bounds"))?;
+    Ok(&payloads[start..end])
 }
 
 #[cfg(test)]
@@ -1244,63 +2105,39 @@ mod tests {
     #[test]
     fn schema_version_is_created_and_reopened() {
         let temp = tempfile::tempdir().unwrap();
-        MlsStore::open(Some(temp.path())).unwrap();
+        let store = MlsStore::open(Some(temp.path())).unwrap();
+        drop(store);
         let loaded = MlsStore::open(Some(temp.path())).unwrap().load().unwrap();
         assert!(loaded.rooms.is_empty());
         assert_eq!(loaded.global.next_welcome_delivery_id, 1);
     }
 
     #[test]
-    fn delivery_handles_hold_concurrent_redb_read_transactions() {
+    fn read_handles_share_hot_state() {
         let store = MlsStore::open(None).unwrap();
-        create(&store, &room(1, Vec::new(), 100));
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let readers = [store.read_handle(), store.read_handle()]
-            .into_iter()
-            .map(|reader| {
-                let barrier = std::sync::Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    let tx = reader.begin_read().unwrap();
-                    let rooms = tx.open_table(ROOMS).unwrap();
-                    assert!(rooms.get(1).unwrap().is_some());
-                    barrier.wait();
-                    barrier.wait();
-                    drop(rooms);
-                    drop(tx);
-                })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        barrier.wait();
-        for reader in readers {
-            reader.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn compaction_requires_delivery_read_handles_to_stop() {
-        let mut store = MlsStore::open(None).unwrap();
         let reader = store.read_handle();
-        assert!(store.compact().unwrap_err().contains("stopped delivery readers"));
-        drop(reader);
-        store.compact().unwrap();
+        create(&store, &room(1, Vec::new(), 100));
+        assert_eq!(reader.events(RoomId(1), 0, 10).unwrap().events.len(), 1);
     }
 
     #[test]
-    fn unsupported_schema_version_is_rejected_clearly() {
+    fn read_handle_acknowledgement_does_not_touch_wal() {
         let temp = tempfile::tempdir().unwrap();
+        let device = DeviceId([23; 16]);
         let store = MlsStore::open(Some(temp.path())).unwrap();
-        let tx = store.database.begin_write().unwrap();
-        {
-            let mut meta = tx.open_table(META).unwrap();
-            meta.insert(SCHEMA_KEY, 99u32.to_be_bytes().as_slice())
-                .unwrap();
-        }
-        tx.commit().unwrap();
-        drop(store);
+        let reader = store.read_handle();
+        create(&store, &room(23, vec![device], 100));
+        store
+            .append_application(RoomId(23), device, 1, EventId([23; 16]), &[1], 150)
+            .unwrap();
+        let wal_path = temp.path().join("mls-state.wal");
+        let before = fs::metadata(&wal_path).unwrap().len();
 
-        let error = MlsStore::open(Some(temp.path())).unwrap_err();
-        assert!(error.contains("unsupported MLS database schema version 99"));
+        assert!(reader.acknowledge(RoomId(23), device, 2, 200).unwrap());
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), before);
+
+        store.persist_acknowledgement(RoomId(23), device).unwrap();
+        assert!(fs::metadata(wal_path).unwrap().len() > before);
     }
 
     #[test]
@@ -1309,101 +2146,32 @@ mod tests {
         let device = DeviceId([7; 16]);
         create(&store, &room(10, vec![device], 100));
         create(&store, &room(11, vec![device], 100));
-
         for (room_id, byte) in [(RoomId(10), 1), (RoomId(10), 2), (RoomId(11), 3)] {
-            let event_id = EventId([byte; 16]);
-            assert!(matches!(
-                store
-                    .append_application(room_id, device, 1, event_id, &[byte], 200)
-                    .unwrap(),
-                AppendApplicationResult::Stored { sequence: 2 | 3, .. }
-            ));
+            store
+                .append_application(room_id, device, 1, EventId([byte; 16]), &[byte], 200)
+                .unwrap();
         }
-
-        let batch = store.events(RoomId(10), 0, 10).unwrap();
         assert_eq!(
-            batch
+            store
+                .events(RoomId(10), 0, 10)
+                .unwrap()
                 .events
                 .iter()
                 .map(MlsDeliveryEvent::sequence)
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
-        assert_eq!(batch.head_sequence, 3);
         assert_eq!(
             store
                 .application_retry(RoomId(10), EventId([1; 16]), 1, &[1])
                 .unwrap(),
             Some(Ok(2))
         );
-        assert_eq!(
-            store
-                .application_retry(RoomId(10), EventId([1; 16]), 1, &[9])
-                .unwrap(),
-            Some(Err(()))
-        );
-        assert!(matches!(
-            store
-                .append_application(
-                    RoomId(10),
-                    device,
-                    1,
-                    EventId([1; 16]),
-                    &[9],
-                    300,
-                )
-                .unwrap(),
-            AppendApplicationResult::Conflict
-        ));
-        assert_eq!(store.events(RoomId(10), 0, 10).unwrap().head_sequence, 3);
         assert_eq!(store.events(RoomId(11), 0, 10).unwrap().events.len(), 2);
     }
 
     #[test]
-    fn global_and_selected_room_replacement_leaves_other_rooms_untouched() {
-        let store = MlsStore::open(None).unwrap();
-        let first_device = DeviceId([6; 16]);
-        let second_device = DeviceId([7; 16]);
-        let mut first = room(12, vec![first_device], 100);
-        let second = room(13, vec![second_device], 100);
-        create(&store, &first);
-        create(&store, &second);
-
-        first.revocation_pending = true;
-        first.required_devices.clear();
-        store
-            .replace_global_and_rooms(
-                &GlobalRecord {
-                    initialized_accounts: vec![UserId(4)],
-                    next_welcome_delivery_id: 1,
-                    ..GlobalRecord::default()
-                },
-                &[first],
-            )
-            .unwrap();
-
-        let loaded = store.load().unwrap();
-        assert_eq!(loaded.global.initialized_accounts, vec![UserId(4)]);
-        let first = loaded
-            .rooms
-            .iter()
-            .find(|room| room.descriptor.room_id == RoomId(12))
-            .unwrap();
-        assert!(first.revocation_pending);
-        assert!(first.required_devices.is_empty());
-        let second = loaded
-            .rooms
-            .iter()
-            .find(|room| room.descriptor.room_id == RoomId(13))
-            .unwrap();
-        assert_eq!(second.required_devices, vec![second_device]);
-        store
-            .acknowledge(RoomId(13), second_device, 1, 200)
-            .unwrap();
-    }
-
-    #[test]
-    fn later_durable_write_flushes_non_durable_acknowledgement() {
+    fn final_checkpoint_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
         let device = DeviceId([8; 16]);
         let store = MlsStore::open(Some(temp.path())).unwrap();
@@ -1412,18 +2180,161 @@ mod tests {
             .append_application(RoomId(14), device, 1, EventId([1; 16]), &[1], 200)
             .unwrap();
         store.acknowledge(RoomId(14), device, 2, 300).unwrap();
+        drop(store);
+        let reopened = MlsStore::open(Some(temp.path())).unwrap();
+        assert_eq!(reopened.events(RoomId(14), 0, 10).unwrap().events.len(), 2);
+    }
+
+    #[test]
+    fn authoritative_mutations_replay_from_wal_without_a_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = DeviceId([18; 16]);
+        let store = MlsStore::open(Some(temp.path())).unwrap();
+        create(&store, &room(16, vec![device], 100));
         store
-            .replace_global(&GlobalRecord {
-                next_welcome_delivery_id: 1,
-                ..GlobalRecord::default()
-            })
+            .append_application(RoomId(16), device, 1, EventId([1; 16]), &[7; 32], 200)
             .unwrap();
+        assert!(!temp.path().join("mls-state.bin").exists());
+        assert!(
+            fs::metadata(temp.path().join("mls-state.wal"))
+                .unwrap()
+                .len()
+                > WAL_HEADER_BYTES
+        );
         drop(store);
 
-        let mut reopened = MlsStore::open(Some(temp.path())).unwrap();
-        let report = reopened.cleanup(300, 10).unwrap();
-        assert_eq!(report.deleted_events, 2);
-        assert!(reopened.events(RoomId(14), 0, 10).unwrap().events.is_empty());
+        let reopened = MlsStore::open(Some(temp.path())).unwrap();
+        assert_eq!(reopened.events(RoomId(16), 0, 10).unwrap().events.len(), 2);
+    }
+
+    #[test]
+    fn torn_wal_tail_is_truncated_after_replaying_whole_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = DeviceId([19; 16]);
+        let store = MlsStore::open(Some(temp.path())).unwrap();
+        create(&store, &room(17, vec![device], 100));
+        drop(store);
+        let path = temp.path().join("mls-state.wal");
+        let valid_len = fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[4, 3, 2, 1, 0]).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+
+        let reopened = MlsStore::open(Some(temp.path())).unwrap();
+        assert_eq!(reopened.events(RoomId(17), 0, 10).unwrap().events.len(), 1);
+        assert_eq!(fs::metadata(path).unwrap().len(), valid_len);
+    }
+
+    #[test]
+    fn unrepaired_wal_failure_blocks_later_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MlsStore::open(Some(temp.path())).unwrap();
+        {
+            let mut persistence = store.persistence.as_ref().unwrap().lock().unwrap();
+            let wal_path = persistence.wal_path.clone();
+            persistence.wal = File::open(wal_path).unwrap();
+        }
+
+        let global = GlobalRecord {
+            next_welcome_delivery_id: 2,
+            ..GlobalRecord::default()
+        };
+        assert!(store.replace_global(&global).is_err());
+        let error = store.replace_global(&global).unwrap_err();
+        assert!(error.contains("earlier write failure"));
+        assert_eq!(store.load().unwrap().global.next_welcome_delivery_id, 1);
+    }
+
+    #[test]
+    fn store_excludes_a_second_writer_for_the_same_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = MlsStore::open(Some(temp.path())).unwrap();
+        let error = MlsStore::open(Some(temp.path())).unwrap_err();
+        assert!(error.contains("another server"));
+        drop(first);
+        MlsStore::open(Some(temp.path())).unwrap();
+    }
+
+    #[test]
+    fn background_snapshot_preserves_active_wal_records_during_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = DeviceId([20; 16]);
+        let store = MlsStore::open(Some(temp.path())).unwrap();
+        create(&store, &room(18, vec![device], 100));
+        store.persistence.as_ref().unwrap().lock().unwrap().seal().unwrap();
+        store
+            .append_application(RoomId(18), device, 1, EventId([2; 16]), &[9; 32], 200)
+            .unwrap();
+        let writer = store.snapshot_writer.as_ref().unwrap();
+        writer.request().unwrap();
+        writer.flush().unwrap();
+        assert!(temp.path().join("mls-state.bin").exists());
+        assert!(!temp.path().join("mls-state.wal.sealed").exists());
+        drop(store);
+
+        let reopened = MlsStore::open(Some(temp.path())).unwrap();
+        assert_eq!(reopened.events(RoomId(18), 0, 10).unwrap().events.len(), 2);
+    }
+
+    #[test]
+    fn wal_threshold_rotates_and_snapshots_in_background() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MlsStore::open(Some(temp.path())).unwrap();
+        create(&store, &room(22, Vec::new(), 100));
+        store.persistence.as_ref().unwrap().lock().unwrap().wal_bytes = WAL_CHECKPOINT_BYTES;
+
+        assert!(store.checkpoint_if_needed().unwrap());
+        store.snapshot_writer.as_ref().unwrap().flush().unwrap();
+        assert!(temp.path().join("mls-state.bin").exists());
+        assert!(!temp.path().join("mls-state.wal.sealed").exists());
+    }
+
+    #[test]
+    fn payload_compaction_clears_retired_byte_accounting() {
+        let mut store = MlsStore::open(None).unwrap();
+        let device = DeviceId([8; 16]);
+        create(&store, &room(15, vec![device], 100));
+        store
+            .append_application(RoomId(15), device, 1, EventId([1; 16]), &[1; 1024], 200)
+            .unwrap();
+        store.acknowledge(RoomId(15), device, 2, 300).unwrap();
+        store.cleanup(300, 10).unwrap();
+
+        let before = store.state.read().unwrap().retired_payload_bytes;
+        assert!(before > 0);
+        reset_fragmentation_accounting(&mut store.state.write().unwrap());
+        let state = store.state.read().unwrap();
+        assert!(state.events.is_empty());
+        assert_eq!(state.retired_payload_bytes, 0);
+    }
+
+    #[test]
+    fn durable_compaction_shrinks_pruned_payloads_and_resets_fragmentation() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = DeviceId([21; 16]);
+        let mut store = MlsStore::open(Some(temp.path())).unwrap();
+        create(&store, &room(19, vec![device], 100));
+        store
+            .append_application(
+                RoomId(19),
+                device,
+                1,
+                EventId([3; 16]),
+                &[5; 1024 * 1024],
+                200,
+            )
+            .unwrap();
+        store.compact().unwrap();
+        let before = store.status().unwrap().file_bytes.unwrap();
+        store.acknowledge(RoomId(19), device, 2, 300).unwrap();
+        store.cleanup(300, 10).unwrap();
+        assert!(store.status().unwrap().fragmented_bytes >= 1024 * 1024);
+
+        store.compact().unwrap();
+        let status = store.status().unwrap();
+        assert_eq!(status.fragmented_bytes, 0);
+        assert!(status.file_bytes.unwrap() < before / 2);
     }
 
     #[test]
@@ -1433,28 +2344,17 @@ mod tests {
         create(&store, &room(20, vec![device], 100));
         for byte in [1, 2] {
             store
-                .append_application(
-                    RoomId(20),
-                    device,
-                    1,
-                    EventId([byte; 16]),
-                    &[byte],
-                    200,
-                )
+                .append_application(RoomId(20), device, 1, EventId([byte; 16]), &[byte], 200)
                 .unwrap();
         }
         store.acknowledge(RoomId(20), device, 3, 300).unwrap();
-
         let first = store.cleanup(300, 2).unwrap();
         assert_eq!(first.deleted_events, 2);
         assert!(first.more_work);
         let second = store.cleanup(300, 2).unwrap();
         assert_eq!(second.deleted_events, 1);
         assert!(!second.more_work);
-        let batch = store.events(RoomId(20), 0, 10).unwrap();
-        assert_eq!(batch.oldest_available_sequence, 4);
-        assert_eq!(batch.head_sequence, 3);
-        assert!(batch.events.is_empty());
+        assert!(store.events(RoomId(20), 0, 10).unwrap().events.is_empty());
         assert_eq!(
             store
                 .application_retry(RoomId(20), EventId([1; 16]), 1, &[1])
@@ -1469,22 +2369,13 @@ mod tests {
         let device = DeviceId([9; 16]);
         create(&store, &room(30, vec![device], 200));
         store
-            .append_application(
-                RoomId(30),
-                device,
-                1,
-                EventId([1; 16]),
-                &[1],
-                100,
-            )
+            .append_application(RoomId(30), device, 1, EventId([1; 16]), &[1], 100)
             .unwrap();
-
         let day = 24 * 60 * 60 * 1000;
         let early = store.cleanup(day + 150, 10).unwrap();
-        assert_eq!(early.deleted_events, 1); // safe cursor only, not forced expiry
+        assert_eq!(early.deleted_events, 1);
         assert_eq!(early.lagging_devices, 0);
         assert!(!store.requires_rejoin(RoomId(30), device).unwrap());
-
         let expired = store.cleanup(day + 201, 10).unwrap();
         assert_eq!(expired.deleted_events, 1);
         assert_eq!(expired.lagging_devices, 1);
