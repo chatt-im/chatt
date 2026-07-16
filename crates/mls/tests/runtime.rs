@@ -7,7 +7,7 @@ use mls_rs::{
     identity::{SigningIdentity, basic::BasicCredential},
 };
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+use mls_rs_crypto_awslc::AwsLcCryptoProvider;
 use rpc::{
     identity::{
         DeviceCertificateBody, DeviceRosterBody, SignedDeviceRoster, account_id,
@@ -24,7 +24,7 @@ struct Device {
 }
 
 fn device(server: &[u8], user: u64, authority_byte: u8, device_byte: u8) -> Device {
-    let crypto = RustCryptoProvider::default();
+    let crypto = AwsLcCryptoProvider::default();
     let cipher = crypto.cipher_suite_provider(CIPHER_SUITE).unwrap();
     let (signing_secret, signing_public) = cipher.signature_key_generate().unwrap();
     let authority_seed = [authority_byte; 32];
@@ -73,7 +73,7 @@ fn account_devices(
     authority_byte: u8,
     device_bytes: &[u8],
 ) -> Vec<Device> {
-    let crypto = RustCryptoProvider::default();
+    let crypto = AwsLcCryptoProvider::default();
     let cipher = crypto.cipher_suite_provider(CIPHER_SUITE).unwrap();
     let authority_seed = [authority_byte; 32];
     let authority_public_key = authority_public_key(&authority_seed).unwrap();
@@ -131,7 +131,7 @@ fn account_devices(
 
 fn client(identities: ChattIdentityProvider, device: &Device) -> Client<impl MlsConfig> {
     Client::builder()
-        .crypto_provider(RustCryptoProvider::default())
+        .crypto_provider(AwsLcCryptoProvider::default())
         .identity_provider(identities.clone())
         .mls_rules(ChattMlsPolicy::new(identities))
         .signing_identity(
@@ -239,7 +239,7 @@ fn public_server_observer_accepts_only_one_commit_for_an_epoch() {
         .unwrap();
     let group_info = alice_group.group_info_message(true).unwrap();
     let mut observer = ExternalClient::builder()
-        .crypto_provider(RustCryptoProvider::default())
+        .crypto_provider(AwsLcCryptoProvider::default())
         .identity_provider(identities.clone())
         .mls_rules(ChattMlsPolicy::new(identities.clone()))
         .build()

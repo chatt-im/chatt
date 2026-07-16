@@ -6,7 +6,10 @@ edition = "2024"
 [dependencies]
 rpc.path = "../rpc"
 jsony = "0.1.10"
-ring = "0.17.14"
+aws-lc-rs = { version = "=1.16.3", default-features = false, features = [
+    "alloc",
+] }
+aws-lc-sys = { version = "=0.40.0", optional = true }
 mls-rs = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = [
     "std",
     "private_message",
@@ -14,9 +17,13 @@ mls-rs = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928
     "external_client",
     "sqlcipher-bundled",
 ] }
-mls-rs-core = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = ["std"] }
-mls-rs-crypto-rustcrypto = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = ["std"] }
-mls-rs-provider-sqlite = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = ["sqlcipher-bundled"] }
+mls-rs-core = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = [
+    "std",
+] }
+mls-rs-crypto-awslc = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d" }
+mls-rs-provider-sqlite = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = [
+    "sqlcipher-bundled",
+] }
 rusqlite = { version = "0.37", default-features = false }
 
 [dev-dependencies]

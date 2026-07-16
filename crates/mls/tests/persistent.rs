@@ -4,7 +4,7 @@ use mls_rs::{
     identity::{SigningIdentity, basic::BasicCredential},
 };
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+use mls_rs_crypto_awslc::AwsLcCryptoProvider;
 use rpc::{
     identity::{
         DeviceCertificateBody, DeviceRosterBody, SignedDeviceRoster, account_id,
@@ -26,7 +26,7 @@ struct Device {
 }
 
 fn device(server: &[u8], user: u64, authority_byte: u8, device_byte: u8) -> Device {
-    let cipher = RustCryptoProvider::default()
+    let cipher = AwsLcCryptoProvider::default()
         .cipher_suite_provider(CIPHER_SUITE)
         .unwrap();
     let (signing_secret, signing_public) = cipher.signature_key_generate().unwrap();
