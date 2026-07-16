@@ -12,8 +12,8 @@ use rpc::{
     ids::{AccountId, DeviceId, EventId, RoomId, UserId},
     mls::{
         EncryptedRoomDescriptor, MlsCommitBundle, MlsCommitOutcome, MlsDeliveryEvent,
-        MlsSubmitOutcome, MlsWelcome, PublishedKeyPackage,
-        validate_commit_bundle, validate_key_packages,
+        MlsSubmitOutcome, MlsWelcome, PublishedKeyPackage, validate_commit_bundle,
+        validate_key_packages,
     },
 };
 
@@ -99,10 +99,8 @@ impl MlsService {
         Ok(service)
     }
 
-    /// Builds an in-memory read view of this service for the network loop.
-    /// The durable instance can then move to the delivery worker while the
-    /// loop continues to answer cache-only authorization queries without
-    /// touching the database.
+    /// Builds the cache view used for network-loop authorization and reads.
+    /// Both views share the same hot store; only the worker view owns storage.
     pub(super) fn in_memory_view(&self) -> Result<Self, String> {
         let mut view = Self::open_with_retention(
             None,
@@ -110,12 +108,9 @@ impl MlsService {
             self.default_retention_days,
             self.room_retention_days.clone(),
         )?;
+        view.store = self.store.read_handle();
         view.restore(self.snapshot())?;
         Ok(view)
-    }
-
-    pub(super) fn delivery_read_handle(&self) -> MlsStore {
-        self.store.read_handle()
     }
 
     pub(super) fn cache_state(&self) -> CacheState {
@@ -403,8 +398,8 @@ impl MlsService {
             .find(|certificate| certificate.body.device_id == device_id)
             .ok_or_else(|| "KeyPackages do not belong to an active session device".to_string())?;
         if packages
-                .iter()
-                .any(|package| package.device_id != device_id)
+            .iter()
+            .any(|package| package.device_id != device_id)
         {
             return Err("KeyPackages do not belong to an active session device".to_string());
         }
@@ -426,14 +421,19 @@ impl MlsService {
             if !batch_hashes.insert(hash) {
                 return Err("KeyPackage batch contains a duplicate".to_string());
             }
-            match self.key_packages.iter().find_map(|(queued_device, queued)| {
-                queued
-                    .iter()
-                    .any(|queued| queued == &package.package)
-                    .then_some(*queued_device)
-            }) {
+            match self
+                .key_packages
+                .iter()
+                .find_map(|(queued_device, queued)| {
+                    queued
+                        .iter()
+                        .any(|queued| queued == &package.package)
+                        .then_some(*queued_device)
+                }) {
                 Some(queued_device) if queued_device == device_id => {}
-                Some(_) => return Err("KeyPackage is already published by another device".to_string()),
+                Some(_) => {
+                    return Err("KeyPackage is already published by another device".to_string());
+                }
                 None => new_packages.push(package.package),
             }
         }
@@ -590,7 +590,9 @@ impl MlsService {
             return Err("room creation GroupInfo does not match descriptor".to_string());
         }
         if parent.member_client_ids.as_slice() != [creator_client_id] {
-            return Err("room creation parent must contain only the authenticated creator".to_string());
+            return Err(
+                "room creation parent must contain only the authenticated creator".to_string(),
+            );
         }
         let applied = validation_validator
             .apply_commit(&parent, &bundle)
@@ -619,14 +621,16 @@ impl MlsService {
             .map(|welcome| {
                 let delivery_id = self.next_welcome_delivery_id;
                 let next_delivery_id = self
-                .next_welcome_delivery_id
-                .checked_add(1)
-                .ok_or_else(|| "MLS Welcome delivery id is exhausted".to_string())?;
+                    .next_welcome_delivery_id
+                    .checked_add(1)
+                    .ok_or_else(|| "MLS Welcome delivery id is exhausted".to_string())?;
                 Ok::<_, String>((delivery_id, next_delivery_id, welcome.clone()))
             })
             .transpose()?;
         let mut global = self.snapshot().global;
-        global.used_key_packages.extend(applied.added_key_package_refs);
+        global
+            .used_key_packages
+            .extend(applied.added_key_package_refs);
         let welcome = welcome_delivery.as_ref().map(|(id, next, bundle)| {
             global.next_welcome_delivery_id = *next;
             (*id, bundle)
@@ -716,7 +720,8 @@ impl MlsService {
             && expected_epoch != room.public_state.epoch
         {
             if let Some((sequence, epoch)) =
-                self.store.find_commit(room_id, expected_epoch, &bundle.commit)?
+                self.store
+                    .find_commit(room_id, expected_epoch, &bundle.commit)?
             {
                 return Ok(MlsCommitOutcome::AlreadyAccepted { sequence, epoch });
             }
@@ -763,13 +768,13 @@ impl MlsService {
             return Ok(MlsCommitOutcome::PolicyRejected);
         }
         if Self::validate_welcome_targets(
-                &self.identities,
-                &previous.public_state,
-                &next,
-                &applied.committer_client_id,
-                &bundle,
-            )
-            .is_err()
+            &self.identities,
+            &previous.public_state,
+            &next,
+            &applied.committer_client_id,
+            &bundle,
+        )
+        .is_err()
         {
             return Ok(MlsCommitOutcome::PolicyRejected);
         }
@@ -796,7 +801,9 @@ impl MlsService {
         } else {
             None
         };
-        global.used_key_packages.extend(applied.added_key_package_refs);
+        global
+            .used_key_packages
+            .extend(applied.added_key_package_refs);
         let now = unix_time_ms().max(previous.last_event_time_unix_ms);
         let mut required_devices = Self::required_devices(&self.identities, &next)?;
         required_devices.sort_unstable();
@@ -817,13 +824,8 @@ impl MlsService {
             epoch: room.public_state.epoch,
             commit: bundle.commit,
         };
-        self.store.append_commit(
-            &global,
-            &previous,
-            &room,
-            &event,
-            welcome_delivery,
-        )?;
+        self.store
+            .append_commit(&global, &previous, &room, &event, welcome_delivery)?;
         self.used_key_packages = global.used_key_packages.into_iter().collect();
         self.next_welcome_delivery_id = global.next_welcome_delivery_id;
         self.rooms.insert(room_id, room.clone());
@@ -861,8 +863,7 @@ impl MlsService {
             .iter()
             .filter(|client_id| {
                 !current_members.contains(client_id.as_slice())
-                    && !(committer_is_external
-                        && client_id.as_slice() == committer_client_id)
+                    && !(committer_is_external && client_id.as_slice() == committer_client_id)
             })
             .map(|client_id| {
                 identities
@@ -970,13 +971,7 @@ impl MlsService {
         event_id: EventId,
         ciphertext: Vec<u8>,
     ) -> Result<MlsSubmitOutcome, String> {
-        self.submit_application_for_device(
-            room_id,
-            DeviceId([0; 16]),
-            epoch,
-            event_id,
-            ciphertext,
-        )
+        self.submit_application_for_device(room_id, DeviceId([0; 16]), epoch, event_id, ciphertext)
     }
 
     pub fn submit_application_for_device(
@@ -988,11 +983,7 @@ impl MlsService {
         ciphertext: Vec<u8>,
     ) -> Result<MlsSubmitOutcome, String> {
         self.submit_application_for_device_with_event(
-            room_id,
-            device_id,
-            epoch,
-            event_id,
-            ciphertext,
+            room_id, device_id, epoch, event_id, ciphertext,
         )
         .map(|(outcome, _)| outcome)
     }
@@ -1068,15 +1059,14 @@ impl MlsService {
             AppendApplicationResult::Conflict => {
                 Err("MLS event id was reused for a different application".to_string())
             }
-            AppendApplicationResult::StaleEpoch { current_epoch } => {
-                Ok((MlsSubmitOutcome::StaleEpochNotStored { current_epoch }, None))
-            }
+            AppendApplicationResult::StaleEpoch { current_epoch } => Ok((
+                MlsSubmitOutcome::StaleEpochNotStored { current_epoch },
+                None,
+            )),
             AppendApplicationResult::RevocationPending => {
                 Ok((MlsSubmitOutcome::RevocationPending, None))
             }
-            AppendApplicationResult::RejoinRequired => {
-                Ok((MlsSubmitOutcome::RejoinRequired, None))
-            }
+            AppendApplicationResult::RejoinRequired => Ok((MlsSubmitOutcome::RejoinRequired, None)),
         }
     }
 
@@ -1088,7 +1078,10 @@ impl MlsService {
         limit: usize,
     ) -> Option<Vec<MlsDeliveryEvent>> {
         self.rooms.get(&room_id)?;
-        self.store.events(room_id, after, limit).ok().map(|batch| batch.events)
+        self.store
+            .events(room_id, after, limit)
+            .ok()
+            .map(|batch| batch.events)
     }
 
     pub fn event_batch(
@@ -1113,20 +1106,31 @@ impl MlsService {
         room_id: RoomId,
         device_id: DeviceId,
         sequence: u64,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         self.store
             .acknowledge(room_id, device_id, sequence, unix_time_ms())
     }
 
-    pub fn acknowledge_welcome(
-        &self,
-        device_id: DeviceId,
-        delivery_id: u64,
-    ) -> Result<(), String> {
+    pub fn acknowledge_welcome(&self, device_id: DeviceId, delivery_id: u64) -> Result<bool, String> {
         self.store.acknowledge_welcome(device_id, delivery_id)
     }
 
-    pub fn cleanup(&mut self, batch_events: usize) -> Result<crate::mls_store::CleanupReport, String> {
+    pub fn persist_acknowledgement(
+        &self,
+        room_id: RoomId,
+        device_id: DeviceId,
+    ) -> Result<(), String> {
+        self.store.persist_acknowledgement(room_id, device_id)
+    }
+
+    pub fn persist_welcome_acknowledgement(&self, device_id: DeviceId) -> Result<(), String> {
+        self.store.persist_welcome_acknowledgement(device_id)
+    }
+
+    pub fn cleanup(
+        &mut self,
+        batch_events: usize,
+    ) -> Result<crate::mls_store::CleanupReport, String> {
         let report = self.store.cleanup(unix_time_ms(), batch_events)?;
         if report.deleted_events > 0 {
             self.rooms = self
@@ -1146,6 +1150,10 @@ impl MlsService {
 
     pub fn compact(&mut self) -> Result<bool, String> {
         self.store.compact()
+    }
+
+    pub fn checkpoint_if_needed(&self) -> Result<bool, String> {
+        self.store.checkpoint_if_needed()
     }
 
     pub fn room_account_member(&self, room_id: RoomId, account_id: AccountId) -> bool {
@@ -1180,7 +1188,11 @@ impl MlsService {
     fn snapshot_global(&self) -> GlobalRecord {
         GlobalRecord {
             initialized_accounts: {
-                let mut users = self.initialized_accounts.iter().copied().collect::<Vec<_>>();
+                let mut users = self
+                    .initialized_accounts
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
                 users.sort_unstable();
                 users
             },
@@ -1195,7 +1207,11 @@ impl MlsService {
                 .map(|(device_id, packages)| (*device_id, packages.iter().cloned().collect()))
                 .collect(),
             retired_key_packages: {
-                let mut hashes = self.retired_key_packages.iter().copied().collect::<Vec<_>>();
+                let mut hashes = self
+                    .retired_key_packages
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
                 hashes.sort_unstable();
                 hashes
             },
@@ -1241,7 +1257,8 @@ impl MlsService {
         self.identities = identities;
         self.initialized_accounts = state.global.initialized_accounts.into_iter().collect();
         self.rosters = rosters;
-        self.key_packages = state.global
+        self.key_packages = state
+            .global
             .key_packages
             .into_iter()
             .map(|(device_id, packages)| (device_id, packages.into()))
@@ -1263,7 +1280,9 @@ impl MlsService {
         for (user_id, roster) in &self.rosters {
             for certificate in &roster.body.active_devices {
                 if self.device_owners.get(&certificate.body.device_id) != Some(user_id) {
-                    return Err("persisted MLS device ownership does not match its roster".to_string());
+                    return Err(
+                        "persisted MLS device ownership does not match its roster".to_string()
+                    );
                 }
             }
         }
@@ -1348,7 +1367,10 @@ impl MlsService {
             }
             if room.oldest_available_sequence == 0
                 || room.oldest_available_sequence > room.head_sequence.saturating_add(1)
-                || room.required_devices.windows(2).any(|pair| pair[0] >= pair[1])
+                || room
+                    .required_devices
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
             {
                 return Err("MLS room durable metadata is inconsistent".to_string());
             }
@@ -1399,9 +1421,7 @@ fn unix_time_ms() -> u64 {
 mod tests {
     use chatt_mls::LocalInstallation;
     use rpc::{
-        identity::{
-            mls_client_id, roster_checkpoint, sign_device_certificate, sign_device_roster,
-        },
+        identity::{mls_client_id, roster_checkpoint, sign_device_certificate, sign_device_roster},
         ids::{EventId, RoomId, UserId},
         mls::{
             ChattEventContent, EncryptedRoomDescriptor, MLS_PROTOCOL_VERSION, MlsChattEvent,
@@ -1412,7 +1432,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initialized_fact_and_roster_share_the_redb_transaction() {
+    fn initialized_fact_and_roster_share_the_transaction() {
         let temp = tempfile::tempdir().unwrap();
         let server_id = [6u8; 32];
         let (installation, _) = LocalInstallation::open_or_create(
@@ -1513,12 +1533,7 @@ mod tests {
         std::fs::create_dir(&state_dir).unwrap();
         let mut service = MlsService::open(Some(state_dir.clone()), server_id.to_vec()).unwrap();
         service
-            .put_roster(
-                UserId(20),
-                None,
-                alice.bootstrap.own_roster.clone(),
-                None,
-            )
+            .put_roster(UserId(20), None, alice.bootstrap.own_roster.clone(), None)
             .unwrap();
         drop(service);
 
@@ -1589,11 +1604,7 @@ mod tests {
         let mut service = MlsService::open(Some(state_dir), server_id.to_vec()).unwrap();
         assert!(
             service
-                .publish_key_packages(
-                    user_id,
-                    installation.bootstrap.device_id,
-                    vec![package],
-                )
+                .publish_key_packages(user_id, installation.bootstrap.device_id, vec![package],)
                 .is_err()
         );
     }
@@ -1690,10 +1701,7 @@ mod tests {
         .unwrap();
         let reused_bundle = alice
             .client
-            .create_room(
-                &reused_descriptor,
-                &[(bob.bootstrap.device_id, package)],
-            )
+            .create_room(&reused_descriptor, &[(bob.bootstrap.device_id, package)])
             .unwrap();
         assert!(
             service
@@ -1789,12 +1797,7 @@ mod tests {
         );
         assert!(
             service
-                .submit_application(
-                    descriptor.room_id,
-                    2,
-                    EventId([6; 16]),
-                    ciphertext,
-                )
+                .submit_application(descriptor.room_id, 2, EventId([6; 16]), ciphertext,)
                 .unwrap_err()
                 .contains("current group epoch")
         );
@@ -1867,18 +1870,10 @@ mod tests {
             .unwrap()
             .remove(0);
         service
-            .publish_key_packages(
-                UserId(12),
-                bob.bootstrap.device_id,
-                vec![bob_package],
-            )
+            .publish_key_packages(UserId(12), bob.bootstrap.device_id, vec![bob_package])
             .unwrap();
         service
-            .publish_key_packages(
-                UserId(13),
-                carol.bootstrap.device_id,
-                vec![carol_package],
-            )
+            .publish_key_packages(UserId(13), carol.bootstrap.device_id, vec![carol_package])
             .unwrap();
         let bob_package = service
             .take_key_package(bob.bootstrap.device_id)
@@ -1911,12 +1906,7 @@ mod tests {
             .unwrap();
         assert_eq!(bundle.welcome.as_ref().unwrap().device_ids.len(), 2);
         let mut wrong_targets = bundle.clone();
-        wrong_targets
-            .welcome
-            .as_mut()
-            .unwrap()
-            .device_ids
-            .pop();
+        wrong_targets.welcome.as_mut().unwrap().device_ids.pop();
         assert!(
             service
                 .create_room(

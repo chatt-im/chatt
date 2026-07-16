@@ -63,7 +63,7 @@ use config::{
 };
 use history_reader::{HistoryReadReply, HistoryReader};
 use local_admin::{AdminCommand, AdminSocket};
-use mls_delivery::{MlsEventQueue, MlsReadPool};
+use mls_delivery::MlsEventQueue;
 use mls_service::{CacheState as MlsCacheState, MlsService, PutRosterError};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
@@ -417,7 +417,6 @@ pub struct Server {
     usernames: UsernameRegistry,
     mls: MlsService,
     mls_worker: MlsWorker,
-    mls_readers: Option<MlsReadPool>,
     mls_events: Arc<MlsEventQueue>,
     /// Control connections waiting for a durability-sensitive MLS operation.
     /// Their already-buffered later frames remain parked until the ordered
@@ -518,15 +517,6 @@ enum MlsReply {
         file_receive_limit_bytes: u64,
         result: Result<MlsCacheState, String>,
     },
-    EventBatch {
-        token: Token,
-        room_id: RoomId,
-        result: Result<mls_store::EventBatch, String>,
-    },
-    Welcomes {
-        token: Token,
-        result: Result<(Vec<rpc::mls::MlsWelcome>, u64), String>,
-    },
     ApplicationSubmitted {
         token: Token,
         room_id: RoomId,
@@ -536,12 +526,9 @@ enum MlsReply {
             Option<mls_store::EventBatch>,
         ), String>,
     },
-    Background(Result<(), String>),
-    DispatchRead(MlsReadRequest),
     Compacted {
         admin_reply: Option<mpsc::Sender<Result<String, String>>>,
         result: Result<Option<(bool, Option<u64>, Option<u64>)>, String>,
-        read_handles: Vec<mls_store::MlsStore>,
         started: Instant,
     },
     Cleanup {
@@ -564,19 +551,16 @@ enum MlsReply {
     },
 }
 
-/// The sole owner of the durable MLS service. redb transactions and fsyncs
-/// run here; the mio loop owns only an in-memory authorization view.
+/// Serializes authoritative MLS mutations and all durable storage I/O away
+/// from the mio loop. Readers use the shared in-memory store directly.
 struct MlsWorker {
     requests: Option<mpsc::Sender<MlsWriteRequest>>,
     thread: Option<thread::JoinHandle<()>>,
+    pending_acknowledgements: Arc<std::sync::Mutex<HashSet<(RoomId, DeviceId)>>>,
+    pending_welcome_acknowledgements: Arc<std::sync::Mutex<HashSet<DeviceId>>>,
 }
 
 enum MlsWriteRequest {
-    #[cfg(test)]
-    BlockForTest {
-        started: mpsc::Sender<()>,
-        release: mpsc::Receiver<()>,
-    },
     PutRoster {
         token: Token,
         session_id: SessionId,
@@ -627,27 +611,6 @@ enum MlsWriteRequest {
         event_id: rpc::ids::EventId,
         ciphertext: Vec<u8>,
     },
-    AckEvent {
-        room_id: RoomId,
-        device_id: DeviceId,
-        sequence: u64,
-    },
-    AckWelcome {
-        device_id: DeviceId,
-        delivery_id: u64,
-    },
-    AckThenReadEvents {
-        token: Token,
-        room_id: RoomId,
-        device_id: DeviceId,
-        after_sequence: u64,
-        limit: usize,
-    },
-    AckThenReadWelcomes {
-        token: Token,
-        device_id: DeviceId,
-        after_sequence: u64,
-    },
     Compact {
         scheduled: bool,
         minimum_fragmented_bytes: u64,
@@ -672,27 +635,92 @@ enum MlsWriteRequest {
         token: Token,
         device_id: DeviceId,
     },
+    PersistAcknowledgement {
+        room_id: RoomId,
+        device_id: DeviceId,
+    },
+    PersistWelcomeAcknowledgement {
+        device_id: DeviceId,
+    },
 }
 
 impl MlsWorker {
-    fn spawn(
-        mut service: MlsService,
-        events: Arc<MlsEventQueue>,
-    ) -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<MlsWriteRequest>();
+    fn spawn(mut service: MlsService, events: Arc<MlsEventQueue>) -> Self {
+        let (requests, receiver) = mpsc::channel();
+        let pending_acknowledgements = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pending_welcome_acknowledgements = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let worker_pending_acknowledgements = Arc::clone(&pending_acknowledgements);
+        let worker_pending_welcome_acknowledgements =
+            Arc::clone(&pending_welcome_acknowledgements);
         let thread = thread::Builder::new()
-            .name("chatt-mls-delivery".to_string())
+            .name("chatt-mls-durability".to_string())
             .spawn(move || {
-                while let Ok(request) = request_rx.recv() {
-                    match request {
-                        #[cfg(test)]
-                        MlsWriteRequest::BlockForTest { started, release } => {
-                            let result = started
-                                .send(())
-                                .map_err(|error| error.to_string())
-                                .and_then(|_| release.recv().map_err(|error| error.to_string()));
-                            events.push(MlsReply::Background(result));
-                        }
+                while let Ok(request) = receiver.recv() {
+                    Self::process(
+                        &mut service,
+                        &events,
+                        &worker_pending_acknowledgements,
+                        &worker_pending_welcome_acknowledgements,
+                        request,
+                    );
+                }
+            })
+            .expect("failed to spawn MLS durability worker");
+        Self {
+            requests: Some(requests),
+            thread: Some(thread),
+            pending_acknowledgements,
+            pending_welcome_acknowledgements,
+        }
+    }
+
+    fn enqueue_typed(&self, request: MlsWriteRequest) -> bool {
+        self.requests
+            .as_ref()
+            .is_some_and(|requests| requests.send(request).is_ok())
+    }
+
+    fn persist_acknowledgement(&self, room_id: RoomId, device_id: DeviceId) -> bool {
+        let key = (room_id, device_id);
+        if !self.pending_acknowledgements.lock().unwrap().insert(key) {
+            return true;
+        }
+        if self.enqueue_typed(MlsWriteRequest::PersistAcknowledgement { room_id, device_id }) {
+            true
+        } else {
+            self.pending_acknowledgements.lock().unwrap().remove(&key);
+            false
+        }
+    }
+
+    fn persist_welcome_acknowledgement(&self, device_id: DeviceId) -> bool {
+        if !self
+            .pending_welcome_acknowledgements
+            .lock()
+            .unwrap()
+            .insert(device_id)
+        {
+            return true;
+        }
+        if self.enqueue_typed(MlsWriteRequest::PersistWelcomeAcknowledgement { device_id }) {
+            true
+        } else {
+            self.pending_welcome_acknowledgements
+                .lock()
+                .unwrap()
+                .remove(&device_id);
+            false
+        }
+    }
+
+    fn process(
+        service: &mut MlsService,
+        events: &MlsEventQueue,
+        pending_acknowledgements: &std::sync::Mutex<HashSet<(RoomId, DeviceId)>>,
+        pending_welcome_acknowledgements: &std::sync::Mutex<HashSet<DeviceId>>,
+        request: MlsWriteRequest,
+    ) {
+        match request {
                         MlsWriteRequest::PutRoster {
                             token,
                             session_id,
@@ -851,61 +879,6 @@ impl MlsWorker {
                                 ciphertext,
                             ),
                         }),
-                        MlsWriteRequest::AckEvent {
-                            room_id,
-                            device_id,
-                            sequence,
-                        } => events.push(MlsReply::Background(
-                            service.acknowledge(room_id, device_id, sequence),
-                        )),
-                        MlsWriteRequest::AckWelcome {
-                            device_id,
-                            delivery_id,
-                        } => events.push(MlsReply::Background(
-                            service.acknowledge_welcome(device_id, delivery_id),
-                        )),
-                        MlsWriteRequest::AckThenReadEvents {
-                            token,
-                            room_id,
-                            device_id,
-                            after_sequence,
-                            limit,
-                        } => match service.acknowledge(
-                            room_id,
-                            device_id,
-                            after_sequence,
-                        ) {
-                            Ok(()) => events.push(MlsReply::DispatchRead(
-                                MlsReadRequest::Events {
-                                    token,
-                                    room_id,
-                                    after_sequence,
-                                    limit,
-                                },
-                            )),
-                            Err(error) => events.push(MlsReply::EventBatch {
-                                token,
-                                room_id,
-                                result: Err(error),
-                            }),
-                        },
-                        MlsWriteRequest::AckThenReadWelcomes {
-                            token,
-                            device_id,
-                            after_sequence,
-                        } => match service.acknowledge_welcome(device_id, after_sequence) {
-                            Ok(()) => events.push(MlsReply::DispatchRead(
-                                MlsReadRequest::Welcomes {
-                                    token,
-                                    device_id,
-                                    after_sequence,
-                                },
-                            )),
-                            Err(error) => events.push(MlsReply::Welcomes {
-                                token,
-                                result: Err(error),
-                            }),
-                        },
                         MlsWriteRequest::Compact {
                             scheduled,
                             minimum_fragmented_bytes,
@@ -936,14 +909,9 @@ impl MlsWorker {
                                     .and_then(|status| status.file_bytes);
                                 Ok(Some((compacted, before, after)))
                             })();
-                            let read_handles = vec![
-                                service.delivery_read_handle(),
-                                service.delivery_read_handle(),
-                            ];
                             events.push(MlsReply::Compacted {
                                 admin_reply,
                                 result,
-                                read_handles,
                                 started,
                             });
                         }
@@ -1000,41 +968,33 @@ impl MlsWorker {
                                 result,
                             });
                         }
-                    }
-                }
-            })
-            .expect("failed to spawn MLS delivery worker");
-        Self {
-            requests: Some(request_tx),
-            thread: Some(thread),
+                        MlsWriteRequest::PersistAcknowledgement { room_id, device_id } => {
+                            pending_acknowledgements
+                                .lock()
+                                .unwrap()
+                                .remove(&(room_id, device_id));
+                            if let Err(error) = service.persist_acknowledgement(room_id, device_id) {
+                                kvlog::warn!("MLS acknowledgement persistence failed", error = error.as_str());
+                            }
+                        }
+                        MlsWriteRequest::PersistWelcomeAcknowledgement { device_id } => {
+                            pending_welcome_acknowledgements
+                                .lock()
+                                .unwrap()
+                                .remove(&device_id);
+                            if let Err(error) = service.persist_welcome_acknowledgement(device_id) {
+                                kvlog::warn!("MLS Welcome acknowledgement persistence failed", error = error.as_str());
+                            }
+                        }
+        }
+        if let Err(error) = service.checkpoint_if_needed() {
+            kvlog::error!("MLS WAL rotation failed", error = error.as_str());
         }
     }
-
-    fn enqueue_typed(&self, request: MlsWriteRequest) -> bool {
-        self.requests
-            .as_ref()
-            .is_some_and(|requests| requests.send(request).is_ok())
-    }
-}
-
-enum MlsReadRequest {
-    Events {
-        token: Token,
-        room_id: RoomId,
-        after_sequence: u64,
-        limit: usize,
-    },
-    Welcomes {
-        token: Token,
-        device_id: DeviceId,
-        after_sequence: u64,
-    },
 }
 
 impl Drop for MlsWorker {
     fn drop(&mut self) {
-        // Closing the request channel lets the worker finish every operation
-        // already accepted before a clean server shutdown returns.
         self.requests.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -1192,10 +1152,6 @@ impl Server {
         let mls = durable_mls
             .in_memory_view()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let mls_read_handles = vec![
-            durable_mls.delivery_read_handle(),
-            durable_mls.delivery_read_handle(),
-        ];
         let mut rooms = HashMap::new();
         for room in &config.rooms {
             let access = match &room.members {
@@ -1252,9 +1208,8 @@ impl Server {
 
         let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
         let (history_reader, history_replies) = HistoryReader::spawn(Arc::clone(&waker));
-        let mls_events = Arc::new(MlsEventQueue::new(waker));
+        let mls_events = Arc::new(MlsEventQueue::new(Arc::clone(&waker)));
         let mls_worker = MlsWorker::spawn(durable_mls, Arc::clone(&mls_events));
-        let mls_readers = MlsReadPool::spawn(mls_read_handles, Arc::clone(&mls_events));
 
         kvlog::info!(
             "server identity loaded",
@@ -1277,7 +1232,6 @@ impl Server {
             usernames,
             mls,
             mls_worker,
-            mls_readers: Some(mls_readers),
             mls_events,
             pending_mls: HashSet::new(),
             poll,
@@ -1452,7 +1406,6 @@ impl Server {
             .mls_compaction_min_fragmented_mib
             .saturating_mul(1024 * 1024);
         let minimum_percent = self.config.storage.mls_compaction_min_fragmented_percent;
-        drop(self.mls_readers.take());
         let queued = self.mls_worker.enqueue_typed(MlsWriteRequest::Compact {
             scheduled: true,
             minimum_fragmented_bytes: minimum,
@@ -1491,7 +1444,6 @@ impl Server {
                         ));
                         continue;
                     }
-                    drop(self.mls_readers.take());
                     if self.mls_worker.enqueue_typed(MlsWriteRequest::Compact {
                         scheduled: false,
                         minimum_fragmented_bytes: 0,
@@ -3108,76 +3060,49 @@ impl Server {
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 self.require_mls_room_member(user_id, room_id)?;
                 let device_id = bound.device_id;
-                if after_sequence == 0 {
-                    if !self.pending_mls.insert(token) {
-                        return Err("connection already has an MLS delivery operation pending".into());
+                if after_sequence > 0 {
+                    if self.mls.acknowledge(room_id, device_id, after_sequence)?
+                        && !self.mls_worker.persist_acknowledgement(room_id, device_id)
+                    {
+                        return Err("MLS durability worker is unavailable".to_string());
                     }
-                    if self.mls_readers.as_ref().is_some_and(|readers| {
-                        readers.enqueue(MlsReadRequest::Events {
-                            token,
-                            room_id,
-                            after_sequence,
-                            limit: usize::from(limit),
-                        })
-                    }) {
-                        return Ok(());
-                    }
-                    self.pending_mls.remove(&token);
-                    return Err("MLS delivery readers are unavailable".into());
                 }
-                if !self.pending_mls.insert(token) {
-                    return Err("connection already has an MLS delivery operation pending".into());
-                }
-                if self.mls_worker.enqueue_typed(MlsWriteRequest::AckThenReadEvents {
+                let batch = self
+                    .mls
+                    .event_batch(room_id, after_sequence, usize::from(limit))?;
+                self.send_control_to_token(
                     token,
-                    room_id,
-                    device_id,
-                    after_sequence,
-                    limit: usize::from(limit),
-                }) {
-                    Ok(())
-                } else {
-                    self.pending_mls.remove(&token);
-                    Err("MLS delivery worker is unavailable".into())
-                }
+                    &ServerControl::MlsEvents {
+                        room_id,
+                        events: batch.events,
+                        oldest_available_sequence: batch.oldest_available_sequence,
+                        head_sequence: batch.head_sequence,
+                    },
+                )
             }
             ClientControl::FetchMlsWelcome { after_sequence } => {
                 let bound = bound
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 let device_id = bound.device_id;
-                if after_sequence == 0 {
-                    if !self.pending_mls.insert(token) {
-                        return Err("connection already has an MLS delivery operation pending".into());
+                if after_sequence > 0 {
+                    if self.mls.acknowledge_welcome(device_id, after_sequence)?
+                        && !self
+                            .mls_worker
+                            .persist_welcome_acknowledgement(device_id)
+                    {
+                        return Err("MLS durability worker is unavailable".to_string());
                     }
-                    if self.mls_readers.as_ref().is_some_and(|readers| {
-                        readers.enqueue(MlsReadRequest::Welcomes {
-                            token,
-                            device_id,
-                            after_sequence,
-                        })
-                    }) {
-                        return Ok(());
-                    }
-                    self.pending_mls.remove(&token);
-                    return Err("MLS delivery readers are unavailable".into());
                 }
-                if !self.pending_mls.insert(token) {
-                    return Err("connection already has an MLS delivery operation pending".into());
-                }
-                if self
-                    .mls_worker
-                    .enqueue_typed(MlsWriteRequest::AckThenReadWelcomes {
-                        token,
-                        device_id,
-                        after_sequence,
-                    })
-                {
-                    Ok(())
-                } else {
-                    self.pending_mls.remove(&token);
-                    Err("MLS delivery worker is unavailable".into())
-                }
+                let welcomes = self.mls.welcomes(device_id, after_sequence)?;
+                let head_sequence = self.mls.welcome_head(device_id)?;
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::MlsWelcomes {
+                        welcomes,
+                        head_sequence,
+                    },
+                )
             }
             ClientControl::AckMlsEvent { room_id, sequence } => {
                 let bound = bound
@@ -3185,12 +3110,10 @@ impl Server {
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 self.require_mls_room_member(user_id, room_id)?;
                 let device_id = bound.device_id;
-                if !self.mls_worker.enqueue_typed(MlsWriteRequest::AckEvent {
-                    room_id,
-                    device_id,
-                    sequence,
-                }) {
-                    return Err("MLS delivery worker is unavailable".to_string());
+                if self.mls.acknowledge(room_id, device_id, sequence)?
+                    && !self.mls_worker.persist_acknowledgement(room_id, device_id)
+                {
+                    return Err("MLS durability worker is unavailable".to_string());
                 }
                 Ok(())
             }
@@ -3199,11 +3122,12 @@ impl Server {
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 let device_id = bound.device_id;
-                if !self.mls_worker.enqueue_typed(MlsWriteRequest::AckWelcome {
-                    device_id,
-                    delivery_id,
-                }) {
-                    return Err("MLS delivery worker is unavailable".to_string());
+                if self.mls.acknowledge_welcome(device_id, delivery_id)?
+                    && !self
+                        .mls_worker
+                        .persist_welcome_acknowledgement(device_id)
+                {
+                    return Err("MLS durability worker is unavailable".to_string());
                 }
                 Ok(())
             }
@@ -4851,36 +4775,6 @@ impl Server {
                     });
                     (Some(token), result)
                 }
-                MlsReply::EventBatch {
-                    token,
-                    room_id,
-                    result,
-                } => {
-                    let result = result.and_then(|batch| {
-                        self.send_control_to_token(
-                            token,
-                            &ServerControl::MlsEvents {
-                                room_id,
-                                events: batch.events,
-                                oldest_available_sequence: batch.oldest_available_sequence,
-                                head_sequence: batch.head_sequence,
-                            },
-                        )
-                    });
-                    (Some(token), result)
-                }
-                MlsReply::Welcomes { token, result } => {
-                    let result = result.and_then(|(welcomes, head_sequence)| {
-                        self.send_control_to_token(
-                            token,
-                            &ServerControl::MlsWelcomes {
-                                welcomes,
-                                head_sequence,
-                            },
-                        )
-                    });
-                    (Some(token), result)
-                }
                 MlsReply::ApplicationSubmitted {
                     token,
                     room_id,
@@ -4917,34 +4811,11 @@ impl Server {
                     });
                     (Some(token), result)
                 }
-                MlsReply::Background(result) => (None, result),
-                MlsReply::DispatchRead(request) => {
-                    let token = match &request {
-                        MlsReadRequest::Events { token, .. }
-                        | MlsReadRequest::Welcomes { token, .. } => *token,
-                    };
-                    if self
-                        .mls_readers
-                        .as_ref()
-                        .is_some_and(|readers| readers.enqueue(request))
-                    {
-                        continue;
-                    }
-                    (
-                        Some(token),
-                        Err("MLS delivery readers are unavailable".to_string()),
-                    )
-                }
                 MlsReply::Compacted {
                     admin_reply,
                     result,
-                    read_handles,
                     started,
                 } => {
-                    self.mls_readers = Some(MlsReadPool::spawn(
-                        read_handles,
-                        Arc::clone(&self.mls_events),
-                    ));
                     self.mls_compaction_pending = false;
                     self.next_mls_compaction_at = Instant::now()
                         + Duration::from_secs(
@@ -8200,39 +8071,6 @@ mod tests {
             bootstrap_credential_hash: None,
         }));
         finish_test_roster(server);
-    }
-
-    #[test]
-    fn delivery_worker_does_not_block_other_connections() {
-        let mut server = test_server();
-        let _blocked_peer = seed_session_client(&mut server, Token(30));
-        let mut responsive_peer = seed_session_client(&mut server, Token(31));
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-
-        assert!(server
-            .mls_worker
-            .enqueue_typed(MlsWriteRequest::BlockForTest {
-                started: started_tx,
-                release: release_rx,
-            }));
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        server
-            .send_control_to_token(Token(31), &ServerControl::Pong { nonce: 77 })
-            .unwrap();
-        server.write_client(Token(31));
-        assert!(matches!(
-            read_plaintext_server_control(&mut responsive_peer),
-            ServerControl::Pong { nonce: 77 }
-        ));
-
-        release_tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while server.mls_events.drain().is_empty() {
-            assert!(Instant::now() < deadline, "MLS worker reply");
-            thread::yield_now();
-        }
     }
 
     #[test]
