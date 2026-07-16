@@ -535,16 +535,8 @@ impl MlsService {
         checkpoints: &[RosterCheckpoint],
         bundle: MlsCommitBundle,
     ) -> Result<u64, String> {
-        descriptor.validate()?;
-        validate_commit_bundle(&bundle)?;
-        if bundle
-            .welcome
-            .as_ref()
-            .is_some_and(|welcome| welcome.descriptor != descriptor)
-        {
-            return Err("initial Welcome room descriptor does not match".to_string());
-        }
-        if descriptor.creator != creator || self.rooms.contains_key(&descriptor.room_id) {
+        Self::validate_room_creation_envelope(creator, &descriptor, &bundle)?;
+        if self.rooms.contains_key(&descriptor.room_id) {
             return Err("encrypted room creator or room id is invalid".to_string());
         }
         if checkpoints.len() != descriptor.member_accounts.len() {
@@ -666,6 +658,41 @@ impl MlsService {
         self.next_welcome_delivery_id = global.next_welcome_delivery_id;
         self.rooms.insert(descriptor.room_id, room);
         Ok(next.epoch)
+    }
+
+    /// Returns the canonical room when another queued creation won first.
+    /// The network loop already has the same existing-room fast path, but two
+    /// requests can both miss its cache before the durability worker processes
+    /// either one. Validate the request envelope before treating that race as
+    /// reconciliation rather than a protocol violation.
+    pub(super) fn existing_room_for_creation(
+        &self,
+        creator: AccountId,
+        descriptor: &EncryptedRoomDescriptor,
+        bundle: &MlsCommitBundle,
+    ) -> Result<Option<RoomRecord>, String> {
+        Self::validate_room_creation_envelope(creator, descriptor, bundle)?;
+        Ok(self.cached_room(descriptor.room_id))
+    }
+
+    fn validate_room_creation_envelope(
+        creator: AccountId,
+        descriptor: &EncryptedRoomDescriptor,
+        bundle: &MlsCommitBundle,
+    ) -> Result<(), String> {
+        descriptor.validate()?;
+        validate_commit_bundle(bundle)?;
+        if bundle
+            .welcome
+            .as_ref()
+            .is_some_and(|welcome| welcome.descriptor != *descriptor)
+        {
+            return Err("initial Welcome room descriptor does not match".to_string());
+        }
+        if descriptor.creator != creator {
+            return Err("encrypted room creator or room id is invalid".to_string());
+        }
+        Ok(())
     }
 
     pub fn group_info(&self, room_id: RoomId) -> Option<(&EncryptedRoomDescriptor, u64, &[u8])> {

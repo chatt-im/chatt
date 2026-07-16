@@ -485,11 +485,7 @@ enum MlsReply {
     RoomCreated {
         token: Token,
         room_id: RoomId,
-        result: Result<(
-            u64,
-            mls_store::RoomRecord,
-            Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>,
-        ), String>,
+        result: Result<RoomCreationReply, String>,
     },
     CommitSubmitted {
         token: Token,
@@ -548,6 +544,17 @@ enum MlsReply {
         token: Token,
         device_id: DeviceId,
         result: Result<(Option<Vec<u8>>, u16, Vec<Vec<u8>>), String>,
+    },
+}
+
+enum RoomCreationReply {
+    Created {
+        epoch: u64,
+        room: mls_store::RoomRecord,
+        deliveries: Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>,
+    },
+    Existing {
+        room: mls_store::RoomRecord,
     },
 }
 
@@ -758,21 +765,32 @@ impl MlsWorker {
                             welcome_devices,
                         } => {
                             let room_id = descriptor.room_id;
-                            let result = service
-                                .create_room(
+                            let result = (|| {
+                                if let Some(room) = service.existing_room_for_creation(
+                                    creator,
+                                    &descriptor,
+                                    &bundle,
+                                )? {
+                                    return Ok(RoomCreationReply::Existing { room });
+                                }
+                                let epoch = service.create_room(
                                     creator,
                                     &creator_client_id,
                                     descriptor,
                                     &checkpoints,
                                     bundle,
-                                )
-                                .and_then(|epoch| {
-                                    Ok((
-                                        epoch,
-                                        service.cached_room(room_id).expect("created room cache"),
-                                        collect_latest_welcomes(&service, &welcome_devices)?,
-                                    ))
-                                });
+                                )?;
+                                Ok(RoomCreationReply::Created {
+                                    epoch,
+                                    room: service
+                                        .cached_room(room_id)
+                                        .expect("created room cache"),
+                                    deliveries: collect_latest_welcomes(
+                                        &service,
+                                        &welcome_devices,
+                                    )?,
+                                })
+                            })();
                             events.push(MlsReply::RoomCreated { token, room_id, result });
                         }
                         MlsWriteRequest::SubmitCommit {
@@ -4693,13 +4711,34 @@ impl Server {
                     room_id,
                     result,
                 } => {
-                    let result = result.and_then(|(epoch, room, deliveries)| {
-                        self.mls.install_cached_room(room);
-                        self.push_mls_welcome_deliveries(deliveries);
-                        self.send_control_to_token(
-                            token,
-                            &ServerControl::EncryptedRoomCreated { room_id, epoch },
-                        )
+                    let result = result.and_then(|reply| match reply {
+                        RoomCreationReply::Created {
+                            epoch,
+                            room,
+                            deliveries,
+                        } => {
+                            self.mls.install_cached_room(room);
+                            self.push_mls_welcome_deliveries(deliveries);
+                            self.send_control_to_token(
+                                token,
+                                &ServerControl::EncryptedRoomCreated { room_id, epoch },
+                            )
+                        }
+                        RoomCreationReply::Existing { room } => {
+                            let descriptor = room.descriptor.clone();
+                            let epoch = room.public_state.epoch;
+                            let group_info = room.group_info.clone();
+                            self.mls.install_cached_room(room);
+                            self.send_control_to_token(
+                                token,
+                                &ServerControl::GroupInfo {
+                                    room_id,
+                                    descriptor: Some(descriptor),
+                                    epoch,
+                                    group_info,
+                                },
+                            )
+                        }
                     });
                     (Some(token), result)
                 }
@@ -9172,6 +9211,142 @@ mod tests {
             roster: mls_identity::roster_checkpoint(&roster),
             client_id: certificate.mls_client_id.clone(),
         });
+    }
+
+    #[test]
+    fn queued_duplicate_room_creation_reconciles_loser_without_disconnect() {
+        let mut server = test_server();
+        let server_id: [u8; 32] = server
+            .server_key_pair
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let client_dir = tempfile::tempdir().unwrap();
+        let (alice, _) = chatt_mls::LocalInstallation::open_or_create(
+            &client_dir.path().join("alice"),
+            server_id,
+            UserId(1),
+            "alice",
+        )
+        .unwrap();
+        let (bob, _) = chatt_mls::LocalInstallation::open_or_create(
+            &client_dir.path().join("bob"),
+            server_id,
+            UserId(2),
+            "bob",
+        )
+        .unwrap();
+        alice.install_roster(&bob.bootstrap.own_roster).unwrap();
+        bob.install_roster(&alice.bootstrap.own_roster).unwrap();
+
+        let mut service = MlsService::new(server_id.to_vec());
+        service
+            .put_roster(
+                UserId(1),
+                None,
+                alice.bootstrap.own_roster.clone(),
+                None,
+            )
+            .unwrap();
+        service
+            .put_roster(
+                UserId(2),
+                None,
+                bob.bootstrap.own_roster.clone(),
+                None,
+            )
+            .unwrap();
+        let published = bob
+            .client
+            .generate_key_packages(bob.bootstrap.device_id, 1)
+            .unwrap()
+            .remove(0);
+        service
+            .publish_key_packages(UserId(2), bob.bootstrap.device_id, vec![published])
+            .unwrap();
+        let package = service
+            .take_key_package(bob.bootstrap.device_id)
+            .unwrap()
+            .unwrap();
+        server.mls = service.in_memory_view().unwrap();
+        server.mls_worker = MlsWorker::spawn(service, Arc::clone(&server.mls_events));
+
+        let room_id = RoomId(50);
+        let mut accounts = vec![alice.bootstrap.account_id, bob.bootstrap.account_id];
+        accounts.sort_unstable();
+        let descriptor = rpc::mls::EncryptedRoomDescriptor::new(
+            room_id,
+            alice.bootstrap.account_id,
+            accounts,
+            10,
+        )
+        .unwrap();
+        let bundle = alice
+            .client
+            .create_room(&descriptor, &[(bob.bootstrap.device_id, package)])
+            .unwrap();
+        let mut checkpoints = vec![
+            mls_identity::roster_checkpoint(&alice.bootstrap.own_roster),
+            mls_identity::roster_checkpoint(&bob.bootstrap.own_roster),
+        ];
+        checkpoints.sort_by_key(|checkpoint| checkpoint.account_id);
+
+        let winner = Token(11);
+        let loser = Token(22);
+        let mut winner_peer = live_user(&mut server, winner, SessionId(1), UserId(1));
+        let mut loser_peer = live_user(&mut server, loser, SessionId(2), UserId(1));
+        server.pending_mls.insert(winner);
+        server.pending_mls.insert(loser);
+        for token in [winner, loser] {
+            assert!(server.mls_worker.enqueue_typed(MlsWriteRequest::CreateRoom {
+                token,
+                creator: descriptor.creator,
+                creator_client_id: alice
+                    .bootstrap
+                    .device_certificate
+                    .body
+                    .mls_client_id
+                    .clone(),
+                descriptor: descriptor.clone(),
+                checkpoints: checkpoints.clone(),
+                bundle: bundle.clone(),
+                welcome_devices: Vec::new(),
+            }));
+        }
+        finish_mls_for_token(&mut server, winner);
+        finish_mls_for_token(&mut server, loser);
+
+        assert!(server.clients.contains_key(&winner));
+        assert!(server.clients.contains_key(&loser));
+        assert!(matches!(
+            read_until(&mut winner_peer, |control| matches!(
+                control,
+                ServerControl::EncryptedRoomCreated { room_id: observed, .. }
+                    if *observed == room_id
+            )),
+            ServerControl::EncryptedRoomCreated { .. }
+        ));
+        let reconciled = read_until(&mut loser_peer, |control| matches!(
+            control,
+            ServerControl::GroupInfo {
+                room_id: observed,
+                descriptor: Some(_),
+                ..
+            } if *observed == room_id
+        ));
+        let ServerControl::GroupInfo {
+            descriptor: Some(canonical),
+            epoch,
+            group_info,
+            ..
+        } = reconciled
+        else {
+            unreachable!()
+        };
+        assert_eq!(canonical, descriptor);
+        assert_eq!(epoch, 1);
+        assert!(!group_info.is_empty());
     }
 
     #[test]
