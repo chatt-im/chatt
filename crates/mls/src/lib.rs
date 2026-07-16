@@ -23,6 +23,6 @@ pub use server::{
 pub const CIPHER_SUITE: mls_rs::CipherSuite = mls_rs::CipherSuite::CURVE25519_AES128;
 pub use bootstrap::{
     BOOTSTRAP_VERSION, BootstrapLoad, BootstrapState, E2eBootstrap, InstallationState,
-    classify_installation, derive_database_key, load_bootstrap,
+    classify_installation, load_bootstrap,
 };
 pub use installation::LocalInstallation;

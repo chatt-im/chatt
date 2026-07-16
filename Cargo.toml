@@ -90,6 +90,7 @@ members = [
     "crates/p2p",
     "crates/rpc",
     "crates/mls",
+    "crates/mls-rs-provider-redb",
     "crates/server",
     "crates/bwrap",
     "crates/opus-codec",

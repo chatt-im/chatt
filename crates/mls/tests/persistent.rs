@@ -82,7 +82,6 @@ fn outbox_rejects_sender_account_not_bound_to_local_credential() {
     identities.install_roster(&bob.roster).unwrap();
     let client = PersistentClient::open(
         &temp.path().join("alice.db"),
-        [11; 32],
         identities,
         alice.signing_identity,
         alice.signing_secret,
@@ -109,7 +108,7 @@ fn outbox_rejects_sender_account_not_bound_to_local_credential() {
 }
 
 #[test]
-fn sqlcipher_reopen_preserves_exact_outbox_and_received_history() {
+fn redb_reopen_preserves_exact_outbox_and_received_history() {
     let temp = tempfile::tempdir().unwrap();
     let server = b"persistent test server";
     let alice = device(server, 1, 1, 1);
@@ -130,7 +129,6 @@ fn sqlcipher_reopen_preserves_exact_outbox_and_received_history() {
     let bob_path = temp.path().join("bob.db");
     let alice_client = PersistentClient::open(
         &alice_path,
-        [11; 32],
         identities.clone(),
         alice.signing_identity,
         alice.signing_secret,
@@ -138,7 +136,6 @@ fn sqlcipher_reopen_preserves_exact_outbox_and_received_history() {
     .unwrap();
     let bob_client = PersistentClient::open(
         &bob_path,
-        [22; 32],
         identities.clone(),
         bob.signing_identity,
         bob.signing_secret,
@@ -207,8 +204,8 @@ fn sqlcipher_reopen_preserves_exact_outbox_and_received_history() {
     drop(alice_client);
     drop(bob_client);
 
-    let alice_client = PersistentClient::reopen(&alice_path, [11; 32], identities.clone()).unwrap();
-    let bob_client = PersistentClient::reopen(&bob_path, [22; 32], identities.clone()).unwrap();
+    let alice_client = PersistentClient::reopen(&alice_path, identities.clone()).unwrap();
+    let bob_client = PersistentClient::reopen(&bob_path, identities.clone()).unwrap();
     assert_eq!(bob_client.cursor(descriptor.room_id).unwrap(), 2);
     assert_eq!(
         bob_client
@@ -239,7 +236,18 @@ fn sqlcipher_reopen_preserves_exact_outbox_and_received_history() {
     ));
     assert_eq!(alice_client.cursor(descriptor.room_id).unwrap(), 2);
     assert!(alice_client.pending_outbox().unwrap().is_empty());
-    assert!(PersistentClient::reopen(&bob_path, [23; 32], identities).is_err());
+    drop(bob_client);
+    let other = device(server, 3, 3, 3);
+    assert!(
+        PersistentClient::open(
+            &bob_path,
+            identities,
+            other.signing_identity,
+            other.signing_secret,
+        )
+        .unwrap_err()
+        .contains("belongs to another MLS credential")
+    );
 }
 
 #[test]
@@ -262,7 +270,6 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
     let alice_path = temp.path().join("alice.db");
     let alice_client = PersistentClient::open(
         &alice_path,
-        [31; 32],
         identities.clone(),
         alice.signing_identity.clone(),
         alice.signing_secret.clone(),
@@ -270,7 +277,6 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
     .unwrap();
     let bob_client = PersistentClient::open(
         &temp.path().join("bob.db"),
-        [32; 32],
         identities.clone(),
         bob.signing_identity.clone(),
         bob.signing_secret.clone(),
@@ -310,7 +316,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
     alice_client.queue_outgoing(event.clone()).unwrap();
     drop(alice_client);
 
-    let alice_client = PersistentClient::reopen(&alice_path, [31; 32], identities.clone()).unwrap();
+    let alice_client = PersistentClient::reopen(&alice_path, identities.clone()).unwrap();
     let pending = alice_client.pending_outbox().unwrap();
     assert!(matches!(
         pending.as_slice(),
@@ -323,7 +329,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
     drop(alice_client);
 
     let alice_client =
-        PersistentClient::reopen(&alice_path, [31; 32], identities.clone()).unwrap();
+        PersistentClient::reopen(&alice_path, identities.clone()).unwrap();
     assert_eq!(
         alice_client
             .encrypt_outgoing(&descriptor, event.event_id)
@@ -367,7 +373,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
     ));
     drop(alice_client);
     let alice_client =
-        PersistentClient::reopen(&alice_path, [31; 32], identities.clone()).unwrap();
+        PersistentClient::reopen(&alice_path, identities.clone()).unwrap();
     assert!(matches!(
         alice_client.pending_ui_dispatches().unwrap().as_slice(),
         [dispatch] if dispatch.sequence == 2 && dispatch.event == event
@@ -515,7 +521,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         .unwrap();
     drop(alice_client);
 
-    let alice_client = PersistentClient::reopen(&alice_path, [31; 32], identities).unwrap();
+    let alice_client = PersistentClient::reopen(&alice_path, identities).unwrap();
     assert!(alice_client
         .pending_outbox()
         .unwrap()
@@ -554,7 +560,6 @@ fn accepted_local_commit_waits_for_earlier_same_epoch_applications() {
     identities.install_room(descriptor.clone()).unwrap();
     let alice_client = PersistentClient::open(
         &temp.path().join("alice-ordered.db"),
-        [41; 32],
         identities.clone(),
         alice.signing_identity,
         alice.signing_secret,
@@ -562,7 +567,6 @@ fn accepted_local_commit_waits_for_earlier_same_epoch_applications() {
     .unwrap();
     let bob_client = PersistentClient::open(
         &temp.path().join("bob-ordered.db"),
-        [42; 32],
         identities.clone(),
         bob.signing_identity,
         bob.signing_secret,
@@ -603,7 +607,6 @@ fn accepted_local_commit_waits_for_earlier_same_epoch_applications() {
     );
     let replacement_client = PersistentClient::open(
         &temp.path().join("bob-replacement-ordered.db"),
-        [43; 32],
         identities.clone(),
         replacement.signing_identity,
         replacement.signing_secret,
@@ -713,7 +716,6 @@ fn external_rejoin_replaces_lost_local_state_and_opens_future_messages() {
     identities.install_room(descriptor.clone()).unwrap();
     let alice_client = PersistentClient::open(
         &temp.path().join("alice-rejoin.db"),
-        [31; 32],
         identities.clone(),
         alice.signing_identity,
         alice.signing_secret,
@@ -723,7 +725,6 @@ fn external_rejoin_replaces_lost_local_state_and_opens_future_messages() {
     let bob_secret = bob.signing_secret.clone();
     let bob_client = PersistentClient::open(
         &temp.path().join("bob-original.db"),
-        [32; 32],
         identities.clone(),
         bob.signing_identity,
         bob.signing_secret,
@@ -750,7 +751,6 @@ fn external_rejoin_replaces_lost_local_state_and_opens_future_messages() {
 
     let replacement = PersistentClient::open(
         &temp.path().join("bob-reconstructed.db"),
-        [33; 32],
         identities,
         bob_identity,
         bob_secret,

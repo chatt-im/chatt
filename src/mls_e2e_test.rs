@@ -1141,7 +1141,7 @@ fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
 
     // Exhaust every combination of direction, sender restart, receiver
     // restart, and receiver-offline delivery. Each restart reopens the exact
-    // SQLCipher MLS database and bootstrap used by the previous process.
+    // redb MLS database and bootstrap used by the previous process.
     for bits in 0u8..16 {
         let alice_sends = bits & 1 == 0;
         let restart_sender = bits & 2 != 0;
@@ -1644,8 +1644,8 @@ fn mls_live_missing_and_corrupt_state_remain_public_only() {
             &rpc::crypto::dev_server_public_key(),
             UserId(1),
         );
-        let database = mls_dir.join("mls.db");
-        let corrupt_bytes = b"deliberately corrupt SQLCipher database";
+        let database = mls_dir.join("mls.redb");
+        let corrupt_bytes = b"deliberately corrupt redb database";
         if corrupt_database {
             std::fs::write(&database, corrupt_bytes).unwrap();
         } else {
