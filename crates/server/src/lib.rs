@@ -20,6 +20,7 @@ mod mls_store;
 pub mod room_store;
 pub mod user_store;
 mod username_registry;
+mod voice_relay;
 
 use mio::{
     Events, Interest, Poll, Token, Waker,
@@ -40,20 +41,20 @@ use rpc::{
         encode_server_control, encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims,
-        KEY_LEN, KeyMaterial, OPEN_PAIR_RECOVERY_PREFIX, RecordProtection, SessionTransport,
-        TransportMode, VideoKeyRole, derive_video_keys, dynamic_user_id_from_recovery_token,
-        encode_hex, issue_dynamic_token, respond_to_client_hello, verify_dynamic_token,
+        CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims, KEY_LEN,
+        KeyMaterial, OPEN_PAIR_RECOVERY_PREFIX, RecordProtection, SessionTransport, TransportMode,
+        VideoKeyRole, derive_video_keys, dynamic_user_id_from_recovery_token, encode_hex,
+        issue_dynamic_token, respond_to_client_hello, verify_dynamic_token,
     },
     evented::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
-        recv_datagram_with, write_queue_to,
+        write_queue_to,
     },
     frame, identity as mls_identity,
     ids::{
         BugReportId, DeviceId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId,
     },
-    media::{self, MediaPayload},
+    media,
     recv::RecvBuffer,
     video::{self, SharedVideoFrame, VideoAck, VideoHello, VideoRecordReader, VideoRole},
 };
@@ -68,18 +69,17 @@ use mls_service::{CacheState as MlsCacheState, MlsService, PutRosterError};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
 use username_registry::UsernameRegistry;
+use voice_relay::{VoiceCommand, VoiceEvent, VoiceRelayHandle, VoiceRoute};
 
 #[cfg(test)]
-use rpc::evented::ReadPumpOutcome;
+use rpc::evented::{ReadPumpOutcome, recv_datagram_with};
 #[cfg(test)]
 use rpc::history;
 
 const LISTENER: Token = Token(0);
-const UDP: Token = Token(1);
-const UDP_PROBE: Token = Token(2);
 /// Wake-only token the history reader thread signals after queueing a reply.
-const WAKER: Token = Token(3);
-const FIRST_CLIENT: usize = 4;
+const WAKER: Token = Token(1);
+const FIRST_CLIENT: usize = 2;
 /// The default config's lobby room id, used by tests asserting lobby state.
 #[cfg(test)]
 const DEFAULT_ROOM: RoomId = RoomId(1);
@@ -88,7 +88,6 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
 const ACCEPT_BUDGET: usize = 64;
 const TCP_WRITE_ATTEMPTS: usize = 32;
-const UDP_DRAIN_BUDGET: usize = 64;
 /// Scheduling budget for bytes read from one TCP connection per readiness pass:
 /// enough for one maximum framed control record, while still preventing one
 /// fast sender from monopolizing the single-threaded loop. mio events are
@@ -164,15 +163,9 @@ const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
 const AUDIO_POP_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
 const AUDIO_POP_PACKET_FLAG_MUTE: u8 = 0x08;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct UdpDrainTasks {
-    mask: u8,
-}
-
 #[derive(Debug, Default)]
 struct LoopWork {
     accept_clients: bool,
-    udp_drains: u8,
     client_reads: VecDeque<Token>,
     client_writes: VecDeque<Token>,
 }
@@ -189,10 +182,7 @@ impl LoopWork {
 
     #[inline]
     fn has_immediate_work(&self) -> bool {
-        self.accept_clients
-            || self.udp_drains != 0
-            || !self.client_reads.is_empty()
-            || !self.client_writes.is_empty()
+        self.accept_clients || !self.client_reads.is_empty() || !self.client_writes.is_empty()
     }
 
     #[inline]
@@ -215,14 +205,6 @@ impl LoopWork {
     }
 
     #[inline]
-    fn queue_udp_drain(&mut self, probe_id: u8) {
-        match probe_id {
-            0 | 1 => self.udp_drains |= 1 << probe_id,
-            _ => debug_assert!(probe_id <= 1),
-        }
-    }
-
-    #[inline]
     fn has_client_read(&self, token: Token) -> bool {
         self.client_reads.contains(&token)
     }
@@ -232,13 +214,6 @@ impl LoopWork {
         let accept_clients = self.accept_clients;
         self.accept_clients = false;
         accept_clients
-    }
-
-    #[inline]
-    fn take_udp_drains(&mut self) -> UdpDrainTasks {
-        let mask = self.udp_drains;
-        self.udp_drains = 0;
-        UdpDrainTasks { mask }
     }
 
     #[inline]
@@ -270,31 +245,6 @@ impl LoopWork {
     fn queued_client_writes(&self) -> Vec<Token> {
         self.client_writes.iter().copied().collect()
     }
-}
-
-impl Iterator for UdpDrainTasks {
-    type Item = u8;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.mask & 1 != 0 {
-            self.mask &= !1;
-            return Some(0);
-        }
-        if self.mask & 2 != 0 {
-            self.mask &= !2;
-            return Some(1);
-        }
-        None
-    }
-}
-
-#[inline]
-fn recv_udp_datagram(
-    socket: &UdpSocket,
-    buf: &mut [u8],
-) -> io::Result<Option<(usize, SocketAddr)>> {
-    recv_datagram_with(buf, |buf| socket.recv_from(buf))
 }
 
 /// Runs the server command-line entry point: parses `std::env::args`, handles
@@ -424,13 +374,13 @@ pub struct Server {
     pending_mls: HashSet<Token>,
     poll: Poll,
     listener: TcpListener,
-    udp: UdpSocket,
-    udp_probe: Option<UdpSocket>,
+    voice_relay: VoiceRelayHandle,
+    voice_events: Vec<VoiceEvent>,
     clients: HashMap<Token, ClientConn>,
     sessions: HashMap<SessionId, Session>,
-    /// The single UDP demux map: a session's derived media route id to its id.
-    /// Populated for every live session regardless of transport mode.
-    media_route_to_session: HashMap<u32, SessionId>,
+    /// Control-plane reservation of live media route ids. The voice thread has
+    /// the independently owned map used for actual UDP demultiplexing.
+    reserved_media_routes: HashMap<u32, SessionId>,
     peer_links: HashMap<(SessionId, SessionId), PeerLink>,
     rooms: HashMap<RoomId, RoomState>,
     streams: HashMap<StreamId, VideoStream>,
@@ -464,12 +414,6 @@ pub struct Server {
     loop_work: LoopWork,
     history_reader: HistoryReader,
     history_replies: mpsc::Receiver<HistoryReadReply>,
-    /// Reusable sealing buffers for [`Self::send_udp_payload`], so per-packet
-    /// voice fan-out allocates nothing in steady state.
-    udp_send_packet: Vec<u8>,
-    udp_send_scratch: Vec<u8>,
-    /// Reusable recipient list for [`Self::relay_voice`].
-    relay_recipients: Vec<SessionId>,
     video_copy_stats: VideoCopyStats,
 }
 
@@ -1077,7 +1021,7 @@ impl Server {
 
     /// Local UDP address the media socket is bound to.
     pub fn udp_local_addr(&self) -> io::Result<SocketAddr> {
-        self.udp.local_addr()
+        Ok(self.voice_relay.local_addr())
     }
 
     pub fn bind(mut config: ServerConfig) -> io::Result<Self> {
@@ -1103,8 +1047,8 @@ impl Server {
         let p2p_enabled = config.network.p2p_enabled;
         let poll = Poll::new()?;
         let mut listener = TcpListener::bind(tcp_addr)?;
-        let mut udp = UdpSocket::bind(udp_addr)?;
-        let mut udp_probe = if p2p_enabled {
+        let udp = UdpSocket::bind(udp_addr)?;
+        let udp_probe = if p2p_enabled {
             udp_probe_addr.map(UdpSocket::bind).transpose()?
         } else {
             None
@@ -1141,12 +1085,6 @@ impl Server {
         }
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
-        poll.registry()
-            .register(&mut udp, UDP, Interest::READABLE)?;
-        if let Some(udp_probe) = udp_probe.as_mut() {
-            poll.registry()
-                .register(udp_probe, UDP_PROBE, Interest::READABLE)?;
-        }
 
         let users = UserStore::open(config.data_dir())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -1225,6 +1163,12 @@ impl Server {
         }
 
         let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
+        let voice_relay = VoiceRelayHandle::spawn(
+            udp,
+            udp_probe,
+            Arc::clone(&waker),
+            p2p_enabled,
+        )?;
         let (history_reader, history_replies) = HistoryReader::spawn(Arc::clone(&waker));
         let mls_events = Arc::new(MlsEventQueue::new(Arc::clone(&waker)));
         let mls_worker = MlsWorker::spawn(durable_mls, Arc::clone(&mls_events));
@@ -1254,11 +1198,11 @@ impl Server {
             pending_mls: HashSet::new(),
             poll,
             listener,
-            udp,
-            udp_probe,
+            voice_relay,
+            voice_events: Vec::new(),
             clients: HashMap::new(),
             sessions: HashMap::new(),
-            media_route_to_session: HashMap::new(),
+            reserved_media_routes: HashMap::new(),
             peer_links: HashMap::new(),
             rooms,
             streams: HashMap::new(),
@@ -1289,9 +1233,6 @@ impl Server {
             loop_work: LoopWork::default(),
             history_reader,
             history_replies,
-            udp_send_packet: Vec::new(),
-            udp_send_scratch: Vec::new(),
-            relay_recipients: Vec::new(),
             video_copy_stats: VideoCopyStats::new(),
         })
     }
@@ -1322,16 +1263,6 @@ impl Server {
                             self.loop_work.queue_accept_clients();
                         }
                     }
-                    UDP => {
-                        if ready.readable_like() {
-                            self.loop_work.queue_udp_drain(0);
-                        }
-                    }
-                    UDP_PROBE => {
-                        if ready.readable_like() {
-                            self.loop_work.queue_udp_drain(1);
-                        }
-                    }
                     // Wake-only; replies drain unconditionally below.
                     WAKER => {}
                     token => {
@@ -1355,9 +1286,6 @@ impl Server {
             if self.loop_work.take_accept_clients() {
                 self.accept_clients()?;
             }
-            for probe_id in self.loop_work.take_udp_drains() {
-                self.receive_udp(probe_id);
-            }
             let client_read_count = self.loop_work.client_read_count();
             for _ in 0..client_read_count {
                 if let Some(token) = self.loop_work.pop_client_read() {
@@ -1371,6 +1299,7 @@ impl Server {
                 }
             }
             self.requeue_unclogged_uploaders();
+            self.drain_voice_events()?;
             self.drain_history_replies();
             self.drain_mls_replies();
             if self.handle_admin_commands(admin_rx) {
@@ -4114,6 +4043,11 @@ impl Server {
             .and_then(|client| client.transport.take())
             .ok_or_else(|| "session transport missing after handshake".to_string())?;
         self.register_media_route(transport.route_id, session_id)?;
+        self.voice_relay.submit(VoiceCommand::RegisterSession {
+            session_id,
+            user_id,
+            protection: media::MediaProtection::from_transport(&transport),
+        });
         self.sessions.insert(
             session_id,
             Session {
@@ -4121,10 +4055,7 @@ impl Server {
                 username: username.clone(),
                 tcp_token: token,
                 voice_room: None,
-                udp_addr: None,
                 transport,
-                media_send_counter: 0,
-                media_recv_replay: AntiReplay::new(),
                 active_stream: None,
                 voice_status: control::ParticipantVoiceStatus::default(),
                 reported_server_rtt_ms: None,
@@ -4209,7 +4140,7 @@ impl Server {
     /// draws a new route id. Stale entries whose session is already gone are
     /// reclaimed.
     fn register_media_route(&mut self, route_id: u32, session_id: SessionId) -> Result<(), String> {
-        if let Some(existing) = self.media_route_to_session.get(&route_id).copied()
+        if let Some(existing) = self.reserved_media_routes.get(&route_id).copied()
             && existing != session_id
             && self.sessions.contains_key(&existing)
         {
@@ -4221,7 +4152,7 @@ impl Server {
             );
             return Err("media route id collision".to_string());
         }
-        self.media_route_to_session.insert(route_id, session_id);
+        self.reserved_media_routes.insert(route_id, session_id);
         Ok(())
     }
 
@@ -4381,6 +4312,13 @@ impl Server {
                 return;
             }
         };
+        self.voice_relay.submit(VoiceCommand::SetRoute {
+            session_id,
+            route: Some(VoiceRoute {
+                room_id,
+                stream_id,
+            }),
+        });
         if !already_active {
             self.broadcast_voice_started(room_id, session_id, user_id, stream_id);
             if let Some(token) = self.live_token_for_session(session_id) {
@@ -5901,6 +5839,10 @@ impl Server {
         let Some(room_id) = room_id else {
             return;
         };
+        self.voice_relay.submit(VoiceCommand::SetRoute {
+            session_id,
+            route: None,
+        });
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.active_streams.remove(&stream_id);
         }
@@ -6127,107 +6069,17 @@ impl Server {
         })
     }
 
-    fn receive_udp(&mut self, probe_id: u8) {
-        let mut buf = [0u8; 2048];
-        let mut datagrams = 0usize;
-        loop {
-            if datagrams >= UDP_DRAIN_BUDGET {
-                self.loop_work.queue_udp_drain(probe_id);
-                break;
-            }
-            let received = if probe_id == 0 {
-                recv_udp_datagram(&self.udp, &mut buf)
-            } else {
-                let Some(udp_probe) = self.udp_probe.as_mut() else {
-                    return;
-                };
-                recv_udp_datagram(udp_probe, &mut buf)
-            };
-            let (len, src) = match received {
-                Ok(Some(value)) => value,
-                Ok(None) => break,
-                Err(error) => {
-                    kvlog::warn!("udp receive failed", error = %error);
-                    break;
-                }
-            };
-            datagrams += 1;
-            let packet = &buf[..len];
-            if let Err(error) = self.handle_udp_packet(probe_id, src, packet) {
-                kvlog::warn!(
-                    "udp packet rejected",
-                    addr = %src,
-                    packet_size = len,
-                    error = %error
-                );
-            }
-        }
-    }
-
-    fn handle_udp_packet(
-        &mut self,
-        server_probe_id: u8,
-        src: SocketAddr,
-        packet: &[u8],
-    ) -> Result<(), String> {
-        let (header, _) = media::parse_header(packet).map_err(|error| error.to_string())?;
-        let session_id = *self
-            .media_route_to_session
-            .get(&header.route_id)
-            .ok_or_else(|| "unknown UDP route id".to_string())?;
-        let (payload, udp_addr_changed) = {
-            let session = self
-                .sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| "unknown UDP session".to_string())?;
-            let protection = session.media_protection();
-            let opened = media::open_media(&protection, &mut session.media_recv_replay, packet)
-                .map_err(|error| error.to_string())?;
-            let is_main_socket = server_probe_id == 0;
-            let udp_addr_changed = match opened.address_proof {
-                // Native: every opened datagram is authenticated. External-link
-                // `Bind`: the address claim carries a valid proof. Either may
-                // refresh the media address, but only on the main socket —
-                // behind a symmetric NAT the probe-port mapping differs from the
-                // main-port mapping, so recording a probe packet's source would
-                // point voice and pongs (sent from the main socket) at a dead
-                // address until the next main-socket packet flips it back.
-                media::AddressProof::AuthenticatedDatagram
-                | media::AddressProof::AuthenticatedAddressClaim => {
-                    if is_main_socket {
-                        session.observe_udp_addr(src).is_some_and(|old| old != src)
-                    } else {
-                        false
-                    }
-                }
-                // External-link data (voice, feedback, ping, pong) is
-                // unauthenticated by chatt, so it is accepted only from the
-                // already-bound address and never rebinds the session.
-                media::AddressProof::None => {
-                    if session.udp_addr != Some(src) {
-                        return Err("external-link media from an unbound source".to_string());
-                    }
-                    false
-                }
-            };
-            (opened.payload, udp_addr_changed)
-        };
-
-        // Authenticated media traffic proves the session is alive: the client
-        // has no TCP keepalive but pings over UDP every few seconds, so this
-        // is what keeps a healthy-but-silent control connection from being
-        // reaped by the idle sweep.
-        if let Some(session) = self.sessions.get(&session_id)
-            && let Some(client) = self.clients.get_mut(&session.tcp_token)
-        {
-            client.last_activity = Instant::now();
-        }
-
-        match payload {
-            MediaPayload::Bind => {
-                kvlog::info!("udp session bound", session_id = session_id.0, addr = %src);
-                let token = self.live_token_for_session(session_id);
-                if let Some(token) = token {
+    fn drain_voice_events(&mut self) -> io::Result<()> {
+        let mut events = std::mem::take(&mut self.voice_events);
+        debug_assert!(events.is_empty());
+        self.voice_relay.drain_events(&mut events);
+        for event in events.drain(..) {
+            match event {
+                VoiceEvent::UdpBound { session_id, addr } => {
+                    kvlog::info!("udp session bound", session_id = session_id.0, addr = %addr);
+                    let Some(token) = self.live_token_for_session(session_id) else {
+                        continue;
+                    };
                     let _ = self.send_control_to_token(token, &ServerControl::UdpBound);
                     if self.config.network.p2p_enabled
                         && self.live_token_for_session(session_id).is_some()
@@ -6235,234 +6087,52 @@ impl Server {
                         let _ = self.send_control_to_token(
                             token,
                             &ServerControl::UdpReflexive {
-                                addr: src.to_string(),
+                                addr: addr.to_string(),
                             },
                         );
                     }
                 }
-                Ok(())
-            }
-            MediaPayload::NatProbe { probe_id } => {
-                // NAT probes are a native/P2P-only mechanism. External-link mode
-                // disables P2P, so a probe there is rejected rather than relayed.
-                if self
-                    .sessions
-                    .get(&session_id)
-                    .is_some_and(Session::is_external_link)
-                {
-                    return Err("NAT probe not available in external-secure-link".into());
-                }
-                if !self.config.network.p2p_enabled {
-                    return Ok(());
-                }
-                let token = self.live_token_for_session(session_id);
-                if let Some(token) = token {
+                VoiceEvent::NatProbe {
+                    session_id,
+                    probe_id,
+                    addr,
+                } => {
+                    let Some(token) = self.live_token_for_session(session_id) else {
+                        continue;
+                    };
                     let _ = self.send_control_to_token(
                         token,
                         &ServerControl::P2pNatProbe {
-                            probe_id: probe_id.max(server_probe_id),
-                            addr: src.to_string(),
+                            probe_id,
+                            addr: addr.to_string(),
                         },
                     );
                 }
-                Ok(())
-            }
-            MediaPayload::Voice {
-                stream_id,
-                sequence,
-                timestamp,
-                flags,
-                payload,
-            } => self.relay_voice(session_id, stream_id, sequence, timestamp, flags, payload),
-            MediaPayload::VoiceFeedback {
-                stream_id,
-                feedback,
-            } => self.relay_voice_feedback(session_id, stream_id, feedback),
-            MediaPayload::PeerVoice { .. } => Ok(()),
-            MediaPayload::PeerVoiceFeedback { .. } => Ok(()),
-            // Server-authored, owner-facing only; a client never sends it.
-            MediaPayload::VoiceFeedbackFrom { .. } => Ok(()),
-            MediaPayload::Ping {
-                nonce,
-                observed_rtt_ms,
-            } => {
-                if let Some(session) = self.sessions.get_mut(&session_id) {
-                    let reported_rtt_ms = if udp_addr_changed {
-                        None
-                    } else {
-                        observed_rtt_ms
+                VoiceEvent::Activity(activity) => {
+                    let Some(token) = self
+                        .sessions
+                        .get(&activity.session_id)
+                        .map(|session| session.tcp_token)
+                    else {
+                        continue;
                     };
-                    session.report_server_rtt(reported_rtt_ms, Instant::now());
+                    if let Some(client) = self.clients.get_mut(&token) {
+                        client.last_activity = client.last_activity.max(activity.last_activity);
+                    }
+                    if let Some(session) = self.sessions.get_mut(&activity.session_id) {
+                        session.reported_server_rtt_ms = activity.reported_rtt_ms;
+                        session.server_rtt_reported_at = activity.rtt_reported_at;
+                    }
                 }
-                self.send_udp_payload(session_id, &MediaPayload::Pong { nonce });
-                Ok(())
-            }
-            MediaPayload::Pong { .. } => Ok(()),
-        }
-    }
-
-    fn relay_voice(
-        &mut self,
-        sender_session_id: SessionId,
-        stream_id: StreamId,
-        sequence: u32,
-        timestamp: u32,
-        flags: u8,
-        voice_payload: media::VoicePayload,
-    ) -> Result<(), String> {
-        let room_id = match self.sessions.get(&sender_session_id) {
-            Some(session)
-                if session.active_stream == Some(stream_id) && session.voice_room.is_some() =>
-            {
-                session.voice_room.unwrap()
-            }
-            _ => return Ok(()),
-        };
-        let mut recipients = std::mem::take(&mut self.relay_recipients);
-        recipients.clear();
-        if let Some(room) = self.rooms.get(&room_id) {
-            for session_id in room.active_streams.values() {
-                if *session_id != sender_session_id {
-                    recipients.push(*session_id);
+                VoiceEvent::Failed(error) => {
+                    return Err(io::Error::other(format!(
+                        "voice relay event loop stopped: {error}"
+                    )));
                 }
             }
         }
-        kvlog::debug!(
-            "voice packet relaying",
-            session_id = sender_session_id.0,
-            room_id = room_id.0,
-            stream_id = stream_id.0,
-            sequence,
-            recipient_count = recipients.len(),
-            payload_size = voice_payload.len()
-        );
-        log_audio_pop_server_media_packet(
-            "rx",
-            sender_session_id,
-            Some(room_id),
-            stream_id,
-            sequence,
-            flags,
-            &voice_payload,
-            Some(recipients.len()),
-        );
-        let payload = MediaPayload::Voice {
-            stream_id,
-            sequence,
-            timestamp,
-            flags,
-            payload: voice_payload,
-        };
-        for session_id in &recipients {
-            self.send_udp_payload(*session_id, &payload);
-        }
-        self.relay_recipients = recipients;
+        self.voice_events = events;
         Ok(())
-    }
-
-    fn relay_voice_feedback(
-        &mut self,
-        receiver_session_id: SessionId,
-        stream_id: StreamId,
-        feedback: media::VoiceFeedback,
-    ) -> Result<(), String> {
-        let room_id = match self.sessions.get(&receiver_session_id) {
-            Some(session) => session.voice_room,
-            None => None,
-        };
-        let Some(room_id) = room_id else {
-            return Ok(());
-        };
-        let Some(owner_session_id) = self
-            .rooms
-            .get(&room_id)
-            .and_then(|room| room.active_streams.get(&stream_id).copied())
-        else {
-            return Ok(());
-        };
-        if owner_session_id == receiver_session_id {
-            return Ok(());
-        }
-        // The trusted server authors the reporter identity so the owner can
-        // attribute the report to the specific listener; clients never send it.
-        let Some(reporter) = self
-            .sessions
-            .get(&receiver_session_id)
-            .map(|session| session.user_id)
-        else {
-            return Ok(());
-        };
-        kvlog::debug!(
-            "voice feedback relaying",
-            receiver_session_id = receiver_session_id.0,
-            owner_session_id = owner_session_id.0,
-            reporter = reporter.0,
-            room_id = room_id.0,
-            stream_id = stream_id.0,
-            expected = feedback.expected_packets,
-            lost = feedback.lost_packets,
-            late = feedback.late_packets,
-            output_ring_ms = feedback.max_output_ring_ms,
-            neteq_target_ms = feedback.max_neteq_target_ms,
-            neteq_playout_delay_ms = feedback.max_neteq_playout_delay_ms,
-            neteq_packet_buffer_ms = feedback.max_neteq_packet_buffer_ms
-        );
-        self.send_udp_payload(
-            owner_session_id,
-            &MediaPayload::VoiceFeedbackFrom {
-                reporter,
-                stream_id,
-                feedback,
-            },
-        );
-        Ok(())
-    }
-
-    fn send_udp_payload(&mut self, session_id: SessionId, payload: &MediaPayload) {
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            return;
-        };
-        let Some(addr) = session.udp_addr else {
-            return;
-        };
-        if let MediaPayload::Voice {
-            stream_id,
-            sequence,
-            timestamp: _,
-            flags,
-            payload,
-        } = payload
-        {
-            log_audio_pop_server_media_packet(
-                "tx",
-                session_id,
-                session.voice_room,
-                *stream_id,
-                *sequence,
-                *flags,
-                payload,
-                None,
-            );
-        }
-        let counter = session.media_send_counter;
-        session.media_send_counter = session.media_send_counter.wrapping_add(1);
-        let protection = session.media_protection();
-        let packet = &mut self.udp_send_packet;
-        let scratch = &mut self.udp_send_scratch;
-        let sealed = media::seal_media_into(&protection, counter, payload, packet, scratch);
-        if let Err(error) = sealed {
-            kvlog::warn!("udp seal failed", session_id = session_id.0, error = %error);
-            return;
-        }
-        if let Err(error) = self.udp.send_to(packet, addr) {
-            kvlog::warn!(
-                "udp send failed",
-                session_id = session_id.0,
-                addr = %addr,
-                packet_size = packet.len(),
-                error = %error
-            );
-        }
     }
 
     fn send_control_to_token(
@@ -6723,9 +6393,11 @@ impl Server {
             self.broadcast_presence(session_id, false);
         }
         if let Some(session) = self.sessions.remove(&session_id) {
-            self.media_route_to_session
+            self.reserved_media_routes
                 .remove(&session.transport.route_id);
         }
+        self.voice_relay
+            .submit(VoiceCommand::RemoveSession { session_id });
         self.remove_peer_links(session_id);
     }
 
@@ -6741,10 +6413,10 @@ impl Server {
         }
         self.next_media_sweep_at = Some(now + MEDIA_SWEEP_INTERVAL);
         let sessions = &self.sessions;
-        let before = self.media_route_to_session.len();
-        self.media_route_to_session
+        let before = self.reserved_media_routes.len();
+        self.reserved_media_routes
             .retain(|_, session_id| sessions.contains_key(session_id));
-        let removed = before.saturating_sub(self.media_route_to_session.len());
+        let removed = before.saturating_sub(self.reserved_media_routes.len());
         if removed > 0 {
             kvlog::warn!("stale media route mappings removed", removed);
         }
@@ -7432,12 +7104,9 @@ struct Session {
     /// The room whose voice call this session is in, independent of which
     /// room's chat the client is reading.
     voice_room: Option<RoomId>,
-    udp_addr: Option<SocketAddr>,
-    /// Full session material derived at handshake. Its mode selects how media
-    /// datagrams are protected; the route id is this session's UDP demux tag.
+    /// Full session material derived at handshake. The media loop receives its
+    /// own codec and exclusively owns the mutable media counters/replay state.
     transport: SessionTransport,
-    media_send_counter: u64,
-    media_recv_replay: AntiReplay,
     active_stream: Option<StreamId>,
     voice_status: control::ParticipantVoiceStatus,
     reported_server_rtt_ms: Option<u16>,
@@ -7484,26 +7153,7 @@ fn require_mls_device(
 }
 
 impl Session {
-    /// The media codec for this session's UDP datagrams, selected by its mode.
-    fn media_protection(&self) -> media::MediaProtection {
-        media::MediaProtection::from_transport(&self.transport)
-    }
-
-    /// Whether chatt secures the wire for this session, versus deferring to an
-    /// outer link (external-secure-link).
-    fn is_external_link(&self) -> bool {
-        self.transport.mode == TransportMode::ExternalSecureLink
-    }
-
-    fn observe_udp_addr(&mut self, addr: SocketAddr) -> Option<SocketAddr> {
-        let old_addr = self.udp_addr.replace(addr);
-        if old_addr.is_some_and(|old| old != addr) {
-            self.reported_server_rtt_ms = None;
-            self.server_rtt_reported_at = None;
-        }
-        old_addr
-    }
-
+    #[cfg(test)]
     fn report_server_rtt(&mut self, rtt_ms: Option<u16>, now: Instant) {
         self.reported_server_rtt_ms = rtt_ms;
         self.server_rtt_reported_at = Some(now);
@@ -8168,10 +7818,7 @@ mod tests {
             username: format!("user-{}", user_id.0),
             tcp_token: token,
             voice_room,
-            udp_addr: None,
             transport: test_transport(1),
-            media_send_counter: 0,
-            media_recv_replay: AntiReplay::new(),
             active_stream: None,
             voice_status: control::ParticipantVoiceStatus::default(),
             reported_server_rtt_ms: None,
@@ -8264,23 +7911,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn udp_address_change_clears_reported_server_rtt() {
-        let mut session = test_session(UserId(9), Token(11), Some(RoomId(1)));
-        let now = Instant::now();
-        let first: SocketAddr = "127.0.0.1:1000".parse().unwrap();
-        let second: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        session.observe_udp_addr(first);
-        session.report_server_rtt(Some(40), now);
-
-        session.observe_udp_addr(first);
-        assert_eq!(session.fresh_server_rtt(now), Some(40));
-
-        session.observe_udp_addr(second);
-        assert_eq!(session.fresh_server_rtt(now), None);
-        assert_eq!(session.server_rtt_reported_at, None);
-    }
-
     fn test_key(id: u32, byte: u8) -> KeyMaterial {
         KeyMaterial {
             id,
@@ -8304,128 +7934,6 @@ mod tests {
             bind_key: [5; KEY_LEN],
             video_auth_key: [6; KEY_LEN],
         }
-    }
-
-    /// The peer-side media codec matching [`test_transport`]: seals datagrams the
-    /// session (`route_id`) will open.
-    fn test_client_media_protection(route_id: u32) -> media::MediaProtection {
-        media::MediaProtection::Aead {
-            route_id,
-            send: test_key(4, 4),
-            recv: test_key(4, 4),
-        }
-    }
-
-    /// An external-secure-link session transport with the given route id and bind
-    /// key, so external-link UDP handling can be exercised end to end.
-    fn test_external_transport(route_id: u32, bind_key: [u8; KEY_LEN]) -> SessionTransport {
-        SessionTransport {
-            mode: TransportMode::ExternalSecureLink,
-            secrets: SessionSecrets {
-                control_send: test_key(1, 1),
-                control_recv: test_key(2, 2),
-                media_send: test_key(3, 3),
-                media_recv: test_key(4, 4),
-            },
-            route_id,
-            bind_key,
-            video_auth_key: [6; KEY_LEN],
-        }
-    }
-
-    fn clear_client(route_id: u32, bind_key: [u8; KEY_LEN]) -> media::MediaProtection {
-        media::MediaProtection::Clear { route_id, bind_key }
-    }
-
-    #[test]
-    fn external_link_bind_binds_and_rejects_spoof_and_unbound() {
-        let mut server = test_server();
-        let session_id = SessionId(1);
-        let bind_key = [9u8; KEY_LEN];
-        let mut session = test_session(UserId(9), Token(11), None);
-        session.transport = test_external_transport(88, bind_key);
-        server.sessions.insert(session_id, session);
-        server.media_route_to_session.insert(88, session_id);
-
-        // A valid external Bind (correct bind key) binds the media address.
-        let client = clear_client(88, bind_key);
-        let src: SocketAddr = "203.0.113.9:6000".parse().unwrap();
-        let bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
-        server.handle_udp_packet(0, src, &bind).unwrap();
-        assert_eq!(
-            server.sessions.get(&session_id).unwrap().udp_addr,
-            Some(src)
-        );
-
-        // A spoofed Bind from a wrong bind key cannot rebind the session.
-        let spoofer = clear_client(88, [1u8; KEY_LEN]);
-        let evil: SocketAddr = "198.51.100.9:6000".parse().unwrap();
-        let spoof = media::seal_media(&spoofer, 2, &MediaPayload::Bind).unwrap();
-        assert!(server.handle_udp_packet(0, evil, &spoof).is_err());
-        assert_eq!(
-            server.sessions.get(&session_id).unwrap().udp_addr,
-            Some(src)
-        );
-
-        // External data from the bound source is accepted, but from any other
-        // source it is rejected (chatt does not authenticate clear data packets).
-        let ping = MediaPayload::Ping {
-            nonce: 1,
-            observed_rtt_ms: None,
-        };
-        let from_bound = media::seal_media(&client, 3, &ping).unwrap();
-        server.handle_udp_packet(0, src, &from_bound).unwrap();
-        let from_evil = media::seal_media(&client, 4, &ping).unwrap();
-        assert!(server.handle_udp_packet(0, evil, &from_evil).is_err());
-
-        // NAT probes are native/P2P-only and rejected in external-link mode.
-        let probe = media::seal_media(&client, 5, &MediaPayload::NatProbe { probe_id: 0 }).unwrap();
-        assert!(server.handle_udp_packet(0, src, &probe).is_err());
-    }
-
-    #[test]
-    fn probe_socket_packet_does_not_clobber_media_addr() {
-        // A NAT probe is deliberately sent from the client's single media
-        // socket toward the probe port. Behind a symmetric NAT that flow gets
-        // its own mapping, so the probe packet's source address is unreachable
-        // from the server's main socket and must not become the session's
-        // media address (nor wipe the RTT estimate).
-        let mut server = test_server();
-        let session_id = SessionId(1);
-        let client = test_client_media_protection(77);
-        let mut session = test_session(UserId(9), Token(11), None);
-        session.transport = test_transport(77);
-        let media_addr: SocketAddr = "203.0.113.5:4000".parse().unwrap();
-        let now = Instant::now();
-        session.observe_udp_addr(media_addr);
-        session.report_server_rtt(Some(40), now);
-        server.sessions.insert(session_id, session);
-        server.media_route_to_session.insert(77, session_id);
-
-        let probe_src: SocketAddr = "203.0.113.5:5000".parse().unwrap();
-        let packet =
-            media::seal_media(&client, 1, &MediaPayload::NatProbe { probe_id: 1 }).unwrap();
-        server.handle_udp_packet(1, probe_src, &packet).unwrap();
-
-        let session = server.sessions.get(&session_id).unwrap();
-        assert_eq!(
-            session.udp_addr,
-            Some(media_addr),
-            "a probe-socket packet must not rebind the media address"
-        );
-        assert_eq!(
-            session.fresh_server_rtt(now),
-            Some(40),
-            "a probe-socket packet must not reset the RTT estimate"
-        );
-
-        // The same packet arriving on the main media socket is the client
-        // genuinely moving, and must still rebind.
-        let packet =
-            media::seal_media(&client, 2, &MediaPayload::NatProbe { probe_id: 1 }).unwrap();
-        server.handle_udp_packet(0, probe_src, &packet).unwrap();
-        let session = server.sessions.get(&session_id).unwrap();
-        assert_eq!(session.udp_addr, Some(probe_src));
     }
 
     #[test]
@@ -8457,7 +7965,7 @@ mod tests {
             .establish_session(Token(11), &alice, false, 0, false, None)
             .unwrap();
         let alice_session = server.clients.get(&Token(11)).unwrap().session_id.unwrap();
-        assert_eq!(server.media_route_to_session.get(&77), Some(&alice_session));
+        assert_eq!(server.reserved_media_routes.get(&77), Some(&alice_session));
 
         let result = server.establish_session(Token(22), &bob, false, 0, false, None);
         assert!(
@@ -8465,7 +7973,7 @@ mod tests {
             "a colliding media route must reject the new session"
         );
         assert_eq!(
-            server.media_route_to_session.get(&77),
+            server.reserved_media_routes.get(&77),
             Some(&alice_session),
             "the live session's mapping must survive the collision"
         );
@@ -8476,7 +7984,7 @@ mod tests {
         // A mapping left behind by a torn-down session (the sweep backstop has
         // not run yet) must not block a new session from taking the route id.
         let mut server = test_server();
-        server.media_route_to_session.insert(77, SessionId(999));
+        server.reserved_media_routes.insert(77, SessionId(999));
         let carol = UserConfig {
             id: UserId(3),
             internal_reference: "carol".to_string(),
@@ -8491,129 +7999,7 @@ mod tests {
             .establish_session(Token(33), &carol, false, 0, false, None)
             .unwrap();
         let carol_session = server.clients.get(&Token(33)).unwrap().session_id.unwrap();
-        assert_eq!(server.media_route_to_session.get(&77), Some(&carol_session));
-    }
-
-    #[test]
-    fn send_udp_payload_seals_decodable_packets_with_incrementing_counters() {
-        // Pins the relay's wire bytes: whatever sealing path the server uses
-        // internally, the client must keep opening consecutive packets with the
-        // shared media key and a fresh anti-replay window.
-        let mut server = test_server();
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let session_id = SessionId(1);
-        // The client opens with the same keys the session seals with.
-        let client = test_client_media_protection(77);
-        let mut session = test_session(UserId(9), Token(11), None);
-        session.transport = test_transport(77);
-        session.udp_addr = Some(receiver.local_addr().unwrap());
-        server.sessions.insert(session_id, session);
-
-        let mut replay = AntiReplay::new();
-        let mut buf = [0u8; 2048];
-        for nonce in [7u64, 8, 9] {
-            server.send_udp_payload(session_id, &MediaPayload::Pong { nonce });
-            let (len, _) = receiver.recv_from(&mut buf).unwrap();
-            let opened = media::open_media(&client, &mut replay, &buf[..len]).unwrap();
-            assert_eq!(opened.payload, MediaPayload::Pong { nonce });
-        }
-    }
-
-    #[test]
-    fn relay_voice_feedback_stamps_reporter_identity() {
-        // A listener's reception report about the owner's outbound stream reaches
-        // the owner as a `VoiceFeedbackFrom` carrying the listener's user id, so
-        // the owner can attribute it to that specific listener.
-        let mut server = test_server();
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let owner_client = test_client_media_protection(77);
-
-        let room_id = RoomId(1);
-        let owner_session = SessionId(1);
-        let listener_session = SessionId(2);
-        let owner_stream = StreamId(100);
-        server.rooms.insert(
-            room_id,
-            RoomState {
-                id: room_id,
-                name: "test".to_string(),
-                access: RoomAccess::Public,
-                active_streams: [(owner_stream, owner_session)].into_iter().collect(),
-            },
-        );
-
-        let mut owner = test_session(UserId(9), Token(11), Some(room_id));
-        owner.transport = test_transport(77);
-        owner.udp_addr = Some(receiver.local_addr().unwrap());
-        server.sessions.insert(owner_session, owner);
-        server.sessions.insert(
-            listener_session,
-            test_session(UserId(5), Token(22), Some(room_id)),
-        );
-
-        let feedback = media::VoiceFeedback {
-            lost_packets: 3,
-            max_neteq_playout_delay_ms: 120,
-            ..Default::default()
-        };
-        server
-            .relay_voice_feedback(listener_session, owner_stream, feedback)
-            .unwrap();
-
-        let mut replay = AntiReplay::new();
-        let mut buf = [0u8; 2048];
-        let (len, _) = receiver.recv_from(&mut buf).unwrap();
-        let opened = media::open_media(&owner_client, &mut replay, &buf[..len]).unwrap();
-        assert_eq!(
-            opened.payload,
-            MediaPayload::VoiceFeedbackFrom {
-                reporter: UserId(5),
-                stream_id: owner_stream,
-                feedback,
-            }
-        );
-    }
-
-    #[test]
-    fn relay_voice_feedback_suppresses_self_report() {
-        // A session reporting on its own stream produces no relayed datagram.
-        let mut server = test_server();
-        let room_id = RoomId(1);
-        let owner_session = SessionId(1);
-        let owner_stream = StreamId(100);
-        server.rooms.insert(
-            room_id,
-            RoomState {
-                id: room_id,
-                name: "test".to_string(),
-                access: RoomAccess::Public,
-                active_streams: [(owner_stream, owner_session)].into_iter().collect(),
-            },
-        );
-        let mut owner = test_session(UserId(9), Token(11), Some(room_id));
-        owner.transport = test_transport(77);
-        // No udp_addr: if the self-skip failed and we tried to send, the missing
-        // address would silently drop it, so we instead assert the early return by
-        // leaving the owner's outbound counter untouched.
-        server.sessions.insert(owner_session, owner);
-
-        server
-            .relay_voice_feedback(owner_session, owner_stream, media::VoiceFeedback::default())
-            .unwrap();
-        assert_eq!(
-            server
-                .sessions
-                .get(&owner_session)
-                .unwrap()
-                .media_send_counter,
-            0
-        );
+        assert_eq!(server.reserved_media_routes.get(&77), Some(&carol_session));
     }
 
     #[test]
@@ -10403,9 +9789,6 @@ mod tests {
 
         work.queue_accept_clients();
         work.queue_accept_clients();
-        work.queue_udp_drain(0);
-        work.queue_udp_drain(0);
-        work.queue_udp_drain(1);
         work.queue_client_read(Token(7));
         work.queue_client_read(Token(7));
         work.queue_client_write(Token(9));
@@ -10414,8 +9797,6 @@ mod tests {
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), Duration::ZERO);
         assert!(work.take_accept_clients());
         assert!(!work.take_accept_clients());
-        assert_eq!(work.take_udp_drains().collect::<Vec<_>>(), vec![0, 1]);
-        assert!(work.take_udp_drains().next().is_none());
         assert_eq!(work.queued_client_reads(), vec![Token(7)]);
         assert_eq!(work.client_read_count(), 1);
         assert_eq!(work.pop_client_read(), Some(Token(7)));
@@ -10792,7 +10173,6 @@ mod tests {
         let server = Server::bind(config).expect("test server");
 
         assert!(!server.config.network.p2p_enabled);
-        assert!(server.udp_probe.is_none());
     }
 
     #[test]
