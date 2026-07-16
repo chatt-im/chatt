@@ -2,11 +2,11 @@
 //!
 //! The control loop submits infrequent session/topology changes through one
 //! [`EventSubmission`]. The UDP loop owns every mutable packet-plane value and
-//! returns only coalesced control-plane observations through another. Both
-//! queues wake their consumer's `mio::Poll`, and consumers swap the queued
-//! `Vec` with a reusable local buffer so draining does not allocate.
+//! returns only coalesced control-plane observations through
+//! [`VoiceEventSubmission`]. Both queues wake their consumer's `mio::Poll`, and
+//! consumers swap reusable buffers so draining does not allocate.
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use mio::{Events, Interest, Poll, Token, Waker, net::UdpSocket};
 use rpc::{
     crypto::AntiReplay,
@@ -54,23 +54,6 @@ impl<T> EventSubmission<T> {
         }
     }
 
-    fn submit_all(&self, events: &mut Vec<T>) {
-        if events.is_empty() {
-            return;
-        }
-        {
-            let mut pending = self.pending.lock().unwrap();
-            if pending.is_empty() {
-                std::mem::swap(&mut *pending, events);
-            } else {
-                pending.append(events);
-            }
-        }
-        if let Err(error) = self.waker.wake() {
-            kvlog::warn!("voice event wake failed", error = %error);
-        }
-    }
-
     fn drain_into(&self, events: &mut Vec<T>) {
         debug_assert!(events.is_empty());
         let mut pending = self.pending.lock().unwrap();
@@ -101,29 +84,85 @@ pub(super) enum VoiceCommand {
 }
 
 pub(super) struct VoiceActivity {
-    pub(super) session_id: SessionId,
     pub(super) last_activity: Instant,
     pub(super) reported_rtt_ms: Option<u16>,
     pub(super) rtt_reported_at: Option<Instant>,
 }
 
-pub(super) enum VoiceEvent {
-    UdpBound {
-        session_id: SessionId,
-        addr: SocketAddr,
-    },
-    NatProbe {
-        session_id: SessionId,
-        probe_id: u8,
-        addr: SocketAddr,
-    },
-    Activity(VoiceActivity),
-    Failed(String),
+#[derive(Default)]
+pub(super) struct VoiceEventBatch {
+    pub(super) udp_bound: HashMap<SessionId, SocketAddr>,
+    pub(super) nat_probe: HashMap<(SessionId, u8), SocketAddr>,
+    pub(super) activity: HashMap<SessionId, VoiceActivity>,
+    pub(super) failure: Option<String>,
+}
+
+impl VoiceEventBatch {
+    pub(super) fn is_empty(&self) -> bool {
+        self.udp_bound.is_empty()
+            && self.nat_probe.is_empty()
+            && self.activity.is_empty()
+            && self.failure.is_none()
+    }
+}
+
+/// Latest-value queue for UDP observations.
+///
+/// The control loop can legitimately stall behind disk or control-plane work.
+/// Keeping only the newest value for each session/probe bounds memory and makes
+/// its eventual drain proportional to the live topology, not the stall length.
+struct VoiceEventSubmission {
+    pending: Mutex<VoiceEventBatch>,
+    waker: Arc<Waker>,
+}
+
+impl VoiceEventSubmission {
+    fn new(waker: Arc<Waker>) -> Self {
+        Self {
+            pending: Mutex::new(VoiceEventBatch::default()),
+            waker,
+        }
+    }
+
+    fn submit_all(&self, events: &mut VoiceEventBatch) {
+        if events.is_empty() {
+            return;
+        }
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.is_empty() {
+                std::mem::swap(&mut *pending, events);
+            } else {
+                pending.udp_bound.extend(events.udp_bound.drain());
+                pending.nat_probe.extend(events.nat_probe.drain());
+                pending.activity.extend(events.activity.drain());
+                if events.failure.is_some() {
+                    pending.failure = events.failure.take();
+                }
+            }
+        }
+        if let Err(error) = self.waker.wake() {
+            kvlog::warn!("voice event wake failed", error = %error);
+        }
+    }
+
+    fn submit_failure(&self, failure: String) {
+        self.pending.lock().unwrap().failure = Some(failure);
+        if let Err(error) = self.waker.wake() {
+            kvlog::warn!("voice event wake failed", error = %error);
+        }
+    }
+
+    fn drain_into(&self, events: &mut VoiceEventBatch) {
+        debug_assert!(events.is_empty());
+        let mut pending = self.pending.lock().unwrap();
+        std::mem::swap(&mut *pending, events);
+    }
 }
 
 pub(super) struct VoiceRelayHandle {
     commands: Arc<EventSubmission<VoiceCommand>>,
-    events: Arc<EventSubmission<VoiceEvent>>,
+    events: Arc<VoiceEventSubmission>,
     thread: Option<JoinHandle<()>>,
     udp_local_addr: SocketAddr,
 }
@@ -145,7 +184,7 @@ impl VoiceRelayHandle {
         }
         let command_waker = Arc::new(Waker::new(poll.registry(), COMMANDS)?);
         let commands = Arc::new(EventSubmission::new(command_waker));
-        let events = Arc::new(EventSubmission::new(control_waker));
+        let events = Arc::new(VoiceEventSubmission::new(control_waker));
         let loop_commands = Arc::clone(&commands);
         let loop_events = Arc::clone(&events);
         let thread = thread::Builder::new()
@@ -162,7 +201,7 @@ impl VoiceRelayHandle {
                 if let Err(error) = relay.run() {
                     let message = error.to_string();
                     kvlog::error!("voice relay stopped", error = message.as_str());
-                    relay.events.submit(VoiceEvent::Failed(message));
+                    relay.events.submit_failure(message);
                 }
             })?;
         Ok(Self {
@@ -177,7 +216,7 @@ impl VoiceRelayHandle {
         self.commands.submit(command);
     }
 
-    pub(super) fn drain_events(&self, events: &mut Vec<VoiceEvent>) {
+    pub(super) fn drain_events(&self, events: &mut VoiceEventBatch) {
         self.events.drain_into(events);
     }
 
@@ -221,7 +260,7 @@ struct VoiceSession {
     last_activity: Instant,
     reported_rtt_ms: Option<u16>,
     rtt_reported_at: Option<Instant>,
-    nat_probe_observed: [bool; 2],
+    activity_dirty: bool,
 }
 
 #[derive(Default)]
@@ -235,15 +274,14 @@ struct VoiceRelay {
     udp: UdpSocket,
     udp_probe: Option<UdpSocket>,
     commands: Arc<EventSubmission<VoiceCommand>>,
-    events: Arc<EventSubmission<VoiceEvent>>,
+    events: Arc<VoiceEventSubmission>,
     p2p_enabled: bool,
     sessions: HashMap<SessionId, VoiceSession>,
     route_to_session: HashMap<u32, SessionId>,
     rooms: HashMap<RoomId, VoiceRoom>,
-    dirty_activity: HashSet<SessionId>,
     next_activity_flush: Instant,
     command_buf: Vec<VoiceCommand>,
-    event_buf: Vec<VoiceEvent>,
+    event_buf: VoiceEventBatch,
     relay_recipients: Vec<SessionId>,
     udp_send_packet: Vec<u8>,
     udp_send_scratch: Vec<u8>,
@@ -257,7 +295,7 @@ impl VoiceRelay {
         udp: UdpSocket,
         udp_probe: Option<UdpSocket>,
         commands: Arc<EventSubmission<VoiceCommand>>,
-        events: Arc<EventSubmission<VoiceEvent>>,
+        events: Arc<VoiceEventSubmission>,
         p2p_enabled: bool,
     ) -> Self {
         Self {
@@ -270,10 +308,9 @@ impl VoiceRelay {
             sessions: HashMap::new(),
             route_to_session: HashMap::new(),
             rooms: HashMap::new(),
-            dirty_activity: HashSet::new(),
             next_activity_flush: Instant::now() + ACTIVITY_FLUSH_INTERVAL,
             command_buf: Vec::new(),
-            event_buf: Vec::new(),
+            event_buf: VoiceEventBatch::default(),
             relay_recipients: Vec::new(),
             udp_send_packet: Vec::new(),
             udp_send_scratch: Vec::new(),
@@ -386,7 +423,7 @@ impl VoiceRelay {
                 last_activity: Instant::now(),
                 reported_rtt_ms: None,
                 rtt_reported_at: None,
-                nat_probe_observed: [false; 2],
+                activity_dirty: false,
             },
         );
     }
@@ -429,7 +466,6 @@ impl VoiceRelay {
         if let Some(session) = self.sessions.remove(&session_id) {
             self.route_to_session.remove(&session.protection.route_id());
         }
-        self.dirty_activity.remove(&session_id);
     }
 
     fn receive_udp(&mut self, probe_id: u8) {
@@ -475,89 +511,92 @@ impl VoiceRelay {
         packet: &[u8],
     ) -> Result<(), String> {
         let (header, _) = media::parse_header(packet).map_err(|error| error.to_string())?;
+        if !self.p2p_enabled && header.kind == media::KIND_NAT_PROBE {
+            let session_id = *self
+                .route_to_session
+                .get(&header.route_id)
+                .ok_or_else(|| "unknown UDP route id".to_string())?;
+            let session = self
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| "unknown UDP session".to_string())?;
+            return if matches!(session.protection, MediaProtection::Clear { .. }) {
+                Err("NAT probe not available in external-secure-link".into())
+            } else {
+                Ok(())
+            };
+        }
         let session_id = *self
             .route_to_session
             .get(&header.route_id)
             .ok_or_else(|| "unknown UDP route id".to_string())?;
-        let (payload, udp_addr_changed, udp_binding_changed, external_link) = {
+        let (payload, udp_addr_changed) = {
             let session = self
                 .sessions
                 .get_mut(&session_id)
                 .ok_or_else(|| "unknown UDP session".to_string())?;
-            let external_link = matches!(session.protection, MediaProtection::Clear { .. });
             let opened = media::open_media(
                 &session.protection,
                 &mut session.recv_replay,
                 packet,
             )
             .map_err(|error| error.to_string())?;
-            let (udp_addr_changed, udp_binding_changed) = match opened.address_proof {
+            let udp_addr_changed = match opened.address_proof {
                 media::AddressProof::AuthenticatedDatagram
                 | media::AddressProof::AuthenticatedAddressClaim => {
                     if server_probe_id == 0 {
                         let old = session.udp_addr.replace(src);
-                        let binding_changed = old != Some(src);
                         let address_changed = old.is_some_and(|old| old != src);
                         if address_changed {
                             session.reported_rtt_ms = None;
                             session.rtt_reported_at = None;
-                            session.nat_probe_observed = [false; 2];
                         }
-                        (address_changed, binding_changed)
+                        address_changed
                     } else {
-                        (false, false)
+                        false
                     }
                 }
                 media::AddressProof::None => {
                     if session.udp_addr != Some(src) {
                         return Err("external-link media from an unbound source".to_string());
                     }
-                    (false, false)
+                    false
                 }
             };
             session.last_activity = Instant::now();
-            (
-                opened.payload,
-                udp_addr_changed,
-                udp_binding_changed,
-                external_link,
-            )
+            session.activity_dirty = true;
+            (opened.payload, udp_addr_changed)
         };
-        self.dirty_activity.insert(session_id);
 
         match payload {
             MediaPayload::Bind => {
-                if udp_binding_changed {
-                    self.event_buf.push(VoiceEvent::UdpBound {
-                        session_id,
-                        addr: src,
-                    });
+                // Bind is the client's explicit acknowledgement handshake. An
+                // earlier authenticated ping/probe may already have installed
+                // the same address, so address change detection cannot gate it.
+                // Probe-socket binds are never a usable relay address.
+                if server_probe_id == 0 {
+                    self.event_buf.udp_bound.insert(session_id, src);
                 }
                 Ok(())
             }
             MediaPayload::NatProbe { probe_id } => {
-                if external_link {
-                    return Err("NAT probe not available in external-secure-link".into());
-                }
+                // A server without P2P has no probe socket or consumer for this
+                // observation; its packets returned immediately after header
+                // parsing and transport-mode lookup, before crypto, replay, or
+                // activity tracking.
                 if !self.p2p_enabled {
                     return Ok(());
                 }
                 let probe_id = probe_id.max(server_probe_id);
-                let Some(observed) = self
-                    .sessions
-                    .get_mut(&session_id)
-                    .and_then(|session| session.nat_probe_observed.get_mut(usize::from(probe_id)))
-                else {
+                if probe_id > 1 {
                     return Err("unknown NAT probe id".into());
-                };
-                if !*observed {
-                    *observed = true;
-                    self.event_buf.push(VoiceEvent::NatProbe {
-                        session_id,
-                        probe_id,
-                        addr: src,
-                    });
                 }
+                // Each client ICE restart needs fresh observations even if the
+                // main public tuple stayed unchanged. The shared batch still
+                // coalesces repeated packets while the control loop is busy.
+                self.event_buf
+                    .nat_probe
+                    .insert((session_id, probe_id), src);
                 Ok(())
             }
             MediaPayload::Voice {
@@ -753,16 +792,16 @@ impl VoiceRelay {
             return;
         }
         self.next_activity_flush = now + ACTIVITY_FLUSH_INTERVAL;
-        for session_id in self.dirty_activity.drain() {
-            let Some(session) = self.sessions.get(&session_id) else {
+        for (session_id, session) in &mut self.sessions {
+            if !session.activity_dirty {
                 continue;
-            };
-            self.event_buf.push(VoiceEvent::Activity(VoiceActivity {
-                session_id,
+            }
+            session.activity_dirty = false;
+            self.event_buf.activity.insert(*session_id, VoiceActivity {
                 last_activity: session.last_activity,
                 reported_rtt_ms: session.reported_rtt_ms,
                 rtt_reported_at: session.rtt_reported_at,
-            }));
+            });
         }
     }
 }
@@ -805,6 +844,7 @@ fn recv_udp_datagram(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hashbrown::HashSet;
     use rpc::{
         crypto::{KEY_LEN, KeyMaterial},
         media::{VoiceFeedback, VoicePayload},
@@ -838,7 +878,7 @@ mod tests {
             let poll = Poll::new().unwrap();
             let command_waker = Arc::new(Waker::new(poll.registry(), COMMANDS).unwrap());
             let commands = Arc::new(EventSubmission::new(command_waker));
-            let events = Arc::new(EventSubmission::new(control_waker));
+            let events = Arc::new(VoiceEventSubmission::new(control_waker));
             let udp = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             Self {
                 _control_poll: control_poll,
@@ -868,6 +908,142 @@ mod tests {
         submission.drain_into(&mut reusable);
         assert_eq!(reusable, vec![42]);
         assert_eq!(reusable.as_ptr(), allocation);
+    }
+
+    #[test]
+    fn voice_events_keep_only_latest_observation_per_key() {
+        let poll = Poll::new().unwrap();
+        let waker = Arc::new(Waker::new(poll.registry(), Token(7)).unwrap());
+        let submission = VoiceEventSubmission::new(waker);
+        let session_id = SessionId(1);
+        let first_addr: SocketAddr = "203.0.113.1:4000".parse().unwrap();
+        let latest_addr: SocketAddr = "203.0.113.1:5000".parse().unwrap();
+
+        let mut first = VoiceEventBatch::default();
+        first.udp_bound.insert(session_id, first_addr);
+        first.nat_probe.insert((session_id, 1), first_addr);
+        first.activity.insert(
+            session_id,
+            VoiceActivity {
+                last_activity: Instant::now(),
+                reported_rtt_ms: Some(10),
+                rtt_reported_at: Some(Instant::now()),
+            },
+        );
+        submission.submit_all(&mut first);
+
+        let mut latest = VoiceEventBatch::default();
+        latest.udp_bound.insert(session_id, latest_addr);
+        latest.nat_probe.insert((session_id, 1), latest_addr);
+        latest.activity.insert(
+            session_id,
+            VoiceActivity {
+                last_activity: Instant::now(),
+                reported_rtt_ms: Some(20),
+                rtt_reported_at: Some(Instant::now()),
+            },
+        );
+        submission.submit_all(&mut latest);
+
+        let mut drained = VoiceEventBatch::default();
+        submission.drain_into(&mut drained);
+        assert_eq!(drained.udp_bound, HashMap::from([(session_id, latest_addr)]));
+        assert_eq!(
+            drained.nat_probe,
+            HashMap::from([((session_id, 1), latest_addr)])
+        );
+        assert_eq!(drained.activity.len(), 1);
+        assert_eq!(
+            drained.activity.get(&session_id).unwrap().reported_rtt_ms,
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn bind_is_acknowledged_after_another_packet_claims_the_address() {
+        let mut direct = DirectRelay::new(false);
+        let session_id = SessionId(1);
+        let client = protection(77);
+        direct
+            .relay
+            .register_session(session_id, UserId(9), protection(77));
+        let receiver = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let src = receiver.local_addr().unwrap();
+        let ping = media::seal_media(
+            &client,
+            1,
+            &MediaPayload::Ping {
+                nonce: 1,
+                observed_rtt_ms: None,
+            },
+        )
+        .unwrap();
+        direct.relay.handle_packet(0, src, &ping).unwrap();
+        assert_eq!(
+            direct.relay.sessions.get(&session_id).unwrap().udp_addr,
+            Some(src)
+        );
+
+        let bind = media::seal_media(&client, 2, &MediaPayload::Bind).unwrap();
+        direct.relay.handle_packet(0, src, &bind).unwrap();
+        assert_eq!(direct.relay.event_buf.udp_bound.get(&session_id), Some(&src));
+    }
+
+    #[test]
+    fn disabled_p2p_skips_probe_before_crypto_and_activity_tracking() {
+        let mut direct = DirectRelay::new(false);
+        let session_id = SessionId(1);
+        let client = protection(77);
+        direct
+            .relay
+            .register_session(session_id, UserId(9), protection(77));
+        let src: SocketAddr = "203.0.113.5:4000".parse().unwrap();
+        let probe = media::seal_media(
+            &client,
+            1,
+            &MediaPayload::NatProbe { probe_id: 0 },
+        )
+        .unwrap();
+        direct.relay.handle_packet(0, src, &probe).unwrap();
+        assert!(!direct
+            .relay
+            .sessions
+            .get(&session_id)
+            .unwrap()
+            .activity_dirty);
+        assert!(direct.relay.event_buf.nat_probe.is_empty());
+
+        // Reusing the skipped probe's counter proves it never entered replay
+        // protection or media decryption.
+        let bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
+        direct.relay.handle_packet(0, src, &bind).unwrap();
+        assert_eq!(direct.relay.event_buf.udp_bound.get(&session_id), Some(&src));
+    }
+
+    #[test]
+    fn repeated_nat_probe_replaces_the_previous_observation() {
+        let mut direct = DirectRelay::new(true);
+        let session_id = SessionId(1);
+        let client = protection(77);
+        direct
+            .relay
+            .register_session(session_id, UserId(9), protection(77));
+        let first_addr: SocketAddr = "203.0.113.5:4000".parse().unwrap();
+        let latest_addr: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        for (counter, addr) in [(1, first_addr), (2, latest_addr)] {
+            let probe = media::seal_media(
+                &client,
+                counter,
+                &MediaPayload::NatProbe { probe_id: 1 },
+            )
+            .unwrap();
+            direct.relay.handle_packet(1, addr, &probe).unwrap();
+        }
+        assert_eq!(direct.relay.event_buf.nat_probe.len(), 1);
+        assert_eq!(
+            direct.relay.event_buf.nat_probe.get(&(session_id, 1)),
+            Some(&latest_addr)
+        );
     }
 
     #[test]
@@ -1017,7 +1193,7 @@ mod tests {
         // Wait until both binds reached the worker, then intentionally leave the
         // control-side event vector undrained while media continues.
         let mut poll_events = Events::with_capacity(4);
-        let mut voice_events = Vec::new();
+        let mut voice_events = VoiceEventBatch::default();
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut bound = HashSet::new();
         while bound.len() != 2 && Instant::now() < deadline {
@@ -1025,11 +1201,7 @@ mod tests {
                 .poll(&mut poll_events, Some(Duration::from_millis(20)))
                 .unwrap();
             relay.drain_events(&mut voice_events);
-            for event in voice_events.drain(..) {
-                if let VoiceEvent::UdpBound { session_id, .. } = event {
-                    bound.insert(session_id);
-                }
-            }
+            bound.extend(voice_events.udp_bound.drain().map(|(session_id, _)| session_id));
         }
         assert_eq!(bound.len(), 2);
 

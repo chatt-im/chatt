@@ -69,7 +69,7 @@ use mls_service::{CacheState as MlsCacheState, MlsService, PutRosterError};
 use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
 use username_registry::UsernameRegistry;
-use voice_relay::{VoiceCommand, VoiceEvent, VoiceRelayHandle, VoiceRoute};
+use voice_relay::{VoiceCommand, VoiceEventBatch, VoiceRelayHandle, VoiceRoute};
 
 #[cfg(test)]
 use rpc::evented::{ReadPumpOutcome, recv_datagram_with};
@@ -375,7 +375,7 @@ pub struct Server {
     poll: Poll,
     listener: TcpListener,
     voice_relay: VoiceRelayHandle,
-    voice_events: Vec<VoiceEvent>,
+    voice_events: VoiceEventBatch,
     clients: HashMap<Token, ClientConn>,
     sessions: HashMap<SessionId, Session>,
     /// Control-plane reservation of live media route ids. The voice thread has
@@ -1199,7 +1199,7 @@ impl Server {
             poll,
             listener,
             voice_relay,
-            voice_events: Vec::new(),
+            voice_events: VoiceEventBatch::default(),
             clients: HashMap::new(),
             sessions: HashMap::new(),
             reserved_media_routes: HashMap::new(),
@@ -6073,62 +6073,59 @@ impl Server {
         let mut events = std::mem::take(&mut self.voice_events);
         debug_assert!(events.is_empty());
         self.voice_relay.drain_events(&mut events);
-        for event in events.drain(..) {
-            match event {
-                VoiceEvent::UdpBound { session_id, addr } => {
-                    kvlog::info!("udp session bound", session_id = session_id.0, addr = %addr);
-                    let Some(token) = self.live_token_for_session(session_id) else {
-                        continue;
-                    };
-                    let _ = self.send_control_to_token(token, &ServerControl::UdpBound);
-                    if self.config.network.p2p_enabled
-                        && self.live_token_for_session(session_id).is_some()
-                    {
-                        let _ = self.send_control_to_token(
-                            token,
-                            &ServerControl::UdpReflexive {
-                                addr: addr.to_string(),
-                            },
-                        );
-                    }
-                }
-                VoiceEvent::NatProbe {
-                    session_id,
-                    probe_id,
-                    addr,
-                } => {
-                    let Some(token) = self.live_token_for_session(session_id) else {
-                        continue;
-                    };
-                    let _ = self.send_control_to_token(
-                        token,
-                        &ServerControl::P2pNatProbe {
-                            probe_id,
-                            addr: addr.to_string(),
-                        },
-                    );
-                }
-                VoiceEvent::Activity(activity) => {
-                    let Some(token) = self
-                        .sessions
-                        .get(&activity.session_id)
-                        .map(|session| session.tcp_token)
-                    else {
-                        continue;
-                    };
-                    if let Some(client) = self.clients.get_mut(&token) {
-                        client.last_activity = client.last_activity.max(activity.last_activity);
-                    }
-                    if let Some(session) = self.sessions.get_mut(&activity.session_id) {
-                        session.reported_server_rtt_ms = activity.reported_rtt_ms;
-                        session.server_rtt_reported_at = activity.rtt_reported_at;
-                    }
-                }
-                VoiceEvent::Failed(error) => {
-                    return Err(io::Error::other(format!(
-                        "voice relay event loop stopped: {error}"
-                    )));
-                }
+        if let Some(error) = events.failure.take() {
+            return Err(io::Error::other(format!(
+                "voice relay event loop stopped: {error}"
+            )));
+        }
+        for (session_id, addr) in events.udp_bound.drain() {
+            kvlog::info!("udp session bound", session_id = session_id.0, addr = %addr);
+            let Some(token) = self.live_token_for_session(session_id) else {
+                continue;
+            };
+            let _ = self.send_control_to_token(token, &ServerControl::UdpBound);
+            if self.config.network.p2p_enabled
+                && self.live_token_for_session(session_id).is_some()
+            {
+                let _ = self.send_control_to_token(
+                    token,
+                    &ServerControl::UdpReflexive {
+                        addr: addr.to_string(),
+                    },
+                );
+            }
+        }
+        if self.config.network.p2p_enabled {
+            for ((session_id, probe_id), addr) in events.nat_probe.drain() {
+                let Some(token) = self.live_token_for_session(session_id) else {
+                    continue;
+                };
+                let _ = self.send_control_to_token(
+                    token,
+                    &ServerControl::P2pNatProbe {
+                        probe_id,
+                        addr: addr.to_string(),
+                    },
+                );
+            }
+        } else {
+            debug_assert!(events.nat_probe.is_empty());
+            events.nat_probe.clear();
+        }
+        for (session_id, activity) in events.activity.drain() {
+            let Some(token) = self
+                .sessions
+                .get(&session_id)
+                .map(|session| session.tcp_token)
+            else {
+                continue;
+            };
+            if let Some(client) = self.clients.get_mut(&token) {
+                client.last_activity = client.last_activity.max(activity.last_activity);
+            }
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.reported_server_rtt_ms = activity.reported_rtt_ms;
+                session.server_rtt_reported_at = activity.rtt_reported_at;
             }
         }
         self.voice_events = events;
