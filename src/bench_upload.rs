@@ -68,6 +68,7 @@ fn server_config() -> ServerConfig {
         members: None,
         persistence: server::config::RoomPersistenceConfig::None,
         memory_limit: None,
+        mls_retention_days: None,
         is_default: true,
     }];
     config

@@ -167,6 +167,10 @@ pub struct RoomConfig {
     /// Ring size for `persistence = "memory"`; rejected for other settings.
     #[toml(default)]
     pub memory_limit: Option<u64>,
+    /// Maximum offline MLS replay period for this room. When absent the
+    /// global storage default is resolved when the encrypted room is created.
+    #[toml(default)]
+    pub mls_retention_days: Option<u16>,
     /// Marks the room clients drop into on connect. At most one room; when
     /// absent the lowest-id public room is the default.
     #[toml(default, rename = "default")]
@@ -196,13 +200,39 @@ impl RoomConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Toml)]
+#[derive(Clone, Debug, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
 pub struct StorageConfig {
     /// Directory for server-side room data (durable logs, DM registry, user
     /// registry). Defaults to `<config stem>-data` beside the config file.
     #[toml(default)]
     pub data_dir: Option<String>,
+    #[toml(default = 90)]
+    pub mls_retention_days: u16,
+    #[toml(default = 15)]
+    pub mls_cleanup_interval_minutes: u64,
+    #[toml(default = 4096)]
+    pub mls_cleanup_batch_events: usize,
+    #[toml(default = 24)]
+    pub mls_compaction_min_interval_hours: u64,
+    #[toml(default = 256)]
+    pub mls_compaction_min_fragmented_mib: u64,
+    #[toml(default = 25)]
+    pub mls_compaction_min_fragmented_percent: u8,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: None,
+            mls_retention_days: 90,
+            mls_cleanup_interval_minutes: 15,
+            mls_cleanup_batch_events: 4096,
+            mls_compaction_min_interval_hours: 24,
+            mls_compaction_min_fragmented_mib: 256,
+            mls_compaction_min_fragmented_percent: 25,
+        }
+    }
 }
 
 /// One record in the server-managed user registry (see
@@ -349,6 +379,12 @@ password-epoch = 0
 # beside this file.
 # [storage]
 # data-dir = "chatt-server-data"
+# mls-retention-days = 90
+# mls-cleanup-interval-minutes = 15
+# mls-cleanup-batch-events = 4096
+# mls-compaction-min-interval-hours = 24
+# mls-compaction-min-fragmented-mib = 256
+# mls-compaction-min-fragmented-percent = 25
 
 [[rooms]]
 id = 1
@@ -361,6 +397,8 @@ name = "lobby"
 persistence = "none"
 # Ring size for persistence = "memory".
 # memory-limit = 512
+# Optional MLS retention override for this room.
+# mls-retention-days = 30
 # Clients drop into the default room on connect. At most one room; when
 # omitted the lowest-id public room is the default.
 default = true
@@ -521,6 +559,18 @@ impl Config {
         if let Some(addr) = &self.network.public_udp_probe_addr {
             validate_public_endpoint(source, "network.public-udp-probe-addr", addr)?;
         }
+        if !(1..=3650).contains(&self.storage.mls_retention_days) {
+            return Err(format!(
+                "{source}: storage.mls-retention-days must be between 1 and 3650"
+            ));
+        }
+        if self.storage.mls_cleanup_interval_minutes == 0
+            || self.storage.mls_cleanup_batch_events == 0
+            || self.storage.mls_compaction_min_interval_hours == 0
+            || self.storage.mls_compaction_min_fragmented_percent > 100
+        {
+            return Err(format!("{source}: invalid MLS storage maintenance limits"));
+        }
 
         let mut room_ids = HashSet::new();
         let mut room_names = HashSet::new();
@@ -565,6 +615,15 @@ impl Config {
             if room.memory_limit == Some(0) {
                 return Err(format!(
                     "{source}: room {} memory-limit must be non-zero",
+                    room.name
+                ));
+            }
+            if room
+                .mls_retention_days
+                .is_some_and(|days| !(1..=3650).contains(&days))
+            {
+                return Err(format!(
+                    "{source}: room {} mls-retention-days must be between 1 and 3650",
                     room.name
                 ));
             }
@@ -837,6 +896,7 @@ fn default_rooms() -> Vec<RoomConfig> {
         members: None,
         persistence: RoomPersistenceConfig::None,
         memory_limit: None,
+        mls_retention_days: None,
         is_default: true,
     }]
 }
@@ -1291,6 +1351,37 @@ mod tests {
         config.storage.data_dir = None;
         config.config_path = None;
         assert_eq!(config.data_dir(), None);
+    }
+
+    #[test]
+    fn mls_retention_defaults_and_room_override_parse() {
+        let config = parse(&config_content(
+            "[storage]\nmls-retention-days = 120\nmls-cleanup-batch-events = 17\n\n\
+             [[rooms]]\nid = 1\nname = \"lobby\"\nmls-retention-days = 30\n",
+        ))
+        .unwrap();
+        assert_eq!(config.storage.mls_retention_days, 120);
+        assert_eq!(config.storage.mls_cleanup_batch_events, 17);
+        assert_eq!(config.rooms[0].mls_retention_days, Some(30));
+
+        let defaults = Config::default();
+        assert_eq!(defaults.storage.mls_retention_days, 90);
+        assert_eq!(defaults.storage.mls_cleanup_interval_minutes, 15);
+    }
+
+    #[test]
+    fn zero_mls_retention_is_rejected_globally_and_per_room() {
+        let global = parse(&config_content(
+            "[storage]\nmls-retention-days = 0\n\n[[rooms]]\nid = 1\nname = \"lobby\"\n",
+        ))
+        .unwrap_err();
+        assert!(global.contains("between 1 and 3650"));
+
+        let room = parse(&config_content(
+            "[[rooms]]\nid = 1\nname = \"lobby\"\nmls-retention-days = 0\n",
+        ))
+        .unwrap_err();
+        assert!(room.contains("between 1 and 3650"));
     }
 
     #[test]

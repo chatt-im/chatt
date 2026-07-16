@@ -24,6 +24,8 @@ mod imp {
     const SOCKET_NAME: &str = "control.sock";
     const MAGIC: &[u8] = b"chatt-server-control-v1\0";
     const OP_INVITE: u8 = 1;
+    const OP_MLS_STORAGE_STATUS: u8 = 2;
+    const OP_MLS_COMPACT: u8 = 3;
     const STATUS_OK: u8 = 0;
     const STATUS_ERROR: u8 = 1;
     const MAX_REQUEST_BYTES: u32 = 1024;
@@ -34,6 +36,12 @@ mod imp {
     pub enum AdminCommand {
         Invite {
             user: String,
+            reply: Sender<Result<String, String>>,
+        },
+        MlsStorageStatus {
+            reply: Sender<Result<String, String>>,
+        },
+        MlsCompact {
             reply: Sender<Result<String, String>>,
         },
         /// Stops the server event loop. Used by embedded lifecycle owners such
@@ -132,6 +140,29 @@ mod imp {
 
     pub fn send_invite(user: &str) -> Result<String, String> {
         send_invite_to_path(&socket_config()?.path, user)
+    }
+
+    pub fn mls_storage_status() -> Result<String, String> {
+        send_empty_request(&socket_config()?.path, OP_MLS_STORAGE_STATUS)
+    }
+
+    pub fn mls_compact() -> Result<String, String> {
+        send_empty_request(&socket_config()?.path, OP_MLS_COMPACT)
+    }
+
+    fn send_empty_request(socket_path: &Path, opcode: u8) -> Result<String, String> {
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            format!("no active chatt server control socket at {}: {error}", socket_path.display())
+        })?;
+        write_frame(&mut stream, opcode, &[], MAX_REQUEST_BYTES, "request")?;
+        let (status, body) = read_frame(&mut stream, MAX_RESPONSE_BYTES, "response")?;
+        let message = String::from_utf8(body)
+            .map_err(|error| format!("server control response is not UTF-8: {error}"))?;
+        match status {
+            STATUS_OK => Ok(message),
+            STATUS_ERROR => Err(message),
+            status => Err(format!("server control socket returned unknown status {status}")),
+        }
     }
 
     fn send_invite_to_path(socket_path: &Path, user: &str) -> Result<String, String> {
@@ -320,6 +351,34 @@ mod imp {
                     message: format!("invite user is not UTF-8: {error}"),
                 },
             },
+            Ok((opcode @ (OP_MLS_STORAGE_STATUS | OP_MLS_COMPACT), body)) if body.is_empty() => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                let command = if opcode == OP_MLS_STORAGE_STATUS {
+                    AdminCommand::MlsStorageStatus { reply: reply_tx }
+                } else {
+                    AdminCommand::MlsCompact { reply: reply_tx }
+                };
+                match commands.send(command) {
+                    Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
+                        Ok(Ok(message)) => Response {
+                            status: STATUS_OK,
+                            message,
+                        },
+                        Ok(Err(message)) => Response {
+                            status: STATUS_ERROR,
+                            message,
+                        },
+                        Err(error) => Response {
+                            status: STATUS_ERROR,
+                            message: format!("server did not answer MLS maintenance request: {error}"),
+                        },
+                    },
+                    Err(_) => Response {
+                        status: STATUS_ERROR,
+                        message: "chatt server is not running".to_string(),
+                    },
+                }
+            }
             Ok((opcode, _)) => Response {
                 status: STATUS_ERROR,
                 message: format!("unknown server control opcode {opcode}"),
@@ -483,6 +542,10 @@ mod imp {
                             reply.send(Ok("tcj1_join".to_string())).unwrap();
                         }
                         AdminCommand::Shutdown => panic!("unexpected shutdown command"),
+                        AdminCommand::MlsStorageStatus { .. }
+                        | AdminCommand::MlsCompact { .. } => {
+                            panic!("unexpected MLS maintenance command")
+                        }
                     },
                 );
 
@@ -603,6 +666,12 @@ mod imp {
             user: String,
             reply: Sender<Result<String, String>>,
         },
+        MlsStorageStatus {
+            reply: Sender<Result<String, String>>,
+        },
+        MlsCompact {
+            reply: Sender<Result<String, String>>,
+        },
         Shutdown,
     }
 
@@ -621,6 +690,14 @@ mod imp {
     pub fn send_invite(_user: &str) -> Result<String, String> {
         Err("chatt-server invite is only supported on Unix".to_string())
     }
+
+    pub fn mls_storage_status() -> Result<String, String> {
+        Err("chatt-server MLS storage status is only supported on Unix".to_string())
+    }
+
+    pub fn mls_compact() -> Result<String, String> {
+        Err("chatt-server MLS compaction is only supported on Unix".to_string())
+    }
 }
 
-pub use imp::{AdminCommand, AdminSocket, send_invite};
+pub use imp::{AdminCommand, AdminSocket, mls_compact, mls_storage_status, send_invite};

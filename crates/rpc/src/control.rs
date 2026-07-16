@@ -308,6 +308,9 @@ pub enum ClientControl {
         room_id: RoomId,
         sequence: u64,
     },
+    AckMlsWelcome {
+        delivery_id: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -531,14 +534,12 @@ pub enum ServerControl {
     MlsEvents {
         room_id: RoomId,
         events: Vec<crate::mls::MlsDeliveryEvent>,
+        oldest_available_sequence: u64,
+        head_sequence: u64,
     },
     MlsWelcomes {
         welcomes: Vec<crate::mls::MlsWelcome>,
         head_sequence: u64,
-    },
-    MlsEventAcked {
-        room_id: RoomId,
-        sequence: u64,
     },
     DeviceLinkCreated {
         redemption_secret_hash: Vec<u8>,

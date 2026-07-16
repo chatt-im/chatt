@@ -272,6 +272,7 @@ pub enum MlsSubmitOutcome {
     AlreadyStored { sequence: u64 },
     StaleEpochNotStored { current_epoch: u64 },
     RevocationPending,
+    RejoinRequired,
     TemporarilyBlocked,
 }
 
@@ -282,6 +283,7 @@ pub enum MlsCommitOutcome {
     AlreadyAccepted { sequence: u64, epoch: u64 },
     StaleEpoch { current_epoch: u64 },
     MissingKeyPackage { device_id: DeviceId },
+    RejoinRequired,
     TemporarilyBlocked,
     PolicyRejected,
 }

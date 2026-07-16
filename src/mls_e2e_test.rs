@@ -232,6 +232,7 @@ fn start_server(root: &Path) -> Addrs {
             members: None,
             persistence: RoomPersistenceConfig::None,
             memory_limit: None,
+            mls_retention_days: None,
             is_default: true,
         }],
         vec![
@@ -1388,6 +1389,7 @@ fn mls_live_fixed_group_three_accounts_with_heterogeneous_devices() {
                 members: None,
                 persistence: RoomPersistenceConfig::None,
                 memory_limit: None,
+                mls_retention_days: None,
                 is_default: true,
             },
             RoomConfig {
@@ -1396,6 +1398,7 @@ fn mls_live_fixed_group_three_accounts_with_heterogeneous_devices() {
                 members: Some(vec!["1".into(), "2".into(), "3".into()]),
                 persistence: RoomPersistenceConfig::None,
                 memory_limit: None,
+                mls_retention_days: None,
                 is_default: false,
             },
         ],
