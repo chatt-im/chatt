@@ -1,5 +1,5 @@
 use extui::{Buffer, Rect, event::KeyEvent, event::MouseEvent};
-use ring::rand::SecureRandom;
+use aws_lc_rs::rand::SecureRandom;
 use rpc::{
     control::InviteTicket,
     crypto::{OPEN_PAIR_RECOVERY_PREFIX, encode_hex},
@@ -627,7 +627,7 @@ pub(crate) fn server_entry_from_invite(
 
 pub(crate) fn random_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
-    ring::rand::SystemRandom::new()
+    aws_lc_rs::rand::SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| "failed to generate pairing token".to_string())?;
     Ok(encode_hex(&bytes))

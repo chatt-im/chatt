@@ -28,7 +28,7 @@ use mio::{
     Events, Interest, Poll, Token, Waker,
     net::{TcpStream, UdpSocket},
 };
-use ring::rand::SecureRandom;
+use aws_lc_rs::rand::SecureRandom;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use rpc::{
     control::{
@@ -1129,7 +1129,7 @@ fn device_pair_once(
             "the encrypted pairing roster does not match the server's current roster".to_string(),
         ));
     }
-    let rng = ring::rand::SystemRandom::new();
+    let rng = aws_lc_rs::rand::SystemRandom::new();
     let mls_dir = mls_installation_dir(data_dir, &trusted, user_id);
     let bootstrap_path = mls_dir.join("mls-bootstrap.bin");
     let attempt_id = rpc::ids::PairAttemptId(
@@ -1987,7 +1987,7 @@ fn connect_and_handshake(
     stream
         .set_nodelay(true)
         .map_err(|error| format!("failed to set TCP_NODELAY: {error}"))?;
-    let rng = ring::rand::SystemRandom::new();
+    let rng = aws_lc_rs::rand::SystemRandom::new();
     let client = generate_client_hello(&rng).map_err(|error| error.to_string())?;
     let hello = encode_client_hello(&client.hello);
     let mut framed = Vec::new();
@@ -3060,7 +3060,7 @@ struct ReceiveSink {
     work_budget: usize,
     capture_image_prefix: bool,
     image_prefix: Vec<u8>,
-    digest: ring::digest::Context,
+    digest: aws_lc_rs::digest::Context,
 }
 
 impl ReceiveSink {
@@ -3072,7 +3072,7 @@ impl ReceiveSink {
             work_budget: 0,
             capture_image_prefix,
             image_prefix: Vec::new(),
-            digest: ring::digest::Context::new(&ring::digest::SHA256),
+            digest: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
         }
     }
 
@@ -4228,7 +4228,7 @@ impl WorkerState {
                 if !self.mls_bound {
                     return Err("the local MLS device is not bound yet; retry shortly".to_string());
                 }
-                let rng = ring::rand::SystemRandom::new();
+                let rng = aws_lc_rs::rand::SystemRandom::new();
                 let mut secret = [0u8; KEY_LEN];
                 rng.fill(&mut secret)
                     .map_err(|_| "failed to generate device-link secret".to_string())?;
@@ -4627,7 +4627,7 @@ impl WorkerState {
             );
         }
         let mut content_key = [0u8; KEY_LEN];
-        ring::rand::SystemRandom::new()
+        aws_lc_rs::rand::SystemRandom::new()
             .fill(&mut content_key)
             .map_err(|_| "failed to generate a file content key".to_string())?;
         let event_id = random_event_id()?;
@@ -8799,7 +8799,7 @@ impl WorkerState {
             self.prefer_ipv6,
         ));
 
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         apply_candidate_privacy(candidates, self.candidate_privacy, &rng)
     }
 
@@ -8831,7 +8831,7 @@ impl WorkerState {
         let recv_key = key_from_control(&peer.recv_key)?;
         let stun_key = key_from_control(&peer.stun_key)?.bytes;
         let mut transaction_salt = [0u8; 32];
-        ring::rand::SystemRandom::new()
+        aws_lc_rs::rand::SystemRandom::new()
             .fill(&mut transaction_salt)
             .map_err(|_| "failed to generate STUN transaction salt".to_string())?;
         let auth = StunAuth::new(stun_key, transaction_salt);
@@ -9783,7 +9783,7 @@ fn unix_now_ms() -> u64 {
 
 fn random_event_id() -> Result<rpc::ids::EventId, String> {
     let mut bytes = [0u8; 16];
-    ring::rand::SystemRandom::new()
+    aws_lc_rs::rand::SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| "failed to generate MLS event id".to_string())?;
     Ok(rpc::ids::EventId(bytes))
@@ -10066,7 +10066,7 @@ fn open_upload_source(path: &Path, delete_after_open: bool) -> std::io::Result<F
 fn file_sha256(path: &Path) -> Result<[u8; 32], String> {
     let mut file = File::open(path)
         .map_err(|error| format!("failed to hash {}: {error}", path.display()))?;
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file
@@ -10239,7 +10239,7 @@ fn dispatch_voice_packet_to(
 }
 
 fn random_u64() -> Result<u64, String> {
-    let rng = ring::rand::SystemRandom::new();
+    let rng = aws_lc_rs::rand::SystemRandom::new();
     let mut bytes = [0u8; 8];
     rng.fill(&mut bytes)
         .map_err(|_| "failed to generate random tie breaker".to_string())?;
@@ -10784,7 +10784,7 @@ mod tests {
 
     #[test]
     fn mdns_mode_publishes_no_private_literal() {
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let candidates = vec![
             cand(1, CandidateKind::Host, "192.168.1.50:5000"),
             cand(2, CandidateKind::ServerReflexive, "198.51.100.7:6000"),
@@ -10814,7 +10814,7 @@ mod tests {
 
     #[test]
     fn no_host_mode_drops_host_candidates() {
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let candidates = vec![
             cand(1, CandidateKind::Host, "192.168.1.50:5000"),
             cand(2, CandidateKind::Relay, "203.0.113.9:7000"),
@@ -10837,7 +10837,7 @@ mod tests {
 
     #[test]
     fn disabled_mode_publishes_literal_host() {
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let candidates = vec![cand(1, CandidateKind::Host, "192.168.1.50:5000")];
         let gathered = apply_candidate_privacy(candidates, CandidatePrivacy::Disabled, &rng);
         assert_eq!(gathered.published[0].addr, "192.168.1.50:5000");

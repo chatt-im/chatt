@@ -26,8 +26,8 @@ use mio::{
     Events, Interest, Poll, Token, Waker,
     net::{TcpListener, TcpStream, UdpSocket},
 };
-use ring::rand::SecureRandom;
-use ring::signature::KeyPair;
+use aws_lc_rs::rand::SecureRandom;
+use aws_lc_rs::signature::KeyPair;
 use rpc::{
     control::{
         self, ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
@@ -399,8 +399,8 @@ pub struct Server {
     device_links: HashMap<Vec<u8>, DeviceLinkState>,
     open_pair_global_allocations: VecDeque<Instant>,
     open_pair_ip_allocations: HashMap<IpAddr, VecDeque<Instant>>,
-    rng: ring::rand::SystemRandom,
-    server_key_pair: ring::signature::Ed25519KeyPair,
+    rng: aws_lc_rs::rand::SystemRandom,
+    server_key_pair: aws_lc_rs::signature::Ed25519KeyPair,
     next_media_sweep_at: Option<Instant>,
     next_rtt_snapshot_at: Instant,
     next_idle_sweep_at: Instant,
@@ -1221,7 +1221,7 @@ impl Server {
             device_links: HashMap::new(),
             open_pair_global_allocations: VecDeque::new(),
             open_pair_ip_allocations: HashMap::new(),
-            rng: ring::rand::SystemRandom::new(),
+            rng: aws_lc_rs::rand::SystemRandom::new(),
             server_key_pair,
             next_media_sweep_at: None,
             next_rtt_snapshot_at: Instant::now() + RTT_SNAPSHOT_INTERVAL,
@@ -2809,8 +2809,8 @@ impl Server {
                     .iter()
                     .find(|certificate| certificate.body.device_id == device_id)
                     .ok_or_else(|| "MLS device is not active".to_string())?;
-                ring::signature::UnparsedPublicKey::new(
-                    &ring::signature::ED25519,
+                aws_lc_rs::signature::UnparsedPublicKey::new(
+                    &aws_lc_rs::signature::ED25519,
                     &certificate.body.mls_signature_public_key,
                 )
                 .verify(
@@ -7419,7 +7419,7 @@ fn is_fd_pressure_accept_error(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
-fn random_secret_hex(rng: &ring::rand::SystemRandom) -> Result<String, String> {
+fn random_secret_hex(rng: &aws_lc_rs::rand::SystemRandom) -> Result<String, String> {
     let mut bytes = [0u8; 32];
     rng.fill(&mut bytes)
         .map_err(|_| "failed to generate invite secret".to_string())?;
@@ -7427,7 +7427,7 @@ fn random_secret_hex(rng: &ring::rand::SystemRandom) -> Result<String, String> {
 }
 
 fn device_link_secret_hash(secret: &str) -> Vec<u8> {
-    ring::digest::digest(&ring::digest::SHA256, secret.as_bytes())
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, secret.as_bytes())
         .as_ref()
         .to_vec()
 }

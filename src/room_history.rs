@@ -18,7 +18,7 @@ use kvlog::encoding::{
     Encoder, Key, LogFields, MunchError, SpanInfo, StaticKey, Value, log_len, munch_log_with_span,
 };
 use kvlog::{Encode, LogLevel};
-use ring::digest::{SHA256, digest};
+use aws_lc_rs::digest::{SHA256, digest};
 use rpc::ids::{FileTransferId, MessageId, RoomId, UserId};
 use rpc::{
     control::{ChatMessage, MAX_CHAT_BODY_BYTES, MessageFlags},

@@ -4,7 +4,7 @@
 //! exact 256-bit public key plus an eight-bit error-detection checksum; the
 //! verification text binds that same key to a server and account context.
 
-use ring::digest::{SHA256, digest};
+use aws_lc_rs::digest::{SHA256, digest};
 use rpc::base32;
 use rpc::crypto::{decode_hex, encode_hex};
 

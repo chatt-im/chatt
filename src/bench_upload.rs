@@ -191,7 +191,7 @@ fn make_payload(len: usize) -> Vec<u8> {
 }
 
 fn sha256(data: &[u8]) -> [u8; 32] {
-    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data);
     digest.as_ref().try_into().expect("sha256 is 32 bytes")
 }
 

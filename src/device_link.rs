@@ -2,7 +2,7 @@
 
 use argon2_kdf::{Algorithm, Hasher};
 use jsony::Jsony;
-use ring::rand::SecureRandom;
+use aws_lc_rs::rand::SecureRandom;
 use rpc::crypto::{KEY_LEN, KeyMaterial, open_in_place_with_aad, seal_in_place_append_tag};
 use zeroize::Zeroizing;
 
@@ -100,7 +100,7 @@ pub(crate) fn open_enrollment(
 }
 
 pub(crate) fn redemption_secret_hash(secret: &str) -> Vec<u8> {
-    ring::digest::digest(&ring::digest::SHA256, secret.as_bytes())
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, secret.as_bytes())
         .as_ref()
         .to_vec()
 }
@@ -158,13 +158,13 @@ mod tests {
 
     #[test]
     fn transfer_password_has_six_words() {
-        let password = generate_transfer_password(&ring::rand::SystemRandom::new()).unwrap();
+        let password = generate_transfer_password(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
         assert_eq!(password.split('-').count(), WORD_COUNT);
     }
 
     #[test]
     fn enrollment_bundle_requires_the_transfer_password_and_context() {
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let plaintext = b"ephemeral authority material".to_vec();
         let server_key = [7; 32];
         let ticket_hash = [9; 32];
