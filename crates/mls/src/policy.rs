@@ -126,9 +126,22 @@ impl ChattIdentityProvider {
     /// Replaces all active certificates for an account with one validated
     /// current roster. Historical certificates are intentionally not kept.
     pub fn install_roster(&self, roster: &SignedDeviceRoster) -> Result<(), PolicyError> {
+        let checkpoint = roster_checkpoint(roster);
+        {
+            let state = self.state.read().map_err(|_| PolicyError::LockPoisoned)?;
+            if let Some(current) = state.rosters.get(&roster.body.account_id) {
+                if *current == checkpoint {
+                    return Ok(());
+                }
+                if checkpoint.revision <= current.revision {
+                    return Err(PolicyError::InvalidRoster(
+                        "device roster revision rolls back or equivocates".to_string(),
+                    ));
+                }
+            }
+        }
         validate_device_roster(roster, &self.server_id, roster.body.user_id)
             .map_err(PolicyError::InvalidRoster)?;
-        let checkpoint = roster_checkpoint(roster);
         let mut state = self.state.write().map_err(|_| PolicyError::LockPoisoned)?;
         if let Some(current) = state.rosters.get(&roster.body.account_id) {
             if *current == checkpoint {
