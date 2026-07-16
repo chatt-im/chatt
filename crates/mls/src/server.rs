@@ -11,7 +11,7 @@ use mls_rs::{
     group::{CommitEffect, ContentType, proposal::Proposal},
     WireFormat,
 };
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+use mls_rs_crypto_awslc::AwsLcCryptoProvider;
 use rpc::mls::MlsCommitBundle;
 
 use crate::{CIPHER_SUITE, ChattIdentityProvider, ChattMlsPolicy};
@@ -20,7 +20,7 @@ type ValidatorConfig = WithMlsRules<
     ChattMlsPolicy,
     WithIdentityProvider<
         ChattIdentityProvider,
-        WithCryptoProvider<RustCryptoProvider, ExternalBaseConfig>,
+        WithCryptoProvider<AwsLcCryptoProvider, ExternalBaseConfig>,
     >,
 >;
 
@@ -84,7 +84,7 @@ impl fmt::Debug for PublicGroupValidator {
 impl PublicGroupValidator {
     pub fn new(identities: ChattIdentityProvider) -> Self {
         let client = ExternalClient::builder()
-            .crypto_provider(RustCryptoProvider::default())
+            .crypto_provider(AwsLcCryptoProvider::default())
             .identity_provider(identities.clone())
             .mls_rules(ChattMlsPolicy::new(identities))
             .build();
@@ -310,7 +310,7 @@ fn added_key_package_refs(
 fn key_package_reference(
     key_package: &mls_rs::KeyPackage,
 ) -> Result<Vec<u8>, PublicValidationError> {
-    let cipher = RustCryptoProvider::default()
+    let cipher = AwsLcCryptoProvider::default()
         .cipher_suite_provider(CIPHER_SUITE)
         .ok_or_else(|| {
             PublicValidationError::Decode("mandatory cipher suite is unavailable".to_string())

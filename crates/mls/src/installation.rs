@@ -3,13 +3,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use mls_rs::{
     CipherSuiteProvider, CryptoProvider,
     identity::{SigningIdentity, basic::BasicCredential},
 };
 use mls_rs_core::crypto::SignaturePublicKey;
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-use ring::rand::{SecureRandom, SystemRandom};
+use mls_rs_crypto_awslc::AwsLcCryptoProvider;
 use rpc::{
     identity::{
         DeviceCertificateBody, DeviceRosterBody, RosterCheckpoint, SignedDeviceRoster, account_id,
@@ -286,7 +286,7 @@ fn create_paired_bootstrap(
     let account_id = account_id(&server_public_key, user_id, &authority_public_key);
     let device_id = DeviceId(device_bytes);
     let client_id = mls_client_id(&server_public_key, account_id, device_id)?;
-    let cipher = RustCryptoProvider::default()
+    let cipher = AwsLcCryptoProvider::default()
         .cipher_suite_provider(CIPHER_SUITE)
         .ok_or_else(|| "mandatory MLS cipher suite is unavailable".to_string())?;
     let (signing_secret, signing_public) = cipher
@@ -367,7 +367,7 @@ fn create_bootstrap(
     let account_id = account_id(&server_public_key, user_id, &authority_public_key);
     let device_id = DeviceId(device_bytes);
     let client_id = mls_client_id(&server_public_key, account_id, device_id)?;
-    let cipher = RustCryptoProvider::default()
+    let cipher = AwsLcCryptoProvider::default()
         .cipher_suite_provider(CIPHER_SUITE)
         .ok_or_else(|| "mandatory MLS cipher suite is unavailable".to_string())?;
     let (signing_secret, signing_public) = cipher

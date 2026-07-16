@@ -12,6 +12,7 @@ use std::{
     sync::Mutex,
 };
 
+use aws_lc_rs::digest;
 use jsony::Jsony;
 use mls_rs::{
     CipherSuiteProvider, Client, CryptoProvider, ExtensionList, MlsMessage,
@@ -22,7 +23,7 @@ use mls_rs::{
     identity::{SigningIdentity, basic::BasicCredential},
 };
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+use mls_rs_crypto_awslc::AwsLcCryptoProvider;
 use mls_rs_provider_sqlite::{
     JournalMode, SqLiteDataStorageEngine, SqLiteDataStorageError,
     connection_strategy::{
@@ -45,7 +46,7 @@ type PersistentConfig = WithMlsRules<
     ChattMlsPolicy,
     WithIdentityProvider<
         ChattIdentityProvider,
-        WithCryptoProvider<RustCryptoProvider, BaseSqlConfig>,
+        WithCryptoProvider<AwsLcCryptoProvider, BaseSqlConfig>,
     >,
 >;
 
@@ -297,7 +298,7 @@ impl PersistentClient {
     ) -> Result<Self, String> {
         let client = ClientBuilder::<BaseSqlConfig>::new_sqlite(storage)
             .map_err(|error| error.to_string())?
-            .crypto_provider(RustCryptoProvider::default())
+            .crypto_provider(AwsLcCryptoProvider::default())
             .identity_provider(identities.historical_group_info_observer())
             .mls_rules(ChattMlsPolicy::new(identities.clone()))
             .signing_identity(signing_identity, signing_secret.clone(), CIPHER_SUITE)
@@ -312,7 +313,7 @@ impl PersistentClient {
     }
 
     pub fn sign_device_binding(&self, message: &[u8]) -> Result<Vec<u8>, String> {
-        RustCryptoProvider::default()
+        AwsLcCryptoProvider::default()
             .cipher_suite_provider(CIPHER_SUITE)
             .ok_or_else(|| "mandatory MLS cipher suite is unavailable".to_string())?
             .sign(&self.signing_secret, message)
@@ -1723,7 +1724,7 @@ impl DeliveryMarker {
 
 fn message_hash(message: &[u8]) -> [u8; 32] {
     let mut hash = [0; 32];
-    hash.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, message).as_ref());
+    hash.copy_from_slice(digest::digest(&digest::SHA256, message).as_ref());
     hash
 }
 

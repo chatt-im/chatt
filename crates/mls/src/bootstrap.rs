@@ -4,8 +4,8 @@ use std::{
     path::Path,
 };
 
+use aws_lc_rs::hkdf;
 use jsony::Jsony;
-use ring::hkdf;
 use rpc::{
     identity::{SignedDeviceCertificate, SignedDeviceRoster},
     ids::{AccountId, DeviceId, PairAttemptId, UserId},
