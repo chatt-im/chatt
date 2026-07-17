@@ -34,7 +34,7 @@ toml-spanner = { version = "1.0.3", features = [
     "derive",
 ] }
 earshot = "1.1.0"
-zstd = "0.13"
+zstd = { version =  "0.13", default-features = false }
 sonora.path = "crates/sonora/crates/sonora"
 sonora-agc2.path = "crates/sonora/crates/sonora-agc2"
 sonora-common-audio.path = "crates/sonora/crates/sonora-common-audio/"
