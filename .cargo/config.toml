@@ -37,3 +37,9 @@ dhat = [
     "--no-default-features",
     "--features", "audio-realtime dhat-heap",
 ]
+
+[env]
+# On none of the supported on modern hardware is this a good idea.
+# Setting this removes 50ms start delay.
+AWS_LC_SYS_NO_JITTER_ENTROPY = { value = "1", force = true }
+
