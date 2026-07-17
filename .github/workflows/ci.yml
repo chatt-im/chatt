@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
+  RUST_VERSION: 1.96.1
+  NEXTEST_VERSION: 0.9.140
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            nextest-platform: linux
+            nextest-args: --workspace --profile ci
+          - os: macos-latest
+            nextest-platform: mac
+            # These workspace packages depend on Linux-only PipeWire/perf-event APIs.
+            nextest-args: --workspace --exclude benchmark --exclude pipewire-sys --profile ci
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            clang \
+            ffmpeg \
+            libasound2-dev \
+            libclang-dev \
+            libpipewire-0.3-dev \
+            pkg-config
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install cargo-nextest
+        run: |
+          mkdir -p "$RUNNER_TEMP/cargo-nextest-bin"
+          curl --fail --location --silent --show-error \
+            "https://get.nexte.st/$NEXTEST_VERSION/${{ matrix.nextest-platform }}" \
+            | tar zxf - -C "$RUNNER_TEMP/cargo-nextest-bin"
+          echo "$RUNNER_TEMP/cargo-nextest-bin" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        run: |
+          rustc --version
+          cargo nextest --version
+
+      - name: Run tests
+        run: cargo nextest run ${{ matrix.nextest-args }}
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ runner.os }}-${{ runner.arch }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 7
