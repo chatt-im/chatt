@@ -104,6 +104,13 @@ const EVENT_LOOP_STATS_INTERVAL: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
 const ACCEPT_BUDGET: usize = 64;
+/// Maximum distinct sockets serviced in each direction during one loop pass.
+/// Per-connection byte/record budgets still apply; these caps bound aggregate
+/// work before worker completions and timers get another turn. Remaining
+/// tokens stay in their FIFO queues, so zero-timeout passes continue at full
+/// throughput while rotating fairly across busy connections.
+const CLIENT_READS_PER_PASS: usize = 64;
+const CLIENT_WRITES_PER_PASS: usize = 64;
 const TCP_WRITE_ATTEMPTS: usize = 32;
 /// Scheduling budget for bytes read from one TCP connection per readiness pass:
 /// enough for one maximum framed control record, while still preventing one
@@ -358,8 +365,14 @@ impl LoopWork {
     }
 
     #[inline]
+    #[cfg(test)]
     fn client_read_count(&self) -> usize {
         self.client_reads.len()
+    }
+
+    #[inline]
+    fn client_read_batch_len(&self) -> usize {
+        self.client_reads.len().min(CLIENT_READS_PER_PASS)
     }
 
     #[inline]
@@ -370,8 +383,14 @@ impl LoopWork {
     }
 
     #[inline]
+    #[cfg(test)]
     fn client_write_count(&self) -> usize {
         self.client_writes.len()
+    }
+
+    #[inline]
+    fn client_write_batch_len(&self) -> usize {
+        self.client_writes.len().min(CLIENT_WRITES_PER_PASS)
     }
 
     #[inline]
@@ -1575,7 +1594,7 @@ impl Server {
             if self.loop_work.take_accept_clients() {
                 self.accept_clients()?;
             }
-            let client_read_count = self.loop_work.client_read_count();
+            let client_read_count = self.loop_work.client_read_batch_len();
             for _ in 0..client_read_count {
                 if let Some(token) = self.loop_work.pop_client_read() {
                     self.read_client(token);
@@ -1583,7 +1602,7 @@ impl Server {
             }
             self.process_control_sends();
             self.process_video_fanouts();
-            let client_write_count = self.loop_work.client_write_count();
+            let client_write_count = self.loop_work.client_write_batch_len();
             for _ in 0..client_write_count {
                 if let Some(token) = self.loop_work.pop_client_write() {
                     self.write_client(token);
@@ -11091,6 +11110,36 @@ mod tests {
         assert_eq!(work.pop_client_write(), Some(Token(9)));
         assert_eq!(work.pop_client_write(), None);
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), POLL_TIMEOUT);
+    }
+
+    #[test]
+    fn loop_work_caps_socket_batches_and_preserves_fifo_remainder() {
+        let mut work = LoopWork::default();
+        for index in 0..=CLIENT_READS_PER_PASS {
+            work.queue_client_read(Token(FIRST_CLIENT + index));
+        }
+        for index in 0..=CLIENT_WRITES_PER_PASS {
+            work.queue_client_write(Token(FIRST_CLIENT + index));
+        }
+
+        assert_eq!(work.client_read_batch_len(), CLIENT_READS_PER_PASS);
+        for _ in 0..work.client_read_batch_len() {
+            work.pop_client_read().unwrap();
+        }
+        assert_eq!(
+            work.queued_client_reads(),
+            vec![Token(FIRST_CLIENT + CLIENT_READS_PER_PASS)]
+        );
+
+        assert_eq!(work.client_write_batch_len(), CLIENT_WRITES_PER_PASS);
+        for _ in 0..work.client_write_batch_len() {
+            work.pop_client_write().unwrap();
+        }
+        assert_eq!(
+            work.queued_client_writes(),
+            vec![Token(FIRST_CLIENT + CLIENT_WRITES_PER_PASS)]
+        );
+        assert_eq!(work.poll_timeout(POLL_TIMEOUT), Duration::ZERO);
     }
 
     #[test]
