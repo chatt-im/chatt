@@ -3,8 +3,8 @@
 //! A reference addresses a message by the durable key the rest of the system
 //! uses for dedup and merge: `message_id` scoped by `room_id`. Message ids are
 //! per-room, monotonic, and persistently watermarked, so the id alone is the
-//! identity. (A server that loses its `state.toml` on a room without a durable
-//! log can restart ids, in which case an old code may resolve to a different
+//! identity. (A server that loses its room-state database on a room without a
+//! durable log can restart ids, in which case an old code may resolve to a different
 //! message; accepted for a reference that is ultimately display text.)
 //! References travel inside message bodies as `@@<code>` where the code is
 //! Crockford base32 of the LEB128-packed fields plus a one-character checksum.

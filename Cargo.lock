@@ -2516,6 +2516,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "mio",
+ "redb",
  "rpc",
  "tempfile",
  "toml-spanner",

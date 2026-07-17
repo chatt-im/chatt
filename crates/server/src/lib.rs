@@ -21,6 +21,7 @@ mod mls_delivery;
 mod mls_service;
 mod mls_store;
 pub mod room_store;
+mod room_state;
 pub mod user_store;
 mod username_registry;
 mod voice_relay;
@@ -1397,7 +1398,8 @@ impl Server {
             );
         }
         let default_room = config.default_room_id();
-        let mut store = RoomStore::open(config.data_dir(), &config.rooms);
+        let mut store = RoomStore::try_open(config.data_dir(), &config.rooms)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         for dm in store.dm_rooms() {
             rooms.insert(
                 dm.room_id,

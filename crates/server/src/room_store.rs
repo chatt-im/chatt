@@ -14,12 +14,14 @@
 //!
 //! # Durability scope
 //!
-//! Log appends and state writes reach the OS through ordinary writes with no
-//! fsync on the append path, so durable rooms survive a process crash (the
-//! page cache persists) but not power loss or a kernel crash. After such an
-//! unclean shutdown the loader truncates the torn log tail while message ids
-//! keep advancing, so a client that saw the lost messages observes a gap.
-//! Fsync-on-a-timer is the upgrade path if that trade stops being acceptable.
+//! Room identity, dynamic-room registration, and message-id reservations live
+//! in a transactional `redb` database. Message log appends still use ordinary
+//! writes with no fsync on the append path, so durable rooms survive a process
+//! crash (the page cache persists) but not power loss or a kernel crash. After
+//! such an unclean shutdown the loader truncates the torn log tail while the
+//! database watermark keeps message ids advancing, so a client that saw the
+//! lost messages observes a gap. Fsync-on-a-timer is the upgrade path if that
+//! trade stops being acceptable.
 //!
 //! Message ids are per-room, monotonic from 1, and durable. Allocation uses a
 //! block reservation: whenever the remaining reservation drops below half a
@@ -35,7 +37,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{Arc, mpsc},
     thread,
 };
 
@@ -44,11 +46,10 @@ use rpc::{
     history,
     ids::{MessageId, RoomId, SessionId, UserId},
 };
-use toml_spanner::Toml;
-
-use crate::config::{FIRST_DYNAMIC_ROOM_ID, RoomConfig, RoomPersistenceConfig, atomic_write_toml};
+use crate::config::{FIRST_DYNAMIC_ROOM_ID, RoomConfig, RoomPersistenceConfig};
 use crate::event_queue::{EventNotifier, EventQueue, ROOM_LOG_EVENTS, ROOM_STATE_EVENTS};
 use crate::history_reader::{HistoryReadRequest, Source};
+use crate::room_state::{self, LoadedState, StateWriteEvent, StateWriter};
 
 /// Message-id block reserved per state write; a restart skips at most twice
 /// this many ids per room.
@@ -59,7 +60,6 @@ const MAX_ACTIVE_LOG_BYTES: u64 = 4 * 1024 * 1024;
 /// Cap on messages a durable room keeps resident; older pages are served
 /// from disk.
 const MAX_DURABLE_RESIDENT_MESSAGES: usize = 8192;
-const STATE_FILE: &str = "state.toml";
 const LOG_WRITE_QUEUE_CAPACITY: usize = 256;
 
 /// Durable retention size limits, injectable so tests can force rotation and
@@ -758,44 +758,64 @@ pub struct RoomStore {
 }
 
 impl RoomStore {
-    /// Opens the store for the configured rooms: loads `state.toml`, fills
+    /// Opens the store for the configured rooms: loads the transactional room
+    /// state database, fills
     /// each durable room's resident window from its active log (repairing a
     /// corrupt tail) and newest segments, and registers persisted DM rooms.
     /// `data_dir = None` keeps everything in memory, so ids restart per
     /// process; real servers always have a data dir.
     pub fn open(data_dir: Option<PathBuf>, rooms: &[RoomConfig]) -> Self {
-        Self::open_with_tuning(data_dir, rooms, StoreTuning::default())
+        Self::try_open_with_tuning(data_dir, rooms, StoreTuning::default())
+            .unwrap_or_else(|error| panic!("failed to open room store: {error}"))
     }
 
+    pub(crate) fn try_open(
+        data_dir: Option<PathBuf>,
+        rooms: &[RoomConfig],
+    ) -> Result<Self, String> {
+        Self::try_open_with_tuning(data_dir, rooms, StoreTuning::default())
+    }
+
+    #[cfg(test)]
     pub(crate) fn open_with_tuning(
         data_dir: Option<PathBuf>,
         rooms: &[RoomConfig],
         tuning: StoreTuning,
     ) -> Self {
+        Self::try_open_with_tuning(data_dir, rooms, tuning)
+            .unwrap_or_else(|error| panic!("failed to open room store: {error}"))
+    }
+
+    fn try_open_with_tuning(
+        data_dir: Option<PathBuf>,
+        rooms: &[RoomConfig],
+        tuning: StoreTuning,
+    ) -> Result<Self, String> {
         if let Some(dir) = &data_dir {
-            if let Err(error) = fs::create_dir_all(dir.join("rooms")) {
-                kvlog::error!(
-                    "room store data dir unavailable; durable state disabled",
-                    dir = dir.display().to_string().as_str(),
-                    error = error.to_string().as_str()
-                );
-                return Self::open_with_tuning(None, rooms, tuning);
-            }
+            fs::create_dir_all(dir.join("rooms")).map_err(|error| {
+                format!(
+                    "room store data directory {} is unavailable: {error}",
+                    dir.display()
+                )
+            })?;
         }
-        let state = data_dir
-            .as_deref()
-            .map(load_state)
-            .unwrap_or_else(StoreState::default);
+        let (state, state_writer) = match data_dir.as_deref() {
+            Some(dir) => {
+                let path = dir.join(room_state::FILE_NAME);
+                let opened = room_state::open(&path).map_err(|error| {
+                    format!("room state database {} is unavailable: {error}", path.display())
+                })?;
+                (opened.0, Some(opened.1))
+            }
+            None => (LoadedState::default(), None),
+        };
         let mut next_room_id = state.next_room_id.max(FIRST_DYNAMIC_ROOM_ID);
         for entry in &state.dm_rooms {
-            next_room_id = next_room_id.max(entry.room_id.saturating_add(1));
+            next_room_id = next_room_id.max(entry.room_id.0.saturating_add(1));
         }
         if let Some(dir) = &data_dir {
             next_room_id = next_room_id.max(next_room_id_above_existing_logs(dir));
         }
-        let state_writer = data_dir
-            .as_deref()
-            .map(|dir| StateWriter::spawn(dir.join(STATE_FILE)));
         let mut store = Self {
             data_dir,
             state_writer,
@@ -814,9 +834,9 @@ impl RoomStore {
             next_dm_operation: 1,
             rooms: HashMap::new(),
         };
-        for entry in state.message_id_watermarks {
-            store.watermarks.insert(RoomId(entry.room_id), entry.next);
-            store.next_ids.insert(RoomId(entry.room_id), entry.next);
+        for (room_id, next) in state.watermarks {
+            store.watermarks.insert(room_id, next);
+            store.next_ids.insert(room_id, next);
         }
         for room in rooms {
             store.register_room(
@@ -825,17 +845,12 @@ impl RoomStore {
                 room.memory_history_limit(),
             );
         }
-        for entry in state.dm_rooms {
-            let room_id = RoomId(entry.room_id);
+        for dm in state.dm_rooms {
+            let room_id = dm.room_id;
             store.register_room(room_id, RoomPersistenceConfig::Durable, 0);
-            store.dm_rooms.push(DmRoom {
-                room_id,
-                user_a: entry.user_a,
-                user_b: entry.user_b,
-                created_at_ms: entry.created_at_ms,
-            });
+            store.dm_rooms.push(dm);
         }
-        store
+        Ok(store)
     }
 
     /// Test-only override of the durable retention limits; both caps are read
@@ -1086,9 +1101,14 @@ impl RoomStore {
         let id = *next;
         *next += 1;
         let watermark = self.watermarks.entry(room_id).or_insert(0);
-        if id + MESSAGE_ID_RESERVE / 2 >= *watermark {
+        let persist = if id + MESSAGE_ID_RESERVE / 2 >= *watermark {
             *watermark = (id + 1 + MESSAGE_ID_RESERVE).next_multiple_of(MESSAGE_ID_RESERVE);
-            self.queue_persist_state();
+            Some(*watermark)
+        } else {
+            None
+        };
+        if let Some(watermark) = persist {
+            self.queue_persist_watermark(room_id, watermark);
         }
         MessageId(id)
     }
@@ -1500,23 +1520,18 @@ impl RoomStore {
             .checked_add(1)
             .ok_or_else(|| "no dynamic room ids are available".to_string())?;
         self.next_room_id = next;
-        self.register_room(room_id, RoomPersistenceConfig::Durable, 0);
-        self.dm_rooms.push(DmRoom {
+        let room = DmRoom {
             room_id,
             user_a: first,
             user_b: second,
             created_at_ms: now_ms,
-        });
-        if let Err(error) = self.try_persist_state() {
-            self.dm_rooms.pop();
-            self.rooms.remove(&room_id);
-            self.next_ids.remove(&room_id);
-            self.watermarks.remove(&room_id);
-            self.heads.remove(&room_id);
-            self.recent_ids.remove(&room_id);
+        };
+        if let Err(error) = self.try_persist_dm(room) {
             self.next_room_id = room_id.0;
             return Err(format!("dm room registry write failed: {error}"));
         }
+        self.register_room(room_id, RoomPersistenceConfig::Durable, 0);
+        self.dm_rooms.push(room);
         Ok(room_id)
     }
 
@@ -1566,8 +1581,9 @@ impl RoomStore {
             },
             previous_next_room_id,
         });
-        if let Err(error) = writer.write_async(
-            self.state_snapshot(),
+        if let Err(error) = writer.insert_dm_async(
+            self.pending_dm.as_ref().expect("pending DM inserted").room,
+            self.next_room_id,
             operation_id,
             Arc::clone(events),
         ) {
@@ -1622,7 +1638,6 @@ impl RoomStore {
                 self.dm_rooms.push(pending.room);
             } else {
                 self.next_room_id = pending.previous_next_room_id;
-                self.queue_persist_state();
             }
             completed.push_back(DmCompletion {
                 operation_id: pending.operation_id,
@@ -1634,257 +1649,28 @@ impl RoomStore {
         completed
     }
 
-    /// Queues a state snapshot to the background writer without waiting for
-    /// the write; used on the message hot path where an fsync stall must not
-    /// block the event loop.
-    fn queue_persist_state(&self) {
+    /// Queues one keyed watermark update without waiting for the transaction;
+    /// used on the message hot path where an fsync stall must not block the
+    /// event loop.
+    fn queue_persist_watermark(&self, room_id: RoomId, next: u64) {
         let Some(writer) = &self.state_writer else {
             return;
         };
-        writer.enqueue(self.state_snapshot());
+        writer.enqueue_watermark(room_id, next);
     }
 
-    /// Writes a state snapshot through the background writer and waits for
-    /// the result, so rare callers like DM creation can roll back on failure.
-    /// Routing through the writer keeps a single ordered stream of `state.toml`
-    /// writes; a queued older snapshot can never clobber a newer one.
-    fn try_persist_state(&self) -> Result<(), String> {
+    /// Atomically reserves the dynamic id and records the DM participants,
+    /// waiting so the in-memory creation can roll back on failure.
+    fn try_persist_dm(&self, room: DmRoom) -> Result<(), String> {
         let Some(writer) = &self.state_writer else {
             return Ok(());
         };
-        writer.write_sync(self.state_snapshot())
-    }
-
-    fn state_snapshot(&self) -> StateSnapshot {
-        let watermarks = self
-            .watermarks
-            .iter()
-            .map(|(room_id, next)| (room_id.0, *next))
-            .collect();
-        let mut dm_rooms = self.dm_rooms.clone();
-        if let Some(pending) = &self.pending_dm {
-            dm_rooms.push(pending.room);
-        }
-        StateSnapshot {
-            next_room_id: self.next_room_id,
-            watermarks,
-            dm_rooms,
-            prepare_logs: self
-                .pending_dm
-                .iter()
-                .filter_map(|pending| {
-                    self.data_dir.as_ref().map(|dir| {
-                        dir.join("rooms")
-                            .join(format!("{}.log", pending.room.room_id.0))
-                    })
-                })
-                .collect(),
-        }
-    }
-}
-
-struct StateSnapshot {
-    next_room_id: u32,
-    watermarks: Vec<(u32, u64)>,
-    dm_rooms: Vec<DmRoom>,
-    /// Files that must be created before this snapshot can expose its dynamic
-    /// rooms. This belongs to the snapshot, rather than its completion waiter,
-    /// so a later coalesced watermark write cannot bypass the prerequisite.
-    prepare_logs: Vec<PathBuf>,
-}
-
-fn render_state_snapshot(mut snapshot: StateSnapshot) -> String {
-    snapshot.watermarks.sort_unstable();
-    let mut out = String::new();
-    out.push_str("# chatt server room state. Managed by the server; do not edit.\n\n");
-    out.push_str(&format!("next-room-id = {}\n", snapshot.next_room_id));
-    for (room_id, next) in snapshot.watermarks {
-            out.push_str("\n[[message-id-watermarks]]\n");
-            out.push_str(&format!("room-id = {room_id}\nnext = {next}\n"));
-    }
-    for dm in snapshot.dm_rooms {
-            out.push_str("\n[[dm-rooms]]\n");
-            out.push_str(&format!(
-                "room-id = {}\nuser-a = {}\nuser-b = {}\ncreated-at-ms = {}\n",
-                dm.room_id.0, dm.user_a.0, dm.user_b.0, dm.created_at_ms
-            ));
-    }
-    out
-}
-
-#[derive(Default)]
-struct PendingStateWrite {
-    snapshot: Option<StateSnapshot>,
-    waiters: Vec<StateWriteWaiter>,
-    closed: bool,
-}
-
-enum StateWriteWaiter {
-    Sync(mpsc::SyncSender<Result<(), String>>),
-    Event {
-        operation_id: u64,
-        events: Arc<EventQueue<StateWriteEvent>>,
-    },
-}
-
-struct StateWriteEvent {
-    operation_id: u64,
-    result: Result<(), String>,
-}
-
-#[derive(Default)]
-struct StateWriteSubmission {
-    pending: Mutex<PendingStateWrite>,
-    ready: Condvar,
-}
-
-impl StateWriteSubmission {
-    fn submit(
-        &self,
-        snapshot: StateSnapshot,
-        waiter: Option<StateWriteWaiter>,
-    ) -> bool {
-        let mut pending = self.pending.lock().unwrap();
-        if pending.closed {
-            return false;
-        }
-        // A complete state snapshot supersedes every not-yet-started snapshot.
-        // Keep only the newest bytes while retaining all durability waiters;
-        // the next write covers every earlier waiter in this batch.
-        pending.snapshot = Some(snapshot);
-        if let Some(waiter) = waiter {
-            pending.waiters.push(waiter);
-        }
-        self.ready.notify_one();
-        true
-    }
-
-    fn receive(&self) -> Option<(StateSnapshot, Vec<StateWriteWaiter>)> {
-        let mut pending = self.pending.lock().unwrap();
-        loop {
-            if let Some(snapshot) = pending.snapshot.take() {
-                return Some((snapshot, std::mem::take(&mut pending.waiters)));
-            }
-            if pending.closed {
-                return None;
-            }
-            pending = self.ready.wait(pending).unwrap();
-        }
-    }
-
-    fn close(&self) {
-        self.pending.lock().unwrap().closed = true;
-        self.ready.notify_one();
-    }
-}
-
-/// Background `state.toml` writer thread. Snapshots are complete state, so
-/// queued writes coalesce to the newest one, and every drained waiter gets
-/// the result of the write that covered its snapshot. Dropping the writer
-/// flushes the queue before returning, so a clean shutdown persists the
-/// final watermarks.
-struct StateWriter {
-    submission: Arc<StateWriteSubmission>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl StateWriter {
-    fn spawn(path: PathBuf) -> Self {
-        let submission = Arc::new(StateWriteSubmission::default());
-        let worker_submission = Arc::clone(&submission);
-        let thread = thread::spawn(move || {
-            while let Some((snapshot, waiters)) = worker_submission.receive() {
-                let prepare_logs = snapshot.prepare_logs.clone();
-                let snapshot = render_state_snapshot(snapshot);
-                // The empty active log is a recovery tombstone. It must exist
-                // before state.toml can make the dynamic room visible, so a
-                // crash or later state corruption can never recycle this id
-                // onto private history from another room.
-                let result = prepare_logs
-                    .iter()
-                    .try_for_each(|log_path| {
-                        open_active_log(log_path)
-                            .map(drop)
-                            .map_err(|error| format!("room log tombstone create failed: {error}"))
-                    })
-                    .and_then(|()| atomic_write_toml(&path, &snapshot));
-                if let Err(error) = &result {
-                    kvlog::error!(
-                        "room state write failed; ids may repeat after restart",
-                        error = error.as_str()
-                    );
-                }
-                for waiter in waiters {
-                    match waiter {
-                        StateWriteWaiter::Sync(reply) => {
-                            let _ = reply.send(result.clone());
-                        }
-                        StateWriteWaiter::Event {
-                            operation_id,
-                            events,
-                        } => events.push(StateWriteEvent {
-                            operation_id,
-                            result: result.clone(),
-                        }),
-                    }
-                }
-            }
-        });
-        Self {
-            submission,
-            thread: Some(thread),
-        }
-    }
-
-    fn enqueue(&self, snapshot: StateSnapshot) {
-        if !self.submission.submit(snapshot, None) {
-            kvlog::error!("room state writer gone; ids may repeat after restart");
-        }
-    }
-
-    fn write_sync(&self, snapshot: StateSnapshot) -> Result<(), String> {
-        let gone = || "room state writer thread is gone".to_string();
-        let (reply, done) = mpsc::sync_channel(1);
-        if !self
-            .submission
-            .submit(snapshot, Some(StateWriteWaiter::Sync(reply)))
-        {
-            return Err(gone());
-        }
-        done.recv().map_err(|_| gone())?
-    }
-
-    fn write_async(
-        &self,
-        snapshot: StateSnapshot,
-        operation_id: u64,
-        events: Arc<EventQueue<StateWriteEvent>>,
-    ) -> Result<(), String> {
-        self.submission
-            .submit(
-                snapshot,
-                Some(StateWriteWaiter::Event {
-                    operation_id,
-                    events,
-                }),
-            )
-            .then_some(())
-            .ok_or_else(|| "room state writer thread is gone".to_string())
-    }
-}
-
-impl Drop for StateWriter {
-    fn drop(&mut self) {
-        self.submission.close();
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
-        let _ = thread.join();
+        writer.insert_dm_sync(room, self.next_room_id)
     }
 }
 
 /// The lowest dynamic room id above every room log already on disk. Guards id
-/// allocation when `state.toml` is lost or corrupt: reusing an id whose log
+/// allocation when the state database is lost or corrupt: reusing an id whose log
 /// survives would seed the new room with the old room's private history.
 fn next_room_id_above_existing_logs(dir: &Path) -> u32 {
     let mut next = FIRST_DYNAMIC_ROOM_ID;
@@ -1909,57 +1695,6 @@ fn next_room_id_above_existing_logs(dir: &Path) -> u32 {
     next
 }
 
-#[derive(Default, Toml)]
-#[toml(FromToml, rename_all = "kebab-case")]
-struct StoreState {
-    #[toml(default = FIRST_DYNAMIC_ROOM_ID)]
-    next_room_id: u32,
-    #[toml(default)]
-    message_id_watermarks: Vec<WatermarkEntry>,
-    #[toml(default)]
-    dm_rooms: Vec<DmRoomEntry>,
-}
-
-#[derive(Toml)]
-#[toml(FromToml, rename_all = "kebab-case")]
-struct WatermarkEntry {
-    room_id: u32,
-    next: u64,
-}
-
-#[derive(Toml)]
-#[toml(FromToml, rename_all = "kebab-case")]
-struct DmRoomEntry {
-    room_id: u32,
-    user_a: UserId,
-    user_b: UserId,
-    created_at_ms: u64,
-}
-
-fn load_state(dir: &Path) -> StoreState {
-    let path = dir.join(STATE_FILE);
-    let Ok(content) = fs::read_to_string(&path) else {
-        return StoreState::default();
-    };
-    let arena = toml_spanner::Arena::new();
-    let Ok(mut doc) = toml_spanner::parse(&content, &arena) else {
-        kvlog::error!(
-            "room state unparseable; starting fresh",
-            path = path.display().to_string().as_str()
-        );
-        return StoreState::default();
-    };
-    match doc.to() {
-        Ok(state) => state,
-        Err(_) => {
-            kvlog::error!(
-                "room state undeserializable; starting fresh",
-                path = path.display().to_string().as_str()
-            );
-            StoreState::default()
-        }
-    }
-}
 
 /// Appends one `len:u32 | record` frame, rejecting records the loader would
 /// treat as a corrupt tail. Without the write-time check an oversized record
@@ -2192,67 +1927,6 @@ fn list_segments(active_path: &Path) -> Vec<Segment> {
 mod tests {
     use super::*;
     use rpc::ids::UserId;
-
-    #[test]
-    fn pending_state_writes_keep_only_latest_snapshot_and_all_waiters() {
-        let snapshot = |next_room_id| StateSnapshot {
-            next_room_id,
-            watermarks: Vec::new(),
-            dm_rooms: Vec::new(),
-            prepare_logs: Vec::new(),
-        };
-        let submission = StateWriteSubmission::default();
-        let (first_reply, first_done) = mpsc::sync_channel(1);
-        let (second_reply, second_done) = mpsc::sync_channel(1);
-        assert!(submission.submit(
-            snapshot(1),
-            Some(StateWriteWaiter::Sync(first_reply))
-        ));
-        assert!(submission.submit(snapshot(2), None));
-        assert!(submission.submit(
-            snapshot(3),
-            Some(StateWriteWaiter::Sync(second_reply))
-        ));
-
-        let (snapshot, waiters) = submission.receive().unwrap();
-        assert_eq!(snapshot.next_room_id, 3);
-        assert_eq!(waiters.len(), 2);
-        for waiter in waiters {
-            let StateWriteWaiter::Sync(waiter) = waiter else {
-                panic!("expected synchronous test waiter");
-            };
-            waiter.send(Ok(())).unwrap();
-        }
-        assert_eq!(first_done.recv().unwrap(), Ok(()));
-        assert_eq!(second_done.recv().unwrap(), Ok(()));
-    }
-
-    #[test]
-    fn pending_dm_prerequisite_is_present_in_every_state_snapshot() {
-        let dir = temp_dir("pending-dm-prerequisite");
-        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
-        let room = DmRoom {
-            room_id: RoomId(FIRST_DYNAMIC_ROOM_ID),
-            user_a: UserId(1),
-            user_b: UserId(2),
-            created_at_ms: 1_000,
-        };
-        store.pending_dm = Some(PendingDm {
-            operation_id: 1,
-            room,
-            previous_next_room_id: FIRST_DYNAMIC_ROOM_ID,
-        });
-
-        let first = store.state_snapshot();
-        store.watermarks.insert(RoomId(1), MESSAGE_ID_RESERVE);
-        let later_watermark = store.state_snapshot();
-        let expected = dir
-            .join("rooms")
-            .join(format!("{}.log", room.room_id.0));
-
-        assert_eq!(first.prepare_logs, vec![expected.clone()]);
-        assert_eq!(later_watermark.prepare_logs, vec![expected]);
-    }
 
     #[test]
     fn async_log_reopen_publishes_a_read_handle() {
@@ -2527,8 +2201,44 @@ mod tests {
     }
 
     #[test]
-    fn async_dm_creation_reserves_id_and_enrolls_log_writer() {
-        let dir = temp_dir("async-dm-tombstone");
+    fn empty_dm_recovers_from_the_database_without_a_log_prerequisite() {
+        let dir = temp_dir("empty-dm-database-recovery");
+        fs::create_dir_all(dir.join("rooms")).unwrap();
+        let room = DmRoom {
+            room_id: RoomId(FIRST_DYNAMIC_ROOM_ID),
+            user_a: UserId(3),
+            user_b: UserId(7),
+            created_at_ms: 1_234,
+        };
+        let (_, writer) = room_state::open(&dir.join(room_state::FILE_NAME)).unwrap();
+        writer
+            .insert_dm_sync(room, FIRST_DYNAMIC_ROOM_ID + 1)
+            .unwrap();
+        drop(writer);
+        let log_path = dir.join("rooms").join(format!("{}.log", room.room_id.0));
+        assert!(!log_path.exists());
+
+        let store = RoomStore::open(Some(dir.to_path_buf()), &[]);
+        assert_eq!(
+            store.dm_room_for(UserId(3), UserId(7)),
+            Some(room.room_id)
+        );
+        assert!(log_path.exists(), "startup must recreate the derived empty log");
+    }
+
+    #[test]
+    fn corrupt_state_database_prevents_durable_store_startup() {
+        let dir = temp_dir("corrupt-state-database");
+        fs::create_dir_all(dir.as_ref()).unwrap();
+        fs::write(dir.join(room_state::FILE_NAME), b"not a redb database").unwrap();
+
+        let result = RoomStore::try_open(Some(dir.to_path_buf()), &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn async_dm_creation_commits_registry_before_enrolling_log_writer() {
+        let dir = temp_dir("async-dm-transaction");
         let mut poll = mio::Poll::new().unwrap();
         let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1)).unwrap());
         let notifier = Arc::new(EventNotifier::new(waker));
@@ -2549,7 +2259,12 @@ mod tests {
         let completion = store.drain_dm_completions().pop_front().unwrap();
         completion.result.unwrap();
         let dm = completion.room.room_id;
-        assert!(dir.join("rooms").join(format!("{}.log", dm.0)).exists());
+        let log_path = dir.join("rooms").join(format!("{}.log", dm.0));
+        assert!(dir.join(room_state::FILE_NAME).exists());
+        assert!(
+            !log_path.exists(),
+            "an empty log is derived state, not a transaction prerequisite"
+        );
 
         let id = store.allocate_message_id(dm);
         store.try_append(dm, &test_message(dm, id.0)).unwrap();
@@ -2557,9 +2272,10 @@ mod tests {
             .unwrap();
         assert_ne!(notifier.take_ready() & ROOM_LOG_EVENTS, 0);
         store.drain_log_events();
+        assert!(log_path.exists());
         drop(store);
 
-        fs::remove_file(dir.join(STATE_FILE)).unwrap();
+        fs::remove_file(dir.join(room_state::FILE_NAME)).unwrap();
         let mut reopened = RoomStore::open(Some(dir.to_path_buf()), &[]);
         let fresh = reopened.open_dm(UserId(3), UserId(4), 2_000).unwrap();
         assert_ne!(fresh, dm, "the async room id tombstone was not recovered");
@@ -2584,7 +2300,7 @@ mod tests {
         store.append(dm, &test_message(dm, id.0));
         drop(store);
 
-        fs::remove_file(dir.join(STATE_FILE)).unwrap();
+        fs::remove_file(dir.join(room_state::FILE_NAME)).unwrap();
         let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
         let fresh = store.open_dm(UserId(3), UserId(4), 2_000).unwrap();
         assert_ne!(fresh, dm, "id with a surviving log was handed out again");
@@ -2600,7 +2316,7 @@ mod tests {
         store.append(dm, &test_message(dm, id.0));
         drop(store);
 
-        fs::remove_file(dir.join(STATE_FILE)).unwrap();
+        fs::remove_file(dir.join(room_state::FILE_NAME)).unwrap();
         let log = dir.join("rooms").join(format!("{}.log", dm.0));
         fs::rename(&log, segment_path(&log, MessageId(1))).unwrap();
         let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
@@ -2621,10 +2337,12 @@ mod tests {
     fn open_dm_rolls_back_when_state_persist_fails() {
         let dir = temp_dir("dm-rollback");
         let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
-        let blocked_tmp = dir.join(format!("{STATE_FILE}.tmp"));
-        fs::create_dir(&blocked_tmp).unwrap();
+        store
+            .state_writer
+            .as_ref()
+            .expect("persistent store")
+            .fail_next_write();
         let result = store.open_dm(UserId(1), UserId(2), 1_000);
-        fs::remove_dir(&blocked_tmp).unwrap();
         assert!(result.is_err(), "unpersistable dm creation must fail");
         assert_eq!(store.dm_room_for(UserId(1), UserId(2)), None);
 
