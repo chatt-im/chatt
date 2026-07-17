@@ -211,6 +211,10 @@ struct RoomLogEvent {
 struct RoomLogWorkerState {
     path: PathBuf,
     file: ActiveLog,
+    /// The event-loop copy cannot page the active tail until the worker sends
+    /// it a cloned read handle. Kept separately from `file` because the worker
+    /// may still be able to append after cloning temporarily fails.
+    needs_read_handle: bool,
     active_bytes: u64,
     active_first_id: Option<MessageId>,
 }
@@ -286,6 +290,7 @@ fn room_log_worker(
                 RoomLogWorkerState {
                     path,
                     file,
+                    needs_read_handle: true,
                     active_bytes: 0,
                     active_first_id: None,
                 },
@@ -295,23 +300,35 @@ fn room_log_worker(
         let Some(state) = rooms.get_mut(&write.room_id) else {
             continue;
         };
-        let mut file_update = if new_room {
-            match state.file.open().and_then(|file| file.try_clone().ok()) {
-                Some(file) => LogFileUpdate::Open(file),
-                None => LogFileUpdate::Reopen,
-            }
-        } else {
-            LogFileUpdate::Keep
-        };
+        let mut file_update = LogFileUpdate::Keep;
         let mut rotated = None;
         let mut error = None;
         if matches!(state.file, ActiveLog::Reopen) {
             match open_active_log(&state.path) {
-                Ok(file) => state.file = ActiveLog::Open(file),
+                Ok(file) => {
+                    state.file = ActiveLog::Open(file);
+                    state.needs_read_handle = true;
+                }
                 Err(open_error) => {
                     error = Some(format!("active log reopen failed: {open_error}"));
                 }
             }
+        }
+        if state.needs_read_handle
+            && let ActiveLog::Open(file) = &state.file
+        {
+            match file.try_clone() {
+                Ok(read_file) => {
+                    file_update = LogFileUpdate::Open(read_file);
+                    state.needs_read_handle = false;
+                }
+                Err(clone_error) => {
+                    error = Some(format!("active log clone failed: {clone_error}"));
+                    file_update = LogFileUpdate::Reopen;
+                }
+            }
+        } else if new_room {
+            file_update = LogFileUpdate::Reopen;
         }
         if let ActiveLog::Open(file) = &mut state.file {
             match write_log_record(file, &write.record) {
@@ -346,8 +363,12 @@ fn room_log_worker(
                     state.active_first_id = None;
                     match open_active_log(&state.path) {
                         Ok(file) => {
+                            state.needs_read_handle = true;
                             file_update = match file.try_clone() {
-                                Ok(read_file) => LogFileUpdate::Open(read_file),
+                                Ok(read_file) => {
+                                    state.needs_read_handle = false;
+                                    LogFileUpdate::Open(read_file)
+                                }
                                 Err(clone_error) => {
                                     error = Some(format!(
                                         "fresh active log clone failed: {clone_error}"
@@ -360,6 +381,7 @@ fn room_log_worker(
                         Err(open_error) => {
                             error = Some(format!("active log reopen after rotation failed: {open_error}"));
                             state.file = ActiveLog::Reopen;
+                            state.needs_read_handle = true;
                             file_update = LogFileUpdate::Reopen;
                         }
                     }
@@ -865,6 +887,7 @@ impl RoomStore {
                 RoomLogWorkerState {
                     path: path.clone(),
                     file: worker_file,
+                    needs_read_handle: matches!(file, ActiveLog::Reopen),
                     active_bytes: *active_bytes,
                     active_first_id: *active_first_id,
                 },
@@ -914,14 +937,17 @@ impl RoomStore {
                     error = error.as_str()
                 );
             }
-            if matches!(file, ActiveLog::Disabled) {
-                continue;
-            }
             if let Some(pending) = self.pending_log_writes.get_mut(&event.room_id) {
                 *pending = pending.saturating_sub(1);
                 if *pending == 0 {
                     self.pending_log_writes.remove(&event.room_id);
                 }
+            }
+            if matches!(file, ActiveLog::Disabled) {
+                if !self.pending_log_writes.contains_key(&event.room_id) {
+                    history.trim_to_limit(self.tuning.max_resident_messages);
+                }
+                continue;
             }
             *active_bytes = event.active_bytes;
             *active_first_id = event.active_first_id;
@@ -1520,14 +1546,9 @@ impl RoomStore {
         let (Some(writer), Some(events)) = (&self.state_writer, &self.state_events) else {
             return self.open_dm(first, second, now_ms).map(OpenDmResult::Existing);
         };
-        let log_path = self
-            .data_dir
-            .as_ref()
-            .map(|dir| {
-                dir.join("rooms")
-                    .join(format!("{}.log", self.next_room_id))
-            })
-            .ok_or_else(|| "dm room log path is unavailable".to_string())?;
+        if self.data_dir.is_none() {
+            return Err("dm room log path is unavailable".to_string());
+        }
         let previous_next_room_id = self.next_room_id;
         let room_id = RoomId(previous_next_room_id);
         self.next_room_id = previous_next_room_id
@@ -1549,7 +1570,6 @@ impl RoomStore {
             self.state_snapshot(),
             operation_id,
             Arc::clone(events),
-            log_path,
         ) {
             self.pending_dm = None;
             self.next_room_id = previous_next_room_id;
@@ -1649,6 +1669,16 @@ impl RoomStore {
             next_room_id: self.next_room_id,
             watermarks,
             dm_rooms,
+            prepare_logs: self
+                .pending_dm
+                .iter()
+                .filter_map(|pending| {
+                    self.data_dir.as_ref().map(|dir| {
+                        dir.join("rooms")
+                            .join(format!("{}.log", pending.room.room_id.0))
+                    })
+                })
+                .collect(),
         }
     }
 }
@@ -1657,6 +1687,10 @@ struct StateSnapshot {
     next_room_id: u32,
     watermarks: Vec<(u32, u64)>,
     dm_rooms: Vec<DmRoom>,
+    /// Files that must be created before this snapshot can expose its dynamic
+    /// rooms. This belongs to the snapshot, rather than its completion waiter,
+    /// so a later coalesced watermark write cannot bypass the prerequisite.
+    prepare_logs: Vec<PathBuf>,
 }
 
 fn render_state_snapshot(mut snapshot: StateSnapshot) -> String {
@@ -1690,7 +1724,6 @@ enum StateWriteWaiter {
     Event {
         operation_id: u64,
         events: Arc<EventQueue<StateWriteEvent>>,
-        prepare_log: PathBuf,
     },
 }
 
@@ -1761,17 +1794,14 @@ impl StateWriter {
         let worker_submission = Arc::clone(&submission);
         let thread = thread::spawn(move || {
             while let Some((snapshot, waiters)) = worker_submission.receive() {
+                let prepare_logs = snapshot.prepare_logs.clone();
                 let snapshot = render_state_snapshot(snapshot);
                 // The empty active log is a recovery tombstone. It must exist
                 // before state.toml can make the dynamic room visible, so a
                 // crash or later state corruption can never recycle this id
                 // onto private history from another room.
-                let result = waiters
+                let result = prepare_logs
                     .iter()
-                    .filter_map(|waiter| match waiter {
-                        StateWriteWaiter::Event { prepare_log, .. } => Some(prepare_log),
-                        StateWriteWaiter::Sync(_) => None,
-                    })
                     .try_for_each(|log_path| {
                         open_active_log(log_path)
                             .map(drop)
@@ -1792,7 +1822,6 @@ impl StateWriter {
                         StateWriteWaiter::Event {
                             operation_id,
                             events,
-                            ..
                         } => events.push(StateWriteEvent {
                             operation_id,
                             result: result.clone(),
@@ -1830,7 +1859,6 @@ impl StateWriter {
         snapshot: StateSnapshot,
         operation_id: u64,
         events: Arc<EventQueue<StateWriteEvent>>,
-        prepare_log: PathBuf,
     ) -> Result<(), String> {
         self.submission
             .submit(
@@ -1838,7 +1866,6 @@ impl StateWriter {
                 Some(StateWriteWaiter::Event {
                     operation_id,
                     events,
-                    prepare_log,
                 }),
             )
             .then_some(())
@@ -2172,6 +2199,7 @@ mod tests {
             next_room_id,
             watermarks: Vec::new(),
             dm_rooms: Vec::new(),
+            prepare_logs: Vec::new(),
         };
         let submission = StateWriteSubmission::default();
         let (first_reply, first_done) = mpsc::sync_channel(1);
@@ -2197,6 +2225,85 @@ mod tests {
         }
         assert_eq!(first_done.recv().unwrap(), Ok(()));
         assert_eq!(second_done.recv().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn pending_dm_prerequisite_is_present_in_every_state_snapshot() {
+        let dir = temp_dir("pending-dm-prerequisite");
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
+        let room = DmRoom {
+            room_id: RoomId(FIRST_DYNAMIC_ROOM_ID),
+            user_a: UserId(1),
+            user_b: UserId(2),
+            created_at_ms: 1_000,
+        };
+        store.pending_dm = Some(PendingDm {
+            operation_id: 1,
+            room,
+            previous_next_room_id: FIRST_DYNAMIC_ROOM_ID,
+        });
+
+        let first = store.state_snapshot();
+        store.watermarks.insert(RoomId(1), MESSAGE_ID_RESERVE);
+        let later_watermark = store.state_snapshot();
+        let expected = dir
+            .join("rooms")
+            .join(format!("{}.log", room.room_id.0));
+
+        assert_eq!(first.prepare_logs, vec![expected.clone()]);
+        assert_eq!(later_watermark.prepare_logs, vec![expected]);
+    }
+
+    #[test]
+    fn async_log_reopen_publishes_a_read_handle() {
+        let dir = temp_dir("async-reopen-handle");
+        fs::create_dir_all(dir.join("rooms")).unwrap();
+        let room_id = RoomId(1);
+        let path = dir.join("rooms").join("1.log");
+        let poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1)).unwrap());
+        let notifier = Arc::new(EventNotifier::new(waker));
+        let events = Arc::new(EventQueue::new(
+            notifier,
+            ROOM_LOG_EVENTS,
+            "room-log-test",
+        ));
+        let writer = RoomLogWriter::spawn(
+            HashMap::from([(
+                room_id,
+                RoomLogWorkerState {
+                    path,
+                    file: ActiveLog::Reopen,
+                    needs_read_handle: true,
+                    active_bytes: 0,
+                    active_first_id: None,
+                },
+            )]),
+            Arc::clone(&events),
+        );
+        let message = test_message(room_id, 1);
+        let mut record = Vec::new();
+        history::write_message(&message, &mut record);
+        writer
+            .enqueue(RoomLogWrite {
+                room_id,
+                message_id: message.message_id,
+                record,
+                max_active_log_bytes: u64::MAX,
+                path: None,
+            })
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let event = loop {
+            if let Some(event) = events.drain().pop_front() {
+                break event;
+            }
+            assert!(std::time::Instant::now() < deadline, "room log reply");
+            std::thread::yield_now();
+        };
+        assert!(event.error.is_none());
+        assert!(matches!(event.file, LogFileUpdate::Open(_)));
     }
 
     fn test_message(room_id: RoomId, id: u64) -> ChatMessage {
