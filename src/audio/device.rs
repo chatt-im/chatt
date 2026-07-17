@@ -19,6 +19,7 @@ use hashbrown::HashSet;
 
 use crate::audio::{
     backend::with_audio_backend_stderr_suppressed,
+    callback::{CaptureCallbackCore, downmix_to_mono_i16_scale_into},
     capture::EchoCancellationControl,
     diagnostics::LivePlaybackWavRecorderHandle,
     errors::{AudioErrorKind, AudioStartError},
@@ -29,9 +30,8 @@ use crate::audio::{
     resample::PlaybackResampler,
     shared::{
         AudioStats, BufferRequest, CaptureCallbackTiming, CapturedAudioChunk, PlaybackStats,
-        SAMPLE_RATE, audio_callback_logging_enabled, audio_pop_logging_enabled, duration_to_us,
-        optional_duration_to_us, output_volume_percent_to_gain, peak_i16_scale, rms_i16_scale,
-        samples_to_duration,
+        SAMPLE_RATE, audio_callback_logging_enabled, audio_pop_logging_enabled,
+        output_volume_percent_to_gain, samples_to_duration,
     },
 };
 
@@ -1051,10 +1051,6 @@ fn stream_instant_ns(instant: cpal::StreamInstant) -> u64 {
     instant.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-fn device_callback_period_us(frames: usize, device_rate: u32) -> u64 {
-    duration_to_us(callback_period(frames, device_rate))
-}
-
 fn log_audio_stream_config(
     direction: &'static str,
     device: &cpal::Device,
@@ -1279,7 +1275,6 @@ where
     T: Sample + cpal::SizedSample + Send + 'static,
     f32: FromSample<T>,
 {
-    let data_stats = stats.clone();
     let error_stats = stats.clone();
     let _ = audio_pop_logging_enabled();
     let _ = audio_callback_logging_enabled();
@@ -1287,6 +1282,7 @@ where
     let mut callback_sequence = 0u64;
     let mut last_callback_at: Option<Instant> = None;
     let mut last_cpal_callback_at: Option<cpal::StreamInstant> = None;
+    let callback_core = CaptureCallbackCore::new(sender, recycle, stats, device_rate);
     device
         .build_input_stream(
             stream_config,
@@ -1315,17 +1311,9 @@ where
                     cpal_callback_delta,
                     cpal_capture_to_callback,
                 };
-                let mono = recycle.try_recv().unwrap_or_default();
-                capture_callback(
-                    input,
-                    channels,
-                    mono,
-                    &sender,
-                    &data_stats,
-                    callback_at,
-                    timing,
-                    device_rate,
-                );
+                let mut mono = callback_core.recycled_buffer();
+                downmix_to_mono_i16_scale_into(input, channels.get(), &mut mono);
+                callback_core.process(mono, callback_at, timing);
             },
             move |error| {
                 if error.kind() == ErrorKind::RealtimeDenied && audio_callback_logging_enabled() {
@@ -2021,101 +2009,6 @@ fn apply_output_gain(samples: &mut [f32], gain: f32) {
     }
 }
 
-fn capture_callback<T>(
-    input: &[T],
-    channels: CallbackChannelCount,
-    mut mono: Vec<f32>,
-    sender: &SyncSender<CapturedAudioChunk>,
-    stats: &AudioStats,
-    callback_at: Instant,
-    timing: CaptureCallbackTiming,
-    device_rate: u32,
-) where
-    T: Sample,
-    f32: FromSample<T>,
-{
-    downmix_to_mono_i16_scale_into(input, channels.get(), &mut mono);
-    let samples = mono.len() as u64;
-    let rms = rms_i16_scale(&mono);
-    let peak = peak_i16_scale(&mono);
-    stats.record_capture_callback(samples, rms, peak);
-
-    let queue_depth_after_enqueue = stats.note_capture_chunk_enqueued();
-    let expected_callback_delta_us = device_callback_period_us(samples as usize, device_rate);
-    let chunk = CapturedAudioChunk::new(mono, callback_at, timing, queue_depth_after_enqueue);
-    if sender.try_send(chunk).is_ok() {
-        if audio_callback_logging_enabled() {
-            kvlog::info!(
-                "capture callback chunk queued",
-                callback_sequence = timing.callback_sequence,
-                samples,
-                device_rate,
-                expected_callback_delta_us,
-                callback_delta_us = optional_duration_to_us(timing.callback_delta),
-                cpal_callback_ns = timing.cpal_callback_ns,
-                cpal_capture_ns = timing.cpal_capture_ns,
-                cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
-                cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
-                queue_depth_after_enqueue,
-                rms,
-                peak
-            );
-        }
-    } else {
-        let _ = stats.note_capture_chunk_dequeued();
-        // The encoder worker is behind, so this chunk is lost. Surface the
-        // backpressure (throttled to powers of two so a sustained overload does
-        // not flood the log) instead of dropping it silently, and account the
-        // dropped duration so the worker leaves a concealable timestamp gap
-        // rather than splicing the media clock across the hole.
-        let dropped = stats.record_dropped_chunk(samples);
-        if audio_callback_logging_enabled() {
-            kvlog::warn!(
-                "capture callback chunk dropped",
-                callback_sequence = timing.callback_sequence,
-                samples,
-                device_rate,
-                expected_callback_delta_us,
-                callback_delta_us = optional_duration_to_us(timing.callback_delta),
-                cpal_callback_ns = timing.cpal_callback_ns,
-                cpal_capture_ns = timing.cpal_capture_ns,
-                cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
-                cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
-                queue_depth_after_enqueue = queue_depth_after_enqueue.saturating_sub(1),
-                dropped_chunks = dropped,
-                rms,
-                peak
-            );
-        }
-        if dropped.is_power_of_two() && audio_callback_logging_enabled() {
-            kvlog::warn!(
-                "capture worker backpressure dropped chunk",
-                dropped_chunks = dropped
-            );
-        }
-    }
-}
-
-fn downmix_to_mono_i16_scale_into<T>(input: &[T], channels: usize, out: &mut Vec<f32>)
-where
-    T: Sample,
-    f32: FromSample<T>,
-{
-    out.clear();
-    if channels == 0 {
-        return;
-    }
-
-    out.reserve(input.len() / channels);
-    for frame in input.chunks_exact(channels) {
-        let mut sum = 0.0f32;
-        for sample in frame {
-            sum += sample.to_sample::<f32>() * i16::MAX as f32;
-        }
-        out.push(sum / channels as f32);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2309,73 +2202,6 @@ mod tests {
                 "{node_name} should not be listed as an output endpoint"
             );
         }
-    }
-
-    #[test]
-    fn dropped_capture_chunk_records_dropped_samples() {
-        let (sender, _receiver) = std::sync::mpsc::sync_channel::<CapturedAudioChunk>(1);
-        let stats = AudioStats::new();
-        let queue_depth = stats.note_capture_chunk_enqueued();
-        sender
-            .try_send(CapturedAudioChunk::new(
-                vec![0.0],
-                Instant::now(),
-                CaptureCallbackTiming {
-                    callback_sequence: 0,
-                    ..CaptureCallbackTiming::default()
-                },
-                queue_depth,
-            ))
-            .unwrap();
-        let channels = CallbackChannelCount::new(2, "input").unwrap();
-
-        // The channel is full, so this stereo chunk (48 mono frames) is dropped
-        // and its sample count must be surfaced for the media clock.
-        capture_callback(
-            &[0.1f32; 96],
-            channels,
-            Vec::new(),
-            &sender,
-            &stats,
-            Instant::now(),
-            CaptureCallbackTiming {
-                callback_sequence: 1,
-                ..CaptureCallbackTiming::default()
-            },
-            SAMPLE_RATE,
-        );
-
-        assert_eq!(stats.take_dropped_capture_samples(), 48);
-        assert_eq!(
-            stats.take_dropped_capture_samples(),
-            0,
-            "taking the dropped samples must drain the counter"
-        );
-        assert_eq!(stats.snapshot().dropped_chunks, 1);
-    }
-
-    #[test]
-    fn downmixes_interleaved_samples_to_mono_i16_scale() {
-        let mut mono = Vec::new();
-        downmix_to_mono_i16_scale_into(&[0.5f32, -0.5, 0.25, 0.75], 2, &mut mono);
-
-        assert_eq!(mono.len(), 2);
-        assert!(mono[0].abs() < 0.01);
-        assert!((mono[1] - 0.5 * i16::MAX as f32).abs() < 1.0);
-
-        // Mono input passes each sample through at i16 scale.
-        let mut mono_in = Vec::new();
-        downmix_to_mono_i16_scale_into(&[0.25f32, -0.5], 1, &mut mono_in);
-        assert_eq!(mono_in.len(), 2);
-        assert!((mono_in[0] - 0.25 * i16::MAX as f32).abs() < 1.0);
-        assert!((mono_in[1] + 0.5 * i16::MAX as f32).abs() < 1.0);
-
-        // Reusing the same buffer for an equal-size fill grows no capacity, so the
-        // recycled callback path allocates nothing after the first fill.
-        let capacity_before = mono.capacity();
-        downmix_to_mono_i16_scale_into(&[0.1f32, 0.2, 0.3, 0.4], 2, &mut mono);
-        assert_eq!(mono.len(), 2);
-        assert_eq!(mono.capacity(), capacity_before);
     }
 
     fn sample_ring_with(samples: &[f32]) -> Arc<crate::audio::playback::SampleRing> {

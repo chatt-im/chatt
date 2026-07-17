@@ -168,7 +168,7 @@ pub(crate) fn run_encoder_worker_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_live_encoder_worker_inner<F>(
+pub(crate) fn run_live_encoder_worker_inner(
     receiver: Receiver<CapturedAudioChunk>,
     recycle: SyncSender<Vec<f32>>,
     encoder: OpusVoiceEncoder,
@@ -183,11 +183,8 @@ pub(crate) fn run_live_encoder_worker_inner<F>(
     echo_source: Option<EchoReferenceSource>,
     device_rate: u32,
     stats: &AudioStats,
-    on_packet: &mut F,
-) -> Result<(), String>
-where
-    F: FnMut(LocalVoiceFrame),
-{
+    on_packet: &mut dyn FnMut(LocalVoiceFrame),
+) -> Result<(), String> {
     let mut pipeline = LiveEncoderPipeline::new(
         encoder,
         denoise,
@@ -421,17 +418,14 @@ impl LiveEncoderPipeline {
         self.processor.echo_enabled()
     }
 
-    pub(crate) fn push_chunk<F>(
+    pub(crate) fn push_chunk(
         &mut self,
         chunk: &[f32],
         max_amplification: f32,
         muted: bool,
         stats: &AudioStats,
-        on_packet: &mut F,
-    ) -> Result<(), String>
-    where
-        F: FnMut(LocalVoiceFrame),
-    {
+        on_packet: &mut dyn FnMut(LocalVoiceFrame),
+    ) -> Result<(), String> {
         if self.auto_gain_enabled && max_amplification != self.gain_max_db {
             self.processor.set_max_gain_db(max_amplification);
             self.gain_max_db = max_amplification;
@@ -531,16 +525,13 @@ impl LiveEncoderPipeline {
         Ok(())
     }
 
-    fn process_accumulated_frame<F>(
+    fn process_accumulated_frame(
         &mut self,
         frame: &mut [f32],
         muted: bool,
         stats: &AudioStats,
-        on_packet: &mut F,
-    ) -> Result<(), String>
-    where
-        F: FnMut(LocalVoiceFrame),
-    {
+        on_packet: &mut dyn FnMut(LocalVoiceFrame),
+    ) -> Result<(), String> {
         // One consolidated APM pass runs high-pass, AEC3, noise suppression, and
         // AGC2 in WebRTC order. The echo reference, present only while AEC is
         // enabled, supplies the 48 kHz render frame to cancel against. It runs
@@ -697,16 +688,13 @@ impl LiveEncoderPipeline {
     /// - On unmute it resumes from suppression with a fresh Opus stream
     ///   (`OPUS_RESET | SILENCE_RESUME`) and fades the gain back in, so the tone
     ///   returns smoothly. Toggling mid-fade simply reverses the gain with no step.
-    fn process_mute_transition<F>(
+    fn process_mute_transition(
         &mut self,
         frame: &mut [f32],
         muted: bool,
         stats: &AudioStats,
-        on_packet: &mut F,
-    ) -> Result<(), String>
-    where
-        F: FnMut(LocalVoiceFrame),
-    {
+        on_packet: &mut dyn FnMut(LocalVoiceFrame),
+    ) -> Result<(), String> {
         let target = if muted { 0.0 } else { 1.0 };
         let log_enabled = audio_pop_logging_enabled();
         let gain_before = self.mute_gain;
@@ -792,16 +780,13 @@ impl LiveEncoderPipeline {
         self.queue_processed_capture_frame(frame, slot_start, stats, on_packet)
     }
 
-    fn queue_processed_capture_frame<F>(
+    fn queue_processed_capture_frame(
         &mut self,
         frame: ProcessedCaptureFrame<'_>,
         slot_start_sample: u32,
         stats: &AudioStats,
-        on_packet: &mut F,
-    ) -> Result<(), String>
-    where
-        F: FnMut(LocalVoiceFrame),
-    {
+        on_packet: &mut dyn FnMut(LocalVoiceFrame),
+    ) -> Result<(), String> {
         if self.pending_opus_samples.is_empty() {
             self.pending_start_sample = slot_start_sample;
         } else {
@@ -906,10 +891,11 @@ impl LiveEncoderPipeline {
         self.pending_opus_samples.clear();
     }
 
-    fn maybe_emit_silence_marker<F>(&mut self, extra_flags: u8, on_packet: &mut F)
-    where
-        F: FnMut(LocalVoiceFrame),
-    {
+    fn maybe_emit_silence_marker(
+        &mut self,
+        extra_flags: u8,
+        on_packet: &mut dyn FnMut(LocalVoiceFrame),
+    ) {
         if self.sender_silence_active && self.silence_keepalive_frames > 0 {
             self.silence_keepalive_frames -= 1;
             return;
