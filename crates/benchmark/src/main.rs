@@ -18,6 +18,8 @@ use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
 use sonora::config::EchoCanceller as Aec3Config;
 use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 
+mod crypto;
+
 const SAMPLE_RATE: usize = 48_000;
 const OPUS_FRAME_SAMPLES: usize = 960;
 const RNNOISE_FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
@@ -156,6 +158,8 @@ fn main() {
 fn benchmark_router() -> Router {
     let corpus = Arc::new(load_corpus());
     let mut router = Router::default();
+
+    router.add("crypto", crypto::bench_crypto);
 
     {
         let corpus = Arc::clone(&corpus);

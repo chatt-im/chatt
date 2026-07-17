@@ -18,7 +18,15 @@ cargo run --release -p benchmark -- bench live/group_call_sim --progress
 cargo run --release -p benchmark -- bench live/output_contention --progress
 cargo run --release -p benchmark -- bench live/output_callback --progress
 cargo run --release -p benchmark -- bench live/ingest_contention --progress
+cargo run --release -p benchmark -- bench crypto --progress
 ```
+
+`crypto/*` isolates every AWS-LC primitive used by Chatt's fixed cipher choices:
+ChaCha20-Poly1305 for transport, AES-128-GCM for MLS, SHA-256, HMAC-SHA256,
+HKDF-SHA256, X25519, and Ed25519. AEAD, hash, and MAC routes cover small control
+messages, media-sized datagrams, and large file chunks. Use these routes when
+comparing workspace-wide AWS-LC build flags such as `OPENSSL_SMALL`; a whole-call
+audio benchmark can hide a public-key regression behind codec and DSP work.
 
 `pipeline/aec_then_encode` mirrors `pipeline/rnnoise_then_encode` but runs the
 `sonora` AEC3 echo canceller (render plus capture) as the per-frame DSP step

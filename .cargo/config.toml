@@ -42,4 +42,4 @@ dhat = [
 # On none of the supported on modern hardware is this a good idea.
 # Setting this removes 50ms start delay.
 AWS_LC_SYS_NO_JITTER_ENTROPY = { value = "1", force = true }
-
+AWS_LC_SYS_CFLAGS="-DOPENSSL_SMALL"

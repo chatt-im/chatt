@@ -6,6 +6,31 @@ useful as the code moves.
 
 ## Security Status
 
+### Cryptographic implementation
+
+AWS-LC is Chatt's sole cryptographic implementation. The transport, media,
+identity, token, and shared protocol paths call `aws-lc-rs`; the MLS paths use
+the in-workspace `mls-rs-crypto-awslc` provider backed by the same
+`aws-lc-rs`/`aws-lc-sys` versions. Chatt has no `ring` cryptographic backend.
+Some AWS-LC Rust APIs intentionally resemble `ring` APIs, so the type and method
+names alone do not identify the provider.
+
+The non-MLS protocol uses AWS-LC's X25519, Ed25519, ChaCha20-Poly1305,
+HKDF-SHA256, HMAC-SHA256, SHA-256, and secure random generation. Chatt's only
+enabled MLS cipher suite is `CURVE25519_AES128`, comprising X25519 and Ed25519
+with AES-128-GCM, HKDF-SHA256, HMAC-SHA256, and SHA-256.
+
+The workspace sets `AWS_LC_SYS_CFLAGS=-DOPENSSL_SMALL` in
+`.cargo/config.toml`. This changes the native AWS-LC library used by all of the
+paths above; it is not scoped to the MLS crate. AWS-LC's small build replaces
+the approximately 30 KiB Curve25519 fixed-base precomputation table with an
+approximately 1 KiB table and a more computationally expensive fixed-base
+scalar multiplication. Performance evaluation should consequently include
+Ed25519 key generation and signing in addition to verification, X25519/HPKE,
+AEAD, hashes, and KDFs, and should use distinct target directories for builds
+with and without the flag to prevent Cargo from reusing the wrong
+`aws-lc-sys` artifact.
+
 - By default (`transport-mode = "native-encrypted"`), application control, chat,
   file relay, video, and server-relayed media traffic is encrypted after the TCP
   handshake completes. The server can instead select
