@@ -1,4 +1,5 @@
 mod backend;
+mod callback;
 mod capture;
 mod device;
 mod diagnostics;
