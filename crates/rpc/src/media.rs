@@ -102,6 +102,72 @@ impl VoicePayload {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoicePayloadRef<'a> {
+    Opus(&'a [u8]),
+    Silence,
+}
+
+impl VoicePayloadRef<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            VoicePayloadRef::Opus(opus) => opus.len(),
+            VoicePayloadRef::Silence => 0,
+        }
+    }
+
+    fn into_owned(self) -> VoicePayload {
+        match self {
+            VoicePayloadRef::Opus(opus) => VoicePayload::Opus(opus.to_vec()),
+            VoicePayloadRef::Silence => VoicePayload::Silence,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaPayloadRef<'a> {
+    Bind,
+    NatProbe {
+        probe_id: u8,
+    },
+    Voice {
+        stream_id: StreamId,
+        sequence: u32,
+        timestamp: u32,
+        flags: u8,
+        payload: VoicePayloadRef<'a>,
+    },
+    PeerVoice {
+        connection_id: u64,
+        stream_id: StreamId,
+        sequence: u32,
+        timestamp: u32,
+        flags: u8,
+        payload: VoicePayloadRef<'a>,
+    },
+    VoiceFeedback {
+        stream_id: StreamId,
+        feedback: VoiceFeedback,
+    },
+    PeerVoiceFeedback {
+        connection_id: u64,
+        stream_id: StreamId,
+        feedback: VoiceFeedback,
+    },
+    VoiceFeedbackFrom {
+        reporter: UserId,
+        stream_id: StreamId,
+        feedback: VoiceFeedback,
+    },
+    Ping {
+        nonce: u64,
+        observed_rtt_ms: Option<u16>,
+    },
+    Pong {
+        nonce: u64,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VoiceFeedback {
     pub highest_contiguous_sequence: u32,
@@ -128,7 +194,7 @@ pub enum MediaError {
     UnknownKind(u8),
     PayloadTooLarge,
     InvalidPayload,
-    Crypto(String),
+    Crypto(CryptoError),
     Replay,
 }
 
@@ -152,7 +218,7 @@ impl std::error::Error for MediaError {}
 
 impl From<CryptoError> for MediaError {
     fn from(value: CryptoError) -> Self {
-        MediaError::Crypto(value.to_string())
+        MediaError::Crypto(value)
     }
 }
 
@@ -221,6 +287,13 @@ pub struct OpenedMedia {
     pub address_proof: AddressProof,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenedMediaRef<'a> {
+    pub header: UdpHeader,
+    pub payload: MediaPayloadRef<'a>,
+    pub address_proof: AddressProof,
+}
+
 /// Domain-separated message covered by the external-link `Bind` proof. Binds the
 /// route id, UDP kind, counter, and selected mode so a proof cannot be replayed
 /// under a different session, kind, counter, or transport mode.
@@ -262,9 +335,27 @@ pub fn seal_media_into(
     packet: &mut Vec<u8>,
     scratch: &mut Vec<u8>,
 ) -> Result<(), MediaError> {
+    seal_media_ref_into(
+        protection,
+        counter,
+        &payload.borrowed(),
+        packet,
+        scratch,
+    )
+}
+
+/// Borrowed-payload counterpart to [`seal_media_into`]. This is used by
+/// real-time relays to forward media directly from their receive buffer.
+pub fn seal_media_ref_into(
+    protection: &MediaProtection,
+    counter: u64,
+    payload: &MediaPayloadRef<'_>,
+    packet: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), MediaError> {
     let kind = payload.kind();
     scratch.clear();
-    encode_payload_into(payload, scratch)?;
+    encode_payload_ref_into(payload, scratch)?;
     if scratch.len() > SAFE_UDP_PAYLOAD_BYTES {
         return Err(MediaError::PayloadTooLarge);
     }
@@ -342,7 +433,7 @@ pub fn open_media(
                 let (payload_bytes, proof) = body.split_at(split);
                 let message = bind_proof_message(header.route_id, header.kind, header.counter);
                 if !crypto::auth_proof_verify(bind_key, &message, proof) {
-                    return Err(MediaError::Crypto("bind proof mismatch".to_string()));
+                    return Err(CryptoError::BindProofMismatch.into());
                 }
                 // Fully validate the datagram before advancing replay state, so a
                 // malformed payload never consumes a counter slot.
@@ -359,6 +450,69 @@ pub fn open_media(
                 Ok(OpenedMedia {
                     header,
                     payload: decode_payload(header.kind, body)?,
+                    address_proof: AddressProof::None,
+                })
+            }
+        }
+    }
+}
+
+/// Opens and decodes a media datagram in place, borrowing voice payload bytes
+/// from `bytes`. The caller must keep the receive buffer alive until it has
+/// finished forwarding the returned payload.
+pub fn open_media_in_place<'a>(
+    protection: &MediaProtection,
+    replay: &mut AntiReplay,
+    bytes: &'a mut [u8],
+) -> Result<OpenedMediaRef<'a>, MediaError> {
+    let (header, _) = parse_header(bytes)?;
+    if header.route_id != protection.route_id() {
+        return Err(CryptoError::WrongKeyId.into());
+    }
+
+    match protection {
+        MediaProtection::Aead { recv, .. } => {
+            let mut aad = [0u8; 1 + crypto::TRANSPORT_HEADER_LEN];
+            aad[0] = crypto::CHANNEL_MEDIA;
+            aad[1..].copy_from_slice(&bytes[2..UDP_HEADER_LEN]);
+            let body = &mut bytes[UDP_HEADER_LEN..];
+            let plaintext_len =
+                crypto::open_in_place_with_aad(recv, header.counter, &aad, body)?;
+            let payload = decode_payload_ref(header.kind, &body[..plaintext_len])?;
+            if !replay.update(header.counter) {
+                return Err(MediaError::Replay);
+            }
+            Ok(OpenedMediaRef {
+                header,
+                payload,
+                address_proof: AddressProof::AuthenticatedDatagram,
+            })
+        }
+        MediaProtection::Clear { bind_key, .. } => {
+            let body = &bytes[UDP_HEADER_LEN..];
+            if header.kind == KIND_BIND {
+                if body.len() < crypto::AUTH_PROOF_LEN {
+                    return Err(MediaError::InvalidPayload);
+                }
+                let split = body.len() - crypto::AUTH_PROOF_LEN;
+                let (payload_bytes, proof) = body.split_at(split);
+                let message = bind_proof_message(header.route_id, header.kind, header.counter);
+                if !crypto::auth_proof_verify(bind_key, &message, proof) {
+                    return Err(CryptoError::BindProofMismatch.into());
+                }
+                let payload = decode_payload_ref(header.kind, payload_bytes)?;
+                if !replay.update(header.counter) {
+                    return Err(MediaError::Replay);
+                }
+                Ok(OpenedMediaRef {
+                    header,
+                    payload,
+                    address_proof: AddressProof::AuthenticatedAddressClaim,
+                })
+            } else {
+                Ok(OpenedMediaRef {
+                    header,
+                    payload: decode_payload_ref(header.kind, body)?,
                     address_proof: AddressProof::None,
                 })
             }
@@ -484,6 +638,166 @@ impl MediaPayload {
             MediaPayload::Pong { .. } => KIND_PONG,
         }
     }
+
+    pub fn borrowed(&self) -> MediaPayloadRef<'_> {
+        match self {
+            MediaPayload::Bind => MediaPayloadRef::Bind,
+            MediaPayload::NatProbe { probe_id } => MediaPayloadRef::NatProbe {
+                probe_id: *probe_id,
+            },
+            MediaPayload::Voice {
+                stream_id,
+                sequence,
+                timestamp,
+                flags,
+                payload,
+            } => MediaPayloadRef::Voice {
+                stream_id: *stream_id,
+                sequence: *sequence,
+                timestamp: *timestamp,
+                flags: *flags,
+                payload: match payload {
+                    VoicePayload::Opus(opus) => VoicePayloadRef::Opus(opus),
+                    VoicePayload::Silence => VoicePayloadRef::Silence,
+                },
+            },
+            MediaPayload::PeerVoice {
+                connection_id,
+                stream_id,
+                sequence,
+                timestamp,
+                flags,
+                payload,
+            } => MediaPayloadRef::PeerVoice {
+                connection_id: *connection_id,
+                stream_id: *stream_id,
+                sequence: *sequence,
+                timestamp: *timestamp,
+                flags: *flags,
+                payload: match payload {
+                    VoicePayload::Opus(opus) => VoicePayloadRef::Opus(opus),
+                    VoicePayload::Silence => VoicePayloadRef::Silence,
+                },
+            },
+            MediaPayload::VoiceFeedback {
+                stream_id,
+                feedback,
+            } => MediaPayloadRef::VoiceFeedback {
+                stream_id: *stream_id,
+                feedback: *feedback,
+            },
+            MediaPayload::PeerVoiceFeedback {
+                connection_id,
+                stream_id,
+                feedback,
+            } => MediaPayloadRef::PeerVoiceFeedback {
+                connection_id: *connection_id,
+                stream_id: *stream_id,
+                feedback: *feedback,
+            },
+            MediaPayload::VoiceFeedbackFrom {
+                reporter,
+                stream_id,
+                feedback,
+            } => MediaPayloadRef::VoiceFeedbackFrom {
+                reporter: *reporter,
+                stream_id: *stream_id,
+                feedback: *feedback,
+            },
+            MediaPayload::Ping {
+                nonce,
+                observed_rtt_ms,
+            } => MediaPayloadRef::Ping {
+                nonce: *nonce,
+                observed_rtt_ms: *observed_rtt_ms,
+            },
+            MediaPayload::Pong { nonce } => MediaPayloadRef::Pong { nonce: *nonce },
+        }
+    }
+}
+
+impl MediaPayloadRef<'_> {
+    pub fn kind(&self) -> u8 {
+        match self {
+            MediaPayloadRef::Bind => KIND_BIND,
+            MediaPayloadRef::NatProbe { .. } => KIND_NAT_PROBE,
+            MediaPayloadRef::Voice { .. } => KIND_VOICE,
+            MediaPayloadRef::PeerVoice { .. } => KIND_PEER_VOICE,
+            MediaPayloadRef::VoiceFeedback { .. } => KIND_VOICE_FEEDBACK,
+            MediaPayloadRef::PeerVoiceFeedback { .. } => KIND_PEER_VOICE_FEEDBACK,
+            MediaPayloadRef::VoiceFeedbackFrom { .. } => KIND_VOICE_FEEDBACK_FROM,
+            MediaPayloadRef::Ping { .. } => KIND_PING,
+            MediaPayloadRef::Pong { .. } => KIND_PONG,
+        }
+    }
+
+    fn into_owned(self) -> MediaPayload {
+        match self {
+            MediaPayloadRef::Bind => MediaPayload::Bind,
+            MediaPayloadRef::NatProbe { probe_id } => MediaPayload::NatProbe { probe_id },
+            MediaPayloadRef::Voice {
+                stream_id,
+                sequence,
+                timestamp,
+                flags,
+                payload,
+            } => MediaPayload::Voice {
+                stream_id,
+                sequence,
+                timestamp,
+                flags,
+                payload: payload.into_owned(),
+            },
+            MediaPayloadRef::PeerVoice {
+                connection_id,
+                stream_id,
+                sequence,
+                timestamp,
+                flags,
+                payload,
+            } => MediaPayload::PeerVoice {
+                connection_id,
+                stream_id,
+                sequence,
+                timestamp,
+                flags,
+                payload: payload.into_owned(),
+            },
+            MediaPayloadRef::VoiceFeedback {
+                stream_id,
+                feedback,
+            } => MediaPayload::VoiceFeedback {
+                stream_id,
+                feedback,
+            },
+            MediaPayloadRef::PeerVoiceFeedback {
+                connection_id,
+                stream_id,
+                feedback,
+            } => MediaPayload::PeerVoiceFeedback {
+                connection_id,
+                stream_id,
+                feedback,
+            },
+            MediaPayloadRef::VoiceFeedbackFrom {
+                reporter,
+                stream_id,
+                feedback,
+            } => MediaPayload::VoiceFeedbackFrom {
+                reporter,
+                stream_id,
+                feedback,
+            },
+            MediaPayloadRef::Ping {
+                nonce,
+                observed_rtt_ms,
+            } => MediaPayload::Ping {
+                nonce,
+                observed_rtt_ms,
+            },
+            MediaPayloadRef::Pong { nonce } => MediaPayload::Pong { nonce },
+        }
+    }
 }
 
 pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
@@ -495,13 +809,20 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
 /// Appends the wire encoding of `payload` to `out` without clearing it first.
 /// [`encode_payload`] is the allocating convenience wrapper.
 pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<(), MediaError> {
+    encode_payload_ref_into(&payload.borrowed(), out)
+}
+
+pub fn encode_payload_ref_into(
+    payload: &MediaPayloadRef<'_>,
+    out: &mut Vec<u8>,
+) -> Result<(), MediaError> {
     out.push(payload.kind());
     match payload {
-        MediaPayload::Bind => {}
-        MediaPayload::NatProbe { probe_id } => {
+        MediaPayloadRef::Bind => {}
+        MediaPayloadRef::NatProbe { probe_id } => {
             out.push(*probe_id);
         }
-        MediaPayload::Voice {
+        MediaPayloadRef::Voice {
             stream_id,
             sequence,
             timestamp,
@@ -514,7 +835,7 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
             out.push(*flags);
             encode_voice_payload(payload, out)?;
         }
-        MediaPayload::PeerVoice {
+        MediaPayloadRef::PeerVoice {
             connection_id,
             stream_id,
             sequence,
@@ -529,14 +850,14 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
             out.push(*flags);
             encode_voice_payload(payload, out)?;
         }
-        MediaPayload::VoiceFeedback {
+        MediaPayloadRef::VoiceFeedback {
             stream_id,
             feedback,
         } => {
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             encode_voice_feedback(*feedback, out);
         }
-        MediaPayload::PeerVoiceFeedback {
+        MediaPayloadRef::PeerVoiceFeedback {
             connection_id,
             stream_id,
             feedback,
@@ -545,7 +866,7 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             encode_voice_feedback(*feedback, out);
         }
-        MediaPayload::VoiceFeedbackFrom {
+        MediaPayloadRef::VoiceFeedbackFrom {
             reporter,
             stream_id,
             feedback,
@@ -554,7 +875,7 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             encode_voice_feedback(*feedback, out);
         }
-        MediaPayload::Ping {
+        MediaPayloadRef::Ping {
             nonce,
             observed_rtt_ms,
         } => {
@@ -567,7 +888,7 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
                 None => out.push(0),
             }
         }
-        MediaPayload::Pong { nonce } => {
+        MediaPayloadRef::Pong { nonce } => {
             out.extend_from_slice(&nonce.to_le_bytes());
         }
     }
@@ -575,6 +896,10 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
 }
 
 pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError> {
+    decode_payload_ref(kind, bytes).map(MediaPayloadRef::into_owned)
+}
+
+pub fn decode_payload_ref(kind: u8, bytes: &[u8]) -> Result<MediaPayloadRef<'_>, MediaError> {
     let Some((&payload_kind, bytes)) = bytes.split_first() else {
         return Err(MediaError::InvalidPayload);
     };
@@ -586,13 +911,13 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             if !bytes.is_empty() {
                 return Err(MediaError::InvalidPayload);
             }
-            Ok(MediaPayload::Bind)
+            Ok(MediaPayloadRef::Bind)
         }
         KIND_NAT_PROBE => {
             if bytes.len() != 1 {
                 return Err(MediaError::InvalidPayload);
             }
-            Ok(MediaPayload::NatProbe { probe_id: bytes[0] })
+            Ok(MediaPayloadRef::NatProbe { probe_id: bytes[0] })
         }
         KIND_VOICE => {
             if bytes.len() < 16 {
@@ -602,8 +927,8 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             let sequence = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
             let timestamp = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
             let flags = bytes[12];
-            let payload = decode_voice_payload(&bytes[13..])?;
-            Ok(MediaPayload::Voice {
+            let payload = decode_voice_payload_ref(&bytes[13..])?;
+            Ok(MediaPayloadRef::Voice {
                 stream_id,
                 sequence,
                 timestamp,
@@ -620,8 +945,8 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             let sequence = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
             let timestamp = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
             let flags = bytes[20];
-            let payload = decode_voice_payload(&bytes[21..])?;
-            Ok(MediaPayload::PeerVoice {
+            let payload = decode_voice_payload_ref(&bytes[21..])?;
+            Ok(MediaPayloadRef::PeerVoice {
                 connection_id,
                 stream_id,
                 sequence,
@@ -634,7 +959,7 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             if bytes.len() != 30 {
                 return Err(MediaError::InvalidPayload);
             }
-            Ok(MediaPayload::VoiceFeedback {
+            Ok(MediaPayloadRef::VoiceFeedback {
                 stream_id: StreamId(u32::from_le_bytes(bytes[0..4].try_into().unwrap())),
                 feedback: decode_voice_feedback(&bytes[4..])?,
             })
@@ -643,7 +968,7 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             if bytes.len() != 38 {
                 return Err(MediaError::InvalidPayload);
             }
-            Ok(MediaPayload::PeerVoiceFeedback {
+            Ok(MediaPayloadRef::PeerVoiceFeedback {
                 connection_id: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
                 stream_id: StreamId(u32::from_le_bytes(bytes[8..12].try_into().unwrap())),
                 feedback: decode_voice_feedback(&bytes[12..])?,
@@ -653,7 +978,7 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             if bytes.len() != 38 {
                 return Err(MediaError::InvalidPayload);
             }
-            Ok(MediaPayload::VoiceFeedbackFrom {
+            Ok(MediaPayloadRef::VoiceFeedbackFrom {
                 reporter: UserId(u64::from_le_bytes(bytes[0..8].try_into().unwrap())),
                 stream_id: StreamId(u32::from_le_bytes(bytes[8..12].try_into().unwrap())),
                 feedback: decode_voice_feedback(&bytes[12..])?,
@@ -669,7 +994,7 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
                 (1, 11) => Some(u16::from_le_bytes(bytes[9..11].try_into().unwrap())),
                 _ => return Err(MediaError::InvalidPayload),
             };
-            Ok(MediaPayload::Ping {
+            Ok(MediaPayloadRef::Ping {
                 nonce,
                 observed_rtt_ms,
             })
@@ -679,7 +1004,7 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
                 return Err(MediaError::InvalidPayload);
             }
             let nonce = u64::from_le_bytes(bytes.try_into().unwrap());
-            Ok(MediaPayload::Pong { nonce })
+            Ok(MediaPayloadRef::Pong { nonce })
         }
         _ => Err(MediaError::UnknownKind(kind)),
     }
@@ -700,9 +1025,9 @@ fn encode_voice_feedback(feedback: VoiceFeedback, out: &mut Vec<u8>) {
     out.extend_from_slice(&feedback.max_interarrival_jitter_ms.to_le_bytes());
 }
 
-fn encode_voice_payload(payload: &VoicePayload, out: &mut Vec<u8>) -> Result<(), MediaError> {
+fn encode_voice_payload(payload: &VoicePayloadRef<'_>, out: &mut Vec<u8>) -> Result<(), MediaError> {
     match payload {
-        VoicePayload::Opus(opus) => {
+        VoicePayloadRef::Opus(opus) => {
             if opus.is_empty() || opus.len() > MAX_VOICE_PAYLOAD_BYTES {
                 return Err(MediaError::PayloadTooLarge);
             }
@@ -711,7 +1036,7 @@ fn encode_voice_payload(payload: &VoicePayload, out: &mut Vec<u8>) -> Result<(),
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(opus);
         }
-        VoicePayload::Silence => {
+        VoicePayloadRef::Silence => {
             out.push(VOICE_PAYLOAD_SILENCE);
             out.extend_from_slice(&0u16.to_le_bytes());
         }
@@ -719,7 +1044,7 @@ fn encode_voice_payload(payload: &VoicePayload, out: &mut Vec<u8>) -> Result<(),
     Ok(())
 }
 
-fn decode_voice_payload(bytes: &[u8]) -> Result<VoicePayload, MediaError> {
+fn decode_voice_payload_ref(bytes: &[u8]) -> Result<VoicePayloadRef<'_>, MediaError> {
     if bytes.len() < 3 {
         return Err(MediaError::InvalidPayload);
     }
@@ -729,13 +1054,13 @@ fn decode_voice_payload(bytes: &[u8]) -> Result<VoicePayload, MediaError> {
             if len == 0 || len > MAX_VOICE_PAYLOAD_BYTES || bytes.len() != 3 + len {
                 return Err(MediaError::InvalidPayload);
             }
-            Ok(VoicePayload::Opus(bytes[3..].to_vec()))
+            Ok(VoicePayloadRef::Opus(&bytes[3..]))
         }
         VOICE_PAYLOAD_SILENCE => {
             if len != 0 || bytes.len() != 3 {
                 return Err(MediaError::InvalidPayload);
             }
-            Ok(VoicePayload::Silence)
+            Ok(VoicePayloadRef::Silence)
         }
         _ => Err(MediaError::InvalidPayload),
     }
@@ -971,6 +1296,31 @@ mod tests {
     }
 
     #[test]
+    fn native_media_opens_in_place_with_borrowed_voice_payload() {
+        let protection = aead_protection(9);
+        let payload = MediaPayload::Voice {
+            stream_id: StreamId(5),
+            sequence: 9,
+            timestamp: 8_640,
+            flags: 0,
+            payload: VoicePayload::Opus(vec![1, 2, 3, 4]),
+        };
+        let mut packet = seal_media(&protection, 0, &payload).unwrap();
+        let packet_start = packet.as_ptr() as usize;
+        let packet_end = packet_start + packet.len();
+        let mut replay = AntiReplay::new();
+        let opened = open_media_in_place(&protection, &mut replay, &mut packet).unwrap();
+        let MediaPayloadRef::Voice { payload, .. } = opened.payload else {
+            panic!("expected voice payload");
+        };
+        let VoicePayloadRef::Opus(opus) = payload else {
+            panic!("expected Opus payload");
+        };
+        assert_eq!(opus, [1, 2, 3, 4]);
+        assert!((packet_start..packet_end).contains(&(opus.as_ptr() as usize)));
+    }
+
+    #[test]
     fn native_media_rejects_tamper() {
         let protection = aead_protection(9);
         let payload = MediaPayload::Pong { nonce: 7 };
@@ -988,7 +1338,7 @@ mod tests {
         let mut replay = AntiReplay::new();
         assert_eq!(
             open_media(&aead_protection(10), &mut replay, &packet).unwrap_err(),
-            MediaError::Crypto(CryptoError::WrongKeyId.to_string())
+            MediaError::Crypto(CryptoError::WrongKeyId)
         );
     }
 
