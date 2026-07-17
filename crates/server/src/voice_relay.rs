@@ -22,6 +22,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::event_queue::{EventNotifier, VOICE_EVENTS};
+
 const UDP: Token = Token(0);
 const UDP_PROBE: Token = Token(1);
 const COMMANDS: Token = Token(2);
@@ -148,14 +150,14 @@ impl VoiceEventBatch {
 /// its eventual drain proportional to the live topology, not the stall length.
 struct VoiceEventSubmission {
     pending: Mutex<VoiceEventBatch>,
-    waker: Arc<Waker>,
+    notifier: Arc<EventNotifier>,
 }
 
 impl VoiceEventSubmission {
-    fn new(waker: Arc<Waker>) -> Self {
+    fn new(notifier: Arc<EventNotifier>) -> Self {
         Self {
             pending: Mutex::new(VoiceEventBatch::default()),
-            waker,
+            notifier,
         }
     }
 
@@ -176,16 +178,12 @@ impl VoiceEventSubmission {
                 }
             }
         }
-        if let Err(error) = self.waker.wake() {
-            kvlog::warn!("voice event wake failed", error = %error);
-        }
+        self.notifier.signal(VOICE_EVENTS, "voice");
     }
 
     fn submit_failure(&self, failure: String) {
         self.pending.lock().unwrap().failure = Some(failure);
-        if let Err(error) = self.waker.wake() {
-            kvlog::warn!("voice event wake failed", error = %error);
-        }
+        self.notifier.signal(VOICE_EVENTS, "voice");
     }
 
     fn drain_into(&self, events: &mut VoiceEventBatch) {
@@ -206,7 +204,7 @@ impl VoiceRelayHandle {
     pub(super) fn spawn(
         mut udp: UdpSocket,
         mut udp_probe: Option<UdpSocket>,
-        control_waker: Arc<Waker>,
+        control_notifier: Arc<EventNotifier>,
         p2p_enabled: bool,
     ) -> io::Result<Self> {
         let udp_local_addr = udp.local_addr()?;
@@ -219,7 +217,7 @@ impl VoiceRelayHandle {
         }
         let command_waker = Arc::new(Waker::new(poll.registry(), COMMANDS)?);
         let commands = Arc::new(EventSubmission::new(command_waker));
-        let events = Arc::new(VoiceEventSubmission::new(control_waker));
+        let events = Arc::new(VoiceEventSubmission::new(control_notifier));
         let loop_commands = Arc::clone(&commands);
         let loop_events = Arc::clone(&events);
         let thread = thread::Builder::new()
@@ -917,10 +915,11 @@ mod tests {
         fn new(p2p_enabled: bool) -> Self {
             let control_poll = Poll::new().unwrap();
             let control_waker = Arc::new(Waker::new(control_poll.registry(), Token(9)).unwrap());
+            let control_notifier = Arc::new(EventNotifier::new(control_waker));
             let poll = Poll::new().unwrap();
             let command_waker = Arc::new(Waker::new(poll.registry(), COMMANDS).unwrap());
             let commands = Arc::new(EventSubmission::new(command_waker));
-            let events = Arc::new(VoiceEventSubmission::new(control_waker));
+            let events = Arc::new(VoiceEventSubmission::new(control_notifier));
             let udp = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             Self {
                 _control_poll: control_poll,
@@ -956,7 +955,8 @@ mod tests {
     fn voice_events_keep_only_latest_observation_per_key() {
         let poll = Poll::new().unwrap();
         let waker = Arc::new(Waker::new(poll.registry(), Token(7)).unwrap());
-        let submission = VoiceEventSubmission::new(waker);
+        let notifier = Arc::new(EventNotifier::new(waker));
+        let submission = VoiceEventSubmission::new(notifier);
         let session_id = SessionId(1);
         let first_addr: SocketAddr = "203.0.113.1:4000".parse().unwrap();
         let latest_addr: SocketAddr = "203.0.113.1:5000".parse().unwrap();
@@ -1191,9 +1191,10 @@ mod tests {
     fn dedicated_thread_relays_while_control_side_does_not_drain() {
         let mut control_poll = Poll::new().unwrap();
         let control_waker = Arc::new(Waker::new(control_poll.registry(), Token(9)).unwrap());
+        let control_notifier = Arc::new(EventNotifier::new(control_waker));
         let udp = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = udp.local_addr().unwrap();
-        let relay = VoiceRelayHandle::spawn(udp, None, control_waker, false).unwrap();
+        let relay = VoiceRelayHandle::spawn(udp, None, control_notifier, false).unwrap();
 
         let alice_id = SessionId(1);
         let bob_id = SessionId(2);

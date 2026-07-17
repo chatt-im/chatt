@@ -35,7 +35,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
 };
 
@@ -47,6 +47,7 @@ use rpc::{
 use toml_spanner::Toml;
 
 use crate::config::{FIRST_DYNAMIC_ROOM_ID, RoomConfig, RoomPersistenceConfig, atomic_write_toml};
+use crate::event_queue::{EventNotifier, EventQueue, ROOM_LOG_EVENTS, ROOM_STATE_EVENTS};
 use crate::history_reader::{HistoryReadRequest, Source};
 
 /// Message-id block reserved per state write; a restart skips at most twice
@@ -59,6 +60,7 @@ const MAX_ACTIVE_LOG_BYTES: u64 = 4 * 1024 * 1024;
 /// from disk.
 const MAX_DURABLE_RESIDENT_MESSAGES: usize = 8192;
 const STATE_FILE: &str = "state.toml";
+const LOG_WRITE_QUEUE_CAPACITY: usize = 256;
 
 /// Durable retention size limits, injectable so tests can force rotation and
 /// resident trimming with a handful of small messages.
@@ -112,11 +114,29 @@ impl MutationDenied {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct DmRoom {
     pub room_id: RoomId,
     pub user_a: UserId,
     pub user_b: UserId,
     pub created_at_ms: u64,
+}
+
+struct PendingDm {
+    operation_id: u64,
+    room: DmRoom,
+    previous_next_room_id: u32,
+}
+
+pub(crate) enum OpenDmResult {
+    Existing(RoomId),
+    Pending { operation_id: u64 },
+}
+
+pub(crate) struct DmCompletion {
+    pub(crate) operation_id: u64,
+    pub(crate) room: DmRoom,
+    pub(crate) result: Result<(), String>,
 }
 
 impl DmRoom {
@@ -160,6 +180,204 @@ impl ActiveLog {
             ActiveLog::Open(file) => Some(file),
             ActiveLog::Reopen | ActiveLog::Disabled => None,
         }
+    }
+}
+
+struct RoomLogWrite {
+    room_id: RoomId,
+    message_id: MessageId,
+    record: Vec<u8>,
+    max_active_log_bytes: u64,
+    path: Option<PathBuf>,
+}
+
+enum LogFileUpdate {
+    Keep,
+    Open(File),
+    Reopen,
+    Disabled,
+}
+
+struct RoomLogEvent {
+    room_id: RoomId,
+    message_id: MessageId,
+    active_bytes: u64,
+    active_first_id: Option<MessageId>,
+    rotated: Option<Segment>,
+    file: LogFileUpdate,
+    error: Option<String>,
+}
+
+struct RoomLogWorkerState {
+    path: PathBuf,
+    file: ActiveLog,
+    active_bytes: u64,
+    active_first_id: Option<MessageId>,
+}
+
+struct RoomLogWriter {
+    requests: Option<mpsc::SyncSender<RoomLogWrite>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl RoomLogWriter {
+    fn spawn(
+        rooms: HashMap<RoomId, RoomLogWorkerState>,
+        events: Arc<EventQueue<RoomLogEvent>>,
+    ) -> Self {
+        let (requests, request_rx) = mpsc::sync_channel(LOG_WRITE_QUEUE_CAPACITY);
+        let thread = thread::Builder::new()
+            .name("chatt-room-log-writer".to_string())
+            .spawn(move || room_log_worker(request_rx, rooms, events))
+            .expect("failed to spawn room log writer");
+        Self {
+            requests: Some(requests),
+            thread: Some(thread),
+        }
+    }
+
+    fn enqueue(&self, write: RoomLogWrite) -> Result<(), &'static str> {
+        let Some(requests) = &self.requests else {
+            return Err("writer gone");
+        };
+        requests.try_send(write).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => "queue full",
+            mpsc::TrySendError::Disconnected(_) => "writer gone",
+        })
+    }
+}
+
+impl Drop for RoomLogWriter {
+    fn drop(&mut self) {
+        drop(self.requests.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn room_log_worker(
+    requests: mpsc::Receiver<RoomLogWrite>,
+    mut rooms: HashMap<RoomId, RoomLogWorkerState>,
+    events: Arc<EventQueue<RoomLogEvent>>,
+) {
+    while let Ok(write) = requests.recv() {
+        let mut new_room = false;
+        if !rooms.contains_key(&write.room_id)
+            && let Some(path) = write.path.clone()
+        {
+            let file = match open_active_log(&path) {
+                Ok(file) => ActiveLog::Open(file),
+                Err(error) => {
+                    events.push(RoomLogEvent {
+                        room_id: write.room_id,
+                        message_id: write.message_id,
+                        active_bytes: 0,
+                        active_first_id: None,
+                        rotated: None,
+                        file: LogFileUpdate::Reopen,
+                        error: Some(format!("active log open failed: {error}")),
+                    });
+                    continue;
+                }
+            };
+            rooms.insert(
+                write.room_id,
+                RoomLogWorkerState {
+                    path,
+                    file,
+                    active_bytes: 0,
+                    active_first_id: None,
+                },
+            );
+            new_room = true;
+        }
+        let Some(state) = rooms.get_mut(&write.room_id) else {
+            continue;
+        };
+        let mut file_update = if new_room {
+            match state.file.open().and_then(|file| file.try_clone().ok()) {
+                Some(file) => LogFileUpdate::Open(file),
+                None => LogFileUpdate::Reopen,
+            }
+        } else {
+            LogFileUpdate::Keep
+        };
+        let mut rotated = None;
+        let mut error = None;
+        if matches!(state.file, ActiveLog::Reopen) {
+            match open_active_log(&state.path) {
+                Ok(file) => state.file = ActiveLog::Open(file),
+                Err(open_error) => {
+                    error = Some(format!("active log reopen failed: {open_error}"));
+                }
+            }
+        }
+        if let ActiveLog::Open(file) = &mut state.file {
+            match write_log_record(file, &write.record) {
+                Ok(written) => {
+                    if state.active_bytes == 0 {
+                        state.active_first_id = Some(write.message_id);
+                    }
+                    state.active_bytes += written as u64;
+                }
+                Err(write_error) if write_error.kind() == std::io::ErrorKind::InvalidInput => {
+                    error = Some("history record exceeds the log record cap".to_string());
+                }
+                Err(write_error) => {
+                    error = Some(format!("durable room log append failed: {write_error}"));
+                    state.file = ActiveLog::Disabled;
+                    file_update = LogFileUpdate::Disabled;
+                }
+            }
+        }
+        if state.active_bytes > write.max_active_log_bytes
+            && let Some(first_id) = state.active_first_id
+            && matches!(state.file, ActiveLog::Open(_))
+        {
+            let segment_path = segment_path(&state.path, first_id);
+            match fs::rename(&state.path, &segment_path) {
+                Ok(()) => {
+                    rotated = Some(Segment {
+                        path: segment_path,
+                        first_id,
+                    });
+                    state.active_bytes = 0;
+                    state.active_first_id = None;
+                    match open_active_log(&state.path) {
+                        Ok(file) => {
+                            file_update = match file.try_clone() {
+                                Ok(read_file) => LogFileUpdate::Open(read_file),
+                                Err(clone_error) => {
+                                    error = Some(format!(
+                                        "fresh active log clone failed: {clone_error}"
+                                    ));
+                                    LogFileUpdate::Reopen
+                                }
+                            };
+                            state.file = ActiveLog::Open(file);
+                        }
+                        Err(open_error) => {
+                            error = Some(format!("active log reopen after rotation failed: {open_error}"));
+                            state.file = ActiveLog::Reopen;
+                            file_update = LogFileUpdate::Reopen;
+                        }
+                    }
+                }
+                Err(rename_error) => {
+                    error = Some(format!("durable room log rotate failed: {rename_error}"));
+                }
+            }
+        }
+        events.push(RoomLogEvent {
+            room_id: write.room_id,
+            message_id: write.message_id,
+            active_bytes: state.active_bytes,
+            active_first_id: state.active_first_id,
+            rotated,
+            file: file_update,
+            error,
+        });
     }
 }
 
@@ -215,6 +433,10 @@ pub struct HistoryFetchPlan {
 impl HistoryFetchPlan {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    pub fn before(&self) -> Option<MessageId> {
+        self.before
     }
 }
 
@@ -286,6 +508,12 @@ impl ResidentHistory {
             len,
         });
         (start, len)
+    }
+
+    fn rollback_append(&mut self, start: usize) {
+        let entry = self.entries.pop().expect("rollback follows append");
+        debug_assert_eq!(entry.start, start);
+        self.bytes.truncate(start);
     }
 
     fn append_record(&mut self, record: &[u8]) -> Result<(), String> {
@@ -491,6 +719,10 @@ impl ResidentHistory {
 pub struct RoomStore {
     data_dir: Option<PathBuf>,
     state_writer: Option<StateWriter>,
+    log_writer: Option<RoomLogWriter>,
+    log_events: Option<Arc<EventQueue<RoomLogEvent>>>,
+    pending_log_writes: HashMap<RoomId, usize>,
+    state_events: Option<Arc<EventQueue<StateWriteEvent>>>,
     tuning: StoreTuning,
     next_room_id: u32,
     next_ids: HashMap<RoomId, u64>,
@@ -498,6 +730,8 @@ pub struct RoomStore {
     heads: HashMap<RoomId, MessageId>,
     recent_ids: HashMap<RoomId, VecDeque<MessageId>>,
     dm_rooms: Vec<DmRoom>,
+    pending_dm: Option<PendingDm>,
+    next_dm_operation: u64,
     rooms: HashMap<RoomId, Retention>,
 }
 
@@ -543,6 +777,10 @@ impl RoomStore {
         let mut store = Self {
             data_dir,
             state_writer,
+            log_writer: None,
+            log_events: None,
+            pending_log_writes: HashMap::new(),
+            state_events: None,
             tuning,
             next_room_id,
             next_ids: HashMap::new(),
@@ -550,6 +788,8 @@ impl RoomStore {
             heads: HashMap::new(),
             recent_ids: HashMap::new(),
             dm_rooms: Vec::new(),
+            pending_dm: None,
+            next_dm_operation: 1,
             rooms: HashMap::new(),
         };
         for entry in state.message_id_watermarks {
@@ -581,6 +821,123 @@ impl RoomStore {
     #[cfg(test)]
     pub(crate) fn set_tuning(&mut self, tuning: StoreTuning) {
         self.tuning = tuning;
+    }
+
+    /// Transfers regular-file appends and rotations to one ordered worker.
+    /// Resident history is still published immediately; the worker completion
+    /// advances only the disk-history mirror used by paging.
+    pub(crate) fn enable_async_log_writes(&mut self, notifier: Arc<EventNotifier>) {
+        if self.log_writer.is_some() {
+            return;
+        }
+        let events = Arc::new(EventQueue::new(notifier, ROOM_LOG_EVENTS, "room-log"));
+        let mut worker_rooms = HashMap::new();
+        let mut failed_rooms = Vec::new();
+        for (room_id, retention) in &self.rooms {
+            let Retention::Durable {
+                file,
+                active_bytes,
+                path: Some(path),
+                active_first_id,
+                ..
+            } = retention
+            else {
+                continue;
+            };
+            let worker_file = match file {
+                ActiveLog::Open(file) => match file.try_clone() {
+                    Ok(file) => ActiveLog::Open(file),
+                    Err(error) => {
+                        kvlog::error!(
+                            "durable room log handoff failed; retention degraded to memory",
+                            room_id = room_id.0,
+                            error = error.to_string().as_str()
+                        );
+                        failed_rooms.push(*room_id);
+                        continue;
+                    }
+                },
+                ActiveLog::Reopen => ActiveLog::Reopen,
+                ActiveLog::Disabled => continue,
+            };
+            worker_rooms.insert(
+                *room_id,
+                RoomLogWorkerState {
+                    path: path.clone(),
+                    file: worker_file,
+                    active_bytes: *active_bytes,
+                    active_first_id: *active_first_id,
+                },
+            );
+        }
+        for room_id in failed_rooms {
+            if let Some(Retention::Durable { file, .. }) = self.rooms.get_mut(&room_id) {
+                *file = ActiveLog::Disabled;
+            }
+        }
+        self.log_writer = Some(RoomLogWriter::spawn(worker_rooms, Arc::clone(&events)));
+        self.log_events = Some(events);
+    }
+
+    pub(crate) fn enable_async_state_writes(&mut self, notifier: Arc<EventNotifier>) {
+        if self.state_writer.is_some() && self.state_events.is_none() {
+            self.state_events = Some(Arc::new(EventQueue::new(
+                notifier,
+                ROOM_STATE_EVENTS,
+                "room-state",
+            )));
+        }
+    }
+
+    pub(crate) fn drain_log_events(&mut self) {
+        let Some(events) = &self.log_events else {
+            return;
+        };
+        let mut completed = events.drain_up_to(64);
+        while let Some(event) = completed.pop_front() {
+            let Some(Retention::Durable {
+                history,
+                file,
+                active_bytes,
+                active_first_id,
+                segments,
+                ..
+            }) = self.rooms.get_mut(&event.room_id)
+            else {
+                continue;
+            };
+            if let Some(error) = event.error {
+                kvlog::error!(
+                    "asynchronous durable room log operation failed",
+                    room_id = event.room_id.0,
+                    message_id = event.message_id.0,
+                    error = error.as_str()
+                );
+            }
+            if matches!(file, ActiveLog::Disabled) {
+                continue;
+            }
+            if let Some(pending) = self.pending_log_writes.get_mut(&event.room_id) {
+                *pending = pending.saturating_sub(1);
+                if *pending == 0 {
+                    self.pending_log_writes.remove(&event.room_id);
+                }
+            }
+            *active_bytes = event.active_bytes;
+            *active_first_id = event.active_first_id;
+            if let Some(segment) = event.rotated {
+                segments.push(segment);
+            }
+            match event.file {
+                LogFileUpdate::Keep => {}
+                LogFileUpdate::Open(read_file) => *file = ActiveLog::Open(read_file),
+                LogFileUpdate::Reopen => *file = ActiveLog::Reopen,
+                LogFileUpdate::Disabled => *file = ActiveLog::Disabled,
+            }
+            if !self.pending_log_writes.contains_key(&event.room_id) {
+                history.trim_to_limit(self.tuning.max_resident_messages);
+            }
+        }
     }
 
     fn register_room(
@@ -711,22 +1068,33 @@ impl RoomStore {
     }
 
     /// Records the message per the room's retention and returns how many
-    /// messages the room now retains.
+    /// messages the room now retains. This compatibility wrapper is used by
+    /// store-level callers that do not run with the bounded async writer.
     pub fn append(&mut self, room_id: RoomId, message: &ChatMessage) -> usize {
+        self.try_append(room_id, message).unwrap_or_else(|_| {
+            self.rooms
+                .get(&room_id)
+                .and_then(Retention::history)
+                .map_or(0, ResidentHistory::len)
+        })
+    }
+
+    /// Records a message without weakening durability when the background
+    /// writer is saturated. The caller can reject this one operation and
+    /// retry later; subsequent room writes remain durable.
+    pub fn try_append(
+        &mut self,
+        room_id: RoomId,
+        message: &ChatMessage,
+    ) -> Result<usize, String> {
         let StoreTuning {
             max_active_log_bytes,
             max_resident_messages,
         } = self.tuning;
         let Some(retention) = self.rooms.get_mut(&room_id) else {
-            return 0;
+            return Ok(0);
         };
-        self.heads.insert(room_id, message.message_id);
-        let recent_ids = self.recent_ids.entry(room_id).or_default();
-        if recent_ids.len() == MUTATION_WINDOW_MESSAGES {
-            recent_ids.pop_front();
-        }
-        recent_ids.push_back(message.message_id);
-        match retention {
+        let history_len = match retention {
             Retention::None => 0,
             Retention::Memory { history, limit } => {
                 history.append_message(message);
@@ -742,6 +1110,35 @@ impl RoomStore {
                 segments,
             } => {
                 let (start, len) = history.append_message(message);
+                if let Some(writer) = &self.log_writer
+                    && !matches!(file, ActiveLog::Disabled)
+                {
+                    let write = RoomLogWrite {
+                        room_id,
+                        message_id: message.message_id,
+                        record: history.record_range(start, len).to_vec(),
+                        max_active_log_bytes,
+                        path: path.clone(),
+                    };
+                    if let Err(error) = writer.enqueue(write) {
+                        history.rollback_append(start);
+                        kvlog::warn!(
+                            "durable room log append deferred by writer backpressure",
+                            room_id = room_id.0,
+                            error
+                        );
+                        return Err(format!("durable history writer is {error}; retry shortly"));
+                    }
+                    *self.pending_log_writes.entry(room_id).or_default() += 1;
+                    let history_len = history.len();
+                    self.heads.insert(room_id, message.message_id);
+                    let recent_ids = self.recent_ids.entry(room_id).or_default();
+                    if recent_ids.len() == MUTATION_WINDOW_MESSAGES {
+                        recent_ids.pop_front();
+                    }
+                    recent_ids.push_back(message.message_id);
+                    return Ok(history_len);
+                }
                 if matches!(file, ActiveLog::Reopen)
                     && let Some(path) = path.as_deref()
                     && let Ok(fresh) = open_active_log(path)
@@ -789,7 +1186,14 @@ impl RoomStore {
                 history.trim_to_limit(max_resident_messages);
                 history.len()
             }
+        };
+        self.heads.insert(room_id, message.message_id);
+        let recent_ids = self.recent_ids.entry(room_id).or_default();
+        if recent_ids.len() == MUTATION_WINDOW_MESSAGES {
+            recent_ids.pop_front();
         }
+        recent_ids.push_back(message.message_id);
+        Ok(history_len)
     }
 
     /// Test-only: the most recent `max` retained messages, oldest first,
@@ -1090,6 +1494,126 @@ impl RoomStore {
         Ok(room_id)
     }
 
+    /// Starts first-time DM persistence without waiting on the event-loop
+    /// thread. A concurrent request for the same unordered pair joins the
+    /// existing operation and receives the same operation id.
+    pub(crate) fn begin_open_dm(
+        &mut self,
+        first: UserId,
+        second: UserId,
+        now_ms: u64,
+    ) -> Result<OpenDmResult, String> {
+        if first == second {
+            return Err("cannot open a direct message with yourself".to_string());
+        }
+        if let Some(existing) = self.dm_room_for(first, second) {
+            return Ok(OpenDmResult::Existing(existing));
+        }
+        if let Some(pending) = &self.pending_dm {
+            if pending.room.pairs(first, second) {
+                return Ok(OpenDmResult::Pending {
+                    operation_id: pending.operation_id,
+                });
+            }
+            return Err("another direct-message room is being persisted; retry shortly".to_string());
+        }
+        let (Some(writer), Some(events)) = (&self.state_writer, &self.state_events) else {
+            return self.open_dm(first, second, now_ms).map(OpenDmResult::Existing);
+        };
+        let log_path = self
+            .data_dir
+            .as_ref()
+            .map(|dir| {
+                dir.join("rooms")
+                    .join(format!("{}.log", self.next_room_id))
+            })
+            .ok_or_else(|| "dm room log path is unavailable".to_string())?;
+        let previous_next_room_id = self.next_room_id;
+        let room_id = RoomId(previous_next_room_id);
+        self.next_room_id = previous_next_room_id
+            .checked_add(1)
+            .ok_or_else(|| "no dynamic room ids are available".to_string())?;
+        let operation_id = self.next_dm_operation;
+        self.next_dm_operation = self.next_dm_operation.wrapping_add(1).max(1);
+        self.pending_dm = Some(PendingDm {
+            operation_id,
+            room: DmRoom {
+                room_id,
+                user_a: first,
+                user_b: second,
+                created_at_ms: now_ms,
+            },
+            previous_next_room_id,
+        });
+        if let Err(error) = writer.write_async(
+            self.state_snapshot(),
+            operation_id,
+            Arc::clone(events),
+            log_path,
+        ) {
+            self.pending_dm = None;
+            self.next_room_id = previous_next_room_id;
+            return Err(format!("dm room registry write failed: {error}"));
+        }
+        Ok(OpenDmResult::Pending {
+            operation_id,
+        })
+    }
+
+    pub(crate) fn drain_dm_completions(&mut self) -> VecDeque<DmCompletion> {
+        let Some(events) = &self.state_events else {
+            return VecDeque::new();
+        };
+        let mut replies = events.drain_up_to(16);
+        let mut completed = VecDeque::new();
+        while let Some(reply) = replies.pop_front() {
+            let Some(pending) = self.pending_dm.take() else {
+                kvlog::warn!(
+                    "unexpected room state completion",
+                    operation_id = reply.operation_id
+                );
+                continue;
+            };
+            if pending.operation_id != reply.operation_id {
+                kvlog::error!(
+                    "room state completion id mismatch",
+                    expected = pending.operation_id,
+                    actual = reply.operation_id
+                );
+            }
+            if reply.result.is_ok() {
+                let room_id = pending.room.room_id;
+                let path = self
+                    .data_dir
+                    .as_ref()
+                    .map(|dir| dir.join("rooms").join(format!("{}.log", room_id.0)));
+                self.rooms.insert(
+                    room_id,
+                    Retention::Durable {
+                        history: ResidentHistory::default(),
+                        file: ActiveLog::Reopen,
+                        active_bytes: 0,
+                        path,
+                        active_first_id: None,
+                        segments: Vec::new(),
+                    },
+                );
+                self.recent_ids.insert(room_id, VecDeque::new());
+                self.dm_rooms.push(pending.room);
+            } else {
+                self.next_room_id = pending.previous_next_room_id;
+                self.queue_persist_state();
+            }
+            completed.push_back(DmCompletion {
+                operation_id: pending.operation_id,
+                room: pending.room,
+                result: reply.result
+                    .map_err(|error| format!("dm room registry write failed: {error}")),
+            });
+        }
+        completed
+    }
+
     /// Queues a state snapshot to the background writer without waiting for
     /// the write; used on the message hot path where an fsync stall must not
     /// block the event loop.
@@ -1111,36 +1635,114 @@ impl RoomStore {
         writer.write_sync(self.state_snapshot())
     }
 
-    fn state_snapshot(&self) -> String {
-        let mut watermarks: Vec<(u32, u64)> = self
+    fn state_snapshot(&self) -> StateSnapshot {
+        let watermarks = self
             .watermarks
             .iter()
             .map(|(room_id, next)| (room_id.0, *next))
             .collect();
-        watermarks.sort_unstable();
-        let mut out = String::new();
-        out.push_str("# chatt server room state. Managed by the server; do not edit.\n\n");
-        out.push_str(&format!("next-room-id = {}\n", self.next_room_id));
-        for (room_id, next) in watermarks {
+        let mut dm_rooms = self.dm_rooms.clone();
+        if let Some(pending) = &self.pending_dm {
+            dm_rooms.push(pending.room);
+        }
+        StateSnapshot {
+            next_room_id: self.next_room_id,
+            watermarks,
+            dm_rooms,
+        }
+    }
+}
+
+struct StateSnapshot {
+    next_room_id: u32,
+    watermarks: Vec<(u32, u64)>,
+    dm_rooms: Vec<DmRoom>,
+}
+
+fn render_state_snapshot(mut snapshot: StateSnapshot) -> String {
+    snapshot.watermarks.sort_unstable();
+    let mut out = String::new();
+    out.push_str("# chatt server room state. Managed by the server; do not edit.\n\n");
+    out.push_str(&format!("next-room-id = {}\n", snapshot.next_room_id));
+    for (room_id, next) in snapshot.watermarks {
             out.push_str("\n[[message-id-watermarks]]\n");
             out.push_str(&format!("room-id = {room_id}\nnext = {next}\n"));
-        }
-        for dm in &self.dm_rooms {
+    }
+    for dm in snapshot.dm_rooms {
             out.push_str("\n[[dm-rooms]]\n");
             out.push_str(&format!(
                 "room-id = {}\nuser-a = {}\nuser-b = {}\ncreated-at-ms = {}\n",
                 dm.room_id.0, dm.user_a.0, dm.user_b.0, dm.created_at_ms
             ));
-        }
-        out
     }
+    out
 }
 
-/// One queued rewrite of `state.toml`; `reply` is present when the caller
-/// waits for the write result.
-struct StateWrite {
-    snapshot: String,
-    reply: Option<mpsc::SyncSender<Result<(), String>>>,
+#[derive(Default)]
+struct PendingStateWrite {
+    snapshot: Option<StateSnapshot>,
+    waiters: Vec<StateWriteWaiter>,
+    closed: bool,
+}
+
+enum StateWriteWaiter {
+    Sync(mpsc::SyncSender<Result<(), String>>),
+    Event {
+        operation_id: u64,
+        events: Arc<EventQueue<StateWriteEvent>>,
+        prepare_log: PathBuf,
+    },
+}
+
+struct StateWriteEvent {
+    operation_id: u64,
+    result: Result<(), String>,
+}
+
+#[derive(Default)]
+struct StateWriteSubmission {
+    pending: Mutex<PendingStateWrite>,
+    ready: Condvar,
+}
+
+impl StateWriteSubmission {
+    fn submit(
+        &self,
+        snapshot: StateSnapshot,
+        waiter: Option<StateWriteWaiter>,
+    ) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.closed {
+            return false;
+        }
+        // A complete state snapshot supersedes every not-yet-started snapshot.
+        // Keep only the newest bytes while retaining all durability waiters;
+        // the next write covers every earlier waiter in this batch.
+        pending.snapshot = Some(snapshot);
+        if let Some(waiter) = waiter {
+            pending.waiters.push(waiter);
+        }
+        self.ready.notify_one();
+        true
+    }
+
+    fn receive(&self) -> Option<(StateSnapshot, Vec<StateWriteWaiter>)> {
+        let mut pending = self.pending.lock().unwrap();
+        loop {
+            if let Some(snapshot) = pending.snapshot.take() {
+                return Some((snapshot, std::mem::take(&mut pending.waiters)));
+            }
+            if pending.closed {
+                return None;
+            }
+            pending = self.ready.wait(pending).unwrap();
+        }
+    }
+
+    fn close(&self) {
+        self.pending.lock().unwrap().closed = true;
+        self.ready.notify_one();
+    }
 }
 
 /// Background `state.toml` writer thread. Snapshots are complete state, so
@@ -1149,75 +1751,104 @@ struct StateWrite {
 /// flushes the queue before returning, so a clean shutdown persists the
 /// final watermarks.
 struct StateWriter {
-    sender: Option<mpsc::Sender<StateWrite>>,
+    submission: Arc<StateWriteSubmission>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl StateWriter {
     fn spawn(path: PathBuf) -> Self {
-        let (sender, receiver) = mpsc::channel::<StateWrite>();
+        let submission = Arc::new(StateWriteSubmission::default());
+        let worker_submission = Arc::clone(&submission);
         let thread = thread::spawn(move || {
-            while let Ok(first) = receiver.recv() {
-                let mut batch = vec![first];
-                while let Ok(more) = receiver.try_recv() {
-                    batch.push(more);
-                }
-                let newest = &batch[batch.len() - 1].snapshot;
-                let result = atomic_write_toml(&path, newest);
+            while let Some((snapshot, waiters)) = worker_submission.receive() {
+                let snapshot = render_state_snapshot(snapshot);
+                // The empty active log is a recovery tombstone. It must exist
+                // before state.toml can make the dynamic room visible, so a
+                // crash or later state corruption can never recycle this id
+                // onto private history from another room.
+                let result = waiters
+                    .iter()
+                    .filter_map(|waiter| match waiter {
+                        StateWriteWaiter::Event { prepare_log, .. } => Some(prepare_log),
+                        StateWriteWaiter::Sync(_) => None,
+                    })
+                    .try_for_each(|log_path| {
+                        open_active_log(log_path)
+                            .map(drop)
+                            .map_err(|error| format!("room log tombstone create failed: {error}"))
+                    })
+                    .and_then(|()| atomic_write_toml(&path, &snapshot));
                 if let Err(error) = &result {
                     kvlog::error!(
                         "room state write failed; ids may repeat after restart",
                         error = error.as_str()
                     );
                 }
-                for write in batch {
-                    let Some(reply) = write.reply else {
-                        continue;
-                    };
-                    let _ = reply.send(result.clone());
+                for waiter in waiters {
+                    match waiter {
+                        StateWriteWaiter::Sync(reply) => {
+                            let _ = reply.send(result.clone());
+                        }
+                        StateWriteWaiter::Event {
+                            operation_id,
+                            events,
+                            ..
+                        } => events.push(StateWriteEvent {
+                            operation_id,
+                            result: result.clone(),
+                        }),
+                    }
                 }
             }
         });
         Self {
-            sender: Some(sender),
+            submission,
             thread: Some(thread),
         }
     }
 
-    fn enqueue(&self, snapshot: String) {
-        let Some(sender) = &self.sender else {
-            return;
-        };
-        if sender
-            .send(StateWrite {
-                snapshot,
-                reply: None,
-            })
-            .is_err()
-        {
+    fn enqueue(&self, snapshot: StateSnapshot) {
+        if !self.submission.submit(snapshot, None) {
             kvlog::error!("room state writer gone; ids may repeat after restart");
         }
     }
 
-    fn write_sync(&self, snapshot: String) -> Result<(), String> {
+    fn write_sync(&self, snapshot: StateSnapshot) -> Result<(), String> {
         let gone = || "room state writer thread is gone".to_string();
-        let Some(sender) = &self.sender else {
-            return Err(gone());
-        };
         let (reply, done) = mpsc::sync_channel(1);
-        sender
-            .send(StateWrite {
-                snapshot,
-                reply: Some(reply),
-            })
-            .map_err(|_| gone())?;
+        if !self
+            .submission
+            .submit(snapshot, Some(StateWriteWaiter::Sync(reply)))
+        {
+            return Err(gone());
+        }
         done.recv().map_err(|_| gone())?
+    }
+
+    fn write_async(
+        &self,
+        snapshot: StateSnapshot,
+        operation_id: u64,
+        events: Arc<EventQueue<StateWriteEvent>>,
+        prepare_log: PathBuf,
+    ) -> Result<(), String> {
+        self.submission
+            .submit(
+                snapshot,
+                Some(StateWriteWaiter::Event {
+                    operation_id,
+                    events,
+                    prepare_log,
+                }),
+            )
+            .then_some(())
+            .ok_or_else(|| "room state writer thread is gone".to_string())
     }
 }
 
 impl Drop for StateWriter {
     fn drop(&mut self) {
-        drop(self.sender.take());
+        self.submission.close();
         let Some(thread) = self.thread.take() else {
             return;
         };
@@ -1535,6 +2166,39 @@ mod tests {
     use super::*;
     use rpc::ids::UserId;
 
+    #[test]
+    fn pending_state_writes_keep_only_latest_snapshot_and_all_waiters() {
+        let snapshot = |next_room_id| StateSnapshot {
+            next_room_id,
+            watermarks: Vec::new(),
+            dm_rooms: Vec::new(),
+        };
+        let submission = StateWriteSubmission::default();
+        let (first_reply, first_done) = mpsc::sync_channel(1);
+        let (second_reply, second_done) = mpsc::sync_channel(1);
+        assert!(submission.submit(
+            snapshot(1),
+            Some(StateWriteWaiter::Sync(first_reply))
+        ));
+        assert!(submission.submit(snapshot(2), None));
+        assert!(submission.submit(
+            snapshot(3),
+            Some(StateWriteWaiter::Sync(second_reply))
+        ));
+
+        let (snapshot, waiters) = submission.receive().unwrap();
+        assert_eq!(snapshot.next_room_id, 3);
+        assert_eq!(waiters.len(), 2);
+        for waiter in waiters {
+            let StateWriteWaiter::Sync(waiter) = waiter else {
+                panic!("expected synchronous test waiter");
+            };
+            waiter.send(Ok(())).unwrap();
+        }
+        assert_eq!(first_done.recv().unwrap(), Ok(()));
+        assert_eq!(second_done.recv().unwrap(), Ok(()));
+    }
+
     fn test_message(room_id: RoomId, id: u64) -> ChatMessage {
         ChatMessage {
             message_id: MessageId(id),
@@ -1753,6 +2417,45 @@ mod tests {
         assert_eq!(store.dm_room_for(UserId(3), UserId(7)), Some(dm));
         assert_eq!(store.dm_rooms().len(), 1);
         assert_eq!(store.recent(dm, 10).len(), 1);
+    }
+
+    #[test]
+    fn async_dm_creation_reserves_id_and_enrolls_log_writer() {
+        let dir = temp_dir("async-dm-tombstone");
+        let mut poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1)).unwrap());
+        let notifier = Arc::new(EventNotifier::new(waker));
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
+        store.enable_async_state_writes(Arc::clone(&notifier));
+        store.enable_async_log_writes(Arc::clone(&notifier));
+
+        let OpenDmResult::Pending { .. } = store
+            .begin_open_dm(UserId(1), UserId(2), 1_000)
+            .unwrap()
+        else {
+            panic!("first async DM unexpectedly already existed");
+        };
+        let mut events = mio::Events::with_capacity(2);
+        poll.poll(&mut events, Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        assert_ne!(notifier.take_ready() & ROOM_STATE_EVENTS, 0);
+        let completion = store.drain_dm_completions().pop_front().unwrap();
+        completion.result.unwrap();
+        let dm = completion.room.room_id;
+        assert!(dir.join("rooms").join(format!("{}.log", dm.0)).exists());
+
+        let id = store.allocate_message_id(dm);
+        store.try_append(dm, &test_message(dm, id.0)).unwrap();
+        poll.poll(&mut events, Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        assert_ne!(notifier.take_ready() & ROOM_LOG_EVENTS, 0);
+        store.drain_log_events();
+        drop(store);
+
+        fs::remove_file(dir.join(STATE_FILE)).unwrap();
+        let mut reopened = RoomStore::open(Some(dir.to_path_buf()), &[]);
+        let fresh = reopened.open_dm(UserId(3), UserId(4), 2_000).unwrap();
+        assert_ne!(fresh, dm, "the async room id tombstone was not recovered");
     }
 
     #[test]

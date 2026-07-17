@@ -7606,9 +7606,11 @@ impl WorkerState {
     }
 
     fn room_requires_mls(&self, room_id: RoomId) -> bool {
-        self.room_kinds
-            .get(&room_id)
-            .is_some_and(|kind| !matches!(kind, RoomKind::Public))
+        // Room metadata can reach linked workers at different times. Never
+        // treat an as-yet unknown room as public: queueing its content in the
+        // durable MLS outbox is safe, while an ordinary-chat fallback would
+        // either leak plaintext or be rejected by the server for a DM.
+        !matches!(self.room_kinds.get(&room_id), Some(RoomKind::Public))
     }
 
     fn mark_mls_upload_announcement_delivered(
