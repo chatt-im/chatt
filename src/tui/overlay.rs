@@ -41,7 +41,7 @@ use crate::{
 use crate::e2e_identity::E2ePublicIdentity;
 
 #[cfg(test)]
-use crate::app::App;
+use crate::app::testing::TestApp;
 /// Overlay hosting the per-user local volume dialog.
 ///
 /// The mode owns the [`UserVolumeDialog`]; event handling lives on [`App`] so it
@@ -1971,6 +1971,7 @@ impl AppMode for PasswordPromptMode {
             TerminalEvent::DevicePairingIdentityExists { .. } => {}
             TerminalEvent::DevicePairingFailed { .. } => {}
             TerminalEvent::Navigation(_) => {}
+            _ => {}
         }
     }
 
@@ -2412,7 +2413,7 @@ macro_rules! app_mode_test_bridge {
         $(
             #[allow(dead_code)]
             impl $mode {
-                fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64) {
+                fn render(&mut self, app: &mut TestApp, buf: &mut Buffer, now_ms: u64) {
                     {
                         let mut cx = app.view_cx();
                         AppMode::render(self, &mut cx, buf, now_ms, DirtySections::ALL);
@@ -2420,7 +2421,7 @@ macro_rules! app_mode_test_bridge {
                     app.drain_core_commands();
                 }
 
-                fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+                fn process_input(&mut self, app: &mut TestApp, key: KeyEvent) -> Action {
                     let action = {
                         let mut cx = app.view_cx();
                         AppMode::process_input(self, &mut cx, key)
@@ -2429,7 +2430,7 @@ macro_rules! app_mode_test_bridge {
                     action
                 }
 
-                fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
+                fn process_mouse(&mut self, app: &mut TestApp, mouse: MouseEvent) -> Action {
                     let action = {
                         let mut cx = app.view_cx();
                         AppMode::process_mouse(self, &mut cx, mouse)
@@ -2438,7 +2439,7 @@ macro_rules! app_mode_test_bridge {
                     action
                 }
 
-                fn process_paste(&mut self, app: &mut App, text: String) {
+                fn process_paste(&mut self, app: &mut TestApp, text: String) {
                     {
                         let mut cx = app.view_cx();
                         AppMode::process_paste(self, &mut cx, text);
@@ -2462,7 +2463,7 @@ app_mode_test_bridge!(
 
 #[cfg(test)]
 impl PasteImageUploadMode {
-    fn presentation(&self, _app: &App) -> ModePresentation {
+    fn presentation(&self, _app: &TestApp) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,
             chrome: Some(ChromeSpec {
@@ -2511,8 +2512,8 @@ mod tests {
     };
     use extui::event::{KeyModifiers, MouseButton, MouseEventKind};
 
-    fn test_app() -> App {
-        App::new(Config::default(), None).expect("test app")
+    fn test_app() -> TestApp {
+        TestApp::new(Config::default(), None).expect("test app")
     }
 
     struct TextClipboard(String);
@@ -3438,7 +3439,7 @@ mod tests {
     #[test]
     fn password_prompt_cancel_button_is_clickable() {
         let mut app = test_app();
-        app.pending_pair = Some(pending_open_pair());
+        app.set_pairing_password_state(pending_open_pair());
         let mut prompt = PasswordPromptMode::new(false);
         prompt.cancel_button = Rect {
             x: 2,
@@ -3457,7 +3458,7 @@ mod tests {
             },
         );
 
-        assert!(app.pending_pair.is_none());
+        assert!(app.pairing_idle());
         assert!(matches!(
             app.take_terminal_event(),
             Some(crate::client_channel::TerminalEvent::Navigation(

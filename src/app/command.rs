@@ -145,27 +145,22 @@ pub(crate) enum CoreCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{app::App, config::Config};
+    use crate::{app::testing::TestApp, config::Config};
 
     #[test]
     fn view_context_queues_commands_until_core_drain() {
-        let mut app = App::new(Config::default(), None).expect("test app");
-        assert!(!app.view.lobby_details);
-        assert!(!app.view.quit_requested);
+        let mut app = TestApp::new(Config::default(), None).expect("test app");
+        let initial_height = app.config.ui.room_height;
 
         {
             let mut cx = app.view_cx();
-            cx.send(CoreCommand::RunSlash {
-                room_id: None,
-                input: "/stats".to_string(),
-            });
+            cx.send(CoreCommand::SetRoomHeight(initial_height + 1));
             cx.send(CoreCommand::Quit);
         }
 
-        assert!(!app.view.lobby_details);
-        assert!(!app.view.quit_requested);
+        assert_eq!(app.config.ui.room_height, initial_height);
         app.drain_core_commands();
-        assert!(app.view.lobby_details);
-        assert!(app.view.quit_requested);
+        assert_eq!(app.config.ui.room_height, initial_height + 1);
+        assert!(app.take_quit_requested());
     }
 }

@@ -11,7 +11,7 @@ use extui::{
     event::{self, Event, Events, Polled},
     vt,
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::{
     app::{AppEvent, EventSender, RoomSession, command::CoreCommand},
@@ -60,11 +60,10 @@ pub(crate) struct ClientThread {
     pub(crate) stdout_fd: RawFd,
     pub(crate) channel: Arc<ClientChannel>,
     pub(crate) session: Arc<RwLock<RoomSession>>,
-    pub(crate) view: Arc<Mutex<ClientView>>,
+    pub(crate) view: ClientView,
     pub(crate) config: Arc<RwLock<Config>>,
     pub(crate) events: EventSender,
     pub(crate) initial_mode: InitialMode,
-    pub(crate) follow_primary_view: bool,
 }
 
 impl ClientThread {
@@ -75,11 +74,10 @@ impl ClientThread {
             stdout_fd,
             channel,
             session,
-            view,
+            mut view,
             config,
             events: app_events,
             initial_mode,
-            follow_primary_view,
         } = self;
 
         // SAFETY: this render thread owns the descriptors for its lifetime. For
@@ -119,7 +117,6 @@ impl ClientThread {
         let mut mode_stack = {
             let session = session.read();
             let config = config.read();
-            let mut view = view.lock();
             let mut cx = ViewCx {
                 view: &mut view,
                 session: &session,
@@ -167,7 +164,6 @@ impl ClientThread {
             let active_animation = {
                 let session = session.read();
                 let config = config.read();
-                let mut view = view.lock();
                 if view.status.expire(std::time::Instant::now()) {
                     dirty |= DirtySections::COMPOSE_BAR;
                 }
@@ -176,15 +172,11 @@ impl ClientThread {
                     url_opener = crate::url_open::UrlOpener::new(url_open_command.clone());
                 }
                 let previous_room = view.viewed_room;
-                if follow_primary_view {
-                    view.sync_active(&session);
-                } else {
-                    view.sync_independent(&session);
-                    if view.viewed_room != previous_room
-                        && let Some(room_id) = view.viewed_room
-                    {
-                        queued.push(CoreCommand::SetViewedRoom(room_id));
-                    }
+                view.sync_independent(&session);
+                if view.viewed_room != previous_room
+                    && let Some(room_id) = view.viewed_room
+                {
+                    queued.push(CoreCommand::SetViewedRoom(room_id));
                 }
                 if view.viewed_room != previous_room {
                     dirty = DirtySections::ALL;
@@ -262,7 +254,6 @@ impl ClientThread {
                 let action = {
                     let session = session.read();
                     let config = config.read();
-                    let mut view = view.lock();
                     let mut cx = ViewCx {
                         view: &mut view,
                         session: &session,
@@ -307,10 +298,8 @@ impl ClientThread {
             }
             flush_commands(&mut queued, &app_events, id);
 
-            let (clipboard_text, url) = {
-                let mut view = view.lock();
-                (view.take_pending_clipboard(), view.take_pending_url_open())
-            };
+            let (clipboard_text, url) =
+                (view.take_pending_clipboard(), view.take_pending_url_open());
             if let Some(text) = clipboard_text {
                 clipboard.copy(&mut terminal, &text);
             }

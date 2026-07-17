@@ -81,6 +81,24 @@ pub(crate) enum NavigationEvent {
 /// Ordered, data-only effects published by the core to one terminal.
 pub(crate) enum TerminalEvent {
     Navigation(NavigationEvent),
+    Status(String),
+    TransientStatus(String),
+    Error(String),
+    LocalNotice {
+        sender: String,
+        body: String,
+        error: bool,
+    },
+    ConfigChanged,
+    SelectRoom(rpc::ids::RoomId),
+    OpenMessageRef {
+        target: rpc::msgref::MessageRef,
+        width: u16,
+        height: u16,
+    },
+    ClearVisualSelection,
+    CancelPendingEdit,
+    ResetRooms,
     PairingPasswordChallenge {
         retry: bool,
     },

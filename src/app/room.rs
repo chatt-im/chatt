@@ -3284,7 +3284,7 @@ mod tests {
             if let Some(room_id) = self.session.viewed_room {
                 self.view.switch_room(room_id, &self.session);
             }
-            self.view.sync_active(&self.session);
+            self.view.sync_independent(&self.session);
         }
 
         fn set_viewed_room(&mut self, room_id: RoomId) -> bool {

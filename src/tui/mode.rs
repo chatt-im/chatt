@@ -17,7 +17,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::app::App;
+use crate::app::testing::TestApp;
 
 /// The state and command sink available to render-thread mode code.
 ///
@@ -180,7 +180,7 @@ pub(crate) struct ModeStack {
 
 impl ModeStack {
     #[cfg(test)]
-    pub(crate) fn new(mut root: Box<dyn AppMode>, app: &mut App) -> Self {
+    pub(crate) fn new(mut root: Box<dyn AppMode>, app: &mut TestApp) -> Self {
         {
             let mut cx = app.view_cx();
             root.on_enter(&mut cx);
@@ -223,8 +223,42 @@ impl ModeStack {
     }
 
     pub(crate) fn process_terminal_event(&mut self, cx: &mut ViewCx<'_>, event: TerminalEvent) {
-        if let TerminalEvent::Navigation(event) = event {
-            let transition = match event {
+        match event {
+            TerminalEvent::Status(status) => cx.view.set_status(status),
+            TerminalEvent::TransientStatus(status) => cx.view.set_transient_status(status),
+            TerminalEvent::Error(error) => cx.view.set_error(error),
+            TerminalEvent::LocalNotice {
+                sender,
+                body,
+                error,
+            } => cx.view.push_local_notice(
+                sender,
+                body,
+                if error {
+                    crate::chat_buffer::NoticeKind::Error
+                } else {
+                    crate::chat_buffer::NoticeKind::Info
+                },
+            ),
+            TerminalEvent::ConfigChanged => cx.view.sync_daemon_config(cx.config),
+            TerminalEvent::SelectRoom(room_id) => cx.view.switch_room(room_id, cx.session),
+            TerminalEvent::OpenMessageRef {
+                target,
+                width,
+                height,
+            } => {
+                cx.view.switch_room(target.room_id, cx.session);
+                let _ = cx.view.jump_to_ref(target, width, height);
+            }
+            TerminalEvent::ClearVisualSelection => {
+                cx.view.active.chat.clear_visual_anchor();
+            }
+            TerminalEvent::CancelPendingEdit => {
+                cx.view.cancel_pending_edit();
+            }
+            TerminalEvent::ResetRooms => cx.view.reset_rooms(),
+            TerminalEvent::Navigation(event) => {
+                let transition = match event {
                 NavigationEvent::ResetBase(base) => ModeTransition::Set(base.into_mode()),
                 NavigationEvent::OpenScreen(screen) => ModeTransition::Push(screen.into_mode()),
                 NavigationEvent::ReplaceScreen(screen) => {
@@ -238,16 +272,16 @@ impl ModeStack {
                     ModeTransition::Replace(overlay.into_mode(&cx.view.theme))
                 }
                 NavigationEvent::CloseOverlay => ModeTransition::Pop,
-            };
-            self.apply_transition(cx, transition);
-            self.apply_pending_cx(cx);
-            return;
+                };
+                self.apply_transition(cx, transition);
+                self.apply_pending_cx(cx);
+            }
+            event => self.active_mut().process_client_event(event),
         }
-        self.active_mut().process_client_event(event);
     }
 
     #[cfg(test)]
-    pub(crate) fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+    pub(crate) fn process_input(&mut self, app: &mut TestApp, key: KeyEvent) -> Action {
         let action = {
             let mut cx = app.view_cx();
             self.process_input_cx(&mut cx, key)
@@ -271,7 +305,7 @@ impl ModeStack {
     /// Applies every queued transition in request order. A root pop is an
     /// explicit no-op; navigation must use `Set` to replace the root.
     #[cfg(test)]
-    pub(crate) fn apply_pending(&mut self, app: &mut App) {
+    pub(crate) fn apply_pending(&mut self, app: &mut TestApp) {
         {
             let mut cx = app.view_cx();
             self.apply_pending_cx(&mut cx);
@@ -327,7 +361,7 @@ impl ModeStack {
     /// Renders the highest full-screen mode and overlays above it. Covered
     /// full-screen modes retain state without mutating active layout caches.
     #[cfg(test)]
-    pub(crate) fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64) {
+    pub(crate) fn render(&mut self, app: &mut TestApp, buf: &mut Buffer, now_ms: u64) {
         {
             let mut cx = app.view_cx();
             self.render_cx(&mut cx, buf, now_ms, DirtySections::ALL);
@@ -363,7 +397,7 @@ impl ModeStack {
     }
 
     #[cfg(test)]
-    pub(crate) fn overlay_active(&self, app: &mut App) -> bool {
+    pub(crate) fn overlay_active(&self, app: &mut TestApp) -> bool {
         let cx = app.view_cx();
         self.modes
             .last()
@@ -371,7 +405,7 @@ impl ModeStack {
     }
 
     #[cfg(test)]
-    pub(crate) fn top_presentation(&self, app: &mut App) -> ModePresentation {
+    pub(crate) fn top_presentation(&self, app: &mut TestApp) -> ModePresentation {
         let cx = app.view_cx();
         self.modes
             .last()
@@ -381,7 +415,7 @@ impl ModeStack {
 }
 
 impl BaseScreen {
-    fn into_mode(self) -> Box<dyn AppMode> {
+    pub(crate) fn into_mode(self) -> Box<dyn AppMode> {
         use crate::tui::modes::{RoomMode, ServerListMode};
         match self {
             Self::Room => Box::new(RoomMode::default()),
@@ -392,7 +426,7 @@ impl BaseScreen {
 }
 
 impl ScreenSpec {
-    fn into_mode(self) -> Box<dyn AppMode> {
+    pub(crate) fn into_mode(self) -> Box<dyn AppMode> {
         use crate::tui::{
             modes::{RoomSwitchMode, ServerEditMode, SettingsMode},
             room_settings::RoomSettingsMode,
@@ -409,7 +443,7 @@ impl ScreenSpec {
 }
 
 impl OverlaySpec {
-    fn into_mode(self, theme: &crate::theme::Theme) -> Box<dyn AppMode> {
+    pub(crate) fn into_mode(self, theme: &crate::theme::Theme) -> Box<dyn AppMode> {
         use crate::tui::overlay::{
             DeviceLinkMode, DevicePairMode, DialogMode, E2eIdentityMode,
             NativeEncryptionWarningMode, PasswordPromptMode, PasteImageUploadMode,
@@ -513,8 +547,8 @@ mod tests {
         }
     }
 
-    fn app() -> App {
-        App::new(Config::default(), None).expect("test app")
+    fn app() -> TestApp {
+        TestApp::new(Config::default(), None).expect("test app")
     }
 
     #[test]
@@ -538,10 +572,11 @@ mod tests {
             KeyModifiers::empty(),
         ))
         .expect("input key");
+        let (core, view) = app.parts_mut();
         let _ = crate::bindings::resolve(
-            &app.config.bindings.router,
+            &core.config.bindings.router,
             crate::bindings::WORKSPACE_LAYER,
-            &mut app.view.chrome.binding.pending_chord,
+            &mut view.chrome.binding.pending_chord,
             input,
         );
         assert!(app.view.chrome.binding.pending_chord.is_some());

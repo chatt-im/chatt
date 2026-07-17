@@ -41,7 +41,6 @@ pub(crate) struct ClientView {
     /// so noise-reduction gating faint background noise reads as a steady level
     /// instead of flicker. Applied in `prepare_screen`; display-only.
     pub mic_level_ballistics: MicLevelBallistics,
-    pub quit_requested: bool,
     /// When `true`, the lobby shows the detailed developer voice stats instead
     /// of the collapsed per-participant latency estimate. Toggled by `/stats`,
     /// session-only (defaults off each launch).
@@ -115,11 +114,14 @@ impl ClientView {
             theme,
             status: StatusState::new("select a server"),
             chrome: ChromeState::default(),
-            server_catalog: crate::app::ServerCatalog::default(),
+            server_catalog: {
+                let mut catalog = crate::app::ServerCatalog::default();
+                catalog.rebuild(config);
+                catalog
+            },
             mic_muted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deafened: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mic_level_ballistics: MicLevelBallistics::default(),
-            quit_requested: false,
             lobby_details: false,
             rooms_offset: 0,
             participant_scroll: 0,
@@ -163,21 +165,6 @@ impl ClientView {
             self.rooms_offset = index + 1 - visible_rows;
         }
         self.clamp_rooms_offset(room_count, visible_rows);
-    }
-
-    /// Catches the viewed room's buffer up to the shared session, following
-    /// the session's viewed room when a session-side flow (auth, offline
-    /// catalog load) moved it without a view switch. Call before rendering
-    /// and before any cursor-addressed operation.
-    pub(crate) fn sync_active(&mut self, session: &RoomSession) {
-        self.reconcile_session_epoch(session);
-        if session.viewed_room != self.viewed_room
-            && let Some(room_id) = session.viewed_room
-        {
-            self.switch_room(room_id, session);
-            return;
-        }
-        self.sync_buffer(session);
     }
 
     /// Synchronizes an attached client's current room without following the
@@ -729,9 +716,8 @@ impl ClientView {
     pub(crate) fn sync_daemon_config(
         &mut self,
         config: &Config,
-        theme: Theme,
-        server_catalog: &crate::app::ServerCatalog,
     ) {
+        let theme = config.ui.resolve_theme();
         if self.theme != theme {
             self.apply_theme(theme);
         }
@@ -741,9 +727,7 @@ impl ClientView {
         if self.bindings != config.ui.default_bindings {
             self.apply_bindings(config.ui.default_bindings);
         }
-        if self.server_catalog.generation() != server_catalog.generation() {
-            self.server_catalog = server_catalog.clone();
-        }
+        self.server_catalog.rebuild(config);
     }
 
     fn apply_bindings(&mut self, bindings: DefaultBindings) {

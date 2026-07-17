@@ -9,7 +9,7 @@ use rpc::ids::UserId;
 use unicode_width::UnicodeWidthStr;
 
 #[cfg(test)]
-use crate::app::App;
+use crate::app::testing::TestApp;
 
 use crate::{
     app::{
@@ -218,7 +218,7 @@ impl UserListMode {
     }
 
     #[cfg(test)]
-    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+    pub(crate) fn process_action(&mut self, app: &mut TestApp, command: BindCommand) -> Action {
         let action = {
             let mut cx = app.view_cx();
             self.process_action_cx(&mut cx, command)
@@ -491,7 +491,7 @@ impl AppMode for UserListMode {
 
 #[cfg(test)]
 impl UserListMode {
-    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+    fn process_input(&mut self, app: &mut TestApp, key: KeyEvent) -> Action {
         let action = {
             let mut cx = app.view_cx();
             AppMode::process_input(self, &mut cx, key)
@@ -589,8 +589,8 @@ mod tests {
         mode.visible.iter().map(|row| row.name.as_str()).collect()
     }
 
-    fn app() -> App {
-        App::new(Config::default(), None).expect("test app")
+    fn app() -> TestApp {
+        TestApp::new(Config::default(), None).expect("test app")
     }
 
     #[test]

@@ -5,10 +5,13 @@ pub(crate) mod commands;
 pub(crate) mod device_pair;
 pub(crate) mod dialogs;
 pub(crate) mod participants;
+mod pairing;
 pub(crate) mod room;
 pub(crate) mod room_settings;
 pub(crate) mod server;
 mod shared;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use hashbrown::{HashMap, HashSet};
 use std::{
@@ -38,9 +41,8 @@ use crate::{
         BaseScreen, DirtySections, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
     },
     client_net::{
-        NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE, PAIRING_CANCELED,
-        PAIRING_COMMITTING, TerminalVerb, TransferDirection, UploadFileRequest,
-        spawn_device_pair_once, spawn_open_pair_once, spawn_pair_once,
+        NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE, PairingEvent, TerminalVerb,
+        TransferDirection, UploadFileRequest,
     },
     config::{
         self, Config, NotificationSoundMode, ServerEntry, SoundboardClip, ThemeSelection,
@@ -54,12 +56,6 @@ use crate::{
     },
     ui::welcome::WelcomeDraft,
 };
-
-#[cfg(test)]
-use crate::tui::mode::ViewCx;
-
-#[cfg(test)]
-use crate::{bindings::BindCommand, tui::Action};
 
 use crate::audio::{
     self, AudioStartError, BufferRequest, DeviceInfo, EchoCancellationControl, LOOPBACK_STREAM_ID,
@@ -75,7 +71,9 @@ use audio_supervisor::{
     AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, RebuildCause,
 };
 use commands::slash_command_help;
-use shared::{CoreMutex, CoreRw};
+use pairing::{PairingCoordinator, PairingInput, PairingJob};
+pub(crate) use pairing::{PairCompletion, PendingPair};
+use shared::CoreRw;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
@@ -84,8 +82,8 @@ pub(crate) use room::{
 };
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
-    PairCompletion, PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem,
-    alias_from_tcp_addr, default_join_alias, default_join_username,
+    ServerEditDraft, ServerEditEvent, ServerSelectItem, alias_from_tcp_addr, default_join_alias,
+    default_join_username,
     random_open_pair_recovery_token, random_token, server_entry_from_invite, unique_server_alias,
 };
 
@@ -264,9 +262,6 @@ impl StatusState {
         }
     }
 
-    pub(crate) fn expires_at(&self) -> Option<Instant> {
-        self.expires_at
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,7 +291,7 @@ pub(crate) struct ServerCatalog {
 }
 
 impl ServerCatalog {
-    fn rebuild(&mut self, config: &Config) -> bool {
+    pub(crate) fn rebuild(&mut self, config: &Config) -> bool {
         let items = config
             .servers
             .iter()
@@ -320,6 +315,7 @@ impl ServerCatalog {
         &self.items
     }
 
+    #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -352,7 +348,6 @@ impl AudioDeviceCatalog {
 /// its render thread draws from.
 pub(crate) struct ClientHandle {
     pub(crate) channel: Arc<crate::client_channel::ClientChannel>,
-    pub(crate) view: Arc<parking_lot::Mutex<ClientView>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,31 +366,18 @@ struct ConnectionAttempt {
 pub(crate) struct App {
     pub config: CoreRw<Config>,
     events: AppEvents,
-    #[allow(dead_code)] // Used as modes move to ViewCx incrementally.
-    command_queue: Vec<command::CoreCommand>,
-    issuing_client: crate::client_channel::ClientId,
-    primary_channel: Option<Arc<crate::client_channel::ClientChannel>>,
     clients: HashMap<crate::client_channel::ClientId, ClientHandle>,
+    command_client: crate::client_channel::ClientId,
+    quit_requested: bool,
     /// Advances when configuration mirrored into attached terminal views changes.
     daemon_config_generation: u64,
     /// Last generation copied into every currently attached terminal view.
     synced_daemon_config_generation: u64,
-    pairing_owner: Option<crate::client_channel::ClientId>,
+    pairing: PairingCoordinator,
     connection_attempt: Option<ConnectionAttempt>,
     next_connection_generation: u64,
     active_network_generation: Option<u64>,
-    next_pairing_attempt: u64,
-    active_pairing_attempt: Option<u64>,
-    password_prompt_active: bool,
     pub room: CoreRw<RoomSession>,
-    /// The primary terminal's exclusive UI state: composer, scrollback
-    /// buffers, pending edit, clipboard queue. Splits off `room` so attached
-    /// clients can each own one.
-    pub view: CoreMutex<ClientView>,
-    #[cfg(test)]
-    pub(crate) test_navigation: VecDeque<crate::tui::mode::ModeTransition>,
-    #[cfg(test)]
-    test_terminal_events: VecDeque<TerminalEvent>,
     pub network: Option<NetworkClient>,
     pub control_socket: Option<local_control::ControlSocket>,
     pub session_id: Option<SessionId>,
@@ -406,12 +388,6 @@ pub(crate) struct App {
     /// auto-join on (re-)authentication until the next explicit join.
     voice_left: bool,
 
-    pub pending_pair: Option<PendingPair>,
-    pairing_cancellation: Option<Arc<AtomicU8>>,
-    /// A pairing attempt whose username the server rejected as taken. Retained so
-    /// the reopened server-edit form's Save & Join can retry the same pairing
-    /// with the edited username instead of a plain connect.
-    username_retry: Option<PendingPair>,
     pub mic_muted: Arc<AtomicBool>,
     pub deafened: Arc<AtomicBool>,
     pub voice_tx_enabled: Arc<AtomicBool>,
@@ -794,9 +770,9 @@ pub(crate) enum AppEvent {
         generation: u64,
         event: NetworkEvent,
     },
-    PairingFor {
+    Pairing {
         attempt: u64,
-        event: NetworkEvent,
+        event: PairingEvent,
     },
     AudioDeviceRefresh(AudioDeviceRefresh),
     AudioDeviceProbe(AudioDeviceProbeEvent),
@@ -1188,7 +1164,12 @@ pub(crate) struct EventSender(pub(crate) Sender<AppEvent>);
 pub(crate) struct NetworkEventSender {
     tx: Sender<AppEvent>,
     generation: Option<u64>,
-    pairing_attempt: Option<u64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PairingEventSender {
+    tx: Sender<AppEvent>,
+    attempt: u64,
 }
 
 impl EventSender {
@@ -1203,15 +1184,13 @@ impl EventSender {
         NetworkEventSender {
             tx: self.0.clone(),
             generation: Some(generation),
-            pairing_attempt: None,
         }
     }
 
-    fn for_pairing(&self, attempt: u64) -> NetworkEventSender {
-        NetworkEventSender {
+    fn for_pairing(&self, attempt: u64) -> PairingEventSender {
+        PairingEventSender {
             tx: self.0.clone(),
-            generation: None,
-            pairing_attempt: Some(attempt),
+            attempt,
         }
     }
 }
@@ -1222,17 +1201,25 @@ impl NetworkEventSender {
         Self {
             tx,
             generation: None,
-            pairing_attempt: None,
         }
     }
 
     pub(crate) fn send(&self, event: NetworkEvent) -> Result<(), mpsc::SendError<AppEvent>> {
-        match (self.generation, self.pairing_attempt) {
-            (Some(generation), None) => self.tx.send(AppEvent::NetworkFor { generation, event }),
-            (None, Some(attempt)) => self.tx.send(AppEvent::PairingFor { attempt, event }),
-            (None, None) => self.tx.send(AppEvent::Network(event)),
-            (Some(_), Some(_)) => unreachable!("event sender has conflicting scopes"),
+        match self.generation {
+            Some(generation) => self.tx.send(AppEvent::NetworkFor { generation, event }),
+            None => self.tx.send(AppEvent::Network(event)),
         }
+    }
+}
+
+impl PairingEventSender {
+    #[cfg(test)]
+    pub(crate) fn for_test(tx: Sender<AppEvent>, attempt: u64) -> Self {
+        Self { tx, attempt }
+    }
+
+    pub(crate) fn send(&self, event: PairingEvent) -> Result<(), mpsc::SendError<AppEvent>> {
+        self.tx.send(AppEvent::Pairing { attempt: self.attempt, event })
     }
 }
 
@@ -1303,9 +1290,7 @@ impl App {
         #[cfg(test)]
         let control_socket = None;
         let soundboard_enabled = config.soundboard.enabled;
-        let theme = config.ui.resolve_theme();
         let room = RoomSession::new(&config);
-        let view = ClientView::new(&config, theme);
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let output_volume_percent_bits =
             Arc::new(AtomicU32::new(config.audio.output_volume.to_bits()));
@@ -1326,27 +1311,20 @@ impl App {
         } else {
             None
         };
-        let mut app = Self {
+        let mic_muted = Arc::new(AtomicBool::new(false));
+        let deafened = Arc::new(AtomicBool::new(false));
+        let app = Self {
             events,
-            command_queue: Vec::new(),
-            issuing_client: crate::client_channel::ClientId::PRIMARY,
-            primary_channel: None,
             clients: HashMap::new(),
+            command_client: crate::client_channel::ClientId::PRIMARY,
+            quit_requested: false,
             daemon_config_generation: 0,
             synced_daemon_config_generation: 0,
-            pairing_owner: None,
+            pairing: PairingCoordinator::default(),
             connection_attempt: None,
             next_connection_generation: 0,
             active_network_generation: None,
-            next_pairing_attempt: 0,
-            active_pairing_attempt: None,
-            password_prompt_active: false,
             room: CoreRw::new(room),
-            view: CoreMutex::new(view),
-            #[cfg(test)]
-            test_navigation: VecDeque::new(),
-            #[cfg(test)]
-            test_terminal_events: VecDeque::new(),
             network: None,
             control_socket,
             session_id: None,
@@ -1354,11 +1332,8 @@ impl App {
             e2e_account_id: None,
             requested_voice_room: None,
             voice_left: false,
-            pending_pair: None,
-            pairing_cancellation: None,
-            username_retry: None,
-            mic_muted: Arc::new(AtomicBool::new(false)),
-            deafened: Arc::new(AtomicBool::new(false)),
+            mic_muted,
+            deafened,
             voice_tx_enabled: Arc::new(AtomicBool::new(false)),
             mic_error: None,
             playback_error: None,
@@ -1405,13 +1380,6 @@ impl App {
             active_tcp_addr: None,
             config: CoreRw::new(config),
         };
-        // The view reads the shared mute switches; hand it the real handles.
-        app.view.mic_muted = app.mic_muted.clone();
-        app.view.deafened = app.deafened.clone();
-        app.rebuild_server_items();
-        if app.pending_startup_join.is_none() && app.config.servers.is_empty() {
-            app.set_status("no servers configured; run chatt pair <server>");
-        }
         Ok(app)
     }
 
@@ -1428,70 +1396,34 @@ impl App {
         self.pending_after_welcome = pending_join;
         let base = self.base_screen();
         self.send_terminal_event(
-            Audience::Client(self.issuing_client),
+            Audience::Client(self.command_client),
             TerminalEvent::Navigation(NavigationEvent::ResetBase(base)),
         );
-    }
-
-    pub(crate) fn request_quit(&mut self) {
-        self.view.quit_requested = true;
-    }
-
-    /// Builds an in-process view context over disjoint App fields, queueing
-    /// commands into [`Self::drain_core_commands`]'s queue.
-    #[cfg(test)]
-    pub(crate) fn view_cx(&mut self) -> ViewCx<'_> {
-        ViewCx {
-            view: &mut self.view,
-            session: &self.room,
-            config: &self.config,
-            commands: &mut self.command_queue,
-            navigation: &mut self.test_navigation,
-            dirty_hint: DirtySections::ALL,
-            frame_retained: false,
-        }
     }
 
     pub(crate) fn shared_session(&self) -> Arc<parking_lot::RwLock<RoomSession>> {
         self.room.shared()
     }
 
-    pub(crate) fn set_primary_channel(
-        &mut self,
-        channel: Arc<crate::client_channel::ClientChannel>,
-    ) {
-        self.primary_channel = Some(channel);
-        if let Some(pending) = self.pending_startup_join.take() {
-            self.start_pending_join(pending);
-        }
-    }
 
-    /// Builds and registers the view for a newly attached terminal, mirroring
-    /// the primary's theme, catalog, status, and viewed room. Returns the view
-    /// handle the terminal's render thread draws from; [`Self::retire_client`]
-    /// releases it.
-    pub(crate) fn attach_client(
+    pub(crate) fn register_client(
         &mut self,
         client_id: crate::client_channel::ClientId,
         channel: Arc<crate::client_channel::ClientChannel>,
-    ) -> Arc<parking_lot::Mutex<ClientView>> {
-        let mut view = ClientView::new(&self.config, self.view.theme);
+    ) -> ClientView {
+        let mut view = ClientView::new(&self.config, self.config.ui.resolve_theme());
         view.mic_muted = self.mic_muted.clone();
         view.deafened = self.deafened.clone();
-        view.server_catalog = self.view.server_catalog.clone();
-        view.status = self.view.status.clone();
         if let Some(room_id) = self.room.viewed_room {
             view.switch_room(room_id, &self.room);
             self.room.prepare_client_view(client_id, room_id);
         }
-        let view = Arc::new(parking_lot::Mutex::new(view));
-        self.clients.insert(
-            client_id,
-            ClientHandle {
-                channel,
-                view: view.clone(),
-            },
-        );
+        self.clients.insert(client_id, ClientHandle { channel });
+        if client_id == crate::client_channel::ClientId::PRIMARY {
+            if let Some(pending) = self.pending_startup_join.take() {
+                self.start_pending_join(pending);
+            }
+        }
         view
     }
 
@@ -1499,13 +1431,9 @@ impl App {
         &self,
         client_id: crate::client_channel::ClientId,
     ) -> Option<Arc<crate::client_channel::ClientChannel>> {
-        if client_id == crate::client_channel::ClientId::PRIMARY {
-            self.primary_channel.clone()
-        } else {
-            self.clients
-                .get(&client_id)
-                .map(|handle| handle.channel.clone())
-        }
+        self.clients
+            .get(&client_id)
+            .map(|handle| handle.channel.clone())
     }
 
     pub(crate) fn send_terminal_event(&mut self, audience: Audience, event: TerminalEvent) {
@@ -1513,9 +1441,6 @@ impl App {
             Audience::Client(client_id) => {
                 if let Some(channel) = self.channel_for(client_id) {
                     channel.push(event);
-                } else {
-                    #[cfg(test)]
-                    self.test_terminal_events.push_back(event);
                 }
             }
             Audience::All => {
@@ -1529,13 +1454,6 @@ impl App {
     }
 
     fn broadcast_base(&mut self, base: BaseScreen) {
-        let primary = TerminalEvent::Navigation(NavigationEvent::ResetBase(base.clone()));
-        if let Some(channel) = self.primary_channel.clone() {
-            channel.push(primary);
-        } else {
-            #[cfg(test)]
-            self.test_terminal_events.push_back(primary);
-        }
         for handle in self.clients.values() {
             handle
                 .channel
@@ -1545,16 +1463,37 @@ impl App {
         }
     }
 
+    fn broadcast_config_changed(&self) {
+        for handle in self.clients.values() {
+            handle.channel.push(TerminalEvent::ConfigChanged);
+        }
+    }
+
+    fn broadcast_reset_rooms(&self) {
+        for handle in self.clients.values() {
+            handle.channel.push(TerminalEvent::ResetRooms);
+        }
+    }
+
+    fn broadcast_cancel_pending_edit(&self) {
+        for handle in self.clients.values() {
+            handle.channel.push(TerminalEvent::CancelPendingEdit);
+        }
+    }
+
+    fn web_client_view(&self) -> ClientView {
+        let mut view = ClientView::new(&self.config, self.config.ui.resolve_theme());
+        if let Some(room_id) = self.room.viewed_room {
+            view.switch_room(room_id, &self.room);
+        }
+        view
+    }
+
     fn navigate_all(&mut self, base: BaseScreen) {
         self.send_terminal_event(
             Audience::All,
             TerminalEvent::Navigation(NavigationEvent::ResetBase(base)),
         );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_terminal_event(&mut self) -> Option<TerminalEvent> {
-        self.test_terminal_events.pop_front()
     }
 
     fn pop_mutation_owner(
@@ -1575,10 +1514,6 @@ impl App {
         owner
     }
 
-    pub(crate) fn shared_view(&self) -> Arc<parking_lot::Mutex<ClientView>> {
-        self.view.shared()
-    }
-
     pub(crate) fn shared_config(&self) -> Arc<parking_lot::RwLock<Config>> {
         self.config.shared()
     }
@@ -1586,7 +1521,6 @@ impl App {
     /// Opens the shared state to render threads. No core method may run until
     /// [`Self::acquire_core_state`] has reacquired the guards.
     pub(crate) fn release_core_state(&mut self) {
-        self.view.release();
         self.config.release();
         self.room.release();
     }
@@ -1595,24 +1529,6 @@ impl App {
     pub(crate) fn acquire_core_state(&mut self) {
         self.room.acquire();
         self.config.acquire();
-        self.view.acquire();
-    }
-
-    /// Runs every command produced by one UI dispatch. A handler may enqueue
-    /// follow-up work, so keep draining until the queue is empty.
-    #[allow(dead_code)]
-    pub(crate) fn drain_core_commands(&mut self) {
-        while !self.command_queue.is_empty() {
-            let commands = std::mem::take(&mut self.command_queue);
-            for command in commands {
-                self.handle_core_command(command);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_queued_core_command(&mut self) -> Option<command::CoreCommand> {
-        (!self.command_queue.is_empty()).then(|| self.command_queue.remove(0))
     }
 
     #[allow(dead_code)]
@@ -1633,10 +1549,11 @@ impl App {
                 skipped,
             } => {
                 let _ = skipped;
-                if self.delete_chat_messages(room_id, targets)
-                    && self.view.viewed_room == Some(room_id)
-                {
-                    self.view.active.chat.clear_visual_anchor();
+                if self.delete_chat_messages(room_id, targets) {
+                    self.send_terminal_event(
+                        Audience::Client(self.command_client),
+                        TerminalEvent::ClearVisualSelection,
+                    );
                 }
             }
             CoreCommand::SetViewedRoom(room_id) => {
@@ -1650,10 +1567,14 @@ impl App {
                 height,
             } => {
                 if self.set_viewed_room(target.room_id) {
-                    match self.view.jump_to_ref(target, width, height) {
-                        room::RefJump::Jumped => {}
-                        _ => self.set_status("referenced message is not in this room's history"),
-                    }
+                    self.send_terminal_event(
+                        Audience::Client(self.command_client),
+                        TerminalEvent::OpenMessageRef {
+                            target,
+                            width,
+                            height,
+                        },
+                    );
                 } else if let Some(preview) = self.room.cross_room_ref_preview(target) {
                     self.set_status(preview);
                 } else {
@@ -1697,13 +1618,13 @@ impl App {
                 self.cancel_native_encryption_warning(generation)
             }
             CoreCommand::CloseE2eIdentity => {
-                self.open_e2e_reviews.remove(&self.issuing_client);
+                self.open_e2e_reviews.remove(&self.command_client);
                 self.navigate_owner(NavigationEvent::CloseOverlay);
             }
             CoreCommand::ForgetE2eIdentity(identity) => self.forget_e2e_identity(identity),
             CoreCommand::ConfirmE2eIdentity(target) => self.confirm_e2e_verification(target),
             CoreCommand::Connect { alias } => {
-                self.start_connection(&alias, self.issuing_client);
+                self.start_connection(&alias, self.command_client);
             }
             CoreCommand::DeleteServer { label } => self.delete_server(&label),
             CoreCommand::SaveServerEdit {
@@ -1767,20 +1688,19 @@ impl App {
                 );
             }
             CoreCommand::CancelPairing => self.cancel_open_pairing(),
-            CoreCommand::ClosePairing => {
-                self.password_prompt_active = false;
-                self.pairing_owner = None;
-            }
+            CoreCommand::ClosePairing => self.apply_pairing_input(PairingInput::OwnerClosed {
+                owner: self.command_client,
+            }),
             CoreCommand::AudioManualReset => self.audio_manual_reset(),
             CoreCommand::ReportBug(description) => self.start_bug_report(description),
-            CoreCommand::Quit => self.request_quit(),
+            CoreCommand::Quit => self.quit_requested = true,
         }
     }
 
     fn handle_settings_op(&mut self, operation: command::SettingsOp) {
         use command::SettingsOp;
 
-        if self.room.settings_owner != Some(self.issuing_client) {
+        if self.room.settings_owner != Some(self.command_client) {
             self.set_error("settings session is no longer owned by this client");
             return;
         }
@@ -1844,8 +1764,8 @@ impl App {
     }
 
     pub(crate) fn take_quit_requested(&mut self) -> bool {
-        let requested = self.view.quit_requested;
-        self.view.quit_requested = false;
+        let requested = self.quit_requested;
+        self.quit_requested = false;
         requested
     }
 
@@ -1860,7 +1780,6 @@ impl App {
         let theme = self.config.ui.resolve_theme();
         let daemon_config_changed =
             previous_bindings != self.config.ui.default_bindings || previous_theme != theme;
-        self.view.apply_theme(theme);
         if daemon_config_changed {
             self.mark_daemon_config_changed();
         }
@@ -1915,89 +1834,20 @@ impl App {
         client_id: crate::client_channel::ClientId,
         command: command::CoreCommand,
     ) -> bool {
-        self.run_as_client(client_id, |app| {
-            app.handle_core_command(command);
-            app.drain_core_commands();
-        })
-    }
-
-    /// Runs `f` with `client_id` as the issuing client and, for an attached
-    /// terminal, that terminal's view swapped into `self.view`. The dispatch
-    /// executes with the issuing terminal's entire view, never a hand-picked
-    /// subset of fields, so core handlers cannot accidentally mutate the
-    /// primary terminal's selection, editor, status, navigation, or room
-    /// buffers. Commands from unknown terminals are dropped. Returns whether
-    /// the terminal requested detach.
-    fn run_as_client(
-        &mut self,
-        client_id: crate::client_channel::ClientId,
-        f: impl FnOnce(&mut Self),
-    ) -> bool {
-        let previous = std::mem::replace(&mut self.issuing_client, client_id);
-        if client_id == crate::client_channel::ClientId::PRIMARY {
-            f(self);
-            self.issuing_client = previous;
+        if !self.clients.contains_key(&client_id) {
             return false;
         }
-        debug_assert_eq!(
-            previous,
-            crate::client_channel::ClientId::PRIMARY,
-            "client dispatch does not nest"
-        );
-        let Some(handle) = self.clients.get(&client_id) else {
-            self.issuing_client = previous;
-            return false;
-        };
-        let mut view = handle.view.lock_arc();
-        std::mem::swap(&mut *self.view, &mut *view);
-        f(self);
-        self.issuing_client = previous;
-        let detach = std::mem::take(&mut self.view.quit_requested);
-        std::mem::swap(&mut *self.view, &mut *view);
-        detach
-    }
-
-    /// Runs `f` as the terminal that initiated the in-flight pairing, so
-    /// completion UI (editor, statuses, prompt close) lands on the head that
-    /// asked for it. Falls back to the primary when no owner is recorded.
-    /// A recorded owner is always a live handle: [`Self::retire_client`]
-    /// clears `pairing_owner` in the same core context that removes the
-    /// handle, so `run_as_client` never drops the completion.
-    fn run_as_pairing_owner(&mut self, f: impl FnOnce(&mut Self)) {
-        let owner = self
-            .pairing_owner
-            .unwrap_or(crate::client_channel::ClientId::PRIMARY);
-        self.run_as_client(owner, f);
-        // A completion under a remote swap rebuilds only the owner's server
-        // catalog; refresh the primary's too, since the tick propagates the
-        // primary's catalog to every remote view.
-        if owner != crate::client_channel::ClientId::PRIMARY {
-            self.rebuild_server_items();
-        }
-    }
-
-    /// Mutates the view belonging to `client_id`: the issuing terminal's
-    /// (`self.view`, which [`Self::run_as_client`] may have swapped) or a
-    /// registered remote handle. Returns false when the terminal is gone.
-    fn with_client_view(
-        &mut self,
-        client_id: crate::client_channel::ClientId,
-        f: impl FnOnce(&mut ClientView),
-    ) -> bool {
-        if client_id == self.issuing_client {
-            f(&mut self.view);
+        if matches!(command, command::CoreCommand::Quit) {
+            if client_id == crate::client_channel::ClientId::PRIMARY {
+                self.quit_requested = true;
+                return false;
+            }
             return true;
         }
-        debug_assert_ne!(
-            client_id,
-            crate::client_channel::ClientId::PRIMARY,
-            "primary view is unreachable while a remote view is swapped in"
-        );
-        let Some(handle) = self.clients.get(&client_id) else {
-            return false;
-        };
-        f(&mut handle.view.lock());
-        true
+        let previous = std::mem::replace(&mut self.command_client, client_id);
+        self.handle_core_command(command);
+        self.command_client = previous;
+        false
     }
 
     pub(crate) fn handle_app_event(&mut self, event: AppEvent) {
@@ -2013,17 +1863,9 @@ impl App {
                     kvlog::debug!("ignored stale network event", generation);
                 }
             }
-            AppEvent::PairingFor { attempt, event } => {
-                if self.active_pairing_attempt == Some(attempt) {
-                    let terminal = pairing_worker_event(&event);
-                    self.handle_network_event(event);
-                    if terminal && self.active_pairing_attempt == Some(attempt) {
-                        self.active_pairing_attempt = None;
-                    }
-                } else {
-                    kvlog::debug!("ignored stale pairing event", attempt);
-                }
-            }
+            AppEvent::Pairing { attempt, event } => self.apply_pairing_input(
+                PairingInput::Worker { attempt, event },
+            ),
             AppEvent::AudioDeviceRefresh(refresh) => self.handle_audio_device_refresh(refresh),
             AppEvent::AudioDeviceProbe(probe) => self.handle_audio_device_probe(probe.result),
             AppEvent::Soundboard(event) => self.handle_soundboard_event(event),
@@ -2121,11 +1963,10 @@ impl App {
                 return;
             }
         };
+        let previous_theme = self.config.ui.resolve_theme();
         self.config.ui.theme = reloaded.ui.theme;
         self.config.ui.themes = reloaded.ui.themes;
-        let theme = self.config.ui.resolve_theme();
-        if self.view.theme != theme {
-            self.view.apply_theme(theme);
+        if self.config.ui.resolve_theme() != previous_theme {
             self.mark_daemon_config_changed();
         }
         let _ = reply.send(Ok("theme reloaded".to_string()));
@@ -2400,7 +2241,8 @@ impl App {
                 body,
             } => {
                 let target = MessageId(target);
-                match self.view.validate_web_edit(&self.room, target) {
+                let client_view = self.web_client_view();
+                match client_view.validate_web_edit(&self.room, target) {
                     Ok(room_id) if !body.trim().is_empty() => {
                         if self.network.is_none() && !self.room.network_disconnected {
                             let message = "select a server before editing messages";
@@ -2459,7 +2301,8 @@ impl App {
                 target,
             } => {
                 let target = MessageId(target);
-                match self.view.validate_web_delete(&self.room, target) {
+                let client_view = self.web_client_view();
+                match client_view.validate_web_delete(&self.room, target) {
                     Ok(room_id) => {
                         if self.network.is_none() {
                             let message = "select a server before deleting messages";
@@ -2754,14 +2597,7 @@ impl App {
     }
 
     fn rebuild_server_items(&mut self) {
-        if self.view.server_catalog.rebuild(&self.config) {
-            self.mark_daemon_config_changed();
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn server_items(&self) -> &[ServerSelectItem] {
-        self.view.server_catalog.items()
+        self.mark_daemon_config_changed();
     }
 
     pub(crate) fn open_server_select(&mut self) {
@@ -2774,16 +2610,6 @@ impl App {
         } else {
             self.set_status("select a server");
         }
-    }
-
-    pub(crate) fn replace_with_server_edit(&mut self, label: &str) {
-        let Some((server_label, draft)) = self.server_edit_draft(label) else {
-            return;
-        };
-        self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(
-            draft,
-        )));
-        self.set_status(format!("editing server {server_label}"));
     }
 
     /// Opens the server-edit form for `label` with the cursor on `field`, used to
@@ -2800,17 +2626,7 @@ impl App {
         self.set_status(format!("editing server {}", server.label));
     }
 
-    fn server_edit_draft(&mut self, label: &str) -> Option<(String, ServerEditDraft)> {
-        let Ok(server) = self.config.server(label).cloned() else {
-            self.set_error(format!("server {label} is not configured"));
-            return None;
-        };
-        let draft = ServerEditDraft::from_server(&server, &self.config);
-        Some((server.label, draft))
-    }
-
     pub(crate) fn start_network(&mut self, alias: &str) -> bool {
-        self.username_retry = None;
         let server = match self.config.server(alias) {
             Ok(server) => server.clone(),
             Err(error) => {
@@ -2823,7 +2639,7 @@ impl App {
             .connection_attempt
             .as_ref()
             .filter(|attempt| attempt.server_label == alias)
-            .map_or(self.issuing_client, |attempt| attempt.owner);
+            .map_or(self.command_client, |attempt| attempt.owner);
         let generation = self.begin_connection_attempt(alias, owner);
         let network = match NetworkClient::spawn(
             server.client_config(&self.config, self.download_store.clone()),
@@ -2840,7 +2656,7 @@ impl App {
             self.room
                 .connect_to_server(server.label.clone(), storage, server.effective_username());
         if continuity == room::ServerContinuity::NewServer {
-            self.view.reset_rooms();
+            self.broadcast_reset_rooms();
             let catalog_dir = self.room.history_storage().catalog_dir();
             if catalog_dir.is_some() {
                 let catalog = crate::room_catalog::load(catalog_dir);
@@ -2849,9 +2665,10 @@ impl App {
         }
         if let Some(feed) = &self.web_feed {
             let view = self.room.viewed_history();
+            let client_view = self.web_client_view();
             feed.set_room(
                 self.room.room_name.clone(),
-                web_room_messages(&view, &self.room, &self.view, self.user_id),
+                web_room_messages(&view, &self.room, &client_view, self.user_id),
             );
         }
         self.active_tcp_addr = Some(
@@ -2992,7 +2809,7 @@ impl App {
         self.pending_dm_clients.clear();
         self.pending_identity_review.clear();
         self.open_e2e_reviews.clear();
-        self.view.cancel_pending_edit();
+        self.broadcast_cancel_pending_edit();
         self.room.clear_e2e_trust_states();
         self.room.reset_for_disconnect();
     }
@@ -3008,14 +2825,12 @@ impl App {
     }
 
     fn sync_web_room_feed(&mut self) {
-        // The web feed mirrors the primary view's buffer, so catch it up
-        // before exporting.
-        self.view.sync_active(&self.room);
         if let Some(feed) = &self.web_feed {
             let view = self.room.viewed_history();
+            let client_view = self.web_client_view();
             feed.set_room(
                 self.room.room_name.clone(),
-                web_room_messages(&view, &self.room, &self.view, self.user_id),
+                web_room_messages(&view, &self.room, &client_view, self.user_id),
             );
         }
     }
@@ -3052,28 +2867,32 @@ impl App {
         feed.set_e2e_security(level, message);
     }
 
-    /// Switches the issuing terminal's viewed room. For the primary this moves
-    /// the shared `session.viewed_room` projection (web feed, upload target,
-    /// persisted catalog); for an attached terminal it only points that
-    /// terminal's view, which [`Self::run_as_client`] has swapped into
-    /// `self.view`. Returns false when the room is unknown.
+    /// Switches the issuing terminal's viewed room. The primary also moves the
+    /// shared web/upload projection; attached terminals keep independent room
+    /// selection in the shared session catalog.
     pub(crate) fn set_viewed_room(&mut self, room_id: RoomId) -> bool {
-        if self.issuing_client != crate::client_channel::ClientId::PRIMARY {
+        if self.command_client != crate::client_channel::ClientId::PRIMARY {
             return self.set_attached_viewed_room(room_id);
         }
         if !self.room.set_viewed_room(room_id) {
             return false;
         }
-        self.view.switch_room(room_id, &self.room);
+        self.send_terminal_event(
+            Audience::Client(self.command_client),
+            TerminalEvent::SelectRoom(room_id),
+        );
         self.after_view_switch();
         true
     }
 
     fn set_attached_viewed_room(&mut self, room_id: RoomId) -> bool {
-        if !self.room.prepare_client_view(self.issuing_client, room_id) {
+        if !self.room.prepare_client_view(self.command_client, room_id) {
             return false;
         }
-        self.view.switch_room(room_id, &self.room);
+        self.send_terminal_event(
+            Audience::Client(self.command_client),
+            TerminalEvent::SelectRoom(room_id),
+        );
         self.room.ensure_e2e_security_notice(room_id);
         if self.room.begin_history_fetch(room_id)
             && !self.send_network_command(
@@ -3094,17 +2913,6 @@ impl App {
         };
         self.set_status(status);
         true
-    }
-
-    #[allow(dead_code)] // Removed after all modes dispatch through ViewCx.
-    pub(crate) fn request_older_history_if_at_top(&mut self, width: u16, height: u16) {
-        if !self.view.active.chat.is_at_top(width, height) {
-            return;
-        }
-        let Some(room_id) = self.view.viewed_room else {
-            return;
-        };
-        self.request_older_history(room_id);
     }
 
     fn request_older_history(&mut self, room_id: RoomId) {
@@ -3229,7 +3037,7 @@ impl App {
     }
 
     fn after_view_switch(&mut self) {
-        if let Some(room_id) = self.view.viewed_room {
+        if let Some(room_id) = self.room.viewed_room {
             self.room.ensure_e2e_security_notice(room_id);
         }
         self.sync_viewed_room_to_feeds();
@@ -3296,7 +3104,7 @@ impl App {
         self.pending_mutation_clients
             .entry((room_id, target, false))
             .or_default()
-            .push_back(self.issuing_client);
+            .push_back(self.command_client);
         self.send_network_command(
             NetworkCommand::EditChat {
                 room_id,
@@ -3337,27 +3145,14 @@ impl App {
     }
 
     fn start_device_pairing_prompt(&mut self, ticket: Option<DeviceLinkTicket>) {
-        if self.active_pairing_attempt.is_some() {
-            self.set_status("a pairing attempt is already in progress; wait for it to finish");
-            return;
-        }
-        self.pairing_owner = Some(self.issuing_client);
-        self.password_prompt_active = true;
         let pairing_string = ticket
             .as_ref()
             .and_then(|ticket| rpc::control::encode_device_link_ticket(ticket).ok())
             .unwrap_or_default();
-        self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::DevicePair(
-            device_pair::DevicePairDialog::new(pairing_string, self.config.ui.default_bindings),
-        )));
-        self.set_status("enter the one-time device link details");
-    }
-
-    fn begin_pairing_attempt(&mut self) -> NetworkEventSender {
-        self.next_pairing_attempt = self.next_pairing_attempt.wrapping_add(1).max(1);
-        let attempt = self.next_pairing_attempt;
-        self.active_pairing_attempt = Some(attempt);
-        self.events.sender().for_pairing(attempt)
+        self.apply_pairing_input(PairingInput::StartDevicePrompt {
+            owner: self.command_client,
+            pairing_string,
+        });
     }
 
     fn submit_device_pairing(
@@ -3367,10 +3162,6 @@ impl App {
         device_name: String,
         overwrite_existing: bool,
     ) {
-        if self.active_pairing_attempt.is_some() {
-            self.set_status("a pairing attempt is already in progress");
-            return;
-        }
         let result = (|| -> Result<(), String> {
             let ticket = rpc::control::decode_device_link_ticket(pairing_string.trim())?;
             let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&ticket.tcp_addr));
@@ -3386,28 +3177,30 @@ impl App {
             };
             let client_config = server.client_config(&self.config, self.download_store.clone());
             let cancellation = Arc::new(AtomicU8::new(PAIRING_CANCELABLE));
-            spawn_device_pair_once(
-                client_config,
-                ticket,
-                transfer_password,
-                device_name,
-                overwrite_existing,
-                cancellation.clone(),
-                self.begin_pairing_attempt(),
-            );
-            self.pairing_cancellation = Some(cancellation);
-            self.pending_pair = Some(PendingPair {
+            let pending = PendingPair {
                 server,
                 open: None,
                 open_password: String::new(),
                 pairing_code: None,
                 completion: PairCompletion::OpenEditor,
+            };
+            self.apply_pairing_input(PairingInput::Start {
+                owner: self.command_client,
+                pending,
+                job: PairingJob::Device {
+                    config: client_config,
+                    ticket,
+                    transfer_password,
+                    device_name,
+                    overwrite_existing,
+                },
+                cancellation: Some(cancellation),
+                persist_first: false,
             });
-            self.set_status(format!("pairing device with {alias}"));
             Ok(())
         })();
         if let Err(error) = result {
-            if let Some(channel) = self.pairing_owner.and_then(|owner| self.channel_for(owner)) {
+            if let Some(channel) = self.channel_for(self.command_client) {
                 channel.push(TerminalEvent::PairingFailed(error.clone()));
             }
             self.set_error(error);
@@ -3415,8 +3208,6 @@ impl App {
     }
 
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
-        self.username_retry = None;
-        self.pairing_owner = Some(self.issuing_client);
         let alias = unique_server_alias(&self.config, &default_join_alias(&ticket));
         let username = default_join_username();
         let token = match random_token() {
@@ -3438,32 +3229,34 @@ impl App {
             return;
         }
         let pairing_code = ticket.pairing_code.clone();
-        spawn_pair_once(
-            server.client_config(&self.config, self.download_store.clone()),
-            ticket.pairing_code,
-            self.begin_pairing_attempt(),
-        );
-        self.pending_pair = Some(PendingPair {
+        let config = server.client_config(&self.config, self.download_store.clone());
+        let pending = PendingPair {
             server,
             open: None,
             open_password: String::new(),
             pairing_code: Some(pairing_code),
             completion: PairCompletion::OpenEditor,
+        };
+        self.apply_pairing_input(PairingInput::Start {
+            owner: self.command_client,
+            pending,
+            job: PairingJob::Invite {
+                config,
+                pairing_code: ticket.pairing_code,
+            },
+            cancellation: None,
+            persist_first: false,
         });
-        self.set_status(format!("pairing {alias}"));
     }
 
     /// Begins self-service pairing against a bare `host:port` address. The
     /// server's public key is trusted on first use, the token is server-issued,
     /// and the server prompts for a password only when it requires one.
     pub(crate) fn start_open_pairing(&mut self, addr: String) {
-        self.username_retry = None;
-        self.pairing_owner = Some(self.issuing_client);
         let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&addr));
         let recovery_token = match random_open_pair_recovery_token() {
             Ok(token) => token,
             Err(error) => {
-                self.pairing_owner = None;
                 self.set_error(error);
                 return;
             }
@@ -3478,25 +3271,26 @@ impl App {
             server_public_key: String::new(),
             ..ServerEntry::default()
         };
-        if let Err(error) = self.persist_provisional_open_pair(&server) {
-            self.pairing_owner = None;
-            self.set_error(error);
-            return;
-        }
-        spawn_open_pair_once(
-            server.client_config(&self.config, self.download_store.clone()),
-            String::new(),
-            recovery_token.clone(),
-            self.begin_pairing_attempt(),
-        );
-        self.pending_pair = Some(PendingPair {
+        let client_config = server.client_config(&self.config, self.download_store.clone());
+        let pending = PendingPair {
             server,
             open: Some(recovery_token),
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
+        };
+        let existing_token = pending.open.clone().unwrap_or_default();
+        self.apply_pairing_input(PairingInput::Start {
+            owner: self.command_client,
+            pending,
+            job: PairingJob::Open {
+                config: client_config,
+                password: String::new(),
+                existing_token,
+            },
+            cancellation: None,
+            persist_first: true,
         });
-        self.set_status(format!("pairing {alias}"));
     }
 
     /// Resolves and acts on a `chatt join` specifier: connect directly, open the
@@ -3504,7 +3298,7 @@ impl App {
     fn start_named_join(&mut self, specifier: String) {
         match self.resolve_join(&specifier) {
             JoinResolution::Connect(label) => {
-                self.start_connection(&label, self.issuing_client);
+                self.start_connection(&label, self.command_client);
             }
             JoinResolution::Filter => {
                 self.open_filtered_server_select(&specifier);
@@ -3547,24 +3341,32 @@ impl App {
         server: ServerEntry,
         owner: crate::client_channel::ClientId,
     ) {
-        self.username_retry = None;
-        self.pairing_owner = Some(owner);
         let recovery_token = server.token.clone();
         let alias = server.label.clone();
-        spawn_open_pair_once(
-            server.client_config(&self.config, self.download_store.clone()),
-            String::new(),
-            recovery_token.clone(),
-            self.begin_pairing_attempt(),
-        );
-        self.pending_pair = Some(PendingPair {
+        let config = server.client_config(&self.config, self.download_store.clone());
+        let pending = PendingPair {
             server,
             open: Some(recovery_token),
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
+        };
+        let existing_token = pending.open.clone().unwrap_or_default();
+        self.apply_pairing_input(PairingInput::Start {
+            owner,
+            pending,
+            job: PairingJob::Open {
+                config,
+                password: String::new(),
+                existing_token,
+            },
+            cancellation: None,
+            persist_first: false,
         });
-        self.set_status(format!("resuming pairing {alias}"));
+        self.send_terminal_event(
+            Audience::Client(owner),
+            TerminalEvent::Status(format!("resuming pairing {alias}")),
+        );
     }
 
     /// Decides what a `chatt join` specifier means against the configured servers.
@@ -3611,159 +3413,38 @@ impl App {
     /// Re-runs the open-pairing worker with a user-entered password, preserving
     /// the pending server and its existing token.
     pub(crate) fn submit_open_pair_password(&mut self, password: String) {
-        let (password, existing_token, alias, client_config) = {
-            let Some(pending) = self.pending_pair.as_mut() else {
-                return;
-            };
-            let Some((password, existing_token)) = pending.open_pair_credentials(Some(password))
-            else {
-                return;
-            };
-            (
-                password,
-                existing_token,
-                pending.server.label.clone(),
-                pending
-                    .server
-                    .client_config(&self.config, self.download_store.clone()),
-            )
+        let Some(server) = self
+            .pairing
+            .pending_server_for(self.command_client)
+            .cloned()
+        else {
+            return;
         };
-        spawn_open_pair_once(
-            client_config,
+        let config = server.client_config(&self.config, self.download_store.clone());
+        self.apply_pairing_input(PairingInput::Password {
+            owner: self.command_client,
             password,
-            existing_token,
-            self.begin_pairing_attempt(),
-        );
-        self.set_status(format!("pairing {alias}"));
-    }
-
-    /// Pins or verifies the trusted server key carried by an open-pairing
-    /// password challenge. The prompt owns the visible retry/error text; this
-    /// only mutates durable pairing state.
-    pub(crate) fn accept_open_pairing_password_challenge(
-        &mut self,
-        server_public_key: String,
-    ) -> Result<(), String> {
-        let Some(pair) = self.pending_pair.as_mut() else {
-            return Err("pairing password prompt is no longer active".to_string());
-        };
-        if pair.server.server_public_key.is_empty() {
-            pair.server.server_public_key = server_public_key;
-            let provisional = pair
-                .server
-                .token
-                .starts_with(OPEN_PAIR_RECOVERY_PREFIX)
-                .then(|| pair.server.clone());
-            if let Some(server) = provisional {
-                self.persist_provisional_open_pair(&server)?;
-            }
-            return Ok(());
-        }
-        if pair.server.server_public_key != server_public_key {
-            self.pending_pair.take();
-            return Err("pairing failed: server key changed during password retry".to_string());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn complete_open_pairing(
-        &mut self,
-        token: String,
-        server_public_key: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
-    ) {
-        self.complete_open_pairing_inner(token, server_public_key, udp_addr, udp_probe_addr, false);
-    }
-
-    pub(crate) fn complete_open_pairing_from_password_prompt(
-        &mut self,
-        token: String,
-        server_public_key: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
-    ) {
-        self.complete_open_pairing_inner(token, server_public_key, udp_addr, udp_probe_addr, true);
-    }
-
-    fn complete_open_pairing_inner(
-        &mut self,
-        token: String,
-        server_public_key: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
-        close_prompt_if_idle: bool,
-    ) {
-        let Some(mut pair) = self.pending_pair.take() else {
-            self.set_status("pairing succeeded");
-            if close_prompt_if_idle {
-                self.navigate_owner(NavigationEvent::CloseOverlay);
-            }
-            return;
-        };
-        pair.server.token = token;
-        pair.server.server_public_key = server_public_key;
-        pair.server.udp_addr = udp_addr;
-        pair.server.udp_probe_addr = udp_probe_addr;
-        if let Err(error) = validate_server_entry(&pair.server) {
-            self.set_error(error);
-            if close_prompt_if_idle {
-                self.navigate_owner(NavigationEvent::CloseOverlay);
-            }
-            return;
-        }
-        let close_after_reconnect =
-            close_prompt_if_idle && matches!(pair.completion, PairCompletion::Reconnect { .. });
-        self.complete_pairing(pair.server, pair.completion);
-        if close_after_reconnect {
-            self.navigate_owner(NavigationEvent::CloseOverlay);
-        }
+            config,
+        });
     }
 
     /// Cancels an in-progress open pairing when the user dismisses the password
     /// prompt.
     pub(crate) fn cancel_open_pairing(&mut self) {
-        if let Some(cancellation) = self.pairing_cancellation.as_ref() {
-            match cancellation.compare_exchange(
-                PAIRING_CANCELABLE,
-                PAIRING_CANCELED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {}
-                Err(PAIRING_COMMITTING) => {
-                    self.set_status("pairing is committing and can no longer be canceled");
-                    return;
-                }
-                Err(_) => {}
-            }
-        }
-        self.active_pairing_attempt = None;
-        self.pairing_cancellation = None;
-        self.password_prompt_active = false;
-        self.pairing_owner = None;
-        self.navigate_owner(NavigationEvent::CloseOverlay);
-        if let Some(pending) = self.pending_pair.take() {
-            self.discard_provisional_open_pair(&pending);
-        }
-        self.room.join_notice = None;
-        self.set_status("pairing canceled");
+        self.apply_pairing_input(PairingInput::Cancel {
+            owner: self.command_client,
+        });
     }
 
     fn cancel_server_edit(&mut self) {
-        if self.username_retry.is_none() || self.pairing_owner != Some(self.issuing_client) {
-            return;
-        }
-        self.password_prompt_active = false;
-        self.pairing_owner = None;
-        if let Some(pending) = self.username_retry.take() {
-            self.discard_provisional_open_pair(&pending);
-        }
+        self.apply_pairing_input(PairingInput::OwnerClosed {
+            owner: self.command_client,
+        });
     }
 
-    fn discard_provisional_open_pair(&mut self, pending: &PendingPair) {
+    fn discard_provisional_open_pair(&mut self, pending: &PendingPair) -> Result<(), String> {
         if !pending.server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX) {
-            return;
+            return Ok(());
         }
         let previous = self.config.servers.clone();
         self.config
@@ -3773,13 +3454,16 @@ impl App {
             && let Err(error) = self.config.save_runtime()
         {
             self.config.servers = previous;
-            self.set_error(error);
-            return;
+            return Err(error);
         }
         self.rebuild_server_items();
+        Ok(())
     }
 
     fn start_stale_token_repair(&mut self, reason: &str) -> bool {
+        if self.pairing.is_busy() {
+            return false;
+        }
         let Some(label) = self.room.active_server_label.clone() else {
             return false;
         };
@@ -3797,108 +3481,46 @@ impl App {
         let client_config = server.client_config(&self.config, self.download_store.clone());
         self.disconnect_network();
         self.push_network_notice("auth", reason);
-        spawn_open_pair_once(
-            client_config,
-            String::new(),
-            existing_token.clone(),
-            self.begin_pairing_attempt(),
-        );
-        self.pending_pair = Some(PendingPair {
+        let pending = PendingPair {
             server,
             open: Some(existing_token),
             open_password: String::new(),
             pairing_code: None,
-            completion: PairCompletion::Reconnect {
-                label: label.clone(),
+            completion: PairCompletion::Reconnect,
+        };
+        let token = pending.open.clone().unwrap_or_default();
+        self.apply_pairing_input(PairingInput::Start {
+            owner: self.command_client,
+            pending,
+            job: PairingJob::Open {
+                config: client_config,
+                password: String::new(),
+                existing_token: token,
             },
+            cancellation: None,
+            persist_first: false,
         });
         self.set_status(format!("refreshing {label}"));
         true
     }
 
-    /// Persists a freshly paired server and applies the caller's post-save action.
-    /// Reopens the server-edit form for a pairing the server rejected because the
-    /// username was taken, with the cursor on the Username field. The pairing
-    /// context is retained so Save & Join retries the same pairing.
-    fn begin_username_retry(&mut self, pending: PendingPair) {
-        self.password_prompt_active = false;
-        let draft = ServerEditDraft::from_server_focused(&pending.server, &self.config, "Username");
-        self.username_retry = Some(pending);
-        self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(
-            draft,
-        )));
-        self.set_error("username already in use; choose another");
-    }
-
     /// Re-runs a pairing attempt whose username was rejected, using the username
     /// (and any other fields) the user edited in the reopened form.
-    fn retry_username_pairing(&mut self, mut pending: PendingPair, server: ServerEntry) -> bool {
-        self.pairing_owner = Some(self.issuing_client);
-        if server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX)
-            && let Err(error) = self.persist_provisional_open_pair(&server)
-        {
-            self.username_retry = Some(pending);
-            self.set_error(error);
-            return false;
-        }
+    fn retry_username_pairing(&mut self, server: ServerEntry) -> bool {
         let client_config = server.client_config(&self.config, self.download_store.clone());
-        let events = self.begin_pairing_attempt();
-        let pairing_code = pending.pairing_code.clone();
-        let _ = match pairing_code {
-            Some(code) => spawn_pair_once(client_config, code, events),
-            None => {
-                let Some((password, existing_token)) = pending.open_pair_credentials(None) else {
-                    self.set_error("pairing retry context is incomplete");
-                    return false;
-                };
-                spawn_open_pair_once(client_config, password, existing_token, events)
-            }
-        };
-        let alias = server.label.clone();
-        pending.server = server;
-        self.pending_pair = Some(pending);
-        self.navigate_all(BaseScreen::Servers { query: None });
-        self.set_status(format!("pairing {alias}"));
+        self.apply_pairing_input(PairingInput::RetryUsername {
+            owner: self.command_client,
+            server,
+            config: client_config,
+        });
         true
     }
 
-    fn complete_pairing(&mut self, server: ServerEntry, completion: PairCompletion) {
-        let alias = server.label.clone();
-        self.config.upsert_server(server);
-        match self.config.save_runtime() {
-            Ok(path) => {
-                self.config.config_path = Some(path.clone());
-                self.rebuild_server_items();
-                match completion {
-                    PairCompletion::OpenEditor => {
-                        self.replace_with_server_edit(&alias);
-                        self.set_status(format!(
-                            "paired {alias}; config saved to {}",
-                            path.display()
-                        ));
-                    }
-                    PairCompletion::Reconnect { label } => {
-                        self.set_status(format!(
-                            "refreshed {label}; config saved to {}",
-                            path.display()
-                        ));
-                        if !self.start_network(&label) {
-                            self.open_server_select();
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                self.rebuild_server_items();
-                if matches!(completion, PairCompletion::OpenEditor) {
-                    self.replace_with_server_edit(&alias);
-                } else {
-                    self.open_server_select();
-                }
-                self.set_error(error);
-            }
-        }
+    fn apply_pairing_input(&mut self, input: PairingInput) {
+        let pairing = std::mem::take(&mut self.pairing);
+        self.pairing = pairing.handle(self, input);
     }
+
 
     fn handle_soundboard_event(&mut self, event: SoundboardEvent) {
         match event.result {
@@ -4120,13 +3742,18 @@ impl App {
                 );
                 let owner =
                     self.pop_mutation_owner(room_id, target, kind == ChatMutationKind::Delete);
-                if let Some(owner) = owner
-                    && !self.with_client_view(owner, |view| view.set_error(message.clone()))
-                {
-                    kvlog::warn!(
-                        "mutation rejection owner is no longer connected",
-                        client_id = owner.0
-                    );
+                if let Some(owner) = owner {
+                    if self.channel_for(owner).is_some() {
+                        self.send_terminal_event(
+                            Audience::Client(owner),
+                            TerminalEvent::Error(message.clone()),
+                        );
+                    } else {
+                        kvlog::warn!(
+                            "mutation rejection owner is no longer connected",
+                            client_id = owner.0
+                        );
+                    }
                 }
                 if let Some(feed) = &self.web_feed {
                     let operation = match kind {
@@ -4176,9 +3803,10 @@ impl App {
                     if viewed && let Some(feed) = &self.web_feed {
                         match update.outcome {
                             MutationOutcome::AppliedEdit(folded) => {
+                                let client_view = self.web_client_view();
                                 feed.send(crate::web_server::WebMessage::from_chat(
                                     &folded,
-                                    &|target| self.view.web_ref_for(&self.room, target),
+                                    &|target| client_view.web_ref_for(&self.room, target),
                                     self.user_id,
                                     self.room.message_unverified(
                                         folded.room_id,
@@ -4214,12 +3842,10 @@ impl App {
                 if let Some(message) = feed_message
                     && let Some(feed) = &self.web_feed
                 {
-                    // Web refs resolve against the primary view's buffer;
-                    // catch it up to include the message just received.
-                    self.view.sync_active(&self.room);
+                    let client_view = self.web_client_view();
                     feed.send(crate::web_server::WebMessage::from_chat(
                         &message,
-                        &|target| self.view.web_ref_for(&self.room, target),
+                        &|target| client_view.web_ref_for(&self.room, target),
                         self.user_id,
                         self.room.message_unverified(
                             message.room_id,
@@ -4447,9 +4073,9 @@ impl App {
                         accepted: identity.clone(),
                     };
                     for client_id in clients {
-                        self.run_as_client(client_id, |app| {
-                            app.open_e2e_identity(target.clone(), None);
-                        });
+                        let previous = std::mem::replace(&mut self.command_client, client_id);
+                        self.open_e2e_identity(target.clone(), None);
+                        self.command_client = previous;
                     }
                 }
             }
@@ -4690,10 +4316,11 @@ impl App {
                     self.disconnect_network();
                     self.navigate_all(BaseScreen::Servers { query: None });
                     if let Some(attempt) = attempt {
-                        self.run_as_client(attempt.owner, |app| {
-                            app.replace_with_server_edit_focused(&attempt.server_label, "Username");
-                            app.set_error("username already in use; choose another");
-                        });
+                        let previous =
+                            std::mem::replace(&mut self.command_client, attempt.owner);
+                        self.replace_with_server_edit_focused(&attempt.server_label, "Username");
+                        self.set_error("username already in use; choose another");
+                        self.command_client = previous;
                     } else {
                         self.set_error("username already in use; choose another");
                     }
@@ -4756,177 +4383,6 @@ impl App {
             NetworkEvent::DeviceLinkCanceled => {
                 self.navigate_owner(NavigationEvent::CloseOverlay);
                 self.set_status("device link canceled");
-            }
-            NetworkEvent::DevicePairingSucceeded {
-                token,
-                username,
-                udp_addr,
-                udp_probe_addr,
-                server_public_key,
-            } => {
-                self.pairing_cancellation = None;
-                self.password_prompt_active = false;
-                self.run_as_pairing_owner(|app| {
-                    let Some(mut pair) = app.pending_pair.take() else {
-                        app.set_error("device pairing completed without pending server state");
-                        return;
-                    };
-                    pair.server.token = token;
-                    pair.server.username = username;
-                    pair.server.udp_addr = udp_addr;
-                    pair.server.udp_probe_addr = udp_probe_addr;
-                    pair.server.server_public_key = server_public_key;
-                    app.navigate_owner(NavigationEvent::CloseOverlay);
-                    app.complete_pairing(pair.server, pair.completion);
-                });
-                self.pairing_owner = None;
-            }
-            NetworkEvent::DevicePairingIdentityExists {
-                message,
-                transfer_password,
-            } => {
-                self.pairing_cancellation = None;
-                if let Some(channel) = self.pairing_owner.and_then(|owner| self.channel_for(owner))
-                {
-                    channel.push(TerminalEvent::DevicePairingIdentityExists {
-                        message,
-                        transfer_password,
-                    });
-                    self.set_status("device pairing needs overwrite confirmation");
-                } else {
-                    self.pending_pair.take();
-                    self.pairing_owner = None;
-                    self.set_error("device pairing confirmation owner is no longer connected");
-                }
-            }
-            NetworkEvent::DevicePairingFailed {
-                message,
-                transfer_password,
-            } => {
-                self.pairing_cancellation = None;
-                if let Some(channel) = self.pairing_owner.and_then(|owner| self.channel_for(owner))
-                {
-                    channel.push(TerminalEvent::DevicePairingFailed {
-                        message: message.clone(),
-                        transfer_password,
-                    });
-                    self.set_error(message);
-                } else {
-                    self.pending_pair.take();
-                    self.set_error(message);
-                }
-            }
-            NetworkEvent::PairingSucceeded => {
-                self.run_as_pairing_owner(|app| {
-                    let Some(pair) = app.pending_pair.take() else {
-                        app.set_status("pairing succeeded");
-                        return;
-                    };
-                    app.complete_pairing(pair.server, pair.completion);
-                });
-                self.pairing_owner = None;
-            }
-            NetworkEvent::OpenPairingSucceeded {
-                token,
-                server_public_key,
-                udp_addr,
-                udp_probe_addr,
-            } => {
-                if self.password_prompt_active {
-                    self.password_prompt_active = false;
-                    self.run_as_pairing_owner(|app| {
-                        app.complete_open_pairing_from_password_prompt(
-                            token,
-                            server_public_key,
-                            udp_addr,
-                            udp_probe_addr,
-                        );
-                    });
-                } else {
-                    self.run_as_pairing_owner(|app| {
-                        app.complete_open_pairing(
-                            token,
-                            server_public_key,
-                            udp_addr,
-                            udp_probe_addr,
-                        );
-                    });
-                }
-                self.pairing_owner = None;
-            }
-            NetworkEvent::OpenPairingNeedsPassword {
-                retry,
-                server_public_key,
-            } => {
-                if let Err(error) = self.accept_open_pairing_password_challenge(server_public_key) {
-                    if self.password_prompt_active {
-                        if let Some(channel) =
-                            self.pairing_owner.and_then(|owner| self.channel_for(owner))
-                        {
-                            channel.push(crate::client_channel::TerminalEvent::PairingFailed(
-                                error.clone(),
-                            ));
-                        }
-                    }
-                    self.run_as_pairing_owner(|app| app.set_error(error));
-                    return;
-                }
-                if self.password_prompt_active {
-                    if let Some(channel) =
-                        self.pairing_owner.and_then(|owner| self.channel_for(owner))
-                    {
-                        channel.push(
-                            crate::client_channel::TerminalEvent::PairingPasswordChallenge {
-                                retry,
-                            },
-                        );
-                    }
-                } else {
-                    self.password_prompt_active = true;
-                    match self.pairing_owner {
-                        Some(owner) => {
-                            if self.channel_for(owner).is_none() {
-                                kvlog::warn!(
-                                    "pairing prompt owner is no longer connected",
-                                    client_id = owner.0
-                                );
-                            } else {
-                                self.send_terminal_event(
-                                    Audience::Client(owner),
-                                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
-                                        OverlaySpec::PairingPassword { retry },
-                                    )),
-                                );
-                            }
-                        }
-                        None => kvlog::warn!("pairing password challenge has no owner"),
-                    }
-                }
-            }
-            NetworkEvent::PairingFailed(error) => {
-                if self.password_prompt_active {
-                    if let Some(channel) =
-                        self.pairing_owner.and_then(|owner| self.channel_for(owner))
-                    {
-                        channel.push(crate::client_channel::TerminalEvent::PairingFailed(
-                            error.clone(),
-                        ));
-                    }
-                    self.run_as_pairing_owner(|app| app.set_error(error));
-                    return;
-                }
-                self.run_as_pairing_owner(|app| {
-                    app.pending_pair.take();
-                    app.set_error(error);
-                });
-                self.pairing_owner = None;
-            }
-            NetworkEvent::UsernameTaken { message } => {
-                self.password_prompt_active = false;
-                self.run_as_pairing_owner(|app| match app.pending_pair.take() {
-                    Some(pending) => app.begin_username_retry(pending),
-                    None => app.set_error(message),
-                });
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.room.network_disconnected = true;
@@ -5047,7 +4503,7 @@ impl App {
             self.pending_mutation_clients
                 .entry((room_id, target, true))
                 .or_default()
-                .push_back(self.issuing_client);
+                .push_back(self.command_client);
             sent_immediately &=
                 self.send_network_command(NetworkCommand::DeleteChat { room_id, target }, true);
         }
@@ -5141,8 +4597,14 @@ impl App {
         let body = body.into();
         self.capture_web_command_line(false, &body);
         if !self.room.push_notice(sender.clone(), body.clone()) {
-            self.view
-                .push_local_notice(sender, body, crate::chat_buffer::NoticeKind::Info);
+            self.send_terminal_event(
+                Audience::Client(self.command_client),
+                TerminalEvent::LocalNotice {
+                    sender,
+                    body,
+                    error: false,
+                },
+            );
         }
     }
 
@@ -5151,8 +4613,14 @@ impl App {
         let body = body.into();
         self.capture_web_command_line(true, &body);
         if !self.room.push_error_notice(sender.clone(), body.clone()) {
-            self.view
-                .push_local_notice(sender, body, crate::chat_buffer::NoticeKind::Error);
+            self.send_terminal_event(
+                Audience::Client(self.command_client),
+                TerminalEvent::LocalNotice {
+                    sender,
+                    body,
+                    error: true,
+                },
+            );
         }
     }
 
@@ -5166,7 +4634,7 @@ impl App {
 
     fn navigate_owner(&mut self, event: NavigationEvent) {
         self.send_terminal_event(
-            Audience::Client(self.issuing_client),
+            Audience::Client(self.command_client),
             TerminalEvent::Navigation(event),
         );
     }
@@ -5184,18 +4652,6 @@ impl App {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn push_mode(&mut self, mode: Box<dyn crate::tui::mode::AppMode>) {
-        self.test_navigation
-            .push_back(crate::tui::mode::ModeTransition::Push(mode));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pop_mode(&mut self) {
-        self.test_navigation
-            .push_back(crate::tui::mode::ModeTransition::Pop);
-    }
-
     pub(crate) fn delete_server(&mut self, label: &str) {
         self.config.servers.retain(|server| server.label != label);
         self.config
@@ -5204,7 +4660,7 @@ impl App {
         if self.room.server_alias == label {
             self.disconnect_network();
             self.room.reset_for_server_list();
-            self.view.reset_rooms();
+            self.broadcast_reset_rooms();
         }
         match self.config.save_runtime() {
             Ok(path) => {
@@ -5224,7 +4680,7 @@ impl App {
             return;
         };
         if attempt.generation != generation
-            || attempt.owner != self.issuing_client
+            || attempt.owner != self.command_client
             || attempt.server_label != label
         {
             return;
@@ -5237,7 +4693,7 @@ impl App {
         else {
             self.set_error(format!("server {label} is not configured"));
             self.room.reset_for_server_list();
-            self.view.reset_rooms();
+            self.broadcast_reset_rooms();
             self.navigate_all(BaseScreen::Servers { query: None });
             return;
         };
@@ -5255,7 +4711,7 @@ impl App {
                     ));
                 } else {
                     self.room.reset_for_server_list();
-                    self.view.reset_rooms();
+                    self.broadcast_reset_rooms();
                     self.navigate_all(BaseScreen::Servers { query: None });
                 }
             }
@@ -5265,14 +4721,14 @@ impl App {
 
     pub(crate) fn cancel_native_encryption_warning(&mut self, generation: u64) {
         if !self.connection_attempt.as_ref().is_some_and(|attempt| {
-            attempt.generation == generation && attempt.owner == self.issuing_client
+            attempt.generation == generation && attempt.owner == self.command_client
         }) {
             return;
         }
         self.connection_attempt = None;
         self.disconnect_network();
         self.room.reset_for_server_list();
-        self.view.reset_rooms();
+        self.broadcast_reset_rooms();
         self.rebuild_server_items();
         self.navigate_all(BaseScreen::Servers { query: None });
         self.set_status("connection canceled");
@@ -5286,21 +4742,18 @@ impl App {
         // A pairing the server rejected for a taken username is retried here.
         // The provisional recovery entry is updated before the retry; the final
         // bearer token replaces it only after pairing succeeds.
-        if self.pairing_owner == Some(self.issuing_client) {
-            if let Some(pending) = self.username_retry.take() {
-                if pending.server.label == draft.original_label() {
-                    let server = match draft.to_update() {
-                        Ok(update) => update.server,
-                        Err(error) => {
-                            self.set_error(error);
-                            self.username_retry = Some(pending);
-                            return false;
-                        }
-                    };
-                    return self.retry_username_pairing(pending, server);
+        if self
+            .pairing
+            .username_retry_matches(self.command_client, draft.original_label())
+        {
+            let server = match draft.to_update() {
+                Ok(update) => update.server,
+                Err(error) => {
+                    self.set_error(error);
+                    return false;
                 }
-                self.username_retry = Some(pending);
-            }
+            };
+            return self.retry_username_pairing(server);
         }
         let update = match draft.to_update() {
             Ok(update) => update,
@@ -5460,31 +4913,6 @@ impl App {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn process_global_command(&mut self, command: BindCommand) -> Action {
-        use BindCommand::*;
-        match command {
-            OpenSettings => self.open_settings(),
-            Quit => return Action::Quit,
-            ToggleMute => self.toggle_mute(),
-            ToggleDeafen => self.set_deafen(!self.deafened.load(Ordering::Relaxed)),
-            PlaySoundboard1 => self.trigger_soundboard_slot(0),
-            PlaySoundboard2 => self.trigger_soundboard_slot(1),
-            PlaySoundboard3 => self.trigger_soundboard_slot(2),
-            PlaySoundboard4 => self.trigger_soundboard_slot(3),
-            PlaySoundboard5 => self.trigger_soundboard_slot(4),
-            PlaySoundboard6 => self.trigger_soundboard_slot(5),
-            PlaySoundboard7 => self.trigger_soundboard_slot(6),
-            PlaySoundboard8 => self.trigger_soundboard_slot(7),
-            PlaySoundboard9 => self.trigger_soundboard_slot(8),
-            ToggleKeyPreview => {
-                self.view.chrome.key_preview.expanded = !self.view.chrome.key_preview.expanded
-            }
-            _ => {}
-        }
-        Action::Continue
-    }
-
     pub(crate) fn open_settings(&mut self) {
         if self.room.settings.is_some() {
             self.set_error("settings are already open in another client");
@@ -5498,7 +4926,7 @@ impl App {
         }
         self.start_settings_preview_capture();
         self.room.settings_generation = self.room.settings_generation.wrapping_add(1);
-        self.room.settings_owner = Some(self.issuing_client);
+        self.room.settings_owner = Some(self.command_client);
         self.room.settings = Some(Arc::new(std::sync::Mutex::new(SettingsSession::new(
             &self.config,
             &self.room.audio_devices,
@@ -5515,10 +4943,7 @@ impl App {
             clients.retain(|pending| *pending != client_id);
         }
         self.room.remove_client_view(client_id);
-        if self.pairing_owner == Some(client_id) {
-            self.pairing_owner = None;
-            self.password_prompt_active = false;
-        }
+        self.apply_pairing_input(PairingInput::OwnerRetired { owner: client_id });
         if self.room.settings_owner != Some(client_id) {
             return;
         }
@@ -5596,7 +5021,7 @@ impl App {
             &mut session.form,
             &mut session.draft,
             session.tab,
-            &self.view.theme,
+            &self.config.ui.resolve_theme(),
             &self.config.bindings,
             session.dirty,
             intent,
@@ -5703,16 +5128,13 @@ impl App {
         self.mark_settings_dirty(session);
     }
 
-    /// Re-resolves the active theme and applies it to the live UI: the chat
-    /// buffer restyles its syntax highlighting and the composer editor adopts
-    /// the new selection colors. Every other surface reads `self.view.theme` per
-    /// frame, so a field swap is enough for them.
+    /// Re-resolves the active theme and publishes the daemon config change to
+    /// every terminal-owned view.
     pub(crate) fn apply_theme(&mut self, selection: ThemeSelection) {
         if self.config.ui.theme == selection {
             return;
         }
         self.config.ui.theme = selection;
-        self.view.apply_theme(self.config.ui.resolve_theme());
         self.mark_daemon_config_changed();
     }
 
@@ -5880,9 +5302,6 @@ impl App {
         if self.start_pending_after_welcome() {
             dirty |= DirtySections::ALL;
         }
-        if self.expire_status(now) {
-            dirty |= DirtySections::COMPOSE_BAR;
-        }
         if self.supervise(now) {
             dirty |= DirtySections::ALL;
         }
@@ -5913,7 +5332,6 @@ impl App {
             return TICK_POLL_INTERVAL;
         }
         let deadlines = [
-            self.view.status.expires_at(),
             self.supervisor.network.due_at(),
             self.supervisor.control_socket.due_at(),
             self.supervisor.capture.due_at(),
@@ -5958,26 +5376,13 @@ impl App {
         if self.synced_daemon_config_generation == self.daemon_config_generation {
             return false;
         }
-        let theme = self.config.ui.resolve_theme();
-        self.view.server_catalog.rebuild(&self.config);
-        let server_catalog = self.view.server_catalog.clone();
-        self.view
-            .sync_daemon_config(&self.config, theme, &server_catalog);
-        for handle in self.clients.values() {
-            handle
-                .view
-                .lock()
-                .sync_daemon_config(&self.config, theme, &server_catalog);
-        }
+        self.broadcast_config_changed();
         self.synced_daemon_config_generation = self.daemon_config_generation;
         true
     }
 
     fn apply_max_messages(&mut self) {
         self.room.set_max_messages(self.config.ui.max_messages);
-        if self.view.set_max_messages(self.config.ui.max_messages) {
-            self.mark_daemon_config_changed();
-        }
     }
 
     /// Projects audio display facts into the shared session so every view
@@ -6880,7 +6285,12 @@ impl App {
         let name = selected.username;
         let value_db = self.config.user_volume_db(&self.room.server_alias, user_id);
         self.room.begin_volume_preview(user_id, value_db);
-        let dialog = UserVolumeDialog::new(user_id, name.clone(), value_db, &self.view.theme);
+        let dialog = UserVolumeDialog::new(
+            user_id,
+            name.clone(),
+            value_db,
+            &self.config.ui.resolve_theme(),
+        );
         self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::UserVolume(
             dialog,
         )));
@@ -7115,29 +6525,6 @@ impl App {
         self.set_status("refreshing audio devices");
     }
 
-    #[allow(dead_code)] // Retained while App-level behavior tests migrate.
-    pub(crate) fn submit_input(&mut self) {
-        let Some(submission) = self.view.submit_composer() else {
-            return;
-        };
-        let input = match submission {
-            ComposerSubmission::Command(input) => input,
-            ComposerSubmission::Message(body) => {
-                self.send_chat_to_viewed(body);
-                return;
-            }
-            ComposerSubmission::Edit {
-                room_id,
-                target,
-                body,
-            } => {
-                self.submit_edit(room_id, target, body);
-                return;
-            }
-        };
-        self.run_slash_command(self.view.viewed_room, input);
-    }
-
     fn run_slash_command(&mut self, room_id: Option<RoomId>, input: String) {
         match input.as_str() {
             "/quit" => self.set_status("use Ctrl-C to quit"),
@@ -7149,8 +6536,8 @@ impl App {
             "/deafened" => self.show_deafen_status(),
             "/audio" => self.show_audio_status(),
             "/audio-reset" => self.audio_manual_reset(),
-            "/stats" => self.toggle_lobby_details(),
-            "/clear" => self.view.clear_chat(),
+            "/stats" => self.set_status("stats display is controlled by the terminal view"),
+            "/clear" => self.set_status("chat display cleared only in terminal views"),
             "/help" => self.show_command_help(room_id),
             "/config" | "/settings" => self.open_settings(),
             "/servers" if self.network.is_some() => {
@@ -7166,8 +6553,8 @@ impl App {
             command if command.starts_with("/room ") => self.switch_room_command(command),
             "/dm" => self.set_error("usage: /dm user"),
             command if command.starts_with("/dm ") => self.open_dm_command(command),
-            "/identity" => self.identity_command("/identity"),
-            command if command.starts_with("/identity ") => self.identity_command(command),
+            "/identity" => self.identity_command(room_id, "/identity"),
+            command if command.starts_with("/identity ") => self.identity_command(room_id, command),
             "/devices" => {
                 self.send_network_command(NetworkCommand::ListE2eDevices, true);
             }
@@ -7334,10 +6721,10 @@ impl App {
         };
         let replaces_open = self
             .open_e2e_reviews
-            .get(&self.issuing_client)
+            .get(&self.command_client)
             .is_some_and(|(room_id, _, _)| *room_id == target.room_id);
         self.open_e2e_reviews.insert(
-            self.issuing_client,
+            self.command_client,
             (
                 target.room_id,
                 target.public_key.clone(),
@@ -7386,10 +6773,10 @@ impl App {
     /// Opens the one identity screen for a DM peer. The command itself never
     /// changes state; every save, confirmation, or forget action remains bound
     /// to the exact identity shown by the overlay.
-    fn identity_command(&mut self, command: &str) {
+    fn identity_command(&mut self, room_id: Option<RoomId>, command: &str) {
         let name = command.strip_prefix("/identity").unwrap_or("").trim();
         let user_id = if name.is_empty() {
-            let Some(room_id) = self.view.viewed_room else {
+            let Some(room_id) = room_id else {
                 self.set_error("open a DM first, or use /identity user");
                 return;
             };
@@ -7409,14 +6796,14 @@ impl App {
             self.pending_identity_review
                 .entry(user_id)
                 .or_default()
-                .push_back(self.issuing_client);
+                .push_back(self.command_client);
             self.open_dm_with(user_id);
             return;
         }
         self.pending_identity_review
             .entry(user_id)
             .or_default()
-            .push_back(self.issuing_client);
+            .push_back(self.command_client);
         self.send_network_command(NetworkCommand::ReviewPeerIdentity { user_id }, true);
     }
 
@@ -7431,7 +6818,7 @@ impl App {
             self.pending_dm_clients
                 .entry(user_id)
                 .or_default()
-                .push_back(self.issuing_client);
+                .push_back(self.command_client);
         }
         self.set_status(format!(
             "opening dm with {}",
@@ -7446,11 +6833,11 @@ impl App {
         peer: UserId,
     ) {
         let status = format!("dm with {}", self.room.username_of(peer));
-        self.run_as_client(client_id, |app| {
-            if app.set_viewed_room(room_id) {
-                app.set_status(status);
-            }
-        });
+        let previous = std::mem::replace(&mut self.command_client, client_id);
+        if self.set_viewed_room(room_id) {
+            self.set_status(status);
+        }
+        self.command_client = previous;
     }
 
     /// Moves the voice call to `name`'s room, or the viewed room without an
@@ -7576,19 +6963,16 @@ impl App {
     fn show_command_help(&mut self, room_id: Option<RoomId>) {
         let body = slash_command_help();
         if !room_id.is_some_and(|room_id| self.room.push_notice_to(room_id, "help", body.clone())) {
-            self.view
-                .push_local_notice("help", body, crate::chat_buffer::NoticeKind::Info);
+            self.send_terminal_event(
+                Audience::Client(self.command_client),
+                TerminalEvent::LocalNotice {
+                    sender: "help".to_string(),
+                    body,
+                    error: false,
+                },
+            );
         }
         self.set_status("slash commands listed");
-    }
-
-    fn toggle_lobby_details(&mut self) {
-        self.view.lobby_details = !self.view.lobby_details;
-        if self.view.lobby_details {
-            self.set_status("lobby detail on (jitter buffer stats)");
-        } else {
-            self.set_status("lobby detail off (latency estimate)");
-        }
     }
 
     fn set_mute(&mut self, muted: bool) {
@@ -8686,19 +8070,27 @@ impl App {
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
         let status = status.into();
         self.capture_web_command_line(false, &status);
-        self.view.status.set(status);
+        self.send_terminal_event(
+            Audience::Client(self.command_client),
+            TerminalEvent::Status(status),
+        );
     }
 
     pub(crate) fn set_transient_status(&mut self, status: impl Into<String>) {
-        self.view
-            .status
-            .set_transient(status, Instant::now() + STATUS_LIFETIME);
+        let status = status.into();
+        self.send_terminal_event(
+            Audience::Client(self.command_client),
+            TerminalEvent::TransientStatus(status),
+        );
     }
 
     pub(crate) fn set_error(&mut self, status: impl Into<String>) {
         let status = status.into();
         self.capture_web_command_line(true, &status);
-        self.view.status.set_error(status);
+        self.send_terminal_event(
+            Audience::Client(self.command_client),
+            TerminalEvent::Error(status),
+        );
     }
 
     fn capture_web_command_line(&mut self, error: bool, text: &str) {
@@ -8710,9 +8102,6 @@ impl App {
         }
     }
 
-    fn expire_status(&mut self, now: Instant) -> bool {
-        self.view.status.expire(now)
-    }
 }
 
 fn handle_audio_picker_key(
@@ -8820,9 +8209,6 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::DeviceLinkCreated { .. } => "device_link_created",
         NetworkEvent::DeviceLinkRedeemed { .. } => "device_link_redeemed",
         NetworkEvent::DeviceLinkCanceled => "device_link_canceled",
-        NetworkEvent::DevicePairingSucceeded { .. } => "device_pairing_succeeded",
-        NetworkEvent::DevicePairingIdentityExists { .. } => "device_pairing_identity_exists",
-        NetworkEvent::DevicePairingFailed { .. } => "device_pairing_failed",
         NetworkEvent::E2ePeerPinProposed { .. } => "e2e_peer_pin_proposed",
         NetworkEvent::E2ePeerPinMatched { .. } => "e2e_peer_pin_matched",
         NetworkEvent::VoiceStarted { .. } => "voice_started",
@@ -8839,11 +8225,6 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
         NetworkEvent::AuthFailed { .. } => "auth_failed",
-        NetworkEvent::PairingSucceeded => "pairing_succeeded",
-        NetworkEvent::PairingFailed(_) => "pairing_failed",
-        NetworkEvent::UsernameTaken { .. } => "username_taken",
-        NetworkEvent::OpenPairingSucceeded { .. } => "open_pairing_succeeded",
-        NetworkEvent::OpenPairingNeedsPassword { .. } => "open_pairing_needs_password",
         NetworkEvent::NativeEncryptionRequired => "native_encryption_required",
         NetworkEvent::MediaConnectivity { .. } => "media_connectivity",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
@@ -8855,20 +8236,6 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::ShareStartRejected { .. } => "share_start_rejected",
         NetworkEvent::Mls(_) => "mls",
     }
-}
-
-fn pairing_worker_event(event: &NetworkEvent) -> bool {
-    matches!(
-        event,
-        NetworkEvent::PairingSucceeded
-            | NetworkEvent::PairingFailed(_)
-            | NetworkEvent::UsernameTaken { .. }
-            | NetworkEvent::OpenPairingSucceeded { .. }
-            | NetworkEvent::OpenPairingNeedsPassword { .. }
-            | NetworkEvent::DevicePairingSucceeded { .. }
-            | NetworkEvent::DevicePairingIdentityExists { .. }
-            | NetworkEvent::DevicePairingFailed { .. }
-    )
 }
 
 fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
@@ -8910,6 +8277,8 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::testing::TestApp;
+    use crate::{bindings::BindCommand, tui::Action};
     use crate::{
         settings::SettingsDraft,
         tui::{
@@ -8924,49 +8293,18 @@ mod tests {
     };
     use extui_editor::Mode as EditorMode;
 
-    fn test_app() -> App {
-        App::new(Config::default(), None).expect("test app")
+    fn test_app() -> TestApp {
+        TestApp::new(Config::default(), None).expect("test app")
     }
 
-    #[test]
-    fn command_line_device_pairing_waits_for_primary_terminal() {
-        let mut app = App::new(
-            Config::default(),
-            Some(PendingJoin::Device { ticket: None }),
-        )
-        .expect("test app");
-        assert!(app.test_terminal_events.is_empty());
-
-        let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("channel"));
-        app.set_primary_channel(channel.clone());
-
-        let mut events = channel.drain_events();
-        assert!(matches!(
-            events.pop_front(),
-            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
-                OverlaySpec::DevicePair(_)
-            )))
-        ));
-        assert!(events.is_empty());
-        assert_eq!(
-            app.pairing_owner,
-            Some(crate::client_channel::ClientId::PRIMARY)
-        );
-    }
-
-    #[test]
-    fn stale_pairing_worker_event_cannot_replace_current_attempt() {
-        let mut app = test_app();
-        app.active_pairing_attempt = Some(2);
-        app.view.status.set("current pairing");
-
-        app.handle_app_event(AppEvent::PairingFor {
-            attempt: 1,
-            event: NetworkEvent::PairingFailed("stale failure".to_string()),
-        });
-
-        assert_eq!(app.active_pairing_attempt, Some(2));
-        assert_eq!(app.view.status.text(), "current pairing");
+    fn user_summary(user_id: UserId, username: &str) -> rpc::control::UserSummary {
+        rpc::control::UserSummary {
+            user_id,
+            username: username.to_string(),
+            online: true,
+            connected_at_ms: 0,
+            voice_status: ParticipantVoiceStatus::default(),
+        }
     }
 
     #[test]
@@ -9087,8 +8425,7 @@ mod tests {
     #[test]
     fn native_encryption_rejection_orders_base_reset_before_owner_warning() {
         let mut app = test_app();
-        let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("channel"));
-        app.set_primary_channel(channel.clone());
+        let channel = app.terminal_channel();
         app.connection_attempt = Some(ConnectionAttempt {
             generation: 9,
             owner: crate::client_channel::ClientId::PRIMARY,
@@ -9119,8 +8456,7 @@ mod tests {
     #[test]
     fn stale_connection_generation_cannot_publish_navigation() {
         let mut app = test_app();
-        let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("channel"));
-        app.set_primary_channel(channel.clone());
+        let channel = app.terminal_channel();
         app.connection_attempt = Some(ConnectionAttempt {
             generation: 2,
             owner: crate::client_channel::ClientId::PRIMARY,
@@ -9138,7 +8474,7 @@ mod tests {
     }
 
     fn attach_test_client(
-        app: &mut App,
+        app: &mut TestApp,
         id: crate::client_channel::ClientId,
     ) -> Arc<parking_lot::Mutex<ClientView>> {
         let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("test channel"));
@@ -9243,26 +8579,7 @@ mod tests {
         assert_eq!(rx.recv().unwrap().unwrap(), path.display().to_string());
     }
 
-    fn pending_open_pair(label: &str) -> PendingPair {
-        PendingPair {
-            server: ServerEntry {
-                label: label.to_string(),
-                tcp_addr: "chat.example.com:443".to_string(),
-                udp_addr: String::new(),
-                udp_probe_addr: None,
-                username: "Zoe".to_string(),
-                token: String::new(),
-                server_public_key: String::new(),
-                ..ServerEntry::default()
-            },
-            open: Some(String::new()),
-            open_password: String::new(),
-            pairing_code: None,
-            completion: PairCompletion::OpenEditor,
-        }
-    }
-
-    fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
+    fn render_room(app: &mut TestApp, room: &mut RoomMode, buffer: &mut Buffer) {
         // The runtime ticks before every paint; reproduce the projection so
         // renders see fresh session display facts.
         app.refresh_session_projection();
@@ -9290,7 +8607,7 @@ mod tests {
             .collect::<String>()
     }
 
-    fn base_mode_label(app: &mut App) -> &'static str {
+    fn base_mode_label(app: &mut TestApp) -> &'static str {
         let mode = app.base_mode();
         let cx = app.view_cx();
         mode.presentation(&cx)
@@ -9312,82 +8629,6 @@ mod tests {
     }
 
     #[test]
-    fn open_pair_password_prompt_pins_trusted_key_before_retry() {
-        let mut app = test_app();
-        app.pending_pair = Some(pending_open_pair("public"));
-        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-        app.handle_app_event(
-            NetworkEvent::OpenPairingNeedsPassword {
-                retry: false,
-                server_public_key: key.to_string(),
-            }
-            .into(),
-        );
-
-        assert_eq!(
-            app.pending_pair.as_ref().unwrap().server.server_public_key,
-            key
-        );
-    }
-
-    #[test]
-    fn username_rejection_clears_password_prompt_state_before_opening_editor() {
-        let mut app = test_app();
-        app.pending_pair = Some(pending_open_pair("public"));
-        app.pairing_owner = Some(crate::client_channel::ClientId::PRIMARY);
-        app.password_prompt_active = true;
-
-        app.handle_app_event(
-            NetworkEvent::UsernameTaken {
-                message: "username already in use".to_string(),
-            }
-            .into(),
-        );
-
-        assert!(!app.password_prompt_active);
-        assert!(app.pending_pair.is_none());
-        assert!(app.username_retry.is_some());
-        assert_eq!(
-            app.pairing_owner,
-            Some(crate::client_channel::ClientId::PRIMARY)
-        );
-    }
-
-    #[test]
-    fn canceling_username_retry_discards_provisional_recovery_secret() {
-        let mut app = test_app();
-        let mut pending = pending_open_pair("public");
-        pending.server.token = format!("{OPEN_PAIR_RECOVERY_PREFIX}{}", "ab".repeat(32));
-        pending.open = Some(pending.server.token.clone());
-        app.config.servers.push(pending.server.clone());
-        app.username_retry = Some(pending);
-        app.pairing_owner = Some(crate::client_channel::ClientId::PRIMARY);
-
-        app.cancel_server_edit();
-
-        assert!(app.username_retry.is_none());
-        assert!(app.config.servers.is_empty());
-        assert_eq!(app.pairing_owner, None);
-    }
-
-    #[test]
-    fn unrelated_terminal_cannot_cancel_an_owned_username_retry() {
-        let mut app = test_app();
-        app.username_retry = Some(pending_open_pair("public"));
-        app.pairing_owner = Some(crate::client_channel::ClientId::PRIMARY);
-        app.issuing_client = crate::client_channel::ClientId(6);
-
-        app.cancel_server_edit();
-
-        assert!(app.username_retry.is_some());
-        assert_eq!(
-            app.pairing_owner,
-            Some(crate::client_channel::ClientId::PRIMARY)
-        );
-    }
-
-    #[test]
     fn auth_failure_shows_detail_after_returning_to_server_list() {
         let mut app = test_app();
         app.room.server_alias = "public".to_string();
@@ -9406,130 +8647,6 @@ mod tests {
         assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
         assert_eq!(h.app.view.status.text(), message);
         assert_eq!(h.app.view.status.kind(), StatusKind::Error);
-    }
-
-    #[test]
-    fn stale_dynamic_token_auth_failure_starts_repair_pairing() {
-        let mut app = test_app();
-        app.config.servers.push(ServerEntry {
-            label: "public".to_string(),
-            tcp_addr: "127.0.0.1:9".to_string(),
-            udp_addr: "127.0.0.1:9".to_string(),
-            udp_probe_addr: None,
-            username: "Zoe".to_string(),
-            token: "tct1_existing-token".to_string(),
-            server_public_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .to_string(),
-            ..ServerEntry::default()
-        });
-        app.room.active_server_label = Some("public".to_string());
-
-        app.handle_app_event(
-            NetworkEvent::AuthFailed {
-                code: ERROR_TOKEN_STALE_EPOCH,
-                message: "authentication failed: the server password changed; re-pair to refresh your token"
-                    .to_string(),
-            }
-            .into(),
-        );
-
-        let pending = app.pending_pair.as_ref().expect("repair pairing pending");
-        assert_eq!(pending.server.label, "public");
-        assert_eq!(pending.open.as_deref(), Some("tct1_existing-token"));
-        assert!(matches!(
-            &pending.completion,
-            PairCompletion::Reconnect { label } if label == "public"
-        ));
-    }
-
-    #[test]
-    fn open_pair_success_persists_token_key_and_udp_endpoints() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-open-pair-client-{}.toml",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let mut app = test_app();
-        app.config.config_path = Some(path.clone());
-        app.pending_pair = Some(pending_open_pair("public"));
-        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-        app.handle_app_event(
-            NetworkEvent::OpenPairingSucceeded {
-                token: "tct1_token-with-enough-content".to_string(),
-                server_public_key: key.to_string(),
-                udp_addr: "198.51.100.20:54100".to_string(),
-                udp_probe_addr: Some("198.51.100.20:54101".to_string()),
-            }
-            .into(),
-        );
-
-        let saved = app
-            .config
-            .servers
-            .iter()
-            .find(|server| server.label == "public")
-            .expect("paired server saved");
-        assert_eq!(saved.token, "tct1_token-with-enough-content");
-        assert_eq!(saved.server_public_key, key);
-        assert_eq!(saved.udp_addr, "198.51.100.20:54100");
-        assert_eq!(saved.udp_probe_addr.as_deref(), Some("198.51.100.20:54101"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn remote_pairing_challenge_opens_prompt_on_owning_view() {
-        let mut app = test_app();
-        let owner = crate::client_channel::ClientId(6);
-        let _view = attach_test_client(&mut app, owner);
-        let channel = app.channel_for(owner).expect("attached channel");
-        app.pending_pair = Some(pending_open_pair("public"));
-        app.pairing_owner = Some(owner);
-        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-        app.handle_app_event(
-            NetworkEvent::OpenPairingNeedsPassword {
-                retry: false,
-                server_public_key: key.to_string(),
-            }
-            .into(),
-        );
-
-        assert!(app.test_navigation.is_empty());
-        assert!(matches!(
-            channel.drain_events().pop_front(),
-            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
-                OverlaySpec::PairingPassword { retry: false }
-            )))
-        ));
-    }
-
-    #[test]
-    fn existing_device_identity_requests_overwrite_without_canceling_pairing() {
-        let mut app = test_app();
-        let owner = crate::client_channel::ClientId(6);
-        let _view = attach_test_client(&mut app, owner);
-        let channel = app.channel_for(owner).expect("attached channel");
-        app.pending_pair = Some(pending_open_pair("public"));
-        app.pairing_owner = Some(owner);
-
-        app.handle_app_event(
-            NetworkEvent::DevicePairingIdentityExists {
-                message: "Existing identity found. Overwrite it?".to_string(),
-                transfer_password: "coral-lantern".to_string(),
-            }
-            .into(),
-        );
-
-        assert!(app.pending_pair.is_some());
-        assert_eq!(app.pairing_owner, Some(owner));
-        assert!(matches!(
-            channel.drain_events().pop_front(),
-            Some(TerminalEvent::DevicePairingIdentityExists {
-                message,
-                transfer_password,
-            }) if message.contains("Overwrite") && transfer_password == "coral-lantern"
-        ));
     }
 
     #[test]
@@ -9572,131 +8689,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remote_pairing_success_replaces_owning_prompt_with_editor() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-remote-pair-success-{}.toml",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let mut app = test_app();
-        app.config.config_path = Some(path.clone());
-        let owner = crate::client_channel::ClientId(6);
-        let _view = attach_test_client(&mut app, owner);
-        let channel = app.channel_for(owner).expect("attached channel");
-        app.pending_pair = Some(pending_open_pair("public"));
-        app.pairing_owner = Some(owner);
-        app.password_prompt_active = true;
-        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-        app.handle_app_event(
-            NetworkEvent::OpenPairingSucceeded {
-                token: "tct1_token-with-enough-content".to_string(),
-                server_public_key: key.to_string(),
-                udp_addr: "198.51.100.20:54100".to_string(),
-                udp_probe_addr: None,
-            }
-            .into(),
-        );
-
-        assert!(matches!(
-            channel.drain_events().pop_front(),
-            Some(TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(
-                ScreenSpec::ServerEditor(_)
-            )))
-        ));
-        assert!(app.test_navigation.is_empty());
-        assert_eq!(app.pairing_owner, None);
-        assert!(!app.password_prompt_active);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn remote_pairing_failure_reports_on_owning_view() {
-        let mut app = test_app();
-        let owner = crate::client_channel::ClientId(6);
-        let channel = Arc::new(crate::client_channel::ClientChannel::new().expect("test channel"));
-        let view = app.attach_client(owner, channel.clone());
-        app.pending_pair = Some(pending_open_pair("public"));
-        app.pairing_owner = Some(owner);
-        app.password_prompt_active = true;
-
-        app.handle_app_event(NetworkEvent::PairingFailed("bad password".to_string()).into());
-
-        {
-            let view = view.lock();
-            assert_eq!(view.status.text(), "bad password");
-            assert_eq!(view.status.kind(), StatusKind::Error);
-        }
-        assert_ne!(app.view.status.text(), "bad password");
-        assert!(matches!(
-            channel.drain_events().pop_front(),
-            Some(crate::client_channel::TerminalEvent::PairingFailed(error)) if error == "bad password"
-        ));
-    }
-
-    #[test]
-    fn pairing_completion_without_owner_falls_back_to_primary() {
-        let mut app = test_app();
-        app.pairing_owner = None;
-        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-        app.handle_app_event(
-            NetworkEvent::OpenPairingSucceeded {
-                token: "tct1_token-with-enough-content".to_string(),
-                server_public_key: key.to_string(),
-                udp_addr: "198.51.100.20:54100".to_string(),
-                udp_probe_addr: None,
-            }
-            .into(),
-        );
-
-        assert_eq!(app.view.status.text(), "pairing succeeded");
-    }
-
-    #[test]
-    fn primary_password_pairing_success_does_not_pop_the_replacement_editor() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-primary-pair-success-{}.toml",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let mut app = test_app();
-        app.config.config_path = Some(path.clone());
-        app.pending_pair = Some(pending_open_pair("public"));
-        app.pairing_owner = Some(crate::client_channel::ClientId::PRIMARY);
-        app.password_prompt_active = true;
-        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-        app.handle_app_event(
-            NetworkEvent::OpenPairingSucceeded {
-                token: "tct1_token-with-enough-content".to_string(),
-                server_public_key: key.to_string(),
-                udp_addr: "198.51.100.20:54100".to_string(),
-                udp_probe_addr: None,
-            }
-            .into(),
-        );
-
-        assert!(matches!(
-            app.take_terminal_event(),
-            Some(TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(
-                ScreenSpec::ServerEditor(_)
-            )))
-        ));
-        let _ = std::fs::remove_file(path);
-    }
-
-    fn user_summary(user_id: UserId, username: &str) -> rpc::control::UserSummary {
-        rpc::control::UserSummary {
-            user_id,
-            username: username.to_string(),
-            online: true,
-            connected_at_ms: 0,
-            voice_status: ParticipantVoiceStatus::default(),
-        }
-    }
-
     fn test_room_info(id: u32) -> rpc::control::RoomInfo {
         rpc::control::RoomInfo {
             room_id: rpc::ids::RoomId(id),
@@ -9735,41 +8727,44 @@ mod tests {
     }
 
     /// Registers room 1 as the viewed room with `users` in the directory.
-    fn enter_room_with_users(app: &mut App, users: Vec<rpc::control::UserSummary>) {
+    fn enter_room_with_users(app: &mut TestApp, users: Vec<rpc::control::UserSummary>) {
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1)],
             users,
             rpc::ids::RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
-        app.view.switch_room(rpc::ids::RoomId(1), &app.room);
+        let (core, view) = app.parts_mut();
+        view.switch_room(rpc::ids::RoomId(1), &core.room);
     }
 
-    fn observe_room_voice(app: &mut App, user_id: UserId, stream_id: u32) {
+    fn observe_room_voice(app: &mut TestApp, user_id: UserId, stream_id: u32) {
+        let session_id = app.session_id;
         app.room.voice_started(
             RoomId(1),
             SessionId(user_id.0),
             user_id,
             StreamId(stream_id),
-            app.session_id,
+            session_id,
             Some(RoomId(1)),
         );
     }
 
-    fn enter_test_room(app: &mut App) {
+    fn enter_test_room(app: &mut TestApp) {
         enter_room_with_users(app, Vec::new());
     }
 
     /// Drives an [`App`] through a real mode stack so tests can exercise mode
     /// transitions (push/pop of overlays) the same way the runtime loop does.
     struct Harness {
-        app: App,
+        app: TestApp,
         stack: crate::tui::mode_stack::ModeStack,
     }
 
     impl Harness {
-        fn new(mut app: App) -> Self {
+        fn new(mut app: TestApp) -> Self {
             let base: Box<dyn AppMode> = if app.room.server_alias.is_empty() {
                 app.base_mode()
             } else {
@@ -10077,12 +9072,13 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1), test_room_info(2)],
             vec![user_summary(UserId(1), "alice")],
             rpc::ids::RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
 
         app.view.composer.set_lines("/room room-2");
@@ -10137,6 +9133,7 @@ mod tests {
     fn dm_irrelevant_presence_produces_no_notice() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[dm_room_info(0x8000_0001, UserId(1), UserId(2))],
             vec![
@@ -10145,7 +9142,7 @@ mod tests {
             ],
             RoomId(0x8000_0001),
             None,
-            app.user_id,
+            user_id,
         );
         app.set_status("steady");
 
@@ -10163,6 +9160,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[dm_room_info(0x8000_0001, UserId(1), UserId(2))],
             vec![
@@ -10171,7 +9169,7 @@ mod tests {
             ],
             RoomId(0x8000_0001),
             None,
-            app.user_id,
+            user_id,
         );
 
         app.handle_network_event(NetworkEvent::Presence {
@@ -10323,6 +9321,7 @@ mod tests {
     fn restored_e2e_peer_pin_match_clears_changed_state_without_claiming_verification() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[dm_room_info(0x8000_0001, UserId(1), UserId(2))],
             vec![
@@ -10331,7 +9330,7 @@ mod tests {
             ],
             RoomId(0x8000_0001),
             None,
-            app.user_id,
+            user_id,
         );
 
         app.room.set_e2e_trust_state(
@@ -10382,6 +9381,7 @@ mod tests {
     fn dm_opened_waits_for_room_upsert_when_room_is_unknown() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1)],
             vec![
@@ -10390,7 +9390,7 @@ mod tests {
             ],
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
         let dm_id = RoomId(0x8000_0001);
         app.pending_dm_clients
@@ -10427,6 +9427,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1)],
             vec![
@@ -10435,7 +9436,7 @@ mod tests {
             ],
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
         let client_id = crate::client_channel::ClientId(7);
         let view = attach_test_client(&mut app, client_id);
@@ -10468,6 +9469,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1)],
             vec![
@@ -10476,7 +9478,7 @@ mod tests {
             ],
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
         let clients = [
             crate::client_channel::ClientId(7),
@@ -10544,21 +9546,23 @@ mod tests {
         let mut app = test_app();
         let (tx, _rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1), test_room_info(2)],
             Vec::new(),
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
-        app.view.switch_room(RoomId(1), &app.room);
+        let (core, view) = app.parts_mut();
+        view.switch_room(RoomId(1), &core.room);
         let client_id = crate::client_channel::ClientId(4);
-        let view = attach_test_client(&mut app, client_id);
+        let remote_view = attach_test_client(&mut app, client_id);
 
         app.handle_client_command(client_id, command::CoreCommand::SetViewedRoom(RoomId(2)));
 
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
-        let view = view.lock();
+        let view = remote_view.lock();
         assert_eq!(view.viewed_room, Some(RoomId(2)));
         assert_eq!(view.status.text(), "viewing room-2");
     }
@@ -10568,12 +9572,11 @@ mod tests {
         let mut app = test_app();
         enter_test_room(&mut app);
         let client_id = crate::client_channel::ClientId(5);
-        let view = attach_test_client(&mut app, client_id);
+        attach_test_client(&mut app, client_id);
 
         assert!(app.handle_client_command(client_id, command::CoreCommand::Quit));
 
         assert!(!app.take_quit_requested());
-        assert!(!view.lock().quit_requested);
     }
 
     #[test]
@@ -10736,12 +9739,13 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.config.soundboard.enabled = true;
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1), test_room_info(2)],
             vec![user_summary(UserId(1), "alice")],
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
         app.session_id = Some(SessionId(1));
         app.room.voice_room = Some(RoomId(1));
@@ -10768,6 +9772,7 @@ mod tests {
     fn share_availability_follows_the_confirmed_voice_room() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1), test_room_info(2)],
             vec![
@@ -10776,7 +9781,7 @@ mod tests {
             ],
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
         app.session_id = Some(SessionId(1));
         app.room.voice_room = Some(RoomId(1));
@@ -10811,6 +9816,7 @@ mod tests {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
         app.session_id = Some(SessionId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1)],
             vec![
@@ -10819,7 +9825,7 @@ mod tests {
             ],
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
         app.room.voice_room = Some(RoomId(1));
         app.handle_network_event(NetworkEvent::ShareAvailable {
@@ -10886,12 +9892,13 @@ mod tests {
     fn background_room_file_completion_updates_its_own_history() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1), test_room_info(2)],
             vec![user_summary(UserId(1), "alice")],
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
         let transfer_id = rpc::ids::FileTransferId(9);
         let metadata = rpc::control::FileMetadata {
@@ -10942,7 +9949,8 @@ mod tests {
         app.room
             .complete_history_fetch(RoomId(1), None, &messages, false);
         app.room.merge_history(RoomId(1), messages);
-        app.view.sync_active(&app.room);
+        let (core, view) = app.parts_mut();
+        view.sync_independent(&core.room);
 
         app.request_older_history_if_at_top(40, 5);
         assert!(rx.try_recv().is_err());
@@ -11402,6 +10410,7 @@ mod tests {
         let room_1 = test_room_info(1);
         let mut room_2 = test_room_info(2);
         room_2.head = Some(MessageId(10));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[room_1, room_2],
             vec![
@@ -11410,9 +10419,10 @@ mod tests {
             ],
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
-        app.view.switch_room(RoomId(1), &app.room);
+        let (core, view) = app.parts_mut();
+        view.switch_room(RoomId(1), &core.room);
 
         app.handle_network_event(NetworkEvent::Chat(test_chat_record(
             RoomId(2),
@@ -11428,8 +10438,9 @@ mod tests {
         );
         assert!(app.view.status.text().contains("message ID is 10"));
         assert!(app.room.set_viewed_room(RoomId(2)));
-        app.view.switch_room(RoomId(2), &app.room);
-        app.view.sync_active(&app.room);
+        let (core, view) = app.parts_mut();
+        view.switch_room(RoomId(2), &core.room);
+        view.sync_independent(&core.room);
         assert_eq!(app.view.active.chat.len(), 1);
         let notice = app.view.active.chat.message(0);
         assert_eq!(notice.sender, "network");
@@ -11445,6 +10456,7 @@ mod tests {
     fn applied_mls_chat_acknowledges_the_durable_ui_dispatch() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[test_room_info(1)],
             vec![
@@ -11453,7 +10465,7 @@ mod tests {
             ],
             RoomId(1),
             None,
-            app.user_id,
+            user_id,
         );
         let (tx, rx) = std::sync::mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
@@ -11600,7 +10612,7 @@ mod tests {
     fn compose_normal_m_uses_binding_to_toggle_mute() {
         let mut config = Config::default();
         config.ui.default_bindings = crate::config::DefaultBindings::Vim;
-        let mut app = App::new(config, None).expect("test app");
+        let mut app = TestApp::new(config, None).expect("test app");
         let mut room = RoomMode::default();
         room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert_eq!(app.view.composer.mode(), EditorMode::Normal);
@@ -11703,6 +10715,7 @@ mod tests {
         app.room.server_alias = "local".to_string();
         app.user_id = Some(UserId(1));
         enter_test_room(&mut app);
+        let user_id = app.user_id;
         for (id, sender) in [(1, UserId(1)), (2, UserId(2)), (3, UserId(1))] {
             app.room.chat_received(
                 rpc::control::ChatMessage {
@@ -11716,11 +10729,12 @@ mod tests {
                     flags: rpc::control::MessageFlags::default(),
                     target: None,
                 },
-                app.user_id,
+                user_id,
             );
         }
 
-        app.view.sync_active(&app.room);
+        let (core, view) = app.parts_mut();
+        view.sync_independent(&core.room);
         let mut mode = RoomMode::with_focus(ChatPanelFocus::ChatLog);
         mode.render(&mut app, &mut Buffer::new(80, 24), 0);
         app.view.active.chat.set_cursor_to_message(0);
@@ -11764,6 +10778,7 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
         enter_test_room(&mut app);
+        let user_id = app.user_id;
         app.room.chat_received(
             rpc::control::ChatMessage {
                 message_id: MessageId(7),
@@ -11776,9 +10791,10 @@ mod tests {
                 flags: rpc::control::MessageFlags::default(),
                 target: None,
             },
-            app.user_id,
+            user_id,
         );
-        app.view.sync_active(&app.room);
+        let (core, view) = app.parts_mut();
+        view.sync_independent(&core.room);
 
         app.handle_web_request(crate::web_server::WebRequest::EditChat {
             client: 1,
@@ -11969,7 +10985,7 @@ mod tests {
         let remote = attach_test_client(&mut app, client_id);
         let selection = ThemeSelection::Builtin(config::ThemeChoice::Base16Light);
 
-        app.run_as_client(client_id, |app| app.apply_theme(selection));
+        app.apply_theme_as(client_id, selection);
         let expected_theme = app.config.ui.resolve_theme();
 
         assert_ne!(app.view.theme, expected_theme);
@@ -12077,7 +11093,7 @@ mod tests {
         assert_eq!(error_marker.fg(), app.view.theme.error.fg());
     }
 
-    fn click_top_bar_rect(app: &mut App, room: &mut RoomMode, rect: extui::Rect) {
+    fn click_top_bar_rect(app: &mut TestApp, room: &mut RoomMode, rect: extui::Rect) {
         assert!(!rect.is_empty());
         room.process_mouse(
             app,
@@ -12365,7 +11381,7 @@ mod tests {
         assert_ne!(call_header.bg(), app.view.theme.status_fill.bg());
     }
 
-    fn app_with_servers(entries: &[(&str, &str)]) -> App {
+    fn app_with_servers(entries: &[(&str, &str)]) -> TestApp {
         let mut app = test_app();
         app.config.servers.clear();
         for (label, tcp_addr) in entries {
@@ -12420,7 +11436,7 @@ mod tests {
             JoinResolution::Pair("192.168.0.1:4000".to_string())
         );
         app.start_named_join("192.168.0.1:4000".to_string());
-        let pending = app.pending_pair.as_ref().expect("pairing started");
+        let pending = app.pairing_pending().expect("pairing started");
         assert!(pending.server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX));
         assert_eq!(
             app.config.server(&pending.server.label).unwrap().token,
@@ -12442,7 +11458,7 @@ mod tests {
 
         app.start_named_join("0.0.0.0:41000".to_string());
 
-        assert!(app.pending_pair.is_none());
+        assert!(app.pairing_pending().is_none());
         assert_eq!(app.view.status.kind(), StatusKind::Error);
     }
 
@@ -12451,7 +11467,7 @@ mod tests {
         let mut app = app_with_servers(&[("lab", "10.0.0.1:4000")]);
         assert_eq!(app.resolve_join("does-not-exist"), JoinResolution::NoMatch);
         app.start_named_join("does-not-exist".to_string());
-        assert!(app.pending_pair.is_none());
+        assert!(app.pairing_pending().is_none());
         assert_eq!(app.view.status.kind(), StatusKind::Error);
         assert!(matches!(
             app.take_terminal_event(),

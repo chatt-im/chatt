@@ -110,43 +110,6 @@ pub(crate) struct ServerEditUpdate {
     pub(crate) server: ServerEntry,
 }
 
-pub(crate) struct PendingPair {
-    pub(crate) server: ServerEntry,
-    /// Open-pairing context: either the existing dynamic token used to preserve
-    /// identity on re-pair, or the client-generated recovery secret for a first
-    /// join. `None` for invite pairing.
-    pub(crate) open: Option<String>,
-    /// Password used by the latest open-pairing attempt. Retained until pairing
-    /// finishes so a username-collision retry does not challenge for it again.
-    /// Empty before a password is submitted and unused for invite pairing.
-    pub(crate) open_password: String,
-    /// Invite pairing code, retained so a rejected attempt (e.g. the username was
-    /// taken) can be retried with a new username. `None` for open pairing.
-    pub(crate) pairing_code: Option<String>,
-    pub(crate) completion: PairCompletion,
-}
-
-impl PendingPair {
-    /// Returns the password and existing token for an open-pair attempt.
-    /// Supplying a password replaces the retained value; omitting it reuses the
-    /// latest value for a retry that changed only the username.
-    pub(super) fn open_pair_credentials(
-        &mut self,
-        password: Option<String>,
-    ) -> Option<(String, String)> {
-        let existing_token = self.open.clone()?;
-        if let Some(password) = password {
-            self.open_password = password;
-        }
-        Some((self.open_password.clone(), existing_token))
-    }
-}
-
-pub(crate) enum PairCompletion {
-    OpenEditor,
-    Reconnect { label: String },
-}
-
 impl ServerEditDraft {
     pub(crate) fn from_server(server: &ServerEntry, config: &Config) -> Self {
         let download_choice = DownloadChoice::from_override(server.files.download);
@@ -762,6 +725,7 @@ pub(crate) fn default_join_username() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{PairCompletion, PendingPair};
     use rpc::ids::RoomId;
 
     fn overridden_entry() -> ServerEntry {
