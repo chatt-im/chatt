@@ -2,7 +2,7 @@
 // Copyright by contributors to this project.
 // SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use mls_rs_core::{
     key_package::{KeyPackageData, KeyPackageStorage},
@@ -103,7 +103,7 @@ impl RedbKeyPackageStorage {
         };
 
         let Some(expiration) = expiration else {
-            transaction.commit().map_err(database_error)?;
+            transaction.abort().map_err(database_error)?;
             return Ok(());
         };
 
@@ -156,6 +156,10 @@ impl RedbKeyPackageStorage {
             let packages = transaction
                 .open_table(KEY_PACKAGES)
                 .map_err(database_error)?;
+            let indexed_ids: HashSet<&[u8]> = indexed
+                .iter()
+                .map(|(_, id)| id.as_slice())
+                .collect();
             for (expiration, id) in &indexed {
                 let record = packages
                     .get(id.as_slice())
@@ -176,16 +180,17 @@ impl RedbKeyPackageStorage {
             for entry in packages.iter().map_err(database_error)? {
                 let (id, record) = entry.map_err(database_error)?;
                 let (expiration, _) = decode_record(record.value())?;
-                if expiration < time
-                    && !indexed.iter().any(|(indexed_expiration, indexed_id)| {
-                        *indexed_expiration == expiration && indexed_id == id.value()
-                    })
-                {
+                if expiration < time && !indexed_ids.contains(id.value()) {
                     return Err(RedbDataStorageError::SecondaryIndexInconsistency(
                         "expired primary record is absent from expiry index".into(),
                     ));
                 }
             }
+        }
+
+        if indexed.is_empty() {
+            transaction.abort().map_err(database_error)?;
+            return Ok(());
         }
 
         {

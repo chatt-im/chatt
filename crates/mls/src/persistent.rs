@@ -13,7 +13,6 @@
 
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
     path::Path,
     sync::Mutex,
 };
@@ -1606,23 +1605,7 @@ fn validate_event(
     Ok(())
 }
 
-fn prepare_database_file(path: &Path) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(path) {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(format!("failed to create {}: {error}", path.display())),
-    }
-}
-
 fn open_storage(path: &Path) -> Result<RedbDataStorageEngine, String> {
-    prepare_database_file(path)?;
     RedbDataStorageEngine::open(path).map_err(|error| error.to_string())
 }
 

@@ -114,7 +114,7 @@ impl MutationDenied {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmRoom {
     pub room_id: RoomId,
     pub user_a: UserId,
@@ -919,11 +919,16 @@ impl RoomStore {
 
     pub(crate) fn enable_async_state_writes(&mut self, notifier: Arc<EventNotifier>) {
         if self.state_writer.is_some() && self.state_events.is_none() {
-            self.state_events = Some(Arc::new(EventQueue::new(
+            let events = Arc::new(EventQueue::new(
                 notifier,
                 ROOM_STATE_EVENTS,
                 "room-state",
-            )));
+            ));
+            self.state_writer
+                .as_ref()
+                .expect("state writer checked")
+                .set_events(Arc::clone(&events));
+            self.state_events = Some(events);
         }
     }
 
@@ -1596,28 +1601,35 @@ impl RoomStore {
         })
     }
 
-    pub(crate) fn drain_dm_completions(&mut self) -> VecDeque<DmCompletion> {
+    pub(crate) fn drain_dm_completions(&mut self) -> Result<VecDeque<DmCompletion>, String> {
         let Some(events) = &self.state_events else {
-            return VecDeque::new();
+            return Ok(VecDeque::new());
         };
         let mut replies = events.drain_up_to(16);
         let mut completed = VecDeque::new();
         while let Some(reply) = replies.pop_front() {
+            let (operation_id, result) = match reply {
+                StateWriteEvent::Dm {
+                    operation_id,
+                    result,
+                } => (operation_id, result),
+                StateWriteEvent::Fatal { error } => return Err(error),
+            };
             let Some(pending) = self.pending_dm.take() else {
                 kvlog::warn!(
                     "unexpected room state completion",
-                    operation_id = reply.operation_id
+                    operation_id
                 );
                 continue;
             };
-            if pending.operation_id != reply.operation_id {
+            if pending.operation_id != operation_id {
                 kvlog::error!(
                     "room state completion id mismatch",
                     expected = pending.operation_id,
-                    actual = reply.operation_id
+                    actual = operation_id
                 );
             }
-            if reply.result.is_ok() {
+            if result.is_ok() {
                 let room_id = pending.room.room_id;
                 let path = self
                     .data_dir
@@ -1642,11 +1654,11 @@ impl RoomStore {
             completed.push_back(DmCompletion {
                 operation_id: pending.operation_id,
                 room: pending.room,
-                result: reply.result
+                result: result
                     .map_err(|error| format!("dm room registry write failed: {error}")),
             });
         }
-        completed
+        Ok(completed)
     }
 
     /// Queues one keyed watermark update without waiting for the transaction;
@@ -1656,7 +1668,12 @@ impl RoomStore {
         let Some(writer) = &self.state_writer else {
             return;
         };
-        writer.enqueue_watermark(room_id, next);
+        if let Err(error) = writer.enqueue_watermark(room_id, next) {
+            kvlog::error!(
+                "room state watermark rejected; server must stop before allocating more ids",
+                error = error.as_str()
+            );
+        }
     }
 
     /// Atomically reserves the dynamic id and records the DM participants,
@@ -2256,7 +2273,11 @@ mod tests {
         poll.poll(&mut events, Some(std::time::Duration::from_secs(2)))
             .unwrap();
         assert_ne!(notifier.take_ready() & ROOM_STATE_EVENTS, 0);
-        let completion = store.drain_dm_completions().pop_front().unwrap();
+        let completion = store
+            .drain_dm_completions()
+            .unwrap()
+            .pop_front()
+            .unwrap();
         completion.result.unwrap();
         let dm = completion.room.room_id;
         let log_path = dir.join("rooms").join(format!("{}.log", dm.0));
@@ -2279,6 +2300,39 @@ mod tests {
         let mut reopened = RoomStore::open(Some(dir.to_path_buf()), &[]);
         let fresh = reopened.open_dm(UserId(3), UserId(4), 2_000).unwrap();
         assert_ne!(fresh, dm, "the async room id tombstone was not recovered");
+    }
+
+    #[test]
+    fn terminal_state_writer_failure_wakes_and_stops_the_event_loop() {
+        let dir = temp_dir("terminal-state-writer");
+        let mut poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1)).unwrap());
+        let notifier = Arc::new(EventNotifier::new(waker));
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
+        store.enable_async_state_writes(Arc::clone(&notifier));
+        store
+            .state_writer
+            .as_ref()
+            .expect("persistent store")
+            .fail_next_write();
+
+        let OpenDmResult::Pending { .. } = store
+            .begin_open_dm(UserId(1), UserId(2), 1_000)
+            .unwrap()
+        else {
+            panic!("first async DM unexpectedly already existed");
+        };
+        let mut events = mio::Events::with_capacity(2);
+        poll.poll(&mut events, Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        assert_ne!(notifier.take_ready() & ROOM_STATE_EVENTS, 0);
+
+        let error = match store.drain_dm_completions() {
+            Ok(_) => panic!("terminal state failure was not surfaced"),
+            Err(error) => error,
+        };
+        assert!(error.contains("forced room-state write failure"));
+        assert!(store.begin_open_dm(UserId(1), UserId(2), 2_000).is_err());
     }
 
     #[test]
@@ -2334,7 +2388,7 @@ mod tests {
     }
 
     #[test]
-    fn open_dm_rolls_back_when_state_persist_fails() {
+    fn open_dm_rolls_back_and_closes_writer_when_state_persist_fails() {
         let dir = temp_dir("dm-rollback");
         let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
         store
@@ -2346,8 +2400,8 @@ mod tests {
         assert!(result.is_err(), "unpersistable dm creation must fail");
         assert_eq!(store.dm_room_for(UserId(1), UserId(2)), None);
 
-        let retry = store.open_dm(UserId(1), UserId(2), 1_000).unwrap();
-        assert_eq!(store.dm_room_for(UserId(1), UserId(2)), Some(retry));
+        assert!(store.open_dm(UserId(1), UserId(2), 1_000).is_err());
+        assert_eq!(store.dm_room_for(UserId(1), UserId(2)), None);
     }
 
     #[test]
