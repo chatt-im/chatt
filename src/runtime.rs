@@ -92,12 +92,8 @@ fn run_app_inner(
             InitialMode::Servers
         };
         let primary_channel = Arc::new(ClientChannel::new_primary()?);
-        app.set_primary_channel(primary_channel.clone());
-        // Bind the initial view to the current epoch before the render thread
-        // starts, so the first sync is not mistaken for a server transition.
-        app.view.sync_active(&app.room);
+        let view = app.register_client(ClientId::PRIMARY, primary_channel.clone());
         let session = app.shared_session();
-        let view = app.shared_view();
         let config = app.shared_config();
         app.release_core_state();
 
@@ -117,7 +113,6 @@ fn run_app_inner(
                         config,
                         events: render_events.clone(),
                         initial_mode,
-                        follow_primary_view: true,
                     };
                     let result = panic::catch_unwind(AssertUnwindSafe(|| client.run()));
                     let _ = render_events.send(AppEvent::ClientCommand {
@@ -316,7 +311,7 @@ fn spawn_remote_client(
             return Err(message);
         }
     };
-    let view = app.attach_client(id, channel.clone());
+    let view = app.register_client(id, channel.clone());
     let initial_mode = if app.network.is_some() || !app.room.server_alias.is_empty() {
         InitialMode::Room
     } else {
@@ -340,7 +335,6 @@ fn spawn_remote_client(
                 config,
                 events: render_events.clone(),
                 initial_mode,
-                follow_primary_view: false,
             };
             let _ = panic::catch_unwind(AssertUnwindSafe(|| client.run()));
             let _ = render_events.send(AppEvent::ClientExited(id));

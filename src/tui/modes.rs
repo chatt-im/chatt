@@ -35,6 +35,9 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use crate::app::testing::TestApp;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     Continue,
@@ -268,7 +271,7 @@ pub(crate) enum BindingResolution {
 }
 
 #[cfg(test)]
-pub(crate) fn resolve_binding(app: &mut App, layer: LayerId, key: KeyEvent) -> BindingResolution {
+pub(crate) fn resolve_binding(app: &mut TestApp, layer: LayerId, key: KeyEvent) -> BindingResolution {
     let mut cx = app.view_cx();
     resolve_binding_cx(&mut cx, layer, key)
 }
@@ -527,7 +530,7 @@ impl ServerListMode {
     }
 
     #[cfg(test)]
-    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+    pub(crate) fn process_action(&mut self, app: &mut TestApp, command: BindCommand) -> Action {
         let action = {
             let mut cx = app.view_cx();
             self.process_action_cx(&mut cx, command)
@@ -637,7 +640,7 @@ impl RoomSwitchMode {
     }
 
     #[cfg(test)]
-    fn refresh(&mut self, app: &App) {
+    fn refresh(&mut self, app: &TestApp) {
         self.items = app.room.room_select_items(app.room.voice_room);
         self.select.refresh(&self.items);
     }
@@ -675,7 +678,7 @@ impl RoomSwitchMode {
     }
 
     #[cfg(test)]
-    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+    pub(crate) fn process_action(&mut self, app: &mut TestApp, command: BindCommand) -> Action {
         let action = {
             let mut cx = app.view_cx();
             self.process_action_cx(&mut cx, command)
@@ -914,7 +917,7 @@ impl SettingsMode {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_form_for_test(form: FormState<FieldId>, app: &mut App) -> Self {
+    pub(crate) fn with_form_for_test(form: FormState<FieldId>, app: &mut TestApp) -> Self {
         let mut session = SettingsSession::new(&app.config, &app.room.audio_devices);
         session.form = form;
         app.room.settings = Some(std::sync::Arc::new(std::sync::Mutex::new(session)));
@@ -1447,7 +1450,7 @@ impl RoomMode {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_focus(&mut self, app: &mut App, focus: ChatPanelFocus) {
+    pub(crate) fn set_focus(&mut self, app: &mut TestApp, focus: ChatPanelFocus) {
         let mut cx = app.view_cx();
         self.set_focus_cx(&mut cx, focus);
         app.drain_core_commands();
@@ -1473,7 +1476,7 @@ impl RoomMode {
     }
 
     #[cfg(test)]
-    fn workspace_layer(&self, app: &App) -> LayerId {
+    fn workspace_layer(&self, app: &TestApp) -> LayerId {
         if self.focus == ChatPanelFocus::ChatLog && app.view.active.chat.has_visual() {
             bindings::CHAT_VISUAL_LAYER
         } else {
@@ -1486,7 +1489,7 @@ impl RoomMode {
         self.set_focus_cx(cx, ChatPanelFocus::Lobby);
     }
 
-    fn submit_input(&mut self, cx: &mut ViewCx<'_>) {
+    pub(crate) fn submit_input(&mut self, cx: &mut ViewCx<'_>) {
         let Some(submission) = cx.view.submit_composer() else {
             return;
         };
@@ -2685,7 +2688,7 @@ macro_rules! app_mode_test_bridge {
             impl $mode {
                 pub(crate) fn render(
                     &mut self,
-                    app: &mut App,
+                    app: &mut TestApp,
                     buf: &mut Buffer,
                     now_ms: u64,
                 ) {
@@ -2696,7 +2699,7 @@ macro_rules! app_mode_test_bridge {
                     app.drain_core_commands();
                 }
 
-                pub(crate) fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+                pub(crate) fn process_input(&mut self, app: &mut TestApp, key: KeyEvent) -> Action {
                     let action = {
                         let mut cx = app.view_cx();
                         AppMode::process_input(self, &mut cx, key)
@@ -2707,7 +2710,7 @@ macro_rules! app_mode_test_bridge {
 
                 pub(crate) fn process_mouse(
                     &mut self,
-                    app: &mut App,
+                    app: &mut TestApp,
                     mouse: MouseEvent,
                 ) -> Action {
                     let action = {
@@ -2718,7 +2721,7 @@ macro_rules! app_mode_test_bridge {
                     action
                 }
 
-                pub(crate) fn process_paste(&mut self, app: &mut App, text: String) {
+                pub(crate) fn process_paste(&mut self, app: &mut TestApp, text: String) {
                     {
                         let mut cx = app.view_cx();
                         AppMode::process_paste(self, &mut cx, text);
@@ -2758,25 +2761,25 @@ mod tests {
     use super::*;
     use crate::{chat_buffer::LineKind, client_net::TerminalVerb, config::Config};
 
-    fn test_app() -> App {
-        App::new(Config::default(), None).expect("test app")
+    fn test_app() -> TestApp {
+        TestApp::new(Config::default(), None).expect("test app")
     }
 
     /// An app whose composer uses Vim bindings, for tests exercising the
     /// compose Normal mode.
-    fn test_app_vim() -> App {
+    fn test_app_vim() -> TestApp {
         let mut config = Config::default();
         config.ui.default_bindings = crate::config::DefaultBindings::Vim;
-        App::new(config, None).expect("test app")
+        TestApp::new(config, None).expect("test app")
     }
 
-    fn app_with_bindings(bindings: &str) -> App {
+    fn app_with_bindings(bindings: &str) -> TestApp {
         let arena = Arena::new();
         let config: Config = toml_spanner::parse(bindings, &arena)
             .expect("bindings parse")
             .to()
             .expect("bindings deserialize");
-        App::new(config, None).expect("test app")
+        TestApp::new(config, None).expect("test app")
     }
 
     fn key(ch: char) -> KeyEvent {
@@ -2960,25 +2963,27 @@ mod tests {
         }
     }
 
-    fn type_text(room: &mut RoomMode, app: &mut App, text: &str) {
+    fn type_text(room: &mut RoomMode, app: &mut TestApp, text: &str) {
         for ch in text.chars() {
             room.process_input(app, key(ch));
         }
     }
 
-    fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
+    fn render_room(app: &mut TestApp, room: &mut RoomMode, buffer: &mut Buffer) {
         // The runtime loop catches the view up to the session before painting.
-        app.view.sync_active(&app.room);
+        let (core, view) = app.parts_mut();
+        view.sync_independent(&core.room);
         room.render(app, buffer, 0);
     }
 
     fn render_room_sections(
-        app: &mut App,
+        app: &mut TestApp,
         room: &mut RoomMode,
         buffer: &mut Buffer,
         dirty: DirtySections,
     ) {
-        app.view.sync_active(&app.room);
+        let (core, view) = app.parts_mut();
+        view.sync_independent(&core.room);
         {
             let mut cx = app.view_cx();
             AppMode::render(room, &mut cx, buffer, 0, dirty);
@@ -2989,7 +2994,7 @@ mod tests {
     /// Renders one gated frame into a retained buffer and returns the bytes
     /// it emitted, feeding them to `term` when given.
     fn gated_frame(
-        app: &mut App,
+        app: &mut TestApp,
         room: &mut RoomMode,
         buffer: &mut Buffer,
         dirty: DirtySections,
@@ -3029,7 +3034,7 @@ mod tests {
         text
     }
 
-    fn enter_room_one(app: &mut App) {
+    fn enter_room_one(app: &mut TestApp) {
         if app.room.viewed_room.is_some() {
             return;
         }
@@ -3037,7 +3042,7 @@ mod tests {
     }
 
     /// Registers public rooms named `room-<id>`, viewing the first.
-    fn enter_rooms(app: &mut App, ids: &[u32]) {
+    fn enter_rooms(app: &mut TestApp, ids: &[u32]) {
         let rooms: Vec<rpc::control::RoomInfo> = ids
             .iter()
             .map(|id| rpc::control::RoomInfo {
@@ -3054,7 +3059,8 @@ mod tests {
             .collect();
         app.room
             .authenticated(&rooms, Vec::new(), RoomId(ids[0]), None, None);
-        app.view.switch_room(RoomId(ids[0]), &app.room);
+        let (core, view) = app.parts_mut();
+        view.switch_room(RoomId(ids[0]), &core.room);
     }
 
     #[test]
@@ -3226,14 +3232,15 @@ mod tests {
     /// seeded previous frame, as the client loop does from the second room
     /// frame onward.
     fn frame_bytes(
-        app: &mut App,
+        app: &mut TestApp,
         room: &mut RoomMode,
         buffer: &mut Buffer,
         dirty: DirtySections,
         frame_retained: bool,
         term: &mut vt100::Parser,
     ) -> Vec<u8> {
-        app.view.sync_active(&app.room);
+        let (core, view) = app.parts_mut();
+        view.sync_independent(&core.room);
         {
             let mut cx = app.view_cx();
             cx.frame_retained = frame_retained;
@@ -3262,7 +3269,7 @@ mod tests {
     /// by background only: an explicit space write, an \x1b[K erase, and a
     /// never-touched cell legitimately disagree on the invisible foreground
     /// and on whether the cell holds " " or "".
-    fn assert_matches_full_redraw(app: &mut App, gated_term: &vt100::Parser) {
+    fn assert_matches_full_redraw(app: &mut TestApp, gated_term: &vt100::Parser) {
         let mut room = RoomMode::new();
         let mut buffer = Buffer::new(80, 24);
         let mut term = vt100::Parser::new(24, 80, 0);
@@ -3296,7 +3303,7 @@ mod tests {
     /// Seeds a room whose chat overflows the viewport (alternating senders,
     /// so each message carries a heading row) and paints the first full frame.
     fn scrolled_room_fixture(
-        app: &mut App,
+        app: &mut TestApp,
         room: &mut RoomMode,
         buffer: &mut Buffer,
         term: &mut vt100::Parser,
@@ -3471,7 +3478,7 @@ mod tests {
     }
 
     fn push_room_message(
-        app: &mut App,
+        app: &mut TestApp,
         message_id: u64,
         sender: UserId,
         timestamp_ms: u64,
@@ -3492,10 +3499,11 @@ mod tests {
             },
             None,
         );
-        app.view.sync_active(&app.room);
+        let (core, view) = app.parts_mut();
+        view.sync_independent(&core.room);
     }
 
-    fn push_file_message(app: &mut App, message_id: u64, transfer_id: FileTransferId) {
+    fn push_file_message(app: &mut TestApp, message_id: u64, transfer_id: FileTransferId) {
         enter_room_one(app);
         app.room.chat_received(
             ChatMessage {
@@ -3511,7 +3519,8 @@ mod tests {
             },
             None,
         );
-        app.view.sync_active(&app.room);
+        let (core, view) = app.parts_mut();
+        view.sync_independent(&core.room);
     }
 
     #[test]
@@ -3735,7 +3744,7 @@ mod tests {
 
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
         let cursor_message =
-            |app: &crate::app::App| app.view.active.chat.cursor().map(|c| c.message);
+            |app: &TestApp| app.view.active.chat.cursor().map(|c| c.message);
         assert_eq!(cursor_message(&app), Some(2));
 
         room.process_input(&mut app, key('k'));
@@ -4315,6 +4324,7 @@ mod tests {
         let mut room = RoomMode::default();
         let room_id = RoomId(0x8000_0001);
         app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
         app.room.authenticated(
             &[rpc::control::RoomInfo {
                 room_id,
@@ -4332,7 +4342,7 @@ mod tests {
             ],
             room_id,
             None,
-            app.user_id,
+            user_id,
         );
         app.room.set_e2e_trust_state(
             room_id,

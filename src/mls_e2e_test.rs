@@ -27,11 +27,11 @@ use server::{
 };
 
 use crate::{
-    app::{AppEvent, NetworkEventSender},
+    app::{AppEvent, NetworkEventSender, PairingEventSender},
     audio::{LocalVoiceFrame, VoicePayload},
     client_net::{
         ClientConfig, FilePolicy, NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE,
-        UploadFileRequest, spawn_device_pair_once,
+        PairingEvent, UploadFileRequest, spawn_device_pair_once,
     },
     config::{CandidatePrivacy, DownloadTarget, EffectiveFiles},
     receive_store::DownloadStore,
@@ -367,17 +367,17 @@ fn pair_device(
         device_name.to_string(),
         false,
         cancellation,
-        NetworkEventSender::for_test(tx),
-    );
+        PairingEventSender::for_test(tx, 1),
+    ).expect("spawn device pairing");
     let result = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
-    let AppEvent::Network(NetworkEvent::DevicePairingSucceeded {
+    let AppEvent::Pairing { event: PairingEvent::DeviceSucceeded {
         token,
         username,
         udp_addr,
         udp_probe_addr,
         server_public_key,
-    }) = result else {
+    }, .. } = result else {
         panic!("device pairing did not succeed");
     };
     pair_config.token = token;
@@ -1556,14 +1556,14 @@ fn mls_live_pair_response_loss_reconciles_exact_device() {
         "pair loss linked".to_string(),
         false,
         Arc::new(AtomicU8::new(PAIRING_CANCELABLE)),
-        NetworkEventSender::for_test(tx),
-    );
+        PairingEventSender::for_test(tx, 1),
+    ).expect("spawn device pairing");
     let failed = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
     proxy.join().unwrap();
     assert!(matches!(
         failed,
-        AppEvent::Network(NetworkEvent::DevicePairingFailed { .. })
+        AppEvent::Pairing { event: PairingEvent::DeviceFailed { .. }, .. }
     ));
 
     pair_config.tcp_addr = addrs.tcp.clone();
@@ -1575,17 +1575,17 @@ fn mls_live_pair_response_loss_reconciles_exact_device() {
         "pair loss linked".to_string(),
         false,
         Arc::new(AtomicU8::new(PAIRING_CANCELABLE)),
-        NetworkEventSender::for_test(tx),
-    );
+        PairingEventSender::for_test(tx, 2),
+    ).expect("spawn device pairing");
     let recovered = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
-    let AppEvent::Network(NetworkEvent::DevicePairingSucceeded {
+    let AppEvent::Pairing { event: PairingEvent::DeviceSucceeded {
         token,
         username,
         udp_addr,
         udp_probe_addr,
         server_public_key,
-    }) = recovered
+    }, .. } = recovered
     else {
         panic!("pair response loss retry did not reconcile")
     };
@@ -1751,11 +1751,11 @@ fn mls_live_pair_close_cancel_future_history_and_revocation() {
         "must not link".into(),
         false,
         Arc::new(AtomicU8::new(PAIRING_CANCELABLE)),
-        NetworkEventSender::for_test(tx),
-    );
+        PairingEventSender::for_test(tx, 1),
+    ).expect("spawn device pairing");
     let result = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
-    assert!(matches!(result, AppEvent::Network(NetworkEvent::DevicePairingFailed { .. })));
+    assert!(matches!(result, AppEvent::Pairing { event: PairingEvent::DeviceFailed { .. }, .. }));
 
     // The surviving paired installation remains restartable after all roster
     // and membership changes.

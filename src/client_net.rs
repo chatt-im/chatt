@@ -63,7 +63,7 @@ use rpc::{
 #[cfg(test)]
 use rpc::evented::ReadPumpOutcome;
 
-use crate::app::NetworkEventSender;
+use crate::app::{NetworkEventSender, PairingEventSender};
 use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
     VoicePayload as AudioVoicePayload,
@@ -667,21 +667,6 @@ pub enum NetworkEvent {
         device_name: String,
     },
     DeviceLinkCanceled,
-    DevicePairingSucceeded {
-        token: String,
-        username: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
-        server_public_key: String,
-    },
-    DevicePairingIdentityExists {
-        message: String,
-        transfer_password: String,
-    },
-    DevicePairingFailed {
-        message: String,
-        transfer_password: String,
-    },
     /// A typed MLS delivery response for the MLS runtime boundary.
     Mls(ServerControl),
     /// One chunk of server-retained history for a room.
@@ -846,28 +831,6 @@ pub enum NetworkEvent {
     LocalIdentityUnavailable {
         message: String,
     },
-    PairingSucceeded,
-    PairingFailed(String),
-    /// A pairing/open-pairing attempt was rejected because the chosen username is
-    /// already registered on the server. The user should pick another.
-    UsernameTaken {
-        message: String,
-    },
-    /// Open pairing succeeded. Carries the issued bearer token and the server's
-    /// trusted-on-first-use Ed25519 public key (hex), both to be persisted.
-    OpenPairingSucceeded {
-        token: String,
-        server_public_key: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
-    },
-    /// Open pairing needs a password (either required or the last one was wrong).
-    /// `retry` is true when a password was already tried and rejected. Carries
-    /// the trusted-on-first-use Ed25519 public key (hex) to pin before retrying.
-    OpenPairingNeedsPassword {
-        retry: bool,
-        server_public_key: String,
-    },
     /// The server selected plaintext ExternalSecureLink transport, while this
     /// saved server still requires chatt-native encryption.
     NativeEncryptionRequired,
@@ -883,6 +846,39 @@ pub enum NetworkEvent {
     },
     WorkerStopped {
         reason: String,
+    },
+}
+
+/// Results emitted only by the short-lived invite/open/device pairing workers.
+#[derive(Clone, Debug)]
+pub(crate) enum PairingEvent {
+    InviteSucceeded,
+    Failed(String),
+    UsernameTaken(String),
+    OpenSucceeded {
+        token: String,
+        server_public_key: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
+    },
+    OpenNeedsPassword {
+        retry: bool,
+        server_public_key: String,
+    },
+    DeviceSucceeded {
+        token: String,
+        username: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
+        server_public_key: String,
+    },
+    DeviceIdentityExists {
+        message: String,
+        transfer_password: String,
+    },
+    DeviceFailed {
+        message: String,
+        transfer_password: String,
     },
 }
 
@@ -1005,20 +1001,20 @@ impl Drop for NetworkClient {
 pub fn spawn_pair_once(
     config: ClientConfig,
     pairing_code: String,
-    events: NetworkEventSender,
-) -> JoinHandle<()> {
+    events: PairingEventSender,
+) -> Result<JoinHandle<()>, String> {
     thread::Builder::new()
         .name("chatt-pair".to_string())
         .stack_size(256 * 1024)
         .spawn(move || {
             let event = match pair_once(&config, pairing_code) {
-                Ok(()) => NetworkEvent::PairingSucceeded,
-                Err(PairFailure::UsernameTaken(message)) => NetworkEvent::UsernameTaken { message },
-                Err(PairFailure::Other(error)) => NetworkEvent::PairingFailed(error),
+                Ok(()) => PairingEvent::InviteSucceeded,
+                Err(PairFailure::UsernameTaken(message)) => PairingEvent::UsernameTaken(message),
+                Err(PairFailure::Other(error)) => PairingEvent::Failed(error),
             };
             let _ = events.send(event);
         })
-        .expect("failed to spawn pairing worker")
+        .map_err(|error| format!("failed to spawn pairing worker: {error}"))
 }
 
 pub(crate) const PAIRING_CANCELABLE: u8 = 0;
@@ -1032,8 +1028,8 @@ pub fn spawn_device_pair_once(
     device_name: String,
     overwrite_existing: bool,
     cancellation: Arc<AtomicU8>,
-    events: NetworkEventSender,
-) -> JoinHandle<()> {
+    events: PairingEventSender,
+) -> Result<JoinHandle<()>, String> {
     thread::Builder::new()
         .name("chatt-device-pair".to_string())
         .stack_size(256 * 1024)
@@ -1049,7 +1045,7 @@ pub fn spawn_device_pair_once(
                 &cancellation,
             ) {
                 Ok((token, username, udp_addr, udp_probe_addr, server_public_key)) => {
-                    NetworkEvent::DevicePairingSucceeded {
+                    PairingEvent::DeviceSucceeded {
                         token,
                         username,
                         udp_addr,
@@ -1058,12 +1054,12 @@ pub fn spawn_device_pair_once(
                     }
                 }
                 Err(DevicePairFailure::IdentityExists { message }) => {
-                    NetworkEvent::DevicePairingIdentityExists {
+                    PairingEvent::DeviceIdentityExists {
                         message,
                         transfer_password: std::mem::take(&mut transfer_password),
                     }
                 }
-                Err(DevicePairFailure::Other(message)) => NetworkEvent::DevicePairingFailed {
+                Err(DevicePairFailure::Other(message)) => PairingEvent::DeviceFailed {
                     message,
                     transfer_password: std::mem::take(&mut transfer_password),
                 },
@@ -1072,7 +1068,7 @@ pub fn spawn_device_pair_once(
             transfer_password.zeroize();
             let _ = events.send(event);
         })
-        .expect("failed to spawn device-pairing worker")
+        .map_err(|error| format!("failed to spawn device-pairing worker: {error}"))
 }
 
 fn device_pair_once(
@@ -1367,8 +1363,8 @@ pub fn spawn_open_pair_once(
     config: ClientConfig,
     password: String,
     existing_token: String,
-    events: NetworkEventSender,
-) -> JoinHandle<()> {
+    events: PairingEventSender,
+) -> Result<JoinHandle<()>, String> {
     thread::Builder::new()
         .name("chatt-open-pair".to_string())
         .stack_size(256 * 1024)
@@ -1379,7 +1375,7 @@ pub fn spawn_open_pair_once(
                     server_public_key,
                     udp_addr,
                     udp_probe_addr,
-                } => NetworkEvent::OpenPairingSucceeded {
+                } => PairingEvent::OpenSucceeded {
                     token,
                     server_public_key,
                     udp_addr,
@@ -1388,16 +1384,16 @@ pub fn spawn_open_pair_once(
                 OpenPairOutcome::NeedsPassword {
                     retry,
                     server_public_key,
-                } => NetworkEvent::OpenPairingNeedsPassword {
+                } => PairingEvent::OpenNeedsPassword {
                     retry,
                     server_public_key,
                 },
-                OpenPairOutcome::UsernameTaken(message) => NetworkEvent::UsernameTaken { message },
-                OpenPairOutcome::Failed(error) => NetworkEvent::PairingFailed(error),
+                OpenPairOutcome::UsernameTaken(message) => PairingEvent::UsernameTaken(message),
+                OpenPairOutcome::Failed(error) => PairingEvent::Failed(error),
             };
             let _ = events.send(event);
         })
-        .expect("failed to spawn open pairing worker")
+        .map_err(|error| format!("failed to spawn open pairing worker: {error}"))
 }
 
 fn run_worker(
