@@ -5,12 +5,10 @@
 use mls_rs_codec::{MlsDecode, MlsEncode, MlsSize};
 use mls_rs_core::time::MlsTime;
 use mls_rs_core::{
-    crypto::SignatureSecretKey, error::IntoAnyError, extension::ExtensionList, group::Member,
-    identity::IdentityProvider,
+    crypto::SignatureSecretKey, error::IntoAnyError, group::Member, identity::IdentityProvider,
 };
 
 use crate::{
-    cipher_suite::CipherSuite,
     client::MlsError,
     external_client::ExternalClientConfig,
     group::{
@@ -31,11 +29,18 @@ use crate::{
         Welcome,
     },
     identity::SigningIdentity,
-    protocol_version::ProtocolVersion,
     psk::AlwaysFoundPskStorage,
-    tree_kem::{node::LeafIndex, path_secret::PathSecret, TreeKemPrivate},
+    tree_kem::{path_secret::PathSecret, TreeKemPrivate},
     CryptoProvider, KeyPackage, MlsMessage,
 };
+
+#[cfg(feature = "by_ref_proposal")]
+use crate::{
+    cipher_suite::CipherSuite, protocol_version::ProtocolVersion, tree_kem::node::LeafIndex,
+};
+
+#[cfg(feature = "by_ref_proposal")]
+use mls_rs_core::extension::ExtensionList;
 
 #[cfg(all(
     feature = "by_ref_proposal",
@@ -80,6 +85,7 @@ use crate::{
 #[cfg(feature = "private_message")]
 use crate::group::framing::PrivateMessage;
 
+#[cfg(feature = "by_ref_proposal")]
 use alloc::boxed::Box;
 
 /// The result of processing an [ExternalGroup](ExternalGroup) message using
@@ -111,6 +117,7 @@ where
     pub(crate) config: C,
     pub(crate) cipher_suite_provider: <C::CryptoProvider as CryptoProvider>::CipherSuiteProvider,
     pub(crate) state: GroupState,
+    #[cfg(feature = "by_ref_proposal")]
     pub(crate) signing_data: Option<(SignatureSecretKey, SigningIdentity)>,
 }
 
@@ -118,7 +125,7 @@ impl<C: ExternalClientConfig + Clone> ExternalGroup<C> {
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     pub(crate) async fn join(
         config: C,
-        signing_data: Option<(SignatureSecretKey, SigningIdentity)>,
+        _signing_data: Option<(SignatureSecretKey, SigningIdentity)>,
         group_info: MlsMessage,
         tree_data: Option<ExportedTree<'_>>,
         maybe_time: Option<MlsTime>,
@@ -157,7 +164,8 @@ impl<C: ExternalClientConfig + Clone> ExternalGroup<C> {
 
         Ok(Self {
             config,
-            signing_data,
+            #[cfg(feature = "by_ref_proposal")]
+            signing_data: _signing_data,
             state: GroupState::new(
                 group_info.group_context,
                 public_tree,

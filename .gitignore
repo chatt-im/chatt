@@ -9,3 +9,4 @@
 /dev/public-server-data/*
 !/dev/public-server-data/users.toml
 /web/public/emoji.db
+/crates/mls-rs/Cargo.lock

@@ -22,9 +22,6 @@ use mls_rs_core::{
 };
 use zeroize::ZeroizeOnDrop;
 
-#[cfg(feature = "private_message")]
-use alloc::boxed::Box;
-
 #[cfg(feature = "custom_proposal")]
 use crate::group::proposal::CustomProposal;
 
