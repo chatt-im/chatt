@@ -2,7 +2,7 @@ use aws_lc_rs::{
     aead::{self, Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey},
     agreement, digest, hkdf, hmac, rand,
     rand::SecureRandom,
-    signature::{self, KeyPair},
+    signature::{self, KeyPair, VerificationAlgorithm},
 };
 
 use jsony::Jsony;
@@ -344,8 +344,9 @@ pub fn complete_client_transport_handshake(
     }
     let trusted = resolve_server_public_key(server_hello, pinned_server_public_key)?;
     let transcript = full_transcript(&handshake.hello, server_hello, &trusted)?;
-    signature::UnparsedPublicKey::new(&signature::ED25519, &trusted)
-        .verify(
+    signature::ED25519
+        .verify_sig(
+            &trusted,
             &server_transcript(
                 &handshake.hello,
                 server_hello.version,

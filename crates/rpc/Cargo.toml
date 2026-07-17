@@ -7,5 +7,5 @@ edition = "2024"
 jsony = "0.1.10"
 libc = "0.2"
 mio = { version = "1.2.1", features = ["os-poll"] }
-aws-lc-rs = "1.16.3"
+aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
 toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
