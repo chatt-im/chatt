@@ -23,7 +23,7 @@ use rpc::{
 use server::{
     Server,
     config::{Config as ServerConfig, RoomConfig, RoomPersistenceConfig, TransportModeConfig, UserConfig, hash_secret},
-    local_admin::AdminCommand,
+    local_admin::{AdminCommand, AdminSender},
 };
 
 use crate::{
@@ -119,7 +119,7 @@ impl LinkedMatrixSpan {
 struct Addrs {
     tcp: String,
     udp: String,
-    admin: mpsc::Sender<AdminCommand>,
+    admin: AdminSender,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -259,9 +259,9 @@ fn start_server_with(root: &Path, rooms: Vec<RoomConfig>, users: Vec<UserConfig>
     server.seed_users(users).unwrap();
     let tcp = server.tcp_local_addr().unwrap().to_string();
     let udp = server.udp_local_addr().unwrap().to_string();
-    let (admin, rx) = mpsc::channel();
+    let admin = server.admin_sender();
     let worker = thread::Builder::new().name("mls-e2e-server".into()).spawn(move || {
-        let _ = server.run(&rx);
+        let _ = server.run();
     }).unwrap();
     Addrs { tcp, udp, admin, worker: Some(worker) }
 }

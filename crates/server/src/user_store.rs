@@ -100,6 +100,22 @@ impl UserStore {
         username: String,
         token_hash: String,
     ) -> Result<UserConfig, String> {
+        let (user, users) = self.prepare_mark_user_paired(
+            internal_reference,
+            username,
+            token_hash,
+        )?;
+        self.save_state(&users)?;
+        self.users = users;
+        Ok(user)
+    }
+
+    pub(crate) fn prepare_mark_user_paired(
+        &self,
+        internal_reference: &str,
+        username: String,
+        token_hash: String,
+    ) -> Result<(UserConfig, Vec<UserConfig>), String> {
         if !valid_username(&username) {
             return Err("username must be 1-64 bytes with no control characters".to_string());
         }
@@ -112,9 +128,7 @@ impl UserStore {
             user.username = username;
             user.token_hash = token_hash;
             let user = user.clone();
-            self.save_state(&users)?;
-            self.users = users;
-            return Ok(user);
+            return Ok((user, users));
         }
 
         let id = users
@@ -135,9 +149,7 @@ impl UserStore {
             token_hash,
         };
         users.push(user.clone());
-        self.save_state(&users)?;
-        self.users = users;
-        Ok(user)
+        Ok((user, users))
     }
 
     /// Updates a user's username and persists the registry.
@@ -150,6 +162,17 @@ impl UserStore {
         user_id: UserId,
         username: String,
     ) -> Result<UserConfig, String> {
+        let (user, users) = self.prepare_set_user_username(user_id, username)?;
+        self.save_state(&users)?;
+        self.users = users;
+        Ok(user)
+    }
+
+    pub(crate) fn prepare_set_user_username(
+        &self,
+        user_id: UserId,
+        username: String,
+    ) -> Result<(UserConfig, Vec<UserConfig>), String> {
         if !valid_username(&username) {
             return Err("username must be 1-64 bytes with no control characters".to_string());
         }
@@ -160,9 +183,15 @@ impl UserStore {
         };
         user.username = username;
         let user = user.clone();
-        self.save_state(&users)?;
+        Ok((user, users))
+    }
+
+    pub(crate) fn persistence_path(&self) -> Option<PathBuf> {
+        self.path.clone()
+    }
+
+    pub(crate) fn install_users(&mut self, users: Vec<UserConfig>) {
         self.users = users;
-        Ok(user)
     }
 
     fn save_state(&self, users: &[UserConfig]) -> Result<(), String> {
@@ -176,7 +205,7 @@ impl UserStore {
         atomic_write_toml(path, &Self::snapshot(users))
     }
 
-    fn snapshot(users: &[UserConfig]) -> String {
+    pub(crate) fn snapshot(users: &[UserConfig]) -> String {
         let mut out = String::new();
         out.push_str("# chatt server user registry. Managed by the server; do not edit.\n\n");
         for user in users {

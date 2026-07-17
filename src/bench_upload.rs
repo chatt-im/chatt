@@ -215,10 +215,7 @@ fn upload_50mb_loopback() {
     thread::Builder::new()
         .name("bench-server".to_string())
         .spawn(move || {
-            // The admin channel is unused here; keep the sender alive for the
-            // thread's lifetime so `run` never sees a disconnected receiver.
-            let (_admin_tx, admin_rx) = mpsc::channel();
-            let _ = server.run(&admin_rx);
+            let _ = server.run();
         })
         .expect("spawn server thread");
     let addrs = ServerAddrs { tcp, udp };

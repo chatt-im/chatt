@@ -21,7 +21,7 @@ use hashbrown::HashMap;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use rpc::ids::UserId;
@@ -114,6 +114,14 @@ impl UsernameRegistry {
         self.by_user.get(&user_id).map(String::as_str)
     }
 
+    pub(crate) fn persistence_path(&self) -> Option<PathBuf> {
+        self.log.as_ref().map(|(path, _)| path.clone())
+    }
+
+    pub(crate) fn needs_dynamic_claim(&self, user_id: UserId, name: &str) -> bool {
+        self.by_user.get(&user_id).map(String::as_str) != Some(name.trim())
+    }
+
     /// Whether `name` is free, or already owned by `claimant`.
     pub fn is_available(&self, name: &str, claimant: Option<UserId>) -> bool {
         match self.owner_of(name) {
@@ -146,6 +154,24 @@ impl UsernameRegistry {
         if let Some((path, file)) = self.log.as_mut() {
             write_record(file, user_id, name)
                 .map_err(|err| format!("failed to append {}: {err}", path.display()))?;
+        }
+        self.apply_dynamic_claim(user_id, name)
+    }
+
+    pub(crate) fn apply_dynamic_claim(
+        &mut self,
+        user_id: UserId,
+        name: &str,
+    ) -> Result<(), String> {
+        if user_id.0 < FIRST_DYNAMIC_USER_ID {
+            return Err(format!("user {user_id} is not a dynamic user"));
+        }
+        if !valid_username(name) {
+            return Err("username must be 1-64 bytes with no control characters".to_string());
+        }
+        let name = name.trim();
+        if !self.is_available(name, Some(user_id)) {
+            return Err(format!("username '{name}' is already in use"));
         }
         self.set_in_memory(user_id, name);
         Ok(())
@@ -243,6 +269,21 @@ impl UsernameRegistry {
         }
         Ok(())
     }
+}
+
+pub(crate) fn persist_dynamic_claim(
+    path: &Path,
+    user_id: UserId,
+    name: &str,
+) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    write_record(&mut file, user_id, name)
+        .map_err(|error| format!("failed to append {}: {error}", path.display()))
 }
 
 /// Appends one `user_id | len:u8 | username` record. Usernames are capped at 64

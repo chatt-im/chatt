@@ -2028,7 +2028,10 @@ impl RoomSession {
         if let Some(first) = messages.first() {
             meta.history_before = Some(first.message_id);
         }
-        meta.history_at_start = at_start || messages.is_empty();
+        // Empty is not synonymous with the durable beginning of history: the
+        // server also uses an empty, non-terminal page to release a request
+        // when its bounded history work queues are saturated.
+        meta.history_at_start = at_start;
         Some(HistoryFetchCompletion {
             resident_newest_before,
         })
@@ -4503,6 +4506,25 @@ mod tests {
         room.complete_history_fetch(RoomId(1), Some(MessageId(6)), &oldest, true);
         room.merge_history(RoomId(1), oldest);
         assert_eq!(room.older_history_request(RoomId(1)), None);
+    }
+
+    #[test]
+    fn nonterminal_empty_history_reply_remains_retryable() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        assert!(room.begin_history_fetch(RoomId(1)));
+        assert!(room
+            .complete_history_fetch(RoomId(1), None, &[], false)
+            .is_some());
+        assert!(
+            room.begin_history_fetch(RoomId(1)),
+            "a scheduler-overload reply must not claim durable history is exhausted"
+        );
     }
 
     #[test]

@@ -52,7 +52,7 @@ fn opt_in_netns_mdns_resolves_local_candidate() {
     setup_ns(&ns_a, &veth_a, "10.77.0.1/24");
     setup_ns(&ns_b, &veth_b, "10.77.0.2/24");
 
-    let name = generate_mdns_name(&ring::rand::SystemRandom::new()).unwrap();
+    let name = generate_mdns_name(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
     let responder_ip: IpAddr = "10.77.0.1".parse().unwrap();
 
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();

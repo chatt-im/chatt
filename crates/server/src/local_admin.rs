@@ -56,13 +56,13 @@ mod imp {
     }
 
     impl AdminSocket {
-        pub fn spawn(commands: Sender<AdminCommand>) -> Result<Self, String> {
+        pub fn spawn(commands: super::AdminSender) -> Result<Self, String> {
             let config = socket_config()?;
             Self::spawn_with_config(config, commands)
         }
 
         #[cfg(test)]
-        fn spawn_at_path(path: PathBuf, commands: Sender<AdminCommand>) -> Result<Self, String> {
+        fn spawn_at_path(path: PathBuf, commands: super::AdminSender) -> Result<Self, String> {
             Self::spawn_with_config(
                 SocketConfig {
                     path,
@@ -74,7 +74,7 @@ mod imp {
 
         fn spawn_with_config(
             config: SocketConfig,
-            commands: Sender<AdminCommand>,
+            commands: super::AdminSender,
         ) -> Result<Self, String> {
             prepare_socket_parent(&config)?;
             let listener = bind_listener(&config.path)?;
@@ -317,7 +317,7 @@ mod imp {
         }
     }
 
-    fn handle_connection(stream: &mut UnixStream, commands: &Sender<AdminCommand>) {
+    fn handle_connection(stream: &mut UnixStream, commands: &super::AdminSender) {
         let response = match read_frame(stream, MAX_REQUEST_BYTES, "request") {
             Ok((OP_INVITE, body)) => match String::from_utf8(body) {
                 Ok(user) => {
@@ -532,11 +532,26 @@ mod imp {
             let dir = temp_test_dir("invite-round-trip");
             fs::create_dir_all(&dir).unwrap();
             let socket_path = dir.join("control.sock");
-            let (tx, rx) = mpsc::channel();
-            let socket = AdminSocket::spawn_at_path(socket_path.clone(), tx).unwrap();
-            let worker =
-                thread::spawn(
-                    move || match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            let poll = mio::Poll::new().unwrap();
+            let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(9)).unwrap());
+            let notifier = Arc::new(crate::event_queue::EventNotifier::new(waker));
+            let events = Arc::new(crate::event_queue::EventQueue::new(
+                notifier,
+                crate::event_queue::ADMIN_EVENTS,
+                "admin-test",
+            ));
+            let sender = crate::local_admin::AdminSender::new(Arc::clone(&events));
+            let socket = AdminSocket::spawn_at_path(socket_path.clone(), sender).unwrap();
+            let worker = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let command = loop {
+                    if let Some(command) = events.drain().pop_front() {
+                        break command;
+                    }
+                    assert!(Instant::now() < deadline, "admin command timeout");
+                    thread::yield_now();
+                };
+                match command {
                         AdminCommand::Invite { user, reply } => {
                             assert_eq!(user, "alice");
                             reply.send(Ok("tcj1_join".to_string())).unwrap();
@@ -546,8 +561,8 @@ mod imp {
                         | AdminCommand::MlsCompact { .. } => {
                             panic!("unexpected MLS maintenance command")
                         }
-                    },
-                );
+                    }
+            });
 
             let response = send_invite_to_path(&socket_path, "alice").unwrap();
 
@@ -678,7 +693,7 @@ mod imp {
     pub struct AdminSocket;
 
     impl AdminSocket {
-        pub fn spawn(_commands: Sender<AdminCommand>) -> Result<Self, String> {
+        pub fn spawn(_commands: super::AdminSender) -> Result<Self, String> {
             Err("chatt server control sockets are only supported on Unix".to_string())
         }
 
@@ -701,3 +716,21 @@ mod imp {
 }
 
 pub use imp::{AdminCommand, AdminSocket, mls_compact, mls_storage_status, send_invite};
+
+#[derive(Clone)]
+pub struct AdminSender {
+    events: std::sync::Arc<crate::event_queue::EventQueue<AdminCommand>>,
+}
+
+impl AdminSender {
+    pub(crate) fn new(
+        events: std::sync::Arc<crate::event_queue::EventQueue<AdminCommand>>,
+    ) -> Self {
+        Self { events }
+    }
+
+    pub fn send(&self, command: AdminCommand) -> Result<(), AdminCommand> {
+        self.events.push(command);
+        Ok(())
+    }
+}

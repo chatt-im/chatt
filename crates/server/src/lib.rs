@@ -1,7 +1,7 @@
 use hashbrown::{HashMap, HashSet};
 use std::{
     collections::VecDeque,
-    io::{self, Write},
+    io,
     net::{IpAddr, SocketAddr},
     path::Path,
     sync::mpsc,
@@ -11,8 +11,11 @@ use std::{
 };
 
 pub mod config;
+mod bug_report_writer;
 mod config_diagnostics;
+mod event_queue;
 mod history_reader;
+mod identity_writer;
 pub mod local_admin;
 mod mls_delivery;
 mod mls_service;
@@ -62,11 +65,23 @@ use rpc::{
 use config::{
     Config as ServerConfig, UserConfig, hash_secret, valid_username, value_arg, verify_secret_hash,
 };
+use bug_report_writer::{
+    BugReportWriteReply, BugReportWriteRequest, BugReportWriter,
+    EnqueueError as BugReportEnqueueError,
+};
+use event_queue::{
+    ADMIN_EVENTS, BUG_REPORT_EVENTS, EventNotifier, EventQueue, HISTORY_EVENTS, IDENTITY_EVENTS,
+    MLS_EVENTS, ROOM_LOG_EVENTS, ROOM_STATE_EVENTS, VOICE_EVENTS,
+};
 use history_reader::{HistoryReadReply, HistoryReader};
-use local_admin::{AdminCommand, AdminSocket};
+use identity_writer::{
+    EnqueueError as IdentityEnqueueError, IdentityWrite, IdentityWriteReply,
+    IdentityWriteRequest, IdentityWriter,
+};
+use local_admin::{AdminCommand, AdminSender, AdminSocket};
 use mls_delivery::MlsEventQueue;
 use mls_service::{CacheState as MlsCacheState, MlsService, PutRosterError};
-use room_store::{MutationKind, RoomStore};
+use room_store::{MutationKind, OpenDmResult, RoomStore};
 use user_store::UserStore;
 use username_registry::UsernameRegistry;
 use voice_relay::{VoiceCommand, VoiceEventBatch, VoiceRelayHandle, VoiceRoute};
@@ -84,6 +99,8 @@ const FIRST_CLIENT: usize = 2;
 #[cfg(test)]
 const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+const SLOW_EVENT_LOOP_WORK: Duration = Duration::from_millis(20);
+const EVENT_LOOP_STATS_INTERVAL: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
 const ACCEPT_BUDGET: usize = 64;
@@ -133,20 +150,33 @@ const HISTORY_CHUNK_TARGET_BYTES: usize = 192 * 1024;
 /// Most disk-paged history fetches one session may have queued on the reader
 /// thread; a well-behaved client keeps at most one in flight per room.
 const MAX_PENDING_DISK_HISTORY_FETCHES: u8 = 8;
+const MAX_PENDING_HISTORY_FETCHES: usize = 32;
+const HISTORY_DELIVERY_BUDGET_BYTES: usize = 384 * 1024;
+const HISTORY_DELIVERY_BUDGET_CHUNKS: usize = 4;
 /// Most concurrent file uploads one session may hold open. A well-behaved
 /// client streams uploads one at a time, so this only bounds a client that
 /// opens transfers and never finishes them.
 const MAX_ACTIVE_UPLOADS_PER_SESSION: usize = 8;
+const MAX_ACTIVE_BUG_REPORTS: usize = 32;
+const MAX_ACTIVE_BUG_REPORTS_PER_SESSION: usize = 1;
 /// Cap on a stream's fast-start ring. Keyframes reset the ring, so this only
 /// bounds a pathologically long GOP rather than normal operation.
 const VIDEO_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// A subscriber whose queued bytes exceed this after a flush is too slow to keep
 /// up and is dropped. It reconnects and fast-starts from the latest keyframe.
 const VIDEO_SUBSCRIBER_HIGH_WATER: usize = 8 * 1024 * 1024;
+const VIDEO_FANOUT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+const VIDEO_FANOUT_BUDGET_RECIPIENTS: usize = 8;
+const VIDEO_FANOUT_QUEUE_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// A control connection whose queued bytes exceed this after a flush is not
 /// draining its socket and is dropped, so a stalled file-relay recipient or a
 /// history-pipelining client cannot pin megabytes of server memory.
 const CONTROL_WRITE_HIGH_WATER: usize = 8 * 1024 * 1024;
+/// Aggregate pending controls plus sealed TCP output across control and video
+/// connections. This bounds the server even when many peers stall together.
+const OUTBOUND_GLOBAL_HIGH_WATER: usize = 64 * 1024 * 1024;
+const CONTROL_SEAL_BUDGET_BYTES: usize = 512 * 1024;
+const CONTROL_SEAL_BUDGET_RECORDS: usize = 32;
 /// Relay flow control: while any recipient of a session's active upload has
 /// more than this queued, the uploader's connection is parked (its socket is
 /// not read and its buffered frames are not processed). TCP backpressure then
@@ -167,7 +197,110 @@ const AUDIO_POP_PACKET_FLAG_MUTE: u8 = 0x08;
 struct LoopWork {
     accept_clients: bool,
     client_reads: VecDeque<Token>,
+    client_read_set: HashSet<Token>,
     client_writes: VecDeque<Token>,
+    client_write_set: HashSet<Token>,
+    background_work: bool,
+}
+
+struct EventLoopStats {
+    window_started: Instant,
+    passes: u64,
+    work_micros: u64,
+    max_work_micros: u64,
+    slow_passes: u64,
+    slow_controls: u64,
+    max_control_micros: u64,
+    max_events: usize,
+    max_client_reads: usize,
+    max_client_writes: usize,
+    slow_control_maxima: HashMap<&'static str, u64>,
+}
+
+impl EventLoopStats {
+    fn new() -> Self {
+        Self {
+            window_started: Instant::now(),
+            passes: 0,
+            work_micros: 0,
+            max_work_micros: 0,
+            slow_passes: 0,
+            slow_controls: 0,
+            max_control_micros: 0,
+            max_events: 0,
+            max_client_reads: 0,
+            max_client_writes: 0,
+            slow_control_maxima: HashMap::new(),
+        }
+    }
+
+    fn observe_control(&mut self, kind: &'static str, elapsed: Duration) {
+        if elapsed < SLOW_EVENT_LOOP_WORK {
+            return;
+        }
+        let elapsed_micros = duration_micros(elapsed);
+        self.slow_controls = self.slow_controls.saturating_add(1);
+        self.max_control_micros = self.max_control_micros.max(elapsed_micros);
+        let maximum = self.slow_control_maxima.entry(kind).or_default();
+        if elapsed_micros > *maximum {
+            *maximum = elapsed_micros;
+            kvlog::warn!(
+                "slow server control handler",
+                kind,
+                elapsed_micros
+            );
+        }
+    }
+
+    fn observe_pass(
+        &mut self,
+        elapsed: Duration,
+        event_count: usize,
+        client_reads: usize,
+        client_writes: usize,
+        immediate_work_remaining: bool,
+    ) {
+        let elapsed_micros = duration_micros(elapsed);
+        let previous_maximum = self.max_work_micros;
+        self.passes = self.passes.saturating_add(1);
+        self.work_micros = self.work_micros.saturating_add(elapsed_micros);
+        self.max_work_micros = self.max_work_micros.max(elapsed_micros);
+        self.max_events = self.max_events.max(event_count);
+        self.max_client_reads = self.max_client_reads.max(client_reads);
+        self.max_client_writes = self.max_client_writes.max(client_writes);
+        if elapsed >= SLOW_EVENT_LOOP_WORK {
+            self.slow_passes = self.slow_passes.saturating_add(1);
+            if elapsed_micros > previous_maximum {
+                kvlog::warn!(
+                    "slow server event-loop pass",
+                    elapsed_micros,
+                    event_count,
+                    client_reads,
+                    client_writes,
+                    immediate_work_remaining
+                );
+            }
+        }
+        if self.window_started.elapsed() >= EVENT_LOOP_STATS_INTERVAL {
+            kvlog::info!(
+                "server event-loop work summary",
+                passes = self.passes,
+                work_micros = self.work_micros,
+                max_work_micros = self.max_work_micros,
+                slow_passes = self.slow_passes,
+                slow_controls = self.slow_controls,
+                max_control_micros = self.max_control_micros,
+                max_events = self.max_events,
+                max_client_reads = self.max_client_reads,
+                max_client_writes = self.max_client_writes
+            );
+            *self = Self::new();
+        }
+    }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 impl LoopWork {
@@ -182,19 +315,22 @@ impl LoopWork {
 
     #[inline]
     fn has_immediate_work(&self) -> bool {
-        self.accept_clients || !self.client_reads.is_empty() || !self.client_writes.is_empty()
+        self.accept_clients
+            || !self.client_reads.is_empty()
+            || !self.client_writes.is_empty()
+            || self.background_work
     }
 
     #[inline]
     fn queue_client_read(&mut self, token: Token) {
-        if !self.client_reads.contains(&token) {
+        if self.client_read_set.insert(token) {
             self.client_reads.push_back(token);
         }
     }
 
     #[inline]
     fn queue_client_write(&mut self, token: Token) {
-        if !self.client_writes.contains(&token) {
+        if self.client_write_set.insert(token) {
             self.client_writes.push_back(token);
         }
     }
@@ -205,8 +341,13 @@ impl LoopWork {
     }
 
     #[inline]
+    fn set_background_work(&mut self, pending: bool) {
+        self.background_work = pending;
+    }
+
+    #[inline]
     fn has_client_read(&self, token: Token) -> bool {
-        self.client_reads.contains(&token)
+        self.client_read_set.contains(&token)
     }
 
     #[inline]
@@ -223,7 +364,9 @@ impl LoopWork {
 
     #[inline]
     fn pop_client_read(&mut self) -> Option<Token> {
-        self.client_reads.pop_front()
+        let token = self.client_reads.pop_front()?;
+        self.client_read_set.remove(&token);
+        Some(token)
     }
 
     #[inline]
@@ -233,7 +376,9 @@ impl LoopWork {
 
     #[inline]
     fn pop_client_write(&mut self) -> Option<Token> {
-        self.client_writes.pop_front()
+        let token = self.client_writes.pop_front()?;
+        self.client_write_set.remove(&token);
+        Some(token)
     }
 
     #[cfg(test)]
@@ -311,8 +456,7 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "disabled".to_string());
     let p2p_enabled = config.network.p2p_enabled;
     let mut server = Server::bind(config)?;
-    let (admin_tx, admin_rx) = mpsc::channel();
-    let admin_socket = AdminSocket::spawn(admin_tx).map_err(invalid_config)?;
+    let admin_socket = AdminSocket::spawn(server.admin_sender()).map_err(invalid_config)?;
     if p2p_enabled && udp_probe_addr.is_some() {
         println!(
             "chatt server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_label}"
@@ -354,7 +498,7 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         p2p_enabled = server.config.network.p2p_enabled
     );
     let _admin_socket = admin_socket;
-    server.run(&admin_rx)
+    server.run()
 }
 
 pub struct Server {
@@ -372,11 +516,28 @@ pub struct Server {
     /// Their already-buffered later frames remain parked until the ordered
     /// worker reply is applied.
     pending_mls: HashSet<Token>,
+    pending_identity: Option<(Token, PendingIdentity)>,
+    /// Authentication controls parked behind the single ordered identity
+    /// transaction. Preparing multiple identity snapshots concurrently would
+    /// let later completions overwrite claims made by earlier ones.
+    deferred_identity_controls: VecDeque<(Token, ClientControl)>,
+    deferred_identity_tokens: HashSet<Token>,
+    identity_writer: IdentityWriter,
+    identity_events: Arc<EventQueue<IdentityWriteReply>>,
+    event_notifier: Arc<EventNotifier>,
+    admin_events: Arc<EventQueue<AdminCommand>>,
     poll: Poll,
     listener: TcpListener,
     voice_relay: VoiceRelayHandle,
     voice_events: VoiceEventBatch,
     clients: HashMap<Token, ClientConn>,
+    pending_controls: HashMap<Token, VecDeque<PendingControl>>,
+    pending_control_bytes: HashMap<Token, usize>,
+    pending_control_total_bytes: usize,
+    /// Bytes already sealed into all TCP connection write queues.
+    write_queue_total_bytes: usize,
+    control_send_tokens: VecDeque<Token>,
+    control_send_set: HashSet<Token>,
     sessions: HashMap<SessionId, Session>,
     /// Control-plane reservation of live media route ids. The voice thread has
     /// the independently owned map used for actual UDP demultiplexing.
@@ -384,18 +545,25 @@ pub struct Server {
     peer_links: HashMap<(SessionId, SessionId), PeerLink>,
     rooms: HashMap<RoomId, RoomState>,
     streams: HashMap<StreamId, VideoStream>,
+    video_fanouts: VecDeque<VideoFanout>,
+    video_fanout_bytes: usize,
     next_token: usize,
     next_session: u64,
     next_stream: u32,
     next_connection_id: u64,
+    accept_retry_at: Option<Instant>,
     next_file_transfer: u64,
     active_uploads: HashMap<(SessionId, FileTransferId), ServerUpload>,
     active_bug_reports: HashMap<(SessionId, BugReportId), ServerBugReport>,
+    pending_bug_reports: HashSet<(SessionId, BugReportId)>,
+    bug_report_writer: BugReportWriter,
+    bug_report_events: Arc<EventQueue<BugReportWriteReply>>,
     reserved_file_names: HashSet<String>,
     default_room: RoomId,
     store: RoomStore,
     file_size_limit_bytes: u64,
     invites: HashMap<String, InviteState>,
+    pending_dm_waiters: HashMap<u64, Vec<(SessionId, UserId)>>,
     device_links: HashMap<Vec<u8>, DeviceLinkState>,
     open_pair_global_allocations: VecDeque<Instant>,
     open_pair_ip_allocations: HashMap<IpAddr, VecDeque<Instant>>,
@@ -412,9 +580,70 @@ pub struct Server {
     /// register here instead of teaching the core loop each local no-sleep
     /// condition.
     loop_work: LoopWork,
+    loop_stats: EventLoopStats,
     history_reader: HistoryReader,
-    history_replies: mpsc::Receiver<HistoryReadReply>,
+    history_events: Arc<EventQueue<HistoryReadReply>>,
+    history_deliveries: VecDeque<HistoryDelivery>,
+    pending_history_fetches: usize,
     video_copy_stats: VideoCopyStats,
+}
+
+struct PendingEstablish {
+    user: UserConfig,
+    receive_files: bool,
+    file_receive_limit_bytes: u64,
+    announce: bool,
+    issued_token: Option<IssuedSessionToken>,
+    bootstrap_credential_hash: Option<String>,
+}
+
+struct HistoryDelivery {
+    session_id: SessionId,
+    token: Token,
+    room_id: RoomId,
+    source: HistoryDeliverySource,
+}
+
+struct VideoFanout {
+    stream_id: StreamId,
+    data: SharedVideoFrame,
+    subscribers: Vec<Token>,
+    next_subscriber: usize,
+    charged_bytes: usize,
+}
+
+struct PendingControl {
+    kind: &'static str,
+    payload: Arc<[u8]>,
+}
+
+enum HistoryDeliverySource {
+    Resident {
+        plan: room_store::HistoryFetchPlan,
+        next_chunk: usize,
+    },
+    Encoded(VecDeque<Vec<u8>>),
+}
+
+enum PendingIdentity {
+    DynamicAuthentication {
+        username: String,
+        establish: PendingEstablish,
+    },
+    ExplicitRename {
+        users: Vec<UserConfig>,
+        updated: PendingEstablish,
+        fallback: PendingEstablish,
+    },
+    InvitePairing {
+        invite_name: String,
+        users: Vec<UserConfig>,
+        establish: PendingEstablish,
+    },
+    OpenPairing {
+        username: String,
+        establish: PendingEstablish,
+    },
 }
 
 enum MlsReply {
@@ -1149,7 +1378,7 @@ impl Server {
             );
         }
         let default_room = config.default_room_id();
-        let store = RoomStore::open(config.data_dir(), &config.rooms);
+        let mut store = RoomStore::open(config.data_dir(), &config.rooms);
         for dm in store.dm_rooms() {
             rooms.insert(
                 dm.room_id,
@@ -1163,15 +1392,40 @@ impl Server {
         }
 
         let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
+        let event_notifier = Arc::new(EventNotifier::new(Arc::clone(&waker)));
+        let admin_events = Arc::new(EventQueue::new(
+            Arc::clone(&event_notifier),
+            ADMIN_EVENTS,
+            "admin",
+        ));
+        store.enable_async_log_writes(Arc::clone(&event_notifier));
+        store.enable_async_state_writes(Arc::clone(&event_notifier));
         let voice_relay = VoiceRelayHandle::spawn(
             udp,
             udp_probe,
-            Arc::clone(&waker),
+            Arc::clone(&event_notifier),
             p2p_enabled,
         )?;
-        let (history_reader, history_replies) = HistoryReader::spawn(Arc::clone(&waker));
-        let mls_events = Arc::new(MlsEventQueue::new(Arc::clone(&waker)));
+        let history_events = Arc::new(EventQueue::new(
+            Arc::clone(&event_notifier),
+            HISTORY_EVENTS,
+            "history",
+        ));
+        let history_reader = HistoryReader::spawn(Arc::clone(&history_events));
+        let mls_events = Arc::new(MlsEventQueue::new(Arc::clone(&event_notifier)));
         let mls_worker = MlsWorker::spawn(durable_mls, Arc::clone(&mls_events));
+        let bug_report_events = Arc::new(EventQueue::new(
+            Arc::clone(&event_notifier),
+            BUG_REPORT_EVENTS,
+            "bug-report",
+        ));
+        let bug_report_writer = BugReportWriter::spawn(Arc::clone(&bug_report_events));
+        let identity_events = Arc::new(EventQueue::new(
+            Arc::clone(&event_notifier),
+            IDENTITY_EVENTS,
+            "identity",
+        ));
+        let identity_writer = IdentityWriter::spawn(Arc::clone(&identity_events));
 
         kvlog::info!(
             "server identity loaded",
@@ -1196,28 +1450,48 @@ impl Server {
             mls_worker,
             mls_events,
             pending_mls: HashSet::new(),
+            pending_identity: None,
+            deferred_identity_controls: VecDeque::new(),
+            deferred_identity_tokens: HashSet::new(),
+            identity_writer,
+            identity_events,
+            event_notifier,
+            admin_events,
             poll,
             listener,
             voice_relay,
             voice_events: VoiceEventBatch::default(),
             clients: HashMap::new(),
+            pending_controls: HashMap::new(),
+            pending_control_bytes: HashMap::new(),
+            pending_control_total_bytes: 0,
+            write_queue_total_bytes: 0,
+            control_send_tokens: VecDeque::new(),
+            control_send_set: HashSet::new(),
             sessions: HashMap::new(),
             reserved_media_routes: HashMap::new(),
             peer_links: HashMap::new(),
             rooms,
             streams: HashMap::new(),
+            video_fanouts: VecDeque::new(),
+            video_fanout_bytes: 0,
             next_token: FIRST_CLIENT,
             next_session: 1,
             next_stream: 1,
             next_connection_id: 1,
+            accept_retry_at: None,
             next_file_transfer: 1,
             active_uploads: HashMap::new(),
             active_bug_reports: HashMap::new(),
+            pending_bug_reports: HashSet::new(),
+            bug_report_writer,
+            bug_report_events,
             reserved_file_names: HashSet::new(),
             default_room,
             store,
             file_size_limit_bytes,
             invites: HashMap::new(),
+            pending_dm_waiters: HashMap::new(),
             device_links: HashMap::new(),
             open_pair_global_allocations: VecDeque::new(),
             open_pair_ip_allocations: HashMap::new(),
@@ -1231,19 +1505,33 @@ impl Server {
             mls_cleanup_pending: false,
             mls_compaction_pending: false,
             loop_work: LoopWork::default(),
+            loop_stats: EventLoopStats::new(),
             history_reader,
-            history_replies,
+            history_events,
+            history_deliveries: VecDeque::new(),
+            pending_history_fetches: 0,
             video_copy_stats: VideoCopyStats::new(),
         })
     }
 
-    pub fn run(
-        &mut self,
-        admin_rx: &mpsc::Receiver<AdminCommand>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn admin_sender(&self) -> AdminSender {
+        AdminSender::new(Arc::clone(&self.admin_events))
+    }
+
+    pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let mut events = Events::with_capacity(256);
         loop {
-            let timeout = self.loop_work.poll_timeout(POLL_TIMEOUT);
+            let mut ready_workers = 0u64;
+            let now = Instant::now();
+            if self.accept_retry_at.is_some_and(|retry| retry <= now) {
+                self.accept_retry_at = None;
+                self.loop_work.queue_accept_clients();
+            }
+            let idle_timeout = self
+                .accept_retry_at
+                .map(|retry| retry.saturating_duration_since(now).min(POLL_TIMEOUT))
+                .unwrap_or(POLL_TIMEOUT);
+            let timeout = self.loop_work.poll_timeout(idle_timeout);
             #[cfg(debug_assertions)]
             if !self.loop_work.has_immediate_work() {
                 self.debug_assert_no_immediate_read_work();
@@ -1255,16 +1543,17 @@ impl Server {
                 }
                 return Err(error.into());
             }
+            let work_started = Instant::now();
+            let event_count = events.iter().count();
             for event in events.iter() {
                 let ready = MioReady::from_event(event);
                 match event.token() {
                     LISTENER => {
-                        if ready.readable_like() {
+                        if ready.readable_like() && self.accept_retry_at.is_none() {
                             self.loop_work.queue_accept_clients();
                         }
                     }
-                    // Wake-only; replies drain unconditionally below.
-                    WAKER => {}
+                    WAKER => ready_workers |= self.event_notifier.take_ready(),
                     token => {
                         if ready.readable_like() {
                             if let Some(client) = self.clients.get_mut(&token) {
@@ -1292,6 +1581,8 @@ impl Server {
                     self.read_client(token);
                 }
             }
+            self.process_control_sends();
+            self.process_video_fanouts();
             let client_write_count = self.loop_work.client_write_count();
             for _ in 0..client_write_count {
                 if let Some(token) = self.loop_work.pop_client_write() {
@@ -1299,10 +1590,30 @@ impl Server {
                 }
             }
             self.requeue_unclogged_uploaders();
-            self.drain_voice_events()?;
-            self.drain_history_replies();
-            self.drain_mls_replies();
-            if self.handle_admin_commands(admin_rx) {
+            if ready_workers & VOICE_EVENTS != 0 {
+                self.drain_voice_events()?;
+            }
+            if ready_workers & ROOM_LOG_EVENTS != 0 {
+                self.store.drain_log_events();
+            }
+            if ready_workers & ROOM_STATE_EVENTS != 0 {
+                self.drain_dm_completions();
+            }
+            if ready_workers & HISTORY_EVENTS != 0 {
+                self.drain_history_replies();
+            } else if !self.history_deliveries.is_empty() {
+                self.process_history_deliveries();
+            }
+            if ready_workers & MLS_EVENTS != 0 {
+                self.drain_mls_replies();
+            }
+            if ready_workers & IDENTITY_EVENTS != 0 {
+                self.drain_identity_replies();
+            }
+            if ready_workers & BUG_REPORT_EVENTS != 0 {
+                self.drain_bug_report_replies();
+            }
+            if ready_workers & ADMIN_EVENTS != 0 && self.handle_admin_commands() {
                 return Ok(());
             }
             self.flush_disconnects();
@@ -1312,6 +1623,13 @@ impl Server {
             self.poll_room_rtt_snapshots(now);
             self.run_mls_cleanup(now);
             self.run_mls_compaction(now);
+            self.loop_stats.observe_pass(
+                work_started.elapsed(),
+                event_count,
+                client_read_count,
+                client_write_count,
+                self.loop_work.has_immediate_work(),
+            );
         }
     }
 
@@ -1368,14 +1686,15 @@ impl Server {
     }
 
     /// Returns true when an embedded owner requested a clean shutdown.
-    fn handle_admin_commands(&mut self, admin_rx: &mpsc::Receiver<AdminCommand>) -> bool {
-        loop {
-            match admin_rx.try_recv() {
-                Ok(AdminCommand::Invite { user, reply }) => {
+    fn handle_admin_commands(&mut self) -> bool {
+        let mut commands = self.admin_events.drain_up_to(16);
+        while let Some(command) = commands.pop_front() {
+            match command {
+                AdminCommand::Invite { user, reply } => {
                     let result = self.create_invite(&user);
                     let _ = reply.send(result);
                 }
-                Ok(AdminCommand::MlsStorageStatus { reply }) => {
+                AdminCommand::MlsStorageStatus { reply } => {
                     if !self.mls_worker.enqueue_typed(MlsWriteRequest::StorageStatus {
                         reply: reply.clone(),
                     }) {
@@ -1383,7 +1702,7 @@ impl Server {
                         let _ = reply.send(Err("MLS delivery worker is unavailable".into()));
                     }
                 }
-                Ok(AdminCommand::MlsCompact { reply }) => {
+                AdminCommand::MlsCompact { reply } => {
                     if self.mls_compaction_pending || !self.clients.is_empty() {
                         let _ = reply.send(Err(
                             "MLS compaction requires an idle server; try again after clients disconnect"
@@ -1404,12 +1723,10 @@ impl Server {
                         let _ = reply.send(Err("MLS delivery worker is unavailable".into()));
                     }
                 }
-                Ok(AdminCommand::Shutdown) => return true,
-                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
-                    return false;
-                }
+                AdminCommand::Shutdown => return true,
             }
         }
+        false
     }
 
     fn create_invite(&mut self, user_name: &str) -> Result<String, String> {
@@ -1469,13 +1786,10 @@ impl Server {
                     continue;
                 }
                 Err(error) if is_fd_pressure_accept_error(&error) => {
-                    // fd pressure (EMFILE/ENFILE) cannot drain by accepting, so
-                    // back off briefly before returning. This stalls the whole
-                    // single-threaded loop, but a tight retry would just spin on
-                    // the same error and starve existing clients harder.
+                    // fd pressure (EMFILE/ENFILE) cannot drain by accepting.
+                    // Keep serving established clients until this deadline.
                     kvlog::warn!("transient tcp accept failure", error = %error);
-                    thread::sleep(ACCEPT_ERROR_BACKOFF);
-                    self.loop_work.queue_accept_clients();
+                    self.accept_retry_at = Some(Instant::now() + ACCEPT_ERROR_BACKOFF);
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -1622,6 +1936,9 @@ impl Server {
             if self.relay_clogged_for_reader(token) {
                 return;
             }
+            if self.pending_mls.contains(&token) || self.identity_pending(token) {
+                return;
+            }
             let Some(client) = self.clients.get_mut(&token) else {
                 return;
             };
@@ -1629,9 +1946,6 @@ impl Server {
             // further frame processing; pipelined frames must not spend crypto
             // or rate-limit work on its behalf.
             if client.is_closing() {
-                return;
-            }
-            if self.pending_mls.contains(&token) {
                 return;
             }
             match control_conn_step(token, client) {
@@ -1650,7 +1964,20 @@ impl Server {
                 }
                 Ok(Some(ControlStep::Control(control))) => {
                     steps += 1;
-                    if let Err(error) = self.handle_control(token, control) {
+                    if self.pending_identity.is_some()
+                        && self.clients.get(&token).map(|client| client.state)
+                            == Some(ConnState::AwaitAuth)
+                        && identity_control_needs_ordering(&control)
+                    {
+                        self.deferred_identity_controls.push_back((token, control));
+                        self.deferred_identity_tokens.insert(token);
+                        return;
+                    }
+                    let kind = client_control_kind(&control);
+                    let started = Instant::now();
+                    let result = self.handle_control(token, control);
+                    self.loop_stats.observe_control(kind, started.elapsed());
+                    if let Err(error) = result {
                         kvlog::warn!(
                             "tcp client protocol error",
                             token = token.0,
@@ -1937,8 +2264,10 @@ impl Server {
             .seal_next(CHANNEL_VIDEO, &ack)
             .map_err(|error| error.to_string())?;
         video.phase = VideoPhase::Streaming;
+        let queued_before = client.write_buf.len();
         video::write_record(client.write_buf.tail_mut(), &sealed)
             .map_err(|error| error.to_string())?;
+        self.write_queue_total_bytes += client.write_buf.len() - queued_before;
         self.write_client(token);
         match role {
             VideoRole::Publisher => {
@@ -1998,8 +2327,16 @@ impl Server {
             }
         };
         let burst_len = burst.len();
-        for data in &burst {
-            self.seal_video_to_subscriber(token, data.as_slice())?;
+        let burst_bytes = burst.iter().fold(0usize, |total, data| {
+            total.saturating_add(video_fanout_charge(data, 1))
+        });
+        if self.video_fanout_bytes.saturating_add(burst_bytes)
+            > VIDEO_FANOUT_QUEUE_MAX_BYTES
+        {
+            return Err("video fast-start queue is full; reconnect shortly".to_string());
+        }
+        for data in burst {
+            self.enqueue_video_fanout(stream_id, data, vec![token])?;
         }
         kvlog::info!(
             "video subscriber attached",
@@ -2011,7 +2348,7 @@ impl Server {
     }
 
     /// Seals one inner frame for a single subscriber directly into its write
-    /// queue (no intermediate frame allocation) and flushes. Returns whether
+    /// queue (no intermediate frame allocation). Returns whether
     /// the subscriber's queue stayed under the high-water mark.
     fn seal_video_to_subscriber(&mut self, token: Token, data: &[u8]) -> Result<bool, String> {
         {
@@ -2030,14 +2367,26 @@ impl Server {
             if sealed_len > video::MAX_VIDEO_FRAME_LEN {
                 return Err("sealed video record exceeds maximum length".to_string());
             }
+            let queued_len = video::VIDEO_LENGTH_PREFIX_LEN + sealed_len;
+            if self
+                .write_queue_total_bytes
+                .saturating_add(self.pending_control_total_bytes)
+                .saturating_add(queued_len)
+                > OUTBOUND_GLOBAL_HIGH_WATER
+            {
+                return Ok(false);
+            }
+            let queued_before = client.write_buf.len();
             let out = client.write_buf.tail_mut();
+            let tail_before = out.len();
             out.extend_from_slice(&(sealed_len as u32).to_le_bytes());
             if let Err(error) = record.seal_next_into(CHANNEL_VIDEO, data, out) {
-                out.truncate(out.len() - video::VIDEO_LENGTH_PREFIX_LEN);
+                out.truncate(tail_before);
                 return Err(error.to_string());
             }
+            self.write_queue_total_bytes += client.write_buf.len() - queued_before;
         }
-        self.write_client(token);
+        self.loop_work.queue_client_write(token);
         let within = self
             .clients
             .get(&token)
@@ -2075,24 +2424,96 @@ impl Server {
                 .maybe_log(visible_bytes, stream.ring_bytes);
             stream.subscribers.clone()
         };
-        let mut overflowed = Vec::new();
-        for token in subscribers {
-            match self.seal_video_to_subscriber(token, data.as_slice()) {
-                Ok(true) => {}
-                Ok(false) | Err(_) => overflowed.push(token),
-            }
+        let _ = self.enqueue_video_fanout(stream_id, data, subscribers);
+    }
+
+    fn enqueue_video_fanout(
+        &mut self,
+        stream_id: StreamId,
+        data: SharedVideoFrame,
+        subscribers: Vec<Token>,
+    ) -> Result<(), String> {
+        if subscribers.is_empty() {
+            return Ok(());
         }
-        for token in overflowed {
-            if let Some(stream) = self.streams.get_mut(&stream_id) {
-                stream.subscribers.retain(|other| *other != token);
-            }
+        let charged_bytes = video_fanout_charge(&data, subscribers.capacity());
+        if self.video_fanout_bytes.saturating_add(charged_bytes)
+            > VIDEO_FANOUT_QUEUE_MAX_BYTES
+        {
             kvlog::warn!(
-                "video subscriber dropped for backpressure",
-                token = token.0,
-                stream_id = stream_id.0
+                "video subscribers dropped because scheduler queue is full",
+                stream_id = stream_id.0,
+                frame_bytes = data.len(),
+                queued_bytes = self.video_fanout_bytes
             );
-            self.disconnect(token);
+            // Continuing with a later delta after dropping an arbitrary frame
+            // corrupts every decoder until the next keyframe. Reconnect makes
+            // each viewer fast-start from a coherent cached GOP instead.
+            for token in subscribers {
+                self.disconnect(token);
+            }
+            return Err("video fanout queue is full".to_string());
         }
+        self.video_fanout_bytes += charged_bytes;
+        self.video_fanouts.push_back(VideoFanout {
+            stream_id,
+            data,
+            subscribers,
+            next_subscriber: 0,
+            charged_bytes,
+        });
+        self.refresh_background_work();
+        Ok(())
+    }
+
+    fn process_video_fanouts(&mut self) {
+        let mut bytes = 0usize;
+        let mut recipients = 0usize;
+        while recipients < VIDEO_FANOUT_BUDGET_RECIPIENTS {
+            let Some(mut fanout) = self.video_fanouts.pop_front() else {
+                break;
+            };
+            if fanout.next_subscriber >= fanout.subscribers.len() {
+                self.video_fanout_bytes = self
+                    .video_fanout_bytes
+                    .saturating_sub(fanout.charged_bytes);
+                continue;
+            }
+            let frame_bytes = fanout.data.len();
+            if recipients > 0 && bytes.saturating_add(frame_bytes) > VIDEO_FANOUT_BUDGET_BYTES {
+                self.video_fanouts.push_front(fanout);
+                break;
+            }
+            let token = fanout.subscribers[fanout.next_subscriber];
+            fanout.next_subscriber += 1;
+            bytes = bytes.saturating_add(frame_bytes);
+            recipients += 1;
+            let within = self
+                .seal_video_to_subscriber(token, fanout.data.as_slice())
+                .unwrap_or(false);
+            if !within {
+                if let Some(stream) = self.streams.get_mut(&fanout.stream_id) {
+                    stream.subscribers.retain(|other| *other != token);
+                }
+                kvlog::warn!(
+                    "video subscriber dropped for backpressure",
+                    token = token.0,
+                    stream_id = fanout.stream_id.0
+                );
+                self.disconnect(token);
+            }
+            if fanout.next_subscriber < fanout.subscribers.len() {
+                self.video_fanouts.push_front(fanout);
+            } else {
+                self.video_fanout_bytes = self
+                    .video_fanout_bytes
+                    .saturating_sub(fanout.charged_bytes);
+            }
+            if bytes >= VIDEO_FANOUT_BUDGET_BYTES {
+                break;
+            }
+        }
+        self.refresh_background_work();
     }
 
     fn start_share(
@@ -2377,8 +2798,10 @@ impl Server {
             .clients
             .get_mut(&token)
             .ok_or_else(|| "unknown client token".to_string())?;
+        let queued_before = client.write_buf.len();
         frame::encode_frame(&encoded, client.write_buf.tail_mut())
             .map_err(|error| error.to_string())?;
+        self.write_queue_total_bytes += client.write_buf.len() - queued_before;
         client.control = Some(control);
         client.transport = Some(response.transport);
         client.state = ConnState::AwaitAuth;
@@ -2739,7 +3162,7 @@ impl Server {
             }
             (ConnState::Ready, ClientControl::BugReportComplete { report_id }) => {
                 let session_id = self.session_for_token(token)?;
-                let result = self.complete_bug_report(token, session_id, report_id);
+                let result = self.complete_bug_report(session_id, report_id);
                 self.report_bug_outcome(token, result)
             }
             (ConnState::AwaitClientHello, _) => Err("handshake is not complete".into()),
@@ -3540,8 +3963,32 @@ impl Server {
                     "authentication failed: invalid username for this account".to_string(),
                 );
             }
-            self.usernames.claim_dynamic(claims.user_id, username)?;
             let user = Self::dynamic_user(claims.user_id, username);
+            if self.usernames.needs_dynamic_claim(claims.user_id, username) {
+                if let Some(path) = self.usernames.persistence_path() {
+                    return self.begin_identity_write(
+                        token,
+                        IdentityWrite::DynamicUsername {
+                            path,
+                            user_id: claims.user_id,
+                            username: username.to_string(),
+                        },
+                        PendingIdentity::DynamicAuthentication {
+                            username: username.to_string(),
+                            establish: PendingEstablish {
+                                user,
+                                receive_files,
+                                file_receive_limit_bytes,
+                                announce: true,
+                                issued_token: None,
+                                bootstrap_credential_hash: Some(hash_secret(auth_token)),
+                            },
+                        },
+                        "authentication failed: the server could not persist the username; retry later",
+                    );
+                }
+                self.usernames.claim_dynamic(claims.user_id, username)?;
+            }
             return self.establish_session_with_credential(
                 token,
                 &user,
@@ -3597,11 +4044,52 @@ impl Server {
             );
             return self.reject_username_taken(token);
         }
+        if self.mls.initialized(user.id) {
+            return self.reject_auth(
+                token,
+                ERROR_AUTH_REJECTED,
+                "authentication failed: use an active MLS device credential".to_string(),
+            );
+        }
         let user = if username == user.username {
             user
         } else {
-            match self.users.set_user_username(user.id, username.to_string()) {
-                Ok(updated) => {
+            match self
+                .users
+                .prepare_set_user_username(user.id, username.to_string())
+            {
+                Ok((updated, users)) => {
+                    if let Some(path) = self.users.persistence_path() {
+                        let credential_hash = user.token_hash.clone();
+                        return self.begin_identity_write(
+                            token,
+                            IdentityWrite::UsersToml {
+                                path,
+                                snapshot: UserStore::snapshot(&users),
+                            },
+                            PendingIdentity::ExplicitRename {
+                                users,
+                                updated: PendingEstablish {
+                                    user: updated,
+                                    receive_files,
+                                    file_receive_limit_bytes,
+                                    announce: true,
+                                    issued_token: None,
+                                    bootstrap_credential_hash: Some(credential_hash.clone()),
+                                },
+                                fallback: PendingEstablish {
+                                    user,
+                                    receive_files,
+                                    file_receive_limit_bytes,
+                                    announce: true,
+                                    issued_token: None,
+                                    bootstrap_credential_hash: Some(credential_hash),
+                                },
+                            },
+                            "authentication failed: the server could not persist the username; retry later",
+                        );
+                    }
+                    self.users.install_users(users);
                     self.usernames.set_explicit(updated.id, &updated.username);
                     updated
                 }
@@ -3615,13 +4103,6 @@ impl Server {
                 }
             }
         };
-        if self.mls.initialized(user.id) {
-            return self.reject_auth(
-                token,
-                ERROR_AUTH_REJECTED,
-                "authentication failed: use an active MLS device credential".to_string(),
-            );
-        }
         self.establish_session_with_credential(
             token,
             &user,
@@ -3731,12 +4212,13 @@ impl Server {
             );
             return self.reject_username_taken(token);
         }
-        let user =
-            match self
-                .users
-                .mark_user_paired(&user_name, username.to_string(), token_hash.clone())
-            {
-                Ok(user) => user,
+        let (user, users) =
+            match self.users.prepare_mark_user_paired(
+                &user_name,
+                username.to_string(),
+                token_hash.clone(),
+            ) {
+                Ok(prepared) => prepared,
                 Err(error) => {
                     kvlog::error!(
                         "pairing rejected",
@@ -3753,6 +4235,29 @@ impl Server {
                     );
                 }
             };
+        if let Some(path) = self.users.persistence_path() {
+            return self.begin_identity_write(
+                token,
+                IdentityWrite::UsersToml {
+                    path,
+                    snapshot: UserStore::snapshot(&users),
+                },
+                PendingIdentity::InvitePairing {
+                    invite_name: user_name,
+                    users,
+                    establish: PendingEstablish {
+                        user,
+                        receive_files,
+                        file_receive_limit_bytes,
+                        announce: false,
+                        issued_token: None,
+                        bootstrap_credential_hash: Some(token_hash),
+                    },
+                },
+                "pairing failed: the server could not persist the pairing; retry pairing",
+            );
+        }
+        self.users.install_users(users);
         self.invites.remove(&user_name);
         self.usernames.set_explicit(user.id, &user.username);
         kvlog::info!(
@@ -3886,23 +4391,48 @@ impl Server {
             },
         )
         .map_err(|error| error.to_string())?;
-        if let Err(error) = self.usernames.claim_dynamic(user_id, username) {
-            kvlog::error!(
-                "open pair rejected",
-                token = token.0,
-                user_id = user_id.0,
-                reason = "state_write_failed",
-                error = error.as_str()
-            );
-            return self.reject_auth(
-                token,
-                control::ERROR_INTERNAL,
-                "open pairing failed: the server could not persist state; retry later".to_string(),
-            );
-        }
-        kvlog::info!("open pair accepted", token = token.0, user_id = user_id.0);
         let user = Self::dynamic_user(user_id, username);
         let bootstrap_credential_hash = hash_secret(&issued);
+        if self.usernames.needs_dynamic_claim(user_id, username) {
+            if let Some(path) = self.usernames.persistence_path() {
+                return self.begin_identity_write(
+                    token,
+                    IdentityWrite::DynamicUsername {
+                        path,
+                        user_id,
+                        username: username.to_string(),
+                    },
+                    PendingIdentity::OpenPairing {
+                        username: username.to_string(),
+                        establish: PendingEstablish {
+                            user,
+                            receive_files,
+                            file_receive_limit_bytes,
+                            announce: false,
+                            issued_token: Some(IssuedSessionToken::OpenPair(issued)),
+                            bootstrap_credential_hash: Some(bootstrap_credential_hash),
+                        },
+                    },
+                    "open pairing failed: the server could not persist state; retry later",
+                );
+            }
+            if let Err(error) = self.usernames.claim_dynamic(user_id, username) {
+                kvlog::error!(
+                    "open pair rejected",
+                    token = token.0,
+                    user_id = user_id.0,
+                    reason = "state_write_failed",
+                    error = error.as_str()
+                );
+                return self.reject_auth(
+                    token,
+                    control::ERROR_INTERNAL,
+                    "open pairing failed: the server could not persist state; retry later"
+                        .to_string(),
+                );
+            }
+        }
+        kvlog::info!("open pair accepted", token = token.0, user_id = user_id.0);
         self.establish_session_with_credential(
             token,
             &user,
@@ -3989,6 +4519,250 @@ impl Server {
             ERROR_USERNAME_TAKEN,
             "username already in use; choose another".to_string(),
         )
+    }
+
+    fn identity_pending(&self, token: Token) -> bool {
+        self.pending_identity
+            .as_ref()
+            .is_some_and(|(pending_token, _)| *pending_token == token)
+            || self.deferred_identity_tokens.contains(&token)
+    }
+
+    fn resume_deferred_identity_controls(&mut self) {
+        while self.pending_identity.is_none() {
+            let Some((token, control)) = self.deferred_identity_controls.pop_front() else {
+                return;
+            };
+            self.deferred_identity_tokens.remove(&token);
+            if self.clients.get(&token).map(|client| client.state) != Some(ConnState::AwaitAuth)
+                || self.clients.get(&token).is_some_and(ClientConn::is_closing)
+            {
+                continue;
+            }
+
+            let kind = client_control_kind(&control);
+            let started = Instant::now();
+            let result = self.handle_control(token, control);
+            self.loop_stats.observe_control(kind, started.elapsed());
+            if let Err(error) = result {
+                kvlog::warn!(
+                    "deferred tcp client protocol error",
+                    token = token.0,
+                    error = %error
+                );
+                self.disconnect(token);
+                continue;
+            }
+            self.queue_client_read_if_work_ready(token);
+        }
+    }
+
+    fn begin_identity_write(
+        &mut self,
+        token: Token,
+        write: IdentityWrite,
+        pending: PendingIdentity,
+        failure_message: &str,
+    ) -> Result<(), String> {
+        if self.pending_identity.is_some() {
+            return self.reject_auth(
+                token,
+                control::ERROR_INTERNAL,
+                "identity persistence is busy; retry shortly".to_string(),
+            );
+        }
+        match self
+            .identity_writer
+            .enqueue(IdentityWriteRequest { token, write })
+        {
+            Ok(()) => {
+                self.pending_identity = Some((token, pending));
+                Ok(())
+            }
+            Err(IdentityEnqueueError::Full | IdentityEnqueueError::Gone) => {
+                kvlog::error!("identity persistence unavailable", token = token.0);
+                self.reject_auth(
+                    token,
+                    control::ERROR_INTERNAL,
+                    failure_message.to_string(),
+                )
+            }
+        }
+    }
+
+    fn finish_pending_establish(&mut self, token: Token, establish: PendingEstablish) {
+        if let Err(error) = self.establish_session_with_credential(
+            token,
+            &establish.user,
+            establish.receive_files,
+            establish.file_receive_limit_bytes,
+            establish.announce,
+            establish.issued_token,
+            establish.bootstrap_credential_hash,
+        ) {
+            kvlog::warn!(
+                "identity completion could not establish session",
+                token = token.0,
+                error = error.as_str()
+            );
+        }
+    }
+
+    fn drain_identity_replies(&mut self) {
+        let mut replies = self.identity_events.drain_up_to(8);
+        while let Some(reply) = replies.pop_front() {
+            let Some((token, pending)) = self.pending_identity.take() else {
+                kvlog::warn!("unexpected identity persistence reply", token = reply.token.0);
+                continue;
+            };
+            if token != reply.token {
+                kvlog::error!(
+                    "identity persistence reply token mismatch",
+                    expected = token.0,
+                    actual = reply.token.0
+                );
+            }
+            match pending {
+                PendingIdentity::DynamicAuthentication {
+                    username,
+                    establish,
+                } => match reply.result {
+                    Ok(()) => {
+                        let user_id = establish.user.id;
+                        match self.usernames.apply_dynamic_claim(user_id, &username) {
+                            Ok(()) => self.finish_pending_establish(token, establish),
+                            Err(error) => {
+                                kvlog::error!(
+                                    "persisted dynamic username could not be applied",
+                                    user_id = user_id.0,
+                                    error = error.as_str()
+                                );
+                                let _ = self.reject_auth(
+                                    token,
+                                    control::ERROR_INTERNAL,
+                                    "authentication failed: identity state conflicted; retry"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        kvlog::error!(
+                            "dynamic authentication persistence failed",
+                            token = token.0,
+                            error = error.as_str()
+                        );
+                        let _ = self.reject_auth(
+                            token,
+                            control::ERROR_INTERNAL,
+                            "authentication failed: the server could not persist the username; retry later"
+                                .to_string(),
+                        );
+                    }
+                },
+                PendingIdentity::ExplicitRename {
+                    users,
+                    updated,
+                    fallback,
+                } => match reply.result {
+                    Ok(()) => {
+                        self.users.install_users(users);
+                        self.usernames
+                            .set_explicit(updated.user.id, &updated.user.username);
+                        self.finish_pending_establish(token, updated);
+                    }
+                    Err(error) => {
+                        kvlog::warn!(
+                            "username update failed",
+                            user_id = fallback.user.id.0,
+                            error = error.as_str()
+                        );
+                        self.finish_pending_establish(token, fallback);
+                    }
+                },
+                PendingIdentity::InvitePairing {
+                    invite_name,
+                    users,
+                    establish,
+                } => match reply.result {
+                    Ok(()) => {
+                        self.users.install_users(users);
+                        self.usernames
+                            .set_explicit(establish.user.id, &establish.user.username);
+                        self.invites.remove(&invite_name);
+                        kvlog::info!(
+                            "pairing accepted",
+                            token = token.0,
+                            user_id = establish.user.id.0,
+                            user = invite_name.as_str()
+                        );
+                        self.finish_pending_establish(token, establish);
+                    }
+                    Err(error) => {
+                        kvlog::error!(
+                            "pairing rejected",
+                            token = token.0,
+                            user = invite_name.as_str(),
+                            reason = "state_write_failed",
+                            error = error.as_str()
+                        );
+                        let _ = self.reject_auth(
+                            token,
+                            control::ERROR_INTERNAL,
+                            "pairing failed: the server could not persist the pairing; retry pairing"
+                                .to_string(),
+                        );
+                    }
+                },
+                PendingIdentity::OpenPairing {
+                    username,
+                    establish,
+                } => match reply.result {
+                    Ok(()) => {
+                        let user_id = establish.user.id;
+                        match self.usernames.apply_dynamic_claim(user_id, &username) {
+                            Ok(()) => {
+                                kvlog::info!(
+                                    "open pair accepted",
+                                    token = token.0,
+                                    user_id = user_id.0
+                                );
+                                self.finish_pending_establish(token, establish);
+                            }
+                            Err(error) => {
+                                kvlog::error!(
+                                    "persisted open-pair username could not be applied",
+                                    user_id = user_id.0,
+                                    error = error.as_str()
+                                );
+                                let _ = self.reject_auth(
+                                    token,
+                                    control::ERROR_INTERNAL,
+                                    "open pairing failed: identity state conflicted; retry"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        kvlog::error!(
+                            "open pair rejected",
+                            token = token.0,
+                            reason = "state_write_failed",
+                            error = error.as_str()
+                        );
+                        let _ = self.reject_auth(
+                            token,
+                            control::ERROR_INTERNAL,
+                            "open pairing failed: the server could not persist state; retry later"
+                                .to_string(),
+                        );
+                    }
+                },
+            }
+            self.queue_client_read_if_work_ready(token);
+        }
+        self.resume_deferred_identity_controls();
     }
 
     fn reject_auth(&mut self, token: Token, code: u16, message: String) -> Result<(), String> {
@@ -4384,9 +5158,8 @@ impl Server {
         self.remove_peer_links(session_id);
     }
 
-    /// Answers a history page: synchronously from the resident window when it
-    /// holds any of the requested range, otherwise via the disk reader thread
-    /// paging the room's rotated segments.
+    /// Plans a history page from the resident window or queues a disk read;
+    /// encoding and delivery then advance under the loop-wide history budget.
     fn fetch_history(
         &mut self,
         session_id: SessionId,
@@ -4400,6 +5173,31 @@ impl Server {
         let Some(token) = self.live_token_for_session(session_id) else {
             return;
         };
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| {
+                session.pending_disk_history_fetches >= MAX_PENDING_DISK_HISTORY_FETCHES
+            })
+        {
+            kvlog::warn!(
+                "history fetch limit exceeded",
+                session_id = session_id.0,
+                room_id = room_id.0
+            );
+            self.send_empty_history_chunk(token, room_id, before);
+            return;
+        }
+        if self.pending_history_fetches >= MAX_PENDING_HISTORY_FETCHES {
+            kvlog::warn!(
+                "server history fetch limit exceeded",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                pending = self.pending_history_fetches
+            );
+            self.send_empty_history_chunk(token, room_id, before);
+            return;
+        }
         let plan = self.store.history_fetch_plan_before(
             room_id,
             before,
@@ -4427,35 +5225,20 @@ impl Server {
             chunk_count,
             at_start = plan.at_start
         );
-        for chunk_index in 0..chunk_count {
-            let payload = match self.store.encode_history_chunk(&plan, chunk_index) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    kvlog::warn!(
-                        "history chunk encode failed",
-                        session_id = session_id.0,
-                        room_id = room_id.0,
-                        chunk_index,
-                        chunk_count,
-                        error = error.as_str()
-                    );
-                    break;
-                }
-            };
-            if let Err(error) =
-                self.queue_control_payload_to_token(token, "history_chunk", &payload)
-            {
-                kvlog::warn!(
-                    "history chunk send failed",
-                    session_id = session_id.0,
-                    room_id = room_id.0,
-                    chunk_index,
-                    chunk_count,
-                    error = error.as_str()
-                );
-                break;
-            }
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.pending_disk_history_fetches += 1;
         }
+        self.pending_history_fetches += 1;
+        self.history_deliveries.push_back(HistoryDelivery {
+            session_id,
+            token,
+            room_id,
+            source: HistoryDeliverySource::Resident {
+                plan,
+                next_chunk: 0,
+            },
+        });
+        self.loop_work.set_background_work(true);
     }
 
     fn enqueue_disk_history_fetch(
@@ -4490,6 +5273,7 @@ impl Server {
         if let Some(session) = self.sessions.get_mut(&session_id) {
             session.pending_disk_history_fetches += 1;
         }
+        self.pending_history_fetches += 1;
         kvlog::info!(
             "disk history fetch queued",
             session_id = session_id.0,
@@ -4513,31 +5297,113 @@ impl Server {
     /// Queues finished disk history pages to their sessions. Called every
     /// event-loop pass; the reader's waker only shortens the wait.
     fn drain_history_replies(&mut self) {
-        while let Ok(reply) = self.history_replies.try_recv() {
-            if let Some(session) = self.sessions.get_mut(&reply.session_id) {
-                session.pending_disk_history_fetches =
-                    session.pending_disk_history_fetches.saturating_sub(1);
-            }
+        let mut replies = self.history_events.drain_up_to(16);
+        while let Some(reply) = replies.pop_front() {
             let Some(token) = self.live_token_for_session(reply.session_id) else {
+                if let Some(session) = self.sessions.get_mut(&reply.session_id) {
+                    session.pending_disk_history_fetches =
+                        session.pending_disk_history_fetches.saturating_sub(1);
+                }
+                self.pending_history_fetches = self.pending_history_fetches.saturating_sub(1);
                 continue;
             };
-            let chunk_count = reply.payloads.len();
-            for (chunk_index, payload) in reply.payloads.into_iter().enumerate() {
-                if let Err(error) =
-                    self.queue_control_payload_to_token(token, "history_chunk", &payload)
-                {
-                    kvlog::warn!(
-                        "disk history chunk send failed",
-                        session_id = reply.session_id.0,
-                        room_id = reply.room_id.0,
-                        chunk_index,
-                        chunk_count,
-                        error = error.as_str()
-                    );
-                    break;
+            self.history_deliveries.push_back(HistoryDelivery {
+                session_id: reply.session_id,
+                token,
+                room_id: reply.room_id,
+                source: HistoryDeliverySource::Encoded(reply.payloads.into()),
+            });
+        }
+        self.process_history_deliveries();
+    }
+
+    fn process_history_deliveries(&mut self) {
+        let mut bytes = 0usize;
+        let mut chunks = 0usize;
+        while chunks < HISTORY_DELIVERY_BUDGET_CHUNKS {
+            let Some(mut delivery) = self.history_deliveries.pop_front() else {
+                break;
+            };
+            if !self.clients.contains_key(&delivery.token) {
+                self.finish_history_delivery(delivery.session_id);
+                continue;
+            }
+            let payload = match &mut delivery.source {
+                HistoryDeliverySource::Resident { plan, next_chunk } => {
+                    if *next_chunk >= plan.chunk_count() {
+                        self.finish_history_delivery(delivery.session_id);
+                        continue;
+                    }
+                    match self.store.encode_history_chunk(plan, *next_chunk) {
+                        Ok(payload) => {
+                            *next_chunk += 1;
+                            payload
+                        }
+                        Err(error) => {
+                            kvlog::warn!(
+                                "history chunk encode failed",
+                                session_id = delivery.session_id.0,
+                                room_id = delivery.room_id.0,
+                                error = error.as_str()
+                            );
+                            *next_chunk = plan.chunk_count();
+                            history_reader::empty_chunk(delivery.room_id, plan.before())
+                        }
+                    }
                 }
+                HistoryDeliverySource::Encoded(payloads) => {
+                    let Some(payload) = payloads.pop_front() else {
+                        self.finish_history_delivery(delivery.session_id);
+                        continue;
+                    };
+                    payload
+                }
+            };
+            if chunks > 0 && bytes.saturating_add(payload.len()) > HISTORY_DELIVERY_BUDGET_BYTES {
+                match &mut delivery.source {
+                    HistoryDeliverySource::Resident { next_chunk, .. } => *next_chunk -= 1,
+                    HistoryDeliverySource::Encoded(payloads) => payloads.push_front(payload),
+                }
+                self.history_deliveries.push_front(delivery);
+                break;
+            }
+            bytes = bytes.saturating_add(payload.len());
+            chunks += 1;
+            let send_failed = self
+                .queue_control_payload_to_token(delivery.token, "history_chunk", &payload)
+                .is_err();
+            let complete = match &delivery.source {
+                HistoryDeliverySource::Resident { plan, next_chunk } => {
+                    send_failed || *next_chunk >= plan.chunk_count()
+                }
+                HistoryDeliverySource::Encoded(payloads) => send_failed || payloads.is_empty(),
+            };
+            if complete {
+                self.finish_history_delivery(delivery.session_id);
+            } else {
+                self.history_deliveries.push_back(delivery);
+            }
+            if bytes >= HISTORY_DELIVERY_BUDGET_BYTES {
+                break;
             }
         }
+        self.refresh_background_work();
+    }
+
+    fn refresh_background_work(&mut self) {
+        self.loop_work.set_background_work(
+            !self.history_deliveries.is_empty()
+                || !self.video_fanouts.is_empty()
+                || !self.control_send_tokens.is_empty(),
+        );
+    }
+
+    fn finish_history_delivery(&mut self, session_id: SessionId) {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.pending_disk_history_fetches =
+                session.pending_disk_history_fetches.saturating_sub(1);
+        }
+        self.pending_history_fetches = self.pending_history_fetches.saturating_sub(1);
     }
 
     fn enqueue_mls_write(
@@ -4561,7 +5427,7 @@ impl Server {
     /// and disconnects that client; unrelated sockets continue to run while
     /// the worker is blocked in storage I/O.
     fn drain_mls_replies(&mut self) {
-        let mut events = self.mls_events.drain();
+        let mut events = self.mls_events.drain_up_to(32);
         while let Some(reply) = events.pop_front() {
             let (token, result) = match reply {
                 MlsReply::RosterStored {
@@ -4980,8 +5846,15 @@ impl Server {
             return;
         }
         let existing = self.store.dm_room_for(requester, peer);
-        let room_id = match self.store.open_dm(requester, peer, now_ms()) {
-            Ok(room_id) => room_id,
+        let room_id = match self.store.begin_open_dm(requester, peer, now_ms()) {
+            Ok(OpenDmResult::Existing(room_id)) => room_id,
+            Ok(OpenDmResult::Pending { operation_id }) => {
+                self.pending_dm_waiters
+                    .entry(operation_id)
+                    .or_default()
+                    .push((session_id, peer));
+                return;
+            }
             Err(error) => {
                 let _ = self.send_control_to_token(
                     token,
@@ -5026,6 +5899,72 @@ impl Server {
         }
         if self.live_token_for_session(session_id).is_some() {
             let _ = self.send_control_to_token(token, &ServerControl::DmOpened { room_id, peer });
+        }
+    }
+
+    fn drain_dm_completions(&mut self) {
+        let mut completed = self.store.drain_dm_completions();
+        while let Some(completion) = completed.pop_front() {
+            let waiters = self
+                .pending_dm_waiters
+                .remove(&completion.operation_id)
+                .unwrap_or_default();
+            if let Err(error) = completion.result {
+                for (session_id, _) in waiters {
+                    if let Some(token) = self.live_token_for_session(session_id) {
+                        let _ = self.send_control_to_token(
+                            token,
+                            &ServerControl::Error {
+                                code: control::ERROR_INTERNAL,
+                                message: error.clone(),
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
+            let room_id = completion.room.room_id;
+            let requester = completion.room.user_a;
+            let peer = completion.room.user_b;
+            self.rooms.insert(
+                room_id,
+                RoomState {
+                    id: room_id,
+                    name: dm_room_name(requester, peer),
+                    access: RoomAccess::Dm(requester, peer),
+                    active_streams: HashMap::new(),
+                },
+            );
+            kvlog::info!(
+                "dm room opened",
+                requester = requester.0,
+                peer = peer.0,
+                room_id = room_id.0,
+                created = true
+            );
+            let room = self.room_info(self.rooms.get(&room_id).expect("dm room inserted"));
+            let endpoint_tokens: Vec<Token> = self
+                .sessions
+                .values()
+                .filter(|session| session.user_id == requester || session.user_id == peer)
+                .map(|session| session.tcp_token)
+                .filter(|token| self.clients.contains_key(token))
+                .collect();
+            self.send_control_to_tokens(
+                &endpoint_tokens,
+                &ServerControl::RoomUpserted { room },
+            );
+            for (session_id, requested_peer) in waiters {
+                if let Some(token) = self.live_token_for_session(session_id) {
+                    let _ = self.send_control_to_token(
+                        token,
+                        &ServerControl::DmOpened {
+                            room_id,
+                            peer: requested_peer,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -5137,7 +6076,18 @@ impl Server {
             flags: MessageFlags::default(),
             target: None,
         };
-        let history_len = self.store.append(room_id, &message);
+        let history_len = match self.store.try_append(room_id, &message) {
+            Ok(history_len) => history_len,
+            Err(error) => {
+                kvlog::warn!(
+                    "chat send deferred by durable history backpressure",
+                    session_id = session_id.0,
+                    room_id = room_id.0,
+                    error = error.as_str()
+                );
+                return self.reject_durable_history_busy(session_id);
+            }
+        };
         kvlog::info!(
             "chat message accepted",
             session_id = session_id.0,
@@ -5252,7 +6202,18 @@ impl Server {
             flags,
             target: Some(target),
         };
-        let history_len = self.store.append(room_id, &message);
+        let history_len = match self.store.try_append(room_id, &message) {
+            Ok(history_len) => history_len,
+            Err(error) => {
+                kvlog::warn!(
+                    "chat mutation deferred by durable history backpressure",
+                    session_id = session_id.0,
+                    room_id = room_id.0,
+                    error = error.as_str()
+                );
+                return self.reject_durable_history_busy(session_id);
+            }
+        };
         kvlog::info!(
             "chat mutation accepted",
             session_id = session_id.0,
@@ -5288,6 +6249,19 @@ impl Server {
                 target,
                 kind,
                 message,
+            },
+        )
+    }
+
+    fn reject_durable_history_busy(&mut self, session_id: SessionId) -> Result<(), String> {
+        let token = self
+            .live_token_for_session(session_id)
+            .ok_or_else(|| "chat sender disconnected".to_string())?;
+        self.send_control_to_token(
+            token,
+            &ServerControl::Error {
+                code: control::ERROR_REQUEST_REJECTED,
+                message: "durable history is busy; retry shortly".to_string(),
             },
         )
     }
@@ -5353,6 +6327,13 @@ impl Server {
         let Some(uploader_token) = self.live_token_for_session(session_id) else {
             return Err("uploading session disconnected".into());
         };
+        if self
+            .clients
+            .get(&uploader_token)
+            .is_some_and(ClientConn::is_closing)
+        {
+            return Err("uploading session is closing".into());
+        }
 
         let member_ids: Vec<SessionId> = self
             .rooms
@@ -5447,7 +6428,20 @@ impl Server {
             return accepted;
         }
         if !mls_encrypted {
-            self.store.append(room_id, &message);
+            if let Err(error) = self.store.try_append(room_id, &message) {
+                kvlog::warn!(
+                    "file announcement deferred by durable history backpressure",
+                    session_id = session_id.0,
+                    room_id = room_id.0,
+                    error = error.as_str()
+                );
+                self.cancel_file_upload(
+                    session_id,
+                    client_transfer_id,
+                    "durable history is busy; retry shortly".to_string(),
+                );
+                return Ok(());
+            }
             self.broadcast_control(room_id, &ServerControl::Chat { message });
         }
         if self.live_token_for_session(session_id).is_none() {
@@ -6137,17 +7131,19 @@ impl Server {
         token: Token,
         control: &ServerControl,
     ) -> Result<(), String> {
-        let payload = encode_server_control(control);
-        self.queue_control_payload_to_token(token, server_control_kind(control), &payload)
+        let payload: Arc<[u8]> = encode_server_control(control).into();
+        self.queue_shared_control_payload(token, server_control_kind(control), payload)
     }
 
     /// Encodes the control once and queues it to every token; per-recipient
     /// failures are logged and skipped.
     fn send_control_to_tokens(&mut self, tokens: &[Token], control: &ServerControl) {
         let kind = server_control_kind(control);
-        let payload = encode_server_control(control);
+        let payload: Arc<[u8]> = encode_server_control(control).into();
         for token in tokens {
-            if let Err(error) = self.queue_control_payload_to_token(*token, kind, &payload) {
+            if let Err(error) =
+                self.queue_shared_control_payload(*token, kind, Arc::clone(&payload))
+            {
                 kvlog::warn!(
                     "server control send failed",
                     token = token.0,
@@ -6164,9 +7160,157 @@ impl Server {
         kind: &'static str,
         payload: &[u8],
     ) -> Result<(), String> {
+        self.queue_shared_control_payload(token, kind, Arc::from(payload))
+    }
+
+    fn queue_shared_control_payload(
+        &mut self,
+        token: Token,
+        kind: &'static str,
+        payload: Arc<[u8]>,
+    ) -> Result<(), String> {
         if payload.len() > MAX_CONTROL_PAYLOAD_BYTES {
             return Err(format!("{kind} exceeds control payload limit"));
         }
+        let client = self
+            .clients
+            .get(&token)
+            .ok_or_else(|| "unknown client token".to_string())?;
+        let transport = client
+            .control
+            .as_ref()
+            .ok_or_else(|| "missing control cipher".to_string())?;
+        let sealed_len = transport.sealed_len(payload.len());
+        if sealed_len > frame::MAX_FRAME_LEN {
+            return Err(format!("{kind} exceeds frame limit"));
+        }
+        let pending_bytes = self.pending_control_bytes.get(&token).copied().unwrap_or(0);
+        let projected = client
+            .write_buf
+            .len()
+            .saturating_add(pending_bytes)
+            .saturating_add(frame::LENGTH_PREFIX_LEN + sealed_len);
+        if projected > CONTROL_WRITE_HIGH_WATER {
+            kvlog::warn!("control client dropped for backpressure", token = token.0, kind);
+            self.disconnect(token);
+            return Err("control write buffer overflow".to_string());
+        }
+        let scheduled_bytes = frame::LENGTH_PREFIX_LEN + sealed_len;
+        if self
+            .write_queue_total_bytes
+            .saturating_add(self.pending_control_total_bytes)
+            .saturating_add(scheduled_bytes)
+            > OUTBOUND_GLOBAL_HIGH_WATER
+        {
+            kvlog::warn!(
+                "control client dropped because global outbound queue is full",
+                token = token.0,
+                kind,
+                queued_bytes = self
+                    .write_queue_total_bytes
+                    .saturating_add(self.pending_control_total_bytes)
+            );
+            self.disconnect(token);
+            return Err("server control queue is full".to_string());
+        }
+        *self.pending_control_bytes.entry(token).or_default() +=
+            scheduled_bytes;
+        self.pending_control_total_bytes += scheduled_bytes;
+        self.pending_controls
+            .entry(token)
+            .or_default()
+            .push_back(PendingControl { kind, payload });
+        if self.control_send_set.insert(token) {
+            self.control_send_tokens.push_back(token);
+        }
+        kvlog::debug!(
+            "server control scheduled",
+            token = token.0,
+            kind = kind,
+            encrypted_size = sealed_len,
+            queued_bytes = projected
+        );
+        self.refresh_background_work();
+        Ok(())
+    }
+
+    fn process_control_sends(&mut self) {
+        let mut bytes = 0usize;
+        let mut records = 0usize;
+        while records < CONTROL_SEAL_BUDGET_RECORDS {
+            let Some(token) = self.control_send_tokens.pop_front() else {
+                break;
+            };
+            self.control_send_set.remove(&token);
+            let Some(control) = self
+                .pending_controls
+                .get_mut(&token)
+                .and_then(VecDeque::pop_front)
+            else {
+                self.pending_controls.remove(&token);
+                self.pending_control_bytes.remove(&token);
+                continue;
+            };
+            if records > 0
+                && bytes.saturating_add(control.payload.len()) > CONTROL_SEAL_BUDGET_BYTES
+            {
+                self.pending_controls
+                    .entry(token)
+                    .or_default()
+                    .push_front(control);
+                if self.control_send_set.insert(token) {
+                    self.control_send_tokens.push_front(token);
+                }
+                break;
+            }
+            let sealed_size = self
+                .clients
+                .get(&token)
+                .and_then(|client| client.control.as_ref())
+                .map(|control_cipher| {
+                    frame::LENGTH_PREFIX_LEN + control_cipher.sealed_len(control.payload.len())
+                })
+                .unwrap_or(0);
+            if let Some(pending) = self.pending_control_bytes.get_mut(&token) {
+                *pending = pending.saturating_sub(sealed_size);
+            }
+            self.pending_control_total_bytes =
+                self.pending_control_total_bytes.saturating_sub(sealed_size);
+            bytes = bytes.saturating_add(control.payload.len());
+            records += 1;
+            if let Err(error) = self.seal_control_payload_now(token, &control.payload)
+            {
+                kvlog::warn!(
+                    "scheduled server control failed",
+                    token = token.0,
+                    kind = control.kind,
+                    error = error.as_str()
+                );
+                self.disconnect(token);
+                continue;
+            }
+            let has_more = self
+                .pending_controls
+                .get(&token)
+                .is_some_and(|pending| !pending.is_empty());
+            if has_more && self.control_send_set.insert(token) {
+                self.control_send_tokens.push_back(token);
+            } else if !has_more {
+                self.pending_controls.remove(&token);
+                self.pending_control_bytes.remove(&token);
+            }
+            if bytes >= CONTROL_SEAL_BUDGET_BYTES {
+                break;
+            }
+        }
+        self.refresh_background_work();
+    }
+
+    fn seal_control_payload_now(
+        &mut self,
+        token: Token,
+        payload: &[u8],
+    ) -> Result<(), String> {
         let client = self
             .clients
             .get_mut(&token)
@@ -6176,41 +7320,23 @@ impl Server {
             .as_mut()
             .ok_or_else(|| "missing control cipher".to_string())?;
         let sealed_len = transport.sealed_len(payload.len());
-        if sealed_len > frame::MAX_FRAME_LEN {
-            return Err(format!("{kind} exceeds frame limit"));
-        }
+        let queued_before = client.write_buf.len();
         let out = client.write_buf.tail_mut();
+        let tail_before = out.len();
         out.extend_from_slice(&(sealed_len as u32).to_le_bytes());
         if let Err(error) = transport.seal_next_into(CHANNEL_CONTROL, payload, out) {
-            out.truncate(out.len() - frame::LENGTH_PREFIX_LEN);
+            out.truncate(tail_before);
             return Err(error.to_string());
         }
+        self.write_queue_total_bytes += client.write_buf.len() - queued_before;
         kvlog::debug!(
             "server control queued",
             token = token.0,
-            kind = kind,
             payload_size = payload.len(),
             encrypted_size = sealed_len,
             queued_bytes = client.write_buf.len()
         );
-        self.write_client(token);
-        // The flush above wrote as much as the socket accepted; what remains
-        // is bounded by the peer draining its end. A control client past the
-        // high-water mark is dropped rather than buffered further, the same
-        // treatment `publish_video_frame` gives a stalled video subscriber.
-        let over_water = self
-            .clients
-            .get(&token)
-            .is_some_and(|client| client.write_buf.len() > CONTROL_WRITE_HIGH_WATER);
-        if over_water {
-            kvlog::warn!(
-                "control client dropped for backpressure",
-                token = token.0,
-                kind
-            );
-            self.disconnect(token);
-            return Err("control write buffer overflow".to_string());
-        }
+        self.loop_work.queue_client_write(token);
         Ok(())
     }
 
@@ -6238,9 +7364,11 @@ impl Server {
             kind,
             recipient_count = tokens.len()
         );
-        let payload = encode_server_control(control);
+        let payload: Arc<[u8]> = encode_server_control(control).into();
         for token in tokens {
-            if let Err(error) = self.queue_control_payload_to_token(token, kind, &payload) {
+            if let Err(error) =
+                self.queue_shared_control_payload(token, kind, Arc::clone(&payload))
+            {
                 kvlog::warn!(
                     "server control broadcast failed",
                     token = token.0,
@@ -6255,12 +7383,21 @@ impl Server {
     fn write_client(&mut self, token: Token) {
         let mut disconnected = false;
         let mut requeue = false;
+        let pending_controls = self
+            .pending_controls
+            .get(&token)
+            .is_some_and(|pending| !pending.is_empty());
         if let Some(client) = self.clients.get_mut(&token) {
-            match write_queue_to(
+            let queued_before = client.write_buf.len();
+            let write_result = write_queue_to(
                 &mut client.socket,
                 &mut client.write_buf,
                 TCP_WRITE_ATTEMPTS,
-            ) {
+            );
+            self.write_queue_total_bytes = self
+                .write_queue_total_bytes
+                .saturating_sub(queued_before - client.write_buf.len());
+            match write_result {
                 Ok(outcome) => {
                     if outcome.bytes_written > 0 {
                         client.last_activity = Instant::now();
@@ -6283,7 +7420,7 @@ impl Server {
                     disconnected = true;
                 }
             }
-            if client.is_closing() && client.write_buf.is_empty() {
+            if client.is_closing() && client.write_buf.is_empty() && !pending_controls {
                 disconnected = true;
             }
         }
@@ -6304,7 +7441,11 @@ impl Server {
             let Close::Draining { deadline } = client.close else {
                 continue;
             };
-            if client.write_buf.is_empty() || now >= deadline {
+            let controls_pending = self
+                .pending_controls
+                .get(token)
+                .is_some_and(|pending| !pending.is_empty());
+            if (client.write_buf.is_empty() && !controls_pending) || now >= deadline {
                 expired.push(*token);
             }
         }
@@ -6344,9 +7485,22 @@ impl Server {
     }
 
     fn disconnect(&mut self, token: Token) {
+        if self.deferred_identity_tokens.remove(&token) {
+            self.deferred_identity_controls
+                .retain(|(pending_token, _)| *pending_token != token);
+        }
+        self.pending_controls.remove(&token);
+        if let Some(pending) = self.pending_control_bytes.remove(&token) {
+            self.pending_control_total_bytes =
+                self.pending_control_total_bytes.saturating_sub(pending);
+        }
+        self.control_send_set.remove(&token);
         let Some(mut client) = self.clients.remove(&token) else {
             return;
         };
+        self.write_queue_total_bytes = self
+            .write_queue_total_bytes
+            .saturating_sub(client.write_buf.len());
         if let Err(error) = self.poll.registry().deregister(&mut client.socket) {
             kvlog::warn!(
                 "tcp client deregister failed",
@@ -6560,6 +7714,7 @@ impl Server {
         };
         if client.is_closing()
             || self.pending_mls.contains(&token)
+            || self.identity_pending(token)
             || self.relay_clogged_for_reader(token)
         {
             return false;
@@ -6655,6 +7810,44 @@ impl Server {
         }
     }
 
+    fn drain_bug_report_replies(&mut self) {
+        let mut replies = self.bug_report_events.drain_up_to(16);
+        while let Some(reply) = replies.pop_front() {
+            self.pending_bug_reports
+                .remove(&(reply.session_id, reply.report_id));
+            let Some(token) = self.live_token_for_session(reply.session_id) else {
+                continue;
+            };
+            match reply.result {
+                Ok(saved) => {
+                    kvlog::info!(
+                        "bug report saved",
+                        session_id = reply.session_id.0,
+                        report_id = reply.report_id.0,
+                        description = reply.description.as_str(),
+                        logs = saved.as_str()
+                    );
+                    if let Err(error) = self.send_control_to_token(
+                        token,
+                        &ServerControl::BugReportSaved {
+                            report_id: reply.report_id,
+                        },
+                    ) {
+                        kvlog::warn!(
+                            "bug report completion send failed",
+                            session_id = reply.session_id.0,
+                            report_id = reply.report_id.0,
+                            error = error.as_str()
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = self.report_bug_outcome(token, Err(error));
+                }
+            }
+        }
+    }
+
     fn start_bug_report(
         &mut self,
         session_id: SessionId,
@@ -6669,6 +7862,22 @@ impl Server {
         if logs_size > MAX_BUG_REPORT_BYTES {
             return Err("bug report logs exceed maximum length".into());
         }
+        let key = (session_id, report_id);
+        if self.active_bug_reports.contains_key(&key) || self.pending_bug_reports.contains(&key) {
+            return Err("bug report is already active".into());
+        }
+        let session_reports = self
+            .active_bug_reports
+            .keys()
+            .chain(self.pending_bug_reports.iter())
+            .filter(|(owner, _)| *owner == session_id)
+            .count();
+        if session_reports >= MAX_ACTIVE_BUG_REPORTS_PER_SESSION {
+            return Err("another bug report is already active for this session".into());
+        }
+        if self.active_bug_reports.len() + self.pending_bug_reports.len() >= MAX_ACTIVE_BUG_REPORTS {
+            return Err("the server bug report queue is full".into());
+        }
         kvlog::info!(
             "bug report starting",
             session_id = session_id.0,
@@ -6676,7 +7885,7 @@ impl Server {
             logs_size
         );
         self.active_bug_reports.insert(
-            (session_id, report_id),
+            key,
             ServerBugReport {
                 description,
                 metadata,
@@ -6711,7 +7920,6 @@ impl Server {
 
     fn complete_bug_report(
         &mut self,
-        token: Token,
         session_id: SessionId,
         report_id: BugReportId,
     ) -> Result<(), String> {
@@ -6730,68 +7938,33 @@ impl Server {
             .get(&session_id)
             .map(|session| session.username.clone())
             .unwrap_or_default();
-        let saved = write_bug_report(&dir, &username, report_id, &report)?;
-        kvlog::info!(
-            "bug report saved",
-            session_id = session_id.0,
-            report_id = report_id.0,
-            description = report.description.as_str(),
-            logs = saved.as_str()
-        );
-        self.send_control_to_token(token, &ServerControl::BugReportSaved { report_id })
-    }
-}
-
-/// Writes a bug report bundle as two files sharing a unique prefix: the
-/// zstd-compressed logs (`.log.zst`, stored verbatim) and the metadata
-/// (`.json`). Returns the logs path.
-fn write_bug_report(
-    dir: &str,
-    username: &str,
-    report_id: BugReportId,
-    report: &ServerBugReport,
-) -> Result<String, String> {
-    let dir = std::path::Path::new(dir);
-    std::fs::create_dir_all(dir)
-        .map_err(|error| format!("failed to create bug-report dir: {error}"))?;
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
-    let user = sanitize_file_name(if username.trim().is_empty() {
-        "anon"
-    } else {
-        username
-    });
-    let base = format!("{timestamp}-{user}-{}", report_id.0);
-
-    // Probe for a collision-free prefix using create_new on the logs file.
-    for index in 0u64.. {
-        let prefix = if index == 0 {
-            base.clone()
-        } else {
-            format!("{base}-{index}")
+        let key = (session_id, report_id);
+        self.pending_bug_reports.insert(key);
+        let request = BugReportWriteRequest {
+            session_id,
+            report_id,
+            dir,
+            username,
+            description: report.description,
+            metadata: report.metadata,
+            logs: report.logs,
         };
-        let logs_path = dir.join(format!("{prefix}.log.zst"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&logs_path)
-        {
-            Ok(mut file) => {
-                file.write_all(&report.logs)
-                    .map_err(|error| format!("failed to write bug report logs: {error}"))?;
-                let metadata_path = dir.join(format!("{prefix}.json"));
-                std::fs::write(&metadata_path, report.metadata.as_bytes())
-                    .map_err(|error| format!("failed to write bug report metadata: {error}"))?;
-                return Ok(logs_path.display().to_string());
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("failed to create bug report file: {error}")),
+        if let Err(error) = self.bug_report_writer.enqueue(request) {
+            self.pending_bug_reports.remove(&key);
+            return Err(match error {
+                BugReportEnqueueError::Full => "the server bug report writer is busy".to_string(),
+                BugReportEnqueueError::Gone => {
+                    "the server bug report writer is unavailable".to_string()
+                }
+            });
         }
+        kvlog::info!(
+            "bug report queued for storage",
+            session_id = session_id.0,
+            report_id = report_id.0
+        );
+        Ok(())
     }
-    unreachable!("u64 bug-report suffix space exhausted")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7370,6 +8543,22 @@ fn subscriber_within_limit(write_buf_len: usize) -> bool {
     write_buf_len <= VIDEO_SUBSCRIBER_HIGH_WATER
 }
 
+fn identity_control_needs_ordering(control: &ClientControl) -> bool {
+    matches!(
+        control,
+        ClientControl::Authenticate { .. }
+            | ClientControl::Pair { .. }
+            | ClientControl::OpenPair { .. }
+            | ClientControl::RedeemDeviceLink { .. }
+    )
+}
+
+fn video_fanout_charge(data: &SharedVideoFrame, subscriber_capacity: usize) -> usize {
+    data.retained_bytes()
+        .saturating_add(subscriber_capacity.saturating_mul(std::mem::size_of::<Token>()))
+        .saturating_add(std::mem::size_of::<VideoFanout>())
+}
+
 fn is_dynamic_user_id(user_id: UserId) -> bool {
     user_id.0 >= config::FIRST_DYNAMIC_USER_ID
 }
@@ -7759,34 +8948,6 @@ mod tests {
         finish_test_roster(server);
     }
 
-    #[test]
-    fn write_bug_report_creates_paired_files() {
-        let dir = std::env::temp_dir().join(format!("chatt-bug-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let report = ServerBugReport {
-            description: "stuck mute".to_string(),
-            metadata: "{\"version\":\"0.1.0\"}".to_string(),
-            logs: vec![1, 2, 3, 4],
-            expected: 4,
-        };
-        let logs_path = write_bug_report(
-            dir.to_str().unwrap(),
-            "Alice Tester",
-            BugReportId(7),
-            &report,
-        )
-        .unwrap();
-
-        assert!(logs_path.ends_with(".log.zst"));
-        let logs = std::fs::read(&logs_path).unwrap();
-        assert_eq!(logs, vec![1, 2, 3, 4]);
-        let metadata_path = logs_path.replace(".log.zst", ".json");
-        let metadata = std::fs::read_to_string(&metadata_path).unwrap();
-        assert_eq!(metadata, "{\"version\":\"0.1.0\"}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     fn test_room(room_id: RoomId, voice_members: &[SessionId]) -> RoomState {
         RoomState {
             id: room_id,
@@ -7861,6 +9022,88 @@ mod tests {
 
     fn test_server() -> Server {
         Server::bind(test_server_config()).expect("test server")
+    }
+
+    #[test]
+    fn bug_report_completion_arrives_from_background_writer() {
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-bug-server-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = test_server_config();
+        config.security.bug_report_dir = Some(dir.display().to_string());
+        let mut server = Server::bind(config).expect("test server");
+        let session_id = SessionId(3);
+        let report_id = BugReportId(7);
+        let token = Token(11);
+        let mut peer = live_user(&mut server, token, session_id, UserId(5));
+
+        server
+            .start_bug_report(
+                session_id,
+                report_id,
+                "stuck mute".to_string(),
+                "{\"version\":\"0.1.0\"}".to_string(),
+                4,
+            )
+            .unwrap();
+        server
+            .receive_bug_report_chunk(session_id, report_id, 0, vec![1, 2, 3, 4])
+            .unwrap();
+        server.complete_bug_report(session_id, report_id).unwrap();
+        assert!(server.pending_bug_reports.contains(&(session_id, report_id)));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.pending_bug_reports.contains(&(session_id, report_id)) {
+            server.drain_bug_report_replies();
+            assert!(Instant::now() < deadline, "bug report completion");
+            thread::yield_now();
+        }
+
+        assert_eq!(
+            read_plaintext_server_control(&mut server, &mut peer),
+            ServerControl::BugReportSaved { report_id }
+        );
+        let logs_path = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "zst"))
+            .expect("bug report logs");
+        assert_eq!(std::fs::read(logs_path).unwrap(), vec![1, 2, 3, 4]);
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bug_report_upload_count_is_bounded_per_session() {
+        let mut server = test_server();
+        server.config.security.bug_report_dir = Some("/tmp/chatt-unused-bug-dir".to_string());
+        let session_id = SessionId(3);
+        server
+            .start_bug_report(
+                session_id,
+                BugReportId(1),
+                String::new(),
+                String::new(),
+                0,
+            )
+            .unwrap();
+
+        let error = server
+            .start_bug_report(
+                session_id,
+                BugReportId(2),
+                String::new(),
+                String::new(),
+                0,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("already active"));
     }
 
     #[test]
@@ -8034,11 +9277,11 @@ mod tests {
         let mut peer = live_user(&mut server, Token(22), outsider, UserId(2));
 
         server.join_voice(outsider, secret);
-        let denied = read_until(&mut peer, |control| {
+        let denied = read_until(&mut server, &mut peer, |control| {
             matches!(control, ServerControl::VoiceJoinFailed { .. })
         });
         server.join_voice(outsider, RoomId(99));
-        let missing = read_until(&mut peer, |control| {
+        let missing = read_until(&mut server, &mut peer, |control| {
             matches!(control, ServerControl::VoiceJoinFailed { .. })
         });
 
@@ -8151,11 +9394,12 @@ mod tests {
     }
 
     fn read_until(
+        server: &mut Server,
         peer: &mut std::net::TcpStream,
         accept: impl Fn(&ServerControl) -> bool,
     ) -> ServerControl {
         for _ in 0..64 {
-            let control = read_plaintext_server_control(peer);
+            let control = read_plaintext_server_control(server, peer);
             if accept(&control) {
                 return control;
             }
@@ -8163,9 +9407,12 @@ mod tests {
         panic!("expected control was not received");
     }
 
-    fn read_until_history_chunk(peer: &mut std::net::TcpStream) -> history::HistoryChunk {
+    fn read_until_history_chunk(
+        server: &mut Server,
+        peer: &mut std::net::TcpStream,
+    ) -> history::HistoryChunk {
         for _ in 0..64 {
-            let payload = read_plaintext_server_payload(peer);
+            let payload = read_plaintext_server_payload(server, peer);
             if let Some(chunk) = history::decode_chunk(&payload).expect("decode history chunk") {
                 return chunk;
             }
@@ -8204,7 +9451,7 @@ mod tests {
             .unwrap();
 
         for peer in [&mut sender_peer, &mut reader_peer] {
-            let control = read_until(peer, |control| {
+            let control = read_until(&mut server, peer, |control| {
                 matches!(control, ServerControl::Chat { .. })
             });
             let ServerControl::Chat { message } = control else {
@@ -8242,6 +9489,7 @@ mod tests {
             .unwrap();
         for peer in [&mut sender_peer, &mut reader_peer] {
             let control = read_until(
+                &mut server,
                 peer,
                 |control| matches!(control, ServerControl::Chat { message } if message.target.is_some()),
             );
@@ -8264,7 +9512,7 @@ mod tests {
             )
             .unwrap();
         assert_no_control(&mut sender_peer);
-        let rejected = read_until(&mut reader_peer, |control| {
+        let rejected = read_until(&mut server, &mut reader_peer, |control| {
             matches!(control, ServerControl::ChatMutationRejected { .. })
         });
         assert!(matches!(
@@ -8286,7 +9534,7 @@ mod tests {
                 String::new(),
             )
             .unwrap();
-        let rejected = read_until(&mut reader_peer, |control| {
+        let rejected = read_until(&mut server, &mut reader_peer, |control| {
             matches!(control, ServerControl::ChatMutationRejected { .. })
         });
         assert!(matches!(
@@ -8309,6 +9557,7 @@ mod tests {
             )
             .unwrap();
         let control = read_until(
+            &mut server,
             &mut reader_peer,
             |control| matches!(control, ServerControl::Chat { message } if message.flags.deleted()),
         );
@@ -8343,6 +9592,7 @@ mod tests {
 
         for peer in [&mut sender_peer, &mut reader_peer] {
             let control = read_until(
+                &mut server,
                 peer,
                 |control| matches!(control, ServerControl::Chat { message } if message.target.is_some()),
             );
@@ -8368,12 +9618,12 @@ mod tests {
         server
             .send_chat(outsider, secret, "let me in".to_string())
             .unwrap();
-        let denied = read_until(&mut outsider_peer, |control| {
+        let denied = read_until(&mut server, &mut outsider_peer, |control| {
             matches!(control, ServerControl::Error { .. })
         });
 
         server.fetch_history(outsider, RoomId(99), None, 10);
-        let missing = read_until(&mut outsider_peer, |control| {
+        let missing = read_until(&mut server, &mut outsider_peer, |control| {
             matches!(control, ServerControl::Error { .. })
         });
 
@@ -8399,7 +9649,7 @@ mod tests {
         let mut endpoint_peer = live_user(&mut server, Token(22), peer_session, UserId(2));
 
         server.open_dm(requester, UserId(2));
-        let upserted = read_until(&mut requester_peer, |control| {
+        let upserted = read_until(&mut server, &mut requester_peer, |control| {
             matches!(control, ServerControl::RoomUpserted { .. })
         });
         let ServerControl::RoomUpserted { room } = upserted else {
@@ -8412,7 +9662,7 @@ mod tests {
                 user_b: UserId(2),
             }
         );
-        let opened = read_until(&mut requester_peer, |control| {
+        let opened = read_until(&mut server, &mut requester_peer, |control| {
             matches!(control, ServerControl::DmOpened { .. })
         });
         let ServerControl::DmOpened { room_id, peer } = opened else {
@@ -8420,12 +9670,12 @@ mod tests {
         };
         assert_eq!(room_id, room.room_id);
         assert_eq!(peer, UserId(2));
-        read_until(&mut endpoint_peer, |control| {
+        read_until(&mut server, &mut endpoint_peer, |control| {
             matches!(control, ServerControl::RoomUpserted { .. })
         });
 
         server.open_dm(peer_session, UserId(1));
-        let reopened = read_until(&mut endpoint_peer, |control| {
+        let reopened = read_until(&mut server, &mut endpoint_peer, |control| {
             matches!(control, ServerControl::DmOpened { .. })
         });
         let ServerControl::DmOpened {
@@ -8439,6 +9689,43 @@ mod tests {
     }
 
     #[test]
+    fn first_dm_is_published_only_after_async_state_completion() {
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-server-async-dm-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = test_server_config();
+        config.storage.data_dir = Some(dir.display().to_string());
+        let mut server = Server::bind(config).expect("test server");
+        let requester = SessionId(1);
+        let peer_session = SessionId(2);
+        let mut requester_peer = live_user(&mut server, Token(11), requester, UserId(1));
+        let _peer = live_user(&mut server, Token(22), peer_session, UserId(2));
+
+        server.open_dm(requester, UserId(2));
+
+        assert_eq!(server.pending_dm_waiters.len(), 1);
+        assert!(server
+            .rooms
+            .keys()
+            .all(|room_id| room_id.0 < config::FIRST_DYNAMIC_ROOM_ID));
+        drive_scheduled_work(&mut server);
+        assert!(server.pending_dm_waiters.is_empty());
+        assert!(matches!(
+            read_until(&mut server, &mut requester_peer, |control| matches!(
+                control,
+                ServerControl::DmOpened { .. }
+            )),
+            ServerControl::DmOpened { .. }
+        ));
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn dm_open_reply_reaches_requester_not_peers_other_devices() {
         let mut server = test_server();
         let bob = SessionId(1);
@@ -8448,7 +9735,7 @@ mod tests {
 
         server.open_dm(bob, UserId(1));
 
-        let opened = read_until(&mut bob_peer, |control| {
+        let opened = read_until(&mut server, &mut bob_peer, |control| {
             matches!(control, ServerControl::DmOpened { .. })
         });
         assert!(matches!(
@@ -8460,7 +9747,7 @@ mod tests {
         ));
         for peer in [&mut alice_first, &mut alice_second] {
             assert!(matches!(
-                read_until(peer, |control| matches!(
+                read_until(&mut server, peer, |control| matches!(
                     control,
                     ServerControl::RoomUpserted { .. }
                 )),
@@ -8478,7 +9765,7 @@ mod tests {
 
         server.open_dm(requester, UserId(1));
 
-        let control = read_until(&mut requester_peer, |control| {
+        let control = read_until(&mut server, &mut requester_peer, |control| {
             matches!(control, ServerControl::Error { .. })
         });
         let ServerControl::Error { code, .. } = control else {
@@ -8703,14 +9990,14 @@ mod tests {
         assert!(server.clients.contains_key(&winner));
         assert!(server.clients.contains_key(&loser));
         assert!(matches!(
-            read_until(&mut winner_peer, |control| matches!(
+            read_until(&mut server, &mut winner_peer, |control| matches!(
                 control,
                 ServerControl::EncryptedRoomCreated { room_id: observed, .. }
                     if *observed == room_id
             )),
             ServerControl::EncryptedRoomCreated { .. }
         ));
-        let reconciled = read_until(&mut loser_peer, |control| matches!(
+        let reconciled = read_until(&mut server, &mut loser_peer, |control| matches!(
             control,
             ServerControl::GroupInfo {
                 room_id: observed,
@@ -8799,7 +10086,7 @@ mod tests {
         assert!(server.mls.authenticate_credential(&bearer).is_some());
         assert_eq!(server.mls.key_package_count(device_id), 1);
         assert!(matches!(
-            read_until(&mut linking_peer, |control| matches!(
+            read_until(&mut server, &mut linking_peer, |control| matches!(
                 control,
                 ServerControl::DeviceLinked { .. }
             )),
@@ -8822,7 +10109,7 @@ mod tests {
             .unwrap();
         // Retry redemption is cache-only and completes inline.
         assert!(matches!(
-            read_until(&mut retry_peer, |control| matches!(
+            read_until(&mut server, &mut retry_peer, |control| matches!(
                 control,
                 ServerControl::DeviceLinked { .. }
             )),
@@ -8842,14 +10129,14 @@ mod tests {
             .create_device_link(session_id, vec![1; 32], vec![1])
             .unwrap();
         assert!(matches!(
-            read_plaintext_server_control(&mut peer),
+            read_plaintext_server_control(&mut server, &mut peer),
             ServerControl::DeviceLinkCreated { .. }
         ));
         server
             .create_device_link(session_id, vec![2; 32], vec![2])
             .unwrap();
         assert!(matches!(
-            read_plaintext_server_control(&mut peer),
+            read_plaintext_server_control(&mut server, &mut peer),
             ServerControl::DeviceLinkCreated { .. }
         ));
 
@@ -8877,7 +10164,7 @@ mod tests {
             .create_device_link(session_id, secret_hash.clone(), vec![1])
             .unwrap();
         assert!(matches!(
-            read_plaintext_server_control(&mut peer),
+            read_plaintext_server_control(&mut server, &mut peer),
             ServerControl::DeviceLinkCreated { .. }
         ));
         server
@@ -8886,7 +10173,7 @@ mod tests {
 
         assert!(!server.device_links.contains_key(&secret_hash));
         assert_eq!(
-            read_plaintext_server_control(&mut peer),
+            read_plaintext_server_control(&mut server, &mut peer),
             ServerControl::DeviceLinkCanceled {
                 redemption_secret_hash: secret_hash,
             }
@@ -8912,7 +10199,7 @@ mod tests {
 
         server.fetch_history(session, RoomId(1), Some(MessageId(6)), 4);
 
-        let chunk = read_until_history_chunk(&mut peer);
+        let chunk = read_until_history_chunk(&mut server, &mut peer);
         assert_eq!(chunk.room_id, RoomId(1));
         assert_eq!(chunk.before, Some(MessageId(6)));
         assert!(chunk.complete);
@@ -8925,7 +10212,7 @@ mod tests {
         assert!(!chunk.at_start);
 
         server.fetch_history(session, RoomId(1), Some(MessageId(2)), 4);
-        let chunk = read_until_history_chunk(&mut peer);
+        let chunk = read_until_history_chunk(&mut server, &mut peer);
         assert_eq!(chunk.before, Some(MessageId(2)));
         assert!(chunk.complete);
         assert_eq!(chunk.messages.len(), 1);
@@ -8991,13 +10278,13 @@ mod tests {
     ) -> history::HistoryChunk {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            server.drain_history_replies();
+            drive_scheduled_pass(server);
             peer.set_read_timeout(Some(Duration::from_millis(20)))
                 .expect("set read timeout");
             let mut len = [0u8; 4];
             match peer.peek(&mut len) {
                 Ok(4) => {
-                    let payload = read_plaintext_server_payload(peer);
+                    let payload = read_plaintext_server_payload(server, peer);
                     if let Some(chunk) =
                         history::decode_chunk(&payload).expect("decode history chunk")
                     {
@@ -9108,7 +10395,7 @@ mod tests {
         assert_eq!(session.voice_room, Some(room_a));
         assert!(session.active_stream.is_some());
         assert_eq!(server.voice_member_sessions(room_a), vec![talker]);
-        let control = read_until(&mut talker_peer, |control| {
+        let control = read_until(&mut server, &mut talker_peer, |control| {
             matches!(control, ServerControl::Chat { .. })
         });
         let ServerControl::Chat { message } = control else {
@@ -9149,13 +10436,13 @@ mod tests {
         server.join_voice(joining, room_id);
 
         let ServerControl::VoiceStarted { user_id, .. } =
-            read_plaintext_server_control(&mut joining_peer)
+            read_plaintext_server_control(&mut server, &mut joining_peer)
         else {
             panic!("voice confirmation must be the first control");
         };
         assert_eq!(user_id, UserId(2));
         let ServerControl::VoiceStarted { user_id, .. } =
-            read_plaintext_server_control(&mut joining_peer)
+            read_plaintext_server_control(&mut server, &mut joining_peer)
         else {
             panic!("existing voice member must follow local confirmation");
         };
@@ -9165,9 +10452,10 @@ mod tests {
     #[test]
     fn join_voice_broadcasts_joiner_stored_status() {
         fn read_voice_status(
+            server: &mut Server,
             peer: &mut std::net::TcpStream,
         ) -> (UserId, control::ParticipantVoiceStatus) {
-            let control = read_until(peer, |control| {
+            let control = read_until(server, peer, |control| {
                 matches!(control, ServerControl::VoiceStatus { .. })
             });
             let ServerControl::VoiceStatus {
@@ -9200,7 +10488,7 @@ mod tests {
 
         let mut statuses = Vec::new();
         for _ in 0..3 {
-            statuses.push(read_voice_status(&mut observer_peer));
+            statuses.push(read_voice_status(&mut server, &mut observer_peer));
         }
         assert_eq!(
             statuses,
@@ -9239,7 +10527,7 @@ mod tests {
             )
             .unwrap();
 
-        let available = read_until(&mut viewer_peer, |control| {
+        let available = read_until(&mut server, &mut viewer_peer, |control| {
             matches!(control, ServerControl::ShareAvailable { .. })
         });
         assert!(matches!(
@@ -9281,7 +10569,7 @@ mod tests {
             server.clients.contains_key(&token),
             "the connection must survive the rejection"
         );
-        let control = read_until(&mut peer, |control| {
+        let control = read_until(&mut server, &mut peer, |control| {
             matches!(control, ServerControl::Error { .. })
         });
         let ServerControl::Error { code, .. } = control else {
@@ -9314,7 +10602,7 @@ mod tests {
             .unwrap();
 
         server.join_voice(joiner, room_id);
-        read_until(&mut joiner_peer, |control| {
+        read_until(&mut server, &mut joiner_peer, |control| {
             matches!(control, ServerControl::VoiceStatus { .. })
         });
 
@@ -9442,7 +10730,7 @@ mod tests {
 
         server.join_voice(viewer, room_id);
 
-        let available = read_until(&mut viewer_peer, |control| {
+        let available = read_until(&mut server, &mut viewer_peer, |control| {
             matches!(control, ServerControl::ShareAvailable { .. })
         });
         let ServerControl::ShareAvailable {
@@ -9471,12 +10759,12 @@ mod tests {
         let mut watcher_peer = live_user(&mut server, Token(22), watcher, UserId(2));
 
         server.join_voice(talker, room_a);
-        read_until(&mut watcher_peer, |control| {
+        read_until(&mut server, &mut watcher_peer, |control| {
             matches!(control, ServerControl::VoiceStarted { .. })
         });
         server.leave_voice(talker, None);
 
-        let stopped = read_until(&mut watcher_peer, |control| {
+        let stopped = read_until(&mut server, &mut watcher_peer, |control| {
             matches!(control, ServerControl::VoiceStopped { .. })
         });
         let ServerControl::VoiceStopped {
@@ -9505,7 +10793,7 @@ mod tests {
 
         server.join_voice(outsider, secret);
 
-        let control = read_until(&mut outsider_peer, |control| {
+        let control = read_until(&mut server, &mut outsider_peer, |control| {
             matches!(control, ServerControl::VoiceJoinFailed { .. })
         });
         let ServerControl::VoiceJoinFailed { room_id, .. } = control else {
@@ -9803,6 +11091,27 @@ mod tests {
         assert_eq!(work.pop_client_write(), Some(Token(9)));
         assert_eq!(work.pop_client_write(), None);
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), POLL_TIMEOUT);
+    }
+
+    #[test]
+    fn control_scheduler_limits_records_per_pass_and_preserves_remainder() {
+        let mut server = test_server();
+        let token = Token(17);
+        let (conn, _peer) = test_live_client();
+        server.clients.insert(token, conn);
+        for _ in 0..40 {
+            server
+                .queue_control_payload_to_token(token, "test", b"payload")
+                .unwrap();
+        }
+
+        server.process_control_sends();
+
+        assert_eq!(server.pending_controls[&token].len(), 8);
+        assert!(server.control_send_set.contains(&token));
+        assert!(server.loop_work.client_write_count() > 0);
+        server.process_control_sends();
+        assert!(!server.pending_controls.contains_key(&token));
     }
 
     #[test]
@@ -10321,11 +11630,7 @@ mod tests {
             None,
         );
 
-        assert!(result.is_ok());
-        assert!(
-            server.clients.is_empty(),
-            "the draining uploader flushes and disconnects during the accept send"
-        );
+        assert_eq!(result.unwrap_err(), "uploading session is closing");
         assert!(server.active_uploads.is_empty());
         assert!(server.reserved_file_names.is_empty());
         let dangling = server
@@ -10515,7 +11820,7 @@ mod tests {
         assert!(upload.declined_notified);
         assert!(server.reserved_file_names.contains("report.pdf"));
 
-        let declined = read_until(&mut uploader_peer, |control| {
+        let declined = read_until(&mut server, &mut uploader_peer, |control| {
             matches!(control, ServerControl::UploadDeclined { .. })
         });
         let ServerControl::UploadDeclined {
@@ -10562,7 +11867,7 @@ mod tests {
         assert!(server.active_uploads[&key].recipients.is_empty());
         assert!(server.active_uploads[&key].declined_notified);
 
-        let declined = read_until(&mut uploader_peer, |control| {
+        let declined = read_until(&mut server, &mut uploader_peer, |control| {
             matches!(control, ServerControl::UploadDeclined { .. })
         });
         assert!(matches!(
@@ -10757,7 +12062,7 @@ mod tests {
             .authenticate_client(Token(1), "bad\u{1}name", token_secret, true, 0)
             .unwrap();
 
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
             panic!("expected invalid-username error");
         };
         assert_eq!(code, ERROR_PAIRING_INVALID_REQUEST);
@@ -10840,7 +12145,7 @@ mod tests {
         server
             .open_pair_client(Token(2), "zoe", "", &second_recovery, true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
             panic!("expected username-taken error");
         };
         assert_eq!(code, ERROR_USERNAME_TAKEN);
@@ -10900,7 +12205,7 @@ mod tests {
         server
             .open_pair_client(Token(2), "alice", "", &recovery, true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
             panic!("expected username-taken error");
         };
         assert_eq!(code, ERROR_USERNAME_TAKEN);
@@ -10933,7 +12238,7 @@ mod tests {
         server
             .pair_client(Token(2), "zoe", code, new_token, true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
             panic!("expected username-taken error");
         };
         assert_eq!(code, ERROR_USERNAME_TAKEN);
@@ -11013,7 +12318,7 @@ mod tests {
             .open_pair_client(token, "Zoe", "hunter2", &existing, true, 0)
             .unwrap();
 
-        let response = read_plaintext_server_control(&mut peer);
+        let response = read_plaintext_server_control(&mut server, &mut peer);
         let ServerControl::OpenPaired {
             token,
             udp_addr,
@@ -11213,7 +12518,7 @@ mod tests {
         server
             .open_pair_client(wrong, "Zoe", "wrong", "", true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut wrong_peer)
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut wrong_peer)
         else {
             panic!("expected password mismatch error");
         };
@@ -11225,7 +12530,7 @@ mod tests {
         server
             .open_pair_client(blocked, "Zoe", "hunter2", "", true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut blocked_peer)
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut blocked_peer)
         else {
             panic!("expected rate-limit error");
         };
@@ -11315,7 +12620,65 @@ mod tests {
         peer
     }
 
-    fn read_plaintext_server_payload(peer: &mut std::net::TcpStream) -> Vec<u8> {
+    fn drive_scheduled_pass(server: &mut Server) -> u64 {
+        let ready = server.event_notifier.take_ready();
+        server.process_control_sends();
+        server.process_video_fanouts();
+        if ready & ROOM_LOG_EVENTS != 0 {
+            server.store.drain_log_events();
+        }
+        if ready & ROOM_STATE_EVENTS != 0 {
+            server.drain_dm_completions();
+        }
+        if ready & HISTORY_EVENTS != 0 {
+            server.drain_history_replies();
+        } else if !server.history_deliveries.is_empty() {
+            server.process_history_deliveries();
+        }
+        if ready & MLS_EVENTS != 0 {
+            server.drain_mls_replies();
+        }
+        if ready & IDENTITY_EVENTS != 0 {
+            server.drain_identity_replies();
+        }
+        if ready & BUG_REPORT_EVENTS != 0 {
+            server.drain_bug_report_replies();
+        }
+        let writes = server.loop_work.client_write_count();
+        for _ in 0..writes {
+            if let Some(token) = server.loop_work.pop_client_write() {
+                server.write_client(token);
+            }
+        }
+        ready
+    }
+
+    fn drive_scheduled_work(server: &mut Server) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = drive_scheduled_pass(server);
+            let waiting_for_worker = server.pending_identity.is_some()
+                || !server.pending_bug_reports.is_empty()
+                || !server.pending_dm_waiters.is_empty()
+                || server
+                    .sessions
+                    .values()
+                    .any(|session| session.pending_disk_history_fetches > 0);
+            let scheduled_output = server.loop_work.background_work
+                || server.loop_work.client_write_count() > 0;
+            if ready == 0 && !waiting_for_worker && !scheduled_output {
+                return;
+            }
+            assert!(Instant::now() < deadline, "server scheduler did not quiesce");
+            thread::yield_now();
+        }
+    }
+
+    fn read_plaintext_server_payload(
+        server: &mut Server,
+        peer: &mut std::net::TcpStream,
+    ) -> Vec<u8> {
+        drive_scheduled_work(server);
         peer.set_read_timeout(Some(Duration::from_secs(1)))
             .expect("set read timeout");
         let mut len = [0u8; 4];
@@ -11339,6 +12702,7 @@ mod tests {
         let mut read_exact = |buf: &mut [u8], what: &str| {
             let mut offset = 0;
             while offset < buf.len() {
+                drive_scheduled_pass(server);
                 server.write_client(token);
                 match peer.read(&mut buf[offset..]) {
                     Ok(0) => panic!("server closed while reading {what}"),
@@ -11361,8 +12725,11 @@ mod tests {
         frame
     }
 
-    fn read_plaintext_server_control(peer: &mut std::net::TcpStream) -> ServerControl {
-        let frame = read_plaintext_server_payload(peer);
+    fn read_plaintext_server_control(
+        server: &mut Server,
+        peer: &mut std::net::TcpStream,
+    ) -> ServerControl {
+        let frame = read_plaintext_server_payload(server, peer);
         rpc::control::decode_server_control(&frame).expect("decode server control")
     }
 
@@ -11482,7 +12849,7 @@ mod tests {
             )
             .unwrap();
 
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
             panic!("expected invalid display name error");
         };
         assert_eq!(code, ERROR_PAIRING_INVALID_REQUEST);
@@ -11523,8 +12890,9 @@ mod tests {
             )
             .unwrap();
 
+        drive_scheduled_work(&mut server);
         let _ = std::fs::remove_file(&blocker);
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
             panic!("expected persist failure error reply");
         };
         assert_eq!(code, control::ERROR_INTERNAL);
@@ -11571,6 +12939,8 @@ mod tests {
             true,
             0,
         );
+
+        drive_scheduled_work(&mut server);
 
         let after = std::fs::read_to_string(&config_path).unwrap();
         let users_content =

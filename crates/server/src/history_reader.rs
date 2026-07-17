@@ -4,7 +4,7 @@
 //! worker thread: the loop enqueues a [`HistoryReadRequest`] built from the
 //! room's segment index ([`crate::room_store::RoomStore::disk_fetch_request`]),
 //! the worker reads the sources and encodes the page into wire chunks, and the
-//! reply channel plus a [`mio::Waker`] hand the finished payloads back to the
+//! shared event queue plus a [`mio::Waker`] hand the finished payloads back to the
 //! loop. The single thread processes requests in order, so replies for one
 //! session never reorder.
 
@@ -21,7 +21,9 @@ use rpc::{
     ids::{MessageId, RoomId, SessionId},
 };
 
-use crate::room_store::{LogRecords, ResidentHistory};
+use crate::{event_queue::EventQueue, room_store::{LogRecords, ResidentHistory}};
+
+const REQUEST_QUEUE_CAPACITY: usize = 32;
 
 /// One disk source holding candidate records for a page.
 pub(crate) enum Source {
@@ -63,35 +65,27 @@ pub(crate) struct HistoryReadReply {
 
 /// Handle to the disk reader thread; dropping it stops the thread.
 pub(crate) struct HistoryReader {
-    requests: mpsc::Sender<HistoryReadRequest>,
+    requests: mpsc::SyncSender<HistoryReadRequest>,
 }
 
 impl HistoryReader {
-    /// Starts the reader thread; it wakes `waker` after queueing each reply.
-    pub(crate) fn spawn(waker: Arc<mio::Waker>) -> (Self, mpsc::Receiver<HistoryReadReply>) {
-        let (requests, request_rx) = mpsc::channel::<HistoryReadRequest>();
-        let (reply_tx, replies) = mpsc::channel();
+    /// Starts the reader thread; the event queue wakes the loop after each reply.
+    pub(crate) fn spawn(events: Arc<EventQueue<HistoryReadReply>>) -> Self {
+        let (requests, request_rx) =
+            mpsc::sync_channel::<HistoryReadRequest>(REQUEST_QUEUE_CAPACITY);
         thread::spawn(move || {
             while let Ok(request) = request_rx.recv() {
                 let reply = execute(&request);
-                if reply_tx.send(reply).is_err() {
-                    return;
-                }
-                if let Err(error) = waker.wake() {
-                    kvlog::warn!(
-                        "history reader wake failed",
-                        error = error.to_string().as_str()
-                    );
-                }
+                events.push(reply);
             }
         });
-        (Self { requests }, replies)
+        Self { requests }
     }
 
     /// Queues a request, returning false when the worker thread is gone; the
     /// caller must then still answer the client with a terminal chunk.
     pub(crate) fn enqueue(&self, request: HistoryReadRequest) -> bool {
-        self.requests.send(request).is_ok()
+        self.requests.try_send(request).is_ok()
     }
 }
 
