@@ -17,7 +17,7 @@ tinyhl = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://gith
 unicode-width = "0.2"
 unicode-segmentation = "1"
 opus-codec = { path = "crates/opus-codec", features = ["dred"] }
-aws-lc-rs = "1.16.3"
+aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
 jsony = "0.1.10"
 rpc.path = "crates/rpc"
 chatt-p2p.path = "crates/p2p"
@@ -98,7 +98,19 @@ members = [
     "crates/darkhttp",
     "crates/pipewire-sys",
 ]
-exclude = ["crates/cpal", "crates/sonora", "crates/pathify_svg"]
+exclude = [
+    "crates/cpal",
+    "crates/sonora",
+    "crates/pathify_svg",
+    "crates/mls-rs",
+    "crates/mls-rs-codec",
+    "crates/mls-rs-codec-derive",
+    "crates/mls-rs-core",
+    "crates/mls-rs-crypto-awslc",
+    "crates/mls-rs-crypto-hpke",
+    "crates/mls-rs-crypto-traits",
+    "crates/mls-rs-identity-x509",
+]
 
 [profile.release]
 debug = 1

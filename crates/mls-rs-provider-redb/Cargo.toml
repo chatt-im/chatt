@@ -10,7 +10,7 @@ keywords = ["mls", "mls-rs", "redb"]
 license = "Apache-2.0 OR MIT"
 
 [dependencies]
-mls-rs-core = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = ["std"] }
+mls-rs-core = { path = "../mls-rs-core", default-features = false, features = ["std"] }
 redb = "4.1"
 thiserror = "2"
 maybe-async = "0.2.10"
@@ -19,8 +19,11 @@ zeroize = "1"
 
 [dev-dependencies]
 assert_matches = "1.5"
-mls-rs = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = ["std", "private_message"] }
-mls-rs-crypto-rustcrypto = { git = "https://github.com/awslabs/mls-rs", rev = "42131c9959efb1d3928428259bc89853027f730d", default-features = false, features = ["std"] }
+mls-rs = { path = "../mls-rs", default-features = false, features = ["std", "private_message"] }
+mls-rs-crypto-awslc = { path = "../mls-rs-crypto-awslc", default-features = false, features = [
+    "non-fips",
+    "curve25519-aes128-only",
+] }
 tempfile = "3"
 
 [lints.rust]

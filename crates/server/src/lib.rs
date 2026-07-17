@@ -31,7 +31,7 @@ use mio::{
     net::{TcpListener, TcpStream, UdpSocket},
 };
 use aws_lc_rs::rand::SecureRandom;
-use aws_lc_rs::signature::KeyPair;
+use aws_lc_rs::signature::{KeyPair, VerificationAlgorithm};
 use rpc::{
     control::{
         self, ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
@@ -3253,11 +3253,9 @@ impl Server {
                     .iter()
                     .find(|certificate| certificate.body.device_id == device_id)
                     .ok_or_else(|| "MLS device is not active".to_string())?;
-                aws_lc_rs::signature::UnparsedPublicKey::new(
-                    &aws_lc_rs::signature::ED25519,
+                aws_lc_rs::signature::ED25519
+                .verify_sig(
                     &certificate.body.mls_signature_public_key,
-                )
-                .verify(
                     &mls_identity::mls_device_binding_message(session_id, device_id, roster),
                     &proof,
                 )

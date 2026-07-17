@@ -4,7 +4,7 @@ use mls_rs::{
     CipherSuite, CipherSuiteProvider, Client, CryptoProvider,
 };
 use mls_rs_core::crypto::SignatureSecretKey;
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+use mls_rs_crypto_awslc::AwsLcCryptoProvider;
 use mls_rs_provider_redb::RedbDataStorageEngine;
 use tempfile::tempdir;
 
@@ -14,7 +14,7 @@ fn client(
     secret_key: SignatureSecretKey,
 ) -> Client<impl MlsConfig> {
     Client::builder()
-        .crypto_provider(RustCryptoProvider::default())
+        .crypto_provider(AwsLcCryptoProvider::default())
         .identity_provider(BasicIdentityProvider::new())
         .key_package_repo(engine.key_package_storage())
         .psk_store(engine.pre_shared_key_storage())
@@ -27,7 +27,7 @@ fn client(
 fn client_can_persist_reopen_and_resume_a_group() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("client.redb");
-    let crypto = RustCryptoProvider::default();
+    let crypto = AwsLcCryptoProvider::default();
     let suite = crypto
         .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
         .unwrap();

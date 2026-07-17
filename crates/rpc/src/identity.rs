@@ -6,7 +6,7 @@
 use jsony::Jsony;
 use aws_lc_rs::{
     digest,
-    signature::{self, KeyPair},
+    signature::{self, KeyPair, VerificationAlgorithm},
 };
 
 use crate::ids::{AccountId, DeviceId, UserId};
@@ -367,8 +367,8 @@ fn verify(
     if signature_bytes.len() != SIGNATURE_LEN {
         return Err(format!("{kind} signature has the wrong length"));
     }
-    signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
-        .verify(message, signature_bytes)
+    signature::ED25519
+        .verify_sig(public_key, message, signature_bytes)
         .map_err(|_| format!("{kind} signature is invalid"))
 }
 
