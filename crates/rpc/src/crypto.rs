@@ -38,7 +38,7 @@ const DEV_SERVER_SEED: [u8; KEY_LEN] = [
     0x65, 0x72, 0x20, 0x6b, 0x65, 0x79, 0x20, 0x76, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
 ];
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CryptoError {
     Random,
     InvalidHandshake,
@@ -51,6 +51,7 @@ pub enum CryptoError {
     Replay,
     CounterExhausted,
     Cipher,
+    BindProofMismatch,
 }
 
 impl std::fmt::Display for CryptoError {
@@ -69,6 +70,7 @@ impl std::fmt::Display for CryptoError {
             CryptoError::Replay => f.write_str("encrypted frame replay detected"),
             CryptoError::CounterExhausted => f.write_str("encrypted frame counter exhausted"),
             CryptoError::Cipher => f.write_str("authenticated encryption failure"),
+            CryptoError::BindProofMismatch => f.write_str("bind proof mismatch"),
         }
     }
 }

@@ -1481,7 +1481,7 @@ impl Server {
             poll,
             listener,
             voice_relay,
-            voice_events: VoiceEventBatch::default(),
+            voice_events: VoiceEventBatch::with_capacity(),
             clients: HashMap::new(),
             pending_controls: HashMap::new(),
             pending_control_bytes: HashMap::new(),
@@ -8750,7 +8750,7 @@ fn log_audio_pop_server_media_packet(
     stream_id: StreamId,
     sequence: u32,
     flags: u8,
-    payload: &media::VoicePayload,
+    payload: &media::VoicePayloadRef<'_>,
     recipient_count: Option<usize>,
 ) {
     if !audio_pop_logging_enabled() || !audio_pop_should_log_packet(flags, payload) {
@@ -8774,14 +8774,14 @@ fn log_audio_pop_server_media_packet(
     );
 }
 
-fn audio_pop_should_log_packet(flags: u8, payload: &media::VoicePayload) -> bool {
-    flags != 0 || matches!(payload, media::VoicePayload::Silence)
+fn audio_pop_should_log_packet(flags: u8, payload: &media::VoicePayloadRef<'_>) -> bool {
+    flags != 0 || matches!(payload, media::VoicePayloadRef::Silence)
 }
 
-fn server_voice_payload_kind(payload: &media::VoicePayload) -> &'static str {
+fn server_voice_payload_kind(payload: &media::VoicePayloadRef<'_>) -> &'static str {
     match payload {
-        media::VoicePayload::Opus(_) => "opus",
-        media::VoicePayload::Silence => "silence",
+        media::VoicePayloadRef::Opus(_) => "opus",
+        media::VoicePayloadRef::Silence => "silence",
     }
 }
 

@@ -9,10 +9,10 @@
 use hashbrown::HashMap;
 use mio::{Events, Interest, Poll, Token, Waker, net::UdpSocket};
 use rpc::{
-    crypto::AntiReplay,
+    crypto::{AntiReplay, TAG_LEN},
     evented::{MioReady, is_interrupted_io_error},
     ids::{RoomId, SessionId, StreamId, UserId},
-    media::{self, MediaPayload, MediaProtection},
+    media::{self, MediaPayloadRef, MediaProtection, VoicePayloadRef},
 };
 use std::{
     io,
@@ -30,9 +30,13 @@ const COMMANDS: Token = Token(2);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const UDP_DRAIN_BUDGET: usize = 64;
 const ACTIVITY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_SESSIONS: usize = super::MAX_CLIENTS;
+const SESSION_WORDS: usize = MAX_SESSIONS.div_ceil(u64::BITS as usize);
+const MAX_UDP_PACKET_BYTES: usize =
+    media::UDP_HEADER_LEN + media::SAFE_UDP_PAYLOAD_BYTES + TAG_LEN;
 
 #[cfg(target_os = "linux")]
-fn request_realtime_priority() -> io::Result<()> {
+fn request_realtime_priority() -> io::Result<bool> {
     let mut policy = 0;
     let mut parameters = libc::sched_param { sched_priority: 0 };
 
@@ -45,7 +49,7 @@ fn request_realtime_priority() -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(result));
     }
     if policy != libc::SCHED_OTHER {
-        return Ok(());
+        return Ok(false);
     }
 
     parameters.sched_priority = 1;
@@ -55,6 +59,30 @@ fn request_realtime_priority() -> io::Result<()> {
         libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &parameters)
     };
     if result == 0 {
+        Ok(true)
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn request_realtime_priority() -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_normal_priority(promoted: bool) -> io::Result<()> {
+    if !promoted {
+        return Ok(());
+    }
+    let parameters = libc::sched_param { sched_priority: 0 };
+    // SAFETY: parameters is valid for the duration of the call and applies to
+    // the calling thread. Lowering a thread back to SCHED_OTHER is permitted
+    // after a successful promotion.
+    let result = unsafe {
+        libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &parameters)
+    };
+    if result == 0 {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(result))
@@ -62,7 +90,7 @@ fn request_realtime_priority() -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn request_realtime_priority() -> io::Result<()> {
+fn restore_normal_priority(_promoted: bool) -> io::Result<()> {
     Ok(())
 }
 
@@ -135,6 +163,15 @@ pub(super) struct VoiceEventBatch {
 }
 
 impl VoiceEventBatch {
+    pub(super) fn with_capacity() -> Self {
+        Self {
+            udp_bound: HashMap::with_capacity(MAX_SESSIONS),
+            nat_probe: HashMap::with_capacity(MAX_SESSIONS * 2),
+            activity: HashMap::with_capacity(MAX_SESSIONS),
+            failure: None,
+        }
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.udp_bound.is_empty()
             && self.nat_probe.is_empty()
@@ -156,7 +193,7 @@ struct VoiceEventSubmission {
 impl VoiceEventSubmission {
     fn new(notifier: Arc<EventNotifier>) -> Self {
         Self {
-            pending: Mutex::new(VoiceEventBatch::default()),
+            pending: Mutex::new(VoiceEventBatch::with_capacity()),
             notifier,
         }
     }
@@ -223,13 +260,6 @@ impl VoiceRelayHandle {
         let thread = thread::Builder::new()
             .name("chatt-voice-relay".to_string())
             .spawn(move || {
-                if let Err(_error) = request_realtime_priority() {
-                    kvlog::debug!(
-                        "voice relay realtime priority unavailable",
-                        error = %_error,
-                        hint = "grant CAP_SYS_NICE to chatt-server to allow SCHED_FIFO"
-                    );
-                }
                 let mut relay = VoiceRelay::new(
                     poll,
                     udp,
@@ -238,7 +268,20 @@ impl VoiceRelayHandle {
                     loop_events,
                     p2p_enabled,
                 );
-                if let Err(error) = relay.run() {
+                let promoted = match request_realtime_priority() {
+                    Ok(promoted) => promoted,
+                    Err(_error) => {
+                        kvlog::debug!(
+                            "voice relay realtime priority unavailable",
+                            error = %_error,
+                            hint = "grant CAP_SYS_NICE to chatt-server to allow SCHED_FIFO"
+                        );
+                        false
+                    }
+                };
+                let result = relay.run();
+                let _ = restore_normal_priority(promoted);
+                if let Err(error) = result {
                     let message = error.to_string();
                     kvlog::error!("voice relay stopped", error = message.as_str());
                     relay.events.submit_failure(message);
@@ -291,6 +334,7 @@ impl From<VoiceRoute> for SessionRoute {
 }
 
 struct VoiceSession {
+    slot: usize,
     user_id: UserId,
     protection: MediaProtection,
     recv_replay: AntiReplay,
@@ -305,8 +349,21 @@ struct VoiceSession {
 
 #[derive(Default)]
 struct VoiceRoom {
-    members: Vec<SessionId>,
-    stream_owners: HashMap<StreamId, SessionId>,
+    members: [u64; SESSION_WORDS],
+}
+
+impl VoiceRoom {
+    fn insert(&mut self, slot: usize) {
+        self.members[slot / u64::BITS as usize] |= 1 << (slot % u64::BITS as usize);
+    }
+
+    fn remove(&mut self, slot: usize) {
+        self.members[slot / u64::BITS as usize] &= !(1 << (slot % u64::BITS as usize));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.members.iter().all(|word| *word == 0)
+    }
 }
 
 struct VoiceRelay {
@@ -319,7 +376,10 @@ struct VoiceRelay {
     sessions: HashMap<SessionId, VoiceSession>,
     route_to_session: HashMap<u32, SessionId>,
     rooms: HashMap<RoomId, VoiceRoom>,
+    stream_owners: HashMap<(RoomId, StreamId), SessionId>,
+    session_slots: [Option<SessionId>; MAX_SESSIONS],
     next_activity_flush: Instant,
+    poll_events: Events,
     command_buf: Vec<VoiceCommand>,
     event_buf: VoiceEventBatch,
     relay_recipients: Vec<SessionId>,
@@ -327,6 +387,39 @@ struct VoiceRelay {
     udp_send_scratch: Vec<u8>,
     udp_work: u8,
     shutting_down: bool,
+}
+
+#[derive(Debug)]
+enum PacketError {
+    Media(media::MediaError),
+    UnknownRoute,
+    UnknownSession,
+    NatProbeUnavailable,
+    UnboundSource,
+    UnknownNatProbe,
+}
+
+impl std::fmt::Display for PacketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PacketError::Media(error) => error.fmt(f),
+            PacketError::UnknownRoute => f.write_str("unknown UDP route id"),
+            PacketError::UnknownSession => f.write_str("unknown UDP session"),
+            PacketError::NatProbeUnavailable => {
+                f.write_str("NAT probe not available in external-secure-link")
+            }
+            PacketError::UnboundSource => {
+                f.write_str("external-link media from an unbound source")
+            }
+            PacketError::UnknownNatProbe => f.write_str("unknown NAT probe id"),
+        }
+    }
+}
+
+impl From<media::MediaError> for PacketError {
+    fn from(error: media::MediaError) -> Self {
+        PacketError::Media(error)
+    }
 }
 
 impl VoiceRelay {
@@ -345,22 +438,24 @@ impl VoiceRelay {
             commands,
             events,
             p2p_enabled,
-            sessions: HashMap::new(),
-            route_to_session: HashMap::new(),
-            rooms: HashMap::new(),
+            sessions: HashMap::with_capacity(MAX_SESSIONS),
+            route_to_session: HashMap::with_capacity(MAX_SESSIONS),
+            rooms: HashMap::with_capacity(MAX_SESSIONS),
+            stream_owners: HashMap::with_capacity(MAX_SESSIONS),
+            session_slots: [None; MAX_SESSIONS],
             next_activity_flush: Instant::now() + ACTIVITY_FLUSH_INTERVAL,
-            command_buf: Vec::new(),
-            event_buf: VoiceEventBatch::default(),
-            relay_recipients: Vec::new(),
-            udp_send_packet: Vec::new(),
-            udp_send_scratch: Vec::new(),
+            poll_events: Events::with_capacity(128),
+            command_buf: Vec::with_capacity(MAX_SESSIONS),
+            event_buf: VoiceEventBatch::with_capacity(),
+            relay_recipients: Vec::with_capacity(MAX_SESSIONS),
+            udp_send_packet: Vec::with_capacity(MAX_UDP_PACKET_BYTES),
+            udp_send_scratch: Vec::with_capacity(media::SAFE_UDP_PAYLOAD_BYTES),
             udp_work: 0,
             shutting_down: false,
         }
     }
 
     fn run(&mut self) -> io::Result<()> {
-        let mut poll_events = Events::with_capacity(128);
         while !self.shutting_down {
             self.drain_commands();
             if self.shutting_down {
@@ -387,12 +482,12 @@ impl VoiceRelay {
                         .saturating_duration_since(Instant::now()),
                 )
             };
-            match self.poll.poll(&mut poll_events, Some(timeout)) {
+            match self.poll.poll(&mut self.poll_events, Some(timeout)) {
                 Ok(()) => {}
                 Err(error) if is_interrupted_io_error(&error) => continue,
                 Err(error) => return Err(error),
             }
-            for event in poll_events.iter() {
+            for event in self.poll_events.iter() {
                 let ready = MioReady::from_event(event);
                 if !ready.readable_like() {
                     continue;
@@ -450,10 +545,20 @@ impl VoiceRelay {
         if self.sessions.contains_key(&session_id) {
             self.remove_session(session_id);
         }
+        let Some(slot) = self.session_slots.iter().position(Option::is_none) else {
+            kvlog::error!(
+                "voice relay session capacity exhausted",
+                session_id = session_id.0,
+                max_sessions = MAX_SESSIONS
+            );
+            return;
+        };
+        self.session_slots[slot] = Some(session_id);
         self.route_to_session.insert(route_id, session_id);
         self.sessions.insert(
             session_id,
             VoiceSession {
+                slot,
                 user_id,
                 protection,
                 recv_replay: AntiReplay::new(),
@@ -469,20 +574,24 @@ impl VoiceRelay {
     }
 
     fn set_route(&mut self, session_id: SessionId, route: Option<SessionRoute>) {
-        let old = self.sessions.get(&session_id).and_then(|session| session.route);
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let old = session.route;
+        let slot = session.slot;
         if old == route {
             return;
         }
         if let Some(old) = old {
             let remove_room = if let Some(room) = self.rooms.get_mut(&old.room_id) {
-                room.members.retain(|member| *member != session_id);
-                if room.stream_owners.get(&old.stream_id) == Some(&session_id) {
-                    room.stream_owners.remove(&old.stream_id);
-                }
-                room.members.is_empty()
+                room.remove(slot);
+                room.is_empty()
             } else {
                 false
             };
+            if self.stream_owners.get(&(old.room_id, old.stream_id)) == Some(&session_id) {
+                self.stream_owners.remove(&(old.room_id, old.stream_id));
+            }
             if remove_room {
                 self.rooms.remove(&old.room_id);
             }
@@ -494,16 +603,16 @@ impl VoiceRelay {
         }
         if let Some(route) = route {
             let room = self.rooms.entry(route.room_id).or_default();
-            if !room.members.contains(&session_id) {
-                room.members.push(session_id);
-            }
-            room.stream_owners.insert(route.stream_id, session_id);
+            room.insert(slot);
+            self.stream_owners
+                .insert((route.room_id, route.stream_id), session_id);
         }
     }
 
     fn remove_session(&mut self, session_id: SessionId) {
         self.set_route(session_id, None);
         if let Some(session) = self.sessions.remove(&session_id) {
+            self.session_slots[session.slot] = None;
             self.route_to_session.remove(&session.protection.route_id());
         }
     }
@@ -533,12 +642,12 @@ impl VoiceRelay {
                 }
             };
             datagrams += 1;
-            if let Err(error) = self.handle_packet(probe_id, src, &buf[..len]) {
+            if let Err(error) = self.handle_packet(probe_id, src, &mut buf[..len]) {
                 kvlog::warn!(
                     "udp packet rejected",
                     addr = %src,
                     packet_size = len,
-                    error = error.as_str()
+                    error = %error
                 );
             }
         }
@@ -548,20 +657,20 @@ impl VoiceRelay {
         &mut self,
         server_probe_id: u8,
         src: SocketAddr,
-        packet: &[u8],
-    ) -> Result<(), String> {
-        let (header, _) = media::parse_header(packet).map_err(|error| error.to_string())?;
+        packet: &mut [u8],
+    ) -> Result<(), PacketError> {
+        let (header, _) = media::parse_header(packet)?;
         if !self.p2p_enabled && header.kind == media::KIND_NAT_PROBE {
             let session_id = *self
                 .route_to_session
                 .get(&header.route_id)
-                .ok_or_else(|| "unknown UDP route id".to_string())?;
+                .ok_or(PacketError::UnknownRoute)?;
             let session = self
                 .sessions
                 .get(&session_id)
-                .ok_or_else(|| "unknown UDP session".to_string())?;
+                .ok_or(PacketError::UnknownSession)?;
             return if matches!(session.protection, MediaProtection::Clear { .. }) {
-                Err("NAT probe not available in external-secure-link".into())
+                Err(PacketError::NatProbeUnavailable)
             } else {
                 Ok(())
             };
@@ -569,18 +678,23 @@ impl VoiceRelay {
         let session_id = *self
             .route_to_session
             .get(&header.route_id)
-            .ok_or_else(|| "unknown UDP route id".to_string())?;
+            .ok_or(PacketError::UnknownRoute)?;
         let (payload, udp_addr_changed) = {
             let session = self
                 .sessions
                 .get_mut(&session_id)
-                .ok_or_else(|| "unknown UDP session".to_string())?;
-            let opened = media::open_media(
+                .ok_or(PacketError::UnknownSession)?;
+            if matches!(session.protection, MediaProtection::Clear { .. })
+                && header.kind != media::KIND_BIND
+                && session.udp_addr != Some(src)
+            {
+                return Err(PacketError::UnboundSource);
+            }
+            let opened = media::open_media_in_place(
                 &session.protection,
                 &mut session.recv_replay,
                 packet,
-            )
-            .map_err(|error| error.to_string())?;
+            )?;
             let udp_addr_changed = match opened.address_proof {
                 media::AddressProof::AuthenticatedDatagram
                 | media::AddressProof::AuthenticatedAddressClaim => {
@@ -597,9 +711,7 @@ impl VoiceRelay {
                     }
                 }
                 media::AddressProof::None => {
-                    if session.udp_addr != Some(src) {
-                        return Err("external-link media from an unbound source".to_string());
-                    }
+                    debug_assert_eq!(session.udp_addr, Some(src));
                     false
                 }
             };
@@ -609,7 +721,7 @@ impl VoiceRelay {
         };
 
         match payload {
-            MediaPayload::Bind => {
+            MediaPayloadRef::Bind => {
                 // Bind is the client's explicit acknowledgement handshake. An
                 // earlier authenticated ping/probe may already have installed
                 // the same address, so address change detection cannot gate it.
@@ -619,7 +731,7 @@ impl VoiceRelay {
                 }
                 Ok(())
             }
-            MediaPayload::NatProbe { probe_id } => {
+            MediaPayloadRef::NatProbe { probe_id } => {
                 // A server without P2P has no probe socket or consumer for this
                 // observation; its packets returned immediately after header
                 // parsing and transport-mode lookup, before crypto, replay, or
@@ -629,7 +741,7 @@ impl VoiceRelay {
                 }
                 let probe_id = probe_id.max(server_probe_id);
                 if probe_id > 1 {
-                    return Err("unknown NAT probe id".into());
+                    return Err(PacketError::UnknownNatProbe);
                 }
                 // Each client ICE restart needs fresh observations even if the
                 // main public tuple stayed unchanged. The shared batch still
@@ -639,7 +751,7 @@ impl VoiceRelay {
                     .insert((session_id, probe_id), src);
                 Ok(())
             }
-            MediaPayload::Voice {
+            MediaPayloadRef::Voice {
                 stream_id,
                 sequence,
                 timestamp,
@@ -653,11 +765,11 @@ impl VoiceRelay {
                 flags,
                 payload,
             ),
-            MediaPayload::VoiceFeedback {
+            MediaPayloadRef::VoiceFeedback {
                 stream_id,
                 feedback,
             } => self.relay_feedback(session_id, stream_id, feedback),
-            MediaPayload::Ping {
+            MediaPayloadRef::Ping {
                 nonce,
                 observed_rtt_ms,
             } => {
@@ -669,13 +781,13 @@ impl VoiceRelay {
                     };
                     session.rtt_reported_at = Some(Instant::now());
                 }
-                self.send_payload(session_id, &MediaPayload::Pong { nonce });
+                self.send_payload(session_id, &MediaPayloadRef::Pong { nonce });
                 Ok(())
             }
-            MediaPayload::PeerVoice { .. }
-            | MediaPayload::PeerVoiceFeedback { .. }
-            | MediaPayload::VoiceFeedbackFrom { .. }
-            | MediaPayload::Pong { .. } => Ok(()),
+            MediaPayloadRef::PeerVoice { .. }
+            | MediaPayloadRef::PeerVoiceFeedback { .. }
+            | MediaPayloadRef::VoiceFeedbackFrom { .. }
+            | MediaPayloadRef::Pong { .. } => Ok(()),
         }
     }
 
@@ -686,8 +798,8 @@ impl VoiceRelay {
         sequence: u32,
         timestamp: u32,
         flags: u8,
-        voice: media::VoicePayload,
-    ) -> Result<(), String> {
+        voice: VoicePayloadRef<'_>,
+    ) -> Result<(), PacketError> {
         let route = match self.sessions.get(&sender).and_then(|session| session.route) {
             Some(route) if route.stream_id == stream_id => route,
             _ => return Ok(()),
@@ -695,21 +807,28 @@ impl VoiceRelay {
         let mut recipients = std::mem::take(&mut self.relay_recipients);
         recipients.clear();
         if let Some(room) = self.rooms.get(&route.room_id) {
-            recipients.extend(
-                room.members
-                    .iter()
-                    .copied()
-                    .filter(|recipient| *recipient != sender),
-            );
+            for (word_index, word) in room.members.iter().copied().enumerate() {
+                let mut remaining = word;
+                while remaining != 0 {
+                    let bit = remaining.trailing_zeros() as usize;
+                    let slot = word_index * u64::BITS as usize + bit;
+                    if let Some(recipient) = self.session_slots[slot]
+                        && recipient != sender
+                    {
+                        recipients.push(recipient);
+                    }
+                    remaining &= remaining - 1;
+                }
+            }
         }
-        let payload = MediaPayload::Voice {
+        let payload = MediaPayloadRef::Voice {
             stream_id,
             sequence,
             timestamp,
             flags,
             payload: voice,
         };
-        if let MediaPayload::Voice {
+        if let MediaPayloadRef::Voice {
             stream_id,
             sequence,
             flags,
@@ -740,7 +859,7 @@ impl VoiceRelay {
         reporter_session: SessionId,
         stream_id: StreamId,
         feedback: media::VoiceFeedback,
-    ) -> Result<(), String> {
+    ) -> Result<(), PacketError> {
         let Some(route) = self
             .sessions
             .get(&reporter_session)
@@ -749,9 +868,9 @@ impl VoiceRelay {
             return Ok(());
         };
         let Some(owner) = self
-            .rooms
-            .get(&route.room_id)
-            .and_then(|room| room.stream_owners.get(&stream_id).copied())
+            .stream_owners
+            .get(&(route.room_id, stream_id))
+            .copied()
         else {
             return Ok(());
         };
@@ -767,7 +886,7 @@ impl VoiceRelay {
         };
         self.send_payload(
             owner,
-            &MediaPayload::VoiceFeedbackFrom {
+            &MediaPayloadRef::VoiceFeedbackFrom {
                 reporter,
                 stream_id,
                 feedback,
@@ -776,14 +895,14 @@ impl VoiceRelay {
         Ok(())
     }
 
-    fn send_payload(&mut self, session_id: SessionId, payload: &MediaPayload) {
+    fn send_payload(&mut self, session_id: SessionId, payload: &MediaPayloadRef<'_>) {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
         let Some(addr) = session.udp_addr else {
             return;
         };
-        if let MediaPayload::Voice {
+        if let MediaPayloadRef::Voice {
             stream_id,
             sequence,
             flags,
@@ -804,7 +923,7 @@ impl VoiceRelay {
         }
         let counter = session.send_counter;
         session.send_counter = session.send_counter.wrapping_add(1);
-        if let Err(error) = media::seal_media_into(
+        if let Err(error) = media::seal_media_ref_into(
             &session.protection,
             counter,
             payload,
@@ -887,7 +1006,7 @@ mod tests {
     use hashbrown::HashSet;
     use rpc::{
         crypto::{KEY_LEN, KeyMaterial},
-        media::{VoiceFeedback, VoicePayload},
+        media::{MediaPayload, VoiceFeedback, VoicePayload},
     };
     use std::net::UdpSocket as StdUdpSocket;
 
@@ -926,6 +1045,69 @@ mod tests {
                 relay: VoiceRelay::new(poll, udp, None, commands, events, p2p_enabled),
             }
         }
+    }
+
+    #[test]
+    fn relay_preallocates_bounded_realtime_state() {
+        let direct = DirectRelay::new(false);
+        assert!(direct.relay.sessions.capacity() >= MAX_SESSIONS);
+        assert!(direct.relay.route_to_session.capacity() >= MAX_SESSIONS);
+        assert!(direct.relay.rooms.capacity() >= MAX_SESSIONS);
+        assert!(direct.relay.stream_owners.capacity() >= MAX_SESSIONS);
+        assert!(direct.relay.command_buf.capacity() >= MAX_SESSIONS);
+        assert!(direct.relay.relay_recipients.capacity() >= MAX_SESSIONS);
+        assert!(direct.relay.udp_send_packet.capacity() >= MAX_UDP_PACKET_BYTES);
+        assert!(
+            direct.relay.udp_send_scratch.capacity() >= media::SAFE_UDP_PAYLOAD_BYTES
+        );
+        assert!(direct.relay.event_buf.udp_bound.capacity() >= MAX_SESSIONS);
+        assert!(direct.relay.event_buf.nat_probe.capacity() >= MAX_SESSIONS * 2);
+        assert!(direct.relay.event_buf.activity.capacity() >= MAX_SESSIONS);
+    }
+
+    #[test]
+    fn route_changes_update_stream_owner_index() {
+        let mut direct = DirectRelay::new(false);
+        let session_id = SessionId(1);
+        let first = SessionRoute {
+            room_id: RoomId(2),
+            stream_id: StreamId(10),
+        };
+        let second = SessionRoute {
+            room_id: RoomId(3),
+            stream_id: StreamId(11),
+        };
+        direct
+            .relay
+            .register_session(session_id, UserId(9), protection(77));
+
+        direct.relay.set_route(session_id, Some(first));
+        assert_eq!(
+            direct
+                .relay
+                .stream_owners
+                .get(&(first.room_id, first.stream_id)),
+            Some(&session_id)
+        );
+
+        direct.relay.set_route(session_id, Some(second));
+        assert!(!direct
+            .relay
+            .stream_owners
+            .contains_key(&(first.room_id, first.stream_id)));
+        assert_eq!(
+            direct
+                .relay
+                .stream_owners
+                .get(&(second.room_id, second.stream_id)),
+            Some(&session_id)
+        );
+
+        direct.relay.set_route(session_id, None);
+        assert!(!direct
+            .relay
+            .stream_owners
+            .contains_key(&(second.room_id, second.stream_id)));
     }
 
     #[test]
@@ -1011,7 +1193,7 @@ mod tests {
             .register_session(session_id, UserId(9), protection(77));
         let receiver = StdUdpSocket::bind("127.0.0.1:0").unwrap();
         let src = receiver.local_addr().unwrap();
-        let ping = media::seal_media(
+        let mut ping = media::seal_media(
             &client,
             1,
             &MediaPayload::Ping {
@@ -1020,14 +1202,14 @@ mod tests {
             },
         )
         .unwrap();
-        direct.relay.handle_packet(0, src, &ping).unwrap();
+        direct.relay.handle_packet(0, src, &mut ping).unwrap();
         assert_eq!(
             direct.relay.sessions.get(&session_id).unwrap().udp_addr,
             Some(src)
         );
 
-        let bind = media::seal_media(&client, 2, &MediaPayload::Bind).unwrap();
-        direct.relay.handle_packet(0, src, &bind).unwrap();
+        let mut bind = media::seal_media(&client, 2, &MediaPayload::Bind).unwrap();
+        direct.relay.handle_packet(0, src, &mut bind).unwrap();
         assert_eq!(direct.relay.event_buf.udp_bound.get(&session_id), Some(&src));
     }
 
@@ -1040,13 +1222,13 @@ mod tests {
             .relay
             .register_session(session_id, UserId(9), protection(77));
         let src: SocketAddr = "203.0.113.5:4000".parse().unwrap();
-        let probe = media::seal_media(
+        let mut probe = media::seal_media(
             &client,
             1,
             &MediaPayload::NatProbe { probe_id: 0 },
         )
         .unwrap();
-        direct.relay.handle_packet(0, src, &probe).unwrap();
+        direct.relay.handle_packet(0, src, &mut probe).unwrap();
         assert!(!direct
             .relay
             .sessions
@@ -1057,8 +1239,8 @@ mod tests {
 
         // Reusing the skipped probe's counter proves it never entered replay
         // protection or media decryption.
-        let bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
-        direct.relay.handle_packet(0, src, &bind).unwrap();
+        let mut bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
+        direct.relay.handle_packet(0, src, &mut bind).unwrap();
         assert_eq!(direct.relay.event_buf.udp_bound.get(&session_id), Some(&src));
     }
 
@@ -1073,13 +1255,13 @@ mod tests {
         let first_addr: SocketAddr = "203.0.113.5:4000".parse().unwrap();
         let latest_addr: SocketAddr = "203.0.113.5:5000".parse().unwrap();
         for (counter, addr) in [(1, first_addr), (2, latest_addr)] {
-            let probe = media::seal_media(
+            let mut probe = media::seal_media(
                 &client,
                 counter,
                 &MediaPayload::NatProbe { probe_id: 1 },
             )
             .unwrap();
-            direct.relay.handle_packet(1, addr, &probe).unwrap();
+            direct.relay.handle_packet(1, addr, &mut probe).unwrap();
         }
         assert_eq!(direct.relay.event_buf.nat_probe.len(), 1);
         assert_eq!(
@@ -1097,8 +1279,11 @@ mod tests {
             .relay
             .register_session(session_id, UserId(9), protection(77));
         let media_addr: SocketAddr = "203.0.113.5:4000".parse().unwrap();
-        let bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
-        direct.relay.handle_packet(0, media_addr, &bind).unwrap();
+        let mut bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
+        direct
+            .relay
+            .handle_packet(0, media_addr, &mut bind)
+            .unwrap();
         {
             let session = direct.relay.sessions.get_mut(&session_id).unwrap();
             session.reported_rtt_ms = Some(40);
@@ -1106,7 +1291,7 @@ mod tests {
         }
 
         let probe_addr: SocketAddr = "203.0.113.5:5000".parse().unwrap();
-        let probe = media::seal_media(
+        let mut probe = media::seal_media(
             &client,
             2,
             &MediaPayload::NatProbe { probe_id: 1 },
@@ -1114,13 +1299,13 @@ mod tests {
         .unwrap();
         direct
             .relay
-            .handle_packet(1, probe_addr, &probe)
+            .handle_packet(1, probe_addr, &mut probe)
             .unwrap();
         let session = direct.relay.sessions.get(&session_id).unwrap();
         assert_eq!(session.udp_addr, Some(media_addr));
         assert_eq!(session.reported_rtt_ms, Some(40));
 
-        let main_probe = media::seal_media(
+        let mut main_probe = media::seal_media(
             &client,
             3,
             &MediaPayload::NatProbe { probe_id: 1 },
@@ -1128,7 +1313,7 @@ mod tests {
         .unwrap();
         direct
             .relay
-            .handle_packet(0, probe_addr, &main_probe)
+            .handle_packet(0, probe_addr, &mut main_probe)
             .unwrap();
         let session = direct.relay.sessions.get(&session_id).unwrap();
         assert_eq!(session.udp_addr, Some(probe_addr));
@@ -1153,8 +1338,8 @@ mod tests {
             bind_key,
         };
         let src: SocketAddr = "203.0.113.9:6000".parse().unwrap();
-        let bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
-        direct.relay.handle_packet(0, src, &bind).unwrap();
+        let mut bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
+        direct.relay.handle_packet(0, src, &mut bind).unwrap();
         assert_eq!(
             direct.relay.sessions.get(&session_id).unwrap().udp_addr,
             Some(src)
@@ -1165,10 +1350,10 @@ mod tests {
             bind_key: [1; KEY_LEN],
         };
         let evil: SocketAddr = "198.51.100.9:6000".parse().unwrap();
-        let bind = media::seal_media(&spoof, 2, &MediaPayload::Bind).unwrap();
-        assert!(direct.relay.handle_packet(0, evil, &bind).is_err());
+        let mut bind = media::seal_media(&spoof, 2, &MediaPayload::Bind).unwrap();
+        assert!(direct.relay.handle_packet(0, evil, &mut bind).is_err());
 
-        let ping = media::seal_media(
+        let mut ping = media::seal_media(
             &client,
             3,
             &MediaPayload::Ping {
@@ -1177,14 +1362,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(direct.relay.handle_packet(0, evil, &ping).is_err());
-        let probe = media::seal_media(
+        assert!(direct.relay.handle_packet(0, evil, &mut ping).is_err());
+        let mut probe = media::seal_media(
             &client,
             4,
             &MediaPayload::NatProbe { probe_id: 0 },
         )
         .unwrap();
-        assert!(direct.relay.handle_packet(0, src, &probe).is_err());
+        assert!(direct.relay.handle_packet(0, src, &mut probe).is_err());
     }
 
     #[test]
@@ -1297,10 +1482,10 @@ mod tests {
             }),
         );
         let owner_client = protection(77);
-        let bind = media::seal_media(&owner_client, 1, &MediaPayload::Bind).unwrap();
+        let mut bind = media::seal_media(&owner_client, 1, &MediaPayload::Bind).unwrap();
         direct
             .relay
-            .handle_packet(0, receiver.local_addr().unwrap(), &bind)
+            .handle_packet(0, receiver.local_addr().unwrap(), &mut bind)
             .unwrap();
 
         let feedback = VoiceFeedback {
