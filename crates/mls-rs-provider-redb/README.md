@@ -24,3 +24,12 @@ key management.
 `redb` is copy-on-write. Deleting a key package or other record does not guarantee
 physical erasure of old database pages. Crypto-shredding requires destroying an
 encryption key that is managed outside this provider.
+
+On Unix, `RedbDataStorageEngine::open` creates the database with mode `0600` and
+repairs broader permissions on reopen. `RedbDataStorageEngine::new` cannot do
+this because an already-open `redb::Database` does not expose its path, so its
+caller is responsible for securing the backing file.
+
+After a database write or commit I/O error, discard every storage adapter and
+engine clone and reopen the database. A redb commit error can require recovery;
+the existing in-process database handle must not be reused.

@@ -209,6 +209,27 @@ fn file_data_survives_close_and_reopen() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn database_file_is_owner_only_on_create_and_reopen() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("private.redb");
+    drop(RedbDataStorageEngine::open(&path).unwrap());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    drop(RedbDataStorageEngine::open(&path).unwrap());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn key_packages_reject_duplicates_and_corruption_is_an_error() {
     let engine = engine();

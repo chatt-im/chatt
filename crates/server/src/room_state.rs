@@ -7,7 +7,8 @@
 
 use std::{
     collections::BTreeMap,
-    path::Path,
+    fs::{self, OpenOptions},
+    path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
 };
@@ -50,10 +51,41 @@ impl Default for LoadedState {
 }
 
 pub(super) fn open(path: &Path) -> Result<(LoadedState, StateWriter), String> {
+    ensure_private_file(path)?;
     let database = Database::create(path).map_err(|error| error.to_string())?;
     initialize_schema(&database)?;
     let state = load(&database)?;
-    Ok((state, StateWriter::spawn(database)))
+    Ok((state, StateWriter::spawn(database, path.to_path_buf())))
+}
+
+fn ensure_private_file(path: &Path) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        let mode = metadata.mode() & 0o777;
+        let private_mode = mode & 0o700;
+        if mode != private_mode {
+            fs::set_permissions(path, fs::Permissions::from_mode(private_mode)).map_err(
+                |error| format!("failed to secure {}: {error}", path.display()),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn initialize_schema(database: &Database) -> Result<(), String> {
@@ -189,9 +221,14 @@ enum StateWriteWaiter {
     },
 }
 
-pub(super) struct StateWriteEvent {
-    pub(super) operation_id: u64,
-    pub(super) result: Result<(), String>,
+pub(super) enum StateWriteEvent {
+    Dm {
+        operation_id: u64,
+        result: Result<(), String>,
+    },
+    Fatal {
+        error: String,
+    },
 }
 
 #[derive(Default)]
@@ -201,10 +238,10 @@ struct StateWriteSubmission {
 }
 
 impl StateWriteSubmission {
-    fn submit_watermark(&self, room_id: RoomId, next: u64) -> bool {
+    fn submit_watermark(&self, room_id: RoomId, next: u64) -> Result<(), String> {
         let mut pending = self.pending.lock().unwrap();
         if pending.closed {
-            return false;
+            return Err("room state writer is closed".to_string());
         }
         pending
             .watermarks
@@ -212,18 +249,18 @@ impl StateWriteSubmission {
             .and_modify(|queued| *queued = (*queued).max(next))
             .or_insert(next);
         self.ready.notify_one();
-        true
+        Ok(())
     }
 
-    fn submit_dm(&self, insert: DmInsert, waiter: StateWriteWaiter) -> bool {
+    fn submit_dm(&self, insert: DmInsert, waiter: StateWriteWaiter) -> Result<(), String> {
         let mut pending = self.pending.lock().unwrap();
         if pending.closed {
-            return false;
+            return Err("room state writer is closed".to_string());
         }
         pending.dm_inserts.push(insert);
         pending.waiters.push(waiter);
         self.ready.notify_one();
-        true
+        Ok(())
     }
 
     fn receive(&self) -> Option<PendingWrite> {
@@ -247,21 +284,40 @@ impl StateWriteSubmission {
         self.pending.lock().unwrap().closed = true;
         self.ready.notify_one();
     }
+
+    fn terminate(&self) -> Vec<StateWriteWaiter> {
+        let mut pending = self.pending.lock().unwrap();
+        pending.closed = true;
+        pending.watermarks.clear();
+        pending.dm_inserts.clear();
+        let waiters = std::mem::take(&mut pending.waiters);
+        self.ready.notify_one();
+        waiters
+    }
 }
 
 /// Single ordered writer for all room-state transactions. Watermark advances
 /// coalesce by room while DM insert waiters retain commit acknowledgement.
+#[derive(Default)]
+struct StateWriteNotifications {
+    events: Option<Arc<EventQueue<StateWriteEvent>>>,
+    terminal_error: Option<String>,
+}
+
 pub(super) struct StateWriter {
     submission: Arc<StateWriteSubmission>,
+    notifications: Arc<Mutex<StateWriteNotifications>>,
     thread: Option<thread::JoinHandle<()>>,
     #[cfg(test)]
     fail_next_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StateWriter {
-    fn spawn(database: Database) -> Self {
+    fn spawn(database: Database, path: PathBuf) -> Self {
         let submission = Arc::new(StateWriteSubmission::default());
         let worker_submission = Arc::clone(&submission);
+        let notifications = Arc::new(Mutex::new(StateWriteNotifications::default()));
+        let worker_notifications = Arc::clone(&notifications);
         #[cfg(test)]
         let fail_next_write = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(test)]
@@ -269,6 +325,7 @@ impl StateWriter {
         let thread = thread::Builder::new()
             .name("chatt-room-state-writer".to_string())
             .spawn(move || {
+                let mut database = Some(database);
                 while let Some(write) = worker_submission.receive() {
                     #[cfg(test)]
                     let forced_failure = worker_fail_next_write
@@ -276,13 +333,30 @@ impl StateWriter {
                     #[cfg(not(test))]
                     let forced_failure = false;
                     let result = if forced_failure {
-                        Err("forced room-state write failure".to_string())
+                        Err(PersistError::Conflict(
+                            "forced room-state write failure".to_string(),
+                        ))
                     } else {
-                        persist(&database, &write)
+                        persist(database.as_ref().expect("database present"), &write)
                     };
-                    if let Err(error) = &result {
+                    let result = match result {
+                        Ok(()) => Ok(()),
+                        Err(PersistError::Storage(first_error)) => {
+                            drop(database.take());
+                            recover_and_persist(&path, &write).map(|reopened| {
+                                database = Some(reopened);
+                            }).map_err(|recovery_error| {
+                                format!(
+                                    "{first_error}; room-state database recovery failed: {recovery_error}"
+                                )
+                            })
+                        }
+                        Err(PersistError::Conflict(error)) => Err(error),
+                    };
+                    let terminal_error = result.as_ref().err().cloned();
+                    if let Some(error) = &terminal_error {
                         kvlog::error!(
-                            "room state transaction failed; ids may repeat after restart",
+                            "room state writer failed; server must stop before allocating more ids",
                             error = error.as_str()
                         );
                     }
@@ -294,38 +368,73 @@ impl StateWriter {
                             StateWriteWaiter::Event {
                                 operation_id,
                                 events,
-                            } => events.push(StateWriteEvent {
+                            } => events.push(StateWriteEvent::Dm {
                                 operation_id,
                                 result: result.clone(),
                             }),
                         }
                     }
+                    let Some(error) = terminal_error else {
+                        continue;
+                    };
+                    let fatal_events = {
+                        let mut notifications = worker_notifications.lock().unwrap();
+                        notifications.terminal_error = Some(error.clone());
+                        notifications.events.clone()
+                    };
+                    for waiter in worker_submission.terminate() {
+                        match waiter {
+                            StateWriteWaiter::Sync(reply) => {
+                                let _ = reply.send(Err(error.clone()));
+                            }
+                            StateWriteWaiter::Event {
+                                operation_id,
+                                events,
+                            } => events.push(StateWriteEvent::Dm {
+                                operation_id,
+                                result: Err(error.clone()),
+                            }),
+                        }
+                    }
+                    if let Some(events) = fatal_events {
+                        events.push(StateWriteEvent::Fatal { error });
+                    }
+                    break;
                 }
             })
             .expect("failed to spawn room state writer");
         Self {
             submission,
+            notifications,
             thread: Some(thread),
             #[cfg(test)]
             fail_next_write,
         }
     }
 
-    pub(super) fn enqueue_watermark(&self, room_id: RoomId, next: u64) {
-        if !self.submission.submit_watermark(room_id, next) {
-            kvlog::error!("room state writer gone; ids may repeat after restart");
+    pub(super) fn set_events(&self, events: Arc<EventQueue<StateWriteEvent>>) {
+        let terminal_error = {
+            let mut notifications = self.notifications.lock().unwrap();
+            notifications.events = Some(Arc::clone(&events));
+            notifications.terminal_error.clone()
+        };
+        if let Some(error) = terminal_error {
+            events.push(StateWriteEvent::Fatal { error });
         }
+    }
+
+    pub(super) fn enqueue_watermark(&self, room_id: RoomId, next: u64) -> Result<(), String> {
+        self.submission.submit_watermark(room_id, next)
     }
 
     pub(super) fn insert_dm_sync(&self, room: DmRoom, next_room_id: u32) -> Result<(), String> {
         let gone = || "room state writer thread is gone".to_string();
         let (reply, done) = mpsc::sync_channel(1);
-        if !self.submission.submit_dm(
+        self.submission.submit_dm(
             DmInsert { room, next_room_id },
             StateWriteWaiter::Sync(reply),
-        ) {
-            return Err(gone());
-        }
+        )
+        .map_err(|_| gone())?;
         done.recv().map_err(|_| gone())?
     }
 
@@ -344,8 +453,7 @@ impl StateWriter {
                     events,
                 },
             )
-            .then_some(())
-            .ok_or_else(|| "room state writer thread is gone".to_string())
+            .map_err(|_| "room state writer thread is gone".to_string())
     }
 
     #[cfg(test)]
@@ -365,52 +473,80 @@ impl Drop for StateWriter {
     }
 }
 
-fn persist(database: &Database, write: &PendingWrite) -> Result<(), String> {
-    let transaction = database.begin_write().map_err(|error| error.to_string())?;
+#[derive(Debug)]
+enum PersistError {
+    Storage(String),
+    Conflict(String),
+}
+
+fn storage_error(error: impl std::fmt::Display) -> PersistError {
+    PersistError::Storage(error.to_string())
+}
+
+fn recover_and_persist(path: &Path, write: &PendingWrite) -> Result<Database, String> {
+    ensure_private_file(path)?;
+    let database = Database::create(path).map_err(|error| error.to_string())?;
+    initialize_schema(&database)?;
+    persist(&database, write).map_err(|error| match error {
+        PersistError::Storage(error) | PersistError::Conflict(error) => error,
+    })?;
+    Ok(database)
+}
+
+fn persist(database: &Database, write: &PendingWrite) -> Result<(), PersistError> {
+    let transaction = database.begin_write().map_err(storage_error)?;
     {
         let mut watermarks = transaction
             .open_table(MESSAGE_ID_WATERMARKS)
-            .map_err(|error| error.to_string())?;
+            .map_err(storage_error)?;
         for (&room_id, &next) in &write.watermarks {
             let stored = watermarks
                 .get(room_id)
-                .map_err(|error| error.to_string())?
+                .map_err(storage_error)?
                 .map_or(0, |value| value.value());
             if next > stored {
                 watermarks
                     .insert(room_id, next)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(storage_error)?;
             }
         }
     }
     if !write.dm_inserts.is_empty() {
         let mut metadata = transaction
             .open_table(METADATA)
-            .map_err(|error| error.to_string())?;
+            .map_err(storage_error)?;
         let mut rooms = transaction
             .open_table(DM_ROOMS)
-            .map_err(|error| error.to_string())?;
+            .map_err(storage_error)?;
         for insert in &write.dm_inserts {
-            if rooms
+            let existing = rooms
                 .get(insert.room.room_id.0)
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                return Err(format!(
-                    "direct-message room {} already exists",
-                    insert.room.room_id.0
-                ));
+                .map_err(storage_error)?
+                .map(|existing| decode_dm(insert.room.room_id, existing.value()))
+                .transpose()
+                .map_err(PersistError::Conflict)?;
+            if let Some(existing) = existing {
+                if existing != insert.room {
+                    return Err(PersistError::Conflict(format!(
+                        "direct-message room {} already exists with different participants",
+                        insert.room.room_id.0
+                    )));
+                }
+            } else {
+                let encoded = encode_dm(insert.room);
+                rooms
+                    .insert(insert.room.room_id.0, encoded.as_slice())
+                    .map_err(storage_error)?;
             }
-            let encoded = encode_dm(insert.room);
-            rooms
-                .insert(insert.room.room_id.0, encoded.as_slice())
-                .map_err(|error| error.to_string())?;
-            metadata
-                .insert(NEXT_ROOM_ID_KEY, u64::from(insert.next_room_id))
-                .map_err(|error| error.to_string())?;
+            let stored_next = metadata
+                .get(NEXT_ROOM_ID_KEY)
+                .map_err(storage_error)?
+                .map_or(u64::from(FIRST_DYNAMIC_ROOM_ID), |value| value.value());
+            let next = stored_next.max(u64::from(insert.next_room_id));
+            metadata.insert(NEXT_ROOM_ID_KEY, next).map_err(storage_error)?;
         }
     }
-    transaction.commit().map_err(|error| error.to_string())
+    transaction.commit().map_err(storage_error)
 }
 
 #[cfg(test)]
@@ -420,10 +556,10 @@ mod tests {
     #[test]
     fn pending_watermarks_coalesce_to_the_highest_value_per_room() {
         let submission = StateWriteSubmission::default();
-        assert!(submission.submit_watermark(RoomId(3), 2048));
-        assert!(submission.submit_watermark(RoomId(3), 1024));
-        assert!(submission.submit_watermark(RoomId(3), 4096));
-        assert!(submission.submit_watermark(RoomId(7), 8192));
+        submission.submit_watermark(RoomId(3), 2048).unwrap();
+        submission.submit_watermark(RoomId(3), 1024).unwrap();
+        submission.submit_watermark(RoomId(3), 4096).unwrap();
+        submission.submit_watermark(RoomId(7), 8192).unwrap();
 
         let write = submission.receive().unwrap();
         assert_eq!(write.watermarks.get(&3), Some(&4096));
@@ -443,7 +579,7 @@ mod tests {
             user_b: UserId(11),
             created_at_ms: 1234,
         };
-        writer.enqueue_watermark(RoomId(1), 2048);
+        writer.enqueue_watermark(RoomId(1), 2048).unwrap();
         writer
             .insert_dm_sync(room, FIRST_DYNAMIC_ROOM_ID + 1)
             .unwrap();
@@ -458,5 +594,53 @@ mod tests {
         assert_eq!(state.dm_rooms[0].user_b, room.user_b);
         assert_eq!(state.dm_rooms[0].created_at_ms, room.created_at_ms);
         drop(writer);
+    }
+
+    #[test]
+    fn replaying_an_ambiguous_batch_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        ensure_private_file(&path).unwrap();
+        let database = Database::create(&path).unwrap();
+        initialize_schema(&database).unwrap();
+        let room = DmRoom {
+            room_id: RoomId(FIRST_DYNAMIC_ROOM_ID),
+            user_a: UserId(7),
+            user_b: UserId(11),
+            created_at_ms: 1234,
+        };
+        let mut write = PendingWrite::default();
+        write.watermarks.insert(1, 2048);
+        write.dm_inserts.push(DmInsert {
+            room,
+            next_room_id: FIRST_DYNAMIC_ROOM_ID + 1,
+        });
+
+        persist(&database, &write).unwrap();
+        drop(database);
+        let database = recover_and_persist(&path, &write).unwrap();
+        let state = load(&database).unwrap();
+
+        assert_eq!(state.watermarks, vec![(RoomId(1), 2048)]);
+        assert_eq!(state.next_room_id, FIRST_DYNAMIC_ROOM_ID + 1);
+        assert_eq!(state.dm_rooms.len(), 1);
+        assert_eq!(state.dm_rooms[0], room);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_file_is_owner_only_on_create_and_reopen() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let (_, writer) = open(&path).unwrap();
+        drop(writer);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        let (_, writer) = open(&path).unwrap();
+        drop(writer);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

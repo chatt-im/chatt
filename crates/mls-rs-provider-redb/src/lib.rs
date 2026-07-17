@@ -11,7 +11,11 @@
 //! encrypted storage or authenticated record encryption with externally managed
 //! keys in production.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    fs::{self, OpenOptions},
+    path::Path,
+    sync::Arc,
+};
 
 use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition};
 use thiserror::Error;
@@ -55,6 +59,10 @@ pub(crate) const PROVIDER_METADATA: TableDefinition<&str, u64> =
 
 #[derive(Debug, Error)]
 pub enum RedbDataStorageError {
+    #[error("database file error: {0}")]
+    DatabaseFile(String),
+    /// A redb operation failed. After a write or commit I/O failure, discard
+    /// every clone of the engine and reopen the database before continuing.
     #[error(transparent)]
     Database(#[from] redb::Error),
     #[error(transparent)]
@@ -93,6 +101,8 @@ pub struct RedbDataStorageEngine {
 impl RedbDataStorageEngine {
     /// Opens or creates a database at `path` and initializes the provider schema.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RedbDataStorageError> {
+        let path = path.as_ref();
+        ensure_private_file(path)?;
         Self::new(Database::create(path).map_err(database_error)?)
     }
 
@@ -168,4 +178,43 @@ impl RedbDataStorageEngine {
     pub fn database(&self) -> Arc<Database> {
         Arc::clone(&self.database)
     }
+}
+
+fn ensure_private_file(path: &Path) -> Result<(), RedbDataStorageError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(|error| {
+        RedbDataStorageError::DatabaseFile(format!(
+            "failed to create or open {}: {error}",
+            path.display()
+        ))
+    })?;
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = fs::metadata(path).map_err(|error| {
+            RedbDataStorageError::DatabaseFile(format!(
+                "failed to inspect {}: {error}",
+                path.display()
+            ))
+        })?;
+        let mode = metadata.mode() & 0o777;
+        if mode != 0o600 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+                RedbDataStorageError::DatabaseFile(format!(
+                    "failed to secure {}: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }

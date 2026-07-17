@@ -5,7 +5,7 @@
 use std::{ops::Deref, sync::Arc};
 
 use mls_rs_core::psk::{ExternalPskId, PreSharedKey, PreSharedKeyStorage};
-use redb::{Database, ReadableDatabase};
+use redb::{Database, ReadableDatabase, ReadableTable};
 
 use crate::{database_error, RedbDataStorageError, PSKS};
 
@@ -25,13 +25,24 @@ impl RedbPreSharedKeyStorage {
         psk: &PreSharedKey,
     ) -> Result<(), RedbDataStorageError> {
         let transaction = self.database.begin_write().map_err(database_error)?;
-        {
+        let modified = {
             let mut table = transaction.open_table(PSKS).map_err(database_error)?;
-            table
-                .insert(psk_id, psk.deref())
-                .map_err(database_error)?;
+            let unchanged = table
+                .get(psk_id)
+                .map_err(database_error)?
+                .is_some_and(|stored| stored.value() == psk.deref());
+            if !unchanged {
+                table
+                    .insert(psk_id, psk.deref())
+                    .map_err(database_error)?;
+            }
+            !unchanged
+        };
+        if modified {
+            transaction.commit().map_err(database_error)
+        } else {
+            transaction.abort().map_err(database_error)
         }
-        transaction.commit().map_err(database_error)
     }
 
     pub fn get(&self, psk_id: &[u8]) -> Result<Option<PreSharedKey>, RedbDataStorageError> {
@@ -45,11 +56,16 @@ impl RedbPreSharedKeyStorage {
 
     pub fn delete(&self, psk_id: &[u8]) -> Result<(), RedbDataStorageError> {
         let transaction = self.database.begin_write().map_err(database_error)?;
-        {
+        let removed = {
             let mut table = transaction.open_table(PSKS).map_err(database_error)?;
-            table.remove(psk_id).map_err(database_error)?;
+            let removed = table.remove(psk_id).map_err(database_error)?.is_some();
+            removed
+        };
+        if removed {
+            transaction.commit().map_err(database_error)
+        } else {
+            transaction.abort().map_err(database_error)
         }
-        transaction.commit().map_err(database_error)
     }
 }
 

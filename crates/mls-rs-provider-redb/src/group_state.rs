@@ -54,12 +54,13 @@ impl RedbGroupStateStorage {
         let (start, end) = epoch_range(group_id)?;
         let transaction = self.database.begin_write().map_err(database_error)?;
 
-        {
+        let removed_group = {
             let mut groups = transaction.open_table(GROUPS).map_err(database_error)?;
-            groups.remove(group_id).map_err(database_error)?;
-        }
+            let removed = groups.remove(group_id).map_err(database_error)?.is_some();
+            removed
+        };
 
-        {
+        let removed_epochs = {
             let mut epochs = transaction.open_table(EPOCHS).map_err(database_error)?;
             let keys = epochs
                 .range(start.as_slice()..=end.as_slice())
@@ -70,12 +71,18 @@ impl RedbGroupStateStorage {
                 })
                 .collect::<Result<Vec<_>, RedbDataStorageError>>()?;
 
+            let removed = keys.len();
             for key in keys {
                 epochs.remove(key.as_slice()).map_err(database_error)?;
             }
-        }
+            removed
+        };
 
-        transaction.commit().map_err(database_error)
+        if removed_group || removed_epochs != 0 {
+            transaction.commit().map_err(database_error)
+        } else {
+            transaction.abort().map_err(database_error)
+        }
     }
 
     fn get_snapshot_data(

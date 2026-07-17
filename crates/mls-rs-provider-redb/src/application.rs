@@ -35,7 +35,11 @@ impl RedbApplicationStorage {
                 1
             }
         };
-        transaction.commit().map_err(database_error)?;
+        if modified == 0 {
+            transaction.abort().map_err(database_error)?;
+        } else {
+            transaction.commit().map_err(database_error)?;
+        }
         Ok(modified)
     }
 
@@ -63,7 +67,11 @@ impl RedbApplicationStorage {
                 }
             }
         }
-        transaction.commit().map_err(database_error)?;
+        if modified == 0 {
+            transaction.abort().map_err(database_error)?;
+        } else {
+            transaction.commit().map_err(database_error)?;
+        }
         Ok(modified)
     }
 
@@ -87,7 +95,11 @@ impl RedbApplicationStorage {
             let removed = table.remove(key).map_err(database_error)?.is_some();
             usize::from(removed)
         };
-        transaction.commit().map_err(database_error)?;
+        if removed == 0 {
+            transaction.abort().map_err(database_error)?;
+        } else {
+            transaction.commit().map_err(database_error)?;
+        }
         Ok(removed)
     }
 
@@ -96,18 +108,15 @@ impl RedbApplicationStorage {
         let table = transaction
             .open_table(APPLICATION_DATA)
             .map_err(database_error)?;
-        table
-            .iter()
-            .map_err(database_error)?
-            .filter_map(|entry| match entry {
-                Ok((key, value)) if key.value().starts_with(key_prefix) => Some(Ok(Item::new(
-                    key.value().to_owned(),
-                    value.value().to_vec(),
-                ))),
-                Ok(_) => None,
-                Err(error) => Some(Err(database_error(error))),
-            })
-            .collect()
+        let mut items = Vec::new();
+        for entry in table.range(key_prefix..).map_err(database_error)? {
+            let (key, value) = entry.map_err(database_error)?;
+            if !key.value().starts_with(key_prefix) {
+                break;
+            }
+            items.push(Item::new(key.value().to_owned(), value.value().to_vec()));
+        }
+        Ok(items)
     }
 
     pub fn delete_by_prefix(&self, key_prefix: &str) -> Result<usize, RedbDataStorageError> {
@@ -116,23 +125,24 @@ impl RedbApplicationStorage {
             let mut table = transaction
                 .open_table(APPLICATION_DATA)
                 .map_err(database_error)?;
-            let keys = table
-                .iter()
-                .map_err(database_error)?
-                .filter_map(|entry| match entry {
-                    Ok((key, _)) if key.value().starts_with(key_prefix) => {
-                        Some(Ok(key.value().to_owned()))
-                    }
-                    Ok(_) => None,
-                    Err(error) => Some(Err(database_error(error))),
-                })
-                .collect::<Result<Vec<_>, RedbDataStorageError>>()?;
+            let mut keys = Vec::new();
+            for entry in table.range(key_prefix..).map_err(database_error)? {
+                let (key, _) = entry.map_err(database_error)?;
+                if !key.value().starts_with(key_prefix) {
+                    break;
+                }
+                keys.push(key.value().to_owned());
+            }
             for key in &keys {
                 table.remove(key.as_str()).map_err(database_error)?;
             }
             keys.len()
         };
-        transaction.commit().map_err(database_error)?;
+        if removed == 0 {
+            transaction.abort().map_err(database_error)?;
+        } else {
+            transaction.commit().map_err(database_error)?;
+        }
         Ok(removed)
     }
 }

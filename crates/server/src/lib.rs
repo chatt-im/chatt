@@ -1618,7 +1618,7 @@ impl Server {
                 self.store.drain_log_events();
             }
             if ready_workers & ROOM_STATE_EVENTS != 0 {
-                self.drain_dm_completions();
+                self.drain_dm_completions().map_err(io::Error::other)?;
             }
             if ready_workers & HISTORY_EVENTS != 0 {
                 self.drain_history_replies();
@@ -5923,8 +5923,8 @@ impl Server {
         }
     }
 
-    fn drain_dm_completions(&mut self) {
-        let mut completed = self.store.drain_dm_completions();
+    fn drain_dm_completions(&mut self) -> Result<(), String> {
+        let mut completed = self.store.drain_dm_completions()?;
         while let Some(completion) = completed.pop_front() {
             let waiters = self
                 .pending_dm_waiters
@@ -5987,6 +5987,7 @@ impl Server {
                 }
             }
         }
+        Ok(())
     }
 
     fn broadcast_p2p_gone(&mut self, session_id: SessionId, room_id: RoomId) {
@@ -12679,7 +12680,7 @@ mod tests {
             server.store.drain_log_events();
         }
         if ready & ROOM_STATE_EVENTS != 0 {
-            server.drain_dm_completions();
+            server.drain_dm_completions().unwrap();
         }
         if ready & HISTORY_EVENTS != 0 {
             server.drain_history_replies();
