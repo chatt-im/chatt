@@ -10,6 +10,7 @@ pub use map_impl::{LargeMap, LargeMapEntry};
 
 #[cfg(feature = "std")]
 mod map_impl {
+    #[cfg(feature = "by_ref_proposal")]
     use core::hash::Hash;
     use std::collections::{hash_map::Entry, HashMap};
 
@@ -19,6 +20,7 @@ mod map_impl {
     pub struct SmallMap<K: Hash + Eq + Ord, V>(pub(super) HashMap<K, V>);
 
     pub type LargeMap<K, V> = HashMap<K, V>;
+    #[cfg(feature = "by_ref_proposal")]
     pub(super) type SmallMapInner<K, V> = HashMap<K, V>;
     pub type LargeMapEntry<'a, K, V> = Entry<'a, K, V>;
 }

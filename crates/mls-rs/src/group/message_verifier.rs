@@ -25,7 +25,7 @@ use super::proposal::Proposal;
 #[derive(Debug)]
 pub(crate) enum SignaturePublicKeysContainer<'a> {
     RatchetTree(&'a TreeKemPublic),
-    #[cfg(feature = "private_message")]
+    #[cfg(all(feature = "private_message", feature = "prior_epoch"))]
     List(&'a [Option<SignaturePublicKey>]),
 }
 
@@ -153,7 +153,7 @@ fn signing_identity_for_member(
             .signing_identity
             .signature_key
             .clone()), // TODO: We can probably get rid of this clone
-        #[cfg(feature = "private_message")]
+        #[cfg(all(feature = "private_message", feature = "prior_epoch"))]
         SignaturePublicKeysContainer::List(list) => list
             .get(*leaf_index as usize)
             .cloned()

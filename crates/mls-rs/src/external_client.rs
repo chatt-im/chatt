@@ -110,6 +110,7 @@ where
 
         Ok(ExternalGroup {
             config: self.config.clone(),
+            #[cfg(feature = "by_ref_proposal")]
             signing_data: self.signing_data.clone(),
             state: snapshot
                 .state
