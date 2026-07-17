@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
 jsony_bench = { rev = "04560c1f91ccbd3e2f3f21cfc9191142fbab5c7c", git = "https://github.com/exrok/jsony" }
 # Use chatt's vendored RNNoise fork (not crates.io) so the isolated `rnnoise`
 # route measures the exact engine chatt ships.
