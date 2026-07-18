@@ -25,11 +25,25 @@ use crate::{
     E2eBootstrap, PersistentClient, load_bootstrap,
 };
 
+use mls_rs_provider_redb::{RedbDataStorageEngine, RedbStorageStats};
+
 pub struct LocalInstallation {
     pub bootstrap: E2eBootstrap,
     pub client: PersistentClient,
     identities: ChattIdentityProvider,
     bootstrap_path: PathBuf,
+    database_path: PathBuf,
+}
+
+pub enum StorageCompactionOutcome {
+    Complete {
+        installation: LocalInstallation,
+        compacted: bool,
+    },
+    Failed {
+        installation: Option<LocalInstallation>,
+        error: String,
+    },
 }
 
 impl std::fmt::Debug for LocalInstallation {
@@ -88,6 +102,7 @@ impl LocalInstallation {
                 client,
                 identities,
                 bootstrap_path,
+                database_path,
             },
             created,
         ))
@@ -240,6 +255,7 @@ impl LocalInstallation {
             client,
             identities,
             bootstrap_path,
+            database_path: data_dir.join("mls.redb"),
         })
     }
 
@@ -249,6 +265,69 @@ impl LocalInstallation {
         }
         self.bootstrap.state = BootstrapState::Active;
         self.bootstrap.store_atomic(&self.bootstrap_path)
+    }
+
+    pub fn storage_stats(&self) -> Result<RedbStorageStats, String> {
+        self.client.storage_stats()
+    }
+
+    pub fn storage_is_quiescent(&self) -> Result<bool, String> {
+        self.client.storage_is_quiescent()
+    }
+
+    pub fn clear_transient_storage_state(&self) -> Result<(), String> {
+        self.client.clear_transient_groups()
+    }
+
+    /// Drops every live redb adapter, compacts the uniquely opened file, and
+    /// rebuilds the persistent MLS client with the existing authorization
+    /// state.
+    pub fn compact_storage(self) -> StorageCompactionOutcome {
+        let Self {
+            bootstrap,
+            client,
+            identities,
+            bootstrap_path,
+            database_path,
+        } = self;
+        drop(client);
+
+        let compacted = RedbDataStorageEngine::compact_file(&database_path)
+            .map_err(|error| error.to_string());
+        let reopened = PersistentClient::reopen(&database_path, identities.clone()).map(|client| {
+            Self {
+                bootstrap,
+                client,
+                identities,
+                bootstrap_path,
+                database_path,
+            }
+        });
+
+        match (compacted, reopened) {
+            (Ok(compacted), Ok(installation)) => StorageCompactionOutcome::Complete {
+                installation,
+                compacted,
+            },
+            (compaction, reopened) => {
+                let error = match (compaction, &reopened) {
+                    (Err(compaction), Ok(_)) => {
+                        format!("MLS database compaction failed: {compaction}")
+                    }
+                    (Ok(_), Err(reopen)) => {
+                        format!("MLS database reopen after compaction failed: {reopen}")
+                    }
+                    (Err(compaction), Err(reopen)) => format!(
+                        "MLS database compaction failed: {compaction}; reopen failed: {reopen}"
+                    ),
+                    (Ok(_), Ok(_)) => unreachable!(),
+                };
+                StorageCompactionOutcome::Failed {
+                    installation: reopened.ok(),
+                    error,
+                }
+            }
+        }
     }
 }
 

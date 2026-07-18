@@ -197,7 +197,7 @@ allow_multiple = true
 pwd = "crates/benchmark"
 sh = '''
 set -e
-echo "> cargo build --release -p benchmark"
+echo "> cargo +nightly test -p chatt --features nightly-test-spans --release --lib build"
 BENCH=$(cargo +nightly test -p chatt --features nightly-test-spans --release --lib --config "target.'cfg(unix)'.runner = 'echo'" run -q)
 perf stat -r 3 $BENCH mls_e2e_test::mls_live_linked_device_pairwise_matrix --ignored --exact >> /tmp/profile-e2e-output.log
 '''
@@ -208,7 +208,7 @@ allow_multiple = true
 pwd = "crates/benchmark"
 sh = '''
 set -e
-echo "> cargo build --release -p benchmark"
+echo "> cargo +nightly test -p chatt --features nightly-test-spans --release --lib build"
 BENCH=$(cargo +nightly test -p chatt --features nightly-test-spans --release --lib --config "target.'cfg(unix)'.runner = 'echo'" run -q)
 ROUTE=${1:-profile}
 PROFILE_ROUTE=$(printf '%s' "$ROUTE" | sed 's#[^A-Za-z0-9_.-]#-#g')

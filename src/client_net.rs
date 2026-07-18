@@ -79,6 +79,8 @@ use crate::file_compression::{
 use crate::mdns::{MdnsSystem, generate_mdns_name};
 use crate::receive_store::{DiskReservation, Reservation};
 
+mod mls_actor;
+
 const TCP: Token = Token(0);
 const UDP: Token = Token(1);
 const WAKE: Token = Token(2);
@@ -941,12 +943,14 @@ impl NetworkClient {
             udp_addr = %config.udp_addr
         );
         let poll = Poll::new().map_err(|error| format!("failed to create poll: {error}"))?;
-        let waker = Waker::new(poll.registry(), WAKE)
-            .map_err(|error| format!("failed to create waker: {error}"))?;
+        let waker = Arc::new(
+            Waker::new(poll.registry(), WAKE)
+                .map_err(|error| format!("failed to create waker: {error}"))?,
+        );
         let (tx, rx) = mpsc::channel();
         let tx = CommandSender {
             tx,
-            waker: Arc::new(waker),
+            waker: Arc::clone(&waker),
         };
         let panic_events = events.clone();
         let worker = thread::Builder::new()
@@ -957,7 +961,7 @@ impl NetworkClient {
             .stack_size(1024 * 1024)
             .spawn(move || {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    run_worker(config, events, rx, poll);
+                    run_worker(config, events, rx, poll, waker);
                 }));
                 if result.is_err() {
                     kvlog::error!("network worker panicked");
@@ -1404,6 +1408,7 @@ fn run_worker(
     events: NetworkEventSender,
     commands: Receiver<NetworkCommand>,
     mut poll: Poll,
+    waker: Arc<Waker>,
 ) {
     kvlog::info!(
         "network worker starting",
@@ -1413,14 +1418,29 @@ fn run_worker(
     );
     let mut reconnect = ReconnectSchedule::new();
     let mut pending_authenticated_commands = VecDeque::new();
+    let mls_runtime = match mls_actor::Runtime::spawn(config.clone(), events.clone(), waker) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = events.send(NetworkEvent::WorkerStopped { reason: error });
+            return;
+        }
+    };
+    let mut mls_generation = 0u64;
     loop {
-        match run_worker_inner(
+        mls_generation = mls_generation.wrapping_add(1).max(1);
+        let session_end = run_worker_inner(
             &config,
             &events,
             &commands,
             &mut pending_authenticated_commands,
             &mut poll,
-        ) {
+            &mls_runtime,
+            mls_generation,
+        );
+        let _ = mls_runtime.try_send(mls_actor::Input::EndSession {
+            generation: mls_generation,
+        });
+        match session_end {
             SessionEnd::Shutdown => break,
             SessionEnd::ConnectFailed(reason) => {
                 kvlog::warn!(
@@ -1453,6 +1473,7 @@ fn run_worker(
             }
         }
     }
+    mls_runtime.stop();
     kvlog::info!("network worker stopped");
 }
 
@@ -1462,6 +1483,8 @@ fn run_worker_inner(
     commands: &Receiver<NetworkCommand>,
     pending_authenticated_commands: &mut VecDeque<NetworkCommand>,
     poll: &mut Poll,
+    mls_runtime: &mls_actor::Runtime,
+    mls_generation: u64,
 ) -> SessionEnd {
     let (std_tcp, transport, _trusted) = match connect_and_handshake(config, false) {
         Ok(value) => value,
@@ -1523,6 +1546,14 @@ fn run_worker_inner(
     }
 
     let mut worker = WorkerState {
+        mls_runtime,
+        mls_generation,
+        pending_mls_input: None,
+        mls_server_pending: 0,
+        deferred_server_control: None,
+        mls_available: false,
+        mls_session_ready: false,
+        mls_outputs: Vec::new(),
         config: config.clone(),
         events: events.clone(),
         tcp: TcpStream::from_std(std_tcp),
@@ -1600,24 +1631,8 @@ fn run_worker_inner(
         incoming_files: HashMap::new(),
         skipped_untrusted_files: HashSet::new(),
         e2e: E2eState::new(None, None, &config.e2e_peer_pins, config.data_dir.clone()),
-        mls: None,
-        mls_bound: false,
-        mls_new: false,
-        pending_mls_rooms: HashMap::new(),
-        pending_mls_group_infos: HashMap::new(),
-        mls_history_expired: HashSet::new(),
-        pending_mls_event_rosters: HashMap::new(),
-        pending_mls_welcome_rosters: None,
-        mls_installed_rosters: HashSet::new(),
-        pending_mls_commits: HashMap::new(),
-        delayed_mls_retries: HashMap::new(),
-        pending_mls_stale_retries: HashSet::new(),
-        pending_mls_roster: None,
-        mls_key_package_publish_pending: false,
         mls_file_announcements: HashMap::new(),
-        emitted_mls_sequences: HashSet::new(),
         room_kinds: HashMap::new(),
-        pending_device_link: None,
         pending_mls_file_offers: HashMap::new(),
         pending_mls_file_bytes: 0,
         pending_mls_file_items: 0,
@@ -1715,12 +1730,18 @@ fn run_worker_inner(
         if let Err(error) = worker.run_loop_tasks() {
             return SessionEnd::Disconnected(error);
         }
+        if let Err(error) = worker.drain_mls_outputs() {
+            return SessionEnd::Disconnected(error);
+        }
         if let Err(error) = worker.process_server_controls() {
             return SessionEnd::Disconnected(error);
         }
 
         let mut command_drain = CommandDrainOutcome::Empty;
-        if worker.user_id.is_some() {
+        if worker.user_id.is_some()
+            && worker.mls_session_ready
+            && worker.pending_mls_input.is_none()
+        {
             let mut handled = 0;
             while handled < MAX_COMMANDS_PER_ITERATION {
                 let Some(command) = pending_authenticated_commands.pop_front() else {
@@ -1730,15 +1751,24 @@ fn run_worker_inner(
                     return SessionEnd::Disconnected(error);
                 }
                 handled += 1;
+                if worker.pending_mls_input.is_some() {
+                    break;
+                }
             }
             if !pending_authenticated_commands.is_empty() {
                 command_drain = CommandDrainOutcome::HitLimit;
             }
         }
-        if command_drain != CommandDrainOutcome::HitLimit {
+        if command_drain != CommandDrainOutcome::HitLimit && worker.pending_mls_input.is_none() {
             command_drain =
                 match drain_commands_with(commands, MAX_COMMANDS_PER_ITERATION, |command| {
-                    if worker.user_id.is_none() && command.requires_authenticated_session() {
+                    if worker.pending_mls_input.is_some() {
+                        pending_authenticated_commands.push_back(command);
+                        return Ok(());
+                    }
+                    if (worker.user_id.is_none() || !worker.mls_session_ready)
+                        && command.requires_authenticated_session()
+                    {
                         pending_authenticated_commands.push_back(command);
                         Ok(())
                     } else {
@@ -1779,9 +1809,6 @@ fn run_worker_inner(
         worker.poll_udp_bind_retry(now);
         worker.poll_relay_keepalive(now);
         worker.poll_rtt_probe(now);
-        if let Err(error) = worker.poll_delayed_mls_retries(now) {
-            return SessionEnd::Disconnected(error);
-        }
         poll_timeout = worker.next_poll_timeout(command_drain, now);
         #[cfg(debug_assertions)]
         if poll_timeout != Duration::ZERO {
@@ -2144,7 +2171,15 @@ struct P2pVoiceRoute {
     key: KeyMaterial,
 }
 
-struct WorkerState {
+struct WorkerState<'a> {
+    mls_runtime: &'a mls_actor::Runtime,
+    mls_generation: u64,
+    pending_mls_input: Option<mls_actor::Input>,
+    mls_server_pending: usize,
+    deferred_server_control: Option<ServerControl>,
+    mls_available: bool,
+    mls_session_ready: bool,
+    mls_outputs: Vec<mls_actor::Output>,
     config: ClientConfig,
     events: NetworkEventSender,
     tcp: TcpStream,
@@ -2248,35 +2283,8 @@ struct WorkerState {
     skipped_untrusted_files: HashSet<FileTransferId>,
     /// Local stable-AccountId pins and manual verification levels.
     e2e: E2eState,
-    mls: Option<LocalInstallation>,
-    mls_bound: bool,
-    mls_new: bool,
-    pending_mls_rooms: HashMap<RoomId, PendingMlsRoom>,
-    pending_mls_group_infos: HashMap<RoomId, PendingMlsGroupInfo>,
-    /// Rooms whose server delivery prefix expired and must be externally
-    /// rejoined before their durable cursor can advance again.
-    mls_history_expired: HashSet<RoomId>,
-    pending_mls_event_rosters: HashMap<RoomId, HashSet<UserId>>,
-    pending_mls_welcome_rosters: Option<HashSet<UserId>>,
-    mls_installed_rosters: HashSet<UserId>,
-    pending_mls_commits: HashMap<RoomId, PendingMlsCommit>,
-    delayed_mls_retries: HashMap<MlsRetryKey, DelayedMlsRetry>,
-    /// Rooms with durable outbox entries reset after a stale-epoch response.
-    /// They resume once a delivery response proves the local cursor reached
-    /// the advertised server head, even if the winning commit push raced
-    /// ahead of the stale response.
-    pending_mls_stale_retries: HashSet<RoomId>,
-    pending_mls_roster: Option<rpc::identity::SignedDeviceRoster>,
-    /// A replenishment batch has been queued but not yet acknowledged. Several
-    /// consumers may drain packages before that publish reaches the server;
-    /// coalescing their low-water notices keeps the local/server pools bounded.
-    mls_key_package_publish_pending: bool,
     mls_file_announcements: HashMap<EventId, MlsFileCache>,
-    /// Session-local final guard against crossed push/submit responses
-    /// dispatching the same durable delivery twice.
-    emitted_mls_sequences: HashSet<(RoomId, u64)>,
     room_kinds: HashMap<RoomId, RoomKind>,
-    pending_device_link: Option<PendingCreatedDeviceLink>,
     pending_mls_file_offers: HashMap<RoomId, PendingMlsFileRoom>,
     pending_mls_file_bytes: usize,
     pending_mls_file_items: usize,
@@ -2324,7 +2332,7 @@ struct PendingMlsGroupInfo {
 #[derive(Clone, Debug)]
 struct MlsFileCache {
     room_id: RoomId,
-    sender_account: AccountId,
+    sender: UserId,
     timestamp_ms: u64,
     file: rpc::mls::MlsFileAnnouncement,
 }
@@ -3401,7 +3409,163 @@ impl EncoderFeedbackController {
     }
 }
 
-impl WorkerState {
+impl WorkerState<'_> {
+    fn queue_mls_input(&mut self, input: mls_actor::Input) -> Result<(), String> {
+        if self.pending_mls_input.is_some() {
+            return Err("client MLS request backlog is full".to_string());
+        }
+        if let Err(input) = self.mls_runtime.try_send(input) {
+            self.pending_mls_input = Some(input);
+        }
+        Ok(())
+    }
+
+    fn flush_pending_mls_input(&mut self) {
+        let Some(input) = self.pending_mls_input.take() else {
+            return;
+        };
+        if let Err(input) = self.mls_runtime.try_send(input) {
+            self.pending_mls_input = Some(input);
+        }
+    }
+
+    fn drain_mls_outputs(&mut self) -> Result<(), String> {
+        self.flush_pending_mls_input();
+        let actor_stopped = self.mls_runtime.drain_outputs(&mut self.mls_outputs);
+        let mut outputs = std::mem::take(&mut self.mls_outputs);
+        for output in outputs.drain(..) {
+            match output {
+                mls_actor::Output::Control {
+                    generation,
+                    control,
+                } if generation == self.mls_generation => self.queue_control(control)?,
+                mls_actor::Output::FileAnnouncement {
+                    generation,
+                    event_id,
+                    cache,
+                } if generation == self.mls_generation => {
+                    let room_id = cache.room_id;
+                    self.mls_file_announcements.insert(event_id, cache);
+                    self.drain_pending_mls_file_offers(room_id)?;
+                }
+                mls_actor::Output::RestoreFile {
+                    generation,
+                    intent,
+                    entry,
+                } if generation == self.mls_generation => {
+                    self.restore_mls_file_upload(intent, entry)?;
+                }
+                mls_actor::Output::MarkFileAnnouncementDelivered {
+                    generation,
+                    room_id,
+                    event_id,
+                } if generation == self.mls_generation => {
+                    self.mark_mls_upload_announcement_delivered(room_id, event_id);
+                }
+                mls_actor::Output::ObservePeerAccount {
+                    generation,
+                    user_id,
+                    account_id,
+                } if generation == self.mls_generation => {
+                    self.observe_peer_account(user_id, account_id);
+                }
+                mls_actor::Output::Availability {
+                    generation,
+                    available,
+                } if generation == self.mls_generation => {
+                    self.mls_available = available;
+                }
+                mls_actor::Output::ServerComplete { generation, count }
+                    if generation == self.mls_generation =>
+                {
+                    debug_assert!(self.mls_server_pending >= count);
+                    self.mls_server_pending = self.mls_server_pending.saturating_sub(count);
+                }
+                mls_actor::Output::SessionReady { generation }
+                    if generation == self.mls_generation =>
+                {
+                    self.mls_session_ready = true;
+                }
+                mls_actor::Output::Error {
+                    generation,
+                    message,
+                } if generation == self.mls_generation => {
+                    let _ = self.events.send(NetworkEvent::Error(message));
+                }
+                _ => {}
+            }
+        }
+        self.mls_outputs = outputs;
+        if actor_stopped {
+            return Err("client MLS worker stopped".to_string());
+        }
+        self.flush_pending_mls_input();
+        Ok(())
+    }
+
+    fn restore_mls_file_upload(
+        &mut self,
+        intent: chatt_mls::DurableFileUpload,
+        entry: chatt_mls::OutboxEntry,
+    ) -> Result<(), String> {
+        if self.outgoing_uploads.iter().any(|upload| {
+            upload.room_id == intent.room_id
+                && upload
+                    .seal
+                    .as_ref()
+                    .is_some_and(|seal| seal.event_id == intent.event_id)
+        }) {
+            return Ok(());
+        }
+        let rpc::mls::ChattEventContent::File(announcement) = &entry.event.content else {
+            return Err("cannot resume encrypted upload: durable announcement is not a file"
+                .to_string());
+        };
+        let path = PathBuf::from(std::ffi::OsString::from_vec(intent.source_path.clone()));
+        let request = UploadFileRequest {
+            path,
+            name_override: Some(announcement.name.clone()),
+            delete_after_open: false,
+        };
+        let mut upload = self.prepare_file_upload(Some(intent.room_id), request)?;
+        let Some(seal) = upload.seal.as_mut() else {
+            return Err(format!(
+                "cannot resume encrypted upload {}: room is no longer encrypted",
+                announcement.name
+            ));
+        };
+        if upload.size != announcement.size
+            || seal.digest != announcement.digest
+            || seal.inner_encoding != announcement.encoding
+        {
+            return Err(format!(
+                "cannot resume encrypted upload {}: source file changed",
+                announcement.name
+            ));
+        }
+        upload.transfer_id = announcement.transfer_id;
+        upload.delete_source_when_done = intent.delete_after_upload;
+        seal.content_key.bytes = announcement.file_key;
+        seal.event_id = intent.event_id;
+        seal.mls_event_id = intent.event_id;
+        seal.announcement_delivered =
+            matches!(entry.state, chatt_mls::OutboxState::Delivered { .. });
+        self.next_file_transfer = self
+            .next_file_transfer
+            .max(announcement.transfer_id.0.wrapping_add(1).max(1));
+        let _ = self.events.send(NetworkEvent::Status(format!(
+            "resuming upload {} ({})",
+            upload.name,
+            format_bytes(upload.size)
+        )));
+        let room_id = upload.room_id;
+        let event_id = seal.event_id;
+        self.outgoing_uploads.push_back(upload);
+        self.queue_mls_input(mls_actor::Input::Command(
+            mls_actor::Command::FileUploadReady { room_id, event_id },
+        ))
+    }
+
     #[inline]
     fn next_poll_timeout(&mut self, command_drain: CommandDrainOutcome, now: Instant) -> Duration {
         self.queue_runnable_io();
@@ -3416,7 +3580,6 @@ impl WorkerState {
         schedule.include(self.interface_wake(now));
         schedule.include(self.rtt_probe_wake(now));
         schedule.include(self.udp_bind_retry_wake(now));
-        schedule.include(self.mls_retry_wake(now));
         schedule.timeout()
     }
 
@@ -3552,16 +3715,6 @@ impl WorkerState {
         }
     }
 
-    #[inline]
-    fn mls_retry_wake(&self, now: Instant) -> WakeIntent {
-        self.delayed_mls_retries
-            .values()
-            .filter_map(|retry| retry.retry_at)
-            .min()
-            .map(|retry_at| WakeIntent::After(retry_at.saturating_duration_since(now)))
-            .unwrap_or(WakeIntent::Idle)
-    }
-
     #[cfg(debug_assertions)]
     fn debug_assert_no_immediate_work(&self, command_drain: CommandDrainOutcome) {
         debug_assert!(!self.loop_work.has_immediate_work());
@@ -3572,24 +3725,6 @@ impl WorkerState {
         debug_assert_ne!(self.bug_report_wake(), WakeIntent::Now);
         debug_assert_ne!(self.receive_wake(), WakeIntent::Now);
         debug_assert_ne!(self.upload_wake(), WakeIntent::Now);
-        debug_assert_ne!(self.mls_retry_wake(Instant::now()), WakeIntent::Now);
-    }
-
-    fn defer_mls_retry(
-        &mut self,
-        key: MlsRetryKey,
-        request: ClientControl,
-        now: Instant,
-    ) -> Duration {
-        defer_mls_retry_in(&mut self.delayed_mls_retries, key, request, now)
-    }
-
-    fn poll_delayed_mls_retries(&mut self, now: Instant) -> Result<(), String> {
-        let ready = take_ready_mls_retries(&mut self.delayed_mls_retries, now);
-        for request in ready {
-            self.queue_control(request)?;
-        }
-        Ok(())
     }
 
     fn queue_control(&mut self, control: ClientControl) -> Result<(), String> {
@@ -3647,6 +3782,9 @@ impl WorkerState {
     }
 
     fn process_server_controls(&mut self) -> Result<(), String> {
+        if self.mls_server_pending != 0 || self.pending_mls_input.is_some() {
+            return Ok(());
+        }
         let mut wire_budget = MAX_FILE_WIRE_BYTES_PER_TICK;
         let mut decoded_budget = MAX_FILE_DECODED_BYTES_PER_TICK;
         let mut controls_since_file_pump = 0;
@@ -3662,6 +3800,10 @@ impl WorkerState {
                     break;
                 }
             }
+            let deferred = self.deferred_server_control.take();
+            let control = if let Some(control) = deferred {
+                control
+            } else {
             let total = match frame::parse_frame(self.read_buf.pending()) {
                 Ok(Some((_, total))) => {
                     kvlog::debug!(
@@ -3688,10 +3830,18 @@ impl WorkerState {
                 controls_processed += 1;
                 continue;
             }
-            let control = decode_server_control(&plaintext)?;
+            decode_server_control(&plaintext)?
+            };
+            if self.mls_server_pending != 0 && !mls_actor::handles_server_control(&control) {
+                self.deferred_server_control = Some(control);
+                break;
+            }
             self.handle_server_control(control)?;
             controls_since_file_pump += 1;
             controls_processed += 1;
+            if self.pending_mls_input.is_some() {
+                break;
+            }
         }
         Ok(())
     }
@@ -3958,16 +4108,13 @@ impl WorkerState {
                     room_id = room_id.0,
                     body_size = body.len()
                 );
-                if self.send_mls_content(
-                    room_id,
-                    rpc::mls::ChattEventContent::Text { body: body.clone() },
-                )? {
-                    return Ok(());
-                }
                 if self.room_requires_mls(room_id) {
-                    let _ = self.events.send(NetworkEvent::Status(
-                        "encrypted room setup is still waiting for device KeyPackages".to_string(),
-                    ));
+                    self.queue_mls_input(mls_actor::Input::Command(
+                        mls_actor::Command::SendContent {
+                            room_id,
+                            content: rpc::mls::ChattEventContent::Text { body },
+                        },
+                    ))?;
                     return Ok(());
                 }
                 self.queue_control(ClientControl::SendChat { room_id, body })?;
@@ -3983,19 +4130,13 @@ impl WorkerState {
                     target = target.0,
                     body_size = body.len()
                 );
-                if self.send_mls_content(
-                    room_id,
-                    rpc::mls::ChattEventContent::Edit {
-                        target,
-                        body: body.clone(),
-                    },
-                )? {
-                    return Ok(());
-                }
                 if self.room_requires_mls(room_id) {
-                    let _ = self.events.send(NetworkEvent::Status(
-                        "encrypted room setup is still waiting for device KeyPackages".to_string(),
-                    ));
+                    self.queue_mls_input(mls_actor::Input::Command(
+                        mls_actor::Command::SendContent {
+                            room_id,
+                            content: rpc::mls::ChattEventContent::Edit { target, body },
+                        },
+                    ))?;
                     return Ok(());
                 }
                 self.queue_control(ClientControl::EditChat {
@@ -4010,13 +4151,13 @@ impl WorkerState {
                     room_id = room_id.0,
                     target = target.0
                 );
-                if self.send_mls_content(room_id, rpc::mls::ChattEventContent::Delete { target })? {
-                    return Ok(());
-                }
                 if self.room_requires_mls(room_id) {
-                    let _ = self.events.send(NetworkEvent::Status(
-                        "encrypted room setup is still waiting for device KeyPackages".to_string(),
-                    ));
+                    self.queue_mls_input(mls_actor::Input::Command(
+                        mls_actor::Command::SendContent {
+                            room_id,
+                            content: rpc::mls::ChattEventContent::Delete { target },
+                        },
+                    ))?;
                     return Ok(());
                 }
                 self.queue_control(ClientControl::DeleteChat { room_id, target })?;
@@ -4041,30 +4182,14 @@ impl WorkerState {
                 before,
                 limit,
             } => {
-                if let Some(installation) = self.mls.as_ref()
-                    && installation.client.descriptor(room_id)?.is_some()
-                {
-                    let history = installation.client.cached_history(room_id)?;
-                    let end = before
-                        .and_then(|before| {
-                            history
-                                .iter()
-                                .position(|event| mls_message_id(event.sequence) == before)
-                        })
-                        .unwrap_or(history.len());
-                    let start = end.saturating_sub(usize::from(limit));
-                    let selected = history[start..end].to_vec();
-                    let mut messages = Vec::with_capacity(selected.len());
-                    for cached in selected {
-                        messages.push(self.mls_chatt_event_to_chat(cached.event, cached.sequence)?);
-                    }
-                    let _ = self.events.send(NetworkEvent::HistoryChunk {
-                        room_id,
-                        before,
-                        messages,
-                        at_start: start == 0,
-                        complete: true,
-                    });
+                if self.room_requires_mls(room_id) {
+                    self.queue_mls_input(mls_actor::Input::Command(
+                        mls_actor::Command::FetchHistory {
+                            room_id,
+                            before,
+                            limit,
+                        },
+                    ))?;
                     return Ok(());
                 }
                 self.queue_control(ClientControl::FetchHistory {
@@ -4158,102 +4283,33 @@ impl WorkerState {
                 }
             }
             NetworkCommand::AcknowledgeMlsUiDispatch { room_id, sequence } => {
-                let installation = self
-                    .mls
-                    .as_ref()
-                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-                installation
-                    .client
-                    .acknowledge_ui_dispatch(room_id, sequence)?;
+                self.queue_mls_input(mls_actor::Input::Command(
+                    mls_actor::Command::AcknowledgeUiDispatch { room_id, sequence },
+                ))?;
             }
             NetworkCommand::RevokeE2eDevice { device_id } => {
-                if let Some(installation) = self.mls.as_ref() {
-                    if !self.mls_bound {
-                        return Err(
-                            "the local MLS device is not bound yet; retry shortly".to_string()
-                        );
-                    }
-                    let roster = installation.roster_without(device_id)?;
-                    let expected = Some(installation.roster_checkpoint());
-                    self.pending_mls_roster = Some(roster.clone());
-                    self.queue_control(ClientControl::PutDeviceRoster { expected, roster })?;
-                    // Roster CAS invalidates every session binding. Do not let
-                    // subsequently drained send commands race the server's
-                    // unbind; the stored-roster response will bind this still
-                    // active device again.
-                    self.mls_bound = false;
-                    return Ok(());
-                }
-                return Err("the MLS installation is unavailable".to_string());
+                self.queue_mls_input(mls_actor::Input::Command(
+                    mls_actor::Command::RevokeDevice(device_id),
+                ))?;
             }
             NetworkCommand::ListE2eDevices => {
-                let installation = self
-                    .mls
-                    .as_ref()
-                    .ok_or_else(|| "the MLS installation is unavailable".to_string())?;
-                let devices = installation
-                    .bootstrap
-                    .own_roster
-                    .body
-                    .active_devices
-                    .iter()
-                    .map(|certificate| {
-                        format!(
-                            "{} ({})",
-                            certificate.body.device_name,
-                            encode_hex(&certificate.body.device_id.0)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let _ = self.events.send(NetworkEvent::Error(format!(
-                    "MLS account devices: {devices}"
-                )));
+                self.queue_mls_input(mls_actor::Input::Command(
+                    mls_actor::Command::ListDevices,
+                ))?;
             }
             NetworkCommand::CreateDeviceLink => {
-                if !self.mls_bound {
-                    return Err("the local MLS device is not bound yet; retry shortly".to_string());
-                }
-                let rng = aws_lc_rs::rand::SystemRandom::new();
-                let mut secret = [0u8; KEY_LEN];
-                rng.fill(&mut secret)
-                    .map_err(|_| "failed to generate device-link secret".to_string())?;
-                let secrets =
-                    crate::device_link::derive_pairing_secrets(&secret, &self.server_public_key)?;
-                let secret_hash =
-                    crate::device_link::redemption_secret_hash(&secrets.redemption_secret);
-                let installation = self
-                    .mls
-                    .as_ref()
-                    .ok_or_else(|| "the MLS installation is unavailable".to_string())?;
-                let enrollment_bundle = crate::device_link::seal_enrollment(
-                    &installation.bootstrap,
-                    &secret_hash,
-                    &secrets.enrollment_key,
-                )?;
-                let pairing_string = encode_device_link_ticket(&DeviceLinkTicket {
-                    version: rpc::PROTOCOL_VERSION,
-                    pairing_secret: secret,
-                    tcp_addr: self.config.tcp_addr.clone(),
-                    udp_addr: self.config.udp_addr.clone(),
-                    udp_probe_addr: self.config.udp_probe_addr.clone(),
-                    server_public_key: self.server_public_key,
-                })?;
-                self.queue_control(ClientControl::CreateDeviceLink {
-                    redemption_secret_hash: secret_hash.clone(),
-                    enrollment_bundle,
-                })?;
-                self.pending_device_link = Some(PendingCreatedDeviceLink {
-                    secret_hash,
-                    pairing_string,
-                });
+                self.queue_mls_input(mls_actor::Input::Command(
+                    mls_actor::Command::CreateDeviceLink,
+                ))?;
             }
             NetworkCommand::CancelDeviceLink {
                 redemption_secret_hash,
             } => {
-                self.queue_control(ClientControl::CancelDeviceLink {
-                    redemption_secret_hash,
-                })?;
+                self.queue_mls_input(mls_actor::Input::Command(
+                    mls_actor::Command::CancelDeviceLink {
+                        redemption_secret_hash,
+                    },
+                ))?;
             }
             NetworkCommand::SetP2pEnabled(enabled) => {
                 // P2P would bypass an outer secure link, so it stays off in
@@ -4446,9 +4502,6 @@ impl WorkerState {
                     return;
                 }
                 self.outgoing_uploads.push_back(upload);
-                if let Err(error) = self.submit_queued_file_announcement() {
-                    let _ = self.events.send(NetworkEvent::Error(error));
-                }
                 let _ = self.events.send(NetworkEvent::Status(format!(
                     "queued upload {name} ({})",
                     format_bytes(size)
@@ -4595,16 +4648,10 @@ impl WorkerState {
         inner_encoding: FileContentEncoding,
         digest: [u8; 32],
     ) -> Result<Option<UploadSeal>, String> {
-        let descriptor = self
-            .mls
-            .as_ref()
-            .map(|installation| installation.client.descriptor(room_id))
-            .transpose()?
-            .flatten();
-        if descriptor.is_none() && !self.room_requires_mls(room_id) {
+        if !self.room_requires_mls(room_id) {
             return Ok(None);
         }
-        if self.mls.is_none() {
+        if !self.mls_available {
             return Err(
                 "cannot send file: this installation has no encrypted-room identity".to_string(),
             );
@@ -4630,14 +4677,13 @@ impl WorkerState {
         }))
     }
 
-    fn persist_and_submit_file_announcement(&self, upload: &OutgoingUpload) -> Result<(), String> {
+    fn persist_and_submit_file_announcement(
+        &mut self,
+        upload: &OutgoingUpload,
+    ) -> Result<(), String> {
         let Some(seal) = upload.seal.as_ref() else {
             return Ok(());
         };
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
         let announcement = rpc::mls::MlsFileAnnouncement {
             transfer_id: upload.transfer_id,
             name: upload.name.clone(),
@@ -4647,42 +4693,28 @@ impl WorkerState {
             file_key: seal.content_key.bytes,
             digest: seal.digest,
         };
-        installation.client.queue_file_outgoing(
-            rpc::mls::MlsChattEvent {
-                version: rpc::mls::MLS_PROTOCOL_VERSION,
-                room_id: upload.room_id,
-                event_id: seal.event_id,
-                sender_account: installation.bootstrap.account_id,
-                timestamp_ms: unix_now_ms(),
-                content: rpc::mls::ChattEventContent::File(announcement),
-            },
-            upload.source_path.as_os_str().as_bytes().to_vec(),
-            upload.delete_source_when_done,
-        )
+        self.queue_mls_input(mls_actor::Input::Command(mls_actor::Command::QueueFile {
+            room_id: upload.room_id,
+            event_id: seal.event_id,
+            timestamp_ms: unix_now_ms(),
+            announcement,
+            source_path: upload.source_path.as_os_str().as_bytes().to_vec(),
+            delete_after_upload: upload.delete_source_when_done,
+        }))
     }
 
-    fn submit_queued_file_announcement(&mut self) -> Result<(), String> {
-        if self.mls_bound {
-            self.queue_pending_mls_outbox()?;
-        }
-        Ok(())
-    }
-
-    fn finish_durable_file_upload(&self, upload: &OutgoingUpload) -> Result<(), String> {
+    fn finish_durable_file_upload(&mut self, upload: &OutgoingUpload) -> Result<(), String> {
         let Some(seal) = upload.seal.as_ref() else {
             return Ok(());
         };
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        installation
-            .client
-            .finish_file_upload(upload.room_id, seal.event_id)?;
-        if upload.delete_source_when_done {
-            let _ = fs::remove_file(&upload.source_path);
-        }
-        Ok(())
+        self.queue_mls_input(mls_actor::Input::Command(
+            mls_actor::Command::FinishFile {
+                room_id: upload.room_id,
+                event_id: seal.event_id,
+                source_path: upload.source_path.clone(),
+                delete_source: upload.delete_source_when_done,
+            },
+        ))
     }
 
     fn poll_uploads(&mut self) -> Result<(), String> {
@@ -5328,7 +5360,7 @@ impl WorkerState {
     }
 
     fn handle_file_offered(&mut self, file: FileMetadata, contents: bool) -> Result<(), String> {
-        if self.mls.is_none() && self.room_requires_mls(file.room_id) {
+        if !self.mls_available && self.room_requires_mls(file.room_id) {
             if contents {
                 self.skip_offered_download(&file);
             }
@@ -5355,13 +5387,7 @@ impl WorkerState {
     }
 
     fn file_offer_ready(&mut self, file: &FileMetadata) -> Result<bool, String> {
-        let is_mls = self
-            .mls
-            .as_ref()
-            .map(|installation| installation.client.descriptor(file.room_id))
-            .transpose()?
-            .flatten()
-            .is_some();
+        let is_mls = self.room_requires_mls(file.room_id);
         if is_mls != (file.encoding == FileContentEncoding::Sealed) {
             return Err(format!(
                 "server sent a file with forbidden encryption form for room {}",
@@ -5541,11 +5567,7 @@ impl WorkerState {
         if cached.room_id != file.room_id {
             return Err("MLS transfer announcement names another room".to_string());
         }
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        if installation.user_for_account(cached.sender_account)? != file.sender {
+        if cached.sender != file.sender {
             return Err(
                 "MLS transfer sender does not match authenticated announcement".to_string(),
             );
@@ -5938,6 +5960,10 @@ impl WorkerState {
             "server control handling",
             kind = server_control_kind(&control)
         );
+        if mls_actor::handles_server_control(&control) {
+            self.mls_server_pending += 1;
+            return self.queue_mls_input(mls_actor::Input::Server(control));
+        }
         match control {
             ServerControl::Authenticated {
                 session_id,
@@ -6295,9 +6321,7 @@ impl WorkerState {
                     name = room.name.as_str()
                 );
                 self.room_kinds.insert(room.room_id, room.kind.clone());
-                if self.mls_bound {
-                    self.queue_mls_room_reconciliation()?;
-                }
+                self.queue_mls_input(mls_actor::Input::RoomUpserted(room.clone()))?;
                 let _ = self.events.send(NetworkEvent::RoomUpserted(room));
             }
             ServerControl::DmOpened { room_id, peer } => {
@@ -6305,42 +6329,7 @@ impl WorkerState {
                 // mapping. The app separately correlates the peer with the UI
                 // clients that requested it, so a late or duplicate response
                 // must not tear down the network session.
-                if let Some(installation) = self.mls.as_ref() {
-                    if let Some(descriptor) = installation.client.descriptor(room_id)? {
-                        let after_sequence = installation.client.cursor(room_id)?;
-                        installation.install_room(descriptor)?;
-                        self.queue_control(ClientControl::FetchMlsEvents {
-                            room_id,
-                            after_sequence,
-                            limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                        })?;
-                    } else {
-                        let inserted = !self.pending_mls_rooms.contains_key(&room_id);
-                        if inserted {
-                            self.pending_mls_rooms.insert(
-                                room_id,
-                                PendingMlsRoom {
-                                    member_users: vec![
-                                        self.user_id.ok_or_else(|| {
-                                            "DM opened before authentication".to_string()
-                                        })?,
-                                        peer,
-                                    ],
-                                    rosters: HashMap::new(),
-                                    descriptor: None,
-                                    checkpoints: Vec::new(),
-                                    awaiting_packages: HashSet::new(),
-                                    missing_packages: HashSet::new(),
-                                    device_accounts: HashMap::new(),
-                                    packages: Vec::new(),
-                                },
-                            );
-                        }
-                        if inserted {
-                            self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-                        }
-                    }
-                }
+                self.queue_mls_input(mls_actor::Input::DmOpened { room_id, peer })?;
                 let _ = self.events.send(NetworkEvent::DmOpened { room_id, peer });
             }
             ServerControl::Presence { user, online } => {
@@ -6354,1016 +6343,17 @@ impl WorkerState {
                     self.room_server_rtts.remove(&user.user_id);
                 }
                 self.user_names.insert(user.user_id, user.username.clone());
+                self.queue_mls_input(mls_actor::Input::Presence {
+                    user: user.clone(),
+                    online,
+                })?;
                 let _ = self.events.send(NetworkEvent::Presence { user, online });
-                if online && self.mls_bound {
-                    self.queue_mls_room_reconciliation()?;
-                }
             }
             ServerControl::UploadDeclined {
                 client_transfer_id,
                 reason,
             } => self.handle_upload_declined(client_transfer_id, &reason),
-            ServerControl::DeviceLinkCreated {
-                redemption_secret_hash,
-                expires_at_ms,
-            } => {
-                let Some(pending) = self.pending_device_link.as_ref() else {
-                    return Ok(());
-                };
-                if pending.secret_hash != redemption_secret_hash {
-                    // A replacement request can overtake the prior response.
-                    // Its acknowledgement must not consume or fail the latest
-                    // request (and therefore must not disconnect the client).
-                    return Ok(());
-                }
-                let mut pending = self.pending_device_link.take().expect("checked above");
-                let _ = self.events.send(NetworkEvent::DeviceLinkCreated {
-                    redemption_secret_hash,
-                    pairing_string: std::mem::take(&mut pending.pairing_string),
-                    expires_at_ms,
-                });
-            }
-            ServerControl::DeviceLinkCanceled {
-                redemption_secret_hash,
-            } => {
-                if self
-                    .pending_device_link
-                    .as_ref()
-                    .is_some_and(|pending| pending.secret_hash == redemption_secret_hash)
-                {
-                    self.pending_device_link = None;
-                }
-                let _ = self.events.send(NetworkEvent::DeviceLinkCanceled);
-            }
-            ServerControl::DeviceLinkRedeemed {
-                device_id,
-                device_name,
-                ..
-            } => {
-                let _ = self.events.send(NetworkEvent::DeviceLinkRedeemed {
-                    device_id,
-                    device_name,
-                });
-            }
-            ServerControl::DeviceLinkBundle { .. } | ServerControl::DeviceLinked { .. } => {
-                return Err("server sent a device-pairing response on a normal session".to_string());
-            }
-            ServerControl::DeviceRoster {
-                user_id,
-                initialized,
-                roster,
-            } => {
-                let local_user = self
-                    .user_id
-                    .ok_or_else(|| "MLS roster arrived before authentication".to_string())?;
-                if user_id == local_user && self.mls.is_none() {
-                    if self.mls_new && !initialized && roster.is_none() {
-                        let data_dir = self.config.data_dir.as_deref().ok_or_else(|| {
-                            "MLS requires a persistent client data directory".to_string()
-                        })?;
-                        let (installation, created) = LocalInstallation::open_or_create(
-                            &mls_installation_dir(data_dir, &self.server_public_key, local_user),
-                            self.server_public_key,
-                            local_user,
-                            DEFAULT_INITIAL_DEVICE_NAME,
-                        )?;
-                        if !created {
-                            return Err(
-                                "deferred MLS genesis unexpectedly found local state".to_string()
-                            );
-                        }
-                        self.mls = Some(installation);
-                    } else {
-                        let message = if initialized || roster.is_some() {
-                            "This installation is not linked for encrypted rooms. Public rooms remain available."
-                        } else {
-                            "The local MLS installation is unavailable. Its files were left unchanged."
-                        };
-                        let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
-                            message: message.to_string(),
-                        });
-                        self.mls_new = false;
-                        return Ok(());
-                    }
-                }
-                let Some(installation) = self.mls.as_mut() else {
-                    return Ok(());
-                };
-                if let Some(roster) = roster.as_ref() {
-                    installation.install_roster(roster)?;
-                    self.mls_installed_rosters.insert(user_id);
-                }
-                if user_id != local_user {
-                    if let Some(peer_roster) = roster.as_ref() {
-                        let peer_account = peer_roster.body.account_id;
-                        self.record_pending_mls_roster(user_id, peer_roster)?;
-                        self.observe_peer_account(user_id, peer_account);
-                        self.resume_pending_mls_group_infos(user_id)?;
-                        self.resume_pending_mls_event_rosters(user_id)?;
-                        self.resume_pending_mls_welcomes(user_id)?;
-                        if self.mls_bound {
-                            self.queue_mls_maintenance()?;
-                        }
-                    }
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::Mls(ServerControl::DeviceRoster {
-                            user_id,
-                            initialized,
-                            roster,
-                        }));
-                    if self.mls_bound {
-                        self.restore_pending_ui_dispatches()?;
-                    }
-                    return Ok(());
-                }
-                let _ = self.events.send(NetworkEvent::MlsAccountIdentity {
-                    account_id: installation.bootstrap.account_id,
-                });
-                match roster {
-                    None if self.mls_new && !initialized => {
-                        let local_roster = installation.bootstrap.own_roster.clone();
-                        self.queue_control(ClientControl::PutDeviceRoster {
-                            expected: None,
-                            roster: local_roster,
-                        })?;
-                    }
-                    None => {
-                        let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
-                            message: "Server MLS continuity is missing; Chatt refused to publish a new account identity. Public rooms remain available."
-                                .to_string(),
-                        });
-                    }
-                    Some(roster) if roster.body.account_id != installation.bootstrap.account_id => {
-                        let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
-                            message: "Server MLS account continuity does not match this installation. Public rooms remain available."
-                                .to_string(),
-                        });
-                    }
-                    Some(roster)
-                        if !roster.body.active_devices.iter().any(|certificate| {
-                            certificate.body.device_id == installation.bootstrap.device_id
-                        }) =>
-                    {
-                        installation.replace_own_roster(roster)?;
-                        let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
-                            message: "this MLS device has been revoked".to_string(),
-                        });
-                    }
-                    Some(roster) => {
-                        installation.replace_own_roster(roster)?;
-                        self.bind_local_mls()?;
-                    }
-                }
-            }
-            ServerControl::DeviceRosterStored { checkpoint } => {
-                self.mls_bound = false;
-                let installation = self.mls.as_mut().ok_or_else(|| {
-                    "server stored a roster without a local MLS installation".to_string()
-                })?;
-                if let Some(roster) = self.pending_mls_roster.take() {
-                    if checkpoint != rpc::identity::roster_checkpoint(&roster) {
-                        return Err("server stored a different MLS roster".to_string());
-                    }
-                    installation.replace_own_roster(roster)?;
-                } else if checkpoint != installation.roster_checkpoint() {
-                    return Err("server stored a different MLS roster".to_string());
-                }
-                self.mls_new = false;
-                if installation
-                    .bootstrap
-                    .own_roster
-                    .body
-                    .active_devices
-                    .iter()
-                    .any(|certificate| {
-                        certificate.body.device_id == installation.bootstrap.device_id
-                    })
-                {
-                    self.bind_local_mls()?;
-                } else {
-                    let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
-                        message: "this MLS device has been revoked".to_string(),
-                    });
-                }
-            }
-            ServerControl::DeviceRosterConflict { .. } => {
-                self.pending_mls_roster = None;
-                let user_id = self.user_id.ok_or_else(|| {
-                    "MLS roster conflict arrived before authentication".to_string()
-                })?;
-                self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
-            }
-            ServerControl::MlsDeviceBound {
-                device_id,
-                available_key_packages,
-            } => {
-                let installation = self.mls.as_ref().ok_or_else(|| {
-                    "MLS binding arrived without a local installation".to_string()
-                })?;
-                if device_id != installation.bootstrap.device_id {
-                    return Err("server bound a different MLS device".to_string());
-                }
-                self.mls_bound = true;
-                let packages = if available_key_packages < MLS_KEY_PACKAGE_TARGET {
-                    let count = usize::from(MLS_KEY_PACKAGE_TARGET - available_key_packages);
-                    Some(
-                        installation
-                            .client
-                            .generate_key_packages(device_id, count)?,
-                    )
-                } else {
-                    None
-                };
-                let after_sequence = installation.client.welcome_cursor()?;
-                if let Some(packages) = packages {
-                    self.queue_control(ClientControl::PublishKeyPackages {
-                        device_id,
-                        packages,
-                    })?;
-                    self.mls_key_package_publish_pending = true;
-                }
-                self.restore_pending_file_uploads()?;
-                self.restore_pending_ui_dispatches()?;
-                self.queue_control(ClientControl::FetchMlsWelcome { after_sequence })?;
-                self.queue_mls_room_reconciliation()?;
-                self.queue_mls_maintenance()?;
-                self.queue_pending_mls_outbox()?;
-                let _ = self.events.send(NetworkEvent::MlsDeviceBound { device_id });
-            }
-            ServerControl::KeyPackage { device_id, package } => {
-                self.handle_mls_key_package(device_id, package)?;
-            }
-            ServerControl::EncryptedRoomCreated { room_id, epoch: _ } => {
-                let installation = self
-                    .mls
-                    .as_ref()
-                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-                let Some(pending) = self.pending_mls_commits.remove(&room_id) else {
-                    if installation.client.descriptor(room_id)?.is_some() {
-                        return Ok(());
-                    }
-                    return Err("server created an unrequested encrypted room".to_string());
-                };
-                let PendingMlsCommit::RoomCreation(descriptor) = pending else {
-                    return Err("room creation matched an external rejoin".to_string());
-                };
-                installation.client.accept_pending_commit(&descriptor, 1)?;
-                self.queue_pending_mls_outbox()?;
-                self.queue_control(ClientControl::FetchMlsEvents {
-                    room_id,
-                    after_sequence: 1,
-                    limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                })?;
-            }
-            ServerControl::MlsWelcomes {
-                welcomes,
-                head_sequence,
-            } => {
-                let delivered_any = !welcomes.is_empty();
-                let mut missing_rosters = HashSet::new();
-                for welcome in &welcomes {
-                    missing_rosters
-                        .extend(self.missing_mls_room_rosters(welcome.descriptor.room_id)?);
-                }
-                if !missing_rosters.is_empty() {
-                    let requests = missing_rosters.iter().copied().collect::<Vec<_>>();
-                    self.pending_mls_welcome_rosters = Some(missing_rosters);
-                    for user_id in requests {
-                        self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
-                    }
-                    return Ok(());
-                }
-                self.pending_mls_welcome_rosters = None;
-                let installation = self
-                    .mls
-                    .as_ref()
-                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-                let local_device = installation.bootstrap.device_id;
-                let mut fetches = Vec::new();
-                for welcome in welcomes {
-                    if welcome.device_id != local_device {
-                        return Err("server delivered a Welcome for another device".to_string());
-                    }
-                    if matches!(
-                        self.pending_mls_commits.get(&welcome.descriptor.room_id),
-                        Some(
-                            PendingMlsCommit::RoomCreation(_)
-                                | PendingMlsCommit::MemberUpdate { .. }
-                        )
-                    ) && let Some(pending) =
-                        self.pending_mls_commits.remove(&welcome.descriptor.room_id)
-                    {
-                        self.delayed_mls_retries
-                            .remove(&MlsRetryKey::Commit(welcome.descriptor.room_id));
-                        let descriptor = match pending {
-                            PendingMlsCommit::RoomCreation(descriptor)
-                            | PendingMlsCommit::MemberUpdate { descriptor, .. } => descriptor,
-                            PendingMlsCommit::ExternalRejoin { .. } => unreachable!(),
-                        };
-                        installation.client.reject_pending_commit(&descriptor)?;
-                    }
-                    self.pending_mls_group_infos
-                        .remove(&welcome.descriptor.room_id);
-                    self.pending_mls_rooms.remove(&welcome.descriptor.room_id);
-                    installation.install_room(welcome.descriptor.clone())?;
-                    installation
-                        .client
-                        .join_welcome(&welcome.descriptor, &welcome)
-                        .map_err(|error| {
-                            format!(
-                                "failed to join MLS Welcome for room {}: {error}",
-                                welcome.descriptor.room_id.0
-                            )
-                        })?;
-                    fetches.push((welcome.descriptor.room_id, welcome.sequence));
-                }
-                installation.client.set_welcome_cursor(head_sequence)?;
-                let welcome_cursor = installation.client.welcome_cursor()?;
-                if welcome_cursor > 0 {
-                    self.queue_control(ClientControl::AckMlsWelcome {
-                        delivery_id: welcome_cursor,
-                    })?;
-                }
-                for (room_id, after_sequence) in fetches {
-                    self.queue_control(ClientControl::FetchMlsEvents {
-                        room_id,
-                        after_sequence,
-                        limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                    })?;
-                }
-                self.queue_pending_mls_outbox()?;
-                if delivered_any {
-                    // A push can contain only the newest Welcome, so a
-                    // non-empty batch is not proof that another pending room
-                    // has no Welcome. Fetch once more from the advanced cursor;
-                    // an empty response is the authoritative fallback signal.
-                    if self
-                        .pending_mls_group_infos
-                        .values()
-                        .any(|pending| pending.awaiting_welcome_check)
-                    {
-                        self.queue_control(ClientControl::FetchMlsWelcome {
-                            after_sequence: welcome_cursor,
-                        })?;
-                    }
-                } else {
-                    self.finish_pending_mls_group_infos_after_welcome()?;
-                }
-            }
-            ServerControl::MlsEvents {
-                room_id,
-                mut events,
-                oldest_available_sequence,
-                head_sequence,
-            } => {
-                let cursor = self
-                    .mls
-                    .as_ref()
-                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?
-                    .client
-                    .cursor(room_id)?;
-                if cursor.saturating_add(1) < oldest_available_sequence {
-                    self.mls_history_expired.insert(room_id);
-                    let _ = self.events.send(NetworkEvent::Status(format!(
-                        "Encrypted history through delivery {} expired; rejoining the room from its current state.",
-                        oldest_available_sequence.saturating_sub(1)
-                    )));
-                    self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-                    return Ok(());
-                }
-                debug_assert!(head_sequence.saturating_add(1) >= oldest_available_sequence);
-                if self.pending_mls_commits.contains_key(&room_id) {
-                    // A push/fetch response can overtake the submit outcome.
-                    // Applying a winning commit to the pre-outcome group can
-                    // remove this client even when its external replacement
-                    // was the winner. The outcome path advances or refetches
-                    // from the authoritative cursor.
-                    kvlog::info!(
-                        "MLS delivery deferred behind pending commit",
-                        room_id = room_id.0,
-                        event_count = events.len(),
-                    );
-                    return Ok(());
-                }
-                let missing_rosters = self.missing_mls_room_rosters(room_id)?;
-                if !missing_rosters.is_empty() {
-                    let requests = missing_rosters.iter().copied().collect::<Vec<_>>();
-                    self.pending_mls_event_rosters
-                        .insert(room_id, missing_rosters);
-                    for user_id in requests {
-                        self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
-                    }
-                    return Ok(());
-                }
-                self.pending_mls_event_rosters.remove(&room_id);
-                let installation = self
-                    .mls
-                    .as_ref()
-                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-                let Some(descriptor) = installation.client.descriptor(room_id)? else {
-                    // Push delivery can race the GroupInfo response used to
-                    // install or externally rejoin a newly discovered room.
-                    self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-                    return Ok(());
-                };
-                events.sort_by_key(rpc::mls::MlsDeliveryEvent::sequence);
-                debug_assert!(
-                    events
-                        .windows(2)
-                        .all(|window| { window[0].sequence() < window[1].sequence() }),
-                    "MLS delivery response repeated a sequence"
-                );
-                let cursor = installation.client.cursor(room_id)?;
-                kvlog::info!(
-                    "MLS delivery batch processing",
-                    room_id = room_id.0,
-                    cursor,
-                    event_count = events.len(),
-                );
-                events.retain(|event| event.sequence() > cursor);
-                if let Some(first) = events.first()
-                    && first.sequence() != cursor.saturating_add(1)
-                {
-                    self.queue_control(ClientControl::FetchMlsEvents {
-                        room_id,
-                        after_sequence: cursor,
-                        limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                    })?;
-                    return Ok(());
-                }
-                let mut opened = Vec::new();
-                let mut recovered_outgoing = Vec::new();
-                let mut saw_commit = false;
-                for event in &events {
-                    match installation
-                        .client
-                        .process_delivery(&descriptor, event)
-                        .map_err(|error| {
-                            format!(
-                                "failed to process MLS delivery {} for room {}: {error}",
-                                event.sequence(),
-                                room_id.0
-                            )
-                        })? {
-                        chatt_mls::ProcessedDelivery::Application(cached) => {
-                            opened.push((cached.sequence, cached.event));
-                        }
-                        chatt_mls::ProcessedDelivery::Outgoing { sequence, event } => {
-                            if let Some(event) = event {
-                                recovered_outgoing.push(event.event_id);
-                                opened.push((sequence, event));
-                            }
-                        }
-                        chatt_mls::ProcessedDelivery::Commit { .. } => saw_commit = true,
-                        chatt_mls::ProcessedDelivery::RejectedApplication { sequence, reason } => {
-                            let _ = self.events.send(NetworkEvent::Status(format!(
-                                "discarded invalid encrypted event {sequence}: {reason}"
-                            )));
-                        }
-                        chatt_mls::ProcessedDelivery::AlreadyProcessed { .. } => {}
-                    }
-                }
-                let ack_sequence = (!events.is_empty())
-                    .then(|| installation.client.cursor(room_id))
-                    .transpose()?;
-                let next_after = if events.len() == rpc::mls::MAX_MLS_EVENT_BATCH {
-                    Some(installation.client.cursor(room_id)?)
-                } else {
-                    None
-                };
-                let caught_up = installation.client.cursor(room_id)? >= head_sequence;
-                if let Some(sequence) = ack_sequence {
-                    self.queue_control(ClientControl::AckMlsEvent { room_id, sequence })?;
-                }
-                for event_id in recovered_outgoing {
-                    self.delayed_mls_retries
-                        .remove(&MlsRetryKey::Application(room_id, event_id));
-                    self.mark_mls_upload_announcement_delivered(room_id, event_id);
-                }
-                for (sequence, event) in opened {
-                    self.emit_mls_chatt_event(event, sequence)?;
-                }
-                if saw_commit && self.mls_bound {
-                    self.queue_mls_maintenance()?;
-                    // Application submissions rejected at the old epoch stay
-                    // in the durable outbox as PendingEncryption. Resume them
-                    // only after the ordered commit has advanced our local
-                    // group; retrying from the submit response would encrypt
-                    // against the same stale epoch in a tight loop.
-                    self.queue_pending_mls_outbox()?;
-                }
-                if caught_up && self.pending_mls_stale_retries.remove(&room_id) {
-                    self.queue_pending_mls_outbox()?;
-                }
-                if let Some(after_sequence) = next_after {
-                    self.queue_control(ClientControl::FetchMlsEvents {
-                        room_id,
-                        after_sequence,
-                        limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                    })?;
-                }
-            }
-            ServerControl::MlsApplicationSubmitted {
-                room_id,
-                event_id,
-                outcome,
-            } => {
-                let installation = self
-                    .mls
-                    .as_ref()
-                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-                match outcome {
-                    rpc::mls::MlsSubmitOutcome::Stored { sequence }
-                    | rpc::mls::MlsSubmitOutcome::AlreadyStored { sequence } => {
-                        self.delayed_mls_retries
-                            .remove(&MlsRetryKey::Application(room_id, event_id));
-                        let entry = installation.client.outbox(room_id, event_id)?;
-                        let should_emit = installation
-                            .client
-                            .mark_outgoing_delivered(room_id, event_id, sequence)?;
-                        let cursor = installation.client.cursor(room_id)?;
-                        kvlog::info!(
-                            "MLS application acknowledgement persisted",
-                            room_id = room_id.0,
-                            sequence,
-                            cursor,
-                            should_emit,
-                        );
-                        self.queue_control(ClientControl::AckMlsEvent {
-                            room_id,
-                            sequence: cursor,
-                        })?;
-                        self.mark_mls_upload_announcement_delivered(room_id, event_id);
-                        if should_emit {
-                            self.emit_mls_chatt_event(entry.event, sequence)?;
-                        } else {
-                            let after_sequence = cursor;
-                            if after_sequence < sequence {
-                                self.queue_control(ClientControl::FetchMlsEvents {
-                                    room_id,
-                                    after_sequence,
-                                    limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                                })?;
-                            }
-                        }
-                    }
-                    rpc::mls::MlsSubmitOutcome::StaleEpochNotStored { current_epoch } => {
-                        self.delayed_mls_retries
-                            .remove(&MlsRetryKey::Application(room_id, event_id));
-                        installation.client.retry_stale_outgoing(
-                            room_id,
-                            event_id,
-                            current_epoch,
-                        )?;
-                        self.pending_mls_stale_retries.insert(room_id);
-                        let after_sequence = installation.client.cursor(room_id)?;
-                        self.queue_control(ClientControl::FetchMlsEvents {
-                            room_id,
-                            after_sequence,
-                            limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                        })?;
-                    }
-                    rpc::mls::MlsSubmitOutcome::RevocationPending => {
-                        self.delayed_mls_retries
-                            .remove(&MlsRetryKey::Application(room_id, event_id));
-                        let _ = self.events.send(NetworkEvent::Status(
-                            "encrypted message queued while room membership is reconciled"
-                                .to_string(),
-                        ));
-                    }
-                    rpc::mls::MlsSubmitOutcome::RejoinRequired => {
-                        self.mls_history_expired.insert(room_id);
-                        let _ = self.events.send(NetworkEvent::Status(
-                            "encrypted delivery history expired; rejoining before sending"
-                                .to_string(),
-                        ));
-                        self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-                    }
-                    rpc::mls::MlsSubmitOutcome::TemporarilyBlocked => {
-                        let entry = installation.client.outbox(room_id, event_id)?;
-                        if let chatt_mls::OutboxState::PendingDelivery { epoch, ciphertext } =
-                            entry.state
-                        {
-                            let delay = self.defer_mls_retry(
-                                MlsRetryKey::Application(room_id, event_id),
-                                ClientControl::SubmitMlsApplication {
-                                    room_id,
-                                    epoch,
-                                    event_id,
-                                    ciphertext,
-                                },
-                                Instant::now(),
-                            );
-                            let _ = self.events.send(NetworkEvent::Status(format!(
-                                "encrypted message temporarily blocked; retrying in {} ms",
-                                delay.as_millis()
-                            )));
-                        }
-                    }
-                }
-            }
-            ServerControl::MlsCommitSubmitted { room_id, outcome } => {
-                match outcome {
-                    rpc::mls::MlsCommitOutcome::Accepted { sequence, .. }
-                    | rpc::mls::MlsCommitOutcome::AlreadyAccepted { sequence, .. } => {
-                        self.delayed_mls_retries
-                            .remove(&MlsRetryKey::Commit(room_id));
-                        let mut refetch_after = None;
-                        let mut resume_outbox = false;
-                        if let Some(pending) = self.pending_mls_commits.remove(&room_id)
-                            && let Some(installation) = self.mls.as_ref()
-                        {
-                            match pending {
-                                PendingMlsCommit::RoomCreation(_)
-                                | PendingMlsCommit::MemberUpdate { .. } => {
-                                    // Keep the exact commit pending until it
-                                    // reaches its position in the ordered
-                                    // stream. Applying it here and setting the
-                                    // cursor to `sequence` would skip any
-                                    // applications appended earlier in the
-                                    // same epoch.
-                                }
-                                PendingMlsCommit::ExternalRejoin { descriptor, .. } => {
-                                    installation
-                                        .client
-                                        .accept_external_rejoin(&descriptor, sequence)?;
-                                    resume_outbox = true;
-                                }
-                            }
-                            refetch_after = Some(installation.client.cursor(room_id)?);
-                        }
-                        if let Some(after_sequence) = refetch_after {
-                            self.queue_control(ClientControl::FetchMlsEvents {
-                                room_id,
-                                after_sequence,
-                                limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                            })?;
-                        }
-                        if resume_outbox {
-                            self.queue_mls_maintenance()?;
-                            self.queue_pending_mls_outbox()?;
-                        }
-                    }
-                    rpc::mls::MlsCommitOutcome::StaleEpoch { .. } => {
-                        self.delayed_mls_retries
-                            .remove(&MlsRetryKey::Commit(room_id));
-                        if let Some(pending) = self.pending_mls_commits.remove(&room_id)
-                            && let Some(installation) = self.mls.as_ref()
-                        {
-                            match pending {
-                                PendingMlsCommit::RoomCreation(descriptor)
-                                | PendingMlsCommit::MemberUpdate { descriptor, .. } => {
-                                    installation.client.reject_pending_commit(&descriptor)?;
-                                    let after_sequence = installation.client.cursor(room_id)?;
-                                    self.queue_control(ClientControl::FetchMlsEvents {
-                                        room_id,
-                                        after_sequence,
-                                        limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                                    })?;
-                                }
-                                PendingMlsCommit::ExternalRejoin { .. } => {
-                                    installation.client.reject_external_rejoin(room_id)?;
-                                    self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-                                }
-                            }
-                        }
-                    }
-                    rpc::mls::MlsCommitOutcome::TemporarilyBlocked => {
-                        let request =
-                            self.pending_mls_commits.get(&room_id).and_then(
-                                |pending| match pending {
-                                    PendingMlsCommit::MemberUpdate { request, .. }
-                                    | PendingMlsCommit::ExternalRejoin { request, .. } => {
-                                        Some(request.clone())
-                                    }
-                                    PendingMlsCommit::RoomCreation(_) => None,
-                                },
-                            );
-                        if let Some(request) = request {
-                            let delay = self.defer_mls_retry(
-                                MlsRetryKey::Commit(room_id),
-                                request,
-                                Instant::now(),
-                            );
-                            let _ = self.events.send(NetworkEvent::Status(format!(
-                                "MLS membership update temporarily blocked; retrying in {} ms",
-                                delay.as_millis()
-                            )));
-                        }
-                    }
-                    rpc::mls::MlsCommitOutcome::RejoinRequired => {
-                        if let Some(pending) = self.pending_mls_commits.remove(&room_id)
-                            && let Some(installation) = self.mls.as_ref()
-                        {
-                            match pending {
-                                PendingMlsCommit::RoomCreation(descriptor)
-                                | PendingMlsCommit::MemberUpdate { descriptor, .. } => {
-                                    installation.client.reject_pending_commit(&descriptor)?;
-                                }
-                                PendingMlsCommit::ExternalRejoin { .. } => {}
-                            }
-                        }
-                        self.mls_history_expired.insert(room_id);
-                        self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-                    }
-                    rpc::mls::MlsCommitOutcome::MissingKeyPackage { .. } => {
-                        self.delayed_mls_retries
-                            .remove(&MlsRetryKey::Commit(room_id));
-                        let mut resume_outbox = false;
-                        let mut refetch_group_info = false;
-                        if let Some(pending) = self.pending_mls_commits.remove(&room_id)
-                            && let Some(installation) = self.mls.as_ref()
-                        {
-                            match pending {
-                                PendingMlsCommit::RoomCreation(descriptor)
-                                | PendingMlsCommit::MemberUpdate { descriptor, .. } => {
-                                    installation.client.reject_pending_commit(&descriptor)?;
-                                    resume_outbox = true;
-                                }
-                                PendingMlsCommit::ExternalRejoin { .. } => {
-                                    installation.client.reject_external_rejoin(room_id)?;
-                                    refetch_group_info = true;
-                                }
-                            }
-                        }
-                        if refetch_group_info {
-                            self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-                        }
-                        if resume_outbox {
-                            // The server did not append this commit. Once the
-                            // speculative local state is rolled back, queued
-                            // applications are safe to encrypt at the still-
-                            // current epoch instead of waiting forever for a
-                            // commit that will never enter the ordered stream.
-                            self.queue_pending_mls_outbox()?;
-                        }
-                        let _ = self.events.send(NetworkEvent::Status(
-                            "MLS membership update is waiting for current device state".to_string(),
-                        ));
-                    }
-                    rpc::mls::MlsCommitOutcome::PolicyRejected => {
-                        self.delayed_mls_retries
-                            .remove(&MlsRetryKey::Commit(room_id));
-                        // A concurrently accepted membership commit can make
-                        // a locally prepared commit invalid even when its
-                        // advertised parent epoch raced ahead of our delivery
-                        // cursor. Roll back the pending state and process the
-                        // ordered winner; this is room-scoped, not a network
-                        // session failure.
-                        let mut resume_outbox = false;
-                        let mut refetch_events = false;
-                        if let Some(pending) = self.pending_mls_commits.remove(&room_id)
-                            && let Some(installation) = self.mls.as_ref()
-                        {
-                            match pending {
-                                PendingMlsCommit::RoomCreation(descriptor)
-                                | PendingMlsCommit::MemberUpdate { descriptor, .. } => {
-                                    installation.client.reject_pending_commit(&descriptor)?;
-                                    resume_outbox = true;
-                                    refetch_events = true;
-                                }
-                                PendingMlsCommit::ExternalRejoin { .. } => {
-                                    installation.client.reject_external_rejoin(room_id)?;
-                                    self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-                                }
-                            }
-                        }
-                        if refetch_events && let Some(installation) = self.mls.as_ref() {
-                            let after_sequence = installation.client.cursor(room_id)?;
-                            self.queue_control(ClientControl::FetchMlsEvents {
-                                room_id,
-                                after_sequence,
-                                limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                            })?;
-                        }
-                        if resume_outbox {
-                            self.queue_pending_mls_outbox()?;
-                        }
-                        let _ = self.events.send(NetworkEvent::Status(
-                            "MLS membership changed concurrently; applying the winning update"
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
-            ServerControl::GroupInfo {
-                room_id,
-                descriptor,
-                epoch: _,
-                group_info,
-            } => {
-                let Some(descriptor) = descriptor else {
-                    let installation = self.mls.as_ref().ok_or_else(|| {
-                        "missing GroupInfo arrived without a local MLS installation".to_string()
-                    })?;
-                    if installation.client.descriptor(room_id)?.is_some()
-                        || self.pending_mls_commits.contains_key(&room_id)
-                        || self.pending_mls_group_infos.contains_key(&room_id)
-                    {
-                        // Multiple reconciliation requests may cross room
-                        // creation. A pre-creation absence received after the
-                        // local or canonical transition started is stale.
-                        return Ok(());
-                    }
-                    let Some(pending) = self.pending_mls_rooms.get(&room_id) else {
-                        return Ok(());
-                    };
-                    let mut members = pending.member_users.clone();
-                    members.sort_unstable();
-                    members.dedup();
-                    let local_user = self.user_id;
-                    for user_id in members
-                        .into_iter()
-                        .filter(|user_id| Some(*user_id) != local_user)
-                    {
-                        self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
-                    }
-                    return Ok(());
-                };
-                if matches!(
-                    self.pending_mls_commits.get(&room_id),
-                    Some(PendingMlsCommit::ExternalRejoin { .. })
-                ) {
-                    return Ok(());
-                }
-                let installation = self.mls.as_ref().ok_or_else(|| {
-                    "GroupInfo arrived without a local MLS installation".to_string()
-                })?;
-                if self.mls_history_expired.remove(&room_id) {
-                    let (expected_epoch, bundle) = installation
-                        .client
-                        .prepare_external_rejoin(&descriptor, &group_info)?;
-                    let request = ClientControl::SubmitCommitBundle {
-                        room_id,
-                        expected_epoch,
-                        bundle,
-                    };
-                    self.pending_mls_commits.insert(
-                        room_id,
-                        PendingMlsCommit::ExternalRejoin {
-                            descriptor,
-                            request: request.clone(),
-                        },
-                    );
-                    self.queue_control(request)?;
-                    return Ok(());
-                }
-                if installation
-                    .client
-                    .recover_accepted_room_creation(&descriptor, &group_info)?
-                {
-                    self.pending_mls_commits.remove(&room_id);
-                    self.delayed_mls_retries
-                        .remove(&MlsRetryKey::Commit(room_id));
-                    self.pending_mls_rooms.remove(&room_id);
-                    self.pending_mls_group_infos.remove(&room_id);
-                    self.queue_control(ClientControl::FetchMlsEvents {
-                        room_id,
-                        after_sequence: 1,
-                        limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                    })?;
-                    self.queue_pending_mls_outbox()?;
-                    return Ok(());
-                }
-                if let Some(pending) = self.pending_mls_commits.remove(&room_id) {
-                    self.delayed_mls_retries
-                        .remove(&MlsRetryKey::Commit(room_id));
-                    // A canonical GroupInfo while room creation is pending is
-                    // the server's response to losing a linked-device genesis
-                    // race. The speculative group was never accepted; clear
-                    // it before installing and externally joining the winner.
-                    self.mls
-                        .as_ref()
-                        .ok_or_else(|| {
-                            "GroupInfo arrived without a local MLS installation".to_string()
-                        })?
-                        .client
-                        .reject_pending_commit(match &pending {
-                            PendingMlsCommit::RoomCreation(descriptor)
-                            | PendingMlsCommit::MemberUpdate { descriptor, .. } => descriptor,
-                            PendingMlsCommit::ExternalRejoin { .. } => {
-                                return Err(
-                                    "canonical GroupInfo crossed an external rejoin".to_string()
-                                );
-                            }
-                        })?;
-                }
-                if self
-                    .mls
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "GroupInfo arrived without a local MLS installation".to_string()
-                    })?
-                    .client
-                    .descriptor(room_id)?
-                    .is_some()
-                {
-                    return Ok(());
-                }
-                // This is an existing encrypted room. Retire the speculative
-                // creator path before any already-queued roster/KeyPackage
-                // responses can complete it with a newly derived descriptor.
-                let local_user = self
-                    .user_id
-                    .ok_or_else(|| "GroupInfo arrived before authentication".to_string())?;
-                let member_users = if let Some(pending) = self.pending_mls_rooms.remove(&room_id) {
-                    pending.member_users
-                } else {
-                    match self.room_kinds.get(&room_id) {
-                        Some(RoomKind::Private { members }) => members.clone(),
-                        Some(RoomKind::Dm { user_a, user_b }) => vec![*user_a, *user_b],
-                        Some(RoomKind::Public) => {
-                            return Err("server sent MLS GroupInfo for a public room".to_string());
-                        }
-                        None => {
-                            return Err("GroupInfo arrived for an unknown room".to_string());
-                        }
-                    }
-                };
-                let awaiting_rosters = member_users
-                    .into_iter()
-                    .filter(|user_id| {
-                        *user_id != local_user && !self.mls_installed_rosters.contains(user_id)
-                    })
-                    .collect::<HashSet<_>>();
-                let roster_requests = awaiting_rosters.iter().copied().collect::<Vec<_>>();
-                self.pending_mls_group_infos.insert(
-                    room_id,
-                    PendingMlsGroupInfo {
-                        descriptor,
-                        group_info,
-                        awaiting_rosters,
-                        awaiting_welcome_check: false,
-                    },
-                );
-                for user_id in roster_requests {
-                    self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
-                }
-                if self
-                    .pending_mls_group_infos
-                    .get(&room_id)
-                    .is_some_and(|pending| pending.awaiting_rosters.is_empty())
-                {
-                    self.process_pending_mls_group_info(room_id)?;
-                }
-            }
-            ServerControl::KeyPackagesLow {
-                device_id,
-                available,
-            } => {
-                if !self.mls_bound
-                    || self.mls_key_package_publish_pending
-                    || available >= MLS_KEY_PACKAGE_TARGET
-                {
-                    return Ok(());
-                }
-                let installation = self.mls.as_ref().ok_or_else(|| {
-                    "KeyPackage notification arrived without MLS state".to_string()
-                })?;
-                if device_id != installation.bootstrap.device_id {
-                    return Err("server sent another device's KeyPackage count".to_string());
-                }
-                let packages = installation.client.generate_key_packages(
-                    device_id,
-                    usize::from(MLS_KEY_PACKAGE_TARGET - available),
-                )?;
-                self.queue_control(ClientControl::PublishKeyPackages {
-                    device_id,
-                    packages,
-                })?;
-                self.mls_key_package_publish_pending = true;
-            }
-            control @ ServerControl::KeyPackagesPublished {
-                device_id,
-                available,
-            } => {
-                let local_device = self
-                    .mls
-                    .as_ref()
-                    .is_some_and(|installation| installation.bootstrap.device_id == device_id);
-                if local_device {
-                    self.mls_key_package_publish_pending = false;
-                    if self.mls_bound && available < MLS_KEY_PACKAGE_TARGET {
-                        let installation = self.mls.as_ref().ok_or_else(|| {
-                            "KeyPackage acknowledgement arrived without MLS state".to_string()
-                        })?;
-                        let packages = installation.client.generate_key_packages(
-                            device_id,
-                            usize::from(MLS_KEY_PACKAGE_TARGET - available),
-                        )?;
-                        self.queue_control(ClientControl::PublishKeyPackages {
-                            device_id,
-                            packages,
-                        })?;
-                        self.mls_key_package_publish_pending = true;
-                    }
-                }
-                if available > 0 {
-                    self.retry_missing_mls_key_packages(device_id, available)?;
-                }
-                let _ = self.events.send(NetworkEvent::Mls(control));
-            }
+            _ => unreachable!("MLS controls are routed to the dedicated worker above"),
         }
         Ok(())
     }
@@ -7402,6 +6392,17 @@ impl WorkerState {
         for room in &rooms {
             self.room_kinds.insert(room.room_id, room.kind.clone());
         }
+        self.mls_available = false;
+        self.mls_session_ready = false;
+        self.queue_mls_input(mls_actor::Input::BeginSession {
+            generation: self.mls_generation,
+            session_id,
+            user_id,
+            rooms: rooms.clone(),
+            users: users.clone(),
+            server_public_key: self.server_public_key,
+            device_name: device_name.to_string(),
+        })?;
         let _ = self.events.send(NetworkEvent::Authenticated {
             session_id,
             user_id,
@@ -7411,56 +6412,6 @@ impl WorkerState {
             video_transport_mode: self.transport_mode,
             video_auth_key: self.video_auth_key,
         });
-        self.mls_bound = false;
-        if self.mls.is_none() {
-            match self.config.data_dir.as_deref() {
-                Some(data_dir) => {
-                    let mls_dir = mls_installation_dir(data_dir, &self.server_public_key, user_id);
-                    match chatt_mls::load_bootstrap(&mls_dir.join("mls-bootstrap.bin")) {
-                        chatt_mls::BootstrapLoad::Missing => {
-                            // Creation is deferred until the server proves this
-                            // account has never initialized MLS.
-                            self.mls_new = true;
-                        }
-                        chatt_mls::BootstrapLoad::Loaded(_) => {
-                            match LocalInstallation::open_or_create(
-                                &mls_dir,
-                                self.server_public_key,
-                                user_id,
-                                device_name,
-                            ) {
-                                Ok((installation, _)) => {
-                                    self.mls = Some(installation);
-                                    self.mls_new = false;
-                                }
-                                Err(error) => {
-                                    let _ =
-                                        self.events.send(NetworkEvent::LocalIdentityUnavailable {
-                                            message: format!(
-                                                "MLS installation unavailable: {error}"
-                                            ),
-                                        });
-                                }
-                            }
-                        }
-                        chatt_mls::BootstrapLoad::Unreadable(error) => {
-                            self.mls_new = false;
-                            let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
-                                message: format!(
-                                    "MLS bootstrap is unreadable and was left unchanged: {error}"
-                                ),
-                            });
-                        }
-                    }
-                    self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
-                }
-                None => {
-                    let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
-                        message: "MLS requires a persistent client data directory".to_string(),
-                    });
-                }
-            }
-        }
         self.bind_udp();
         Ok(())
     }
@@ -7502,79 +6453,6 @@ impl WorkerState {
         }
     }
 
-    fn bind_local_mls(&mut self) -> Result<(), String> {
-        let session_id = self
-            .session_id
-            .ok_or_else(|| "cannot bind MLS before authentication".to_string())?;
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        let device_id = installation.bootstrap.device_id;
-        let roster = installation.roster_checkpoint();
-        let proof = installation.binding_proof(session_id)?;
-        self.queue_control(ClientControl::BindMlsDevice {
-            device_id,
-            roster,
-            proof,
-        })
-    }
-
-    fn send_mls_content(
-        &mut self,
-        room_id: RoomId,
-        content: rpc::mls::ChattEventContent,
-    ) -> Result<bool, String> {
-        let Some(installation) = self.mls.as_ref() else {
-            return Ok(false);
-        };
-        let descriptor = installation.client.descriptor(room_id)?;
-        if descriptor.is_none() && !self.room_requires_mls(room_id) {
-            return Ok(false);
-        }
-        let event_id = random_event_id()?;
-        installation
-            .client
-            .queue_outgoing(rpc::mls::MlsChattEvent {
-                version: rpc::mls::MLS_PROTOCOL_VERSION,
-                room_id,
-                event_id,
-                sender_account: installation.bootstrap.account_id,
-                timestamp_ms: unix_now_ms(),
-                content,
-            })?;
-        let Some(descriptor) = descriptor else {
-            let _ = self.events.send(NetworkEvent::Status(
-                "encrypted message queued while room setup waits for device KeyPackages"
-                    .to_string(),
-            ));
-            return Ok(true);
-        };
-        if !self.mls_bound {
-            let _ = self.events.send(NetworkEvent::Status(
-                "encrypted message queued until the MLS device is bound".to_string(),
-            ));
-            return Ok(true);
-        }
-        if self.pending_mls_commits.contains_key(&room_id)
-            || installation.client.has_pending_commit(&descriptor)?
-        {
-            let _ = self.events.send(NetworkEvent::Status(
-                "encrypted message queued while room membership is reconciled".to_string(),
-            ));
-            return Ok(true);
-        }
-        let (epoch, ciphertext) = installation
-            .client
-            .encrypt_outgoing(&descriptor, event_id)?;
-        self.queue_control(ClientControl::SubmitMlsApplication {
-            room_id,
-            epoch,
-            event_id,
-            ciphertext,
-        })?;
-        Ok(true)
-    }
 
     fn room_requires_mls(&self, room_id: RoomId) -> bool {
         // Room metadata can reach linked workers at different times. Never
@@ -7600,716 +6478,6 @@ impl WorkerState {
         debug_assert!(matched <= 1, "one MLS event unlocked multiple file uploads");
     }
 
-    fn emit_mls_chatt_event(
-        &mut self,
-        event: rpc::mls::MlsChattEvent,
-        sequence: u64,
-    ) -> Result<(), String> {
-        if self
-            .emitted_mls_sequences
-            .contains(&(event.room_id, sequence))
-        {
-            return Ok(());
-        }
-        let room_id = event.room_id;
-        if let rpc::mls::ChattEventContent::File(file) = &event.content {
-            self.mls_file_announcements.insert(
-                event.event_id,
-                MlsFileCache {
-                    room_id: event.room_id,
-                    sender_account: event.sender_account,
-                    timestamp_ms: event.timestamp_ms,
-                    file: file.clone(),
-                },
-            );
-            self.drain_pending_mls_file_offers(event.room_id)?;
-        }
-        let message = self.mls_chatt_event_to_chat(event, sequence)?;
-        self.emitted_mls_sequences.insert((room_id, sequence));
-        let _ = self.events.send(NetworkEvent::Chat(message));
-        Ok(())
-    }
-
-    fn restore_pending_ui_dispatches(&mut self) -> Result<(), String> {
-        let pending = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?
-            .client
-            .pending_ui_dispatches()?;
-        for dispatch in pending {
-            if let Err(error) = self.emit_mls_chatt_event(dispatch.event, dispatch.sequence) {
-                kvlog::info!(
-                    "durable MLS UI dispatch is waiting for sender identity",
-                    error = error.as_str()
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn mls_chatt_event_to_chat(
-        &self,
-        event: rpc::mls::MlsChattEvent,
-        sequence: u64,
-    ) -> Result<AuthenticatedChat, String> {
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        let sender = installation.user_for_account(event.sender_account)?;
-        let sender_name = self
-            .user_names
-            .get(&sender)
-            .cloned()
-            .unwrap_or_else(|| sender.to_string());
-        let (body, file_transfer_id, flags, target) = match event.content {
-            rpc::mls::ChattEventContent::Text { body } => {
-                (body, None, MessageFlags::default(), None)
-            }
-            rpc::mls::ChattEventContent::Edit { target, body } => {
-                (body, None, MessageFlags(MessageFlags::EDITED), Some(target))
-            }
-            rpc::mls::ChattEventContent::Delete { target } => (
-                String::new(),
-                None,
-                MessageFlags(MessageFlags::DELETED),
-                Some(target),
-            ),
-            rpc::mls::ChattEventContent::Reaction { target, reaction } => {
-                (reaction, None, MessageFlags::default(), Some(target))
-            }
-            rpc::mls::ChattEventContent::File(file) => (
-                file.name,
-                Some(file.transfer_id),
-                MessageFlags::default(),
-                None,
-            ),
-        };
-        let message = ChatMessage {
-            message_id: mls_message_id(sequence),
-            room_id: event.room_id,
-            sender,
-            sender_name,
-            timestamp_ms: event.timestamp_ms,
-            body,
-            file_transfer_id,
-            flags,
-            target,
-        };
-        Ok(message.into())
-    }
-
-    fn resume_pending_mls_group_infos(&mut self, user_id: UserId) -> Result<(), String> {
-        let ready = self
-            .pending_mls_group_infos
-            .iter_mut()
-            .filter_map(|(room_id, pending)| {
-                pending.awaiting_rosters.remove(&user_id);
-                pending.awaiting_rosters.is_empty().then_some(*room_id)
-            })
-            .collect::<Vec<_>>();
-        for room_id in ready {
-            self.process_pending_mls_group_info(room_id)?;
-        }
-        Ok(())
-    }
-
-    fn process_pending_mls_group_info(&mut self, room_id: RoomId) -> Result<(), String> {
-        let Some(pending) = self.pending_mls_group_infos.get(&room_id) else {
-            return Ok(());
-        };
-        if !pending.awaiting_rosters.is_empty() || pending.awaiting_welcome_check {
-            return Ok(());
-        }
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "GroupInfo arrived without a local MLS installation".to_string())?;
-        if installation.client.descriptor(room_id)?.is_some() {
-            self.pending_mls_group_infos.remove(&room_id);
-            return Ok(());
-        }
-        self.pending_mls_group_infos
-            .get_mut(&room_id)
-            .expect("pending GroupInfo checked above")
-            .awaiting_welcome_check = true;
-        let after_sequence = installation.client.welcome_cursor()?;
-        self.queue_control(ClientControl::FetchMlsWelcome { after_sequence })?;
-        Ok(())
-    }
-
-    fn finish_pending_mls_group_infos_after_welcome(&mut self) -> Result<(), String> {
-        let ready = self
-            .pending_mls_group_infos
-            .iter()
-            .filter_map(|(room_id, pending)| {
-                (pending.awaiting_welcome_check && pending.awaiting_rosters.is_empty())
-                    .then_some(*room_id)
-            })
-            .collect::<Vec<_>>();
-        for room_id in ready {
-            self.finish_pending_mls_group_info(room_id)?;
-        }
-        Ok(())
-    }
-
-    fn finish_pending_mls_group_info(&mut self, room_id: RoomId) -> Result<(), String> {
-        let Some(pending) = self.pending_mls_group_infos.remove(&room_id) else {
-            return Ok(());
-        };
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "GroupInfo arrived without a local MLS installation".to_string())?;
-        if installation.client.descriptor(room_id)?.is_some() {
-            return Ok(());
-        }
-        installation.install_room(pending.descriptor.clone())?;
-        let (expected_epoch, bundle) = installation
-            .client
-            .prepare_external_rejoin(&pending.descriptor, &pending.group_info)?;
-        let request = ClientControl::SubmitCommitBundle {
-            room_id,
-            expected_epoch,
-            bundle,
-        };
-        let replaced = self.pending_mls_commits.insert(
-            room_id,
-            PendingMlsCommit::ExternalRejoin {
-                descriptor: pending.descriptor,
-                request: request.clone(),
-            },
-        );
-        debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
-        self.queue_control(request)?;
-        Ok(())
-    }
-
-    fn missing_mls_room_rosters(&self, room_id: RoomId) -> Result<HashSet<UserId>, String> {
-        let local_user = self
-            .user_id
-            .ok_or_else(|| "MLS events arrived before authentication".to_string())?;
-        let members = match self.room_kinds.get(&room_id) {
-            Some(RoomKind::Private { members }) => members.clone(),
-            Some(RoomKind::Dm { user_a, user_b }) => vec![*user_a, *user_b],
-            Some(RoomKind::Public) => {
-                return Err("server sent MLS events for a public room".to_string());
-            }
-            None => return Err("MLS events arrived for an unknown room".to_string()),
-        };
-        Ok(members
-            .into_iter()
-            .filter(|user_id| {
-                *user_id != local_user && !self.mls_installed_rosters.contains(user_id)
-            })
-            .collect())
-    }
-
-    fn resume_pending_mls_event_rosters(&mut self, user_id: UserId) -> Result<(), String> {
-        let ready = self
-            .pending_mls_event_rosters
-            .iter_mut()
-            .filter_map(|(room_id, awaiting)| {
-                awaiting.remove(&user_id);
-                awaiting.is_empty().then_some(*room_id)
-            })
-            .collect::<Vec<_>>();
-        for room_id in ready {
-            self.pending_mls_event_rosters.remove(&room_id);
-            let installation = self
-                .mls
-                .as_ref()
-                .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-            if installation.client.descriptor(room_id)?.is_some() {
-                let after_sequence = installation.client.cursor(room_id)?;
-                self.queue_control(ClientControl::FetchMlsEvents {
-                    room_id,
-                    after_sequence,
-                    limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-                })?;
-            } else {
-                self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-            }
-        }
-        Ok(())
-    }
-
-    fn resume_pending_mls_welcomes(&mut self, user_id: UserId) -> Result<(), String> {
-        let Some(awaiting) = self.pending_mls_welcome_rosters.as_mut() else {
-            return Ok(());
-        };
-        awaiting.remove(&user_id);
-        if !awaiting.is_empty() {
-            return Ok(());
-        }
-        self.pending_mls_welcome_rosters = None;
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        let after_sequence = installation.client.welcome_cursor()?;
-        self.queue_control(ClientControl::FetchMlsWelcome { after_sequence })?;
-        Ok(())
-    }
-
-    fn record_pending_mls_roster(
-        &mut self,
-        user_id: UserId,
-        roster: &rpc::identity::SignedDeviceRoster,
-    ) -> Result<(), String> {
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        let own_roster = installation.bootstrap.own_roster.clone();
-        let own_device = installation.bootstrap.device_id;
-        let own_user = installation.bootstrap.user_id;
-        let own_account = installation.bootstrap.account_id;
-        let room_ids: Vec<RoomId> = self
-            .pending_mls_rooms
-            .iter()
-            .filter_map(|(room_id, pending)| {
-                (pending.member_users.contains(&user_id) && pending.descriptor.is_none())
-                    .then_some(*room_id)
-            })
-            .collect();
-        let mut requests = Vec::new();
-        for room_id in room_ids {
-            {
-                let pending = self
-                    .pending_mls_rooms
-                    .get_mut(&room_id)
-                    .expect("pending MLS room collected above");
-                pending.rosters.insert(own_user, own_roster.clone());
-                pending.rosters.insert(user_id, roster.clone());
-                if pending
-                    .member_users
-                    .iter()
-                    .any(|member| !pending.rosters.contains_key(member))
-                {
-                    continue;
-                }
-            }
-            let pending = self
-                .pending_mls_rooms
-                .get(&room_id)
-                .expect("pending MLS room collected above");
-            let mut member_accounts = pending
-                .member_users
-                .iter()
-                .map(|member| {
-                    pending
-                        .rosters
-                        .get(member)
-                        .map(|roster| roster.body.account_id)
-                        .ok_or_else(|| "encrypted room member roster is missing".to_string())
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            member_accounts.sort_unstable();
-            member_accounts.dedup();
-            if member_accounts.first().copied() != Some(own_account) {
-                let _ = self.events.send(NetworkEvent::Status(format!(
-                    "encrypted room {} is waiting for its designated creator",
-                    room_id.0
-                )));
-                continue;
-            }
-            let descriptor = rpc::mls::EncryptedRoomDescriptor::new(
-                room_id,
-                own_account,
-                member_accounts,
-                unix_now_ms(),
-            )?;
-            let pending = self
-                .pending_mls_rooms
-                .get_mut(&room_id)
-                .expect("pending MLS room collected above");
-            pending.checkpoints = pending
-                .rosters
-                .values()
-                .map(rpc::identity::roster_checkpoint)
-                .collect();
-            pending
-                .checkpoints
-                .sort_by_key(|checkpoint| checkpoint.account_id);
-            pending.descriptor = Some(descriptor);
-            for certificate in pending
-                .rosters
-                .values()
-                .flat_map(|roster| &roster.body.active_devices)
-                .filter(|certificate| certificate.body.device_id != own_device)
-            {
-                if pending.awaiting_packages.insert(certificate.body.device_id) {
-                    pending
-                        .device_accounts
-                        .insert(certificate.body.device_id, certificate.body.account_id);
-                    requests.push(certificate.body.device_id);
-                }
-            }
-        }
-        for device_id in requests {
-            self.queue_control(ClientControl::TakeKeyPackage { device_id })?;
-        }
-        Ok(())
-    }
-
-    fn queue_mls_maintenance(&mut self) -> Result<(), String> {
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        let mut maintenance = Vec::new();
-        for descriptor in installation.client.descriptors()? {
-            if self.pending_mls_commits.contains_key(&descriptor.room_id) {
-                continue;
-            }
-            if let Some((expected_epoch, bundle)) =
-                installation.client.prepare_revocation_commit(&descriptor)?
-            {
-                maintenance.push((descriptor, expected_epoch, bundle));
-            }
-        }
-        for (descriptor, expected_epoch, bundle) in maintenance {
-            let room_id = descriptor.room_id;
-            let request = ClientControl::SubmitCommitBundle {
-                room_id,
-                expected_epoch,
-                bundle,
-            };
-            let replaced = self.pending_mls_commits.insert(
-                room_id,
-                PendingMlsCommit::MemberUpdate {
-                    descriptor,
-                    request: request.clone(),
-                },
-            );
-            debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
-            self.queue_control(request)?;
-        }
-        Ok(())
-    }
-
-    fn queue_pending_mls_outbox(&mut self) -> Result<(), String> {
-        let Some(installation) = self.mls.as_ref() else {
-            return Ok(());
-        };
-        let mut deliveries = Vec::new();
-        for entry in installation.client.pending_outbox()? {
-            let room_id = entry.event.room_id;
-            let event_id = entry.event.event_id;
-            if self
-                .delayed_mls_retries
-                .contains_key(&MlsRetryKey::Application(room_id, event_id))
-            {
-                continue;
-            }
-            if matches!(entry.event.content, rpc::mls::ChattEventContent::File(_))
-                && !self.outgoing_uploads.iter().any(|upload| {
-                    upload.room_id == room_id
-                        && upload
-                            .seal
-                            .as_ref()
-                            .is_some_and(|seal| seal.event_id == event_id)
-                })
-            {
-                // Never make a file announcement durable at the server unless
-                // the corresponding source has been reconstructed locally.
-                continue;
-            }
-            let Some(descriptor) = installation.client.descriptor(room_id)? else {
-                continue;
-            };
-            if self.pending_mls_commits.contains_key(&room_id)
-                || installation.client.has_pending_commit(&descriptor)?
-            {
-                continue;
-            }
-            let (epoch, ciphertext) = match entry.state {
-                chatt_mls::OutboxState::PendingEncryption => installation
-                    .client
-                    .encrypt_outgoing(&descriptor, event_id)?,
-                chatt_mls::OutboxState::PendingDelivery { epoch, ciphertext } => {
-                    (epoch, ciphertext)
-                }
-                chatt_mls::OutboxState::Delivered { .. } => continue,
-            };
-            deliveries.push((room_id, epoch, event_id, ciphertext));
-        }
-        for (room_id, epoch, event_id, ciphertext) in deliveries {
-            self.queue_control(ClientControl::SubmitMlsApplication {
-                room_id,
-                epoch,
-                event_id,
-                ciphertext,
-            })?;
-        }
-        Ok(())
-    }
-
-    fn restore_pending_file_uploads(&mut self) -> Result<(), String> {
-        let Some(installation) = self.mls.as_ref() else {
-            return Ok(());
-        };
-        let intents = installation.client.pending_file_uploads()?;
-        for intent in intents {
-            if self.outgoing_uploads.iter().any(|upload| {
-                upload.room_id == intent.room_id
-                    && upload
-                        .seal
-                        .as_ref()
-                        .is_some_and(|seal| seal.event_id == intent.event_id)
-            }) {
-                continue;
-            }
-            let entry = match self
-                .mls
-                .as_ref()
-                .expect("MLS installation checked above")
-                .client
-                .outbox(intent.room_id, intent.event_id)
-            {
-                Ok(entry) => entry,
-                Err(error) => {
-                    let _ = self.events.send(NetworkEvent::Error(format!(
-                        "cannot resume encrypted upload: {error}"
-                    )));
-                    continue;
-                }
-            };
-            let rpc::mls::ChattEventContent::File(announcement) = &entry.event.content else {
-                let _ = self.events.send(NetworkEvent::Error(
-                    "cannot resume encrypted upload: durable announcement is not a file"
-                        .to_string(),
-                ));
-                continue;
-            };
-            let path = PathBuf::from(std::ffi::OsString::from_vec(intent.source_path.clone()));
-            let request = UploadFileRequest {
-                path,
-                name_override: Some(announcement.name.clone()),
-                delete_after_open: false,
-            };
-            let mut upload = match self.prepare_file_upload(Some(intent.room_id), request) {
-                Ok(upload) => upload,
-                Err(error) => {
-                    let _ = self.events.send(NetworkEvent::Error(format!(
-                        "cannot resume encrypted upload {}: {error}",
-                        announcement.name
-                    )));
-                    continue;
-                }
-            };
-            let Some(seal) = upload.seal.as_mut() else {
-                let _ = self.events.send(NetworkEvent::Error(format!(
-                    "cannot resume encrypted upload {}: room is no longer encrypted",
-                    announcement.name
-                )));
-                continue;
-            };
-            if upload.size != announcement.size
-                || seal.digest != announcement.digest
-                || seal.inner_encoding != announcement.encoding
-            {
-                let _ = self.events.send(NetworkEvent::Error(format!(
-                    "cannot resume encrypted upload {}: source file changed",
-                    announcement.name
-                )));
-                continue;
-            }
-            upload.transfer_id = announcement.transfer_id;
-            upload.delete_source_when_done = intent.delete_after_upload;
-            seal.content_key.bytes = announcement.file_key;
-            seal.event_id = intent.event_id;
-            seal.mls_event_id = intent.event_id;
-            seal.announcement_delivered =
-                matches!(entry.state, chatt_mls::OutboxState::Delivered { .. });
-            self.next_file_transfer = self
-                .next_file_transfer
-                .max(announcement.transfer_id.0.wrapping_add(1).max(1));
-            let _ = self.events.send(NetworkEvent::Status(format!(
-                "resuming upload {} ({})",
-                upload.name,
-                format_bytes(upload.size)
-            )));
-            self.outgoing_uploads.push_back(upload);
-        }
-        Ok(())
-    }
-
-    fn queue_mls_room_reconciliation(&mut self) -> Result<(), String> {
-        let Some(installation) = self.mls.as_ref() else {
-            return Ok(());
-        };
-        let local_user = installation.bootstrap.user_id;
-        let mut requests = Vec::new();
-        let mut roster_requests = Vec::new();
-        let mut event_fetches = Vec::new();
-        for (room_id, kind) in &self.room_kinds {
-            if matches!(kind, RoomKind::Public) {
-                continue;
-            }
-            if installation.client.descriptor(*room_id)?.is_some() {
-                match kind {
-                    RoomKind::Public => {}
-                    RoomKind::Private { members } => {
-                        roster_requests.extend(members.iter().copied())
-                    }
-                    RoomKind::Dm { user_a, user_b } => {
-                        roster_requests.extend([*user_a, *user_b]);
-                    }
-                }
-                event_fetches.push((*room_id, installation.client.cursor(*room_id)?));
-                continue;
-            }
-            if self.pending_mls_rooms.contains_key(room_id) {
-                continue;
-            }
-            let mut member_users = match kind {
-                RoomKind::Public => continue,
-                RoomKind::Private { members } => members.clone(),
-                RoomKind::Dm { user_a, user_b } => vec![*user_a, *user_b],
-            };
-            if !member_users.contains(&local_user) {
-                continue;
-            }
-            member_users.sort_unstable();
-            member_users.dedup();
-            roster_requests.extend(member_users.iter().copied());
-            self.pending_mls_rooms.insert(
-                *room_id,
-                PendingMlsRoom {
-                    member_users,
-                    rosters: HashMap::new(),
-                    descriptor: None,
-                    checkpoints: Vec::new(),
-                    awaiting_packages: HashSet::new(),
-                    missing_packages: HashSet::new(),
-                    device_accounts: HashMap::new(),
-                    packages: Vec::new(),
-                },
-            );
-            requests.push(*room_id);
-        }
-        roster_requests.sort_unstable();
-        roster_requests.dedup();
-        roster_requests.retain(|user_id| {
-            *user_id != local_user && !self.mls_installed_rosters.contains(user_id)
-        });
-        for user_id in roster_requests {
-            self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
-        }
-        for room_id in requests {
-            self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-        }
-        for (room_id, after_sequence) in event_fetches {
-            self.queue_control(ClientControl::FetchMlsEvents {
-                room_id,
-                after_sequence,
-                limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
-            })?;
-        }
-        Ok(())
-    }
-
-    fn handle_mls_key_package(
-        &mut self,
-        device_id: DeviceId,
-        package: Option<Vec<u8>>,
-    ) -> Result<(), String> {
-        let Some(room_id) = self
-            .pending_mls_rooms
-            .iter()
-            .find_map(|(room_id, pending)| {
-                pending
-                    .awaiting_packages
-                    .contains(&device_id)
-                    .then_some(*room_id)
-            })
-        else {
-            return Ok(());
-        };
-        let pending = self
-            .pending_mls_rooms
-            .get_mut(&room_id)
-            .expect("pending MLS room selected above");
-        pending.awaiting_packages.remove(&device_id);
-        let Some(package) = package else {
-            pending.missing_packages.insert(device_id);
-            let _ = self.events.send(NetworkEvent::Status(
-                "encrypted room is waiting for a KeyPackage from one of its accounts".to_string(),
-            ));
-            return Ok(());
-        };
-        pending.packages.push((device_id, package));
-        if !pending.awaiting_packages.is_empty() || !pending.missing_packages.is_empty() {
-            return Ok(());
-        }
-        let pending = self
-            .pending_mls_rooms
-            .remove(&room_id)
-            .expect("completed pending MLS room");
-        let descriptor = pending
-            .descriptor
-            .ok_or_else(|| "pending MLS room has no descriptor".to_string())?;
-        let creator = descriptor.creator;
-        let mut represented = vec![creator];
-        for (device_id, _) in &pending.packages {
-            if let Some(account) = pending.device_accounts.get(device_id) {
-                represented.push(*account);
-            }
-        }
-        represented.sort_unstable();
-        represented.dedup();
-        if descriptor
-            .member_accounts
-            .iter()
-            .any(|account| represented.binary_search(account).is_err())
-        {
-            let _ = self.events.send(NetworkEvent::Status(
-                "encrypted room is waiting for a KeyPackage from one of its accounts".to_string(),
-            ));
-            return Ok(());
-        }
-        let installation = self
-            .mls
-            .as_ref()
-            .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
-        let initial_commit = installation
-            .client
-            .create_room(&descriptor, &pending.packages)?;
-        let replaced = self
-            .pending_mls_commits
-            .insert(room_id, PendingMlsCommit::RoomCreation(descriptor.clone()));
-        debug_assert!(replaced.is_none(), "replaced a pending MLS commit");
-        self.queue_control(ClientControl::CreateEncryptedRoom {
-            descriptor,
-            roster_checkpoints: pending.checkpoints,
-            initial_commit,
-        })
-    }
-
-    fn retry_missing_mls_key_packages(
-        &mut self,
-        device_id: DeviceId,
-        available: u16,
-    ) -> Result<(), String> {
-        let mut retries = 0usize;
-        for pending in self.pending_mls_rooms.values_mut() {
-            if retries == usize::from(available) {
-                break;
-            }
-            if pending.missing_packages.remove(&device_id) {
-                let inserted = pending.awaiting_packages.insert(device_id);
-                debug_assert!(inserted, "missing KeyPackage was still in flight");
-                retries += 1;
-            }
-        }
-        for _ in 0..retries {
-            self.queue_control(ClientControl::TakeKeyPackage { device_id })?;
-        }
-        Ok(())
-    }
 
     fn defer_mls_file_offer(&mut self, item: PendingMlsFileOffer) -> Result<(), String> {
         let room_id = item
