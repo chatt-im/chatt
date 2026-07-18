@@ -15,11 +15,7 @@ use std::{
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::{
-    config::FIRST_DYNAMIC_ROOM_ID,
-    event_queue::EventQueue,
-    room_store::DmRoom,
-};
+use crate::{config::FIRST_DYNAMIC_ROOM_ID, event_queue::EventQueue, room_store::DmRoom};
 use rpc::ids::{RoomId, UserId};
 
 pub(super) const FILE_NAME: &str = "state.redb";
@@ -80,9 +76,8 @@ fn ensure_private_file(path: &Path) -> Result<(), String> {
         let mode = metadata.mode() & 0o777;
         let private_mode = mode & 0o700;
         if mode != private_mode {
-            fs::set_permissions(path, fs::Permissions::from_mode(private_mode)).map_err(
-                |error| format!("failed to secure {}: {error}", path.display()),
-            )?;
+            fs::set_permissions(path, fs::Permissions::from_mode(private_mode))
+                .map_err(|error| format!("failed to secure {}: {error}", path.display()))?;
         }
     }
     Ok(())
@@ -430,11 +425,12 @@ impl StateWriter {
     pub(super) fn insert_dm_sync(&self, room: DmRoom, next_room_id: u32) -> Result<(), String> {
         let gone = || "room state writer thread is gone".to_string();
         let (reply, done) = mpsc::sync_channel(1);
-        self.submission.submit_dm(
-            DmInsert { room, next_room_id },
-            StateWriteWaiter::Sync(reply),
-        )
-        .map_err(|_| gone())?;
+        self.submission
+            .submit_dm(
+                DmInsert { room, next_room_id },
+                StateWriteWaiter::Sync(reply),
+            )
+            .map_err(|_| gone())?;
         done.recv().map_err(|_| gone())?
     }
 
@@ -505,19 +501,13 @@ fn persist(database: &Database, write: &PendingWrite) -> Result<(), PersistError
                 .map_err(storage_error)?
                 .map_or(0, |value| value.value());
             if next > stored {
-                watermarks
-                    .insert(room_id, next)
-                    .map_err(storage_error)?;
+                watermarks.insert(room_id, next).map_err(storage_error)?;
             }
         }
     }
     if !write.dm_inserts.is_empty() {
-        let mut metadata = transaction
-            .open_table(METADATA)
-            .map_err(storage_error)?;
-        let mut rooms = transaction
-            .open_table(DM_ROOMS)
-            .map_err(storage_error)?;
+        let mut metadata = transaction.open_table(METADATA).map_err(storage_error)?;
+        let mut rooms = transaction.open_table(DM_ROOMS).map_err(storage_error)?;
         for insert in &write.dm_inserts {
             let existing = rooms
                 .get(insert.room.room_id.0)
@@ -543,7 +533,9 @@ fn persist(database: &Database, write: &PendingWrite) -> Result<(), PersistError
                 .map_err(storage_error)?
                 .map_or(u64::from(FIRST_DYNAMIC_ROOM_ID), |value| value.value());
             let next = stored_next.max(u64::from(insert.next_room_id));
-            metadata.insert(NEXT_ROOM_ID_KEY, next).map_err(storage_error)?;
+            metadata
+                .insert(NEXT_ROOM_ID_KEY, next)
+                .map_err(storage_error)?;
         }
     }
     transaction.commit().map_err(storage_error)
@@ -636,11 +628,17 @@ mod tests {
         let path = dir.path().join(FILE_NAME);
         let (_, writer) = open(&path).unwrap();
         drop(writer);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
         let (_, writer) = open(&path).unwrap();
         drop(writer);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

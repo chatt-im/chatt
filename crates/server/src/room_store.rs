@@ -41,15 +41,15 @@ use std::{
     thread,
 };
 
+use crate::config::{FIRST_DYNAMIC_ROOM_ID, RoomConfig, RoomPersistenceConfig};
+use crate::event_queue::{EventNotifier, EventQueue, ROOM_LOG_EVENTS, ROOM_STATE_EVENTS};
+use crate::history_reader::{HistoryReadRequest, Source};
+use crate::room_state::{self, LoadedState, StateWriteEvent, StateWriter};
 use rpc::{
     control::{ChatMessage, MUTATION_WINDOW_MESSAGES},
     history,
     ids::{MessageId, RoomId, SessionId, UserId},
 };
-use crate::config::{FIRST_DYNAMIC_ROOM_ID, RoomConfig, RoomPersistenceConfig};
-use crate::event_queue::{EventNotifier, EventQueue, ROOM_LOG_EVENTS, ROOM_STATE_EVENTS};
-use crate::history_reader::{HistoryReadRequest, Source};
-use crate::room_state::{self, LoadedState, StateWriteEvent, StateWriter};
 
 /// Message-id block reserved per state write; a restart skips at most twice
 /// this many ids per room.
@@ -379,7 +379,9 @@ fn room_log_worker(
                             state.file = ActiveLog::Open(file);
                         }
                         Err(open_error) => {
-                            error = Some(format!("active log reopen after rotation failed: {open_error}"));
+                            error = Some(format!(
+                                "active log reopen after rotation failed: {open_error}"
+                            ));
                             state.file = ActiveLog::Reopen;
                             state.needs_read_handle = true;
                             file_update = LogFileUpdate::Reopen;
@@ -803,7 +805,10 @@ impl RoomStore {
             Some(dir) => {
                 let path = dir.join(room_state::FILE_NAME);
                 let opened = room_state::open(&path).map_err(|error| {
-                    format!("room state database {} is unavailable: {error}", path.display())
+                    format!(
+                        "room state database {} is unavailable: {error}",
+                        path.display()
+                    )
                 })?;
                 (opened.0, Some(opened.1))
             }
@@ -919,11 +924,7 @@ impl RoomStore {
 
     pub(crate) fn enable_async_state_writes(&mut self, notifier: Arc<EventNotifier>) {
         if self.state_writer.is_some() && self.state_events.is_none() {
-            let events = Arc::new(EventQueue::new(
-                notifier,
-                ROOM_STATE_EVENTS,
-                "room-state",
-            ));
+            let events = Arc::new(EventQueue::new(notifier, ROOM_STATE_EVENTS, "room-state"));
             self.state_writer
                 .as_ref()
                 .expect("state writer checked")
@@ -1133,11 +1134,7 @@ impl RoomStore {
     /// Records a message without weakening durability when the background
     /// writer is saturated. The caller can reject this one operation and
     /// retry later; subsequent room writes remain durable.
-    pub fn try_append(
-        &mut self,
-        room_id: RoomId,
-        message: &ChatMessage,
-    ) -> Result<usize, String> {
+    pub fn try_append(&mut self, room_id: RoomId, message: &ChatMessage) -> Result<usize, String> {
         let StoreTuning {
             max_active_log_bytes,
             max_resident_messages,
@@ -1561,10 +1558,14 @@ impl RoomStore {
                     operation_id: pending.operation_id,
                 });
             }
-            return Err("another direct-message room is being persisted; retry shortly".to_string());
+            return Err(
+                "another direct-message room is being persisted; retry shortly".to_string(),
+            );
         }
         let (Some(writer), Some(events)) = (&self.state_writer, &self.state_events) else {
-            return self.open_dm(first, second, now_ms).map(OpenDmResult::Existing);
+            return self
+                .open_dm(first, second, now_ms)
+                .map(OpenDmResult::Existing);
         };
         if self.data_dir.is_none() {
             return Err("dm room log path is unavailable".to_string());
@@ -1596,9 +1597,7 @@ impl RoomStore {
             self.next_room_id = previous_next_room_id;
             return Err(format!("dm room registry write failed: {error}"));
         }
-        Ok(OpenDmResult::Pending {
-            operation_id,
-        })
+        Ok(OpenDmResult::Pending { operation_id })
     }
 
     pub(crate) fn drain_dm_completions(&mut self) -> Result<VecDeque<DmCompletion>, String> {
@@ -1616,10 +1615,7 @@ impl RoomStore {
                 StateWriteEvent::Fatal { error } => return Err(error),
             };
             let Some(pending) = self.pending_dm.take() else {
-                kvlog::warn!(
-                    "unexpected room state completion",
-                    operation_id
-                );
+                kvlog::warn!("unexpected room state completion", operation_id);
                 continue;
             };
             if pending.operation_id != operation_id {
@@ -1651,12 +1647,15 @@ impl RoomStore {
             } else {
                 self.next_room_id = pending.previous_next_room_id;
             }
+            let terminal_error = result.as_ref().err().cloned();
             completed.push_back(DmCompletion {
                 operation_id: pending.operation_id,
                 room: pending.room,
-                result: result
-                    .map_err(|error| format!("dm room registry write failed: {error}")),
+                result: result.map_err(|error| format!("dm room registry write failed: {error}")),
             });
+            if let Some(error) = terminal_error {
+                return Err(error);
+            }
         }
         Ok(completed)
     }
@@ -1711,7 +1710,6 @@ fn next_room_id_above_existing_logs(dir: &Path) -> u32 {
     }
     next
 }
-
 
 /// Appends one `len:u32 | record` frame, rejecting records the loader would
 /// treat as a corrupt tail. Without the write-time check an oversized record
@@ -1954,11 +1952,7 @@ mod tests {
         let poll = mio::Poll::new().unwrap();
         let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1)).unwrap());
         let notifier = Arc::new(EventNotifier::new(waker));
-        let events = Arc::new(EventQueue::new(
-            notifier,
-            ROOM_LOG_EVENTS,
-            "room-log-test",
-        ));
+        let events = Arc::new(EventQueue::new(notifier, ROOM_LOG_EVENTS, "room-log-test"));
         let writer = RoomLogWriter::spawn(
             HashMap::from([(
                 room_id,
@@ -2236,11 +2230,11 @@ mod tests {
         assert!(!log_path.exists());
 
         let store = RoomStore::open(Some(dir.to_path_buf()), &[]);
-        assert_eq!(
-            store.dm_room_for(UserId(3), UserId(7)),
-            Some(room.room_id)
+        assert_eq!(store.dm_room_for(UserId(3), UserId(7)), Some(room.room_id));
+        assert!(
+            log_path.exists(),
+            "startup must recreate the derived empty log"
         );
-        assert!(log_path.exists(), "startup must recreate the derived empty log");
     }
 
     #[test]
@@ -2263,9 +2257,8 @@ mod tests {
         store.enable_async_state_writes(Arc::clone(&notifier));
         store.enable_async_log_writes(Arc::clone(&notifier));
 
-        let OpenDmResult::Pending { .. } = store
-            .begin_open_dm(UserId(1), UserId(2), 1_000)
-            .unwrap()
+        let OpenDmResult::Pending { .. } =
+            store.begin_open_dm(UserId(1), UserId(2), 1_000).unwrap()
         else {
             panic!("first async DM unexpectedly already existed");
         };
@@ -2273,11 +2266,7 @@ mod tests {
         poll.poll(&mut events, Some(std::time::Duration::from_secs(2)))
             .unwrap();
         assert_ne!(notifier.take_ready() & ROOM_STATE_EVENTS, 0);
-        let completion = store
-            .drain_dm_completions()
-            .unwrap()
-            .pop_front()
-            .unwrap();
+        let completion = store.drain_dm_completions().unwrap().pop_front().unwrap();
         completion.result.unwrap();
         let dm = completion.room.room_id;
         let log_path = dir.join("rooms").join(format!("{}.log", dm.0));
@@ -2316,9 +2305,8 @@ mod tests {
             .expect("persistent store")
             .fail_next_write();
 
-        let OpenDmResult::Pending { .. } = store
-            .begin_open_dm(UserId(1), UserId(2), 1_000)
-            .unwrap()
+        let OpenDmResult::Pending { .. } =
+            store.begin_open_dm(UserId(1), UserId(2), 1_000).unwrap()
         else {
             panic!("first async DM unexpectedly already existed");
         };

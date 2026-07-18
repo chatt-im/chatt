@@ -52,8 +52,7 @@ impl CaptureCallbackCore {
         let queue_depth_after_enqueue = self.stats.note_capture_chunk_enqueued();
         let expected_callback_delta_us =
             device_callback_period_us(samples as usize, self.device_rate);
-        let chunk =
-            CapturedAudioChunk::new(mono, callback_at, timing, queue_depth_after_enqueue);
+        let chunk = CapturedAudioChunk::new(mono, callback_at, timing, queue_depth_after_enqueue);
         if self.sender.try_send(chunk).is_ok() {
             if audio_callback_logging_enabled() {
                 kvlog::info!(
@@ -108,11 +107,8 @@ impl CaptureCallbackCore {
     }
 }
 
-pub(super) fn downmix_to_mono_i16_scale_into<T>(
-    input: &[T],
-    channels: usize,
-    out: &mut Vec<f32>,
-) where
+pub(super) fn downmix_to_mono_i16_scale_into<T>(input: &[T], channels: usize, out: &mut Vec<f32>)
+where
     T: Sample,
     f32: FromSample<T>,
 {

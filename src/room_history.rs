@@ -14,11 +14,11 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aws_lc_rs::digest::{SHA256, digest};
 use kvlog::encoding::{
     Encoder, Key, LogFields, MunchError, SpanInfo, StaticKey, Value, log_len, munch_log_with_span,
 };
 use kvlog::{Encode, LogLevel};
-use aws_lc_rs::digest::{SHA256, digest};
 use rpc::ids::{FileTransferId, MessageId, RoomId, UserId};
 use rpc::{
     control::{ChatMessage, MAX_CHAT_BODY_BYTES, MessageFlags},

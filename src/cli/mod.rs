@@ -65,7 +65,7 @@ UI. The daemon owns server, audio, web, and local-control state while other \
             name: "pair",
             aliases: &[],
             about: "Pair a new device or join a server.",
-            long_about: "With no argument, securely prompts in the TUI for a one-time device pairing string, transfer password, and device name.",
+            long_about: "With no argument, securely prompts in the TUI for a one-time device pairing string and device name.",
             args: &[Arg {
                 name: "join_string",
                 value_name: "TICKET_OR_ADDRESS",

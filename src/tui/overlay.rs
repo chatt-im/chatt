@@ -1,20 +1,8 @@
-use extui::{
-    Buffer, Ellipsis, HAlign, Rect,
-    event::{
-        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    },
-    vt::Modifier,
-};
-use extui_bindings::InputKey;
-use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
-use unicode_width::UnicodeWidthStr;
 use crate::{
     app::{
         UserVolumeDialog,
         command::CoreCommand,
-        device_pair::{
-            DeviceLinkButton, DeviceLinkDialog, DevicePairDialog, DevicePairEvent,
-        },
+        device_pair::{DeviceLinkButton, DeviceLinkDialog, DevicePairDialog, DevicePairEvent},
     },
     bindings::{self, BindCommand, Resolved},
     client_channel::{DirtySections, E2eIdentityOverlay, E2eIdentityTarget},
@@ -37,6 +25,16 @@ use crate::{
         },
     },
 };
+use extui::{
+    Buffer, Ellipsis, HAlign, Rect,
+    event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
+    vt::Modifier,
+};
+use extui_bindings::InputKey;
+use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
+use unicode_width::UnicodeWidthStr;
 
 use crate::e2e_identity::E2ePublicIdentity;
 
@@ -1641,12 +1639,10 @@ impl DevicePairMode {
             }
             DevicePairEvent::Submit {
                 pairing_string,
-                transfer_password,
                 device_name,
                 overwrite_existing,
             } => cx.send(CoreCommand::SubmitDevicePair {
                 pairing_string,
-                transfer_password,
                 device_name,
                 overwrite_existing,
             }),
@@ -1665,17 +1661,11 @@ impl AppMode for DevicePairMode {
         let mut app = crate::tui::render::RenderState::new(cx);
         let area = buf.rect();
         let form_height = self.dialog.form_height(area.w);
-        let Some(panel) =
-            crate::tui::render::form_dialog_panel(area, form_height)
-        else {
+        let Some(panel) = crate::tui::render::form_dialog_panel(area, form_height) else {
             return;
         };
-        let body = crate::tui::render::draw_dialog_frame(
-            panel,
-            buf,
-            &app.view.theme,
-            "Pair a device",
-        );
+        let body =
+            crate::tui::render::draw_dialog_frame(panel, buf, &app.view.theme, "Pair a device");
         self.dialog.render(body, buf, &app.view.theme);
         crate::tui::render::draw_overlay_key_preview(&mut app, bindings::FORM_LAYER, buf);
     }
@@ -1704,16 +1694,12 @@ impl AppMode for DevicePairMode {
             crate::client_channel::TerminalEvent::PairingFailed(error) => {
                 self.dialog.pairing_failed(error);
             }
-            crate::client_channel::TerminalEvent::DevicePairingIdentityExists {
-                message,
-                transfer_password,
-            } => self.dialog.identity_exists(message, transfer_password),
-            crate::client_channel::TerminalEvent::DevicePairingFailed {
-                message,
-                transfer_password,
-            } => self
-                .dialog
-                .device_pairing_failed(message, transfer_password),
+            crate::client_channel::TerminalEvent::DevicePairingIdentityExists { message } => {
+                self.dialog.identity_exists(message)
+            }
+            crate::client_channel::TerminalEvent::DevicePairingFailed { message } => {
+                self.dialog.pairing_failed(message)
+            }
             _ => {}
         }
     }
@@ -1735,7 +1721,7 @@ impl DeviceLinkMode {
 
     fn handle_button(&mut self, cx: &mut ViewCx<'_>, button: DeviceLinkButton) {
         match button {
-            DeviceLinkButton::CopyTicket | DeviceLinkButton::CopyPassword => {
+            DeviceLinkButton::CopyTicket => {
                 if let Some(value) = self.dialog.value(button) {
                     cx.queue_clipboard(value.to_string());
                 }

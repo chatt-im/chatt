@@ -334,13 +334,16 @@ fn two_multi_device_accounts_receive_constant_size_application_messages() {
     let descriptor = EncryptedRoomDescriptor::new(
         RoomId(20),
         alice[0].roster.body.account_id,
-        vec![alice[0].roster.body.account_id, bob[0].roster.body.account_id],
+        vec![
+            alice[0].roster.body.account_id,
+            bob[0].roster.body.account_id,
+        ],
         100,
     )
     .unwrap();
     identities.install_room(descriptor.clone()).unwrap();
-    let clients = [&alice[0], &alice[1], &bob[0], &bob[1]]
-        .map(|device| client(identities.clone(), device));
+    let clients =
+        [&alice[0], &alice[1], &bob[0], &bob[1]].map(|device| client(identities.clone(), device));
     let mut group = clients[0]
         .create_group_with_id(
             descriptor.mls_group_id,
@@ -395,7 +398,10 @@ fn two_multi_device_accounts_receive_constant_size_application_messages() {
     let two_descriptor = EncryptedRoomDescriptor::new(
         RoomId(21),
         single_alice.roster.body.account_id,
-        vec![single_alice.roster.body.account_id, single_bob.roster.body.account_id],
+        vec![
+            single_alice.roster.body.account_id,
+            single_bob.roster.body.account_id,
+        ],
         100,
     )
     .unwrap();

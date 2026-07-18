@@ -4518,9 +4518,10 @@ mod tests {
             Some(UserId(1)),
         );
         assert!(room.begin_history_fetch(RoomId(1)));
-        assert!(room
-            .complete_history_fetch(RoomId(1), None, &[], false)
-            .is_some());
+        assert!(
+            room.complete_history_fetch(RoomId(1), None, &[], false)
+                .is_some()
+        );
         assert!(
             room.begin_history_fetch(RoomId(1)),
             "a scheduler-overload reply must not claim durable history is exhausted"

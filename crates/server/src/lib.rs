@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub mod config;
 mod bug_report_writer;
+pub mod config;
 mod config_diagnostics;
 mod event_queue;
 mod history_reader;
@@ -20,18 +20,18 @@ pub mod local_admin;
 mod mls_delivery;
 mod mls_service;
 mod mls_store;
-pub mod room_store;
 mod room_state;
+pub mod room_store;
 pub mod user_store;
 mod username_registry;
 mod voice_relay;
 
+use aws_lc_rs::rand::SecureRandom;
+use aws_lc_rs::signature::{KeyPair, VerificationAlgorithm};
 use mio::{
     Events, Interest, Poll, Token, Waker,
     net::{TcpListener, TcpStream, UdpSocket},
 };
-use aws_lc_rs::rand::SecureRandom;
-use aws_lc_rs::signature::{KeyPair, VerificationAlgorithm};
 use rpc::{
     control::{
         self, ChatMessage, ChatMutationKind, ClientControl, ERROR_AUTH_REJECTED,
@@ -55,20 +55,18 @@ use rpc::{
         write_queue_to,
     },
     frame, identity as mls_identity,
-    ids::{
-        BugReportId, DeviceId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId,
-    },
+    ids::{BugReportId, DeviceId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media,
     recv::RecvBuffer,
     video::{self, SharedVideoFrame, VideoAck, VideoHello, VideoRecordReader, VideoRole},
 };
 
-use config::{
-    Config as ServerConfig, UserConfig, hash_secret, valid_username, value_arg, verify_secret_hash,
-};
 use bug_report_writer::{
     BugReportWriteReply, BugReportWriteRequest, BugReportWriter,
     EnqueueError as BugReportEnqueueError,
+};
+use config::{
+    Config as ServerConfig, UserConfig, hash_secret, valid_username, value_arg, verify_secret_hash,
 };
 use event_queue::{
     ADMIN_EVENTS, BUG_REPORT_EVENTS, EventNotifier, EventQueue, HISTORY_EVENTS, IDENTITY_EVENTS,
@@ -76,8 +74,8 @@ use event_queue::{
 };
 use history_reader::{HistoryReadReply, HistoryReader};
 use identity_writer::{
-    EnqueueError as IdentityEnqueueError, IdentityWrite, IdentityWriteReply,
-    IdentityWriteRequest, IdentityWriter,
+    EnqueueError as IdentityEnqueueError, IdentityWrite, IdentityWriteReply, IdentityWriteRequest,
+    IdentityWriter,
 };
 use local_admin::{AdminCommand, AdminSender, AdminSocket};
 use mls_delivery::MlsEventQueue;
@@ -252,11 +250,7 @@ impl EventLoopStats {
         let maximum = self.slow_control_maxima.entry(kind).or_default();
         if elapsed_micros > *maximum {
             *maximum = elapsed_micros;
-            kvlog::warn!(
-                "slow server control handler",
-                kind,
-                elapsed_micros
-            );
+            kvlog::warn!("slow server control handler", kind, elapsed_micros);
         }
     }
 
@@ -434,7 +428,10 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         ["mls", "storage-status"] => {
-            println!("{}", local_admin::mls_storage_status().map_err(invalid_config)?);
+            println!(
+                "{}",
+                local_admin::mls_storage_status().map_err(invalid_config)?
+            );
             return Ok(());
         }
         ["mls", "compact"] => {
@@ -683,14 +680,17 @@ enum MlsReply {
     CommitSubmitted {
         token: Token,
         room_id: RoomId,
-        result: Result<(
-            rpc::mls::MlsCommitOutcome,
-            Option<mls_store::RoomRecord>,
-            Option<(
-                mls_store::EventBatch,
-                Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>,
-            )>,
-        ), String>,
+        result: Result<
+            (
+                rpc::mls::MlsCommitOutcome,
+                Option<mls_store::RoomRecord>,
+                Option<(
+                    mls_store::EventBatch,
+                    Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>,
+                )>,
+            ),
+            String,
+        >,
     },
     DeviceLinkRedeemed {
         token: Token,
@@ -710,10 +710,7 @@ enum MlsReply {
         token: Token,
         room_id: RoomId,
         event_id: rpc::ids::EventId,
-        result: Result<(
-            rpc::mls::MlsSubmitOutcome,
-            Option<mls_store::EventBatch>,
-        ), String>,
+        result: Result<(rpc::mls::MlsSubmitOutcome, Option<mls_store::EventBatch>), String>,
     },
     Compacted {
         admin_reply: Option<mpsc::Sender<Result<String, String>>>,
@@ -850,8 +847,7 @@ impl MlsWorker {
         let pending_acknowledgements = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let pending_welcome_acknowledgements = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let worker_pending_acknowledgements = Arc::clone(&pending_acknowledgements);
-        let worker_pending_welcome_acknowledgements =
-            Arc::clone(&pending_welcome_acknowledgements);
+        let worker_pending_welcome_acknowledgements = Arc::clone(&pending_welcome_acknowledgements);
         let thread = thread::Builder::new()
             .name("chatt-mls-durability".to_string())
             .spawn(move || {
@@ -921,282 +917,268 @@ impl MlsWorker {
         request: MlsWriteRequest,
     ) {
         match request {
-                        MlsWriteRequest::PutRoster {
-                            token,
-                            session_id,
-                            user_id,
-                            expected,
-                            roster,
-                            bootstrap_credential_hash,
-                        } => {
-                            let initial = expected.is_none();
-                            let stored_roster = roster.clone();
-                            let result = service
-                                .put_roster(
-                                    user_id,
-                                    expected,
-                                    roster,
-                                    bootstrap_credential_hash,
-                                )
-                                .map(|checkpoint| (checkpoint, service.cache_state()));
-                            events.push(MlsReply::RosterStored {
-                                token,
-                                session_id,
-                                user_id,
-                                initial,
-                                roster: stored_roster,
-                                result,
-                            });
-                        }
-                        MlsWriteRequest::CreateRoom {
-                            token,
-                            creator,
-                            creator_client_id,
-                            descriptor,
-                            checkpoints,
-                            bundle,
-                            welcome_devices,
-                        } => {
-                            let room_id = descriptor.room_id;
-                            let result = (|| {
-                                if let Some(room) = service.existing_room_for_creation(
-                                    creator,
-                                    &descriptor,
-                                    &bundle,
-                                )? {
-                                    return Ok(RoomCreationReply::Existing { room });
-                                }
-                                let epoch = service.create_room(
-                                    creator,
-                                    &creator_client_id,
-                                    descriptor,
-                                    &checkpoints,
-                                    bundle,
-                                )?;
-                                Ok(RoomCreationReply::Created {
-                                    epoch,
-                                    room: service
-                                        .cached_room(room_id)
-                                        .expect("created room cache"),
-                                    deliveries: collect_latest_welcomes(
-                                        &service,
-                                        &welcome_devices,
-                                    )?,
-                                })
-                            })();
-                            events.push(MlsReply::RoomCreated { token, room_id, result });
-                        }
-                        MlsWriteRequest::SubmitCommit {
-                            token,
-                            room_id,
-                            device_id,
-                            committer_client_id,
-                            expected_epoch,
-                            bundle,
-                            welcome_devices,
-                        } => {
-                            let result = service
-                                .submit_commit_for_device(
-                                    room_id,
-                                    device_id,
-                                    &committer_client_id,
-                                    expected_epoch,
-                                    bundle,
-                                )
-                                .and_then(|outcome| {
-                                    let accepted = match &outcome {
-                                        rpc::mls::MlsCommitOutcome::Accepted { sequence, .. } => {
-                                            Some(*sequence)
-                                        }
-                                        _ => None,
-                                    };
-                                    let room = accepted.and_then(|_| service.cached_room(room_id));
-                                    let pushed = if let Some(sequence) = accepted {
-                                        Some((
-                                            service.event_batch(
-                                                room_id,
-                                                sequence.saturating_sub(1),
-                                                1,
-                                            )?,
-                                            collect_latest_welcomes(
-                                                &service,
-                                                &welcome_devices,
-                                            )?,
-                                        ))
-                                    } else {
-                                        None
-                                    };
-                                    Ok((outcome, room, pushed))
-                                });
-                            events.push(MlsReply::CommitSubmitted { token, room_id, result });
-                        }
-                        MlsWriteRequest::RedeemDeviceLink {
-                            token,
-                            secret_hash,
-                            user_id,
-                            username,
-                            expected,
-                            roster,
-                            device_id,
-                            device_name,
-                            credential_hash,
-                            attempt_id,
-                            packages,
-                            bearer_token,
-                            receive_files,
-                            file_receive_limit_bytes,
-                        } => {
-                            let result = service
-                                .redeem_pair(
-                                    user_id,
-                                    expected,
-                                    roster,
-                                    device_id,
-                                    credential_hash.clone(),
-                                    packages,
-                                )
-                                .map(|_| service.cache_state());
-                            events.push(MlsReply::DeviceLinkRedeemed {
-                                token,
-                                secret_hash,
-                                user_id,
-                                username,
-                                device_id,
-                                device_name,
-                                credential_hash,
-                                attempt_id,
-                                bearer_token,
-                                receive_files,
-                                file_receive_limit_bytes,
-                                result,
-                            });
-                        }
-                        MlsWriteRequest::SubmitApplication {
-                            token,
-                            room_id,
-                            device_id,
-                            epoch,
-                            event_id,
-                            ciphertext,
-                        } => events.push(MlsReply::ApplicationSubmitted {
-                            token,
-                            room_id,
-                            event_id,
-                            result: service.submit_application_for_device_with_event(
-                                room_id,
-                                device_id,
-                                epoch,
-                                event_id,
-                                ciphertext,
-                            ),
-                        }),
-                        MlsWriteRequest::Compact {
-                            scheduled,
-                            minimum_fragmented_bytes,
-                            minimum_fragmented_percent,
-                            admin_reply,
-                            started,
-                        } => {
-                            let result = (|| {
-                                let status = service.storage_status()?;
-                                let percent = if status.allocated_bytes == 0 {
-                                    0
-                                } else {
-                                    status.fragmented_bytes.saturating_mul(100)
-                                        / status.allocated_bytes
-                                };
-                                if scheduled
-                                    && (status.fragmented_bytes < minimum_fragmented_bytes
-                                        || percent
-                                            < u64::from(minimum_fragmented_percent))
-                                {
-                                    return Ok(None);
-                                }
-                                let before = status.file_bytes;
-                                let compacted = service.compact()?;
-                                let after = service
-                                    .storage_status()
-                                    .ok()
-                                    .and_then(|status| status.file_bytes);
-                                Ok(Some((compacted, before, after)))
-                            })();
-                            events.push(MlsReply::Compacted {
-                                admin_reply,
-                                result,
-                                started,
-                            });
-                        }
-                        MlsWriteRequest::Cleanup {
-                            batch_events,
-                            interval,
-                        } => events.push(MlsReply::Cleanup {
-                            interval,
-                            result: service.cleanup(batch_events),
-                        }),
-                        MlsWriteRequest::StorageStatus { reply } => {
-                            let result = service.storage_status().map(|status| {
-                                format!(
-                                    "allocated={} stored={} fragmented={} file={}",
-                                    status.allocated_bytes,
-                                    status.stored_bytes,
-                                    status.fragmented_bytes,
-                                    status.file_bytes.map_or_else(
-                                        || "memory".to_string(),
-                                        |bytes| bytes.to_string()
-                                    )
-                                )
-                            });
-                            events.push(MlsReply::StorageStatus { reply, result });
-                        }
-                        MlsWriteRequest::PublishKeyPackages {
-                            token,
-                            user_id,
-                            device_id,
-                            packages,
-                        } => {
-                            let result = service
-                                .publish_key_packages(user_id, device_id, packages)
-                                .map(|available| {
-                                    (available, service.cached_key_packages(device_id))
-                                });
-                            events.push(MlsReply::KeyPackagesPublished {
-                                token,
-                                device_id,
-                                result,
-                            });
-                        }
-                        MlsWriteRequest::TakeKeyPackage { token, device_id } => {
-                            let result = service.take_key_package(device_id).map(|package| {
-                                (
-                                    package,
-                                    service.key_package_count(device_id),
-                                    service.cached_key_packages(device_id),
-                                )
-                            });
-                            events.push(MlsReply::KeyPackageTaken {
-                                token,
-                                device_id,
-                                result,
-                            });
-                        }
-                        MlsWriteRequest::PersistAcknowledgement { room_id, device_id } => {
-                            pending_acknowledgements
-                                .lock()
-                                .unwrap()
-                                .remove(&(room_id, device_id));
-                            if let Err(error) = service.persist_acknowledgement(room_id, device_id) {
-                                kvlog::warn!("MLS acknowledgement persistence failed", error = error.as_str());
+            MlsWriteRequest::PutRoster {
+                token,
+                session_id,
+                user_id,
+                expected,
+                roster,
+                bootstrap_credential_hash,
+            } => {
+                let initial = expected.is_none();
+                let stored_roster = roster.clone();
+                let result = service
+                    .put_roster(user_id, expected, roster, bootstrap_credential_hash)
+                    .map(|checkpoint| (checkpoint, service.cache_state()));
+                events.push(MlsReply::RosterStored {
+                    token,
+                    session_id,
+                    user_id,
+                    initial,
+                    roster: stored_roster,
+                    result,
+                });
+            }
+            MlsWriteRequest::CreateRoom {
+                token,
+                creator,
+                creator_client_id,
+                descriptor,
+                checkpoints,
+                bundle,
+                welcome_devices,
+            } => {
+                let room_id = descriptor.room_id;
+                let result = (|| {
+                    if let Some(room) =
+                        service.existing_room_for_creation(creator, &descriptor, &bundle)?
+                    {
+                        return Ok(RoomCreationReply::Existing { room });
+                    }
+                    let epoch = service.create_room(
+                        creator,
+                        &creator_client_id,
+                        descriptor,
+                        &checkpoints,
+                        bundle,
+                    )?;
+                    Ok(RoomCreationReply::Created {
+                        epoch,
+                        room: service.cached_room(room_id).expect("created room cache"),
+                        deliveries: collect_latest_welcomes(&service, &welcome_devices)?,
+                    })
+                })();
+                events.push(MlsReply::RoomCreated {
+                    token,
+                    room_id,
+                    result,
+                });
+            }
+            MlsWriteRequest::SubmitCommit {
+                token,
+                room_id,
+                device_id,
+                committer_client_id,
+                expected_epoch,
+                bundle,
+                welcome_devices,
+            } => {
+                let result = service
+                    .submit_commit_for_device(
+                        room_id,
+                        device_id,
+                        &committer_client_id,
+                        expected_epoch,
+                        bundle,
+                    )
+                    .and_then(|outcome| {
+                        let accepted = match &outcome {
+                            rpc::mls::MlsCommitOutcome::Accepted { sequence, .. } => {
+                                Some(*sequence)
                             }
-                        }
-                        MlsWriteRequest::PersistWelcomeAcknowledgement { device_id } => {
-                            pending_welcome_acknowledgements
-                                .lock()
-                                .unwrap()
-                                .remove(&device_id);
-                            if let Err(error) = service.persist_welcome_acknowledgement(device_id) {
-                                kvlog::warn!("MLS Welcome acknowledgement persistence failed", error = error.as_str());
-                            }
-                        }
+                            _ => None,
+                        };
+                        let room = accepted.and_then(|_| service.cached_room(room_id));
+                        let pushed = if let Some(sequence) = accepted {
+                            Some((
+                                service.event_batch(room_id, sequence.saturating_sub(1), 1)?,
+                                collect_latest_welcomes(&service, &welcome_devices)?,
+                            ))
+                        } else {
+                            None
+                        };
+                        Ok((outcome, room, pushed))
+                    });
+                events.push(MlsReply::CommitSubmitted {
+                    token,
+                    room_id,
+                    result,
+                });
+            }
+            MlsWriteRequest::RedeemDeviceLink {
+                token,
+                secret_hash,
+                user_id,
+                username,
+                expected,
+                roster,
+                device_id,
+                device_name,
+                credential_hash,
+                attempt_id,
+                packages,
+                bearer_token,
+                receive_files,
+                file_receive_limit_bytes,
+            } => {
+                let result = service
+                    .redeem_pair(
+                        user_id,
+                        expected,
+                        roster,
+                        device_id,
+                        credential_hash.clone(),
+                        packages,
+                    )
+                    .map(|_| service.cache_state());
+                events.push(MlsReply::DeviceLinkRedeemed {
+                    token,
+                    secret_hash,
+                    user_id,
+                    username,
+                    device_id,
+                    device_name,
+                    credential_hash,
+                    attempt_id,
+                    bearer_token,
+                    receive_files,
+                    file_receive_limit_bytes,
+                    result,
+                });
+            }
+            MlsWriteRequest::SubmitApplication {
+                token,
+                room_id,
+                device_id,
+                epoch,
+                event_id,
+                ciphertext,
+            } => events.push(MlsReply::ApplicationSubmitted {
+                token,
+                room_id,
+                event_id,
+                result: service.submit_application_for_device_with_event(
+                    room_id, device_id, epoch, event_id, ciphertext,
+                ),
+            }),
+            MlsWriteRequest::Compact {
+                scheduled,
+                minimum_fragmented_bytes,
+                minimum_fragmented_percent,
+                admin_reply,
+                started,
+            } => {
+                let result = (|| {
+                    let status = service.storage_status()?;
+                    let percent = if status.allocated_bytes == 0 {
+                        0
+                    } else {
+                        status.fragmented_bytes.saturating_mul(100) / status.allocated_bytes
+                    };
+                    if scheduled
+                        && (status.fragmented_bytes < minimum_fragmented_bytes
+                            || percent < u64::from(minimum_fragmented_percent))
+                    {
+                        return Ok(None);
+                    }
+                    let before = status.file_bytes;
+                    let compacted = service.compact()?;
+                    let after = service
+                        .storage_status()
+                        .ok()
+                        .and_then(|status| status.file_bytes);
+                    Ok(Some((compacted, before, after)))
+                })();
+                events.push(MlsReply::Compacted {
+                    admin_reply,
+                    result,
+                    started,
+                });
+            }
+            MlsWriteRequest::Cleanup {
+                batch_events,
+                interval,
+            } => events.push(MlsReply::Cleanup {
+                interval,
+                result: service.cleanup(batch_events),
+            }),
+            MlsWriteRequest::StorageStatus { reply } => {
+                let result = service.storage_status().map(|status| {
+                    format!(
+                        "allocated={} stored={} fragmented={} file={}",
+                        status.allocated_bytes,
+                        status.stored_bytes,
+                        status.fragmented_bytes,
+                        status
+                            .file_bytes
+                            .map_or_else(|| "memory".to_string(), |bytes| bytes.to_string())
+                    )
+                });
+                events.push(MlsReply::StorageStatus { reply, result });
+            }
+            MlsWriteRequest::PublishKeyPackages {
+                token,
+                user_id,
+                device_id,
+                packages,
+            } => {
+                let result = service
+                    .publish_key_packages(user_id, device_id, packages)
+                    .map(|available| (available, service.cached_key_packages(device_id)));
+                events.push(MlsReply::KeyPackagesPublished {
+                    token,
+                    device_id,
+                    result,
+                });
+            }
+            MlsWriteRequest::TakeKeyPackage { token, device_id } => {
+                let result = service.take_key_package(device_id).map(|package| {
+                    (
+                        package,
+                        service.key_package_count(device_id),
+                        service.cached_key_packages(device_id),
+                    )
+                });
+                events.push(MlsReply::KeyPackageTaken {
+                    token,
+                    device_id,
+                    result,
+                });
+            }
+            MlsWriteRequest::PersistAcknowledgement { room_id, device_id } => {
+                pending_acknowledgements
+                    .lock()
+                    .unwrap()
+                    .remove(&(room_id, device_id));
+                if let Err(error) = service.persist_acknowledgement(room_id, device_id) {
+                    kvlog::warn!(
+                        "MLS acknowledgement persistence failed",
+                        error = error.as_str()
+                    );
+                }
+            }
+            MlsWriteRequest::PersistWelcomeAcknowledgement { device_id } => {
+                pending_welcome_acknowledgements
+                    .lock()
+                    .unwrap()
+                    .remove(&device_id);
+                if let Err(error) = service.persist_welcome_acknowledgement(device_id) {
+                    kvlog::warn!(
+                        "MLS Welcome acknowledgement persistence failed",
+                        error = error.as_str()
+                    );
+                }
+            }
         }
         if let Err(error) = service.checkpoint_if_needed() {
             kvlog::error!("MLS WAL rotation failed", error = error.as_str());
@@ -1421,12 +1403,8 @@ impl Server {
         ));
         store.enable_async_log_writes(Arc::clone(&event_notifier));
         store.enable_async_state_writes(Arc::clone(&event_notifier));
-        let voice_relay = VoiceRelayHandle::spawn(
-            udp,
-            udp_probe,
-            Arc::clone(&event_notifier),
-            p2p_enabled,
-        )?;
+        let voice_relay =
+            VoiceRelayHandle::spawn(udp, udp_probe, Arc::clone(&event_notifier), p2p_enabled)?;
         let history_events = Arc::new(EventQueue::new(
             Arc::clone(&event_notifier),
             HISTORY_EVENTS,
@@ -1458,8 +1436,8 @@ impl Server {
             );
         }
         let file_size_limit_bytes = config.security.max_file_size_bytes();
-        let next_mls_cleanup_at = Instant::now()
-            + Duration::from_secs(config.storage.mls_cleanup_interval_minutes * 60);
+        let next_mls_cleanup_at =
+            Instant::now() + Duration::from_secs(config.storage.mls_cleanup_interval_minutes * 60);
         let next_mls_compaction_at = Instant::now()
             + Duration::from_secs(config.storage.mls_compaction_min_interval_hours * 60 * 60);
 
@@ -1659,7 +1637,10 @@ impl Server {
             return;
         }
         let interval = Duration::from_secs(
-            self.config.storage.mls_cleanup_interval_minutes.saturating_mul(60),
+            self.config
+                .storage
+                .mls_cleanup_interval_minutes
+                .saturating_mul(60),
         );
         let batch = self.config.storage.mls_cleanup_batch_events;
         let queued = self.mls_worker.enqueue_typed(MlsWriteRequest::Cleanup {
@@ -1678,7 +1659,10 @@ impl Server {
             return;
         }
         let retry = Duration::from_secs(
-            self.config.storage.mls_cleanup_interval_minutes.saturating_mul(60),
+            self.config
+                .storage
+                .mls_cleanup_interval_minutes
+                .saturating_mul(60),
         );
         // Compaction is exclusive. Defer while any client could be affected;
         // deleted pages remain reusable in the meantime.
@@ -1716,9 +1700,12 @@ impl Server {
                     let _ = reply.send(result);
                 }
                 AdminCommand::MlsStorageStatus { reply } => {
-                    if !self.mls_worker.enqueue_typed(MlsWriteRequest::StorageStatus {
-                        reply: reply.clone(),
-                    }) {
+                    if !self
+                        .mls_worker
+                        .enqueue_typed(MlsWriteRequest::StorageStatus {
+                            reply: reply.clone(),
+                        })
+                    {
                         kvlog::warn!("MLS storage status worker unavailable");
                         let _ = reply.send(Err("MLS delivery worker is unavailable".into()));
                     }
@@ -2351,9 +2338,7 @@ impl Server {
         let burst_bytes = burst.iter().fold(0usize, |total, data| {
             total.saturating_add(video_fanout_charge(data, 1))
         });
-        if self.video_fanout_bytes.saturating_add(burst_bytes)
-            > VIDEO_FANOUT_QUEUE_MAX_BYTES
-        {
+        if self.video_fanout_bytes.saturating_add(burst_bytes) > VIDEO_FANOUT_QUEUE_MAX_BYTES {
             return Err("video fast-start queue is full; reconnect shortly".to_string());
         }
         for data in burst {
@@ -2458,9 +2443,7 @@ impl Server {
             return Ok(());
         }
         let charged_bytes = video_fanout_charge(&data, subscribers.capacity());
-        if self.video_fanout_bytes.saturating_add(charged_bytes)
-            > VIDEO_FANOUT_QUEUE_MAX_BYTES
-        {
+        if self.video_fanout_bytes.saturating_add(charged_bytes) > VIDEO_FANOUT_QUEUE_MAX_BYTES {
             kvlog::warn!(
                 "video subscribers dropped because scheduler queue is full",
                 stream_id = stream_id.0,
@@ -2495,9 +2478,8 @@ impl Server {
                 break;
             };
             if fanout.next_subscriber >= fanout.subscribers.len() {
-                self.video_fanout_bytes = self
-                    .video_fanout_bytes
-                    .saturating_sub(fanout.charged_bytes);
+                self.video_fanout_bytes =
+                    self.video_fanout_bytes.saturating_sub(fanout.charged_bytes);
                 continue;
             }
             let frame_bytes = fanout.data.len();
@@ -2526,9 +2508,8 @@ impl Server {
             if fanout.next_subscriber < fanout.subscribers.len() {
                 self.video_fanouts.push_front(fanout);
             } else {
-                self.video_fanout_bytes = self
-                    .video_fanout_bytes
-                    .saturating_sub(fanout.charged_bytes);
+                self.video_fanout_bytes =
+                    self.video_fanout_bytes.saturating_sub(fanout.charged_bytes);
             }
             if bytes >= VIDEO_FANOUT_BUDGET_BYTES {
                 break;
@@ -2956,13 +2937,7 @@ impl Server {
                 let result = self.cancel_device_link(session_id, redemption_secret_hash);
                 self.report_request_outcome(token, result)
             }
-            (
-                ConnState::Ready,
-                ClientControl::SendChat {
-                    room_id,
-                    body,
-                },
-            ) => {
+            (ConnState::Ready, ClientControl::SendChat { room_id, body }) => {
                 let session_id = self.session_for_token(token)?;
                 self.send_chat(session_id, room_id, body)
             }
@@ -2975,21 +2950,9 @@ impl Server {
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
-                self.mutate_chat(
-                    session_id,
-                    room_id,
-                    target,
-                    MutationKind::Edit,
-                    body,
-                )
+                self.mutate_chat(session_id, room_id, target, MutationKind::Edit, body)
             }
-            (
-                ConnState::Ready,
-                ClientControl::DeleteChat {
-                    room_id,
-                    target,
-                },
-            ) => {
+            (ConnState::Ready, ClientControl::DeleteChat { room_id, target }) => {
                 let session_id = self.session_for_token(token)?;
                 self.mutate_chat(
                     session_id,
@@ -3221,8 +3184,10 @@ impl Server {
                 )
             }
             ClientControl::PutDeviceRoster { expected, roster } => {
-                let bootstrap_credential_hash =
-                    expected.is_none().then_some(bootstrap_credential_hash).flatten();
+                let bootstrap_credential_hash = expected
+                    .is_none()
+                    .then_some(bootstrap_credential_hash)
+                    .flatten();
                 self.enqueue_mls_write(
                     token,
                     MlsWriteRequest::PutRoster {
@@ -3254,12 +3219,12 @@ impl Server {
                     .find(|certificate| certificate.body.device_id == device_id)
                     .ok_or_else(|| "MLS device is not active".to_string())?;
                 aws_lc_rs::signature::ED25519
-                .verify_sig(
-                    &certificate.body.mls_signature_public_key,
-                    &mls_identity::mls_device_binding_message(session_id, device_id, roster),
-                    &proof,
-                )
-                .map_err(|_| "MLS device binding proof is invalid".to_string())?;
+                    .verify_sig(
+                        &certificate.body.mls_signature_public_key,
+                        &mls_identity::mls_device_binding_message(session_id, device_id, roster),
+                        &proof,
+                    )
+                    .map_err(|_| "MLS device binding proof is invalid".to_string())?;
                 let client_id = certificate.body.mls_client_id.clone();
                 self.sessions
                     .get_mut(&session_id)
@@ -3285,12 +3250,15 @@ impl Server {
                 if !self.pending_mls.insert(token) {
                     return Err("connection already has an MLS delivery operation pending".into());
                 }
-                if self.mls_worker.enqueue_typed(MlsWriteRequest::PublishKeyPackages {
-                    token,
-                    user_id,
-                    device_id: bound.device_id,
-                    packages,
-                }) {
+                if self
+                    .mls_worker
+                    .enqueue_typed(MlsWriteRequest::PublishKeyPackages {
+                        token,
+                        user_id,
+                        device_id: bound.device_id,
+                        packages,
+                    })
+                {
                     Ok(())
                 } else {
                     self.pending_mls.remove(&token);
@@ -3321,12 +3289,12 @@ impl Server {
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 let account_id = self.mls_account_id(user_id)?;
                 let room_id = descriptor.room_id;
-                let existing_group = self
-                    .mls
-                    .group_info(room_id)
-                    .map(|(descriptor, epoch, group_info)| {
-                        (descriptor.clone(), epoch, group_info.to_vec())
-                    });
+                let existing_group =
+                    self.mls
+                        .group_info(room_id)
+                        .map(|(descriptor, epoch, group_info)| {
+                            (descriptor.clone(), epoch, group_info.to_vec())
+                        });
                 if let Some((existing, epoch, group_info)) = existing_group {
                     if !self.check_room_access(session_id, room_id) {
                         return Err("encrypted room is not accessible".to_string());
@@ -3425,14 +3393,17 @@ impl Server {
                 if !self.pending_mls.insert(token) {
                     return Err("connection already has an MLS delivery operation pending".into());
                 }
-                if self.mls_worker.enqueue_typed(MlsWriteRequest::SubmitApplication {
-                    token,
-                    room_id,
-                    device_id,
-                    epoch,
-                    event_id,
-                    ciphertext,
-                }) {
+                if self
+                    .mls_worker
+                    .enqueue_typed(MlsWriteRequest::SubmitApplication {
+                        token,
+                        room_id,
+                        device_id,
+                        epoch,
+                        event_id,
+                        ciphertext,
+                    })
+                {
                     Ok(())
                 } else {
                     self.pending_mls.remove(&token);
@@ -3476,9 +3447,7 @@ impl Server {
                 let device_id = bound.device_id;
                 if after_sequence > 0 {
                     if self.mls.acknowledge_welcome(device_id, after_sequence)?
-                        && !self
-                            .mls_worker
-                            .persist_welcome_acknowledgement(device_id)
+                        && !self.mls_worker.persist_welcome_acknowledgement(device_id)
                     {
                         return Err("MLS durability worker is unavailable".to_string());
                     }
@@ -3512,9 +3481,7 @@ impl Server {
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
                 let device_id = bound.device_id;
                 if self.mls.acknowledge_welcome(device_id, delivery_id)?
-                    && !self
-                        .mls_worker
-                        .persist_welcome_acknowledgement(device_id)
+                    && !self.mls_worker.persist_welcome_acknowledgement(device_id)
                 {
                     return Err("MLS durability worker is unavailable".to_string());
                 }
@@ -3944,12 +3911,10 @@ impl Server {
             );
         }
         if auth_token.starts_with(DYNAMIC_TOKEN_PREFIX) {
-            let claims = verify_dynamic_token(
-                &self.config.security.server_identity_seed,
-                auth_token,
-            )
-            .ok()
-            .filter(|claims| is_dynamic_user_id(claims.user_id));
+            let claims =
+                verify_dynamic_token(&self.config.security.server_identity_seed, auth_token)
+                    .ok()
+                    .filter(|claims| is_dynamic_user_id(claims.user_id));
             let Some(claims) = claims else {
                 return self.reject_auth(
                     token,
@@ -4231,29 +4196,28 @@ impl Server {
             );
             return self.reject_username_taken(token);
         }
-        let (user, users) =
-            match self.users.prepare_mark_user_paired(
-                &user_name,
-                username.to_string(),
-                token_hash.clone(),
-            ) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    kvlog::error!(
-                        "pairing rejected",
-                        token = token.0,
-                        user = user_name.as_str(),
-                        reason = "state_write_failed",
-                        error = error.as_str()
-                    );
-                    return self.reject_auth(
-                        token,
-                        control::ERROR_INTERNAL,
-                        "pairing failed: the server could not persist the pairing; retry pairing"
-                            .to_string(),
-                    );
-                }
-            };
+        let (user, users) = match self.users.prepare_mark_user_paired(
+            &user_name,
+            username.to_string(),
+            token_hash.clone(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                kvlog::error!(
+                    "pairing rejected",
+                    token = token.0,
+                    user = user_name.as_str(),
+                    reason = "state_write_failed",
+                    error = error.as_str()
+                );
+                return self.reject_auth(
+                    token,
+                    control::ERROR_INTERNAL,
+                    "pairing failed: the server could not persist the pairing; retry pairing"
+                        .to_string(),
+                );
+            }
+        };
         if let Some(path) = self.users.persistence_path() {
             return self.begin_identity_write(
                 token,
@@ -4364,9 +4328,7 @@ impl Server {
             .flatten()
             .filter(|claims| is_dynamic_user_id(claims.user_id));
         let token_user_id = verified_claims
-            .filter(|claims| {
-                claims.password_epoch == current_epoch || current_password_verified
-            })
+            .filter(|claims| claims.password_epoch == current_epoch || current_password_verified)
             .map(|claims| claims.user_id);
         let recovery_user_id = existing_token
             .starts_with(OPEN_PAIR_RECOVERY_PREFIX)
@@ -4600,11 +4562,7 @@ impl Server {
             }
             Err(IdentityEnqueueError::Full | IdentityEnqueueError::Gone) => {
                 kvlog::error!("identity persistence unavailable", token = token.0);
-                self.reject_auth(
-                    token,
-                    control::ERROR_INTERNAL,
-                    failure_message.to_string(),
-                )
+                self.reject_auth(token, control::ERROR_INTERNAL, failure_message.to_string())
             }
         }
     }
@@ -4631,7 +4589,10 @@ impl Server {
         let mut replies = self.identity_events.drain_up_to(8);
         while let Some(reply) = replies.pop_front() {
             let Some((token, pending)) = self.pending_identity.take() else {
-                kvlog::warn!("unexpected identity persistence reply", token = reply.token.0);
+                kvlog::warn!(
+                    "unexpected identity persistence reply",
+                    token = reply.token.0
+                );
                 continue;
             };
             if token != reply.token {
@@ -5107,10 +5068,7 @@ impl Server {
         };
         self.voice_relay.submit(VoiceCommand::SetRoute {
             session_id,
-            route: Some(VoiceRoute {
-                room_id,
-                stream_id,
-            }),
+            route: Some(VoiceRoute { room_id, stream_id }),
         });
         if !already_active {
             self.broadcast_voice_started(room_id, session_id, user_id, stream_id);
@@ -5192,13 +5150,9 @@ impl Server {
         let Some(token) = self.live_token_for_session(session_id) else {
             return;
         };
-        if self
-            .sessions
-            .get(&session_id)
-            .is_some_and(|session| {
-                session.pending_disk_history_fetches >= MAX_PENDING_DISK_HISTORY_FETCHES
-            })
-        {
+        if self.sessions.get(&session_id).is_some_and(|session| {
+            session.pending_disk_history_fetches >= MAX_PENDING_DISK_HISTORY_FETCHES
+        }) {
             kvlog::warn!(
                 "history fetch limit exceeded",
                 session_id = session_id.0,
@@ -5425,11 +5379,7 @@ impl Server {
         self.pending_history_fetches = self.pending_history_fetches.saturating_sub(1);
     }
 
-    fn enqueue_mls_write(
-        &mut self,
-        token: Token,
-        request: MlsWriteRequest,
-    ) -> Result<(), String> {
+    fn enqueue_mls_write(&mut self, token: Token, request: MlsWriteRequest) -> Result<(), String> {
         if !self.pending_mls.insert(token) {
             return Err("connection already has an MLS delivery operation pending".to_string());
         }
@@ -5460,9 +5410,7 @@ impl Server {
                     let result = match result {
                         Ok((checkpoint, state)) => (|| {
                             self.install_mls_cache(state)?;
-                            if initial
-                                && let Some(session) = self.sessions.get_mut(&session_id)
-                            {
+                            if initial && let Some(session) = self.sessions.get_mut(&session_id) {
                                 session.bootstrap_credential_hash = None;
                             }
                             let active_devices = roster
@@ -5479,9 +5427,7 @@ impl Server {
                                     session
                                         .mls_device
                                         .as_ref()
-                                        .filter(|bound| {
-                                            !active_devices.contains(&bound.device_id)
-                                        })
+                                        .filter(|bound| !active_devices.contains(&bound.device_id))
                                         .map(|_| session.tcp_token)
                                 })
                                 .collect::<Vec<_>>();
@@ -5969,10 +5915,7 @@ impl Server {
                 .map(|session| session.tcp_token)
                 .filter(|token| self.clients.contains_key(token))
                 .collect();
-            self.send_control_to_tokens(
-                &endpoint_tokens,
-                &ServerControl::RoomUpserted { room },
-            );
+            self.send_control_to_tokens(&endpoint_tokens, &ServerControl::RoomUpserted { room });
             for (session_id, requested_peer) in waiters {
                 if let Some(token) = self.live_token_for_session(session_id) {
                     let _ = self.send_control_to_token(
@@ -7098,8 +7041,7 @@ impl Server {
                 continue;
             };
             let _ = self.send_control_to_token(token, &ServerControl::UdpBound);
-            if self.config.network.p2p_enabled
-                && self.live_token_for_session(session_id).is_some()
+            if self.config.network.p2p_enabled && self.live_token_for_session(session_id).is_some()
             {
                 let _ = self.send_control_to_token(
                     token,
@@ -7211,7 +7153,11 @@ impl Server {
             .saturating_add(pending_bytes)
             .saturating_add(frame::LENGTH_PREFIX_LEN + sealed_len);
         if projected > CONTROL_WRITE_HIGH_WATER {
-            kvlog::warn!("control client dropped for backpressure", token = token.0, kind);
+            kvlog::warn!(
+                "control client dropped for backpressure",
+                token = token.0,
+                kind
+            );
             self.disconnect(token);
             return Err("control write buffer overflow".to_string());
         }
@@ -7233,8 +7179,7 @@ impl Server {
             self.disconnect(token);
             return Err("server control queue is full".to_string());
         }
-        *self.pending_control_bytes.entry(token).or_default() +=
-            scheduled_bytes;
+        *self.pending_control_bytes.entry(token).or_default() += scheduled_bytes;
         self.pending_control_total_bytes += scheduled_bytes;
         self.pending_controls
             .entry(token)
@@ -7298,8 +7243,7 @@ impl Server {
                 self.pending_control_total_bytes.saturating_sub(sealed_size);
             bytes = bytes.saturating_add(control.payload.len());
             records += 1;
-            if let Err(error) = self.seal_control_payload_now(token, &control.payload)
-            {
+            if let Err(error) = self.seal_control_payload_now(token, &control.payload) {
                 kvlog::warn!(
                     "scheduled server control failed",
                     token = token.0,
@@ -7326,11 +7270,7 @@ impl Server {
         self.refresh_background_work();
     }
 
-    fn seal_control_payload_now(
-        &mut self,
-        token: Token,
-        payload: &[u8],
-    ) -> Result<(), String> {
+    fn seal_control_payload_now(&mut self, token: Token, payload: &[u8]) -> Result<(), String> {
         let client = self
             .clients
             .get_mut(&token)
@@ -7386,8 +7326,7 @@ impl Server {
         );
         let payload: Arc<[u8]> = encode_server_control(control).into();
         for token in tokens {
-            if let Err(error) =
-                self.queue_shared_control_payload(token, kind, Arc::clone(&payload))
+            if let Err(error) = self.queue_shared_control_payload(token, kind, Arc::clone(&payload))
             {
                 kvlog::warn!(
                     "server control broadcast failed",
@@ -7895,7 +7834,8 @@ impl Server {
         if session_reports >= MAX_ACTIVE_BUG_REPORTS_PER_SESSION {
             return Err("another bug report is already active for this session".into());
         }
-        if self.active_bug_reports.len() + self.pending_bug_reports.len() >= MAX_ACTIVE_BUG_REPORTS {
+        if self.active_bug_reports.len() + self.pending_bug_reports.len() >= MAX_ACTIVE_BUG_REPORTS
+        {
             return Err("the server bug report queue is full".into());
         }
         kvlog::info!(
@@ -9073,10 +9013,17 @@ mod tests {
             .receive_bug_report_chunk(session_id, report_id, 0, vec![1, 2, 3, 4])
             .unwrap();
         server.complete_bug_report(session_id, report_id).unwrap();
-        assert!(server.pending_bug_reports.contains(&(session_id, report_id)));
+        assert!(
+            server
+                .pending_bug_reports
+                .contains(&(session_id, report_id))
+        );
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while server.pending_bug_reports.contains(&(session_id, report_id)) {
+        while server
+            .pending_bug_reports
+            .contains(&(session_id, report_id))
+        {
             server.drain_bug_report_replies();
             assert!(Instant::now() < deadline, "bug report completion");
             thread::yield_now();
@@ -9104,23 +9051,11 @@ mod tests {
         server.config.security.bug_report_dir = Some("/tmp/chatt-unused-bug-dir".to_string());
         let session_id = SessionId(3);
         server
-            .start_bug_report(
-                session_id,
-                BugReportId(1),
-                String::new(),
-                String::new(),
-                0,
-            )
+            .start_bug_report(session_id, BugReportId(1), String::new(), String::new(), 0)
             .unwrap();
 
         let error = server
-            .start_bug_report(
-                session_id,
-                BugReportId(2),
-                String::new(),
-                String::new(),
-                0,
-            )
+            .start_bug_report(session_id, BugReportId(2), String::new(), String::new(), 0)
             .unwrap_err();
 
         assert!(error.contains("already active"));
@@ -9727,10 +9662,12 @@ mod tests {
         server.open_dm(requester, UserId(2));
 
         assert_eq!(server.pending_dm_waiters.len(), 1);
-        assert!(server
-            .rooms
-            .keys()
-            .all(|room_id| room_id.0 < config::FIRST_DYNAMIC_ROOM_ID));
+        assert!(
+            server
+                .rooms
+                .keys()
+                .all(|room_id| room_id.0 < config::FIRST_DYNAMIC_ROOM_ID)
+        );
         drive_scheduled_work(&mut server);
         assert!(server.pending_dm_waiters.is_empty());
         assert!(matches!(
@@ -9932,20 +9869,10 @@ mod tests {
 
         let mut service = MlsService::new(server_id.to_vec());
         service
-            .put_roster(
-                UserId(1),
-                None,
-                alice.bootstrap.own_roster.clone(),
-                None,
-            )
+            .put_roster(UserId(1), None, alice.bootstrap.own_roster.clone(), None)
             .unwrap();
         service
-            .put_roster(
-                UserId(2),
-                None,
-                bob.bootstrap.own_roster.clone(),
-                None,
-            )
+            .put_roster(UserId(2), None, bob.bootstrap.own_roster.clone(), None)
             .unwrap();
         let published = bob
             .client
@@ -9989,20 +9916,24 @@ mod tests {
         server.pending_mls.insert(winner);
         server.pending_mls.insert(loser);
         for token in [winner, loser] {
-            assert!(server.mls_worker.enqueue_typed(MlsWriteRequest::CreateRoom {
-                token,
-                creator: descriptor.creator,
-                creator_client_id: alice
-                    .bootstrap
-                    .device_certificate
-                    .body
-                    .mls_client_id
-                    .clone(),
-                descriptor: descriptor.clone(),
-                checkpoints: checkpoints.clone(),
-                bundle: bundle.clone(),
-                welcome_devices: Vec::new(),
-            }));
+            assert!(
+                server
+                    .mls_worker
+                    .enqueue_typed(MlsWriteRequest::CreateRoom {
+                        token,
+                        creator: descriptor.creator,
+                        creator_client_id: alice
+                            .bootstrap
+                            .device_certificate
+                            .body
+                            .mls_client_id
+                            .clone(),
+                        descriptor: descriptor.clone(),
+                        checkpoints: checkpoints.clone(),
+                        bundle: bundle.clone(),
+                        welcome_devices: Vec::new(),
+                    })
+            );
         }
         finish_mls_for_token(&mut server, winner);
         finish_mls_for_token(&mut server, loser);
@@ -10017,14 +9948,16 @@ mod tests {
             )),
             ServerControl::EncryptedRoomCreated { .. }
         ));
-        let reconciled = read_until(&mut server, &mut loser_peer, |control| matches!(
-            control,
-            ServerControl::GroupInfo {
-                room_id: observed,
-                descriptor: Some(_),
-                ..
-            } if *observed == room_id
-        ));
+        let reconciled = read_until(&mut server, &mut loser_peer, |control| {
+            matches!(
+                control,
+                ServerControl::GroupInfo {
+                    room_id: observed,
+                    descriptor: Some(_),
+                    ..
+                } if *observed == room_id
+            )
+        });
         let ServerControl::GroupInfo {
             descriptor: Some(canonical),
             epoch,
@@ -10254,9 +10187,7 @@ mod tests {
             .insert(session, test_session(UserId(1), Token(11), None));
         let body = "x".repeat(rpc::control::MAX_CHAT_BODY_BYTES);
         for _ in 0..80 {
-            server
-                .send_chat(session, RoomId(1), body.clone())
-                .unwrap();
+            server.send_chat(session, RoomId(1), body.clone()).unwrap();
         }
         let mut peer = live_user(&mut server, Token(11), session, UserId(1));
 
@@ -12112,7 +12043,9 @@ mod tests {
             .authenticate_client(Token(1), "bad\u{1}name", token_secret, true, 0)
             .unwrap();
 
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
+        let ServerControl::Error { code, .. } =
+            read_plaintext_server_control(&mut server, &mut peer)
+        else {
             panic!("expected invalid-username error");
         };
         assert_eq!(code, ERROR_PAIRING_INVALID_REQUEST);
@@ -12195,7 +12128,9 @@ mod tests {
         server
             .open_pair_client(Token(2), "zoe", "", &second_recovery, true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
+        let ServerControl::Error { code, .. } =
+            read_plaintext_server_control(&mut server, &mut peer)
+        else {
             panic!("expected username-taken error");
         };
         assert_eq!(code, ERROR_USERNAME_TAKEN);
@@ -12255,7 +12190,9 @@ mod tests {
         server
             .open_pair_client(Token(2), "alice", "", &recovery, true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
+        let ServerControl::Error { code, .. } =
+            read_plaintext_server_control(&mut server, &mut peer)
+        else {
             panic!("expected username-taken error");
         };
         assert_eq!(code, ERROR_USERNAME_TAKEN);
@@ -12288,7 +12225,9 @@ mod tests {
         server
             .pair_client(Token(2), "zoe", code, new_token, true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
+        let ServerControl::Error { code, .. } =
+            read_plaintext_server_control(&mut server, &mut peer)
+        else {
             panic!("expected username-taken error");
         };
         assert_eq!(code, ERROR_USERNAME_TAKEN);
@@ -12568,7 +12507,8 @@ mod tests {
         server
             .open_pair_client(wrong, "Zoe", "wrong", "", true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut wrong_peer)
+        let ServerControl::Error { code, .. } =
+            read_plaintext_server_control(&mut server, &mut wrong_peer)
         else {
             panic!("expected password mismatch error");
         };
@@ -12580,7 +12520,8 @@ mod tests {
         server
             .open_pair_client(blocked, "Zoe", "hunter2", "", true, 0)
             .unwrap();
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut blocked_peer)
+        let ServerControl::Error { code, .. } =
+            read_plaintext_server_control(&mut server, &mut blocked_peer)
         else {
             panic!("expected rate-limit error");
         };
@@ -12714,12 +12655,15 @@ mod tests {
                     .sessions
                     .values()
                     .any(|session| session.pending_disk_history_fetches > 0);
-            let scheduled_output = server.loop_work.background_work
-                || server.loop_work.client_write_count() > 0;
+            let scheduled_output =
+                server.loop_work.background_work || server.loop_work.client_write_count() > 0;
             if ready == 0 && !waiting_for_worker && !scheduled_output {
                 return;
             }
-            assert!(Instant::now() < deadline, "server scheduler did not quiesce");
+            assert!(
+                Instant::now() < deadline,
+                "server scheduler did not quiesce"
+            );
             thread::yield_now();
         }
     }
@@ -12899,7 +12843,9 @@ mod tests {
             )
             .unwrap();
 
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
+        let ServerControl::Error { code, .. } =
+            read_plaintext_server_control(&mut server, &mut peer)
+        else {
             panic!("expected invalid display name error");
         };
         assert_eq!(code, ERROR_PAIRING_INVALID_REQUEST);
@@ -12942,7 +12888,9 @@ mod tests {
 
         drive_scheduled_work(&mut server);
         let _ = std::fs::remove_file(&blocker);
-        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut server, &mut peer) else {
+        let ServerControl::Error { code, .. } =
+            read_plaintext_server_control(&mut server, &mut peer)
+        else {
             panic!("expected persist failure error reply");
         };
         assert_eq!(code, control::ERROR_INTERNAL);
@@ -13022,5 +12970,4 @@ mod tests {
             io::ErrorKind::PermissionDenied
         )));
     }
-
 }

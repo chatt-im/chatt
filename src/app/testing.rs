@@ -82,7 +82,11 @@ impl TestApp {
         self.sync_terminal_events();
     }
 
-    pub(crate) fn handle_client_command(&mut self, client_id: ClientId, command: CoreCommand) -> bool {
+    pub(crate) fn handle_client_command(
+        &mut self,
+        client_id: ClientId,
+        command: CoreCommand,
+    ) -> bool {
         let detach = self.app.handle_client_command(client_id, command);
         self.sync_terminal_events();
         detach
@@ -171,7 +175,9 @@ impl TestApp {
         id: ClientId,
         channel: Arc<ClientChannel>,
     ) -> Arc<parking_lot::Mutex<ClientView>> {
-        let view = Arc::new(parking_lot::Mutex::new(self.app.register_client(id, channel.clone())));
+        let view = Arc::new(parking_lot::Mutex::new(
+            self.app.register_client(id, channel.clone()),
+        ));
         self.remote_views.insert(id, view.clone());
         self.remote_channels.insert(id, channel);
         view
@@ -201,7 +207,9 @@ impl TestApp {
             OpenSettings => self.app.open_settings(),
             Quit => return Action::Quit,
             ToggleMute => self.app.toggle_mute(),
-            ToggleDeafen => self.app.set_deafen(!self.app.deafened.load(std::sync::atomic::Ordering::Relaxed)),
+            ToggleDeafen => self
+                .app
+                .set_deafen(!self.app.deafened.load(std::sync::atomic::Ordering::Relaxed)),
             PlaySoundboard1 => self.app.trigger_soundboard_slot(0),
             PlaySoundboard2 => self.app.trigger_soundboard_slot(1),
             PlaySoundboard3 => self.app.trigger_soundboard_slot(2),
@@ -235,7 +243,11 @@ impl TestApp {
         }
     }
 
-    pub(crate) fn apply_theme_as(&mut self, id: ClientId, selection: crate::config::ThemeSelection) {
+    pub(crate) fn apply_theme_as(
+        &mut self,
+        id: ClientId,
+        selection: crate::config::ThemeSelection,
+    ) {
         let theme = crate::theme::Theme::resolve(&selection, &self.app.config.ui.themes);
         if id == ClientId::PRIMARY {
             self.view.apply_theme(theme);
@@ -274,19 +286,37 @@ impl TestApp {
                 TerminalEvent::Status(status) => self.view.set_status(status),
                 TerminalEvent::TransientStatus(status) => self.view.set_transient_status(status),
                 TerminalEvent::Error(error) => self.view.set_error(error),
-                TerminalEvent::LocalNotice { sender, body, error } => self.view.push_local_notice(
+                TerminalEvent::LocalNotice {
                     sender,
                     body,
-                    if error { crate::chat_buffer::NoticeKind::Error } else { crate::chat_buffer::NoticeKind::Info },
+                    error,
+                } => self.view.push_local_notice(
+                    sender,
+                    body,
+                    if error {
+                        crate::chat_buffer::NoticeKind::Error
+                    } else {
+                        crate::chat_buffer::NoticeKind::Info
+                    },
                 ),
                 TerminalEvent::ConfigChanged => self.view.sync_daemon_config(&self.app.config),
-                TerminalEvent::SelectRoom(room_id) => self.view.switch_room(room_id, &self.app.room),
-                TerminalEvent::OpenMessageRef { target, width, height } => {
+                TerminalEvent::SelectRoom(room_id) => {
+                    self.view.switch_room(room_id, &self.app.room)
+                }
+                TerminalEvent::OpenMessageRef {
+                    target,
+                    width,
+                    height,
+                } => {
                     self.view.switch_room(target.room_id, &self.app.room);
                     let _ = self.view.jump_to_ref(target, width, height);
                 }
-                TerminalEvent::ClearVisualSelection => { self.view.active.chat.clear_visual_anchor(); }
-                TerminalEvent::CancelPendingEdit => { self.view.cancel_pending_edit(); }
+                TerminalEvent::ClearVisualSelection => {
+                    self.view.active.chat.clear_visual_anchor();
+                }
+                TerminalEvent::CancelPendingEdit => {
+                    self.view.cancel_pending_edit();
+                }
                 TerminalEvent::ResetRooms => self.view.reset_rooms(),
                 event => {
                     // Pairing overlay feedback is intentionally retained for a
@@ -296,7 +326,9 @@ impl TestApp {
             }
         }
         for (id, channel) in &self.remote_channels {
-            let Some(view) = self.remote_views.get(id) else { continue };
+            let Some(view) = self.remote_views.get(id) else {
+                continue;
+            };
             let mut view = view.lock();
             for event in channel.drain_events() {
                 match event {
@@ -306,7 +338,9 @@ impl TestApp {
                     TerminalEvent::ConfigChanged => view.sync_daemon_config(&self.app.config),
                     TerminalEvent::SelectRoom(room_id) => view.switch_room(room_id, &self.app.room),
                     TerminalEvent::ResetRooms => view.reset_rooms(),
-                    TerminalEvent::CancelPendingEdit => { view.cancel_pending_edit(); }
+                    TerminalEvent::CancelPendingEdit => {
+                        view.cancel_pending_edit();
+                    }
                     event => channel.push(event),
                 }
             }
@@ -316,9 +350,13 @@ impl TestApp {
 
 impl Deref for TestApp {
     type Target = App;
-    fn deref(&self) -> &Self::Target { &self.app }
+    fn deref(&self) -> &Self::Target {
+        &self.app
+    }
 }
 
 impl DerefMut for TestApp {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.app }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.app
+    }
 }

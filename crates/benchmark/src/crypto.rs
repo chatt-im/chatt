@@ -30,11 +30,7 @@ const PUBLIC_KEY_PROFILE_ITERATIONS: u64 = 20_000;
 pub(super) fn bench_crypto(bench: &mut Bench<'_>) {
     let mut bench = bench.with_parameters(BENCH_PARAMS);
 
-    bench_aead(
-        &mut bench,
-        "chacha20_poly1305",
-        &aead::CHACHA20_POLY1305,
-    );
+    bench_aead(&mut bench, "chacha20_poly1305", &aead::CHACHA20_POLY1305);
     bench_aead(&mut bench, "aes_128_gcm", &aead::AES_128_GCM);
     bench_hash(&mut bench);
     bench_hmac(&mut bench);
@@ -80,7 +76,6 @@ fn bench_aead(bench: &mut Bench<'_>, name: &str, algorithm: &'static aead::Algor
                         let _ = black_box(tag);
                     },
                 );
-
             },
         );
 
@@ -102,9 +97,8 @@ fn bench_aead(bench: &mut Bench<'_>, name: &str, algorithm: &'static aead::Algor
                     move || {
                         let nonce_bytes = nonce_bytes_from_counter(counter);
                         counter = counter.wrapping_add(1);
-                        let key = LessSafeKey::new(
-                            UnboundKey::new(algorithm, &generator_key).unwrap(),
-                        );
+                        let key =
+                            LessSafeKey::new(UnboundKey::new(algorithm, &generator_key).unwrap());
                         let mut payload = vec![0x5a; size];
                         key.seal_in_place_append_tag(
                             Nonce::assume_unique_for_key(nonce_bytes),
@@ -136,35 +130,25 @@ fn bench_hash(bench: &mut Bench<'_>) {
     bench
         .named("sha256")
         .with_profile_iterations(HASH_PROFILE_ITERATIONS)
-        .param_str_profile_defaults(
-            "bytes",
-            HASH_SIZES,
-            [PROFILE_HASH_SIZE],
-            |bench, size| {
-                let input = vec![0xa5; parse_size(&size)];
-                bench.func(move || {
-                    black_box(digest::digest(&digest::SHA256, black_box(&input)));
-                });
-            },
-        );
+        .param_str_profile_defaults("bytes", HASH_SIZES, [PROFILE_HASH_SIZE], |bench, size| {
+            let input = vec![0xa5; parse_size(&size)];
+            bench.func(move || {
+                black_box(digest::digest(&digest::SHA256, black_box(&input)));
+            });
+        });
 }
 
 fn bench_hmac(bench: &mut Bench<'_>) {
     bench
         .named("hmac_sha256")
         .with_profile_iterations(HASH_PROFILE_ITERATIONS)
-        .param_str_profile_defaults(
-            "bytes",
-            HASH_SIZES,
-            [PROFILE_HASH_SIZE],
-            |bench, size| {
-                let input = vec![0xa5; parse_size(&size)];
-                let key = hmac::Key::new(hmac::HMAC_SHA256, &[0x42; 32]);
-                bench.func(move || {
-                    black_box(hmac::sign(&key, black_box(&input)));
-                });
-            },
-        );
+        .param_str_profile_defaults("bytes", HASH_SIZES, [PROFILE_HASH_SIZE], |bench, size| {
+            let input = vec![0xa5; parse_size(&size)];
+            let key = hmac::Key::new(hmac::HMAC_SHA256, &[0x42; 32]);
+            bench.func(move || {
+                black_box(hmac::sign(&key, black_box(&input)));
+            });
+        });
 }
 
 fn bench_hkdf(bench: &mut Bench<'_>) {
@@ -178,9 +162,7 @@ fn bench_hkdf(bench: &mut Bench<'_>) {
         .func(move || {
             let prk = salt.extract(black_box(&input_key_material));
             let info = [black_box(&b"chatt benchmark context"[..])];
-            let okm = prk
-                .expand(&info, hkdf::HKDF_SHA256)
-                .unwrap();
+            let okm = prk.expand(&info, hkdf::HKDF_SHA256).unwrap();
             okm.fill(black_box(&mut output)).unwrap();
             black_box(output);
         });
@@ -194,14 +176,13 @@ fn bench_x25519(bench: &mut Bench<'_>) {
         .named("generate_public")
         .with_profile_iterations(PUBLIC_KEY_PROFILE_ITERATIONS)
         .func(move || {
-            let private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
-                .unwrap();
+            let private =
+                agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).unwrap();
             black_box(private.compute_public_key().unwrap());
         });
 
     let rng = SystemRandom::new();
-    let peer_private =
-        agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).unwrap();
+    let peer_private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).unwrap();
     let peer_public = peer_private.compute_public_key().unwrap().as_ref().to_vec();
 
     bench
@@ -229,7 +210,8 @@ fn bench_ed25519(bench: &mut Bench<'_>) {
         .named("key_from_seed")
         .with_profile_iterations(PUBLIC_KEY_PROFILE_ITERATIONS)
         .func(|| {
-            let key_pair = signature::Ed25519KeyPair::from_seed_unchecked(black_box(&SEED)).unwrap();
+            let key_pair =
+                signature::Ed25519KeyPair::from_seed_unchecked(black_box(&SEED)).unwrap();
             black_box(key_pair.public_key());
         });
 

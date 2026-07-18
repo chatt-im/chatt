@@ -19,11 +19,7 @@ impl RedbPreSharedKeyStorage {
         Self { database }
     }
 
-    pub fn insert(
-        &self,
-        psk_id: &[u8],
-        psk: &PreSharedKey,
-    ) -> Result<(), RedbDataStorageError> {
+    pub fn insert(&self, psk_id: &[u8], psk: &PreSharedKey) -> Result<(), RedbDataStorageError> {
         let transaction = self.database.begin_write().map_err(database_error)?;
         let modified = {
             let mut table = transaction.open_table(PSKS).map_err(database_error)?;
@@ -32,9 +28,7 @@ impl RedbPreSharedKeyStorage {
                 .map_err(database_error)?
                 .is_some_and(|stored| stored.value() == psk.deref());
             if !unchanged {
-                table
-                    .insert(psk_id, psk.deref())
-                    .map_err(database_error)?;
+                table.insert(psk_id, psk.deref()).map_err(database_error)?;
             }
             !unchanged
         };

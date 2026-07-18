@@ -16,12 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use aws_lc_rs::rand::SecureRandom;
 use chatt_p2p::{
     interfaces::discover_interfaces,
     socket::{UdpSocketOptions, bind_udp_socket},
 };
 use mio::{Interest, Registry, Token, net::UdpSocket as MioUdpSocket};
-use aws_lc_rs::rand::SecureRandom;
 use rpc::evented::recv_datagram_with;
 
 const MDNS_PORT: u16 = 5353;

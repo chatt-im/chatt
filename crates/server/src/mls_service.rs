@@ -1138,7 +1138,11 @@ impl MlsService {
             .acknowledge(room_id, device_id, sequence, unix_time_ms())
     }
 
-    pub fn acknowledge_welcome(&self, device_id: DeviceId, delivery_id: u64) -> Result<bool, String> {
+    pub fn acknowledge_welcome(
+        &self,
+        device_id: DeviceId,
+        delivery_id: u64,
+    ) -> Result<bool, String> {
         self.store.acknowledge_welcome(device_id, delivery_id)
     }
 

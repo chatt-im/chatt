@@ -1,7 +1,4 @@
-#![cfg_attr(
-    all(test, feature = "nightly-test-spans"),
-    feature(thread_spawn_hook)
-)]
+#![cfg_attr(all(test, feature = "nightly-test-spans"), feature(thread_spawn_hook))]
 
 mod app;
 mod attach;
@@ -17,13 +14,9 @@ mod clipboard;
 mod clipboard_paste;
 mod config;
 mod config_diagnostics;
+mod device_link;
 mod e2e;
 mod e2e_identity;
-#[cfg(test)]
-mod mls_e2e_test;
-#[cfg(test)]
-mod test_temp;
-mod device_link;
 mod file_compression;
 mod fuzzy;
 mod highlight;
@@ -31,6 +24,8 @@ mod link;
 mod local_control;
 mod markdown;
 pub mod mdns;
+#[cfg(test)]
+mod mls_e2e_test;
 pub mod network;
 pub mod packet_log;
 mod paths;
@@ -40,6 +35,8 @@ mod room_history;
 mod runtime;
 mod self_log;
 mod settings;
+#[cfg(test)]
+mod test_temp;
 mod theme;
 mod tui;
 mod ui;

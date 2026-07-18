@@ -1,28 +1,22 @@
-//! Disposable, password-protected enrollment bundles for linking devices.
+//! Disposable, capability-protected enrollment bundles for linking devices.
 
-use argon2_kdf::{Algorithm, Hasher};
 use jsony::Jsony;
-use aws_lc_rs::rand::SecureRandom;
-use rpc::crypto::{KEY_LEN, KeyMaterial, open_in_place_with_aad, seal_in_place_append_tag};
+use rpc::crypto::{
+    KEY_LEN, KeyMaterial, derive_device_link_keys, encode_hex, open_in_place_with_aad,
+    seal_in_place_append_tag,
+};
 use zeroize::Zeroizing;
 
 use chatt_mls::E2eBootstrap;
 use rpc::identity::SignedDeviceRoster;
 
-const BUNDLE_VERSION: u8 = 2;
-const SALT_LEN: usize = 16;
-const WORD_COUNT: usize = 6;
-const AAD_LABEL: &[u8] = b"chatt disposable device enrollment v2";
-const WORDLIST: &str = include_str!("../assets/english.txt");
+const BUNDLE_VERSION: u8 = 3;
+const AAD_LABEL: &[u8] = b"chatt disposable device enrollment v3";
 
-#[cfg(not(test))]
-const KDF_MEMORY_KIB: u32 = 62_500;
-#[cfg(test)]
-const KDF_MEMORY_KIB: u32 = 32;
-#[cfg(not(test))]
-const KDF_ITERATIONS: u32 = 18;
-#[cfg(test)]
-const KDF_ITERATIONS: u32 = 1;
+pub(crate) struct PairingSecrets {
+    pub redemption_secret: Zeroizing<String>,
+    pub enrollment_key: Zeroizing<[u8; KEY_LEN]>,
+}
 
 #[derive(Clone, Debug, Jsony)]
 #[jsony(Binary, version)]
@@ -34,8 +28,8 @@ pub(crate) struct MlsEnrollment {
 pub(crate) fn seal_enrollment(
     bootstrap: &E2eBootstrap,
     ticket_hash: &[u8],
-    rng: &dyn SecureRandom,
-) -> Result<(Vec<u8>, String), String> {
+    enrollment_key: &[u8; KEY_LEN],
+) -> Result<Vec<u8>, String> {
     seal_plaintext(
         jsony::to_binary(&MlsEnrollment {
             authority_seed: bootstrap.authority_seed,
@@ -43,7 +37,7 @@ pub(crate) fn seal_enrollment(
         }),
         &bootstrap.server_public_key,
         ticket_hash,
-        rng,
+        enrollment_key,
     )
 }
 
@@ -51,49 +45,49 @@ fn seal_plaintext(
     mut plaintext: Vec<u8>,
     server_public_key: &[u8],
     ticket_hash: &[u8],
-    rng: &dyn SecureRandom,
-) -> Result<(Vec<u8>, String), String> {
-    let password = generate_transfer_password(rng)?;
-    let mut salt = [0u8; SALT_LEN];
-    rng.fill(&mut salt)
-        .map_err(|_| "failed to generate enrollment salt".to_string())?;
-    let key = derive_key(&password, &salt)?;
+    enrollment_key: &[u8; KEY_LEN],
+) -> Result<Vec<u8>, String> {
     let aad = enrollment_aad(server_public_key, ticket_hash);
     seal_in_place_append_tag(
-        &KeyMaterial { id: 1, bytes: *key },
+        &KeyMaterial {
+            id: 1,
+            bytes: *enrollment_key,
+        },
         0,
         &aad,
         0,
         &mut plaintext,
     )
     .map_err(|error| error.to_string())?;
-    let mut bundle = Vec::with_capacity(1 + SALT_LEN + plaintext.len());
+    let mut bundle = Vec::with_capacity(1 + plaintext.len());
     bundle.push(BUNDLE_VERSION);
-    bundle.extend_from_slice(&salt);
     bundle.extend_from_slice(&plaintext);
-    Ok((bundle, password))
+    Ok(bundle)
 }
 
 pub(crate) fn open_enrollment(
     bundle: &[u8],
-    password: &str,
+    enrollment_key: &[u8; KEY_LEN],
     server_public_key: &[u8],
     ticket_hash: &[u8],
 ) -> Result<MlsEnrollment, String> {
-    if bundle.len() <= 1 + SALT_LEN || bundle[0] != BUNDLE_VERSION {
+    if bundle.len() <= 1 || bundle[0] != BUNDLE_VERSION {
         return Err("device enrollment bundle has an unsupported format".to_string());
     }
-    let salt = &bundle[1..1 + SALT_LEN];
-    let key = derive_key(&normalize_password(password), salt)?;
     let aad = enrollment_aad(server_public_key, ticket_hash);
-    let mut plaintext = Zeroizing::new(bundle[1 + SALT_LEN..].to_vec());
+    let mut plaintext = Zeroizing::new(bundle[1..].to_vec());
     let len = open_in_place_with_aad(
-        &KeyMaterial { id: 1, bytes: *key },
+        &KeyMaterial {
+            id: 1,
+            bytes: *enrollment_key,
+        },
         0,
         &aad,
         &mut plaintext,
     )
-    .map_err(|_| "transfer password is incorrect or the enrollment bundle was altered".to_string())?;
+    .map_err(|_| {
+        "the pairing string is incorrect or the enrollment bundle was altered".to_string()
+    })?;
     plaintext.truncate(len);
     jsony::from_binary(&plaintext)
         .map_err(|error| format!("invalid MLS device enrollment bundle: {error}"))
@@ -105,21 +99,16 @@ pub(crate) fn redemption_secret_hash(secret: &str) -> Vec<u8> {
         .to_vec()
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
-    let hash = Hasher::new()
-        .algorithm(Algorithm::Argon2id)
-        .memory_cost_kib(KDF_MEMORY_KIB)
-        .iterations(KDF_ITERATIONS)
-        .threads(1)
-        .hash_length(KEY_LEN as u32)
-        .custom_salt(salt)
-        .hash(password.as_bytes())
-        .map_err(|error| format!("failed to derive enrollment key: {error}"))?;
-    let bytes: [u8; KEY_LEN] = hash
-        .as_bytes()
-        .try_into()
-        .map_err(|_| "enrollment KDF returned the wrong key length".to_string())?;
-    Ok(Zeroizing::new(bytes))
+pub(crate) fn derive_pairing_secrets(
+    pairing_secret: &[u8; KEY_LEN],
+    server_public_key: &[u8],
+) -> Result<PairingSecrets, String> {
+    let derived = derive_device_link_keys(pairing_secret, server_public_key)
+        .map_err(|error| format!("failed to derive device-link keys: {error}"))?;
+    Ok(PairingSecrets {
+        redemption_secret: Zeroizing::new(encode_hex(&derived.redemption_secret)),
+        enrollment_key: Zeroizing::new(derived.enrollment_key),
+    })
 }
 
 fn enrollment_aad(server_public_key: &[u8], ticket_hash: &[u8]) -> Vec<u8> {
@@ -130,58 +119,49 @@ fn enrollment_aad(server_public_key: &[u8], ticket_hash: &[u8]) -> Vec<u8> {
     aad
 }
 
-fn generate_transfer_password(rng: &dyn SecureRandom) -> Result<String, String> {
-    let words = WORDLIST.lines().collect::<Vec<_>>();
-    debug_assert_eq!(words.len(), 2048);
-    let mut selected = Vec::with_capacity(WORD_COUNT);
-    while selected.len() < WORD_COUNT {
-        let mut bytes = [0u8; 2];
-        rng.fill(&mut bytes)
-            .map_err(|_| "failed to generate transfer password".to_string())?;
-        let sample = u16::from_le_bytes(bytes);
-        selected.push(words[usize::from(sample % 2048)]);
-    }
-    Ok(selected.join("-"))
-}
-
-fn normalize_password(password: &str) -> String {
-    password
-        .split(|character: char| character.is_whitespace() || character == '-')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn transfer_password_has_six_words() {
-        let password = generate_transfer_password(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
-        assert_eq!(password.split('-').count(), WORD_COUNT);
-    }
-
-    #[test]
-    fn enrollment_bundle_requires_the_transfer_password_and_context() {
-        let rng = aws_lc_rs::rand::SystemRandom::new();
+    fn enrollment_bundle_requires_the_pairing_capability_and_context() {
         let plaintext = b"ephemeral authority material".to_vec();
         let server_key = [7; 32];
         let ticket_hash = [9; 32];
-        let (bundle, password) =
-            seal_plaintext(plaintext.clone(), &server_key, &ticket_hash, &rng).unwrap();
+        let pairing = [5; KEY_LEN];
+        let secrets = derive_pairing_secrets(&pairing, &server_key).unwrap();
+        let bundle = seal_plaintext(
+            plaintext.clone(),
+            &server_key,
+            &ticket_hash,
+            &secrets.enrollment_key,
+        )
+        .unwrap();
 
-        let mut encrypted = Zeroizing::new(bundle[1 + SALT_LEN..].to_vec());
-        let key = derive_key(&password, &bundle[1..1 + SALT_LEN]).unwrap();
+        let mut encrypted = Zeroizing::new(bundle[1..].to_vec());
         let len = open_in_place_with_aad(
-            &KeyMaterial { id: 1, bytes: *key },
+            &KeyMaterial {
+                id: 1,
+                bytes: *secrets.enrollment_key,
+            },
             0,
             &enrollment_aad(&server_key, &ticket_hash),
             &mut encrypted,
         )
         .unwrap();
         assert_eq!(&encrypted[..len], plaintext);
-        assert!(open_enrollment(&bundle, "wrong-password", &server_key, &ticket_hash).is_err());
-        assert!(open_enrollment(&bundle, &password, &[8; 32], &ticket_hash).is_err());
+        assert!(open_enrollment(&bundle, &[6; KEY_LEN], &server_key, &ticket_hash).is_err());
+        assert!(open_enrollment(&bundle, &secrets.enrollment_key, &[8; 32], &ticket_hash).is_err());
+    }
+
+    #[test]
+    fn pairing_secret_derives_separate_redemption_and_enrollment_keys() {
+        let pairing = [11; KEY_LEN];
+        let secrets = derive_pairing_secrets(&pairing, &[7; 32]).unwrap();
+        assert_ne!(
+            secrets.redemption_secret.as_bytes(),
+            &*secrets.enrollment_key
+        );
+        assert_eq!(secrets.redemption_secret.len(), KEY_LEN * 2);
     }
 }

@@ -63,7 +63,6 @@ pub(super) enum PairingJob {
     Device {
         config: ClientConfig,
         ticket: DeviceLinkTicket,
-        transfer_password: String,
         device_name: String,
         overwrite_existing: bool,
     },
@@ -71,19 +70,30 @@ pub(super) enum PairingJob {
 
 enum PairingState {
     Idle,
-    AwaitingDeviceDetails { owner: ClientId },
+    AwaitingDeviceDetails {
+        owner: ClientId,
+    },
     Running {
         attempt: u64,
         owner: ClientId,
         pending: PendingPair,
         cancellation: Option<Arc<AtomicU8>>,
     },
-    AwaitingPassword { owner: ClientId, pending: PendingPair },
-    AwaitingUsername { owner: ClientId, pending: PendingPair },
+    AwaitingPassword {
+        owner: ClientId,
+        pending: PendingPair,
+    },
+    AwaitingUsername {
+        owner: ClientId,
+        pending: PendingPair,
+    },
 }
 
 pub(super) enum PairingInput {
-    StartDevicePrompt { owner: ClientId, pairing_string: String },
+    StartDevicePrompt {
+        owner: ClientId,
+        pairing_string: String,
+    },
     Start {
         owner: ClientId,
         pending: PendingPair,
@@ -91,12 +101,29 @@ pub(super) enum PairingInput {
         cancellation: Option<Arc<AtomicU8>>,
         persist_first: bool,
     },
-    Password { owner: ClientId, password: String, config: ClientConfig },
-    RetryUsername { owner: ClientId, server: ServerEntry, config: ClientConfig },
-    Worker { attempt: u64, event: PairingEvent },
-    Cancel { owner: ClientId },
-    OwnerClosed { owner: ClientId },
-    OwnerRetired { owner: ClientId },
+    Password {
+        owner: ClientId,
+        password: String,
+        config: ClientConfig,
+    },
+    RetryUsername {
+        owner: ClientId,
+        server: ServerEntry,
+        config: ClientConfig,
+    },
+    Worker {
+        attempt: u64,
+        event: PairingEvent,
+    },
+    Cancel {
+        owner: ClientId,
+    },
+    OwnerClosed {
+        owner: ClientId,
+    },
+    OwnerRetired {
+        owner: ClientId,
+    },
 }
 
 pub(super) struct PairingCoordinator {
@@ -115,11 +142,7 @@ impl Default for PairingCoordinator {
 
 impl PairingCoordinator {
     #[cfg(test)]
-    pub(super) fn set_awaiting_password_for_test(
-        &mut self,
-        owner: ClientId,
-        pending: PendingPair,
-    ) {
+    pub(super) fn set_awaiting_password_for_test(&mut self, owner: ClientId, pending: PendingPair) {
         self.state = PairingState::AwaitingPassword { owner, pending };
     }
 
@@ -139,9 +162,14 @@ impl PairingCoordinator {
 
     pub(super) fn pending_server_for(&self, owner: ClientId) -> Option<&ServerEntry> {
         match &self.state {
-            PairingState::AwaitingPassword { owner: active, pending }
-            | PairingState::AwaitingUsername { owner: active, pending }
-                if *active == owner => Some(&pending.server),
+            PairingState::AwaitingPassword {
+                owner: active,
+                pending,
+            }
+            | PairingState::AwaitingUsername {
+                owner: active,
+                pending,
+            } if *active == owner => Some(&pending.server),
             _ => None,
         }
     }
@@ -162,7 +190,13 @@ impl PairingCoordinator {
     pub(super) fn handle(mut self, app: &mut App, input: PairingInput) -> Self {
         let state = std::mem::replace(&mut self.state, PairingState::Idle);
         match (state, input) {
-            (PairingState::Idle, PairingInput::StartDevicePrompt { owner, pairing_string }) => {
+            (
+                PairingState::Idle,
+                PairingInput::StartDevicePrompt {
+                    owner,
+                    pairing_string,
+                },
+            ) => {
                 app.send_terminal_event(
                     Audience::Client(owner),
                     TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
@@ -178,25 +212,53 @@ impl PairingCoordinator {
                 );
                 self.state = PairingState::AwaitingDeviceDetails { owner };
             }
-            (PairingState::Idle, PairingInput::Start { owner, pending, job, cancellation, persist_first }) => {
+            (
+                PairingState::Idle,
+                PairingInput::Start {
+                    owner,
+                    pending,
+                    job,
+                    cancellation,
+                    persist_first,
+                },
+            ) => {
                 self.start(app, owner, pending, job, cancellation, persist_first);
             }
             (
                 PairingState::AwaitingDeviceDetails { owner: active },
-                PairingInput::Start { owner, pending, job, cancellation, persist_first },
+                PairingInput::Start {
+                    owner,
+                    pending,
+                    job,
+                    cancellation,
+                    persist_first,
+                },
             ) if active == owner && matches!(&job, PairingJob::Device { .. }) => {
                 self.start(app, owner, pending, job, cancellation, persist_first);
             }
             (
-                PairingState::AwaitingPassword { owner: active, mut pending },
-                PairingInput::Password { owner, password, config },
+                PairingState::AwaitingPassword {
+                    owner: active,
+                    mut pending,
+                },
+                PairingInput::Password {
+                    owner,
+                    password,
+                    config,
+                },
             ) if active == owner => {
-                if let Some((password, existing_token)) = pending.open_pair_credentials(Some(password)) {
+                if let Some((password, existing_token)) =
+                    pending.open_pair_credentials(Some(password))
+                {
                     self.start(
                         app,
                         owner,
                         pending,
-                        PairingJob::Open { config, password, existing_token },
+                        PairingJob::Open {
+                            config,
+                            password,
+                            existing_token,
+                        },
                         None,
                         false,
                     );
@@ -209,15 +271,29 @@ impl PairingCoordinator {
                 }
             }
             (
-                PairingState::AwaitingUsername { owner: active, mut pending },
-                PairingInput::RetryUsername { owner, server, config },
+                PairingState::AwaitingUsername {
+                    owner: active,
+                    mut pending,
+                },
+                PairingInput::RetryUsername {
+                    owner,
+                    server,
+                    config,
+                },
             ) if active == owner => {
                 let job = if let Some(pairing_code) = pending.pairing_code.clone() {
-                    Some(PairingJob::Invite { config, pairing_code })
-                } else {
-                    pending.open_pair_credentials(None).map(|(password, existing_token)| {
-                        PairingJob::Open { config, password, existing_token }
+                    Some(PairingJob::Invite {
+                        config,
+                        pairing_code,
                     })
+                } else {
+                    pending
+                        .open_pair_credentials(None)
+                        .map(|(password, existing_token)| PairingJob::Open {
+                            config,
+                            password,
+                            existing_token,
+                        })
                 };
                 if let Some(job) = job {
                     pending.server = server;
@@ -232,9 +308,16 @@ impl PairingCoordinator {
                 }
             }
             (
-                PairingState::Running { attempt: active, owner, pending, cancellation },
+                PairingState::Running {
+                    attempt: active,
+                    owner,
+                    pending,
+                    cancellation,
+                },
                 PairingInput::Worker { attempt, event },
-            ) if active == attempt => self.worker_result(app, attempt, owner, pending, cancellation, event),
+            ) if active == attempt => {
+                self.worker_result(app, attempt, owner, pending, cancellation, event)
+            }
             (state, PairingInput::Cancel { owner }) if state.owner() == Some(owner) => {
                 self.cancel(app, state, owner, true);
             }
@@ -276,9 +359,7 @@ impl PairingCoordinator {
         cancellation: Option<Arc<AtomicU8>>,
         persist_first: bool,
     ) {
-        if persist_first
-            && let Err(message) = app.persist_provisional_open_pair(&pending.server)
-        {
+        if persist_first && let Err(message) = app.persist_provisional_open_pair(&pending.server) {
             app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
             return;
         }
@@ -292,23 +373,24 @@ impl PairingCoordinator {
         };
         let events = app.events.sender().for_pairing(attempt);
         let result = match job {
-            PairingJob::Invite { config, pairing_code } => {
-                spawn_pair_once(config, pairing_code, events)
-            }
-            PairingJob::Open { config, password, existing_token } => {
-                spawn_open_pair_once(config, password, existing_token, events)
-            }
+            PairingJob::Invite {
+                config,
+                pairing_code,
+            } => spawn_pair_once(config, pairing_code, events),
+            PairingJob::Open {
+                config,
+                password,
+                existing_token,
+            } => spawn_open_pair_once(config, password, existing_token, events),
             PairingJob::Device {
                 config,
                 ticket,
-                transfer_password,
                 device_name,
                 overwrite_existing,
             } => match cancellation {
                 Some(cancellation) => spawn_device_pair_once(
                     config,
                     ticket,
-                    transfer_password,
                     device_name,
                     overwrite_existing,
                     cancellation,
@@ -372,7 +454,10 @@ impl PairingCoordinator {
                 pending.server.server_public_key = server_public_key;
                 self.commit(app, attempt, owner, pending, true);
             }
-            PairingEvent::OpenNeedsPassword { retry, server_public_key } => {
+            PairingEvent::OpenNeedsPassword {
+                retry,
+                server_public_key,
+            } => {
                 if pending.server.server_public_key.is_empty() {
                     pending.server.server_public_key = server_public_key;
                 } else if pending.server.server_public_key != server_public_key {
@@ -385,19 +470,13 @@ impl PairingCoordinator {
                         Audience::Client(owner),
                         TerminalEvent::PairingFailed(message.clone()),
                     );
-                    app.send_terminal_event(
-                        Audience::Client(owner),
-                        TerminalEvent::Error(message),
-                    );
+                    app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
                     return;
                 }
                 if pending.is_provisional()
                     && let Err(message) = app.persist_provisional_open_pair(&pending.server)
                 {
-                    app.send_terminal_event(
-                        Audience::Client(owner),
-                        TerminalEvent::Error(message),
-                    );
+                    app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
                     return;
                 }
                 let replace = !pending.open_password.is_empty();
@@ -417,11 +496,8 @@ impl PairingCoordinator {
                 }
             }
             PairingEvent::UsernameTaken(message) => {
-                let draft = ServerEditDraft::from_server_focused(
-                    &pending.server,
-                    &app.config,
-                    "Username",
-                );
+                let draft =
+                    ServerEditDraft::from_server_focused(&pending.server, &app.config, "Username");
                 self.state = PairingState::AwaitingUsername { owner, pending };
                 app.send_terminal_event(
                     Audience::Client(owner),
@@ -443,14 +519,11 @@ impl PairingCoordinator {
                 );
                 app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
             }
-            PairingEvent::DeviceIdentityExists { message, transfer_password } => {
+            PairingEvent::DeviceIdentityExists { message } => {
                 self.state = PairingState::AwaitingDeviceDetails { owner };
                 app.send_terminal_event(
                     Audience::Client(owner),
-                    TerminalEvent::DevicePairingIdentityExists {
-                        message,
-                        transfer_password,
-                    },
+                    TerminalEvent::DevicePairingIdentityExists { message },
                 );
                 app.send_terminal_event(
                     Audience::Client(owner),
@@ -459,13 +532,12 @@ impl PairingCoordinator {
                     ),
                 );
             }
-            PairingEvent::DeviceFailed { message, transfer_password } => {
+            PairingEvent::DeviceFailed { message } => {
                 self.state = PairingState::AwaitingDeviceDetails { owner };
                 app.send_terminal_event(
                     Audience::Client(owner),
                     TerminalEvent::DevicePairingFailed {
                         message: message.clone(),
-                        transfer_password,
                     },
                 );
                 app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));

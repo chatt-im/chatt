@@ -49,7 +49,8 @@ pub(super) struct BugReportWriter {
 
 impl BugReportWriter {
     pub(super) fn spawn(events: Arc<EventQueue<BugReportWriteReply>>) -> Self {
-        let (requests, request_rx) = mpsc::sync_channel::<BugReportWriteRequest>(WRITE_QUEUE_CAPACITY);
+        let (requests, request_rx) =
+            mpsc::sync_channel::<BugReportWriteRequest>(WRITE_QUEUE_CAPACITY);
         let thread = thread::Builder::new()
             .name("chatt-bug-report-writer".to_string())
             .spawn(move || {
@@ -63,19 +64,14 @@ impl BugReportWriter {
                         metadata,
                         logs,
                     } = request;
-                    let result = write_bug_report(
-                        Path::new(&dir),
-                        &username,
-                        report_id,
-                        &metadata,
-                        &logs,
-                    );
+                    let result =
+                        write_bug_report(Path::new(&dir), &username, report_id, &metadata, &logs);
                     events.push(BugReportWriteReply {
-                            session_id,
-                            report_id,
-                            description,
-                            result,
-                        });
+                        session_id,
+                        report_id,
+                        description,
+                        result,
+                    });
                 }
             })
             .expect("failed to spawn bug report writer");
@@ -85,10 +81,7 @@ impl BugReportWriter {
         }
     }
 
-    pub(super) fn enqueue(
-        &self,
-        request: BugReportWriteRequest,
-    ) -> Result<(), EnqueueError> {
+    pub(super) fn enqueue(&self, request: BugReportWriteRequest) -> Result<(), EnqueueError> {
         let Some(requests) = &self.requests else {
             return Err(EnqueueError::Gone);
         };
@@ -118,8 +111,7 @@ fn write_bug_report(
     metadata: &str,
     logs: &[u8],
 ) -> Result<String, String> {
-    fs::create_dir_all(dir)
-        .map_err(|error| format!("failed to create bug-report dir: {error}"))?;
+    fs::create_dir_all(dir).map_err(|error| format!("failed to create bug-report dir: {error}"))?;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

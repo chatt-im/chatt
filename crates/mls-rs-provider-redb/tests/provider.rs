@@ -7,19 +7,16 @@ use mls_rs_core::{
 };
 use mls_rs_provider_redb::{RedbDataStorageEngine, RedbDataStorageError};
 use redb::{
-    Database, MultimapTableDefinition, ReadableDatabase, ReadableTableMetadata,
-    TableDefinition,
+    Database, MultimapTableDefinition, ReadableDatabase, ReadableTableMetadata, TableDefinition,
 };
 use tempfile::{tempdir, NamedTempFile};
 
 const GROUPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_groups");
 const EPOCHS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_epochs");
-const KEY_PACKAGES: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("mls_key_packages");
+const KEY_PACKAGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_key_packages");
 const KEY_PACKAGE_EXPIRY: MultimapTableDefinition<u64, &[u8]> =
     MultimapTableDefinition::new("mls_key_package_expiry");
-const PROVIDER_METADATA: TableDefinition<&str, u64> =
-    TableDefinition::new("provider_metadata");
+const PROVIDER_METADATA: TableDefinition<&str, u64> = TableDefinition::new("provider_metadata");
 
 fn engine() -> RedbDataStorageEngine {
     RedbDataStorageEngine::open(NamedTempFile::new().unwrap().path()).unwrap()
@@ -48,12 +45,14 @@ fn key_package(expiration: u64, byte: u8) -> KeyPackageData {
 #[test]
 fn groups_upsert_update_and_retain_the_actual_highest_insert() {
     let engine = engine();
-    let mut storage = engine
-        .group_state_storage()
-        .with_max_epoch_retention(3);
+    let mut storage = engine.group_state_storage().with_max_epoch_retention(3);
 
     storage
-        .write(group_state(b"group", b"snapshot-1"), vec![epoch(0, 0)], vec![])
+        .write(
+            group_state(b"group", b"snapshot-1"),
+            vec![epoch(0, 0)],
+            vec![],
+        )
         .unwrap();
     storage
         .write(
@@ -63,7 +62,10 @@ fn groups_upsert_update_and_retain_the_actual_highest_insert() {
         )
         .unwrap();
 
-    assert_eq!(storage.state(b"group").unwrap().unwrap().as_slice(), b"snapshot-2");
+    assert_eq!(
+        storage.state(b"group").unwrap().unwrap().as_slice(),
+        b"snapshot-2"
+    );
     assert!(storage.epoch(b"group", 5).unwrap().is_none());
     for id in 10..=12 {
         assert!(storage.epoch(b"group", id).unwrap().is_some());
@@ -86,13 +88,12 @@ fn groups_list_multiple_ids_and_update_existing_epochs() {
     assert_eq!(storage.max_epoch_id(b"two").unwrap(), None);
 
     storage
-        .write(
-            group_state(b"one", b"updated"),
-            vec![],
-            vec![epoch(0, 9)],
-        )
+        .write(group_state(b"one", b"updated"), vec![], vec![epoch(0, 9)])
         .unwrap();
-    assert_eq!(storage.epoch(b"one", 0).unwrap().unwrap().as_slice(), &[9; 16]);
+    assert_eq!(
+        storage.epoch(b"one", 0).unwrap().unwrap().as_slice(),
+        &[9; 16]
+    );
 
     let mut ids = storage.group_ids().unwrap();
     ids.sort();
@@ -113,14 +114,13 @@ fn epoch_updates_require_existing_records_and_support_full_u64() {
     assert_eq!(storage.max_epoch_id(b"group").unwrap(), Some(u64::MAX));
 
     let error = storage
-        .write(
-            group_state(b"group", b"changed"),
-            vec![],
-            vec![epoch(4, 4)],
-        )
+        .write(group_state(b"group", b"changed"), vec![], vec![epoch(4, 4)])
         .unwrap_err();
     assert_matches!(error, RedbDataStorageError::MissingEpoch(4));
-    assert_eq!(storage.state(b"group").unwrap().unwrap().as_slice(), b"snapshot");
+    assert_eq!(
+        storage.state(b"group").unwrap().unwrap().as_slice(),
+        b"snapshot"
+    );
 }
 
 #[test]
@@ -143,7 +143,10 @@ fn duplicate_epoch_rolls_back_the_complete_group_write() {
         )
         .unwrap_err();
     assert_matches!(error, RedbDataStorageError::DuplicateEpoch(0));
-    assert_eq!(storage.state(b"group").unwrap().unwrap().as_slice(), b"original");
+    assert_eq!(
+        storage.state(b"group").unwrap().unwrap().as_slice(),
+        b"original"
+    );
     assert!(storage.epoch(b"group", 1).unwrap().is_none());
 }
 
@@ -234,9 +237,7 @@ fn database_file_is_owner_only_on_create_and_reopen() {
 fn key_packages_reject_duplicates_and_corruption_is_an_error() {
     let engine = engine();
     let mut storage = engine.key_package_storage();
-    storage
-        .insert(b"id".to_vec(), key_package(100, 1))
-        .unwrap();
+    storage.insert(b"id".to_vec(), key_package(100, 1)).unwrap();
     let error = storage
         .insert(b"id".to_vec(), key_package(200, 2))
         .unwrap_err();
@@ -245,7 +246,9 @@ fn key_packages_reject_duplicates_and_corruption_is_an_error() {
     let transaction = engine.database().begin_write().unwrap();
     {
         let mut packages = transaction.open_table(KEY_PACKAGES).unwrap();
-        packages.insert(b"corrupt".as_slice(), b"bad".as_slice()).unwrap();
+        packages
+            .insert(b"corrupt".as_slice(), b"bad".as_slice())
+            .unwrap();
     }
     transaction.commit().unwrap();
 
@@ -290,9 +293,7 @@ fn expiration_boundary_and_u64_max_are_supported() {
     let mut storage = engine.key_package_storage();
     storage.insert(vec![1], key_package(29, 1)).unwrap();
     storage.insert(vec![2], key_package(30, 2)).unwrap();
-    storage
-        .insert(vec![3], key_package(u64::MAX, 3))
-        .unwrap();
+    storage.insert(vec![3], key_package(u64::MAX, 3)).unwrap();
 
     storage.delete_expired_by_time(30).unwrap();
     assert!(storage.get(&[1]).unwrap().is_none());
@@ -311,18 +312,13 @@ fn expiration_index_inconsistency_is_reported_without_partial_delete() {
 
     let transaction = engine.database().begin_write().unwrap();
     {
-        let mut expiry = transaction
-            .open_multimap_table(KEY_PACKAGE_EXPIRY)
-            .unwrap();
+        let mut expiry = transaction.open_multimap_table(KEY_PACKAGE_EXPIRY).unwrap();
         assert!(expiry.remove(11, [2].as_slice()).unwrap());
     }
     transaction.commit().unwrap();
 
     let error = storage.delete_expired_by_time(20).unwrap_err();
-    assert_matches!(
-        error,
-        RedbDataStorageError::SecondaryIndexInconsistency(_)
-    );
+    assert_matches!(error, RedbDataStorageError::SecondaryIndexInconsistency(_));
 
     let transaction = engine.database().begin_read().unwrap();
     let packages = transaction.open_table(KEY_PACKAGES).unwrap();
@@ -383,7 +379,14 @@ fn application_batch_insert_counts_only_changes() {
 fn application_prefixes_are_literal_unicode_prefixes() {
     let engine = engine();
     let storage = engine.application_data_storage();
-    for key in ["%_heart", "%_hearth", "%Xheart", "other", "\u{2764}a", "\u{2764}b"] {
+    for key in [
+        "%_heart",
+        "%_hearth",
+        "%Xheart",
+        "other",
+        "\u{2764}a",
+        "\u{2764}b",
+    ] {
         storage.insert(key, key.as_bytes()).unwrap();
     }
 

@@ -264,9 +264,11 @@ impl<'a> Form<'a> {
             return;
         };
         let palette = row_palette(self.theme, self.surface);
-        let style = palette
-            .base
-            .patch(if error { self.theme.error } else { self.theme.subtle });
+        let style = palette.base.patch(if error {
+            self.theme.error
+        } else {
+            self.theme.subtle
+        });
         area.with(style).clear(buf);
         for line in &lines {
             area.take_top(1).with(style).text(buf, line);
@@ -1321,10 +1323,7 @@ mod tests {
         assert!(rendered.starts_with("*************"));
         assert!(!rendered.contains("coral"));
         for column in 8..24 {
-            assert_eq!(
-                cell_style(&mut buf, column, 0),
-                theme.join_input_active
-            );
+            assert_eq!(cell_style(&mut buf, column, 0), theme.join_input_active);
         }
     }
 

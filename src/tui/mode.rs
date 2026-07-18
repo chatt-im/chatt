@@ -259,19 +259,19 @@ impl ModeStack {
             TerminalEvent::ResetRooms => cx.view.reset_rooms(),
             TerminalEvent::Navigation(event) => {
                 let transition = match event {
-                NavigationEvent::ResetBase(base) => ModeTransition::Set(base.into_mode()),
-                NavigationEvent::OpenScreen(screen) => ModeTransition::Push(screen.into_mode()),
-                NavigationEvent::ReplaceScreen(screen) => {
-                    ModeTransition::Replace(screen.into_mode())
-                }
-                NavigationEvent::CloseScreen => ModeTransition::Pop,
-                NavigationEvent::ShowOverlay(overlay) => {
-                    ModeTransition::Push(overlay.into_mode(&cx.view.theme))
-                }
-                NavigationEvent::ReplaceOverlay(overlay) => {
-                    ModeTransition::Replace(overlay.into_mode(&cx.view.theme))
-                }
-                NavigationEvent::CloseOverlay => ModeTransition::Pop,
+                    NavigationEvent::ResetBase(base) => ModeTransition::Set(base.into_mode()),
+                    NavigationEvent::OpenScreen(screen) => ModeTransition::Push(screen.into_mode()),
+                    NavigationEvent::ReplaceScreen(screen) => {
+                        ModeTransition::Replace(screen.into_mode())
+                    }
+                    NavigationEvent::CloseScreen => ModeTransition::Pop,
+                    NavigationEvent::ShowOverlay(overlay) => {
+                        ModeTransition::Push(overlay.into_mode(&cx.view.theme))
+                    }
+                    NavigationEvent::ReplaceOverlay(overlay) => {
+                        ModeTransition::Replace(overlay.into_mode(&cx.view.theme))
+                    }
+                    NavigationEvent::CloseOverlay => ModeTransition::Pop,
                 };
                 self.apply_transition(cx, transition);
                 self.apply_pending_cx(cx);

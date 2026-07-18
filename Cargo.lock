@@ -88,18 +88,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
-name = "argon2-kdf"
-version = "1.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5d14adc97284e2513ae5f30d87ba7b7f1e766daed63f079dd137d1b126e1600"
-dependencies = [
- "base64",
- "bindgen",
- "cc",
- "rand",
-]
-
-[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -353,7 +341,6 @@ name = "chatt"
 version = "0.1.0"
 dependencies = [
  "annotate-snippets 0.12.16",
- "argon2-kdf",
  "aws-lc-rs",
  "bwrap",
  "chatt-mls",

@@ -3,7 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::{MlsReply, event_queue::{EventNotifier, MLS_EVENTS}};
+use super::{
+    MlsReply,
+    event_queue::{EventNotifier, MLS_EVENTS},
+};
 
 /// Completed storage events waiting to be applied by the mio event loop.
 /// Producers wake the loop directly; the loop never waits on a channel.

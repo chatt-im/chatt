@@ -152,7 +152,10 @@ mod imp {
 
     fn send_empty_request(socket_path: &Path, opcode: u8) -> Result<String, String> {
         let mut stream = UnixStream::connect(socket_path).map_err(|error| {
-            format!("no active chatt server control socket at {}: {error}", socket_path.display())
+            format!(
+                "no active chatt server control socket at {}: {error}",
+                socket_path.display()
+            )
         })?;
         write_frame(&mut stream, opcode, &[], MAX_REQUEST_BYTES, "request")?;
         let (status, body) = read_frame(&mut stream, MAX_RESPONSE_BYTES, "response")?;
@@ -161,7 +164,9 @@ mod imp {
         match status {
             STATUS_OK => Ok(message),
             STATUS_ERROR => Err(message),
-            status => Err(format!("server control socket returned unknown status {status}")),
+            status => Err(format!(
+                "server control socket returned unknown status {status}"
+            )),
         }
     }
 
@@ -370,7 +375,9 @@ mod imp {
                         },
                         Err(error) => Response {
                             status: STATUS_ERROR,
-                            message: format!("server did not answer MLS maintenance request: {error}"),
+                            message: format!(
+                                "server did not answer MLS maintenance request: {error}"
+                            ),
                         },
                     },
                     Err(_) => Response {
@@ -552,16 +559,15 @@ mod imp {
                     thread::yield_now();
                 };
                 match command {
-                        AdminCommand::Invite { user, reply } => {
-                            assert_eq!(user, "alice");
-                            reply.send(Ok("tcj1_join".to_string())).unwrap();
-                        }
-                        AdminCommand::Shutdown => panic!("unexpected shutdown command"),
-                        AdminCommand::MlsStorageStatus { .. }
-                        | AdminCommand::MlsCompact { .. } => {
-                            panic!("unexpected MLS maintenance command")
-                        }
+                    AdminCommand::Invite { user, reply } => {
+                        assert_eq!(user, "alice");
+                        reply.send(Ok("tcj1_join".to_string())).unwrap();
                     }
+                    AdminCommand::Shutdown => panic!("unexpected shutdown command"),
+                    AdminCommand::MlsStorageStatus { .. } | AdminCommand::MlsCompact { .. } => {
+                        panic!("unexpected MLS maintenance command")
+                    }
+                }
             });
 
             let response = send_invite_to_path(&socket_path, "alice").unwrap();

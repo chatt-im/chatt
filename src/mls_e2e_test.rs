@@ -6,11 +6,7 @@ use std::{
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::AtomicU8,
-        mpsc,
-    },
+    sync::{Arc, Mutex, atomic::AtomicU8, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -22,7 +18,10 @@ use rpc::{
 };
 use server::{
     Server,
-    config::{Config as ServerConfig, RoomConfig, RoomPersistenceConfig, TransportModeConfig, UserConfig, hash_secret},
+    config::{
+        Config as ServerConfig, RoomConfig, RoomPersistenceConfig, TransportModeConfig, UserConfig,
+        hash_secret,
+    },
     local_admin::{AdminCommand, AdminSender},
 };
 
@@ -216,7 +215,9 @@ impl Client {
 static LIVE_MLS_E2E: Mutex<()> = Mutex::new(());
 
 fn live_mls_e2e_guard() -> std::sync::MutexGuard<'static, ()> {
-    LIVE_MLS_E2E.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    LIVE_MLS_E2E
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn temp_dir(label: &str) -> TempDir {
@@ -236,8 +237,18 @@ fn start_server(root: &Path) -> Addrs {
             is_default: true,
         }],
         vec![
-            UserConfig { id: UserId(1), internal_reference: "alice".into(), username: "Alice".into(), token_hash: hash_secret(ALICE_TOKEN) },
-            UserConfig { id: UserId(2), internal_reference: "bob".into(), username: "Bob".into(), token_hash: hash_secret(BOB_TOKEN) },
+            UserConfig {
+                id: UserId(1),
+                internal_reference: "alice".into(),
+                username: "Alice".into(),
+                token_hash: hash_secret(ALICE_TOKEN),
+            },
+            UserConfig {
+                id: UserId(2),
+                internal_reference: "bob".into(),
+                username: "Bob".into(),
+                token_hash: hash_secret(BOB_TOKEN),
+            },
         ],
     )
 }
@@ -260,10 +271,18 @@ fn start_server_with(root: &Path, rooms: Vec<RoomConfig>, users: Vec<UserConfig>
     let tcp = server.tcp_local_addr().unwrap().to_string();
     let udp = server.udp_local_addr().unwrap().to_string();
     let admin = server.admin_sender();
-    let worker = thread::Builder::new().name("mls-e2e-server".into()).spawn(move || {
-        let _ = server.run();
-    }).unwrap();
-    Addrs { tcp, udp, admin, worker: Some(worker) }
+    let worker = thread::Builder::new()
+        .name("mls-e2e-server".into())
+        .spawn(move || {
+            let _ = server.run();
+        })
+        .unwrap();
+    Addrs {
+        tcp,
+        udp,
+        admin,
+        worker: Some(worker),
+    }
 }
 
 fn config(addrs: &Addrs, root: &Path, name: &str, token: &str, receive: bool) -> ClientConfig {
@@ -284,7 +303,13 @@ fn config(addrs: &Addrs, root: &Path, name: &str, token: &str, receive: bool) ->
         data_dir: Some(root.join(format!("{}-state", name.to_ascii_lowercase()))),
         e2e_peer_pins: Vec::new(),
         require_native_encryption: true,
-        file_policy: FilePolicy { default: EffectiveFiles { target, max_download_bytes: 8 * 1024 * 1024 }, rooms: Vec::new() },
+        file_policy: FilePolicy {
+            default: EffectiveFiles {
+                target,
+                max_download_bytes: 8 * 1024 * 1024,
+            },
+            rooms: Vec::new(),
+        },
         download_store: DownloadStore::new(8 * 1024 * 1024),
         max_upload_bytes: 8 * 1024 * 1024,
         upload_rate_bytes: 0,
@@ -307,14 +332,17 @@ fn spawn(config: ClientConfig) -> Client {
 }
 
 fn wait_event<F>(client: &Client, label: &str, timeout: Duration, mut predicate: F) -> NetworkEvent
-where F: FnMut(&NetworkEvent) -> bool {
+where
+    F: FnMut(&NetworkEvent) -> bool,
+{
     let backlog_match = client.backlog.borrow().iter().position(&mut predicate);
     if let Some(index) = backlog_match {
         return client.backlog.borrow_mut().remove(index).unwrap();
     }
     let deadline = Instant::now() + timeout;
     loop {
-        let remaining = deadline.checked_duration_since(Instant::now())
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
             .unwrap_or_else(|| {
                 panic!(
                     "{label}: timed out; statuses: {:?}; observed MLS chats: {:?}",
@@ -331,7 +359,9 @@ where F: FnMut(&NetworkEvent) -> bool {
                     | NetworkEvent::Error(message) => panic!("{label}: {message}"),
                     _ => {}
                 }
-                if predicate(&event) { return event; }
+                if predicate(&event) {
+                    return event;
+                }
                 client.backlog.borrow_mut().push_back(event);
             }
             Ok(_) => {}
@@ -345,16 +375,21 @@ where F: FnMut(&NetworkEvent) -> bool {
 }
 
 fn wait_authenticated(client: &Client, label: &str) -> DeviceId {
-    wait_event(client, label, Duration::from_secs(10), |event| matches!(event, NetworkEvent::Authenticated { .. }));
-    let bound = wait_event(client, label, Duration::from_secs(10), |event| matches!(event, NetworkEvent::MlsDeviceBound { .. }));
-    let NetworkEvent::MlsDeviceBound { device_id } = bound else { unreachable!() };
+    wait_event(client, label, Duration::from_secs(10), |event| {
+        matches!(event, NetworkEvent::Authenticated { .. })
+    });
+    let bound = wait_event(client, label, Duration::from_secs(10), |event| {
+        matches!(event, NetworkEvent::MlsDeviceBound { .. })
+    });
+    let NetworkEvent::MlsDeviceBound { device_id } = bound else {
+        unreachable!()
+    };
     device_id
 }
 
 fn pair_device(
     mut pair_config: ClientConfig,
     pairing_string: &str,
-    transfer_password: &str,
     device_name: &str,
 ) -> (ClientConfig, Client, DeviceId) {
     let ticket = decode_device_link_ticket(pairing_string).unwrap();
@@ -363,21 +398,26 @@ fn pair_device(
     let worker = spawn_device_pair_once(
         pair_config.clone(),
         ticket,
-        transfer_password.to_string(),
         device_name.to_string(),
         false,
         cancellation,
         PairingEventSender::for_test(tx, 1),
-    ).expect("spawn device pairing");
+    )
+    .expect("spawn device pairing");
     let result = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
-    let AppEvent::Pairing { event: PairingEvent::DeviceSucceeded {
-        token,
-        username,
-        udp_addr,
-        udp_probe_addr,
-        server_public_key,
-    }, .. } = result else {
+    let AppEvent::Pairing {
+        event:
+            PairingEvent::DeviceSucceeded {
+                token,
+                username,
+                udp_addr,
+                udp_probe_addr,
+                server_public_key,
+            },
+        ..
+    } = result
+    else {
         panic!("device pairing did not succeed");
     };
     pair_config.token = token;
@@ -445,7 +485,10 @@ fn wait_revoked(client: &Client, label: &str) {
         while let Some(event) = client.backlog.borrow_mut().pop_front() {
             match event {
                 NetworkEvent::LocalIdentityUnavailable { message }
-                    if message.contains("revoked") => return,
+                    if message.contains("revoked") =>
+                {
+                    return;
+                }
                 NetworkEvent::AuthFailed { code: 401, .. } => return,
                 _ => {}
             }
@@ -458,7 +501,10 @@ fn wait_revoked(client: &Client, label: &str) {
                 client.observe_network_event(&event);
                 match event {
                     NetworkEvent::LocalIdentityUnavailable { message }
-                        if message.contains("revoked") => return,
+                        if message.contains("revoked") =>
+                    {
+                        return;
+                    }
                     NetworkEvent::AuthFailed { code: 401, .. } => return,
                     _ => {}
                 }
@@ -473,14 +519,13 @@ fn wait_chat(client: &Client, body: &str) -> crate::e2e::AuthenticatedChat {
     wait_chat_labeled(client, body, body)
 }
 
-fn wait_chat_labeled(
-    client: &Client,
-    body: &str,
-    label: &str,
-) -> crate::e2e::AuthenticatedChat {
-    let event = wait_event(client, label, Duration::from_secs(10), |event| {
-        matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body)
-    });
+fn wait_chat_labeled(client: &Client, body: &str, label: &str) -> crate::e2e::AuthenticatedChat {
+    let event = wait_event(
+        client,
+        label,
+        Duration::from_secs(10),
+        |event| matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body),
+    );
     let NetworkEvent::Chat(chat) = event else {
         unreachable!()
     };
@@ -516,11 +561,7 @@ fn send_to_all(
         .unwrap();
     let mut expected = None;
     for (index, receiver) in receivers.iter().enumerate() {
-        let observed = wait_chat_labeled(
-            receiver,
-            body,
-            &format!("{body} receiver {index}"),
-        );
+        let observed = wait_chat_labeled(receiver, body, &format!("{body} receiver {index}"));
         if let Some(expected) = &expected {
             assert_same_chat(expected, &observed, body);
         } else {
@@ -544,7 +585,10 @@ fn retarget(mut config: ClientConfig, addrs: &Addrs) -> ClientConfig {
 }
 
 fn open_dm(client: &Client) -> RoomId {
-    client.handle.try_send(NetworkCommand::OpenDm(UserId(2))).unwrap();
+    client
+        .handle
+        .try_send(NetworkCommand::OpenDm(UserId(2)))
+        .unwrap();
     let opened = wait_event(client, "open dm", Duration::from_secs(10), |event| {
         matches!(event, NetworkEvent::DmOpened { .. })
     });
@@ -578,31 +622,31 @@ fn link_device_with_id(
     let link = wait_event(primary, device_name, Duration::from_secs(10), |event| {
         matches!(event, NetworkEvent::DeviceLinkCreated { .. })
     });
-    let NetworkEvent::DeviceLinkCreated {
-        pairing_string,
-        transfer_password,
-        ..
-    } = link
-    else {
+    let NetworkEvent::DeviceLinkCreated { pairing_string, .. } = link else {
         unreachable!()
     };
     let pair_config = config(addrs, root, state_name, "unused", false);
-    let (_, linked, device_id) = pair_device(
-        pair_config,
-        &pairing_string,
-        &transfer_password,
-        device_name,
-    );
+    let (_, linked, device_id) = pair_device(pair_config, &pairing_string, device_name);
     (linked, device_id)
 }
 
 fn wait_room_upsert(client: &Client, room_id: RoomId, label: &str) {
-    wait_event(client, label, Duration::from_secs(10), |event| {
-        matches!(event, NetworkEvent::RoomUpserted(room) if room.room_id == room_id)
-    });
+    wait_event(
+        client,
+        label,
+        Duration::from_secs(10),
+        |event| matches!(event, NetworkEvent::RoomUpserted(room) if room.room_id == room_id),
+    );
 }
 
-fn send_alice_to_all(sender: &Client, primary: &Client, linked: &Client, bob: &Client, room: RoomId, body: &str) {
+fn send_alice_to_all(
+    sender: &Client,
+    primary: &Client,
+    linked: &Client,
+    bob: &Client,
+    room: RoomId,
+    body: &str,
+) {
     send_to_all(sender, &[bob, primary, linked], room, body);
 }
 
@@ -611,9 +655,12 @@ fn send_bob_to_all(bob: &Client, primary: &Client, linked: &Client, room: RoomId
 }
 
 fn join_voice(client: &Client, room_id: RoomId, user_id: UserId) -> StreamId {
-    wait_event(client, "UDP media binding", Duration::from_secs(10), |event| {
-        matches!(event, NetworkEvent::Status(message) if message == "udp media bound")
-    });
+    wait_event(
+        client,
+        "UDP media binding",
+        Duration::from_secs(10),
+        |event| matches!(event, NetworkEvent::Status(message) if message == "udp media bound"),
+    );
     client
         .handle
         .try_send(NetworkCommand::JoinVoice(room_id))
@@ -777,9 +824,8 @@ fn linked_matrix_cases() -> Vec<LinkedMatrixCase> {
     let mut columns: Vec<u32> = (1..LINKED_MATRIX_PAIRWISE_ROWS).collect();
     rng.shuffle(&mut columns);
     let complements = rng.next() as u32;
-    let mut encoded = Vec::with_capacity(
-        LINKED_MATRIX_PAIRWISE_ROWS as usize + LINKED_MATRIX_RANDOM_CASES,
-    );
+    let mut encoded =
+        Vec::with_capacity(LINKED_MATRIX_PAIRWISE_ROWS as usize + LINKED_MATRIX_RANDOM_CASES);
     for row in 0..LINKED_MATRIX_PAIRWISE_ROWS {
         let mut bits = 0;
         for factor in 0..LINKED_MATRIX_BITS as usize {
@@ -797,7 +843,10 @@ fn linked_matrix_cases() -> Vec<LinkedMatrixCase> {
         }
     }
     rng.shuffle(&mut encoded);
-    encoded.into_iter().map(LinkedMatrixCase::from_bits).collect()
+    encoded
+        .into_iter()
+        .map(LinkedMatrixCase::from_bits)
+        .collect()
 }
 
 fn assert_linked_matrix_pairwise(cases: &[LinkedMatrixCase]) {
@@ -836,9 +885,8 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
         (primary, bob)
     };
 
-    let needs_pre_link_dm = case.dm_before_link
-        || case.pre_link_message_from_alice
-        || case.pre_link_message_from_bob;
+    let needs_pre_link_dm =
+        case.dm_before_link || case.pre_link_message_from_alice || case.pre_link_message_from_bob;
     let mut room_id = needs_pre_link_dm.then(|| open_dm(&primary));
     if let Some(room_id) = room_id {
         // A peer cannot address a newly created room until its authenticated
@@ -865,24 +913,21 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
     if case.bob_offline_during_link {
         drop(bob_slot.take());
     }
-    primary.handle.try_send(NetworkCommand::CreateDeviceLink).unwrap();
-    let link = wait_event(&primary, "matrix create link", Duration::from_secs(10), |event| {
-        matches!(event, NetworkEvent::DeviceLinkCreated { .. })
-    });
-    let NetworkEvent::DeviceLinkCreated {
-        pairing_string,
-        transfer_password,
-        ..
-    } = link
-    else {
+    primary
+        .handle
+        .try_send(NetworkCommand::CreateDeviceLink)
+        .unwrap();
+    let link = wait_event(
+        &primary,
+        "matrix create link",
+        Duration::from_secs(10),
+        |event| matches!(event, NetworkEvent::DeviceLinkCreated { .. }),
+    );
+    let NetworkEvent::DeviceLinkCreated { pairing_string, .. } = link else {
         unreachable!()
     };
-    let (linked_config, mut linked, _) = pair_device(
-        linked_pair_config,
-        &pairing_string,
-        &transfer_password,
-        "matrix linked",
-    );
+    let (linked_config, mut linked, _) =
+        pair_device(linked_pair_config, &pairing_string, "matrix linked");
     for body in &pre_link_bodies {
         assert!(
             !linked.backlog.borrow().iter().any(
@@ -1014,16 +1059,29 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
         &linked
     };
     for (client, download_dir) in [
-        (other_alice, root.join(if case.alice_file_from_linked { "alice-downloads" } else { "alice-linked-downloads" })),
+        (
+            other_alice,
+            root.join(if case.alice_file_from_linked {
+                "alice-downloads"
+            } else {
+                "alice-linked-downloads"
+            }),
+        ),
         (&bob, root.join("bob-downloads")),
     ] {
-        let event = wait_event(client, "matrix file", Duration::from_secs(20), |event| {
-            matches!(event, NetworkEvent::FileReceived { served_name, .. } if served_name == &file_name)
-        });
+        let event = wait_event(
+            client,
+            "matrix file",
+            Duration::from_secs(20),
+            |event| matches!(event, NetworkEvent::FileReceived { served_name, .. } if served_name == &file_name),
+        );
         let NetworkEvent::FileReceived { served_name, .. } = event else {
             unreachable!()
         };
-        assert_eq!(std::fs::read(download_dir.join(served_name)).unwrap(), payload);
+        assert_eq!(
+            std::fs::read(download_dir.join(served_name)).unwrap(),
+            payload
+        );
     }
 
     let bob_file_name = format!("matrix-bob-{:04x}.bin", case.bits);
@@ -1042,9 +1100,12 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
         (&primary, root.join("alice-downloads")),
         (&linked, root.join("alice-linked-downloads")),
     ] {
-        let event = wait_event(client, "matrix Bob file", Duration::from_secs(20), |event| {
-            matches!(event, NetworkEvent::FileReceived { served_name, .. } if served_name == &bob_file_name)
-        });
+        let event = wait_event(
+            client,
+            "matrix Bob file",
+            Duration::from_secs(20),
+            |event| matches!(event, NetworkEvent::FileReceived { served_name, .. } if served_name == &bob_file_name),
+        );
         let NetworkEvent::FileReceived { served_name, .. } = event else {
             unreachable!()
         };
@@ -1134,10 +1195,27 @@ fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
     let mut bob = Some(spawn(bob_config.clone()));
     wait_authenticated(alice.as_ref().unwrap(), "alice initial");
     wait_authenticated(bob.as_ref().unwrap(), "bob initial");
-    alice.as_ref().unwrap().handle.try_send(NetworkCommand::OpenDm(UserId(2))).unwrap();
-    let opened = wait_event(alice.as_ref().unwrap(), "open dm", Duration::from_secs(10), |event| matches!(event, NetworkEvent::DmOpened { .. }));
-    let NetworkEvent::DmOpened { room_id, .. } = opened else { unreachable!() };
-    send_until_received(alice.as_ref().unwrap(), bob.as_ref().unwrap(), room_id, "matrix bootstrap");
+    alice
+        .as_ref()
+        .unwrap()
+        .handle
+        .try_send(NetworkCommand::OpenDm(UserId(2)))
+        .unwrap();
+    let opened = wait_event(
+        alice.as_ref().unwrap(),
+        "open dm",
+        Duration::from_secs(10),
+        |event| matches!(event, NetworkEvent::DmOpened { .. }),
+    );
+    let NetworkEvent::DmOpened { room_id, .. } = opened else {
+        unreachable!()
+    };
+    send_until_received(
+        alice.as_ref().unwrap(),
+        bob.as_ref().unwrap(),
+        room_id,
+        "matrix bootstrap",
+    );
 
     // Exhaust every combination of direction, sender restart, receiver
     // restart, and receiver-offline delivery. Each restart reopens the exact
@@ -1163,23 +1241,58 @@ fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
         if offline_receiver {
             if alice_sends {
                 drop(bob.take());
-                alice.as_ref().unwrap().handle.try_send(NetworkCommand::SendChat { room_id, body: body.clone() }).unwrap();
+                alice
+                    .as_ref()
+                    .unwrap()
+                    .handle
+                    .try_send(NetworkCommand::SendChat {
+                        room_id,
+                        body: body.clone(),
+                    })
+                    .unwrap();
                 thread::sleep(Duration::from_millis(150));
                 bob = Some(spawn(bob_config.clone()));
                 wait_authenticated(bob.as_ref().unwrap(), "bob offline restart");
-                wait_event(bob.as_ref().unwrap(), &body, Duration::from_secs(10), |event| matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body));
+                wait_event(
+                    bob.as_ref().unwrap(),
+                    &body,
+                    Duration::from_secs(10),
+                    |event| matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body),
+                );
             } else {
                 drop(alice.take());
-                bob.as_ref().unwrap().handle.try_send(NetworkCommand::SendChat { room_id, body: body.clone() }).unwrap();
+                bob.as_ref()
+                    .unwrap()
+                    .handle
+                    .try_send(NetworkCommand::SendChat {
+                        room_id,
+                        body: body.clone(),
+                    })
+                    .unwrap();
                 thread::sleep(Duration::from_millis(150));
                 alice = Some(spawn(alice_config.clone()));
                 wait_authenticated(alice.as_ref().unwrap(), "alice offline restart");
-                wait_event(alice.as_ref().unwrap(), &body, Duration::from_secs(10), |event| matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body));
+                wait_event(
+                    alice.as_ref().unwrap(),
+                    &body,
+                    Duration::from_secs(10),
+                    |event| matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body),
+                );
             }
         } else if alice_sends {
-            send_until_received(alice.as_ref().unwrap(), bob.as_ref().unwrap(), room_id, &body);
+            send_until_received(
+                alice.as_ref().unwrap(),
+                bob.as_ref().unwrap(),
+                room_id,
+                &body,
+            );
         } else {
-            send_until_received(bob.as_ref().unwrap(), alice.as_ref().unwrap(), room_id, &body);
+            send_until_received(
+                bob.as_ref().unwrap(),
+                alice.as_ref().unwrap(),
+                room_id,
+                &body,
+            );
         }
     }
 
@@ -1192,9 +1305,15 @@ fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
         .handle
         .try_send(NetworkCommand::SetUploadRate(1))
         .unwrap();
-    alice.as_ref().unwrap().handle.try_send(NetworkCommand::UploadFile {
-        room_id: Some(room_id), request: UploadFileRequest::new(source),
-    }).unwrap();
+    alice
+        .as_ref()
+        .unwrap()
+        .handle
+        .try_send(NetworkCommand::UploadFile {
+            room_id: Some(room_id),
+            request: UploadFileRequest::new(source),
+        })
+        .unwrap();
     wait_event(
         alice.as_ref().unwrap(),
         "durably queued MLS file",
@@ -1204,9 +1323,19 @@ fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
     drop(alice.take());
     alice = Some(spawn(alice_config));
     wait_authenticated(alice.as_ref().unwrap(), "file sender restart");
-    let received = wait_event(bob.as_ref().unwrap(), "MLS file", Duration::from_secs(20), |event| matches!(event, NetworkEvent::FileReceived { .. }));
-    let NetworkEvent::FileReceived { served_name, .. } = received else { unreachable!() };
-    assert_eq!(std::fs::read(root.join("bob-downloads").join(served_name)).unwrap(), payload);
+    let received = wait_event(
+        bob.as_ref().unwrap(),
+        "MLS file",
+        Duration::from_secs(20),
+        |event| matches!(event, NetworkEvent::FileReceived { .. }),
+    );
+    let NetworkEvent::FileReceived { served_name, .. } = received else {
+        unreachable!()
+    };
+    assert_eq!(
+        std::fs::read(root.join("bob-downloads").join(served_name)).unwrap(),
+        payload
+    );
 }
 
 #[test]
@@ -1230,15 +1359,13 @@ fn mls_live_maximum_linked_devices_receive_crossed_message_burst() {
             .handle
             .try_send(NetworkCommand::CreateDeviceLink)
             .unwrap();
-        let link = wait_event(&alice, "fanout Alice link", Duration::from_secs(10), |event| {
-            matches!(event, NetworkEvent::DeviceLinkCreated { .. })
-        });
-        let NetworkEvent::DeviceLinkCreated {
-            pairing_string,
-            transfer_password,
-            ..
-        } = link
-        else {
+        let link = wait_event(
+            &alice,
+            "fanout Alice link",
+            Duration::from_secs(10),
+            |event| matches!(event, NetworkEvent::DeviceLinkCreated { .. }),
+        );
+        let NetworkEvent::DeviceLinkCreated { pairing_string, .. } = link else {
             unreachable!()
         };
         let pair_config = config(
@@ -1251,7 +1378,6 @@ fn mls_live_maximum_linked_devices_receive_crossed_message_burst() {
         let (_, linked, _) = pair_device(
             pair_config,
             &pairing_string,
-            &transfer_password,
             &format!("Alice fanout {index:02}"),
         );
         alice_linked.push(linked);
@@ -1263,12 +1389,7 @@ fn mls_live_maximum_linked_devices_receive_crossed_message_burst() {
         let link = wait_event(&bob, "fanout Bob link", Duration::from_secs(10), |event| {
             matches!(event, NetworkEvent::DeviceLinkCreated { .. })
         });
-        let NetworkEvent::DeviceLinkCreated {
-            pairing_string,
-            transfer_password,
-            ..
-        } = link
-        else {
+        let NetworkEvent::DeviceLinkCreated { pairing_string, .. } = link else {
             unreachable!()
         };
         let pair_config = config(
@@ -1281,7 +1402,6 @@ fn mls_live_maximum_linked_devices_receive_crossed_message_burst() {
         let (_, linked, _) = pair_device(
             pair_config,
             &pairing_string,
-            &transfer_password,
             &format!("Bob fanout {index:02}"),
         );
         bob_linked.push(linked);
@@ -1403,14 +1523,41 @@ fn mls_live_fixed_group_three_accounts_with_heterogeneous_devices() {
             },
         ],
         vec![
-            UserConfig { id: UserId(1), internal_reference: "alice".into(), username: "Alice".into(), token_hash: hash_secret(ALICE_TOKEN) },
-            UserConfig { id: UserId(2), internal_reference: "bob".into(), username: "Bob".into(), token_hash: hash_secret(BOB_TOKEN) },
-            UserConfig { id: UserId(3), internal_reference: "carol".into(), username: "Carol".into(), token_hash: hash_secret(CAROL_TOKEN) },
+            UserConfig {
+                id: UserId(1),
+                internal_reference: "alice".into(),
+                username: "Alice".into(),
+                token_hash: hash_secret(ALICE_TOKEN),
+            },
+            UserConfig {
+                id: UserId(2),
+                internal_reference: "bob".into(),
+                username: "Bob".into(),
+                token_hash: hash_secret(BOB_TOKEN),
+            },
+            UserConfig {
+                id: UserId(3),
+                internal_reference: "carol".into(),
+                username: "Carol".into(),
+                token_hash: hash_secret(CAROL_TOKEN),
+            },
         ],
     );
-    let alice = spawn(config(&addrs, &root, "group-Alice-primary", ALICE_TOKEN, false));
+    let alice = spawn(config(
+        &addrs,
+        &root,
+        "group-Alice-primary",
+        ALICE_TOKEN,
+        false,
+    ));
     let bob = spawn(config(&addrs, &root, "group-Bob-primary", BOB_TOKEN, false));
-    let carol = spawn(config(&addrs, &root, "group-Carol-primary", CAROL_TOKEN, false));
+    let carol = spawn(config(
+        &addrs,
+        &root,
+        "group-Carol-primary",
+        CAROL_TOKEN,
+        false,
+    ));
     wait_authenticated(&alice, "group Alice primary");
     wait_authenticated(&bob, "group Bob primary");
     wait_authenticated(&carol, "group Carol primary");
@@ -1441,13 +1588,7 @@ fn mls_live_fixed_group_three_accounts_with_heterogeneous_devices() {
         GROUP_ROOM,
         "Alice third joined fixed group",
     );
-    let bob_second = link_device(
-        &addrs,
-        &root,
-        &bob,
-        "group-Bob-second",
-        "Bob group second",
-    );
+    let bob_second = link_device(&addrs, &root, &bob, "group-Bob-second", "Bob group second");
 
     let receivers = [
         &alice,
@@ -1457,7 +1598,12 @@ fn mls_live_fixed_group_three_accounts_with_heterogeneous_devices() {
         &bob_second,
         &carol,
     ];
-    send_to_all(&bob_second, &receivers, GROUP_ROOM, "Bob second joined fixed group");
+    send_to_all(
+        &bob_second,
+        &receivers,
+        GROUP_ROOM,
+        "Bob second joined fixed group",
+    );
     for (sender, body) in [
         (&alice, "fixed group from Alice"),
         (&bob, "fixed group from Bob"),
@@ -1536,12 +1682,7 @@ fn mls_live_pair_response_loss_reconciles_exact_device() {
         Duration::from_secs(10),
         |event| matches!(event, NetworkEvent::DeviceLinkCreated { .. }),
     );
-    let NetworkEvent::DeviceLinkCreated {
-        pairing_string,
-        transfer_password,
-        ..
-    } = link
-    else {
+    let NetworkEvent::DeviceLinkCreated { pairing_string, .. } = link else {
         unreachable!()
     };
     let ticket = decode_device_link_ticket(&pairing_string).unwrap();
@@ -1552,18 +1693,21 @@ fn mls_live_pair_response_loss_reconciles_exact_device() {
     let worker = spawn_device_pair_once(
         pair_config.clone(),
         ticket.clone(),
-        transfer_password.clone(),
         "pair loss linked".to_string(),
         false,
         Arc::new(AtomicU8::new(PAIRING_CANCELABLE)),
         PairingEventSender::for_test(tx, 1),
-    ).expect("spawn device pairing");
+    )
+    .expect("spawn device pairing");
     let failed = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
     proxy.join().unwrap();
     assert!(matches!(
         failed,
-        AppEvent::Pairing { event: PairingEvent::DeviceFailed { .. }, .. }
+        AppEvent::Pairing {
+            event: PairingEvent::DeviceFailed { .. },
+            ..
+        }
     ));
 
     pair_config.tcp_addr = addrs.tcp.clone();
@@ -1571,21 +1715,25 @@ fn mls_live_pair_response_loss_reconciles_exact_device() {
     let worker = spawn_device_pair_once(
         pair_config.clone(),
         ticket,
-        transfer_password,
         "pair loss linked".to_string(),
         false,
         Arc::new(AtomicU8::new(PAIRING_CANCELABLE)),
         PairingEventSender::for_test(tx, 2),
-    ).expect("spawn device pairing");
+    )
+    .expect("spawn device pairing");
     let recovered = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
-    let AppEvent::Pairing { event: PairingEvent::DeviceSucceeded {
-        token,
-        username,
-        udp_addr,
-        udp_probe_addr,
-        server_public_key,
-    }, .. } = recovered
+    let AppEvent::Pairing {
+        event:
+            PairingEvent::DeviceSucceeded {
+                token,
+                username,
+                udp_addr,
+                udp_probe_addr,
+                server_public_key,
+            },
+        ..
+    } = recovered
     else {
         panic!("pair response loss retry did not reconcile")
     };
@@ -1618,7 +1766,11 @@ fn mls_live_pair_response_loss_reconciles_exact_device() {
 fn mls_live_missing_and_corrupt_state_remain_public_only() {
     let _guard = live_mls_e2e_guard();
     for corrupt_database in [false, true] {
-        let label = if corrupt_database { "corrupt" } else { "missing" };
+        let label = if corrupt_database {
+            "corrupt"
+        } else {
+            "missing"
+        };
         let root = temp_dir(label);
         std::fs::create_dir_all(root.join("server")).unwrap();
         let addrs = start_server(&root);
@@ -1693,53 +1845,89 @@ fn mls_live_pair_close_cancel_future_history_and_revocation() {
     let bob = spawn(bob_config);
     let original_alice_device = wait_authenticated(&alice, "alice initial");
     wait_authenticated(&bob, "bob initial");
-    alice.handle.try_send(NetworkCommand::OpenDm(UserId(2))).unwrap();
-    let opened = wait_event(&alice, "open dm", Duration::from_secs(10), |event| matches!(event, NetworkEvent::DmOpened { .. }));
-    let NetworkEvent::DmOpened { room_id, .. } = opened else { unreachable!() };
+    alice
+        .handle
+        .try_send(NetworkCommand::OpenDm(UserId(2)))
+        .unwrap();
+    let opened = wait_event(&alice, "open dm", Duration::from_secs(10), |event| {
+        matches!(event, NetworkEvent::DmOpened { .. })
+    });
+    let NetworkEvent::DmOpened { room_id, .. } = opened else {
+        unreachable!()
+    };
     send_until_received(&alice, &bob, room_id, "history before pairing");
 
-    alice.handle.try_send(NetworkCommand::CreateDeviceLink).unwrap();
-    let link = wait_event(&alice, "create device link", Duration::from_secs(10), |event| matches!(event, NetworkEvent::DeviceLinkCreated { .. }));
-    let NetworkEvent::DeviceLinkCreated { pairing_string, transfer_password, .. } = link else { unreachable!() };
+    alice
+        .handle
+        .try_send(NetworkCommand::CreateDeviceLink)
+        .unwrap();
+    let link = wait_event(
+        &alice,
+        "create device link",
+        Duration::from_secs(10),
+        |event| matches!(event, NetworkEvent::DeviceLinkCreated { .. }),
+    );
+    let NetworkEvent::DeviceLinkCreated { pairing_string, .. } = link else {
+        unreachable!()
+    };
 
     // Closing the creator is deliberately not Cancel. Redemption must remain
     // possible after the generating UI/process disappears (dual boot).
     drop(alice);
     let linked_config = config(&addrs, &root, "Alice-linked", "unused", false);
-    let (linked_config, linked, linked_device) = pair_device(
-        linked_config,
-        &pairing_string,
-        &transfer_password,
-        "Alice linked",
-    );
+    let (linked_config, linked, linked_device) =
+        pair_device(linked_config, &pairing_string, "Alice linked");
     assert_ne!(linked_device, original_alice_device);
-    send_to_all(
-        &linked,
-        &[&linked, &bob],
-        room_id,
-        "future after pairing",
-    );
+    send_to_all(&linked, &[&linked, &bob], room_id, "future after pairing");
 
     // Reopen the original installation, revoke it from the linked device, and
     // prove the affected room automatically removes the old leaf and resumes.
     alice = spawn(alice_config.clone());
-    assert_eq!(wait_authenticated(&alice, "alice original reopen"), original_alice_device);
-    linked.handle.try_send(NetworkCommand::RevokeE2eDevice { device_id: original_alice_device }).unwrap();
+    assert_eq!(
+        wait_authenticated(&alice, "alice original reopen"),
+        original_alice_device
+    );
+    linked
+        .handle
+        .try_send(NetworkCommand::RevokeE2eDevice {
+            device_id: original_alice_device,
+        })
+        .unwrap();
     send_until_received(&linked, &bob, room_id, "after revocation removal");
     drop(alice);
 
     // Explicit Cancel has the opposite contract: once acknowledged, the
     // exposed ticket cannot be redeemed.
-    linked.handle.try_send(NetworkCommand::CreateDeviceLink).unwrap();
-    let canceled_link = wait_event(&linked, "create canceled link", Duration::from_secs(10), |event| matches!(event, NetworkEvent::DeviceLinkCreated { .. }));
+    linked
+        .handle
+        .try_send(NetworkCommand::CreateDeviceLink)
+        .unwrap();
+    let canceled_link = wait_event(
+        &linked,
+        "create canceled link",
+        Duration::from_secs(10),
+        |event| matches!(event, NetworkEvent::DeviceLinkCreated { .. }),
+    );
     let NetworkEvent::DeviceLinkCreated {
         redemption_secret_hash,
         pairing_string,
-        transfer_password,
         ..
-    } = canceled_link else { unreachable!() };
-    linked.handle.try_send(NetworkCommand::CancelDeviceLink { redemption_secret_hash }).unwrap();
-    wait_event(&linked, "cancel device link", Duration::from_secs(10), |event| matches!(event, NetworkEvent::DeviceLinkCanceled));
+    } = canceled_link
+    else {
+        unreachable!()
+    };
+    linked
+        .handle
+        .try_send(NetworkCommand::CancelDeviceLink {
+            redemption_secret_hash,
+        })
+        .unwrap();
+    wait_event(
+        &linked,
+        "cancel device link",
+        Duration::from_secs(10),
+        |event| matches!(event, NetworkEvent::DeviceLinkCanceled),
+    );
 
     let canceled_config = config(&addrs, &root, "Alice-canceled", "unused", false);
     let ticket = decode_device_link_ticket(&pairing_string).unwrap();
@@ -1747,15 +1935,21 @@ fn mls_live_pair_close_cancel_future_history_and_revocation() {
     let worker = spawn_device_pair_once(
         canceled_config,
         ticket,
-        transfer_password,
         "must not link".into(),
         false,
         Arc::new(AtomicU8::new(PAIRING_CANCELABLE)),
         PairingEventSender::for_test(tx, 1),
-    ).expect("spawn device pairing");
+    )
+    .expect("spawn device pairing");
     let result = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
-    assert!(matches!(result, AppEvent::Pairing { event: PairingEvent::DeviceFailed { .. }, .. }));
+    assert!(matches!(
+        result,
+        AppEvent::Pairing {
+            event: PairingEvent::DeviceFailed { .. },
+            ..
+        }
+    ));
 
     // The surviving paired installation remains restartable after all roster
     // and membership changes.
@@ -1793,31 +1987,54 @@ fn mls_live_revocation_exhaustive_matrix() {
         let message_before_revocation = bits & 4 != 0;
         let mut room_id = None;
         if dm_before_link {
-            alice.handle.try_send(NetworkCommand::OpenDm(UserId(2))).unwrap();
-            let opened = wait_event(&alice, "pre-link dm", Duration::from_secs(10), |event| matches!(event, NetworkEvent::DmOpened { .. }));
-            let NetworkEvent::DmOpened { room_id: opened, .. } = opened else { unreachable!() };
+            alice
+                .handle
+                .try_send(NetworkCommand::OpenDm(UserId(2)))
+                .unwrap();
+            let opened = wait_event(&alice, "pre-link dm", Duration::from_secs(10), |event| {
+                matches!(event, NetworkEvent::DmOpened { .. })
+            });
+            let NetworkEvent::DmOpened {
+                room_id: opened, ..
+            } = opened
+            else {
+                unreachable!()
+            };
             send_until_received(&alice, &bob, opened, &format!("pre-link {bits}"));
             room_id = Some(opened);
         }
 
-        alice.handle.try_send(NetworkCommand::CreateDeviceLink).unwrap();
-        let link = wait_event(&alice, "revocation link", Duration::from_secs(10), |event| matches!(event, NetworkEvent::DeviceLinkCreated { .. }));
-        let NetworkEvent::DeviceLinkCreated { pairing_string, transfer_password, .. } = link else { unreachable!() };
-        let victim_config = config(&addrs, &root, "Alice-victim", "unused", false);
-        let (victim_config, victim, victim_id) = pair_device(
-            victim_config,
-            &pairing_string,
-            &transfer_password,
-            "revocation victim",
+        alice
+            .handle
+            .try_send(NetworkCommand::CreateDeviceLink)
+            .unwrap();
+        let link = wait_event(
+            &alice,
+            "revocation link",
+            Duration::from_secs(10),
+            |event| matches!(event, NetworkEvent::DeviceLinkCreated { .. }),
         );
+        let NetworkEvent::DeviceLinkCreated { pairing_string, .. } = link else {
+            unreachable!()
+        };
+        let victim_config = config(&addrs, &root, "Alice-victim", "unused", false);
+        let (victim_config, victim, victim_id) =
+            pair_device(victim_config, &pairing_string, "revocation victim");
         let mut victim = Some(victim);
 
         let room_id = match room_id {
             Some(room_id) => room_id,
             None => {
-                alice.handle.try_send(NetworkCommand::OpenDm(UserId(2))).unwrap();
-                let opened = wait_event(&alice, "post-link dm", Duration::from_secs(10), |event| matches!(event, NetworkEvent::DmOpened { .. }));
-                let NetworkEvent::DmOpened { room_id, .. } = opened else { unreachable!() };
+                alice
+                    .handle
+                    .try_send(NetworkCommand::OpenDm(UserId(2)))
+                    .unwrap();
+                let opened = wait_event(&alice, "post-link dm", Duration::from_secs(10), |event| {
+                    matches!(event, NetworkEvent::DmOpened { .. })
+                });
+                let NetworkEvent::DmOpened { room_id, .. } = opened else {
+                    unreachable!()
+                };
                 room_id
             }
         };
@@ -1834,7 +2051,12 @@ fn mls_live_revocation_exhaustive_matrix() {
             send_until_received(&bob, &alice, room_id, &format!("before revoke {bits}"));
         }
 
-        alice.handle.try_send(NetworkCommand::RevokeE2eDevice { device_id: victim_id }).unwrap();
+        alice
+            .handle
+            .try_send(NetworkCommand::RevokeE2eDevice {
+                device_id: victim_id,
+            })
+            .unwrap();
         let queued_file = if bits == 0 {
             let payload = b"file announcement queued behind revocation".repeat(4096);
             let source = root.join("queued-behind-revocation.bin");
@@ -1882,7 +2104,13 @@ fn mls_live_competing_membership_commits_roll_back_loser_and_resume() {
     let root = temp_dir("competing-commits");
     std::fs::create_dir_all(root.join("server")).unwrap();
     let addrs = start_server(&root);
-    let alice = spawn(config(&addrs, &root, "compete-Alice-primary", ALICE_TOKEN, false));
+    let alice = spawn(config(
+        &addrs,
+        &root,
+        "compete-Alice-primary",
+        ALICE_TOKEN,
+        false,
+    ));
     let bob = spawn(config(&addrs, &root, "compete-Bob", BOB_TOKEN, false));
     wait_authenticated(&alice, "competing Alice primary");
     wait_authenticated(&bob, "competing Bob");

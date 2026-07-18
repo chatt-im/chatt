@@ -3,11 +3,11 @@
 //! MLS authenticates leaves inside a group. These types bind those leaves to
 //! Chatt accounts and are deliberately independent of MLS serialization.
 
-use jsony::Jsony;
 use aws_lc_rs::{
     digest,
     signature::{self, KeyPair, VerificationAlgorithm},
 };
+use jsony::Jsony;
 
 use crate::ids::{AccountId, DeviceId, UserId};
 

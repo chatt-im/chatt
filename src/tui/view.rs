@@ -713,10 +713,7 @@ impl ClientView {
         true
     }
 
-    pub(crate) fn sync_daemon_config(
-        &mut self,
-        config: &Config,
-    ) {
+    pub(crate) fn sync_daemon_config(&mut self, config: &Config) {
         let theme = config.ui.resolve_theme();
         if self.theme != theme {
             self.apply_theme(theme);

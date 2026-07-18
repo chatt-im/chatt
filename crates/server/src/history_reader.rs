@@ -21,7 +21,10 @@ use rpc::{
     ids::{MessageId, RoomId, SessionId},
 };
 
-use crate::{event_queue::EventQueue, room_store::{LogRecords, ResidentHistory}};
+use crate::{
+    event_queue::EventQueue,
+    room_store::{LogRecords, ResidentHistory},
+};
 
 const REQUEST_QUEUE_CAPACITY: usize = 32;
 

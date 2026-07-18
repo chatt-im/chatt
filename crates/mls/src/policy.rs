@@ -56,9 +56,7 @@ impl fmt::Display for PolicyError {
             Self::ActiveDeviceRemoval => {
                 f.write_str("commit removes a device that is still active")
             }
-            Self::InvalidGroupRoster => {
-                f.write_str("commit would violate the fixed room roster")
-            }
+            Self::InvalidGroupRoster => f.write_str("commit would violate the fixed room roster"),
             Self::ReinitializationNotAllowed => {
                 f.write_str("MLS reinitialization would change the immutable room")
             }
@@ -285,11 +283,7 @@ impl ChattIdentityProvider {
 
     pub fn account_for_client(&self, client_id: &[u8]) -> Result<AccountId, PolicyError> {
         let state = self.state.read().map_err(|_| PolicyError::LockPoisoned)?;
-        if let Some(account_id) = state
-            .devices
-            .get(client_id)
-            .map(|device| device.account_id)
-        {
+        if let Some(account_id) = state.devices.get(client_id).map(|device| device.account_id) {
             return Ok(account_id);
         }
         parse_mls_client_id(&self.server_id, client_id)
@@ -326,17 +320,18 @@ impl IdentityProvider for ChattIdentityProvider {
             _ => None,
         };
         if let Some(group_id) = historical_group_id {
-            return self.validate_in_group(signing_identity, Some(group_id)).or_else(|error| {
-                if matches!(
-                    &error,
-                    PolicyError::UnknownDevice | PolicyError::SignatureKeyMismatch
-                )
-                {
-                    self.validate_historical_in_group(signing_identity, group_id)
-                } else {
-                    Err(error)
-                }
-            });
+            return self
+                .validate_in_group(signing_identity, Some(group_id))
+                .or_else(|error| {
+                    if matches!(
+                        &error,
+                        PolicyError::UnknownDevice | PolicyError::SignatureKeyMismatch
+                    ) {
+                        self.validate_historical_in_group(signing_identity, group_id)
+                    } else {
+                        Err(error)
+                    }
+                });
         }
         let group_id = match context {
             MemberValidationContext::ForCommit {
@@ -669,13 +664,7 @@ mod tests {
         assert!(!identities.is_active(&old_identity).unwrap());
         assert!(identities.is_active(&current_identity).unwrap());
 
-        let mut equivocation = roster(
-            server,
-            UserId(1),
-            &[1; 32],
-            DeviceId([3; 16]),
-            &[13; 32],
-        );
+        let mut equivocation = roster(server, UserId(1), &[1; 32], DeviceId([3; 16]), &[13; 32]);
         equivocation.body.revision = 2;
         let equivocation = sign_device_roster(equivocation.body, &[1; 32]).unwrap();
         assert!(matches!(

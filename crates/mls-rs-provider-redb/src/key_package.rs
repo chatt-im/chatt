@@ -13,9 +13,7 @@ use redb::{
     Database, ReadableDatabase, ReadableMultimapTable, ReadableTable, ReadableTableMetadata,
 };
 
-use crate::{
-    database_error, RedbDataStorageError, KEY_PACKAGES, KEY_PACKAGE_EXPIRY,
-};
+use crate::{database_error, RedbDataStorageError, KEY_PACKAGES, KEY_PACKAGE_EXPIRY};
 
 #[derive(Clone, Debug)]
 pub struct RedbKeyPackageStorage {
@@ -156,10 +154,7 @@ impl RedbKeyPackageStorage {
             let packages = transaction
                 .open_table(KEY_PACKAGES)
                 .map_err(database_error)?;
-            let indexed_ids: HashSet<&[u8]> = indexed
-                .iter()
-                .map(|(_, id)| id.as_slice())
-                .collect();
+            let indexed_ids: HashSet<&[u8]> = indexed.iter().map(|(_, id)| id.as_slice()).collect();
             for (expiration, id) in &indexed {
                 let record = packages
                     .get(id.as_slice())
