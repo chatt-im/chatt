@@ -81,6 +81,41 @@ const MAX_RECENT_VOICE_STREAMS: usize = 256;
 /// discarded so recovery sends current audio instead of a stale burst.
 const MAX_QUEUED_MICROPHONE_PACKETS: usize = 10;
 
+/// How inbound audio should behave when no playback sink is currently usable.
+///
+/// WebRTC keeps pulling receive streams through a null audio device while
+/// device playout is disabled, which prevents NetEQ from accumulating old
+/// audio. Chatt tears its playback graph down on deafen instead, so suspended
+/// ingress discards packets until a fresh sink attaches. The distinct initial
+/// state retains the short startup queue used while the first sink is opening.
+#[derive(Clone, Default)]
+enum PlaybackIngressState {
+    #[default]
+    Buffering,
+    Attached(LivePlaybackSink),
+    Suspended,
+}
+
+impl PlaybackIngressState {
+    fn sink(&self) -> Option<&LivePlaybackSink> {
+        match self {
+            Self::Attached(sink) => Some(sink),
+            Self::Buffering | Self::Suspended => None,
+        }
+    }
+
+    fn buffer_without_sink(&self) -> bool {
+        matches!(self, Self::Buffering)
+    }
+
+    fn from_sink_update(sink: Option<LivePlaybackSink>) -> Self {
+        match sink {
+            Some(sink) => Self::Attached(sink),
+            None => Self::Suspended,
+        }
+    }
+}
+
 /// Candidate privacy output shared with focused candidate-policy tests.
 pub(super) struct GatheredP2p {
     pub(super) local: Vec<Candidate>,
@@ -1350,7 +1385,7 @@ struct VoiceLoop {
     output_buf: VoiceOutputBatch,
     generation: Option<u64>,
     session: Option<VoiceSession>,
-    playback_sink: Option<LivePlaybackSink>,
+    playback_ingress: PlaybackIngressState,
     udp_work: bool,
     mdns_work: u8,
     command_work: bool,
@@ -1377,7 +1412,7 @@ impl VoiceLoop {
             output_buf: VoiceOutputBatch::default(),
             generation: None,
             session: None,
-            playback_sink: None,
+            playback_ingress: PlaybackIngressState::default(),
             udp_work: false,
             mdns_work: 0,
             command_work: false,
@@ -1469,7 +1504,7 @@ impl VoiceLoop {
             return;
         }
         if let Some(sink) = self.playback_sink_update.take() {
-            self.playback_sink = sink.clone();
+            self.playback_ingress = PlaybackIngressState::from_sink_update(sink.clone());
             if let Some(session) = self.session.as_mut() {
                 session.set_playback_sink(sink);
             }
@@ -1521,7 +1556,7 @@ impl VoiceLoop {
                 );
                 match result {
                     Ok(mut session) => {
-                        session.set_playback_sink(self.playback_sink.clone());
+                        session.set_playback_ingress(self.playback_ingress.clone());
                         self.generation = Some(generation);
                         self.session = Some(session);
                         self.udp_work = true;
@@ -1713,7 +1748,7 @@ struct VoiceSession {
     server_rtt_in_flight: VecDeque<(u64, Instant)>,
     server_rtt_ms: Option<f32>,
     server_rtt_last_sample_at: Option<Instant>,
-    playback_sink: Option<LivePlaybackSink>,
+    playback_ingress: PlaybackIngressState,
     pending_playback_packets: VecDeque<crate::audio::RemoteVoicePacket>,
     encoder_feedback: EncoderFeedbackController,
     restart_port_policy: RestartPortPolicy,
@@ -1802,7 +1837,7 @@ impl VoiceSession {
             server_rtt_in_flight: VecDeque::new(),
             server_rtt_ms: None,
             server_rtt_last_sample_at: None,
-            playback_sink: None,
+            playback_ingress: PlaybackIngressState::default(),
             pending_playback_packets: VecDeque::new(),
             encoder_feedback: EncoderFeedbackController::new(),
             restart_port_policy: RestartPortPolicy::default(),
@@ -1818,7 +1853,7 @@ impl VoiceSession {
     fn shutdown(&mut self, poll: &Poll) {
         let _ = poll.registry().deregister(&mut self.udp);
         self.mdns.shutdown(poll.registry());
-        self.playback_sink = None;
+        self.playback_ingress = PlaybackIngressState::Suspended;
         self.pending_playback_packets.clear();
         self.p2p_peers.clear();
         self.inbound_streams.clear();
@@ -2732,7 +2767,8 @@ impl VoiceSession {
         }
         dispatch_voice_packet_to(
             &self.events,
-            self.playback_sink.as_ref(),
+            self.playback_ingress.sink(),
+            self.playback_ingress.buffer_without_sink(),
             &mut self.pending_playback_packets,
             packet,
         );
@@ -2782,15 +2818,21 @@ impl VoiceSession {
     }
 
     fn set_playback_sink(&mut self, sink: Option<LivePlaybackSink>) {
-        let Some(sink) = sink else {
-            self.playback_sink = None;
-            self.pending_playback_packets.clear();
+        self.set_playback_ingress(PlaybackIngressState::from_sink_update(sink));
+    }
+
+    fn set_playback_ingress(&mut self, state: PlaybackIngressState) {
+        let PlaybackIngressState::Attached(sink) = state else {
+            if matches!(state, PlaybackIngressState::Suspended) {
+                self.pending_playback_packets.clear();
+            }
+            self.playback_ingress = state;
             return;
         };
         while let Some(packet) = self.pending_playback_packets.pop_front() {
             sink.push(packet);
         }
-        self.playback_sink = Some(sink);
+        self.playback_ingress = PlaybackIngressState::Attached(sink);
     }
 
     fn clear_pending_playback_stream(&mut self, stream_id: StreamId) {
@@ -3736,6 +3778,51 @@ mod tests {
     }
 
     #[test]
+    fn deafened_playback_does_not_queue_stale_audio_for_resume() {
+        let (mut actor, _main_poll) = direct_loop();
+        assert!(actor.commands.submit(start_command(1)).is_ok());
+        actor.commands.activate(1).unwrap();
+        actor.drain_commands();
+
+        // Deafen detaches the playback sink. A continuous 20 ms stream must not
+        // accumulate behind it: feeding those packets to the replacement NetEQ
+        // on undeafen turns the intentional pause into playout delay.
+        actor.commands.submit_playback_sink(None).unwrap();
+        actor.drain_commands();
+        {
+            let session = actor.session.as_mut().unwrap();
+            for sequence in 0..75 {
+                session.dispatch_voice_packet(
+                    crate::audio::RemoteVoicePacket {
+                        stream_id: 8,
+                        sequence,
+                        timestamp: sequence * 960,
+                        flags: 0,
+                        payload: VoicePayload::Opus(vec![1, 2, 3]),
+                        received_at: Instant::now(),
+                    },
+                    "server",
+                );
+            }
+
+            assert!(
+                session.pending_playback_packets.is_empty(),
+                "deafened playback retained {} ms of stale audio",
+                session.pending_playback_packets.len() * 20
+            );
+        }
+
+        actor
+            .commands
+            .submit_playback_sink(Some(LivePlaybackSink::for_test()))
+            .unwrap();
+        actor.drain_commands();
+        let session = actor.session.as_ref().unwrap();
+        assert!(session.playback_ingress.sink().is_some());
+        assert!(session.pending_playback_packets.is_empty());
+    }
+
+    #[test]
     fn playback_feedback_without_stream_owner_uses_server_relay() {
         let actor_poll = Poll::new().unwrap();
         let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
@@ -3800,10 +3887,11 @@ mod tests {
     #[test]
     fn generation_lifecycle_resets_packet_state_and_ignores_stale_commands() {
         let (mut actor, _main_poll) = direct_loop();
-        actor.playback_sink = Some(LivePlaybackSink::for_test());
+        actor.playback_ingress =
+            PlaybackIngressState::Attached(LivePlaybackSink::for_test());
         actor.apply_command(start_command(4));
         let session = actor.session.as_mut().unwrap();
-        assert!(session.playback_sink.is_some());
+        assert!(session.playback_ingress.sink().is_some());
         session.media_send_counter = 99;
         session.local_sequence = 77;
         session.voice_room = Some(RoomId(8));
@@ -3831,7 +3919,7 @@ mod tests {
         assert!(session.pending_playback_packets.is_empty());
         assert!(session.p2p_peers.is_empty());
         assert!(session.server_rtt_in_flight.is_empty());
-        assert!(session.playback_sink.is_some());
+        assert!(session.playback_ingress.sink().is_some());
     }
 
     #[test]
