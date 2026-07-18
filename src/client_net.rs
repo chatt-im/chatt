@@ -6303,6 +6303,7 @@ fn audio_pop_should_log_packet(flags: u8, payload_kind: &str) -> bool {
 fn dispatch_voice_packet_to(
     events: &NetworkEventSender,
     playback_sink: Option<&LivePlaybackSink>,
+    buffer_without_sink: bool,
     pending_playback_packets: &mut VecDeque<RemoteVoicePacket>,
     packet: RemoteVoicePacket,
 ) {
@@ -6317,7 +6318,7 @@ fn dispatch_voice_packet_to(
             sink.push(packet);
         }
         sink.push(packet);
-    } else {
+    } else if buffer_without_sink {
         if pending_playback_packets.len() == MAX_PENDING_PLAYBACK_PACKETS {
             pending_playback_packets.pop_front();
         }
@@ -7345,6 +7346,7 @@ mod tests {
         dispatch_voice_packet_to(
             &events,
             None,
+            true,
             &mut pending,
             test_remote_voice_packet(7, 3, vec![1, 2, 3, 4]),
         );
@@ -7375,6 +7377,7 @@ mod tests {
         dispatch_voice_packet_to(
             &events,
             Some(&sink),
+            true,
             &mut pending,
             test_remote_voice_packet(9, 4, vec![5, 6, 7]),
         );
