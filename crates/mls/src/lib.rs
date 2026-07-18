@@ -25,4 +25,5 @@ pub use bootstrap::{
     BOOTSTRAP_VERSION, BootstrapLoad, BootstrapState, E2eBootstrap, InstallationState,
     classify_installation, load_bootstrap,
 };
-pub use installation::LocalInstallation;
+pub use installation::{LocalInstallation, StorageCompactionOutcome};
+pub use mls_rs_provider_redb::RedbStorageStats;

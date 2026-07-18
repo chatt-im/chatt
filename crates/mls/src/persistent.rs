@@ -27,7 +27,7 @@ use mls_rs::{
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs_crypto_awslc::AwsLcCryptoProvider;
 use mls_rs_provider_redb::{
-    RedbDataStorageEngine,
+    RedbDataStorageEngine, RedbStorageStats,
     storage::{
         Item, RedbApplicationStorage, RedbGroupStateStorage, RedbKeyPackageStorage,
         RedbPreSharedKeyStorage,
@@ -185,6 +185,7 @@ struct PendingCommitRecord {
 /// One installation's MLS client and encrypted application cache.
 pub struct PersistentClient {
     client: Client<PersistentConfig>,
+    storage: RedbDataStorageEngine,
     application: RedbApplicationStorage,
     identities: ChattIdentityProvider,
     signing_secret: SignatureSecretKey,
@@ -286,6 +287,7 @@ impl PersistentClient {
             .build();
         Ok(Self {
             client,
+            storage,
             application,
             identities,
             signing_secret,
@@ -299,6 +301,27 @@ impl PersistentClient {
             .ok_or_else(|| "mandatory MLS cipher suite is unavailable".to_string())?
             .sign(&self.signing_secret, message)
             .map_err(|error| error.to_string())
+    }
+
+    pub fn storage_stats(&self) -> Result<RedbStorageStats, String> {
+        self.storage
+            .storage_stats()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn storage_is_quiescent(&self) -> Result<bool, String> {
+        self.pending_external_rejoins
+            .lock()
+            .map(|groups| groups.is_empty())
+            .map_err(|_| "pending external rejoin lock is poisoned".to_string())
+    }
+
+    pub fn clear_transient_groups(&self) -> Result<(), String> {
+        self.pending_external_rejoins
+            .lock()
+            .map_err(|_| "pending external rejoin lock is poisoned".to_string())?
+            .clear();
+        Ok(())
     }
 
     pub fn generate_key_packages(

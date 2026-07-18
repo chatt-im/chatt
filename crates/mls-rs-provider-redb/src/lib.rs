@@ -17,7 +17,9 @@ use std::{
     sync::Arc,
 };
 
-use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition};
+use redb::{
+    CompactionError, Database, MultimapTableDefinition, ReadableTable, TableDefinition,
+};
 use thiserror::Error;
 
 mod application;
@@ -62,6 +64,8 @@ pub enum RedbDataStorageError {
     #[error(transparent)]
     Database(#[from] redb::Error),
     #[error(transparent)]
+    Compaction(#[from] CompactionError),
+    #[error(transparent)]
     MlsCodec(#[from] mls_rs_core::mls_rs_codec::Error),
     #[error("unsupported provider schema version {found}; supported version is {supported}")]
     UnsupportedSchemaVersion { found: u64, supported: u64 },
@@ -77,6 +81,14 @@ pub enum RedbDataStorageError {
     CorruptRecord(String),
     #[error("key-package expiration secondary index is inconsistent: {0}")]
     SecondaryIndexInconsistency(String),
+}
+
+/// Storage usage reported by redb for an open MLS database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RedbStorageStats {
+    pub allocated_bytes: u64,
+    pub stored_bytes: u64,
+    pub fragmented_bytes: u64,
 }
 
 impl mls_rs_core::error::IntoAnyError for RedbDataStorageError {
@@ -170,6 +182,34 @@ impl RedbDataStorageEngine {
         RedbApplicationStorage::new(Arc::clone(&self.database))
     }
 
+    /// Returns redb's current allocation and fragmentation accounting.
+    pub fn storage_stats(&self) -> Result<RedbStorageStats, RedbDataStorageError> {
+        let transaction = self.database.begin_write().map_err(database_error)?;
+        let stats = transaction.stats().map_err(database_error)?;
+        let allocated_bytes = stats
+            .allocated_pages()
+            .saturating_mul(stats.page_size() as u64);
+        let result = RedbStorageStats {
+            allocated_bytes,
+            stored_bytes: stats.stored_bytes(),
+            fragmented_bytes: stats.fragmented_bytes(),
+        };
+        transaction.abort().map_err(database_error)?;
+        Ok(result)
+    }
+
+    /// Fully compacts a database file that is not open anywhere else.
+    ///
+    /// redb requires unique mutable ownership for full page relocation. Callers
+    /// must drop every engine and storage adapter for `path` before invoking
+    /// this function.
+    pub fn compact_file(path: impl AsRef<Path>) -> Result<bool, RedbDataStorageError> {
+        let path = path.as_ref();
+        ensure_private_file(path)?;
+        let mut database = Database::create(path).map_err(database_error)?;
+        database.compact().map_err(Into::into)
+    }
+
     /// Returns the shared database for advanced redb configuration or inspection.
     pub fn database(&self) -> Arc<Database> {
         Arc::clone(&self.database)
@@ -213,4 +253,23 @@ fn ensure_private_file(path: &Path) -> Result<(), RedbDataStorageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_stats_and_compacts_after_all_adapters_are_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mls.redb");
+        let engine = RedbDataStorageEngine::open(&path).unwrap();
+        let stats = engine.storage_stats().unwrap();
+        assert!(stats.allocated_bytes >= stats.stored_bytes);
+        drop(engine);
+
+        RedbDataStorageEngine::compact_file(&path).unwrap();
+        let reopened = RedbDataStorageEngine::open(&path).unwrap();
+        assert!(reopened.storage_stats().is_ok());
+    }
 }
