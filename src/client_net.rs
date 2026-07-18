@@ -1,15 +1,13 @@
 use chatt_mls::LocalInstallation;
 use hashbrown::{HashMap, HashSet};
+#[cfg(test)]
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    net::{
-        IpAddr, SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs,
-        UdpSocket as StdUdpSocket,
-    },
+    net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
@@ -22,16 +20,15 @@ use std::{
 };
 
 use aws_lc_rs::rand::SecureRandom;
+use chatt_p2p::{Candidate, CandidateKind, IceRole, NatKind, RestartPortPolicy};
+#[cfg(test)]
 use chatt_p2p::{
-    Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole,
-    NatClassifier, NatKind, ReflexiveObservation, RestartPortPolicy, StunAuth, TraversalAgent,
+    AgentConfig as P2pAgentConfig, StunAuth, TraversalAgent,
     interfaces::InterfaceSnapshot,
-    socket::{UdpSocketOptions, bind_udp_socket, is_ignorable_udp_error},
-    stun::{StunMessage, is_stun_message},
 };
 use mio::{
     Events, Interest, Poll, Token, Waker,
-    net::{TcpStream, UdpSocket},
+    net::TcpStream,
 };
 use rpc::{
     control::{
@@ -45,12 +42,12 @@ use rpc::{
         encode_client_control, encode_client_hello, encode_device_link_ticket, max_file_wire_bytes,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, RecordProtection, SessionTransport,
-        TransportMode, complete_client_transport_handshake, dev_server_public_key,
-        ed25519_public_key_from_hex, encode_hex, generate_client_hello,
+        CHANNEL_CONTROL, KEY_LEN, KeyMaterial, RecordProtection, SessionTransport, TransportMode,
+        complete_client_transport_handshake, dev_server_public_key, ed25519_public_key_from_hex,
+        encode_hex, generate_client_hello,
     },
     evented::{
-        MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, recv_datagram_with,
+        MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error,
         write_queue_to,
     },
     frame, history,
@@ -65,6 +62,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(test)]
 use rpc::evented::ReadPumpOutcome;
+#[cfg(test)]
+use rpc::crypto::AntiReplay;
+#[cfg(test)]
+use std::net::IpAddr;
 
 use crate::app::{NetworkEventSender, PairingEventSender};
 use crate::audio::{
@@ -76,22 +77,21 @@ use crate::e2e::{AcceptedPeerIdentity, AuthenticatedChat, E2eState};
 use crate::file_compression::{
     self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
 };
-use crate::mdns::{MdnsSystem, generate_mdns_name};
+use crate::mdns::generate_mdns_name;
 use crate::receive_store::{DiskReservation, Reservation};
 
 mod mls_actor;
+mod voice;
+
+use voice::{GatheredP2p, PeerConnection};
+#[cfg(test)]
+use voice::{
+    EncoderFeedbackController, InterfaceMonitor, RecentVoiceSequenceResult, RecentVoiceSequences,
+    direct_path_healthy, relay_suppressed,
+};
 
 const TCP: Token = Token(0);
-const UDP: Token = Token(1);
-const WAKE: Token = Token(2);
-const MDNS_V4: Token = Token(3);
-const MDNS_V6: Token = Token(4);
-/// Poll tick while p2p peers exist. The traversal agents' retransmissions,
-/// keepalives, and consent timers, plus direct-path stability and relay
-/// suppression, are polled rather than scheduling their own wakes, so they
-/// need a steady cadence. Voice alone does not arm it: sends are paced by the
-/// command waker and receives by socket readiness.
-const P2P_POLL_TIMEOUT: Duration = Duration::from_millis(20);
+const WAKE: Token = Token(1);
 /// Backstop poll timeout while idle. Sockets, the command waker, and the
 /// deadline wakes in [`WorkerState::next_poll_timeout`] drive the loop; this
 /// only bounds how long a missed schedule could sleep.
@@ -171,8 +171,6 @@ const MAX_SERVER_CONTROLS_PER_FILE_PUMP: usize = 8;
 const MAX_SERVER_CONTROLS_PER_ITERATION: usize = 64;
 const MAX_BUFFERED_SERVER_BYTES: usize = 2 * 1024 * 1024;
 const TCP_WRITE_ATTEMPTS: usize = 32;
-const UDP_DRAIN_BUDGET: usize = 64;
-const MDNS_DRAIN_BUDGET: usize = 32;
 /// Byte step between [`NetworkEvent::TransferProgress`] ticks. Small enough for a
 /// smooth progress bar, coarse enough to keep the event channel and web feed from
 /// flooding on a fast transfer. First and final ticks are always emitted.
@@ -183,7 +181,6 @@ const MAX_COMMANDS_PER_ITERATION: usize = 8;
 const DEFAULT_INITIAL_DEVICE_NAME: &str = "first-device";
 const MAX_PENDING_PLAYBACK_PACKETS: usize = 256;
 const MAX_RECENT_VOICE_SEQUENCES: usize = 512;
-const MAX_RECENT_VOICE_STREAMS: usize = 256;
 const RECENT_VOICE_SEQUENCE_WORD_BITS: usize = u64::BITS as usize;
 const RECENT_VOICE_SEQUENCE_WORDS: usize =
     MAX_RECENT_VOICE_SEQUENCES / RECENT_VOICE_SEQUENCE_WORD_BITS;
@@ -226,15 +223,10 @@ impl PollSchedule {
 enum WorkerTask {
     TcpRead,
     TcpWrite,
-    UdpDrain,
-    MdnsDrain(Token),
 }
 
 const WORK_TCP_READ: u8 = 1 << 0;
 const WORK_TCP_WRITE: u8 = 1 << 1;
-const WORK_UDP_DRAIN: u8 = 1 << 2;
-const WORK_MDNS_V4_DRAIN: u8 = 1 << 3;
-const WORK_MDNS_V6_DRAIN: u8 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct WorkerWork {
@@ -267,20 +259,6 @@ impl WorkerWork {
     }
 
     #[inline]
-    fn queue_udp_drain(&mut self) {
-        self.bits |= WORK_UDP_DRAIN;
-    }
-
-    #[inline]
-    fn queue_mdns_drain(&mut self, token: Token) {
-        match token {
-            MDNS_V4 => self.bits |= WORK_MDNS_V4_DRAIN,
-            MDNS_V6 => self.bits |= WORK_MDNS_V6_DRAIN,
-            _ => {}
-        }
-    }
-
-    #[inline]
     fn take_tasks(&mut self) -> WorkerTasks {
         let bits = self.bits;
         self.bits = 0;
@@ -306,18 +284,6 @@ impl Iterator for WorkerTasks {
             self.bits &= !WORK_TCP_WRITE;
             return Some(WorkerTask::TcpWrite);
         }
-        if self.bits & WORK_UDP_DRAIN != 0 {
-            self.bits &= !WORK_UDP_DRAIN;
-            return Some(WorkerTask::UdpDrain);
-        }
-        if self.bits & WORK_MDNS_V4_DRAIN != 0 {
-            self.bits &= !WORK_MDNS_V4_DRAIN;
-            return Some(WorkerTask::MdnsDrain(MDNS_V4));
-        }
-        if self.bits & WORK_MDNS_V6_DRAIN != 0 {
-            self.bits &= !WORK_MDNS_V6_DRAIN;
-            return Some(WorkerTask::MdnsDrain(MDNS_V6));
-        }
         None
     }
 }
@@ -326,27 +292,6 @@ impl Iterator for WorkerTasks {
 #[inline]
 fn tcp_receive_work_ready(readiness: Readiness, read_buf: &RecvBuffer) -> bool {
     readiness.is_ready() || matches!(frame::parse_frame(read_buf.pending()), Ok(Some(_)))
-}
-
-#[inline]
-fn recv_udp_datagram(
-    socket: &UdpSocket,
-    buf: &mut [u8],
-) -> io::Result<Option<(usize, SocketAddr)>> {
-    recv_datagram_with(buf, |buf| socket.recv_from(buf))
-}
-
-fn bind_voice_udp_socket(addr: SocketAddr) -> io::Result<StdUdpSocket> {
-    let socket = bind_udp_socket(addr, UdpSocketOptions::default())?;
-    if let Err(error) = rpc::qos::apply_voice_qos(socket.as_raw_fd(), addr) {
-        kvlog::warn!(
-            "voice udp qos unavailable",
-            addr = %addr,
-            dscp = rpc::qos::VOICE_DSCP,
-            error = %error
-        );
-    }
-    Ok(socket)
 }
 
 #[cfg(test)]
@@ -897,16 +842,13 @@ pub(crate) enum PairingEvent {
     },
 }
 
-/// Sends a [`NetworkCommand`] to the worker and wakes its event loop.
-///
-/// The worker blocks in [`Poll::poll`] watching only its sockets and timer
-/// deadlines, so a queued command would otherwise wait for the next socket
-/// event or the timeout. Waking after the channel send makes the worker drain
-/// outbound voice immediately, which keeps send pacing off the poll cadence.
+/// Routes a [`NetworkCommand`] to the owning actor and wakes its event loop.
 #[derive(Clone)]
 pub struct CommandSender {
     tx: Sender<NetworkCommand>,
     waker: Arc<Waker>,
+    voice: Option<voice::VoiceInputSender>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CommandSender {
@@ -916,6 +858,19 @@ impl CommandSender {
     ///
     /// Returns [`SendError`] if the worker has stopped and the channel is closed.
     pub fn send(&self, command: NetworkCommand) -> Result<(), SendError<NetworkCommand>> {
+        if !self.alive.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SendError(command));
+        }
+        if matches!(
+            command,
+            NetworkCommand::LocalVoicePacket(_)
+                | NetworkCommand::SequencedLocalVoicePacket { .. }
+                | NetworkCommand::SetPlaybackSink(_)
+                | NetworkCommand::PlaybackFeedback(_)
+        ) && let Some(voice) = &self.voice
+        {
+            return voice.send(command);
+        }
         self.tx.send(command)?;
         let _ = self.waker.wake();
         Ok(())
@@ -925,13 +880,19 @@ impl CommandSender {
     pub(crate) fn for_test(tx: Sender<NetworkCommand>) -> Self {
         let poll = Poll::new().expect("create test poll");
         let waker = Arc::new(Waker::new(poll.registry(), WAKE).expect("create test waker"));
-        Self { tx, waker }
+        Self {
+            tx,
+            waker,
+            voice: None,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
     }
 }
 
 pub struct NetworkClient {
     tx: CommandSender,
     worker: Option<JoinHandle<()>>,
+    voice: Option<voice::VoiceLoopHandle>,
 }
 
 impl NetworkClient {
@@ -947,12 +908,20 @@ impl NetworkClient {
             Waker::new(poll.registry(), WAKE)
                 .map_err(|error| format!("failed to create waker: {error}"))?,
         );
+        let mut voice = voice::VoiceLoopHandle::spawn(events.clone(), Arc::clone(&waker))?;
+        let voice_input = voice.input_sender();
+        let voice_control = voice.control();
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
         let tx = CommandSender {
             tx,
             waker: Arc::clone(&waker),
+            voice: Some(voice_input),
+            alive: Arc::clone(&alive),
         };
         let panic_events = events.clone();
+        let worker_alive = Arc::clone(&alive);
+        let voice_shutdown = voice_control.clone();
         let worker = thread::Builder::new()
             .name("chatt-net".to_string())
             // 1M. This thread runs the mio loop, ChaCha20-Poly1305/X25519 crypto, jsony
@@ -961,19 +930,25 @@ impl NetworkClient {
             .stack_size(1024 * 1024)
             .spawn(move || {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    run_worker(config, events, rx, poll, waker);
+                    run_worker(config, events, rx, poll, waker, voice_control);
                 }));
+                let _ = voice_shutdown.submit(voice::VoiceCommand::Shutdown);
                 if result.is_err() {
                     kvlog::error!("network worker panicked");
                     let _ = panic_events.send(NetworkEvent::WorkerStopped {
                         reason: "network worker panicked".to_string(),
                     });
                 }
+                worker_alive.store(false, std::sync::atomic::Ordering::Release);
             })
-            .map_err(|error| format!("failed to spawn network worker: {error}"))?;
+            .map_err(|error| {
+                voice.stop();
+                format!("failed to spawn network worker: {error}")
+            })?;
         Ok(Self {
             tx,
             worker: Some(worker),
+            voice: Some(voice),
         })
     }
 
@@ -998,6 +973,7 @@ impl NetworkClient {
         Self {
             tx: CommandSender::for_test(tx),
             worker: None,
+            voice: None,
         }
     }
 
@@ -1005,6 +981,9 @@ impl NetworkClient {
         let _ = self.tx.send(NetworkCommand::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(mut voice) = self.voice.take() {
+            voice.stop();
         }
     }
 }
@@ -1409,6 +1388,7 @@ fn run_worker(
     commands: Receiver<NetworkCommand>,
     mut poll: Poll,
     waker: Arc<Waker>,
+    voice: voice::VoiceControl,
 ) {
     kvlog::info!(
         "network worker starting",
@@ -1427,6 +1407,18 @@ fn run_worker(
     };
     let mut mls_generation = 0u64;
     loop {
+        let mut voice_outputs = voice::VoiceOutputBatch::default();
+        let voice_stopped = voice.drain_outputs(&mut voice_outputs);
+        if let Some(reason) = voice_outputs.fatal_failure.take() {
+            let _ = events.send(NetworkEvent::WorkerStopped { reason });
+            break;
+        }
+        if voice_stopped {
+            let _ = events.send(NetworkEvent::WorkerStopped {
+                reason: "voice worker stopped".to_string(),
+            });
+            break;
+        }
         mls_generation = mls_generation.wrapping_add(1).max(1);
         let session_end = run_worker_inner(
             &config,
@@ -1436,7 +1428,11 @@ fn run_worker(
             &mut poll,
             &mls_runtime,
             mls_generation,
+            &voice,
         );
+        let _ = voice.submit(voice::VoiceCommand::EndSession {
+            generation: mls_generation,
+        });
         let _ = mls_runtime.try_send(mls_actor::Input::EndSession {
             generation: mls_generation,
         });
@@ -1471,6 +1467,10 @@ fn run_worker(
                 let _ = events.send(NetworkEvent::LocalIdentityUnavailable { message });
                 break;
             }
+            SessionEnd::Fatal(reason) => {
+                let _ = events.send(NetworkEvent::WorkerStopped { reason });
+                break;
+            }
         }
     }
     mls_runtime.stop();
@@ -1485,6 +1485,7 @@ fn run_worker_inner(
     poll: &mut Poll,
     mls_runtime: &mls_actor::Runtime,
     mls_generation: u64,
+    voice_control: &voice::VoiceControl,
 ) -> SessionEnd {
     let (std_tcp, transport, _trusted) = match connect_and_handshake(config, false) {
         Ok(value) => value,
@@ -1519,7 +1520,7 @@ fn run_worker_inner(
         },
         None => None,
     };
-    let std_udp = match bind_voice_udp_socket(if server_udp_addr.is_ipv4() {
+    let std_udp = match voice::bind_voice_udp_socket(if server_udp_addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
@@ -1541,8 +1542,25 @@ fn run_worker_inner(
     if let Err(error) = std_tcp.set_nonblocking(true) {
         return SessionEnd::ConnectFailed(format!("failed to make TCP nonblocking: {error}"));
     }
-    if let Err(error) = std_udp.set_nonblocking(true) {
-        return SessionEnd::ConnectFailed(format!("failed to make UDP nonblocking: {error}"));
+    let initial_udp_bind = match voice::InitialUdpBind::prepare(&std_udp, &media, server_udp_addr) {
+        Ok(bind) => bind,
+        Err(error) => return SessionEnd::ConnectFailed(error),
+    };
+
+    let voice_start = voice::VoiceCommand::StartSession {
+        generation: mls_generation,
+        udp: std_udp,
+        media,
+        initial_bind_attempted: true,
+        transport_mode,
+        server_udp_addr,
+        server_udp_probe_addr,
+        p2p_enabled,
+        candidate_privacy: config.candidate_privacy,
+        prefer_ipv6: config.prefer_ipv6,
+    };
+    if voice_control.submit(voice_start).is_err() {
+        return SessionEnd::ConnectFailed("client voice worker is unavailable".to_string());
     }
 
     let mut worker = WorkerState {
@@ -1556,22 +1574,17 @@ fn run_worker_inner(
         mls_outputs: Vec::new(),
         config: config.clone(),
         events: events.clone(),
+        voice: voice_control,
+        voice_generation: mls_generation,
+        pending_initial_udp_bind: Some(initial_udp_bind),
         tcp: TcpStream::from_std(std_tcp),
-        udp: UdpSocket::from_std(std_udp),
-        udp_local_addr,
         loop_work: WorkerWork::default(),
-        server_udp_addr,
-        server_udp_probe_addr,
         read_buf: RecvBuffer::new(),
         // Starts true so the first loop iteration reads anything that arrived
         // before the socket was registered with the poll.
         tcp_readiness: Readiness::primed(),
         write_buf: WriteQueue::new(),
-        media_packet: Vec::new(),
-        media_scratch: Vec::new(),
-        p2p_routes: Vec::new(),
         control,
-        media,
         transport_mode,
         video_auth_key,
         server_public_key,
@@ -1580,48 +1593,7 @@ fn run_worker_inner(
         user_names: HashMap::new(),
         active_room: None,
         voice_room: None,
-        active_stream: None,
         pending_share_start: false,
-        local_sequence: 0,
-        media_send_counter: 0,
-        media_recv_replay: AntiReplay::new(),
-        p2p_generation: 1,
-        p2p_tie_breaker: random_u64().unwrap_or(1),
-        p2p_nat: configured_nat_kind(),
-        p2p_nat_classifier: NatClassifier::new(),
-        p2p_reflexive_addr: None,
-        p2p_candidates: Vec::new(),
-        p2p_local_candidates: Vec::new(),
-        p2p_enabled,
-        candidate_privacy: config.candidate_privacy,
-        prefer_ipv6: config.prefer_ipv6,
-        mdns: if p2p_enabled {
-            MdnsSystem::bind()
-        } else {
-            MdnsSystem::unbound()
-        },
-        mdns_pending: HashMap::new(),
-        p2p_peers: HashMap::new(),
-        p2p_stream_owners: HashMap::new(),
-        voice_others: HashSet::new(),
-        room_server_rtts: HashMap::new(),
-        next_relay_keepalive: Instant::now() + RELAY_KEEPALIVE_INTERVAL,
-        next_rtt_probe: Instant::now() + RTT_PROBE_INTERVAL,
-        next_udp_bind_retry: Instant::now() + UDP_BIND_RETRY_INTERVAL,
-        rtt_probe_seq: 0,
-        server_rtt_in_flight: VecDeque::new(),
-        server_rtt_ms: None,
-        server_rtt_last_sample_at: None,
-        playback_sink: None,
-        pending_playback_packets: VecDeque::new(),
-        voice_dedup: VoicePacketDeduplicator::new(),
-        encoder_feedback: EncoderFeedbackController::new(),
-        restart_port_policy: RestartPortPolicy::default(),
-        udp_rebind_requested: false,
-        awaiting_udp_bound: false,
-        udp_bind_attempts: 0,
-        udp_reported_unreachable: false,
-        interface_monitor: InterfaceMonitor::new(Instant::now()),
         next_file_transfer: 1,
         outgoing_uploads: VecDeque::new(),
         upload_throttle: UploadThrottle::new(config.upload_rate_bytes),
@@ -1654,17 +1626,6 @@ fn run_worker_inner(
     ) {
         return SessionEnd::ConnectFailed(format!("failed to register TCP socket: {error}"));
     }
-    if let Err(error) = poll
-        .registry()
-        .register(&mut worker.udp, UDP, Interest::READABLE)
-    {
-        return SessionEnd::ConnectFailed(format!("failed to register UDP socket: {error}"));
-    }
-    // mDNS is best effort: a failure to register leaves it inert and host
-    // candidates fall back to reflexive/relay rather than aborting the session.
-    if let Err(error) = worker.mdns.register(poll.registry(), MDNS_V4, MDNS_V6) {
-        kvlog::warn!("failed to register mdns sockets", error = %error);
-    }
 
     let auth_control = ClientControl::Authenticate {
         username: worker.config.username.clone(),
@@ -1682,6 +1643,7 @@ fn run_worker_inner(
     let _ = worker.events.send(NetworkEvent::Connected);
 
     let mut poll_events = Events::with_capacity(128);
+    let mut voice_outputs = voice::VoiceOutputBatch::default();
     let mut poll_timeout = worker.next_poll_timeout(CommandDrainOutcome::Empty, Instant::now());
     while !worker.shutdown {
         if let Err(error) = poll.poll(&mut poll_events, Some(poll_timeout)) {
@@ -1708,24 +1670,33 @@ fn run_worker_inner(
                         worker.loop_work.queue_tcp_write();
                     }
                 }
-                UDP => {
-                    if MioReady::from_event(event).readable_like() {
-                        worker.loop_work.queue_udp_drain();
-                    }
-                }
-                MDNS_V4 => {
-                    if MioReady::from_event(event).readable_like() {
-                        worker.loop_work.queue_mdns_drain(MDNS_V4);
-                    }
-                }
-                MDNS_V6 => {
-                    if MioReady::from_event(event).readable_like() {
-                        worker.loop_work.queue_mdns_drain(MDNS_V6);
-                    }
-                }
                 WAKE => {}
                 _ => {}
             }
+        }
+        let voice_stopped = voice_control.drain_outputs(&mut voice_outputs);
+        if let Some(reason) = voice_outputs.fatal_failure.take() {
+            return SessionEnd::Fatal(reason);
+        }
+        if voice_stopped {
+            return SessionEnd::Fatal("voice worker stopped".to_string());
+        }
+        if let Some((generation, reason)) = voice_outputs.session_failure.take()
+            && generation == mls_generation
+        {
+            return SessionEnd::Disconnected(reason);
+        }
+        if let Some(publish) = voice_outputs.publish_p2p.take()
+            && publish.generation == mls_generation
+            && let Err(error) = worker.queue_control(ClientControl::PublishP2p {
+                room_id: publish.room_id,
+                generation: publish.candidate_generation,
+                nat: publish.nat,
+                tie_breaker: publish.tie_breaker,
+                candidates: publish.candidates,
+            })
+        {
+            return SessionEnd::Disconnected(error);
         }
         if let Err(error) = worker.run_loop_tasks() {
             return SessionEnd::Disconnected(error);
@@ -1793,22 +1764,6 @@ fn run_worker_inner(
             return SessionEnd::Disconnected(error);
         }
         let now = Instant::now();
-        if worker.p2p_enabled {
-            worker.poll_interfaces(now);
-        }
-        if worker.udp_rebind_requested {
-            worker.reconcile_mdns(poll);
-            if let Err(error) = worker.rebind_udp_socket(poll) {
-                return SessionEnd::Disconnected(error);
-            }
-        }
-        if worker.p2p_enabled {
-            worker.poll_p2p(now);
-            worker.poll_mdns(now);
-        }
-        worker.poll_udp_bind_retry(now);
-        worker.poll_relay_keepalive(now);
-        worker.poll_rtt_probe(now);
         poll_timeout = worker.next_poll_timeout(command_drain, now);
         #[cfg(debug_assertions)]
         if poll_timeout != Duration::ZERO {
@@ -1827,12 +1782,20 @@ fn run_worker_inner(
     }
 }
 
+fn report_initial_udp_bind_send_error(events: &NetworkEventSender, error: Option<io::Error>) {
+    if let Some(error) = error {
+        kvlog::warn!("initial UDP bind send failed", error = %error);
+        let _ = events.send(NetworkEvent::Error(format!("UDP send failed: {error}")));
+    }
+}
+
 enum SessionEnd {
     Shutdown,
     ConnectFailed(String),
     Disconnected(String),
     AuthFailed { code: u16, reason: String },
     LocalIdentityUnavailable(String),
+    Fatal(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2142,34 +2105,6 @@ fn read_blocking_frame(stream: &mut StdTcpStream) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
-/// A remote `.local` host candidate awaiting mDNS resolution, keyed by its
-/// lowercased host name. On resolution the address is rebuilt from the resolved
-/// IP and this stored port and fed to the peer's agent.
-struct MdnsPending {
-    session_id: SessionId,
-    control: P2pCandidate,
-    port: u16,
-}
-
-/// The result of gathering local candidates: literal-address candidates for the
-/// IP-only agent, the candidates published to the server (host names rewritten
-/// per privacy mode), and the responder name table.
-struct GatheredP2p {
-    local: Vec<Candidate>,
-    published: Vec<P2pCandidate>,
-    mdns_names: HashMap<String, IpAddr>,
-}
-
-/// Per-peer routing captured for one outbound P2P voice frame. Collected while
-/// iterating the peer map so the seal-and-send loop can reuse a single packet
-/// buffer without holding a borrow on `p2p_peers`.
-struct P2pVoiceRoute {
-    session_id: SessionId,
-    addr: SocketAddr,
-    connection_id: u64,
-    counter: u64,
-    key: KeyMaterial,
-}
 
 struct WorkerState<'a> {
     mls_runtime: &'a mls_actor::Runtime,
@@ -2182,9 +2117,10 @@ struct WorkerState<'a> {
     mls_outputs: Vec<mls_actor::Output>,
     config: ClientConfig,
     events: NetworkEventSender,
+    voice: &'a voice::VoiceControl,
+    voice_generation: u64,
+    pending_initial_udp_bind: Option<voice::InitialUdpBind>,
     tcp: TcpStream,
-    udp: UdpSocket,
-    udp_local_addr: SocketAddr,
     loop_work: WorkerWork,
     read_buf: RecvBuffer,
     /// Whether the TCP socket may hold unread bytes. Set on every readable
@@ -2196,26 +2132,14 @@ struct WorkerState<'a> {
     /// blocked on our zero receive window.
     tcp_readiness: Readiness,
     write_buf: WriteQueue,
-    /// Reusable buffers for the outbound media seal path, cleared on each use so
-    /// the per-frame voice send does not allocate. `media_packet` holds the UDP
-    /// datagram, `media_scratch` the encoded plaintext, and `p2p_routes` the
-    /// per-peer routing collected before sealing.
-    media_packet: Vec<u8>,
-    media_scratch: Vec<u8>,
-    p2p_routes: Vec<P2pVoiceRoute>,
     control: RecordProtection,
-    /// The server-link media codec selected by the negotiated mode. Holds the
-    /// route id, AEAD keys (native), or bind key (external-link).
-    media: media::MediaProtection,
-    /// The negotiated transport mode, gating P2P and steering `bind_udp`.
+    /// The negotiated transport mode is retained for control/UI/video checks.
     transport_mode: TransportMode,
     /// Session-authentication key for external-link video connection setup.
     video_auth_key: [u8; KEY_LEN],
     /// Server identity is part of every AccountId and MLS store namespace,
     /// preventing credentials or room state crossing server trust domains.
     server_public_key: [u8; 32],
-    server_udp_addr: SocketAddr,
-    server_udp_probe_addr: Option<SocketAddr>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
     user_names: HashMap<UserId, String>,
@@ -2225,54 +2149,7 @@ struct WorkerState<'a> {
     /// The room whose voice call this client is in, target for screen shares
     /// and P2P publication.
     voice_room: Option<RoomId>,
-    active_stream: Option<StreamId>,
     pending_share_start: bool,
-    local_sequence: u32,
-    media_send_counter: u64,
-    media_recv_replay: AntiReplay,
-    p2p_generation: u64,
-    p2p_tie_breaker: u64,
-    p2p_nat: P2pNatKind,
-    p2p_nat_classifier: NatClassifier,
-    p2p_reflexive_addr: Option<SocketAddr>,
-    p2p_candidates: Vec<P2pCandidate>,
-    p2p_local_candidates: Vec<Candidate>,
-    p2p_enabled: bool,
-    candidate_privacy: CandidatePrivacy,
-    prefer_ipv6: bool,
-    mdns: MdnsSystem,
-    mdns_pending: HashMap<String, MdnsPending>,
-    p2p_peers: HashMap<SessionId, PeerConnection>,
-    p2p_stream_owners: HashMap<StreamId, SessionId>,
-    voice_others: HashSet<UserId>,
-    room_server_rtts: HashMap<UserId, u16>,
-    next_relay_keepalive: Instant,
-    next_rtt_probe: Instant,
-    next_udp_bind_retry: Instant,
-    rtt_probe_seq: u64,
-    server_rtt_in_flight: VecDeque<(u64, Instant)>,
-    server_rtt_ms: Option<f32>,
-    server_rtt_last_sample_at: Option<Instant>,
-    playback_sink: Option<LivePlaybackSink>,
-    pending_playback_packets: VecDeque<RemoteVoicePacket>,
-    voice_dedup: VoicePacketDeduplicator,
-    encoder_feedback: EncoderFeedbackController,
-    restart_port_policy: RestartPortPolicy,
-    udp_rebind_requested: bool,
-    /// Whether a `UdpBound` confirmation is still owed for the latest
-    /// [`bind_udp`](WorkerState::bind_udp). The relay keepalive reuses the
-    /// `Bind` payload and the server confirms every one, so only the first
-    /// confirmation after a bind is announced.
-    awaiting_udp_bound: bool,
-    /// Consecutive unconfirmed `Bind` retries since the last [`bind_udp`], used
-    /// to detect a UDP media path that never binds.
-    ///
-    /// [`bind_udp`]: WorkerState::bind_udp
-    udp_bind_attempts: u32,
-    /// Whether a [`NetworkEvent::MediaConnectivity`] failure has already been
-    /// announced for the current outage, so the failure edge fires once.
-    udp_reported_unreachable: bool,
-    interface_monitor: InterfaceMonitor,
     next_file_transfer: u64,
     outgoing_uploads: VecDeque<OutgoingUpload>,
     upload_throttle: UploadThrottle,
@@ -2408,286 +2285,6 @@ impl PendingMlsFileOffer {
         }
     }
 }
-
-#[derive(Debug)]
-struct InterfaceMonitor {
-    snapshot: Option<InterfaceSnapshot>,
-    next_poll: Instant,
-}
-
-impl InterfaceMonitor {
-    fn new(now: Instant) -> Self {
-        Self {
-            snapshot: None,
-            next_poll: now,
-        }
-    }
-
-    fn snapshot(&self) -> Option<&InterfaceSnapshot> {
-        self.snapshot.as_ref()
-    }
-
-    fn deactivate(&mut self, now: Instant) {
-        self.snapshot = None;
-        self.next_poll = now;
-    }
-
-    fn next_wake(&self, now: Instant) -> Duration {
-        self.next_poll.saturating_duration_since(now)
-    }
-
-    fn ensure_with<F>(&mut self, now: Instant, capture: F) -> io::Result<()>
-    where
-        F: FnOnce() -> io::Result<InterfaceSnapshot>,
-    {
-        if self.snapshot.is_none() {
-            let _ = self.refresh_with(now, capture)?;
-        }
-        Ok(())
-    }
-
-    fn poll_with<F>(&mut self, active: bool, now: Instant, capture: F) -> io::Result<Option<bool>>
-    where
-        F: FnOnce() -> io::Result<InterfaceSnapshot>,
-    {
-        if !active {
-            self.deactivate(now);
-            return Ok(None);
-        }
-        self.refresh_with(now, capture)
-    }
-
-    /// Refreshes a due snapshot and reports whether it differs from the
-    /// previous successful capture. A failed capture retains the previous
-    /// baseline and is retried at the normal interval.
-    fn refresh_with<F>(&mut self, now: Instant, capture: F) -> io::Result<Option<bool>>
-    where
-        F: FnOnce() -> io::Result<InterfaceSnapshot>,
-    {
-        if now < self.next_poll {
-            return Ok(None);
-        }
-        self.next_poll = now + INTERFACE_POLL_INTERVAL;
-        let snapshot = capture()?;
-        let changed = self
-            .snapshot
-            .as_ref()
-            .is_some_and(|previous| snapshot.changed_from(previous));
-        self.snapshot = Some(snapshot);
-        Ok(Some(changed))
-    }
-}
-
-#[derive(Debug)]
-struct VoicePacketDeduplicator {
-    streams: HashMap<u32, RecentVoiceSequences>,
-    clock: u64,
-}
-
-impl VoicePacketDeduplicator {
-    fn new() -> Self {
-        Self {
-            streams: HashMap::with_capacity(MAX_RECENT_VOICE_STREAMS),
-            clock: 0,
-        }
-    }
-
-    fn observe(&mut self, stream_id: u32, sequence: u32) -> RecentVoiceSequenceResult {
-        if !self.streams.contains_key(&stream_id) && self.streams.len() >= MAX_RECENT_VOICE_STREAMS
-        {
-            self.evict_oldest_stream();
-        }
-
-        self.clock = self.clock.wrapping_add(1);
-        let stream = self.streams.entry(stream_id).or_default();
-        stream.last_touched = self.clock;
-        stream.observe(sequence)
-    }
-
-    fn remove_stream(&mut self, stream_id: u32) {
-        self.streams.remove(&stream_id);
-    }
-
-    fn evict_oldest_stream(&mut self) {
-        let oldest = self
-            .streams
-            .iter()
-            .min_by_key(|(_, stream)| stream.last_touched)
-            .map(|(stream_id, _)| *stream_id);
-        if let Some(stream_id) = oldest {
-            self.streams.remove(&stream_id);
-        }
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.streams.len()
-    }
-}
-
-impl Default for VoicePacketDeduplicator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RecentVoiceSequenceResult {
-    New,
-    Duplicate,
-    Stale,
-}
-
-#[derive(Debug)]
-struct RecentVoiceSequences {
-    highest: Option<u32>,
-    seen: [u64; RECENT_VOICE_SEQUENCE_WORDS],
-    last_touched: u64,
-}
-
-impl Default for RecentVoiceSequences {
-    fn default() -> Self {
-        Self {
-            highest: None,
-            seen: [0; RECENT_VOICE_SEQUENCE_WORDS],
-            last_touched: 0,
-        }
-    }
-}
-
-impl RecentVoiceSequences {
-    fn observe(&mut self, sequence: u32) -> RecentVoiceSequenceResult {
-        let Some(highest) = self.highest else {
-            self.highest = Some(sequence);
-            self.set_seen(0);
-            return RecentVoiceSequenceResult::New;
-        };
-
-        if let Some(forward) = voice_sequence_distance_forward(highest, sequence) {
-            if forward == 0 {
-                return if self.is_seen(0) {
-                    RecentVoiceSequenceResult::Duplicate
-                } else {
-                    self.set_seen(0);
-                    RecentVoiceSequenceResult::New
-                };
-            }
-
-            self.shift_seen(forward as usize);
-            self.highest = Some(sequence);
-            self.set_seen(0);
-            return RecentVoiceSequenceResult::New;
-        }
-
-        let Some(backward) = voice_sequence_distance_forward(sequence, highest) else {
-            return RecentVoiceSequenceResult::Stale;
-        };
-        let backward = backward as usize;
-        if backward >= MAX_RECENT_VOICE_SEQUENCES {
-            return RecentVoiceSequenceResult::Stale;
-        }
-        if self.is_seen(backward) {
-            RecentVoiceSequenceResult::Duplicate
-        } else {
-            self.set_seen(backward);
-            RecentVoiceSequenceResult::New
-        }
-    }
-
-    fn shift_seen(&mut self, shift: usize) {
-        if shift >= MAX_RECENT_VOICE_SEQUENCES {
-            self.seen.fill(0);
-            return;
-        }
-
-        let word_shift = shift / RECENT_VOICE_SEQUENCE_WORD_BITS;
-        let bit_shift = shift % RECENT_VOICE_SEQUENCE_WORD_BITS;
-
-        if word_shift > 0 {
-            for index in (0..RECENT_VOICE_SEQUENCE_WORDS).rev() {
-                self.seen[index] = if index >= word_shift {
-                    self.seen[index - word_shift]
-                } else {
-                    0
-                };
-            }
-        }
-
-        if bit_shift > 0 {
-            for index in (0..RECENT_VOICE_SEQUENCE_WORDS).rev() {
-                let carry = if index > 0 {
-                    self.seen[index - 1] >> (RECENT_VOICE_SEQUENCE_WORD_BITS - bit_shift)
-                } else {
-                    0
-                };
-                self.seen[index] = (self.seen[index] << bit_shift) | carry;
-            }
-        }
-    }
-
-    fn is_seen(&self, distance: usize) -> bool {
-        debug_assert!(distance < MAX_RECENT_VOICE_SEQUENCES);
-        let word = distance / RECENT_VOICE_SEQUENCE_WORD_BITS;
-        let bit = distance % RECENT_VOICE_SEQUENCE_WORD_BITS;
-        self.seen[word] & (1u64 << bit) != 0
-    }
-
-    fn set_seen(&mut self, distance: usize) {
-        debug_assert!(distance < MAX_RECENT_VOICE_SEQUENCES);
-        let word = distance / RECENT_VOICE_SEQUENCE_WORD_BITS;
-        let bit = distance % RECENT_VOICE_SEQUENCE_WORD_BITS;
-        self.seen[word] |= 1u64 << bit;
-    }
-}
-
-/// Whether a direct path counts as healthy right now: a candidate pair is
-/// selected and an inbound packet arrived within `failover_idle`.
-fn direct_path_healthy(
-    selected: bool,
-    last_inbound: Option<Instant>,
-    now: Instant,
-    failover_idle: Duration,
-) -> bool {
-    selected && last_inbound.is_some_and(|at| now.saturating_duration_since(at) <= failover_idle)
-}
-
-/// Whether the server relay can be dropped: there is at least one other online
-/// participant and every one of them has a peer whose direct path has been
-/// stable for at least `confirm_window`.
-fn relay_suppressed(
-    now: Instant,
-    confirm_window: Duration,
-    voice_others: &HashSet<UserId>,
-    peers: impl Iterator<Item = (UserId, Option<Instant>)>,
-) -> bool {
-    if voice_others.is_empty() {
-        return false;
-    }
-    let mut covered = HashSet::new();
-    for (user_id, stable_since) in peers {
-        if let Some(since) = stable_since {
-            if now.saturating_duration_since(since) >= confirm_window {
-                covered.insert(user_id);
-            }
-        }
-    }
-    voice_others.iter().all(|user_id| covered.contains(user_id))
-}
-
-fn voice_sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
-    let distance = to.wrapping_sub(from);
-    if distance < (1 << 31) {
-        Some(distance)
-    } else {
-        None
-    }
-}
-
-/// A token bucket that paces upload chunk emission to a byte-per-second ceiling.
-///
-/// A `rate` of `0` disables pacing: [`budget`](Self::budget) is unbounded and the
-/// other operations are no-ops. Otherwise tokens accrue at `rate` bytes per
-/// second, capped at one second's worth so a poll loop that parked between
 /// transfers cannot bank credit and then burst.
 struct UploadThrottle {
     /// Ceiling in bytes per second. `0` disables throttling.
@@ -3268,148 +2865,13 @@ impl IncomingFile {
     }
 }
 
-struct PeerConnection {
-    user_id: UserId,
-    agent: TraversalAgent,
-    send_key: KeyMaterial,
-    recv_key: KeyMaterial,
-    send_counter: u64,
-    recv_replay: AntiReplay,
-    connection_id: u64,
-    /// The peer's candidate generation this agent was built from.
-    remote_generation: u64,
-    /// Our own candidate generation when this agent was built. A local restart
-    /// bumps it, so a matching `P2pPeer` must still rebuild the agent to pick
-    /// up the fresh local candidates.
-    local_generation: u64,
-    /// When the current healthy direct path was first observed, the clock for
-    /// the [`DIRECT_CONFIRM_WINDOW`] confirmation. `None` while no healthy direct
-    /// path exists.
-    direct_stable_since: Option<Instant>,
-    /// Last inbound direct packet (media or STUN) from this peer.
-    last_direct_inbound: Option<Instant>,
-    /// Outstanding RTT probe nonces sent over the direct path, paired with their
-    /// send time. Bounded by [`RTT_IN_FLIGHT_CAP`].
-    rtt_in_flight: VecDeque<(u64, Instant)>,
-    /// Smoothed round-trip time to this peer over the direct path, in
-    /// milliseconds. `None` until the first `Pong` arrives.
-    rtt_ms: Option<f32>,
-}
-
-enum P2pMediaPacket {
-    Voice {
-        stream_id: StreamId,
-        sequence: u32,
-        timestamp: u32,
-        flags: u8,
-        payload: MediaVoicePayload,
-        action: Option<P2pAction>,
-    },
-    Feedback {
-        stream_id: StreamId,
-        feedback: media::VoiceFeedback,
-        action: Option<P2pAction>,
-    },
-    Ping {
-        nonce: u64,
-        action: Option<P2pAction>,
-    },
-    Pong {
-        rtt_ms: Option<u16>,
-        action: Option<P2pAction>,
-    },
-}
-
-struct EncoderFeedbackController {
-    current: LiveEncoderProfile,
-    smoothed_loss: f32,
-    high_loss_windows: u8,
-    hold_until: Instant,
-}
-
-impl EncoderFeedbackController {
-    fn new() -> Self {
-        Self {
-            current: LiveEncoderProfile::DRED_20,
-            smoothed_loss: 0.0,
-            high_loss_windows: 0,
-            hold_until: Instant::now(),
-        }
-    }
-
-    fn observe(
-        &mut self,
-        feedback: LivePlaybackFeedback,
-        now: Instant,
-    ) -> Option<LiveEncoderProfile> {
-        if feedback.expected_packets == 0 {
-            return None;
-        }
-        let effective_loss = f32::from(feedback.lost_packets.saturating_add(feedback.late_packets))
-            / f32::from(feedback.expected_packets);
-        self.smoothed_loss = ENCODER_FEEDBACK_ALPHA * effective_loss
-            + (1.0 - ENCODER_FEEDBACK_ALPHA) * self.smoothed_loss;
-        if effective_loss >= 0.45 {
-            self.high_loss_windows = self.high_loss_windows.saturating_add(1).min(2);
-        } else {
-            self.high_loss_windows = 0;
-        }
-
-        let target = if effective_loss >= 0.55 || self.high_loss_windows >= 2 {
-            LiveEncoderProfile::DRED_60
-        } else if effective_loss >= 0.40 {
-            LiveEncoderProfile::DRED_50
-        } else if effective_loss >= 0.25 {
-            LiveEncoderProfile::DRED_35
-        } else {
-            LiveEncoderProfile::DRED_20
-        };
-
-        if target.packet_loss_percent > self.current.packet_loss_percent {
-            return self.set_current(target, now);
-        }
-        if target.packet_loss_percent == self.current.packet_loss_percent
-            && self.current.packet_loss_percent > LiveEncoderProfile::DRED_20.packet_loss_percent
-        {
-            self.hold_until = now + ENCODER_PROFILE_HOLD;
-            return None;
-        }
-        if now < self.hold_until {
-            return None;
-        }
-
-        let next = match self.current.packet_loss_percent {
-            60 if self.smoothed_loss < 0.45 => Some(LiveEncoderProfile::DRED_50),
-            50 if self.smoothed_loss < 0.30 => Some(LiveEncoderProfile::DRED_35),
-            35 if self.smoothed_loss < 0.15
-                && feedback.max_neteq_target_ms < 200
-                && feedback.max_neteq_playout_delay_ms < 200
-                && feedback.max_interarrival_jitter_ms < 50 =>
-            {
-                Some(LiveEncoderProfile::DRED_20)
-            }
-            _ => None,
-        };
-        next.and_then(|profile| self.set_current(profile, now))
-    }
-
-    fn set_current(
-        &mut self,
-        profile: LiveEncoderProfile,
-        now: Instant,
-    ) -> Option<LiveEncoderProfile> {
-        if profile == self.current {
-            return None;
-        }
-        self.current = profile;
-        if profile.packet_loss_percent > LiveEncoderProfile::DRED_20.packet_loss_percent {
-            self.hold_until = now + ENCODER_PROFILE_HOLD;
-        }
-        Some(profile)
-    }
-}
-
 impl WorkerState<'_> {
+    fn queue_voice_command(&self, command: voice::VoiceCommand) -> Result<(), String> {
+        self.voice
+            .submit(command)
+            .map_err(|_| "client voice command mailbox is full or stopped".to_string())
+    }
+
     fn queue_mls_input(&mut self, input: mls_actor::Input) -> Result<(), String> {
         if self.pending_mls_input.is_some() {
             return Err("client MLS request backlog is full".to_string());
@@ -3568,7 +3030,7 @@ impl WorkerState<'_> {
     }
 
     #[inline]
-    fn next_poll_timeout(&mut self, command_drain: CommandDrainOutcome, now: Instant) -> Duration {
+    fn next_poll_timeout(&mut self, command_drain: CommandDrainOutcome, _now: Instant) -> Duration {
         self.queue_runnable_io();
         let mut schedule = PollSchedule::after(IDLE_POLL_TIMEOUT);
         schedule.include(self.loop_work.wake());
@@ -3576,11 +3038,6 @@ impl WorkerState<'_> {
         schedule.include(self.bug_report_wake());
         schedule.include(self.receive_wake());
         schedule.include(self.upload_wake());
-        schedule.include(self.mdns_wake(now));
-        schedule.include(self.p2p_wake());
-        schedule.include(self.interface_wake(now));
-        schedule.include(self.rtt_probe_wake(now));
-        schedule.include(self.udp_bind_retry_wake(now));
         schedule.timeout()
     }
 
@@ -3601,8 +3058,6 @@ impl WorkerState<'_> {
                     }
                 }
                 WorkerTask::TcpWrite => self.write_tcp()?,
-                WorkerTask::UdpDrain => self.read_udp(),
-                WorkerTask::MdnsDrain(token) => self.handle_mdns_readable(token, Instant::now()),
             }
         }
         Ok(())
@@ -3669,50 +3124,6 @@ impl WorkerState<'_> {
                 self.upload_throttle
                     .delay_until(pending.min(MAX_FILE_CHUNK_BYTES) as u64),
             )
-        }
-    }
-
-    #[inline]
-    fn mdns_wake(&self, now: Instant) -> WakeIntent {
-        match self.mdns.next_timeout(now) {
-            Some(delay) => WakeIntent::After(delay),
-            None => WakeIntent::Idle,
-        }
-    }
-
-    #[inline]
-    fn p2p_wake(&self) -> WakeIntent {
-        if self.p2p_peers.is_empty() {
-            WakeIntent::Idle
-        } else {
-            WakeIntent::After(P2P_POLL_TIMEOUT)
-        }
-    }
-
-    #[inline]
-    fn interface_wake(&self, now: Instant) -> WakeIntent {
-        if self.p2p_enabled && self.voice_room.is_some() {
-            WakeIntent::After(self.interface_monitor.next_wake(now))
-        } else {
-            WakeIntent::Idle
-        }
-    }
-
-    #[inline]
-    fn rtt_probe_wake(&self, now: Instant) -> WakeIntent {
-        let mut wake = self.next_rtt_probe;
-        if let Some(sample_at) = self.server_rtt_last_sample_at {
-            wake = wake.min(sample_at + RTT_STALE_AFTER);
-        }
-        WakeIntent::After(wake.saturating_duration_since(now))
-    }
-
-    #[inline]
-    fn udp_bind_retry_wake(&self, now: Instant) -> WakeIntent {
-        if self.awaiting_udp_bound {
-            WakeIntent::After(self.next_udp_bind_retry.saturating_duration_since(now))
-        } else {
-            WakeIntent::Idle
         }
     }
 
@@ -3870,225 +3281,6 @@ impl WorkerState<'_> {
         Ok(())
     }
 
-    fn read_udp(&mut self) {
-        let mut buf = [0u8; 2048];
-        let mut datagrams_this_wake = 0usize;
-        loop {
-            let (len, src) = match recv_udp_datagram(&self.udp, &mut buf) {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    // More than one datagram per poll wake means inbound packets
-                    // queued in the socket while this single-threaded worker was
-                    // busy (sending voice, polling p2p) between wakes. That read
-                    // coalescing is what the receiver measures as interarrival
-                    // jitter, so surface it.
-                    if datagrams_this_wake > 1 {
-                        kvlog::info!("udp read coalesced", datagrams = datagrams_this_wake);
-                    }
-                    break;
-                }
-                Err(error) => {
-                    kvlog::warn!("udp receive failed", error = %error);
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::Error(format!("UDP receive failed: {error}")));
-                    break;
-                }
-            };
-            datagrams_this_wake += 1;
-            let packet = &buf[..len];
-            let now = Instant::now();
-            if is_stun_message(packet) {
-                self.handle_p2p_stun(now, src, packet);
-            } else if self.handle_p2p_media(now, src, packet) {
-            } else if src != self.server_udp_addr {
-                kvlog::warn!(
-                    "udp packet ignored",
-                    addr = %src,
-                    expected_addr = %self.server_udp_addr,
-                    packet_size = len
-                );
-            } else {
-                match self.open_server_media(packet) {
-                    Ok((
-                        _,
-                        MediaPayload::Voice {
-                            stream_id,
-                            sequence,
-                            timestamp,
-                            flags,
-                            payload,
-                        },
-                    )) => {
-                        let payload_size = payload.len();
-                        let payload_kind = media_voice_payload_kind(&payload);
-                        kvlog::info!(
-                            "voice packet received",
-                            route = "server",
-                            stream_id = stream_id.0,
-                            sequence,
-                            media_timestamp = timestamp,
-                            flags,
-                            payload_size,
-                            payload_kind
-                        );
-                        log_audio_pop_media_packet(
-                            "rx",
-                            "server",
-                            stream_id.0,
-                            sequence,
-                            timestamp,
-                            flags,
-                            payload_size,
-                            payload_kind,
-                        );
-                        self.dispatch_voice_packet(
-                            RemoteVoicePacket {
-                                stream_id: stream_id.0,
-                                sequence,
-                                timestamp,
-                                flags,
-                                payload: audio_payload_from_media(payload),
-                                received_at: now,
-                            },
-                            "server",
-                        );
-                    }
-                    Ok((_, MediaPayload::Pong { nonce })) => {
-                        if let Some(sample) =
-                            take_rtt_sample(&mut self.server_rtt_in_flight, nonce, now)
-                        {
-                            let rtt = fold_rtt_ewma(self.server_rtt_ms, sample);
-                            self.server_rtt_ms = Some(rtt);
-                            self.server_rtt_last_sample_at = Some(now);
-                            let _ = self.events.send(NetworkEvent::ServerRtt {
-                                rtt_ms: Some(clamp_rtt_ms(rtt)),
-                            });
-                            self.publish_all_relay_rtts();
-                        }
-                    }
-                    Ok((
-                        _,
-                        MediaPayload::VoiceFeedbackFrom {
-                            reporter,
-                            stream_id,
-                            feedback,
-                        },
-                    )) => {
-                        let feedback = live_feedback_from_media(stream_id, feedback);
-                        self.handle_encoder_feedback(reporter, feedback, now);
-                    }
-                    Ok((_, MediaPayload::Ping { nonce, .. })) => {
-                        self.send_media(&MediaPayload::Pong { nonce });
-                    }
-                    Ok((_, MediaPayload::Bind { .. })) => {}
-                    Ok((_, MediaPayload::NatProbe { .. })) => {}
-                    // Variants a client never receives from the server: peer media
-                    // arrives on the p2p socket, and the server upgrades every
-                    // relayed reception report to `VoiceFeedbackFrom`.
-                    Ok((
-                        _,
-                        MediaPayload::PeerVoice { .. }
-                        | MediaPayload::PeerVoiceFeedback { .. }
-                        | MediaPayload::VoiceFeedback { .. },
-                    )) => {}
-                    Err(error) => {
-                        kvlog::warn!("udp packet rejected", packet_size = len, error = %error);
-                        let _ = self
-                            .events
-                            .send(NetworkEvent::Error(format!("UDP packet rejected: {error}")));
-                    }
-                }
-            }
-            if datagrams_this_wake >= UDP_DRAIN_BUDGET {
-                self.loop_work.queue_udp_drain();
-                break;
-            }
-        }
-    }
-
-    fn open_server_media(
-        &mut self,
-        packet: &[u8],
-    ) -> Result<(media::UdpHeader, MediaPayload), media::MediaError> {
-        let opened = media::open_media(&self.media, &mut self.media_recv_replay, packet)?;
-        Ok((opened.header, opened.payload))
-    }
-
-    fn dispatch_voice_packet(&mut self, packet: RemoteVoicePacket, route: &'static str) {
-        let stream_id = packet.stream_id;
-        let sequence = packet.sequence;
-        let timestamp = packet.timestamp;
-        let flags = packet.flags;
-        let payload_size = packet.payload.len();
-        let payload_kind = voice_payload_kind(&packet.payload);
-        match self.voice_dedup.observe(stream_id, sequence) {
-            RecentVoiceSequenceResult::New => {
-                kvlog::info!(
-                    "voice packet accepted",
-                    route,
-                    stream_id,
-                    sequence,
-                    media_timestamp = timestamp,
-                    flags,
-                    payload_size,
-                    payload_kind
-                );
-            }
-            RecentVoiceSequenceResult::Duplicate => {
-                kvlog::info!(
-                    "duplicate voice packet dropped",
-                    route,
-                    stream_id,
-                    sequence,
-                    media_timestamp = timestamp,
-                    flags,
-                    payload_size,
-                    payload_kind
-                );
-                return;
-            }
-            RecentVoiceSequenceResult::Stale => {
-                kvlog::info!(
-                    "stale voice packet dropped",
-                    route,
-                    stream_id,
-                    sequence,
-                    media_timestamp = timestamp,
-                    flags,
-                    payload_size,
-                    payload_kind
-                );
-                return;
-            }
-        }
-        dispatch_voice_packet_to(
-            &self.events,
-            self.playback_sink.as_ref(),
-            &mut self.pending_playback_packets,
-            packet,
-        );
-    }
-
-    fn set_playback_sink(&mut self, sink: Option<LivePlaybackSink>) {
-        let Some(sink) = sink else {
-            self.playback_sink = None;
-            self.pending_playback_packets.clear();
-            return;
-        };
-
-        while let Some(packet) = self.pending_playback_packets.pop_front() {
-            sink.push(packet);
-        }
-        self.playback_sink = Some(sink);
-    }
-
-    fn clear_pending_playback_stream(&mut self, stream_id: StreamId) {
-        self.pending_playback_packets
-            .retain(|packet| packet.stream_id != stream_id.0);
-        self.voice_dedup.remove_stream(stream_id.0);
-    }
-
     fn handle_command(&mut self, command: NetworkCommand) -> Result<(), String> {
         if !matches!(
             command,
@@ -4173,6 +3365,7 @@ impl WorkerState<'_> {
                 self.active_room = Some(room_id);
             }
             NetworkCommand::JoinVoice(room_id) => {
+                self.voice.activate(self.voice_generation)?;
                 self.queue_control(ClientControl::JoinVoice { room_id })?;
             }
             NetworkCommand::LeaveVoice => {
@@ -4321,78 +3514,18 @@ impl WorkerState<'_> {
                     ));
                     return Ok(());
                 }
-                if self.p2p_enabled == enabled {
-                    return Ok(());
-                }
-                self.p2p_enabled = enabled;
-                self.request_p2p_restart();
-                if enabled {
-                    self.publish_p2p_candidates();
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::Status("P2P enabled".to_string()));
-                } else {
-                    self.publish_p2p_disabled();
-                    self.reset_voice_peer_state();
-                    // The loop no longer runs poll_interfaces while p2p is
-                    // off, so drop the baseline here to match what the
-                    // active=false path would have done.
-                    self.interface_monitor.deactivate(Instant::now());
-                    let _ = self.events.send(NetworkEvent::Status(
-                        "P2P disabled; using relay".to_string(),
-                    ));
-                }
+                self.queue_voice_command(voice::VoiceCommand::SetP2pEnabled {
+                    generation: self.voice_generation,
+                    enabled,
+                })?;
             }
-            NetworkCommand::LocalVoicePacket(frame) => {
-                if let Some(stream_id) = self.active_stream {
-                    let sequence = allocate_local_voice_sequence(&mut self.local_sequence);
-                    self.send_local_voice_packet(stream_id, sequence, frame);
-                }
-            }
-            NetworkCommand::SequencedLocalVoicePacket { sequence, frame } => {
-                if let Some(stream_id) = self.active_stream {
-                    advance_local_voice_sequence_past(&mut self.local_sequence, sequence);
-                    self.send_local_voice_packet(stream_id, sequence, frame);
-                }
-            }
-            NetworkCommand::SetPlaybackSink(sink) => {
-                self.set_playback_sink(sink);
-            }
-            NetworkCommand::PlaybackFeedback(feedback) => {
-                let _ = self.events.send(NetworkEvent::PlaybackFeedback(feedback));
-                let stream_id = StreamId(feedback.stream_id);
-                kvlog::info!(
-                    "playback feedback sent",
-                    stream_id = feedback.stream_id,
-                    highest_contiguous_sequence = feedback.highest_contiguous_sequence,
-                    expected_packets = feedback.expected_packets,
-                    lost_packets = feedback.lost_packets,
-                    late_packets = feedback.late_packets,
-                    duplicate_packets = feedback.duplicate_packets,
-                    reordered_packets = feedback.reordered_packets,
-                    window_ms = feedback.window_ms,
-                    max_output_ring_ms = feedback.max_output_ring_ms,
-                    max_neteq_target_ms = feedback.max_neteq_target_ms,
-                    max_neteq_playout_delay_ms = feedback.max_neteq_playout_delay_ms,
-                    max_neteq_packet_buffer_ms = feedback.max_neteq_packet_buffer_ms,
-                    max_interarrival_jitter_ms = feedback.max_interarrival_jitter_ms
-                );
-                let owner = self.p2p_stream_owners.get(&stream_id).copied();
-                let owner_direct_stable = owner
-                    .and_then(|session_id| self.p2p_peers.get(&session_id))
-                    .and_then(|peer| peer.direct_stable_since)
-                    .is_some_and(|since| {
-                        Instant::now().saturating_duration_since(since) >= DIRECT_CONFIRM_WINDOW
-                    });
-                if !owner_direct_stable {
-                    self.send_media(&MediaPayload::VoiceFeedback {
-                        stream_id,
-                        feedback: media_feedback_from_live(feedback),
-                    });
-                }
-                if let Some(session_id) = owner {
-                    self.send_p2p_voice_feedback(session_id, stream_id, feedback);
-                }
+            NetworkCommand::LocalVoicePacket(_)
+            | NetworkCommand::SequencedLocalVoicePacket { .. }
+            | NetworkCommand::SetPlaybackSink(_)
+            | NetworkCommand::PlaybackFeedback(_) => {
+                // Production senders route these directly. The test fallback
+                // intentionally drops them rather than doing packet work here.
+                kvlog::debug!("media fast-path command reached chatt-net fallback");
             }
             NetworkCommand::SetVoiceStatus(status) => {
                 if audio_pop_logging_enabled() {
@@ -4452,45 +3585,6 @@ impl WorkerState<'_> {
             }
         }
         Ok(())
-    }
-
-    fn send_local_voice_packet(
-        &mut self,
-        stream_id: StreamId,
-        sequence: u32,
-        frame: LocalVoiceFrame,
-    ) {
-        let timestamp = frame.timestamp;
-        kvlog::info!(
-            "voice packet sent",
-            stream_id = stream_id.0,
-            sequence,
-            media_timestamp = timestamp,
-            flags = frame.flags,
-            payload_size = frame.payload.len(),
-            payload_kind = voice_payload_kind(&frame.payload)
-        );
-        log_audio_pop_media_packet(
-            "tx",
-            "local",
-            stream_id.0,
-            sequence,
-            timestamp,
-            frame.flags,
-            frame.payload.len(),
-            voice_payload_kind(&frame.payload),
-        );
-        if !self.relay_suppressed(Instant::now()) {
-            let relay_payload = MediaPayload::Voice {
-                stream_id,
-                sequence,
-                timestamp,
-                flags: frame.flags,
-                payload: media_payload_from_audio(&frame.payload),
-            };
-            self.send_media(&relay_payload);
-        }
-        self.send_p2p_voice(stream_id, sequence, timestamp, frame.flags, &frame.payload);
     }
 
     fn queue_file_upload(&mut self, room_id: Option<RoomId>, request: UploadFileRequest) {
@@ -6031,19 +5125,17 @@ impl WorkerState<'_> {
                     user_id = user_id.0,
                     stream_id = stream_id.0
                 );
-                if Some(session_id) == self.session_id {
-                    self.reset_voice_peer_state();
+                let local = Some(session_id) == self.session_id;
+                self.queue_voice_command(voice::VoiceCommand::VoiceStarted {
+                    generation: self.voice_generation,
+                    room_id,
+                    session_id,
+                    user_id,
+                    stream_id,
+                    local,
+                })?;
+                if local {
                     self.voice_room = Some(room_id);
-                    self.active_stream = Some(stream_id);
-                    self.voice_others.clear();
-                    self.local_sequence = 0;
-                    self.encoder_feedback = EncoderFeedbackController::new();
-                    let _ = self.events.send(NetworkEvent::EncoderProfileChanged(
-                        LiveEncoderProfile::DRED_20,
-                    ));
-                    self.publish_p2p_candidates();
-                } else if self.voice_room == Some(room_id) {
-                    self.voice_others.insert(user_id);
                 }
                 let _ = self.events.send(NetworkEvent::VoiceStarted {
                     room_id,
@@ -6063,17 +5155,18 @@ impl WorkerState<'_> {
                     user_id = user_id.0,
                     stream_id = stream_id.0
                 );
-                if Some(stream_id) == self.active_stream {
-                    self.active_stream = None;
-                    if self.voice_room == Some(room_id) {
-                        self.voice_room = None;
-                    }
-                    self.reset_voice_peer_state();
-                } else if self.voice_room == Some(room_id) {
-                    self.voice_others.remove(&user_id);
+                let local = Some(session_id) == self.session_id;
+                self.queue_voice_command(voice::VoiceCommand::VoiceStopped {
+                    generation: self.voice_generation,
+                    room_id,
+                    session_id,
+                    user_id,
+                    stream_id,
+                    local,
+                })?;
+                if local && self.voice_room == Some(room_id) {
+                    self.voice_room = None;
                 }
-                self.p2p_stream_owners.remove(&stream_id);
-                self.clear_pending_playback_stream(stream_id);
                 let _ = self.events.send(NetworkEvent::VoiceStopped {
                     room_id,
                     session_id,
@@ -6113,42 +5206,27 @@ impl WorkerState<'_> {
                     .send(NetworkEvent::VoiceJoinFailed { room_id, message });
             }
             ServerControl::RoomRttSnapshot { room_id, members } => {
-                if self.voice_room == Some(room_id) {
-                    self.room_server_rtts = members
-                        .into_iter()
-                        .filter_map(|member| {
-                            member.server_rtt_ms.map(|rtt_ms| (member.user_id, rtt_ms))
-                        })
-                        .collect();
-                    self.publish_all_relay_rtts();
-                }
+                self.queue_voice_command(voice::VoiceCommand::RoomRttSnapshot {
+                    generation: self.voice_generation,
+                    room_id,
+                    members,
+                })?;
             }
             ServerControl::UdpBound => {
-                if self.awaiting_udp_bound {
-                    self.awaiting_udp_bound = false;
-                    kvlog::info!("client udp bound");
-                    if self.udp_reported_unreachable {
-                        let _ = self
-                            .events
-                            .send(NetworkEvent::MediaConnectivity { udp_ok: true });
-                    }
-                    self.udp_reported_unreachable = false;
-                    self.udp_bind_attempts = 0;
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::Status("udp media bound".to_string()));
-                }
+                let _ = self
+                    .events
+                    .send(NetworkEvent::Status("udp media bound".to_string()));
+                self.queue_voice_command(voice::VoiceCommand::UdpBound {
+                    generation: self.voice_generation,
+                })?;
             }
             ServerControl::UdpReflexive { addr } => match addr.parse::<SocketAddr>() {
                 Ok(addr) => {
                     kvlog::info!("client udp reflexive address received", addr = %addr);
-                    // The server answers every relay keepalive `Bind` with a
-                    // fresh `UdpReflexive`, so an unchanged address must not
-                    // republish or the peers re-pair once per keepalive.
-                    if self.p2p_reflexive_addr != Some(addr) {
-                        self.p2p_reflexive_addr = Some(addr);
-                        self.publish_p2p_candidates();
-                    }
+                    self.queue_voice_command(voice::VoiceCommand::UdpReflexive {
+                        generation: self.voice_generation,
+                        addr,
+                    })?;
                 }
                 Err(error) => {
                     kvlog::warn!("invalid udp reflexive address", addr = addr.as_str(), error = %error);
@@ -6161,20 +5239,11 @@ impl WorkerState<'_> {
                         probe_id,
                         addr = %addr
                     );
-                    let server_addr = self
-                        .probe_addr_for_id(probe_id)
-                        .unwrap_or(self.server_udp_addr);
-                    self.p2p_nat_classifier.observe(ReflexiveObservation {
-                        server_addr,
-                        mapped_addr: addr,
-                    });
-                    let previous = (self.p2p_nat, self.p2p_reflexive_addr);
-                    let classified = self.p2p_nat_classifier.classify();
-                    self.p2p_nat = control_nat_kind(classified);
-                    self.p2p_reflexive_addr = self.p2p_nat_classifier.primary_reflexive_addr();
-                    if (self.p2p_nat, self.p2p_reflexive_addr) != previous {
-                        self.publish_p2p_candidates();
-                    }
+                    self.queue_voice_command(voice::VoiceCommand::NatProbeObserved {
+                        generation: self.voice_generation,
+                        probe_id,
+                        addr,
+                    })?;
                 }
                 Err(error) => {
                     kvlog::warn!(
@@ -6186,21 +5255,20 @@ impl WorkerState<'_> {
                 }
             },
             ServerControl::P2pPeer { peer } => {
-                if let Err(error) = self.install_p2p_peer(peer) {
-                    kvlog::warn!("p2p peer rejected", error = %error);
-                    let _ = self.events.send(NetworkEvent::Error(error));
-                }
+                self.queue_voice_command(voice::VoiceCommand::InstallPeer {
+                    generation: self.voice_generation,
+                    peer,
+                })?;
             }
             ServerControl::P2pPeerGone {
                 session_id,
                 user_id,
             } => {
-                self.p2p_peers.remove(&session_id);
-                let _ = self.events.send(NetworkEvent::PeerTransport {
+                self.queue_voice_command(voice::VoiceCommand::RemovePeer {
+                    generation: self.voice_generation,
+                    session_id,
                     user_id,
-                    direct: false,
-                });
-                self.publish_relay_rtt(user_id);
+                })?;
                 kvlog::info!(
                     "p2p peer removed",
                     session_id = session_id.0,
@@ -6344,7 +5412,10 @@ impl WorkerState<'_> {
                     online
                 );
                 if !online {
-                    self.room_server_rtts.remove(&user.user_id);
+                    self.queue_voice_command(voice::VoiceCommand::UserOffline {
+                        generation: self.voice_generation,
+                        user_id: user.user_id,
+                    })?;
                 }
                 self.user_names.insert(user.user_id, user.username.clone());
                 self.queue_mls_input(mls_actor::Input::Presence {
@@ -6377,7 +5448,6 @@ impl WorkerState<'_> {
         self.session_id = Some(session_id);
         self.user_id = Some(user_id);
         self.active_room = Some(default_room);
-        self.room_server_rtts.clear();
         kvlog::info!(
             "client authenticated",
             session_id = session_id.0,
@@ -6407,6 +5477,16 @@ impl WorkerState<'_> {
             server_public_key: self.server_public_key,
             device_name: device_name.to_string(),
         })?;
+        let initial_udp_bind = self
+            .pending_initial_udp_bind
+            .take()
+            .ok_or_else(|| "initial UDP bind was already dispatched".to_string())?;
+        let send_error = initial_udp_bind.dispatch()?;
+        report_initial_udp_bind_send_error(&self.events, send_error);
+        self.queue_voice_command(voice::VoiceCommand::Authenticated {
+            generation: self.voice_generation,
+            session_id,
+        })?;
         let _ = self.events.send(NetworkEvent::Authenticated {
             session_id,
             user_id,
@@ -6416,7 +5496,6 @@ impl WorkerState<'_> {
             video_transport_mode: self.transport_mode,
             video_auth_key: self.video_auth_key,
         });
-        self.bind_udp();
         Ok(())
     }
 
@@ -6604,1140 +5683,6 @@ impl WorkerState<'_> {
         let _ = self.cancel_outgoing_upload(upload, reason, UploadAbort::Declined);
     }
 
-    fn bind_udp(&mut self) {
-        if let Some(session_id) = self.session_id {
-            kvlog::info!("udp bind sending", session_id = session_id.0);
-            self.awaiting_udp_bound = true;
-            self.udp_bind_attempts = 0;
-            self.next_udp_bind_retry = Instant::now() + UDP_BIND_RETRY_INTERVAL;
-            self.send_media(&MediaPayload::Bind);
-            // NAT probes discover reflexive addresses for P2P only, which runs
-            // solely in native-encrypted mode. External-link mode disables P2P
-            // and the server rejects probes there.
-            if self.p2p_enabled {
-                self.send_nat_probe(0, self.server_udp_addr);
-                if let Some(udp_probe_addr) = self.server_udp_probe_addr {
-                    self.send_nat_probe(1, udp_probe_addr);
-                }
-            }
-        }
-    }
-
-    fn poll_udp_bind_retry(&mut self, now: Instant) {
-        if !self.awaiting_udp_bound || now < self.next_udp_bind_retry {
-            return;
-        }
-        self.next_udp_bind_retry = now + UDP_BIND_RETRY_INTERVAL;
-        if self.session_id.is_some() {
-            kvlog::info!("udp bind retry sending");
-            self.send_media(&MediaPayload::Bind);
-        }
-        self.udp_bind_attempts = self.udp_bind_attempts.saturating_add(1);
-        if self.udp_bind_attempts >= UDP_BIND_FAILURE_ATTEMPTS && !self.udp_reported_unreachable {
-            self.udp_reported_unreachable = true;
-            kvlog::warn!("client udp unreachable", attempts = self.udp_bind_attempts);
-            let _ = self
-                .events
-                .send(NetworkEvent::MediaConnectivity { udp_ok: false });
-        }
-    }
-
-    fn send_nat_probe(&mut self, probe_id: u8, addr: SocketAddr) {
-        let payload = MediaPayload::NatProbe { probe_id };
-        let counter = self.media_send_counter;
-        self.media_send_counter = self.media_send_counter.wrapping_add(1);
-        match self.seal_server_media(counter, &payload) {
-            Ok(packet) => self.send_udp_raw("nat_probe", None, addr, &packet),
-            Err(error) => {
-                kvlog::warn!("nat probe seal failed", probe_id, error = %error);
-            }
-        }
-    }
-
-    fn probe_addr_for_id(&self, probe_id: u8) -> Option<SocketAddr> {
-        match probe_id {
-            0 => Some(self.server_udp_addr),
-            1 => self.server_udp_probe_addr,
-            _ => None,
-        }
-    }
-
-    fn poll_interfaces(&mut self, now: Instant) {
-        match self.interface_monitor.poll_with(
-            self.p2p_enabled && self.voice_room.is_some(),
-            now,
-            InterfaceSnapshot::capture,
-        ) {
-            Ok(Some(true)) => {
-                kvlog::info!("network interfaces changed; requesting p2p restart");
-                self.request_p2p_restart();
-            }
-            Ok(_) => {}
-            Err(error) => {
-                kvlog::warn!("network interface discovery failed", error = %error);
-            }
-        }
-    }
-
-    fn request_p2p_restart(&mut self) {
-        self.p2p_generation = self.p2p_generation.wrapping_add(1).max(1);
-        self.p2p_reflexive_addr = None;
-        self.p2p_candidates.clear();
-        self.p2p_local_candidates.clear();
-        self.mdns_pending.clear();
-        self.p2p_nat_classifier = NatClassifier::new();
-        self.p2p_nat = configured_nat_kind();
-        self.udp_rebind_requested = true;
-    }
-
-    /// Aligns the mdns sockets with the p2p toggle: enabling binds and
-    /// registers them, disabling deregisters and drops them so LAN multicast
-    /// no longer wakes the loop. Runs on the same deferred rebind flag as the
-    /// UDP socket because the command handler cannot reach the poll registry.
-    fn reconcile_mdns(&mut self, poll: &Poll) {
-        if self.p2p_enabled && !self.mdns.is_bound() {
-            if let Err(error) = self.mdns.rebind(poll.registry()) {
-                kvlog::warn!("failed to register mdns sockets", error = %error);
-            }
-        } else if !self.p2p_enabled && self.mdns.is_bound() {
-            self.mdns.shutdown(poll.registry());
-        }
-    }
-
-    fn rebind_udp_socket(&mut self, poll: &mut Poll) -> Result<(), String> {
-        self.udp_rebind_requested = false;
-        if let Err(error) = poll.registry().deregister(&mut self.udp) {
-            kvlog::warn!("failed to deregister udp socket before rebind", error = %error);
-        }
-        self.restart_port_policy.record(self.udp_local_addr.port());
-
-        let bind_addr =
-            RestartPortPolicy::bind_addr_for_restart(if self.server_udp_addr.is_ipv4() {
-                "0.0.0.0:0".parse().unwrap()
-            } else {
-                "[::]:0".parse().unwrap()
-            });
-        let mut last_error = None;
-        for _ in 0..8 {
-            match bind_voice_udp_socket(bind_addr) {
-                Ok(socket) => {
-                    let local_addr = socket
-                        .local_addr()
-                        .map_err(|error| format!("failed to read rebound UDP address: {error}"))?;
-                    if !self.restart_port_policy.accepts(local_addr.port()) {
-                        self.restart_port_policy.record(local_addr.port());
-                        continue;
-                    }
-                    self.udp_local_addr = local_addr;
-                    self.udp = UdpSocket::from_std(socket);
-                    poll.registry()
-                        .register(&mut self.udp, UDP, Interest::READABLE)
-                        .map_err(|error| {
-                            format!("failed to register rebound UDP socket: {error}")
-                        })?;
-                    kvlog::info!("udp socket rebound", addr = %self.udp_local_addr);
-                    self.reset_server_rtt();
-                    self.bind_udp();
-                    return Ok(());
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                }
-            }
-        }
-
-        Err(format!(
-            "failed to rebind UDP socket to fresh port{}",
-            last_error
-                .map(|error| format!(": {error}"))
-                .unwrap_or_default()
-        ))
-    }
-
-    fn send_media(&mut self, payload: &MediaPayload) {
-        let kind = media_payload_kind(payload);
-        let counter = self.media_send_counter;
-        self.media_send_counter = self.media_send_counter.wrapping_add(1);
-        let result = media::seal_media_into(
-            &self.media,
-            counter,
-            payload,
-            &mut self.media_packet,
-            &mut self.media_scratch,
-        );
-        match result {
-            Ok(()) => {
-                // Detach the packet buffer so `send_udp` style logging can borrow
-                // `self` again, then restore it to retain its capacity.
-                let packet = std::mem::take(&mut self.media_packet);
-                if let Err(error) = self.udp.send_to(&packet, self.server_udp_addr) {
-                    kvlog::warn!(
-                        "udp send failed",
-                        kind,
-                        packet_size = packet.len(),
-                        error = %error
-                    );
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::Error(format!("UDP send failed: {error}")));
-                } else if !matches!(
-                    payload,
-                    MediaPayload::Voice { .. } | MediaPayload::VoiceFeedback { .. }
-                ) {
-                    kvlog::info!("udp packet sent", kind, packet_size = packet.len(), counter);
-                }
-                self.media_packet = packet;
-            }
-            Err(error) => {
-                kvlog::warn!("udp seal failed", kind, error = %error);
-                let _ = self
-                    .events
-                    .send(NetworkEvent::Error(format!("UDP seal failed: {error}")));
-            }
-        }
-    }
-
-    fn seal_server_media(
-        &self,
-        counter: u64,
-        payload: &MediaPayload,
-    ) -> Result<Vec<u8>, media::MediaError> {
-        media::seal_media(&self.media, counter, payload)
-    }
-
-    fn publish_p2p_candidates(&mut self) {
-        if !self.p2p_enabled {
-            return;
-        }
-        let Some(room_id) = self.voice_room else {
-            return;
-        };
-        if self.session_id.is_none() {
-            return;
-        }
-        if let Err(error) = self
-            .interface_monitor
-            .ensure_with(Instant::now(), InterfaceSnapshot::capture)
-        {
-            kvlog::warn!("host candidate discovery failed", error = %error);
-        }
-        let gathered = self.gather_p2p_candidates();
-        self.p2p_local_candidates = gathered.local;
-        self.p2p_candidates = gathered.published.clone();
-        self.mdns.publish_names(gathered.mdns_names);
-        kvlog::info!(
-            "publishing p2p candidates",
-            generation = self.p2p_generation,
-            candidate_count = gathered.published.len()
-        );
-        let _ = self.queue_control(ClientControl::PublishP2p {
-            room_id,
-            generation: self.p2p_generation,
-            nat: self.p2p_nat,
-            tie_breaker: self.p2p_tie_breaker,
-            candidates: gathered.published,
-        });
-    }
-
-    fn publish_p2p_disabled(&mut self) {
-        let Some(room_id) = self.voice_room else {
-            return;
-        };
-        if self.session_id.is_none() {
-            return;
-        }
-        self.p2p_local_candidates.clear();
-        self.p2p_candidates.clear();
-        self.mdns.publish_names(std::iter::empty());
-        let _ = self.queue_control(ClientControl::PublishP2p {
-            room_id,
-            generation: self.p2p_generation,
-            nat: self.p2p_nat,
-            tie_breaker: self.p2p_tie_breaker,
-            candidates: Vec::new(),
-        });
-    }
-
-    fn reset_voice_peer_state(&mut self) {
-        let users = self
-            .p2p_peers
-            .values()
-            .map(|peer| peer.user_id)
-            .collect::<HashSet<_>>();
-        self.p2p_peers.clear();
-        self.p2p_stream_owners.clear();
-        self.mdns_pending.clear();
-        self.room_server_rtts.clear();
-        self.voice_others.clear();
-        for user_id in users {
-            let _ = self.events.send(NetworkEvent::PeerTransport {
-                user_id,
-                direct: false,
-            });
-        }
-    }
-
-    /// Builds the local candidate set from interface enumeration and applies the
-    /// configured candidate privacy mode. The returned `local` candidates always
-    /// carry literal addresses for the IP-only agent, while `published` carries
-    /// the rewritten `.local` names (mDNS mode) and `mdns_names` maps each name
-    /// back to the interface address for the responder.
-    fn gather_p2p_candidates(&self) -> GatheredP2p {
-        let mut next_id = 1;
-        let mut candidates = self
-            .interface_monitor
-            .snapshot()
-            .map(|snapshot| {
-                snapshot.host_candidates_with_metadata(
-                    1,
-                    self.p2p_generation,
-                    self.udp_local_addr.port(),
-                    true,
-                    &mut next_id,
-                    self.prefer_ipv6,
-                )
-            })
-            .unwrap_or_default();
-        if candidates.is_empty() {
-            let fallback_ip = if self.server_udp_addr.is_ipv4() {
-                "127.0.0.1".parse().unwrap()
-            } else {
-                "::1".parse().unwrap()
-            };
-            candidates.push(Candidate::with_metadata(
-                next_id,
-                1,
-                self.p2p_generation,
-                CandidateKind::Host,
-                SocketAddr::new(fallback_ip, self.udp_local_addr.port()),
-                None,
-                true,
-                self.prefer_ipv6,
-            ));
-            next_id = next_id.wrapping_add(1).max(1);
-        }
-        if let Some(reflexive) = self.p2p_reflexive_addr {
-            candidates.push(Candidate::with_metadata(
-                next_id,
-                1,
-                self.p2p_generation,
-                CandidateKind::ServerReflexive,
-                reflexive,
-                Some(self.udp_local_addr),
-                true,
-                self.prefer_ipv6,
-            ));
-            next_id = next_id.wrapping_add(1).max(1);
-        }
-        candidates.push(Candidate::with_metadata(
-            next_id,
-            1,
-            self.p2p_generation,
-            CandidateKind::Relay,
-            self.server_udp_addr,
-            None,
-            true,
-            self.prefer_ipv6,
-        ));
-
-        let rng = aws_lc_rs::rand::SystemRandom::new();
-        apply_candidate_privacy(candidates, self.candidate_privacy, &rng)
-    }
-
-    fn install_p2p_peer(&mut self, peer: P2pPeerInfo) -> Result<(), String> {
-        if !self.p2p_enabled {
-            return Ok(());
-        }
-        if self.voice_room != Some(peer.room_id) {
-            kvlog::info!(
-                "p2p peer ignored for inactive voice room",
-                peer_room_id = peer.room_id.0,
-                voice_room_id = self.voice_room.map(|room| room.0).unwrap_or(0)
-            );
-            return Ok(());
-        }
-        if let Some(existing) = self.p2p_peers.get(&peer.session_id)
-            && p2p_peer_is_republish(existing, &peer, self.p2p_generation)
-        {
-            kvlog::info!(
-                "p2p peer republish ignored",
-                session_id = peer.session_id.0,
-                user_id = peer.user_id.0,
-                generation = peer.generation,
-                connection_id = peer.connection_id
-            );
-            return Ok(());
-        }
-        let send_key = key_from_control(&peer.send_key)?;
-        let recv_key = key_from_control(&peer.recv_key)?;
-        let stun_key = key_from_control(&peer.stun_key)?.bytes;
-        let mut transaction_salt = [0u8; 32];
-        aws_lc_rs::rand::SystemRandom::new()
-            .fill(&mut transaction_salt)
-            .map_err(|_| "failed to generate STUN transaction salt".to_string())?;
-        let auth = StunAuth::new(stun_key, transaction_salt);
-        let local_candidates = self.p2p_local_candidates.clone();
-        // Literal-IP remote candidates go straight into the agent. Each `.local`
-        // host candidate is queued for mDNS resolution and added later via
-        // `add_remote_candidate` once its address is known.
-        let mut remote_candidates = Vec::new();
-        let mut pending = Vec::new();
-        for control in &peer.candidates {
-            if let Some(candidate) = candidate_from_control(control) {
-                remote_candidates.push(candidate);
-            } else if let Some((name, port)) = split_mdns_addr(&control.addr) {
-                pending.push((name, control.clone(), port));
-            }
-        }
-        if local_candidates.is_empty() {
-            return Err("missing local P2P candidates".to_string());
-        }
-        if remote_candidates.is_empty() && pending.is_empty() {
-            return Err("missing remote P2P candidates".to_string());
-        }
-        let config = P2pAgentConfig {
-            username: Some(p2p_username(peer.connection_id)),
-            keepalive_interval: P2P_KEEPALIVE_INTERVAL,
-            consent_timeout: P2P_CONSENT_TIMEOUT,
-            ..P2pAgentConfig::with_auth(auth)
-        };
-        let agent = TraversalAgent::new(
-            Instant::now(),
-            config,
-            ice_role_from_control(peer.role),
-            self.p2p_tie_breaker,
-            nat_from_control(self.p2p_nat),
-            nat_from_control(peer.nat),
-            local_candidates,
-            remote_candidates,
-        );
-        kvlog::info!(
-            "p2p peer installed",
-            session_id = peer.session_id.0,
-            user_id = peer.user_id.0,
-            generation = peer.generation,
-            connection_id = peer.connection_id,
-            direct_pair_count = agent.direct_pair_count()
-        );
-        let session_id = peer.session_id;
-        self.p2p_peers.insert(
-            session_id,
-            PeerConnection {
-                user_id: peer.user_id,
-                agent,
-                send_key,
-                recv_key,
-                send_counter: 0,
-                recv_replay: AntiReplay::new(),
-                connection_id: peer.connection_id,
-                remote_generation: peer.generation,
-                local_generation: self.p2p_generation,
-                direct_stable_since: None,
-                last_direct_inbound: None,
-                rtt_in_flight: VecDeque::new(),
-                rtt_ms: None,
-            },
-        );
-        let now = Instant::now();
-        for (name, control, port) in pending {
-            self.mdns.start_resolve(&name, now);
-            self.mdns_pending.insert(
-                name,
-                MdnsPending {
-                    session_id,
-                    control,
-                    port,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    /// Drains resolved mDNS answers on the given socket, feeding each one into
-    /// the matching peer's agent. Also answers inbound queries for local names.
-    fn handle_mdns_readable(&mut self, token: Token, now: Instant) {
-        let outcome = self.mdns.handle_readable(token, now, MDNS_DRAIN_BUDGET);
-        for (name, ip) in outcome.resolved {
-            let Some(pending) = self.mdns_pending.remove(&name) else {
-                continue;
-            };
-            let addr = SocketAddr::new(ip, pending.port);
-            let candidate = candidate_from_control_with_addr(&pending.control, addr);
-            let Some(peer) = self.p2p_peers.get_mut(&pending.session_id) else {
-                continue;
-            };
-            kvlog::info!("p2p mdns candidate resolved", name = name.as_str(), addr = %addr);
-            peer.agent.add_remote_candidate(now, candidate);
-        }
-        if outcome.hit_limit {
-            self.loop_work.queue_mdns_drain(token);
-        }
-    }
-
-    /// Drops mDNS queries that exceeded the resolution timeout.
-    fn poll_mdns(&mut self, now: Instant) {
-        for name in self.mdns.handle_timeout(now) {
-            self.mdns_pending.remove(&name);
-        }
-    }
-
-    fn poll_p2p(&mut self, now: Instant) {
-        let actions = self
-            .p2p_peers
-            .iter_mut()
-            .map(|(session_id, peer)| (*session_id, peer.agent.poll(now)))
-            .filter(|(_, actions)| !actions.is_empty())
-            .collect::<Vec<_>>();
-        for (session_id, actions) in actions {
-            self.apply_p2p_actions(session_id, actions);
-        }
-        self.reconcile_direct_stability(now);
-    }
-
-    /// Derives each peer's direct-path stability from current liveness. Arms
-    /// [`PeerConnection::direct_stable_since`] once a path is healthy, clears it
-    /// when the path stalls past [`DIRECT_FAILOVER_IDLE`] or loses selection,
-    /// and re-arms after recovery. The relay suppression decision reads from it.
-    fn reconcile_direct_stability(&mut self, now: Instant) {
-        for peer in self.p2p_peers.values_mut() {
-            let healthy = direct_path_healthy(
-                peer.agent.selected().is_some(),
-                peer.last_direct_inbound,
-                now,
-                DIRECT_FAILOVER_IDLE,
-            );
-            if healthy {
-                if peer.direct_stable_since.is_none() {
-                    peer.direct_stable_since = Some(now);
-                }
-            } else {
-                peer.direct_stable_since = None;
-            }
-        }
-    }
-
-    /// Returns true when every other online participant is reachable over a
-    /// direct path that has been stable for [`DIRECT_CONFIRM_WINDOW`], so the
-    /// server relay is pure redundancy and can be dropped.
-    fn relay_suppressed(&self, now: Instant) -> bool {
-        relay_suppressed(
-            now,
-            DIRECT_CONFIRM_WINDOW,
-            &self.voice_others,
-            self.p2p_peers
-                .values()
-                .map(|peer| (peer.user_id, peer.direct_stable_since)),
-        )
-    }
-
-    /// Sends a lightweight server keepalive while the relay is suppressed so the
-    /// on-path NAT binding stays warm and relay can resume without a stall.
-    fn poll_relay_keepalive(&mut self, now: Instant) {
-        if !self.relay_suppressed(now) {
-            self.next_relay_keepalive = now + RELAY_KEEPALIVE_INTERVAL;
-            return;
-        }
-        if now < self.next_relay_keepalive {
-            return;
-        }
-        self.next_relay_keepalive = now + RELAY_KEEPALIVE_INTERVAL;
-        if self.session_id.is_some() {
-            self.send_media(&MediaPayload::Bind);
-        }
-    }
-
-    fn publish_relay_rtt(&self, user_id: UserId) {
-        if self
-            .p2p_peers
-            .values()
-            .any(|peer| peer.user_id == user_id && peer.agent.selected().is_some())
-        {
-            return;
-        }
-        let rtt_ms = combined_relay_rtt(
-            self.server_rtt_ms,
-            self.room_server_rtts.get(&user_id).copied(),
-        );
-        let _ = self.events.send(NetworkEvent::PeerRtt { user_id, rtt_ms });
-    }
-
-    fn publish_all_relay_rtts(&self) {
-        for user_id in &self.voice_others {
-            self.publish_relay_rtt(*user_id);
-        }
-    }
-
-    fn reset_server_rtt(&mut self) {
-        self.server_rtt_ms = None;
-        self.server_rtt_last_sample_at = None;
-        self.server_rtt_in_flight.clear();
-        let _ = self.events.send(NetworkEvent::ServerRtt { rtt_ms: None });
-        self.publish_all_relay_rtts();
-    }
-
-    /// Allocates the next monotonically increasing RTT probe nonce.
-    fn next_rtt_nonce(&mut self) -> u64 {
-        self.rtt_probe_seq = self.rtt_probe_seq.wrapping_add(1);
-        self.rtt_probe_seq
-    }
-
-    /// Sends a media `Ping` to the server relay and to every peer with a selected
-    /// direct path. The server ping reports the previous relay RTT estimate so
-    /// the server can include it in batched room snapshots.
-    fn poll_rtt_probe(&mut self, now: Instant) {
-        if rtt_sample_is_stale(self.server_rtt_last_sample_at, now) {
-            self.reset_server_rtt();
-        }
-        if now < self.next_rtt_probe {
-            return;
-        }
-        self.next_rtt_probe = now + RTT_PROBE_INTERVAL;
-        if self.session_id.is_some() {
-            let nonce = self.next_rtt_nonce();
-            push_rtt_in_flight(&mut self.server_rtt_in_flight, nonce, now);
-            self.send_media(&MediaPayload::Ping {
-                nonce,
-                observed_rtt_ms: self.server_rtt_ms.map(clamp_rtt_ms),
-            });
-        }
-        let peer_sessions: Vec<SessionId> = self
-            .p2p_peers
-            .iter()
-            .filter(|(_, peer)| peer.agent.selected().is_some())
-            .map(|(session_id, _)| *session_id)
-            .collect();
-        for session_id in peer_sessions {
-            let nonce = self.next_rtt_nonce();
-            self.send_p2p_ping(session_id, nonce, now);
-        }
-    }
-
-    /// Seals a media `Ping` with the peer's key and sends it over the direct
-    /// path, recording the send time so the matching `Pong` yields an RTT sample.
-    fn send_p2p_ping(&mut self, session_id: SessionId, nonce: u64, now: Instant) {
-        let Some((addr, packet)) = self.p2p_peers.get_mut(&session_id).and_then(|peer| {
-            let addr = peer.agent.selected()?.remote_addr;
-            let counter = peer.send_counter;
-            peer.send_counter = peer.send_counter.wrapping_add(1);
-            push_rtt_in_flight(&mut peer.rtt_in_flight, nonce, now);
-            Some((
-                addr,
-                media::seal_peer_media(
-                    &peer.send_key,
-                    counter,
-                    &MediaPayload::Ping {
-                        nonce,
-                        observed_rtt_ms: None,
-                    },
-                ),
-            ))
-        }) else {
-            return;
-        };
-        match packet {
-            Ok(packet) => self.send_udp_raw("p2p_ping", Some(session_id), addr, &packet),
-            Err(error) => {
-                kvlog::warn!("p2p ping seal failed", session_id = session_id.0, error = %error);
-            }
-        }
-    }
-
-    /// Echoes a media `Pong` back to a peer over the direct path so it can
-    /// measure its own round-trip time to us.
-    fn send_p2p_pong(&mut self, session_id: SessionId, nonce: u64) {
-        let Some((addr, packet)) = self.p2p_peers.get_mut(&session_id).and_then(|peer| {
-            let addr = peer.agent.selected()?.remote_addr;
-            let counter = peer.send_counter;
-            peer.send_counter = peer.send_counter.wrapping_add(1);
-            Some((
-                addr,
-                media::seal_peer_media(&peer.send_key, counter, &MediaPayload::Pong { nonce }),
-            ))
-        }) else {
-            return;
-        };
-        match packet {
-            Ok(packet) => self.send_udp_raw("p2p_pong", Some(session_id), addr, &packet),
-            Err(error) => {
-                kvlog::warn!("p2p pong seal failed", session_id = session_id.0, error = %error);
-            }
-        }
-    }
-
-    fn handle_p2p_stun(&mut self, now: Instant, src: SocketAddr, packet: &[u8]) {
-        // Two-step contract: route by the unverified USERNAME, then reject by
-        // verified integrity. The username is not a secret, so it only picks the
-        // candidate agent. That agent's `handle_inbound` recomputes the per-pair
-        // HMAC and drops forgeries, bounding the cost of a spoofed username to one
-        // HMAC check per datagram.
-        let username = StunMessage::decode(packet)
-            .ok()
-            .and_then(|message| message.username);
-        let targets = if let Some(connection_id) = username
-            .as_deref()
-            .and_then(connection_id_from_p2p_username)
-        {
-            self.p2p_peers
-                .iter()
-                .filter_map(|(session_id, peer)| {
-                    (peer.connection_id == connection_id).then_some(*session_id)
-                })
-                .collect::<Vec<_>>()
-        } else {
-            self.p2p_peers.keys().copied().collect::<Vec<_>>()
-        };
-
-        let mut pending = Vec::new();
-        for session_id in targets {
-            let Some(peer) = self.p2p_peers.get_mut(&session_id) else {
-                continue;
-            };
-            match peer.agent.handle_inbound(now, src, packet) {
-                Ok(actions) => {
-                    peer.last_direct_inbound = Some(now);
-                    if !actions.is_empty() {
-                        pending.push((session_id, actions));
-                    }
-                }
-                Err(error) => {
-                    kvlog::warn!(
-                        "p2p stun packet rejected",
-                        session_id = session_id.0,
-                        addr = %src,
-                        error = %error
-                    );
-                }
-            }
-        }
-        for (session_id, actions) in pending {
-            self.apply_p2p_actions(session_id, actions);
-        }
-    }
-
-    fn handle_p2p_media(&mut self, now: Instant, src: SocketAddr, packet: &[u8]) -> bool {
-        let Ok((header, _)) = media::parse_header(packet) else {
-            return false;
-        };
-        let Some(session_id) = self.p2p_peers.iter().find_map(|(session_id, peer)| {
-            (peer.recv_key.id == header.route_id).then_some(*session_id)
-        }) else {
-            return false;
-        };
-
-        let outcome = {
-            let peer = self
-                .p2p_peers
-                .get_mut(&session_id)
-                .expect("p2p peer exists");
-            match media::open_peer_media(&peer.recv_key, &mut peer.recv_replay, packet) {
-                Ok((
-                    _,
-                    MediaPayload::PeerVoice {
-                        connection_id,
-                        stream_id,
-                        sequence,
-                        timestamp,
-                        flags,
-                        payload,
-                    },
-                )) if connection_id == peer.connection_id => {
-                    let action = peer.agent.observe_authenticated_packet(now, src);
-                    peer.last_direct_inbound = Some(now);
-                    Ok(P2pMediaPacket::Voice {
-                        stream_id,
-                        sequence,
-                        timestamp,
-                        flags,
-                        payload,
-                        action,
-                    })
-                }
-                Ok((
-                    _,
-                    MediaPayload::PeerVoiceFeedback {
-                        connection_id,
-                        stream_id,
-                        feedback,
-                    },
-                )) if connection_id == peer.connection_id => {
-                    let action = peer.agent.observe_authenticated_packet(now, src);
-                    peer.last_direct_inbound = Some(now);
-                    Ok(P2pMediaPacket::Feedback {
-                        stream_id,
-                        feedback,
-                        action,
-                    })
-                }
-                Ok((_, MediaPayload::Ping { nonce, .. })) => {
-                    let action = peer.agent.observe_authenticated_packet(now, src);
-                    peer.last_direct_inbound = Some(now);
-                    Ok(P2pMediaPacket::Ping { nonce, action })
-                }
-                Ok((_, MediaPayload::Pong { nonce })) => {
-                    let action = peer.agent.observe_authenticated_packet(now, src);
-                    peer.last_direct_inbound = Some(now);
-                    let rtt_ms =
-                        take_rtt_sample(&mut peer.rtt_in_flight, nonce, now).map(|sample| {
-                            let rtt = fold_rtt_ewma(peer.rtt_ms, sample);
-                            peer.rtt_ms = Some(rtt);
-                            clamp_rtt_ms(rtt)
-                        });
-                    Ok(P2pMediaPacket::Pong { rtt_ms, action })
-                }
-                Ok(_) => Err("unexpected P2P media payload".to_string()),
-                Err(error) => Err(error.to_string()),
-            }
-        };
-
-        match outcome {
-            Ok(P2pMediaPacket::Voice {
-                stream_id,
-                sequence,
-                timestamp,
-                flags,
-                payload,
-                action,
-            }) => {
-                if let Some(action) = action {
-                    self.apply_p2p_actions(session_id, vec![action]);
-                }
-                let payload_size = payload.len();
-                let payload_kind = media_voice_payload_kind(&payload);
-                kvlog::info!(
-                    "voice packet received",
-                    route = "p2p",
-                    stream_id = stream_id.0,
-                    sequence,
-                    media_timestamp = timestamp,
-                    flags,
-                    payload_size,
-                    payload_kind
-                );
-                log_audio_pop_media_packet(
-                    "rx",
-                    "p2p",
-                    stream_id.0,
-                    sequence,
-                    timestamp,
-                    flags,
-                    payload_size,
-                    payload_kind,
-                );
-                self.p2p_stream_owners.insert(stream_id, session_id);
-                self.dispatch_voice_packet(
-                    RemoteVoicePacket {
-                        stream_id: stream_id.0,
-                        sequence,
-                        timestamp,
-                        flags,
-                        payload: audio_payload_from_media(payload),
-                        received_at: now,
-                    },
-                    "p2p",
-                );
-            }
-            Ok(P2pMediaPacket::Feedback {
-                stream_id,
-                feedback,
-                action,
-            }) => {
-                if let Some(action) = action {
-                    self.apply_p2p_actions(session_id, vec![action]);
-                }
-                // The packet was matched to this p2p peer by route id, so the peer
-                // (and its user) is present; it is the reporting listener.
-                if let Some(reporter) = self.p2p_peers.get(&session_id).map(|peer| peer.user_id) {
-                    let feedback = live_feedback_from_media(stream_id, feedback);
-                    self.handle_encoder_feedback(reporter, feedback, now);
-                }
-            }
-            Ok(P2pMediaPacket::Ping { nonce, action }) => {
-                if let Some(action) = action {
-                    self.apply_p2p_actions(session_id, vec![action]);
-                }
-                self.send_p2p_pong(session_id, nonce);
-            }
-            Ok(P2pMediaPacket::Pong { rtt_ms, action }) => {
-                if let Some(action) = action {
-                    self.apply_p2p_actions(session_id, vec![action]);
-                }
-                if let (Some(rtt_ms), Some(user_id)) = (
-                    rtt_ms,
-                    self.p2p_peers.get(&session_id).map(|peer| peer.user_id),
-                ) {
-                    let _ = self.events.send(NetworkEvent::PeerRtt {
-                        user_id,
-                        rtt_ms: Some(rtt_ms),
-                    });
-                }
-            }
-            Err(error) => {
-                kvlog::warn!(
-                    "p2p media packet rejected",
-                    session_id = session_id.0,
-                    addr = %src,
-                    error = error.as_str()
-                );
-            }
-        }
-        true
-    }
-
-    fn send_p2p_voice(
-        &mut self,
-        stream_id: StreamId,
-        sequence: u32,
-        timestamp: u32,
-        flags: u8,
-        audio_payload: &AudioVoicePayload,
-    ) {
-        // Phase 1: collect routing for each ready peer. This borrows the peer map
-        // mutably (to advance `send_counter`), so it must finish before the
-        // seal-and-send loop can reuse `self.media_packet` and `send_udp_raw`.
-        let mut routes = std::mem::take(&mut self.p2p_routes);
-        routes.clear();
-        for (session_id, peer) in &mut self.p2p_peers {
-            let Some(selected) = peer.agent.selected() else {
-                continue;
-            };
-            let counter = peer.send_counter;
-            peer.send_counter = peer.send_counter.wrapping_add(1);
-            routes.push(P2pVoiceRoute {
-                session_id: *session_id,
-                addr: selected.remote_addr,
-                connection_id: peer.connection_id,
-                counter,
-                key: peer.send_key.clone(),
-            });
-        }
-
-        // Phase 2: seal into the shared buffer and send, one peer at a time.
-        for route in &routes {
-            let payload = MediaPayload::PeerVoice {
-                connection_id: route.connection_id,
-                stream_id,
-                sequence,
-                timestamp,
-                flags,
-                payload: media_payload_from_audio(audio_payload),
-            };
-            match media::seal_peer_media_into(
-                &route.key,
-                route.counter,
-                &payload,
-                &mut self.media_packet,
-                &mut self.media_scratch,
-            ) {
-                Ok(()) => {
-                    let packet = std::mem::take(&mut self.media_packet);
-                    self.send_udp_raw("p2p_voice", Some(route.session_id), route.addr, &packet);
-                    self.media_packet = packet;
-                }
-                Err(error) => {
-                    kvlog::warn!(
-                        "p2p media seal failed",
-                        session_id = route.session_id.0,
-                        error = %error
-                    );
-                }
-            }
-        }
-        self.p2p_routes = routes;
-    }
-
-    fn send_p2p_voice_feedback(
-        &mut self,
-        session_id: SessionId,
-        stream_id: StreamId,
-        feedback: LivePlaybackFeedback,
-    ) {
-        let Some((addr, packet)) = self.p2p_peers.get_mut(&session_id).and_then(|peer| {
-            let addr = peer.agent.selected()?.remote_addr;
-            let payload = MediaPayload::PeerVoiceFeedback {
-                connection_id: peer.connection_id,
-                stream_id,
-                feedback: media_feedback_from_live(feedback),
-            };
-            let counter = peer.send_counter;
-            peer.send_counter = peer.send_counter.wrapping_add(1);
-            Some((
-                addr,
-                media::seal_peer_media(&peer.send_key, counter, &payload),
-            ))
-        }) else {
-            return;
-        };
-        match packet {
-            Ok(packet) => self.send_udp_raw("p2p_voice_feedback", Some(session_id), addr, &packet),
-            Err(error) => {
-                kvlog::warn!(
-                    "p2p feedback seal failed",
-                    session_id = session_id.0,
-                    error = %error
-                );
-            }
-        }
-    }
-
-    /// Handles a reception report about *my own* outbound stream. `reporter` is
-    /// the listening user (stamped by the trusted server, or the known p2p peer);
-    /// the UI routes it to that user's roster row so outbound latency is
-    /// per-listener. Encoder adaptation stays aggregate across all reporters.
-    fn handle_encoder_feedback(
-        &mut self,
-        reporter: UserId,
-        feedback: LivePlaybackFeedback,
-        now: Instant,
-    ) {
-        let _ = self
-            .events
-            .send(NetworkEvent::OutboundFeedback { reporter, feedback });
-        kvlog::info!(
-            "playback feedback received",
-            stream_id = feedback.stream_id,
-            highest_contiguous_sequence = feedback.highest_contiguous_sequence,
-            expected_packets = feedback.expected_packets,
-            lost_packets = feedback.lost_packets,
-            late_packets = feedback.late_packets,
-            duplicate_packets = feedback.duplicate_packets,
-            reordered_packets = feedback.reordered_packets,
-            window_ms = feedback.window_ms,
-            max_output_ring_ms = feedback.max_output_ring_ms,
-            max_neteq_target_ms = feedback.max_neteq_target_ms,
-            max_neteq_playout_delay_ms = feedback.max_neteq_playout_delay_ms,
-            max_neteq_packet_buffer_ms = feedback.max_neteq_packet_buffer_ms,
-            max_interarrival_jitter_ms = feedback.max_interarrival_jitter_ms
-        );
-        if self.active_stream != Some(StreamId(feedback.stream_id)) {
-            return;
-        }
-        if let Some(profile) = self.encoder_feedback.observe(feedback, now) {
-            kvlog::info!(
-                "live encoder DRED profile changed",
-                profile = profile.label(),
-                packet_loss_percent = profile.packet_loss_percent
-            );
-            let _ = self
-                .events
-                .send(NetworkEvent::EncoderProfileChanged(profile));
-        }
-    }
-
-    fn apply_p2p_actions(&mut self, session_id: SessionId, actions: Vec<P2pAction>) {
-        for action in actions {
-            match action {
-                P2pAction::UseRelay { reason, .. } => {
-                    if let Some(user_id) = self.p2p_peers.get(&session_id).map(|peer| peer.user_id)
-                    {
-                        let _ = self.events.send(NetworkEvent::PeerTransport {
-                            user_id,
-                            direct: false,
-                        });
-                        self.publish_relay_rtt(user_id);
-                    }
-                    kvlog::info!(
-                        "p2p using relay",
-                        session_id = session_id.0,
-                        reason = ?reason
-                    );
-                }
-                P2pAction::SendStun { to, bytes, .. }
-                | P2pAction::SendStunResponse { to, bytes, .. }
-                | P2pAction::SendKeepalive { to, bytes, .. } => {
-                    self.send_udp_raw("p2p_stun", Some(session_id), to, &bytes);
-                }
-                P2pAction::DirectReady { selected } | P2pAction::Migrated { selected } => {
-                    let user_id = self.p2p_peers.get(&session_id).map(|peer| peer.user_id);
-                    if let Some(user_id) = user_id {
-                        let _ = self.events.send(NetworkEvent::PeerTransport {
-                            user_id,
-                            direct: true,
-                        });
-                        let _ = self.events.send(NetworkEvent::Status(format!(
-                            "p2p direct path to user {}",
-                            user_id.0
-                        )));
-                    }
-                    kvlog::info!(
-                        "p2p direct path selected",
-                        session_id = session_id.0,
-                        user_id = user_id.map(|id| id.0),
-                        addr = %selected.remote_addr,
-                        peer_reflexive = selected.peer_reflexive
-                    );
-                }
-                P2pAction::IceRestart { .. } => {
-                    self.request_p2p_restart();
-                }
-                P2pAction::Disconnected => {
-                    kvlog::warn!("p2p direct path timed out", session_id = session_id.0);
-                    if let Some(peer) = self.p2p_peers.remove(&session_id) {
-                        let _ = self.events.send(NetworkEvent::PeerTransport {
-                            user_id: peer.user_id,
-                            direct: false,
-                        });
-                        self.publish_relay_rtt(peer.user_id);
-                    }
-                    let _ = self.events.send(NetworkEvent::Status(
-                        "p2p direct path timed out; using relay".to_string(),
-                    ));
-                }
-                P2pAction::ConsentExpired => {
-                    // RFC 7675 hard send-stop. The agent has already cleared its
-                    // selection, so `send_p2p_voice`/`send_p2p_voice_feedback`
-                    // (gated on `agent.selected()`) emit nothing further to the
-                    // stale address. Clearing `direct_stable_since` resumes the
-                    // relay. The peer is kept, distinct from `Disconnected`.
-                    kvlog::warn!("p2p consent to send expired", session_id = session_id.0);
-                    if let Some(peer) = self.p2p_peers.get_mut(&session_id) {
-                        peer.direct_stable_since = None;
-                        let user_id = peer.user_id;
-                        let _ = self.events.send(NetworkEvent::PeerTransport {
-                            user_id,
-                            direct: false,
-                        });
-                        self.publish_relay_rtt(user_id);
-                    }
-                    let _ = self.events.send(NetworkEvent::Status(
-                        "p2p consent expired; using relay".to_string(),
-                    ));
-                }
-            }
-        }
-    }
-
-    fn send_udp_raw(
-        &mut self,
-        kind: &'static str,
-        session_id: Option<SessionId>,
-        addr: SocketAddr,
-        packet: &[u8],
-    ) {
-        match self.udp.send_to(packet, addr) {
-            Ok(_) => {}
-            Err(error) if is_ignorable_udp_error(&error) => {
-                kvlog::warn!(
-                    "udp send got ignorable socket error",
-                    kind,
-                    session_id = session_id.map(|id| id.0),
-                    addr = %addr,
-                    error = %error
-                );
-            }
-            Err(error) => {
-                kvlog::warn!(
-                    "udp send failed",
-                    kind,
-                    session_id = session_id.map(|id| id.0),
-                    addr = %addr,
-                    error = %error
-                );
-                let _ = self
-                    .events
-                    .send(NetworkEvent::Error(format!("UDP send failed: {error}")));
-            }
-        }
-    }
 }
 
 fn correlate_upload_accepted(
@@ -8571,7 +6516,7 @@ mod tests {
 
     #[test]
     fn voice_udp_bind_applies_ef_qos() {
-        let socket = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let socket = voice::bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
         assert_eq!(
             socket_int_option(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS) & !0b11,
             (rpc::qos::VOICE_DSCP as i32) << 2
@@ -8581,6 +6526,25 @@ mod tests {
             socket_int_option(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PRIORITY),
             6
         );
+    }
+
+    #[test]
+    fn initial_udp_bind_send_failure_is_reported_without_becoming_session_error() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let events = NetworkEventSender::for_test(event_tx);
+        report_initial_udp_bind_send_error(
+            &events,
+            Some(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "test backpressure",
+            )),
+        );
+
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            crate::app::AppEvent::Network(NetworkEvent::Error(message))
+                if message.contains("test backpressure")
+        ));
     }
 
     fn socket_int_option(fd: libc::c_int, level: libc::c_int, option: libc::c_int) -> i32 {
@@ -9197,7 +7161,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_work_queues_socket_drains_and_forces_zero_timeout() {
+    fn worker_work_queues_tcp_and_forces_zero_timeout() {
         let mut work = WorkerWork::default();
         assert_eq!(work.wake(), WakeIntent::Idle);
 
@@ -9205,25 +7169,55 @@ mod tests {
         work.queue_tcp_read();
         work.queue_tcp_write();
         work.queue_tcp_write();
-        work.queue_udp_drain();
-        work.queue_udp_drain();
-        work.queue_mdns_drain(MDNS_V4);
-        work.queue_mdns_drain(MDNS_V4);
-        work.queue_mdns_drain(MDNS_V6);
-
         assert_eq!(work.wake(), WakeIntent::Now);
         let tasks = work.take_tasks().collect::<Vec<_>>();
-        assert_eq!(
-            tasks,
-            vec![
-                WorkerTask::TcpRead,
-                WorkerTask::TcpWrite,
-                WorkerTask::UdpDrain,
-                WorkerTask::MdnsDrain(MDNS_V4),
-                WorkerTask::MdnsDrain(MDNS_V6),
-            ]
-        );
+        assert_eq!(tasks, vec![WorkerTask::TcpRead, WorkerTask::TcpWrite]);
         assert_eq!(work.wake(), WakeIntent::Idle);
+    }
+
+    #[test]
+    fn command_sender_routes_media_fast_path_away_from_main_receiver() {
+        let (main_tx, main_rx) = mpsc::channel();
+        let main_poll = Poll::new().unwrap();
+        let main_waker = Arc::new(Waker::new(main_poll.registry(), WAKE).unwrap());
+        let (voice_sender, voice_rx) = voice::input_for_test();
+        let sender = CommandSender {
+            tx: main_tx,
+            waker: main_waker,
+            voice: Some(voice_sender),
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        sender
+            .send(NetworkCommand::SequencedLocalVoicePacket {
+                sequence: 44,
+                frame: LocalVoiceFrame {
+                    timestamp: 44 * 960,
+                    flags: 0,
+                    payload: AudioVoicePayload::Opus(vec![1, 2, 3]),
+                },
+            })
+            .unwrap();
+        sender.send(NetworkCommand::JoinVoice(RoomId(7))).unwrap();
+
+        assert!(matches!(main_rx.try_recv(), Ok(NetworkCommand::JoinVoice(RoomId(7)))));
+        assert!(main_rx.try_recv().is_err());
+        assert_eq!(voice_rx.drain_microphone_sequences(), vec![Some(44)]);
+
+        sender
+            .alive
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            sender.send(NetworkCommand::LocalVoicePacket(LocalVoiceFrame {
+                timestamp: 0,
+                flags: 0,
+                payload: AudioVoicePayload::Opus(vec![4]),
+            })),
+            Err(SendError(NetworkCommand::LocalVoicePacket(_)))
+        ));
+        assert!(matches!(
+            sender.send(NetworkCommand::JoinVoice(RoomId(8))),
+            Err(SendError(NetworkCommand::JoinVoice(RoomId(8))))
+        ));
     }
 
     #[test]
@@ -9232,7 +7226,7 @@ mod tests {
         let mut calls = 0;
         let mut buf = [0u8; 8];
 
-        let received = recv_datagram_with(&mut buf, |_| {
+        let received = rpc::evented::recv_datagram_with(&mut buf, |_| {
             calls += 1;
             match calls {
                 1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
@@ -9246,7 +7240,7 @@ mod tests {
         assert_eq!(calls, 2);
 
         let mut calls = 0;
-        let drained: Option<(usize, SocketAddr)> = recv_datagram_with(&mut buf, |_| {
+        let drained: Option<(usize, SocketAddr)> = rpc::evented::recv_datagram_with(&mut buf, |_| {
             calls += 1;
             match calls {
                 1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
@@ -9416,17 +7410,6 @@ mod tests {
             matches!(recent.observe(10), RecentVoiceSequenceResult::Stale),
             "packets outside the fixed dedup window should be dropped as stale"
         );
-    }
-
-    #[test]
-    fn voice_packet_deduplicator_bounds_stream_table() {
-        let mut dedup = VoicePacketDeduplicator::new();
-
-        for stream_id in 0..(MAX_RECENT_VOICE_STREAMS as u32 + 8) {
-            assert_eq!(dedup.observe(stream_id, 0), RecentVoiceSequenceResult::New);
-        }
-
-        assert_eq!(dedup.len(), MAX_RECENT_VOICE_STREAMS);
     }
 
     #[test]
