@@ -200,6 +200,13 @@ pub(super) struct Runtime {
     thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PendingMlsHistory {
+    room_id: RoomId,
+    before: Option<MessageId>,
+    limit: u16,
+}
+
 impl Runtime {
     pub(super) fn spawn(
         config: ClientConfig,
@@ -290,6 +297,7 @@ struct Actor {
     pending_mls_event_rosters: HashMap<RoomId, HashSet<UserId>>,
     pending_mls_welcome_rosters: Option<HashSet<UserId>>,
     mls_installed_rosters: HashSet<UserId>,
+    pending_mls_history: Vec<PendingMlsHistory>,
     pending_mls_commits: HashMap<RoomId, PendingMlsCommit>,
     delayed_mls_retries: HashMap<MlsRetryKey, DelayedMlsRetry>,
     pending_mls_stale_retries: HashSet<RoomId>,
@@ -324,6 +332,7 @@ impl Actor {
             pending_mls_event_rosters: HashMap::new(),
             pending_mls_welcome_rosters: None,
             mls_installed_rosters: HashSet::new(),
+            pending_mls_history: Vec::new(),
             pending_mls_commits: HashMap::new(),
             delayed_mls_retries: HashMap::new(),
             pending_mls_stale_retries: HashSet::new(),
@@ -594,6 +603,7 @@ impl Actor {
         self.pending_mls_event_rosters.clear();
         self.pending_mls_welcome_rosters = None;
         self.mls_installed_rosters.clear();
+        self.pending_mls_history.clear();
         self.pending_mls_commits.clear();
         self.delayed_mls_retries.clear();
         self.pending_mls_stale_retries.clear();
@@ -693,13 +703,22 @@ impl Actor {
                 if user_id != local_user {
                     if let Some(peer_roster) = roster.as_ref() {
                         let peer_account = peer_roster.body.account_id;
-                        self.record_pending_mls_roster(user_id, peer_roster)?;
+                        self.record_pending_mls_roster(user_id, peer_roster)
+                            .map_err(|error| format!("recording peer MLS roster: {error}"))?;
                         self.observe_peer_account(user_id, peer_account);
-                        self.resume_pending_mls_group_infos(user_id)?;
-                        self.resume_pending_mls_event_rosters(user_id)?;
-                        self.resume_pending_mls_welcomes(user_id)?;
+                        self.resume_pending_mls_group_infos(user_id)
+                            .map_err(|error| format!("resuming MLS GroupInfo: {error}"))?;
+                        self.resume_pending_mls_event_rosters(user_id)
+                            .map_err(|error| format!("resuming MLS event fetch: {error}"))?;
+                        self.resume_pending_mls_welcomes(user_id)
+                            .map_err(|error| format!("resuming MLS welcomes: {error}"))?;
+                        self.resume_pending_mls_history()
+                            .map_err(|error| format!("resuming encrypted history: {error}"))?;
                         if self.mls_bound {
-                            self.queue_mls_maintenance()?;
+                            self.queue_mls_maintenance()
+                                .map_err(|error| format!("resuming MLS maintenance: {error}"))?;
+                            self.queue_pending_mls_outbox()
+                                .map_err(|error| format!("resuming pending MLS outbox: {error}"))?;
                         }
                     }
                     let _ = self
@@ -710,7 +729,9 @@ impl Actor {
                             roster,
                         }));
                     if self.mls_bound {
-                        self.restore_pending_ui_dispatches()?;
+                        self.restore_pending_ui_dispatches().map_err(|error| {
+                            format!("restoring pending MLS UI dispatches: {error}")
+                        })?;
                     }
                     return Ok(());
                 }
@@ -820,12 +841,17 @@ impl Actor {
                     })?;
                     self.mls_key_package_publish_pending = true;
                 }
-                self.restore_pending_file_uploads()?;
-                self.restore_pending_ui_dispatches()?;
+                self.restore_pending_file_uploads()
+                    .map_err(|error| format!("restoring pending MLS file uploads: {error}"))?;
+                self.restore_pending_ui_dispatches()
+                    .map_err(|error| format!("restoring pending MLS UI dispatches: {error}"))?;
                 self.queue_control(ClientControl::FetchMlsWelcome { after_sequence })?;
-                self.queue_mls_room_reconciliation()?;
-                self.queue_mls_maintenance()?;
-                self.queue_pending_mls_outbox()?;
+                self.queue_mls_room_reconciliation()
+                    .map_err(|error| format!("starting MLS room reconciliation: {error}"))?;
+                self.queue_mls_maintenance()
+                    .map_err(|error| format!("starting MLS room maintenance: {error}"))?;
+                self.queue_pending_mls_outbox()
+                    .map_err(|error| format!("restoring pending MLS outbox: {error}"))?;
                 let _ = self.events.send(NetworkEvent::MlsDeviceBound { device_id });
             }
             ServerControl::KeyPackage { device_id, package } => {
@@ -1635,28 +1661,21 @@ impl Actor {
                     })?;
                     return Ok(());
                 };
-                let history = installation.client.cached_history(room_id)?;
-                let end = before
-                    .and_then(|before| {
-                        history
-                            .iter()
-                            .position(|event| mls_message_id(event.sequence) == before)
-                    })
-                    .unwrap_or(history.len());
-                let start = end.saturating_sub(usize::from(limit));
-                let selected = history[start..end].to_vec();
-                let mut messages = Vec::with_capacity(selected.len());
-                for cached in selected {
-                    messages.push(self.mls_chatt_event_to_chat(cached.event, cached.sequence)?);
+                if !self.mls_room_rosters_ready(room_id) {
+                    let pending = PendingMlsHistory {
+                        room_id,
+                        before,
+                        limit,
+                    };
+                    if !self.pending_mls_history.contains(&pending) {
+                        self.pending_mls_history.push(pending);
+                    }
+                    for user_id in self.missing_mls_room_rosters(room_id)? {
+                        self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
+                    }
+                    return Ok(());
                 }
-                let _ = self.events.send(NetworkEvent::HistoryChunk {
-                    room_id,
-                    before,
-                    messages,
-                    at_start: start == 0,
-                    complete: true,
-                });
-                Ok(())
+                self.emit_cached_mls_history(room_id, before, limit)
             }
             Command::AcknowledgeUiDispatch { room_id, sequence } => self
                 .installation
@@ -1883,6 +1902,12 @@ impl Actor {
             ));
             return Ok(true);
         }
+        if !self.mls_room_rosters_ready(room_id) {
+            let _ = self.events.send(NetworkEvent::Status(
+                "encrypted message queued while room device rosters are synchronized".to_string(),
+            ));
+            return Ok(true);
+        }
         if self.pending_mls_commits.contains_key(&room_id)
             || installation.client.has_pending_commit(&descriptor)?
         {
@@ -1909,6 +1934,20 @@ impl Actor {
         // durable MLS outbox is safe, while an ordinary-chat fallback would
         // either leak plaintext or be rejected by the server for a DM.
         !matches!(self.room_kinds.get(&room_id), Some(RoomKind::Public))
+    }
+
+    fn mls_room_rosters_ready(&self, room_id: RoomId) -> bool {
+        let Some(local_user) = self.user_id else {
+            return false;
+        };
+        let ready = |user_id: &UserId| {
+            *user_id == local_user || self.mls_installed_rosters.contains(user_id)
+        };
+        match self.room_kinds.get(&room_id) {
+            Some(RoomKind::Private { members }) => members.iter().all(ready),
+            Some(RoomKind::Dm { user_a, user_b }) => ready(user_a) && ready(user_b),
+            Some(RoomKind::Public) | None => return false,
+        }
     }
 
     fn mark_mls_upload_announcement_delivered(&mut self, room_id: RoomId, event_id: EventId) {
@@ -1970,6 +2009,56 @@ impl Actor {
                 );
             }
         }
+        Ok(())
+    }
+
+    fn resume_pending_mls_history(&mut self) -> Result<(), String> {
+        let mut ready = Vec::new();
+        for pending in std::mem::take(&mut self.pending_mls_history) {
+            if self.mls_room_rosters_ready(pending.room_id) {
+                ready.push(pending);
+            } else {
+                self.pending_mls_history.push(pending);
+            }
+        }
+        for pending in ready {
+            self.emit_cached_mls_history(pending.room_id, pending.before, pending.limit)?;
+        }
+        Ok(())
+    }
+
+    fn emit_cached_mls_history(
+        &self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        limit: u16,
+    ) -> Result<(), String> {
+        let history = self
+            .installation
+            .as_ref()
+            .ok_or_else(|| "local MLS installation is unavailable".to_string())?
+            .client
+            .cached_history(room_id)?;
+        let end = before
+            .and_then(|before| {
+                history
+                    .iter()
+                    .position(|event| mls_message_id(event.sequence) == before)
+            })
+            .unwrap_or(history.len());
+        let start = end.saturating_sub(usize::from(limit));
+        let selected = history[start..end].to_vec();
+        let mut messages = Vec::with_capacity(selected.len());
+        for cached in selected {
+            messages.push(self.mls_chatt_event_to_chat(cached.event, cached.sequence)?);
+        }
+        let _ = self.events.send(NetworkEvent::HistoryChunk {
+            room_id,
+            before,
+            messages,
+            at_start: start == 0,
+            complete: true,
+        });
         Ok(())
     }
 
@@ -2233,13 +2322,6 @@ impl Actor {
                 .collect::<Result<Vec<_>, String>>()?;
             member_accounts.sort_unstable();
             member_accounts.dedup();
-            if member_accounts.first().copied() != Some(own_account) {
-                let _ = self.events.send(NetworkEvent::Status(format!(
-                    "encrypted room {} is waiting for its designated creator",
-                    room_id.0
-                )));
-                continue;
-            }
             let descriptor = rpc::mls::EncryptedRoomDescriptor::new(
                 room_id,
                 own_account,
@@ -2289,6 +2371,9 @@ impl Actor {
             if self.pending_mls_commits.contains_key(&descriptor.room_id) {
                 continue;
             }
+            if !self.mls_room_rosters_ready(descriptor.room_id) {
+                continue;
+            }
             if let Some((expected_epoch, bundle)) =
                 installation.client.prepare_revocation_commit(&descriptor)?
             {
@@ -2323,6 +2408,9 @@ impl Actor {
         for entry in installation.client.pending_outbox()? {
             let room_id = entry.event.room_id;
             let event_id = entry.event.event_id;
+            if !self.mls_room_rosters_ready(room_id) {
+                continue;
+            }
             if self
                 .delayed_mls_retries
                 .contains_key(&MlsRetryKey::Application(room_id, event_id))
@@ -3001,5 +3089,274 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn restart_defers_history_and_maintenance_until_room_rosters_are_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [12; 32];
+        let alice_path = temp.path().join("alice");
+        let (alice, _) = LocalInstallation::open_or_create(
+            &alice_path,
+            server_id,
+            UserId(1),
+            "Alice",
+        )
+        .unwrap();
+        let (mut bob, _) = LocalInstallation::open_or_create(
+            &temp.path().join("bob"),
+            server_id,
+            UserId(2),
+            "Bob",
+        )
+        .unwrap();
+        let bob_second = LocalInstallation::create_pending_pair(
+            &temp.path().join("bob-second"),
+            server_id,
+            UserId(2),
+            "Bob second",
+            bob.bootstrap.authority_seed,
+            &bob.bootstrap.own_roster,
+            rpc::ids::PairAttemptId([1; 16]),
+            "secret",
+            "bearer",
+        )
+        .unwrap();
+        bob.replace_own_roster(bob_second.bootstrap.own_roster.clone())
+            .unwrap();
+        let (carol, _) = LocalInstallation::open_or_create(
+            &temp.path().join("carol"),
+            server_id,
+            UserId(3),
+            "Carol",
+        )
+        .unwrap();
+        alice.install_roster(&bob.bootstrap.own_roster).unwrap();
+        alice.install_roster(&carol.bootstrap.own_roster).unwrap();
+        let mut accounts = vec![
+            alice.bootstrap.account_id,
+            bob.bootstrap.account_id,
+            carol.bootstrap.account_id,
+        ];
+        accounts.sort_unstable();
+        let descriptor = rpc::mls::EncryptedRoomDescriptor::new(
+            RoomId(9),
+            alice.bootstrap.account_id,
+            accounts,
+            1,
+        )
+        .unwrap();
+        let bob_package = bob
+            .client
+            .generate_key_packages(bob.bootstrap.device_id, 1)
+            .unwrap()
+            .remove(0);
+        let bob_second_package = bob_second
+            .client
+            .generate_key_packages(bob_second.bootstrap.device_id, 1)
+            .unwrap()
+            .remove(0);
+        let carol_package = carol
+            .client
+            .generate_key_packages(carol.bootstrap.device_id, 1)
+            .unwrap()
+            .remove(0);
+        alice
+            .client
+            .create_room(
+                &descriptor,
+                &[
+                    (bob.bootstrap.device_id, bob_package.package),
+                    (
+                        bob_second.bootstrap.device_id,
+                        bob_second_package.package,
+                    ),
+                    (carol.bootstrap.device_id, carol_package.package),
+                ],
+            )
+            .unwrap();
+        alice
+            .client
+            .accept_pending_commit(&descriptor, 1)
+            .unwrap();
+        let bob_without_second = bob
+            .roster_without(bob_second.bootstrap.device_id)
+            .unwrap();
+        bob.replace_own_roster(bob_without_second.clone()).unwrap();
+        drop(alice);
+
+        // Reopening restores only the local certified device. Peer rosters
+        // arrive asynchronously after the server binds this installation.
+        let (alice, created) = LocalInstallation::open_or_create(
+            &alice_path,
+            server_id,
+            UserId(1),
+            "Alice",
+        )
+        .unwrap();
+        assert!(!created);
+        let (mut actor, outputs, _poll) = test_actor(test_config(None));
+        actor.generation = 1;
+        actor.session_id = Some(SessionId(1));
+        actor.user_id = Some(UserId(1));
+        actor.mls_bound = true;
+        actor.installation = Some(alice);
+        actor.room_kinds.insert(
+            RoomId(9),
+            RoomKind::Private {
+                members: vec![UserId(1), UserId(2), UserId(3)],
+            },
+        );
+        actor.mls_installed_rosters.insert(UserId(1));
+
+        actor
+            .handle_command(Command::FetchHistory {
+                room_id: RoomId(9),
+                before: None,
+                limit: 50,
+            })
+            .unwrap();
+        assert_eq!(actor.pending_mls_history.len(), 1);
+        outputs.outputs.lock().unwrap().clear();
+
+        actor.queue_mls_maintenance().unwrap();
+        assert!(outputs.outputs.lock().unwrap().is_empty());
+
+        actor
+            .handle_server_control(ServerControl::DeviceRoster {
+                user_id: UserId(2),
+                initialized: true,
+                roster: Some(bob_without_second),
+            })
+            .unwrap();
+        assert_eq!(actor.pending_mls_history.len(), 1);
+        assert!(!outputs.outputs.lock().unwrap().iter().any(|output| matches!(
+            output,
+            Output::Control {
+                control: ClientControl::SubmitCommitBundle { .. },
+                ..
+            }
+        )));
+        outputs.outputs.lock().unwrap().clear();
+
+        actor
+            .handle_server_control(ServerControl::DeviceRoster {
+                user_id: UserId(3),
+                initialized: true,
+                roster: Some(carol.bootstrap.own_roster.clone()),
+            })
+            .unwrap();
+        assert!(actor.pending_mls_history.is_empty());
+        assert!(outputs.outputs.lock().unwrap().iter().any(|output| matches!(
+            output,
+            Output::Control {
+                control: ClientControl::SubmitCommitBundle {
+                    room_id: RoomId(9),
+                    expected_epoch: 1,
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn any_online_room_member_can_start_encrypted_room_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [13; 32];
+        let mut installations = [
+            (UserId(1), "Alice"),
+            (UserId(2), "Bob"),
+            (UserId(3), "Carol"),
+        ]
+        .into_iter()
+        .map(|(user_id, name)| {
+            let (installation, _) = LocalInstallation::open_or_create(
+                &temp.path().join(name),
+                server_id,
+                user_id,
+                name,
+            )
+            .unwrap();
+            (user_id, installation)
+        })
+        .collect::<Vec<_>>();
+        let local_index = installations
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (_, installation))| installation.bootstrap.account_id)
+            .map(|(index, _)| index)
+            .unwrap();
+        let (local_user, local) = installations.swap_remove(local_index);
+        let local_account = local.bootstrap.account_id;
+        let local_device = local.bootstrap.device_id;
+        let peer_rosters = installations
+            .iter()
+            .map(|(user_id, installation)| {
+                (
+                    *user_id,
+                    installation.bootstrap.device_id,
+                    installation.bootstrap.own_roster.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(peer_rosters
+            .iter()
+            .all(|(_, _, roster)| roster.body.account_id < local_account));
+        for (_, _, roster) in &peer_rosters {
+            local.install_roster(roster).unwrap();
+        }
+
+        let (mut actor, outputs, _poll) = test_actor(test_config(None));
+        actor.generation = 1;
+        actor.session_id = Some(SessionId(1));
+        actor.user_id = Some(local_user);
+        actor.mls_bound = true;
+        actor.installation = Some(local);
+        actor.pending_mls_rooms.insert(
+            RoomId(9),
+            PendingMlsRoom {
+                member_users: vec![UserId(1), UserId(2), UserId(3)],
+                rosters: HashMap::new(),
+                descriptor: None,
+                checkpoints: Vec::new(),
+                awaiting_packages: HashSet::new(),
+                missing_packages: HashSet::new(),
+                device_accounts: HashMap::new(),
+                packages: Vec::new(),
+            },
+        );
+
+        for (user_id, _, roster) in &peer_rosters {
+            actor.mls_installed_rosters.insert(*user_id);
+            actor.record_pending_mls_roster(*user_id, roster).unwrap();
+        }
+
+        let pending = actor.pending_mls_rooms.get(&RoomId(9)).unwrap();
+        assert_eq!(
+            pending.descriptor.as_ref().map(|descriptor| descriptor.creator),
+            Some(local_account)
+        );
+        let requested = outputs
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|output| match output {
+                Output::Control {
+                    control: ClientControl::TakeKeyPackage { device_id },
+                    ..
+                } => Some(*device_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            requested,
+            peer_rosters
+                .iter()
+                .map(|(_, device_id, _)| *device_id)
+                .collect()
+        );
+        assert!(!requested.contains(&local_device));
     }
 }
