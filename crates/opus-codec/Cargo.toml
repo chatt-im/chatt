@@ -32,14 +32,12 @@ exclude = [
 
 [build-dependencies]
 cc = "1.2"
-bindgen = "0.72.1"
-pkg-config = "0.3.33"
-sha2 = "0.10.9"
+pkg-config = { version = "0.3.33", optional = true }
 
 [features]
 default = []
 dred = []
-system-lib = []
+system-lib = ["dep:pkg-config"]
 presume-avx2 = []
 
 [dev-dependencies]
