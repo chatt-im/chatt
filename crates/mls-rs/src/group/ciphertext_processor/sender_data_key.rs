@@ -58,8 +58,7 @@ impl<CP: CipherSuiteProvider + Debug> Debug for SenderDataKey<'_, CP> {
 }
 
 impl<'a, CP: CipherSuiteProvider> SenderDataKey<'a, CP> {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn new(
+    pub(super) fn new(
         sender_data_secret: &SenderDataSecret,
         ciphertext: &[u8],
         cipher_suite_provider: &'a CP,
@@ -78,7 +77,7 @@ impl<'a, CP: CipherSuiteProvider> SenderDataKey<'a, CP> {
             ciphertext_sample,
             Some(cipher_suite_provider.aead_key_size()),
         )
-        .await?;
+        ?;
 
         let nonce = kdf_expand_with_label(
             cipher_suite_provider,
@@ -87,7 +86,7 @@ impl<'a, CP: CipherSuiteProvider> SenderDataKey<'a, CP> {
             ciphertext_sample,
             Some(cipher_suite_provider.aead_nonce_size()),
         )
-        .await?;
+        ?;
 
         Ok(Self {
             key,
@@ -95,9 +94,7 @@ impl<'a, CP: CipherSuiteProvider> SenderDataKey<'a, CP> {
             cipher_suite_provider,
         })
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn seal(
+    pub(crate) fn seal(
         &self,
         sender_data: &SenderData,
         aad: &SenderDataAAD,
@@ -109,12 +106,10 @@ impl<'a, CP: CipherSuiteProvider> SenderDataKey<'a, CP> {
                 Some(&aad.mls_encode_to_vec()?),
                 &self.nonce,
             )
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn open(
+    pub(crate) fn open(
         &self,
         sender_data: &[u8],
         aad: &SenderDataAAD,
@@ -126,7 +121,7 @@ impl<'a, CP: CipherSuiteProvider> SenderDataKey<'a, CP> {
                 Some(&aad.mls_encode_to_vec()?),
                 &self.nonce,
             )
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))
             .and_then(|data| SenderData::mls_decode(&mut &**data).map_err(From::from))
     }
@@ -167,13 +162,11 @@ pub(crate) mod test_utils {
                 sender_data_secret: secret,
             }
         }
-
-        #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-        pub async fn verify<P: CipherSuiteProvider>(&self, cs: &P) {
+        pub fn verify<P: CipherSuiteProvider>(&self, cs: &P) {
             let secret = self.sender_data_secret.clone().into();
 
             let key = SenderDataKey::new(&secret, &self.ciphertext, cs)
-                .await
+
                 .unwrap();
 
             assert_eq!(key.key.to_vec(), self.key, "sender data key mismatch");
@@ -317,8 +310,8 @@ mod tests {
         load_test_case_json!(sender_data_key_test_vector, generate_test_vector())
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn sender_data_key_test_vector() {
+    #[test]
+    fn sender_data_key_test_vector() {
         for test_case in load_test_cases() {
             let Some(provider) = try_test_cipher_suite_provider(test_case.cipher_suite) else {
                 continue;
@@ -329,7 +322,7 @@ mod tests {
                 &test_case.ciphertext_bytes,
                 &provider,
             )
-            .await
+
             .unwrap();
 
             assert_eq!(sender_data_key.key.to_vec(), test_case.expected_key);
@@ -340,14 +333,14 @@ mod tests {
 
             let ciphertext = sender_data_key
                 .seal(&sender_data, &sender_data_aad)
-                .await
+
                 .unwrap();
 
             assert_eq!(ciphertext, test_case.expected_ciphertext);
 
             let plaintext = sender_data_key
                 .open(&ciphertext, &sender_data_aad)
-                .await
+
                 .unwrap();
 
             assert_eq!(plaintext, sender_data);

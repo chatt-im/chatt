@@ -42,9 +42,7 @@ pub struct ValidatedUpdatePath {
     pub leaf_node: LeafNode,
     pub nodes: Vec<Option<UpdatePathNode>>,
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn validate_update_path<C: IdentityProvider, CSP: CipherSuiteProvider>(
+pub(crate) fn validate_update_path<C: IdentityProvider, CSP: CipherSuiteProvider>(
     identity_provider: &C,
     cipher_suite_provider: &CSP,
     path: UpdatePath,
@@ -69,7 +67,7 @@ pub(crate) async fn validate_update_path<C: IdentityProvider, CSP: CipherSuitePr
             &path.leaf_node,
             ValidationContext::Commit((&state.group_context.group_id, *sender, commit_time)),
         )
-        .await?;
+        ?;
 
     let check_identity_eq = state.applied_proposals.external_initializations.is_empty();
 
@@ -83,7 +81,7 @@ pub(crate) async fn validate_update_path<C: IdentityProvider, CSP: CipherSuitePr
                 &path.leaf_node.signing_identity,
                 &state.group_context.extensions,
             )
-            .await
+
             .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))?
             .then_some(())
             .ok_or(MlsError::InvalidSuccessor)?;
@@ -137,10 +135,8 @@ mod tests {
     use crate::{cipher_suite::CipherSuite, tree_kem::MlsError};
 
     use alloc::vec::Vec;
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn test_update_path(cipher_suite: CipherSuite, cred: &str) -> UpdatePath {
-        let (mut leaf_node, _, signer) = get_basic_test_node_sig_key(cipher_suite, cred).await;
+    fn test_update_path(cipher_suite: CipherSuite, cred: &str) -> UpdatePath {
+        let (mut leaf_node, _, signer) = get_basic_test_node_sig_key(cipher_suite, cred);
 
         leaf_node.leaf_node_source = LeafNodeSource::Commit(ParentHash::from(hex!("beef")));
 
@@ -153,7 +149,7 @@ mod tests {
                 None,
                 &signer,
             )
-            .await
+
             .unwrap();
 
         let node = UpdatePathNode {
@@ -169,35 +165,33 @@ mod tests {
             nodes: vec![node.clone(), node],
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn test_provisional_state(cipher_suite: CipherSuite) -> ProvisionalState {
-        let mut tree = get_test_tree(cipher_suite).await.public;
-        let leaf_nodes = get_test_leaf_nodes(cipher_suite).await;
+    fn test_provisional_state(cipher_suite: CipherSuite) -> ProvisionalState {
+        let mut tree = get_test_tree(cipher_suite).public;
+        let leaf_nodes = get_test_leaf_nodes(cipher_suite);
 
         tree.add_leaves(
             leaf_nodes,
             &BasicIdentityProvider,
             &test_cipher_suite_provider(cipher_suite),
         )
-        .await
+
         .unwrap();
 
         ProvisionalState {
             public_tree: tree,
             applied_proposals: Default::default(),
-            group_context: get_test_group_context(1, cipher_suite).await,
+            group_context: get_test_group_context(1, cipher_suite),
             indexes_of_added_kpkgs: vec![],
             external_init_index: None,
             unused_proposals: vec![],
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_valid_leaf_node() {
+    #[test]
+    fn test_valid_leaf_node() {
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
-        let update_path = test_update_path(TEST_CIPHER_SUITE, "creator").await;
-        let state = test_provisional_state(TEST_CIPHER_SUITE).await;
+        let update_path = test_update_path(TEST_CIPHER_SUITE, "creator");
+        let state = test_provisional_state(TEST_CIPHER_SUITE);
 
         let validated = validate_update_path(
             &BasicIdentityProvider,
@@ -208,7 +202,7 @@ mod tests {
             None,
             &state.group_context,
         )
-        .await
+
         .unwrap();
 
         let expected = update_path.nodes.into_iter().map(Some).collect::<Vec<_>>();
@@ -217,12 +211,12 @@ mod tests {
         assert_eq!(validated.leaf_node, update_path.leaf_node);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_invalid_key_package() {
+    #[test]
+    fn test_invalid_key_package() {
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
-        let mut update_path = test_update_path(TEST_CIPHER_SUITE, "creator").await;
+        let mut update_path = test_update_path(TEST_CIPHER_SUITE, "creator");
         update_path.leaf_node.signature = random_bytes(32);
-        let state = test_provisional_state(TEST_CIPHER_SUITE).await;
+        let state = test_provisional_state(TEST_CIPHER_SUITE);
 
         let validated = validate_update_path(
             &BasicIdentityProvider,
@@ -233,17 +227,17 @@ mod tests {
             None,
             &state.group_context,
         )
-        .await;
+        ;
 
         assert_matches!(validated, Err(MlsError::InvalidSignature));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn validating_path_fails_with_different_identity() {
+    #[test]
+    fn validating_path_fails_with_different_identity() {
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
         let cipher_suite = TEST_CIPHER_SUITE;
-        let update_path = test_update_path(cipher_suite, "foobar").await;
-        let state = test_provisional_state(TEST_CIPHER_SUITE).await;
+        let update_path = test_update_path(cipher_suite, "foobar");
+        let state = test_provisional_state(TEST_CIPHER_SUITE);
 
         let validated = validate_update_path(
             &BasicIdentityProvider,
@@ -254,16 +248,16 @@ mod tests {
             None,
             &state.group_context,
         )
-        .await;
+        ;
 
         assert_matches!(validated, Err(MlsError::InvalidSuccessor));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn validating_path_fails_with_same_hpke_key() {
+    #[test]
+    fn validating_path_fails_with_same_hpke_key() {
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
-        let update_path = test_update_path(TEST_CIPHER_SUITE, "creator").await;
-        let mut state = test_provisional_state(TEST_CIPHER_SUITE).await;
+        let update_path = test_update_path(TEST_CIPHER_SUITE, "creator");
+        let mut state = test_provisional_state(TEST_CIPHER_SUITE);
 
         state
             .public_tree
@@ -281,7 +275,7 @@ mod tests {
             None,
             &state.group_context,
         )
-        .await;
+        ;
 
         assert_matches!(validated, Err(MlsError::SameHpkeKey(_)));
     }

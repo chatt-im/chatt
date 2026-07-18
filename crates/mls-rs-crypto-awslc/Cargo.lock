@@ -18,17 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
 
 [[package]]
-name = "async-trait"
-version = "0.1.89"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "aws-lc-fips-sys"
 version = "0.13.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -367,17 +356,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "maybe-async"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "746873a384ad60adc5db74471dfaba74bd278afbdcfd81db93fafcdfc8b5ca0c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -413,10 +391,8 @@ dependencies = [
 name = "mls-rs-core"
 version = "0.27.0"
 dependencies = [
- "async-trait",
  "hex",
  "itertools 0.14.0",
- "maybe-async",
  "mls-rs-codec",
  "serde",
  "serde_bytes",
@@ -431,13 +407,11 @@ name = "mls-rs-crypto-awslc"
 version = "0.25.0"
 dependencies = [
  "assert_matches",
- "async-trait",
  "aws-lc-fips-sys",
  "aws-lc-rs",
  "aws-lc-sys",
  "futures-test",
  "hex",
- "maybe-async",
  "mls-rs-core",
  "mls-rs-crypto-hpke",
  "mls-rs-crypto-traits",
@@ -452,9 +426,7 @@ dependencies = [
 name = "mls-rs-crypto-hpke"
 version = "0.21.0"
 dependencies = [
- "async-trait",
  "cfg-if",
- "maybe-async",
  "mls-rs-core",
  "mls-rs-crypto-traits",
  "thiserror",
@@ -465,8 +437,6 @@ dependencies = [
 name = "mls-rs-crypto-traits"
 version = "0.22.0"
 dependencies = [
- "async-trait",
- "maybe-async",
  "mls-rs-core",
  "zeroize",
 ]
@@ -475,8 +445,6 @@ dependencies = [
 name = "mls-rs-identity-x509"
 version = "0.21.0"
 dependencies = [
- "async-trait",
- "maybe-async",
  "mls-rs-core",
  "thiserror",
  "wasm-bindgen",

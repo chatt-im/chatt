@@ -178,9 +178,7 @@ impl ExternalSendersExt {
     pub fn allowed_senders(&self) -> &[SigningIdentity] {
         &self.allowed_senders
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn verify_all<I: IdentityProvider>(
+    pub(crate) fn verify_all<I: IdentityProvider>(
         &self,
         provider: &I,
         timestamp: Option<MlsTime>,
@@ -189,7 +187,7 @@ impl ExternalSendersExt {
         for id in self.allowed_senders.iter() {
             provider
                 .validate_external_sender(id, timestamp, Some(group_context_extensions))
-                .await?;
+                ?;
         }
 
         Ok(())
@@ -270,9 +268,9 @@ mod tests {
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_external_senders() {
-        let identity = get_test_signing_identity(TEST_CIPHER_SUITE, &[1]).await.0;
+    #[test]
+    fn test_external_senders() {
+        let identity = get_test_signing_identity(TEST_CIPHER_SUITE, &[1]).0;
         let ext = ExternalSendersExt::new(vec![identity]);
 
         let as_extension = ext.clone().into_extension().unwrap();

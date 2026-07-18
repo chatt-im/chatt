@@ -111,8 +111,6 @@ impl From<Vec<u8>> for ExternalPskId {
 }
 
 /// Storage trait to maintain a set of pre-shared key values.
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 pub trait PreSharedKeyStorage: Send + Sync {
     /// Error type that the underlying storage mechanism returns on internal
     /// failure.
@@ -121,10 +119,10 @@ pub trait PreSharedKeyStorage: Send + Sync {
     /// Get a pre-shared key by [`ExternalPskId`](ExternalPskId).
     ///
     /// `None` should be returned if a pre-shared key can not be found for `id`.
-    async fn get(&self, id: &ExternalPskId) -> Result<Option<PreSharedKey>, Self::Error>;
+    fn get(&self, id: &ExternalPskId) -> Result<Option<PreSharedKey>, Self::Error>;
 
     /// Determines if a PSK is located within the store
-    async fn contains(&self, id: &ExternalPskId) -> Result<bool, Self::Error> {
-        self.get(id).await.map(|key| key.is_some())
+    fn contains(&self, id: &ExternalPskId) -> Result<bool, Self::Error> {
+        self.get(id).map(|key| key.is_some())
     }
 }

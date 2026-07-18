@@ -66,8 +66,8 @@ struct TestUpdatePath {
     commit_secret: Vec<u8>,
 }
 
-#[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-async fn tree_kem() {
+#[test]
+fn tree_kem() {
     // The test vector can be found here https://github.com/mlswg/mls-implementations/blob/main/test-vectors/treekem.json
 
     let test_cases: Vec<TreeKemTestCase> =
@@ -83,7 +83,7 @@ async fn tree_kem() {
 
         let mut tree =
             TreeKemPublic::import_node_data(nodes, &BasicIdentityProvider, &Default::default())
-                .await
+
                 .unwrap();
 
         // Construct GroupContext
@@ -92,7 +92,7 @@ async fn tree_kem() {
             cipher_suite: cs.cipher_suite(),
             group_id: test_case.group_id,
             epoch: test_case.epoch,
-            tree_hash: tree.tree_hash(&cs).await.unwrap(),
+            tree_hash: tree.tree_hash(&cs).unwrap(),
             confirmed_transcript_hash: test_case.confirmed_transcript_hash.into(),
             extensions: ExtensionList::new(),
         };
@@ -117,7 +117,7 @@ async fn tree_kem() {
                 let private_key = if let Some(secret) = secret {
                     let (secret_key, public_key) = PathSecret::from(secret)
                         .to_hpke_key_pair(&cs)
-                        .await
+
                         .unwrap();
 
                     let tree_public = &tree.nodes.borrow_as_parent(dp).unwrap().public_key;
@@ -142,7 +142,7 @@ async fn tree_kem() {
                 .filter(|path| path.sender != leaf.index);
 
             for update_path in paths {
-                let mut group = GroupWithoutKeySchedule::new(cs.cipher_suite()).await;
+                let mut group = GroupWithoutKeySchedule::new(cs.cipher_suite());
                 group.state.context = group_context.clone();
                 group.state.public_tree = tree.clone();
                 group.private_tree = tree_private.clone();
@@ -162,12 +162,12 @@ async fn tree_kem() {
                     WireFormat::PublicMessage,
                 );
 
-                auth_content.auth.confirmation_tag = Some(ConfirmationTag::empty(&cs).await);
+                auth_content.auth.confirmation_tag = Some(ConfirmationTag::empty(&cs));
 
                 // Hack not to increment epoch
                 group.state.context.epoch -= 1;
 
-                group.process_commit(auth_content, None).await.unwrap();
+                group.process_commit(auth_content, None).unwrap();
 
                 // Check that we got the expected commit secret and correctly merged the update path.
                 // This implies that we computed the path secrets correctly.
@@ -176,7 +176,7 @@ async fn tree_kem() {
                 assert_eq!(&*commit_secret, &update_path.commit_secret);
 
                 let new_tree = &mut group.provisional_public_state.unwrap().public_tree;
-                let new_tree_hash = new_tree.tree_hash(&cs).await.unwrap();
+                let new_tree_hash = new_tree.tree_hash(&cs).unwrap();
 
                 assert_eq!(&new_tree_hash, &update_path.tree_hash_after);
             }

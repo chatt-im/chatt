@@ -44,21 +44,18 @@ impl Deref for ConfirmationTag {
 }
 
 impl ConfirmationTag {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn create<P: CipherSuiteProvider>(
+    pub(crate) fn create<P: CipherSuiteProvider>(
         confirmation_key: &[u8],
         confirmed_transcript_hash: &ConfirmedTranscriptHash,
         cipher_suite_provider: &P,
     ) -> Result<Self, MlsError> {
         cipher_suite_provider
             .mac(confirmation_key, confirmed_transcript_hash)
-            .await
+
             .map(ConfirmationTag)
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn matches<P: CipherSuiteProvider>(
+    pub(crate) fn matches<P: CipherSuiteProvider>(
         &self,
         confirmation_key: &[u8],
         confirmed_transcript_hash: &ConfirmedTranscriptHash,
@@ -69,7 +66,7 @@ impl ConfirmationTag {
             confirmed_transcript_hash,
             cipher_suite_provider,
         )
-        .await?;
+        ?;
 
         Ok(&tag == self)
     }
@@ -77,15 +74,14 @@ impl ConfirmationTag {
 
 #[cfg(test)]
 impl ConfirmationTag {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn empty<P: CipherSuiteProvider>(cipher_suite_provider: &P) -> Self {
+    pub(crate) fn empty<P: CipherSuiteProvider>(cipher_suite_provider: &P) -> Self {
         Self(
             cipher_suite_provider
                 .mac(
                     &alloc::vec![0; cipher_suite_provider.kdf_extract_size()],
                     &[],
                 )
-                .await
+
                 .unwrap(),
         )
     }
@@ -99,8 +95,8 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_confirmation_tag_matching() {
+    #[test]
+    fn test_confirmation_tag_matching() {
         for cipher_suite in TestCryptoProvider::all_supported_cipher_suites() {
             let cipher_suite_provider = test_cipher_suite_provider(cipher_suite);
 
@@ -117,7 +113,7 @@ mod tests {
                 &confirmed_hash_a,
                 &cipher_suite_provider,
             )
-            .await
+
             .unwrap();
 
             let matches = confirmation_tag
@@ -126,7 +122,7 @@ mod tests {
                     &confirmed_hash_a,
                     &cipher_suite_provider,
                 )
-                .await
+
                 .unwrap();
 
             assert!(matches);
@@ -137,7 +133,7 @@ mod tests {
                     &confirmed_hash_a,
                     &cipher_suite_provider,
                 )
-                .await
+
                 .unwrap();
 
             assert!(!matches);
@@ -148,7 +144,7 @@ mod tests {
                     &confirmed_hash_b,
                     &cipher_suite_provider,
                 )
-                .await
+
                 .unwrap();
 
             assert!(!matches);

@@ -30,9 +30,7 @@ use super::{
 };
 
 use super::message_processor::ProvisionalState;
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn validate_group_info_common<C: CipherSuiteProvider>(
+pub(crate) fn validate_group_info_common<C: CipherSuiteProvider>(
     msg_version: ProtocolVersion,
     group_info: &GroupInfo,
     signer: &SigningIdentity,
@@ -46,20 +44,18 @@ pub(crate) async fn validate_group_info_common<C: CipherSuiteProvider>(
         return Err(MlsError::CipherSuiteMismatch);
     }
 
-    group_info.verify(cs, &signer.signature_key, &()).await?;
+    group_info.verify(cs, &signer.signature_key, &())?;
 
     Ok(())
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn validate_group_info_member<C: CipherSuiteProvider>(
+pub(crate) fn validate_group_info_member<C: CipherSuiteProvider>(
     self_state: &GroupState,
     msg_version: ProtocolVersion,
     group_info: &GroupInfo,
     cs: &C,
 ) -> Result<(), MlsError> {
     let signer = &self_state.public_tree.get_leaf_node(group_info.signer)?;
-    validate_group_info_common(msg_version, group_info, &signer.signing_identity, cs).await?;
+    validate_group_info_common(msg_version, group_info, &signer.signing_identity, cs)?;
 
     let self_tree = ExportedTree::new_borrowed(&self_state.public_tree.nodes);
 
@@ -76,9 +72,7 @@ pub(crate) async fn validate_group_info_member<C: CipherSuiteProvider>(
 
     Ok(())
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn validate_tree_and_info_joiner<C: CipherSuiteProvider, I: IdentityProvider>(
+pub(crate) fn validate_tree_and_info_joiner<C: CipherSuiteProvider, I: IdentityProvider>(
     msg_version: ProtocolVersion,
     group_info: &GroupInfo,
     tree: Option<ExportedTree<'_>>,
@@ -86,19 +80,17 @@ pub(crate) async fn validate_tree_and_info_joiner<C: CipherSuiteProvider, I: Ide
     cs: &C,
     maybe_time: Option<MlsTime>,
 ) -> Result<TreeKemPublic, MlsError> {
-    let public_tree = validate_tree_joiner(group_info, tree, id_provider, cs, maybe_time).await?;
+    let public_tree = validate_tree_joiner(group_info, tree, id_provider, cs, maybe_time)?;
 
     let signer = &public_tree
         .get_leaf_node(group_info.signer)?
         .signing_identity;
 
-    validate_group_info_joiner(msg_version, group_info, signer, id_provider, cs).await?;
+    validate_group_info_joiner(msg_version, group_info, signer, id_provider, cs)?;
 
     Ok(public_tree)
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn validate_tree_joiner<C: CipherSuiteProvider, I: IdentityProvider>(
+pub(crate) fn validate_tree_joiner<C: CipherSuiteProvider, I: IdentityProvider>(
     group_info: &GroupInfo,
     tree: Option<ExportedTree<'_>>,
     id_provider: &I,
@@ -113,18 +105,16 @@ pub(crate) async fn validate_tree_joiner<C: CipherSuiteProvider, I: IdentityProv
     let context = &group_info.group_context;
 
     let mut tree =
-        TreeKemPublic::import_node_data(tree.into(), id_provider, &context.extensions).await?;
+        TreeKemPublic::import_node_data(tree.into(), id_provider, &context.extensions)?;
 
     // Verify the integrity of the ratchet tree
     TreeValidator::new(cs, context, id_provider)
         .validate(&mut tree, maybe_time)
-        .await?;
+        ?;
 
     Ok(tree)
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn validate_group_info_joiner<C: CipherSuiteProvider, I: IdentityProvider>(
+pub(crate) fn validate_group_info_joiner<C: CipherSuiteProvider, I: IdentityProvider>(
     msg_version: ProtocolVersion,
     group_info: &GroupInfo,
     signer: &SigningIdentity,
@@ -140,11 +130,11 @@ pub(crate) async fn validate_group_info_joiner<C: CipherSuiteProvider, I: Identi
         // TODO do joiners verify group against current time??
         ext_senders
             .verify_all(id_provider, None, &context.extensions)
-            .await
+
             .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))?;
     }
 
-    validate_group_info_common(msg_version, group_info, signer, cs).await?;
+    validate_group_info_common(msg_version, group_info, signer, cs)?;
 
     Ok(())
 }
@@ -164,9 +154,7 @@ pub(crate) fn commit_sender(
             .ok_or(MlsError::ExternalCommitMissingExternalInit),
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(super) async fn transcript_hashes<P: CipherSuiteProvider>(
+pub(super) fn transcript_hashes<P: CipherSuiteProvider>(
     cipher_suite_provider: &P,
     prev_interim_transcript_hash: &InterimTranscriptHash,
     content: &AuthenticatedContent,
@@ -176,7 +164,7 @@ pub(super) async fn transcript_hashes<P: CipherSuiteProvider>(
         prev_interim_transcript_hash,
         content,
     )
-    .await?;
+    ?;
 
     let confirmation_tag = content
         .auth
@@ -189,20 +177,18 @@ pub(super) async fn transcript_hashes<P: CipherSuiteProvider>(
         &confirmed_transcript_hash,
         confirmation_tag,
     )
-    .await?;
+    ?;
 
     Ok((interim_transcript_hash, confirmed_transcript_hash))
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn find_key_package_generation<'a, K: KeyPackageStorage>(
+pub(crate) fn find_key_package_generation<'a, K: KeyPackageStorage>(
     key_package_repo: &K,
     secrets: &'a [EncryptedGroupSecrets],
 ) -> Result<(&'a EncryptedGroupSecrets, KeyPackageGeneration), MlsError> {
     for secret in secrets {
         if let Some(val) = key_package_repo
             .get(&secret.new_member)
-            .await
+
             .map_err(|e| MlsError::KeyPackageRepoError(e.into_any_error()))
             .and_then(|maybe_data| {
                 if let Some(data) = maybe_data {
@@ -227,8 +213,7 @@ pub(crate) async fn find_key_package_generation<'a, K: KeyPackageStorage>(
 // sent this. Reject the message instead of mis-attributing it to whoever
 // has the sender's original index.
 #[cfg(feature = "prior_epoch")]
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn validate_sender_signature_key_from_prior_epoch(
+pub(crate) fn validate_sender_signature_key_from_prior_epoch(
     public_tree: &TreeKemPublic,
     prior_epoch_signature_keys: &[Option<crate::crypto::SignaturePublicKey>],
     sender: &Sender,

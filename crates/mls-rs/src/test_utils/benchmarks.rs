@@ -62,9 +62,7 @@ macro_rules! load_test_case_mls {
         }
     }};
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-async fn generate_test_cases() -> Vec<MlsMessage> {
+fn generate_test_cases() -> Vec<MlsMessage> {
     let mut cases = Vec::new();
 
     for size in [16, 64, 128] {
@@ -76,13 +74,13 @@ async fn generate_test_cases() -> Vec<MlsMessage> {
             false,
             &MlsCryptoProvider::new(),
         )
-        .await
+
         .pop()
         .unwrap();
 
         let group_info = group
             .group_info_message_allowing_ext_commit(true)
-            .await
+
             .unwrap();
 
         cases.push(group_info)
@@ -112,9 +110,7 @@ pub fn load_group_states() -> Vec<GroupStates<impl MlsConfig>> {
         .map(|info| join_group(BENCH_CIPHER_SUITE, info))
         .collect()
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub async fn join_group(cs: CipherSuite, group_info: MlsMessage) -> GroupStates<impl MlsConfig> {
+pub fn join_group(cs: CipherSuite, group_info: MlsMessage) -> GroupStates<impl MlsConfig> {
     let client = generate_basic_client(
         cs,
         ProtocolVersion::MLS_10,
@@ -125,7 +121,7 @@ pub async fn join_group(cs: CipherSuite, group_info: MlsMessage) -> GroupStates<
         None,
     );
 
-    let mut sender = client.commit_external(group_info).await.unwrap().0;
+    let mut sender = client.commit_external(group_info).unwrap().0;
 
     let client = generate_basic_client(
         cs,
@@ -139,11 +135,11 @@ pub async fn join_group(cs: CipherSuite, group_info: MlsMessage) -> GroupStates<
 
     let group_info = sender
         .group_info_message_allowing_ext_commit(true)
-        .await
+
         .unwrap();
 
-    let (receiver, commit) = client.commit_external(group_info).await.unwrap();
-    sender.process_incoming_message(commit).await.unwrap();
+    let (receiver, commit) = client.commit_external(group_info).unwrap();
+    sender.process_incoming_message(commit).unwrap();
 
     GroupStates { sender, receiver }
 }

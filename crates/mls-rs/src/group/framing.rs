@@ -549,8 +549,7 @@ impl MlsMessage {
     }
 
     /// If this is a key package, return its key package reference.
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn key_package_reference<C: CipherSuiteProvider>(
+    pub fn key_package_reference<C: CipherSuiteProvider>(
         &self,
         cipher_suite: &C,
     ) -> Result<Option<KeyPackageRef>, MlsError> {
@@ -558,14 +557,13 @@ impl MlsMessage {
             return Ok(None);
         };
 
-        kp.to_reference(cipher_suite).await.map(Some)
+        kp.to_reference(cipher_suite).map(Some)
     }
 
     /// If this is a plaintext proposal, return the proposal reference that can be matched e.g. with
     /// [`NewEpoch::unused_proposals`](super::NewEpoch::unused_proposals).
     #[cfg(feature = "by_ref_proposal")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn into_proposal_reference<C: CipherSuiteProvider>(
+    pub fn into_proposal_reference<C: CipherSuiteProvider>(
         self,
         cipher_suite: &C,
     ) -> Result<Option<Vec<u8>>, MlsError> {
@@ -574,7 +572,7 @@ impl MlsMessage {
         };
 
         ProposalRef::from_content(cipher_suite, &public_message.into())
-            .await
+
             .map(|r| Some(r.to_vec()))
     }
 }
@@ -779,8 +777,8 @@ mod tests {
         assert_matches!(decoded, Err(mls_rs_codec::Error::Custom(_)));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn proposal_ref() {
+    #[test]
+    fn proposal_ref() {
         let cs = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
         let test_auth = auth_content_from_proposal(
@@ -790,31 +788,31 @@ mod tests {
             Sender::External(0),
         );
 
-        let expected_ref = ProposalRef::from_content(&cs, &test_auth).await.unwrap();
+        let expected_ref = ProposalRef::from_content(&cs, &test_auth).unwrap();
 
         let test_message = MlsMessage {
             version: TEST_PROTOCOL_VERSION,
             payload: MlsMessagePayload::Plain(PublicMessage {
                 content: test_auth.content,
                 auth: test_auth.auth,
-                membership_tag: Some(cs.mac(&[1, 2, 3], &[1, 2, 3]).await.unwrap().into()),
+                membership_tag: Some(cs.mac(&[1, 2, 3], &[1, 2, 3]).unwrap().into()),
             }),
         };
 
         let computed_ref = test_message
             .into_proposal_reference(&cs)
-            .await
+
             .unwrap()
             .unwrap();
 
         assert_eq!(computed_ref, expected_ref.to_vec());
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn message_description() {
-        let mut group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+    #[test]
+    fn message_description() {
+        let mut group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
 
-        let message = group.commit(vec![]).await.unwrap();
+        let message = group.commit(vec![]).unwrap();
 
         let expected = MlsMessageDescription::PublicProtocolMessage {
             group_id: group.group_id(),
@@ -826,11 +824,11 @@ mod tests {
 
         assert_eq!(message.commit_message.description(), expected);
 
-        group.apply_pending_commit().await.unwrap();
+        group.apply_pending_commit().unwrap();
 
         let message = group
             .encrypt_application_message(b"123", vec![])
-            .await
+
             .unwrap();
 
         let expected = MlsMessageDescription::PrivateProtocolMessage {
@@ -843,13 +841,13 @@ mod tests {
 
         let group_info = group
             .group_info_message_allowing_ext_commit(true)
-            .await
+
             .unwrap();
 
         assert_eq!(group_info.description(), MlsMessageDescription::GroupInfo);
 
         let key_package =
-            test_key_package_message(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, "something").await;
+            test_key_package_message(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, "something");
 
         assert_eq!(key_package.description(), MlsMessageDescription::KeyPackage);
     }

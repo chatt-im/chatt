@@ -48,28 +48,25 @@ where
     P: PreSharedKeyStorage,
     CSP: CipherSuiteProvider,
 {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn apply_proposals_from_member(
+    pub(super) fn apply_proposals_from_member(
         &self,
         commit_sender: LeafIndex,
         proposals: &ProposalBundle,
         commit_time: Option<MlsTime>,
     ) -> Result<ApplyProposalsOutput, MlsError> {
         filter_out_removal_of_committer(commit_sender, proposals)?;
-        filter_out_invalid_psks(self.cipher_suite_provider, proposals, self.psk_storage).await?;
+        filter_out_invalid_psks(self.cipher_suite_provider, proposals, self.psk_storage)?;
 
         #[cfg(feature = "by_ref_proposal")]
-        filter_out_invalid_group_extensions(proposals, self.identity_provider, commit_time).await?;
+        filter_out_invalid_group_extensions(proposals, self.identity_provider, commit_time)?;
 
         filter_out_extra_group_context_extensions(proposals)?;
         filter_out_invalid_reinit(proposals, self.original_context.protocol_version)?;
         filter_out_reinit_if_other_proposals(proposals)?;
 
-        self.apply_proposal_changes(proposals, commit_time).await
+        self.apply_proposal_changes(proposals, commit_time)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn apply_proposal_changes(
+    pub(super) fn apply_proposal_changes(
         &self,
         proposals: &ProposalBundle,
         commit_time: Option<MlsTime>,
@@ -77,24 +74,22 @@ where
         match proposals.group_context_extensions_proposal().cloned() {
             Some(p) => {
                 self.apply_proposals_with_new_capabilities(proposals, p, commit_time)
-                    .await
+
             }
             None => {
                 self.apply_tree_changes(proposals, &self.original_context.extensions, commit_time)
-                    .await
+
             }
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn apply_tree_changes(
+    pub(super) fn apply_tree_changes(
         &self,
         proposals: &ProposalBundle,
         new_extensions: &ExtensionList,
         commit_time: Option<MlsTime>,
     ) -> Result<ApplyProposalsOutput, MlsError> {
         self.validate_new_nodes(proposals, new_extensions, commit_time)
-            .await?;
+            ?;
 
         let mut new_tree = self.original_tree.clone();
 
@@ -105,7 +100,7 @@ where
                 self.identity_provider,
                 self.cipher_suite_provider,
             )
-            .await?;
+            ?;
 
         let new_context_extensions = proposals
             .group_context_extensions
@@ -119,9 +114,7 @@ where
             new_context_extensions,
         })
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn validate_new_nodes(
+    fn validate_new_nodes(
         &self,
         proposals: &ProposalBundle,
         new_extensions: &ExtensionList,
@@ -147,7 +140,7 @@ where
             .try_for_each(|p| {
                 self.validate_new_node(leaf_node_validator, &p.proposal.key_package, commit_time)
             })
-            .await
+
     }
 }
 
@@ -165,8 +158,7 @@ fn filter_out_removal_of_committer(
 }
 
 #[cfg(feature = "by_ref_proposal")]
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-async fn filter_out_invalid_group_extensions<C>(
+fn filter_out_invalid_group_extensions<C>(
     proposals: &ProposalBundle,
     identity_provider: &C,
     commit_time: Option<MlsTime>,
@@ -177,7 +169,7 @@ where
     if let Some(p) = proposals.group_context_extensions.first() {
         if let Some(ext) = p.proposal.get_as::<ExternalSendersExt>()? {
             ext.verify_all(identity_provider, commit_time, p.proposal())
-                .await
+
                 .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))?;
         }
     }

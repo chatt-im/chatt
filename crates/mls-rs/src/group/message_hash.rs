@@ -24,13 +24,12 @@ impl Debug for MessageHash {
 }
 
 impl MessageHash {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn compute<CS: CipherSuiteProvider>(
+    pub(crate) fn compute<CS: CipherSuiteProvider>(
         cs: &CS,
         message: &MlsMessage,
     ) -> Result<Self, MlsError> {
         cs.hash(&message.mls_encode_to_vec()?)
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))
             .map(Self)
     }

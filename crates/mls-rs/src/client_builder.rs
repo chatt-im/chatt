@@ -952,15 +952,13 @@ pub(crate) mod test_utils {
                 .crypto_provider(TestCryptoProvider::new())
                 .identity_provider(BasicWithCustomProvider::new(BasicIdentityProvider::new()))
         }
-
-        #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-        pub async fn with_random_signing_identity(
+        pub fn with_random_signing_identity(
             self,
             identity: &str,
             cipher_suite: CipherSuite,
         ) -> Self {
             let (signing_identity, signer) =
-                get_test_signing_identity(cipher_suite, identity.as_bytes()).await;
+                get_test_signing_identity(cipher_suite, identity.as_bytes());
             self.signing_identity(signing_identity, signer, cipher_suite)
         }
     }

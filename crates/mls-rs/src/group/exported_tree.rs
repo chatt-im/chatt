@@ -129,8 +129,8 @@ mod tests {
     use super::*;
     use crate::tree_kem::node::{test_utils::get_test_node_vec, NodeTypeResolver};
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_exported_tree_accessors() {
+    #[test]
+    fn test_exported_tree_accessors() {
         // The test tree (7 nodes, 4 leaf slots):
         //
         //        3
@@ -147,7 +147,7 @@ mod tests {
         // Node 4: Leaf "C"
         // Node 5: Parent { key: "CD", unmerged_leaves: [2] }
         // Node 6: Leaf "D"
-        let nodes = get_test_node_vec().await;
+        let nodes = get_test_node_vec();
         let tree = ExportedTree::new(nodes.clone());
 
         assert_eq!(tree.nodes().len(), nodes.len());

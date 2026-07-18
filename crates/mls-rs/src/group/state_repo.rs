@@ -83,22 +83,19 @@ where
             key_package_repo,
         })
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn find_max_id(&self) -> Result<Option<u64>, MlsError> {
+    fn find_max_id(&self) -> Result<Option<u64>, MlsError> {
         if let Some(max) = self.pending_commit.inserts.back().map(|e| e.epoch_id()) {
             Ok(Some(max))
         } else {
             self.storage
                 .max_epoch_id(&self.group_id)
-                .await
+
                 .map_err(|e| MlsError::GroupStorageError(e.into_any_error()))
         }
     }
 
     #[cfg(feature = "psk")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn resumption_secret(
+    pub fn resumption_secret(
         &self,
         psk_id: &ResumptionPsk,
     ) -> Result<Option<PreSharedKey>, MlsError> {
@@ -128,15 +125,14 @@ where
         // Search the stored cache
         self.storage
             .epoch(&psk_id.psk_group_id.0, psk_id.psk_epoch)
-            .await
+
             .map_err(|e| MlsError::GroupStorageError(e.into_any_error()))?
             .map(|e| Ok(PriorEpoch::mls_decode(&mut &**e)?.secrets.resumption_secret))
             .transpose()
     }
 
     #[cfg(feature = "private_message")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn get_epoch_mut(
+    pub fn get_epoch_mut(
         &mut self,
         epoch_id: u64,
     ) -> Result<Option<&mut PriorEpoch>, MlsError> {
@@ -157,7 +153,7 @@ where
             None => self
                 .storage
                 .epoch(&self.group_id, epoch_id)
-                .await
+
                 .map_err(|e| MlsError::GroupStorageError(e.into_any_error()))?
                 .and_then(|epoch| {
                     PriorEpoch::mls_decode(&mut &**epoch)
@@ -171,16 +167,14 @@ where
         .transpose()
         .map_err(Into::into)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn insert(&mut self, epoch: PriorEpoch) -> Result<(), MlsError> {
+    pub fn insert(&mut self, epoch: PriorEpoch) -> Result<(), MlsError> {
         if epoch.group_id() != self.group_id {
             return Err(MlsError::GroupIdMismatch);
         }
 
         let epoch_id = epoch.epoch_id();
 
-        if let Some(expected_id) = self.find_max_id().await?.map(|id| id + 1) {
+        if let Some(expected_id) = self.find_max_id()?.map(|id| id + 1) {
             if epoch_id != expected_id {
                 return Err(MlsError::InvalidEpoch);
             }
@@ -190,9 +184,7 @@ where
 
         Ok(())
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn write_to_storage(&mut self, group_snapshot: Snapshot) -> Result<(), MlsError> {
+    pub fn write_to_storage(&mut self, group_snapshot: Snapshot) -> Result<(), MlsError> {
         let inserts = self
             .pending_commit
             .inserts
@@ -224,13 +216,13 @@ where
 
         self.storage
             .write(group_state, inserts, updates)
-            .await
+
             .map_err(|e| MlsError::GroupStorageError(e.into_any_error()))?;
 
         if let Some(ref key_package_ref) = self.pending_key_package_removal {
             self.key_package_repo
                 .delete(key_package_ref)
-                .await
+
                 .map_err(|e| MlsError::KeyPackageRepoError(e.into_any_error()))?;
         }
 
@@ -283,18 +275,16 @@ mod tests {
     fn test_epoch(epoch_id: u64) -> PriorEpoch {
         get_test_epoch_with_id(TEST_GROUP.to_vec(), TEST_CIPHER_SUITE, epoch_id)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn test_snapshot(epoch_id: u64) -> Snapshot {
-        crate::group::snapshot::test_utils::get_test_snapshot(TEST_CIPHER_SUITE, epoch_id).await
+    fn test_snapshot(epoch_id: u64) -> Snapshot {
+        crate::group::snapshot::test_utils::get_test_snapshot(TEST_CIPHER_SUITE, epoch_id)
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_epoch_inserts() {
+    #[test]
+    fn test_epoch_inserts() {
         let mut test_repo = test_group_state_repo(1);
         let test_epoch = test_epoch(0);
 
-        test_repo.insert(test_epoch.clone()).await.unwrap();
+        test_repo.insert(test_epoch.clone()).unwrap();
 
         // Check the in-memory state
         assert_eq!(
@@ -316,8 +306,8 @@ mod tests {
         };
 
         // Make sure you can recall an epoch sitting as a pending insert
-        let resumption = test_repo.resumption_secret(&psk_id).await.unwrap();
-        let prior_epoch = test_repo.get_epoch_mut(0).await.unwrap().cloned();
+        let resumption = test_repo.resumption_secret(&psk_id).unwrap();
+        let prior_epoch = test_repo.get_epoch_mut(0).unwrap().cloned();
 
         assert_eq!(
             prior_epoch.clone().unwrap().secrets.resumption_secret,
@@ -327,8 +317,8 @@ mod tests {
         assert_eq!(prior_epoch.unwrap(), test_epoch);
 
         // Write to the storage
-        let snapshot = test_snapshot(test_epoch.epoch_id()).await;
-        test_repo.write_to_storage(snapshot.clone()).await.unwrap();
+        let snapshot = test_snapshot(test_epoch.epoch_id());
+        test_repo.write_to_storage(snapshot.clone()).unwrap();
 
         // Make sure the memory cache cleared
         assert!(test_repo.pending_commit.inserts.is_empty());
@@ -357,20 +347,20 @@ mod tests {
         );
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_updates() {
+    #[test]
+    fn test_updates() {
         let mut test_repo = test_group_state_repo(2);
         let test_epoch_0 = test_epoch(0);
 
-        test_repo.insert(test_epoch_0.clone()).await.unwrap();
+        test_repo.insert(test_epoch_0.clone()).unwrap();
 
         test_repo
-            .write_to_storage(test_snapshot(0).await)
-            .await
+            .write_to_storage(test_snapshot(0))
+
             .unwrap();
 
         // Update the stored epoch
-        let to_update = test_repo.get_epoch_mut(0).await.unwrap().unwrap();
+        let to_update = test_repo.get_epoch_mut(0).unwrap().unwrap();
         assert_eq!(to_update, &test_epoch_0);
 
         let new_sender_secret = random_bytes(32);
@@ -392,12 +382,12 @@ mod tests {
             usage: ResumptionPSKUsage::Application,
         };
 
-        let owned = test_repo.resumption_secret(&psk_id).await.unwrap();
+        let owned = test_repo.resumption_secret(&psk_id).unwrap();
         assert_eq!(owned.as_ref(), Some(&to_update.secrets.resumption_secret));
 
         // Write the update to storage
-        let snapshot = test_snapshot(1).await;
-        test_repo.write_to_storage(snapshot.clone()).await.unwrap();
+        let snapshot = test_snapshot(1);
+        test_repo.write_to_storage(snapshot.clone()).unwrap();
 
         assert!(test_repo.pending_commit.updates.is_empty());
         assert!(test_repo.pending_commit.inserts.is_empty());
@@ -425,31 +415,31 @@ mod tests {
         );
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_insert_and_update() {
+    #[test]
+    fn test_insert_and_update() {
         let mut test_repo = test_group_state_repo(2);
         let test_epoch_0 = test_epoch(0);
 
-        test_repo.insert(test_epoch_0).await.unwrap();
+        test_repo.insert(test_epoch_0).unwrap();
 
         test_repo
-            .write_to_storage(test_snapshot(0).await)
-            .await
+            .write_to_storage(test_snapshot(0))
+
             .unwrap();
 
         // Update the stored epoch
-        let to_update = test_repo.get_epoch_mut(0).await.unwrap().unwrap();
+        let to_update = test_repo.get_epoch_mut(0).unwrap().unwrap();
         let new_sender_secret = random_bytes(32);
         to_update.secrets.sender_data_secret = SenderDataSecret::from(new_sender_secret);
         let to_update = to_update.clone();
 
         // Insert another epoch
         let test_epoch_1 = test_epoch(1);
-        test_repo.insert(test_epoch_1.clone()).await.unwrap();
+        test_repo.insert(test_epoch_1.clone()).unwrap();
 
         test_repo
-            .write_to_storage(test_snapshot(1).await)
-            .await
+            .write_to_storage(test_snapshot(1))
+
             .unwrap();
 
         assert!(test_repo.pending_commit.inserts.is_empty());
@@ -484,38 +474,38 @@ mod tests {
         );
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_many_epochs_in_storage() {
+    #[test]
+    fn test_many_epochs_in_storage() {
         let epochs = (0..10).map(test_epoch).collect::<Vec<_>>();
 
         let mut test_repo = test_group_state_repo(10);
 
         for epoch in epochs.iter().cloned() {
-            test_repo.insert(epoch).await.unwrap()
+            test_repo.insert(epoch).unwrap()
         }
 
         test_repo
-            .write_to_storage(test_snapshot(9).await)
-            .await
+            .write_to_storage(test_snapshot(9))
+
             .unwrap();
 
         for mut epoch in epochs {
-            let res = test_repo.get_epoch_mut(epoch.epoch_id()).await.unwrap();
+            let res = test_repo.get_epoch_mut(epoch.epoch_id()).unwrap();
 
             assert_eq!(res, Some(&mut epoch));
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_stored_groups_list() {
+    #[test]
+    fn test_stored_groups_list() {
         let mut test_repo = test_group_state_repo(2);
         let test_epoch_0 = test_epoch(0);
 
-        test_repo.insert(test_epoch_0.clone()).await.unwrap();
+        test_repo.insert(test_epoch_0.clone()).unwrap();
 
         test_repo
-            .write_to_storage(test_snapshot(0).await)
-            .await
+            .write_to_storage(test_snapshot(0))
+
             .unwrap();
 
         assert_eq!(
@@ -524,33 +514,33 @@ mod tests {
         )
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn reducing_retention_limit_takes_effect_on_epoch_access() {
+    #[test]
+    fn reducing_retention_limit_takes_effect_on_epoch_access() {
         let mut repo = test_group_state_repo(1);
 
-        repo.insert(test_epoch(0)).await.unwrap();
-        repo.insert(test_epoch(1)).await.unwrap();
+        repo.insert(test_epoch(0)).unwrap();
+        repo.insert(test_epoch(1)).unwrap();
 
-        repo.write_to_storage(test_snapshot(0).await).await.unwrap();
+        repo.write_to_storage(test_snapshot(0)).unwrap();
 
         let mut repo = GroupStateRepository {
             storage: repo.storage,
             ..test_group_state_repo(1)
         };
 
-        let res = repo.get_epoch_mut(0).await.unwrap();
+        let res = repo.get_epoch_mut(0).unwrap();
 
         assert!(res.is_none());
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn in_memory_storage_obeys_retention_limit_after_saving() {
+    #[test]
+    fn in_memory_storage_obeys_retention_limit_after_saving() {
         let mut repo = test_group_state_repo(1);
 
-        repo.insert(test_epoch(0)).await.unwrap();
-        repo.write_to_storage(test_snapshot(0).await).await.unwrap();
-        repo.insert(test_epoch(1)).await.unwrap();
-        repo.write_to_storage(test_snapshot(1).await).await.unwrap();
+        repo.insert(test_epoch(0)).unwrap();
+        repo.write_to_storage(test_snapshot(0)).unwrap();
+        repo.insert(test_epoch(1)).unwrap();
+        repo.write_to_storage(test_snapshot(1)).unwrap();
 
         #[cfg(feature = "std")]
         let lock = repo.storage.inner.lock().unwrap();
@@ -560,12 +550,12 @@ mod tests {
         assert_eq!(lock.get(TEST_GROUP).unwrap().epoch_data.len(), 1);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn used_key_package_is_deleted() {
+    #[test]
+    fn used_key_package_is_deleted() {
         let key_package_repo = InMemoryKeyPackageStorage::default();
 
         let key_package = test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"member")
-            .await
+
             .0;
 
         let (id, data) = key_package.to_storage().unwrap();
@@ -582,7 +572,7 @@ mod tests {
 
         repo.key_package_repo.get(&key_package.reference).unwrap();
 
-        repo.write_to_storage(test_snapshot(4).await).await.unwrap();
+        repo.write_to_storage(test_snapshot(4)).unwrap();
 
         assert!(repo.key_package_repo.get(&key_package.reference).is_none());
     }

@@ -80,15 +80,14 @@ impl HpkeEncryptable for PathSecret {
 }
 
 impl PathSecret {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn to_hpke_key_pair<P: CipherSuiteProvider>(
+    pub fn to_hpke_key_pair<P: CipherSuiteProvider>(
         &self,
         cs: &P,
     ) -> Result<(HpkeSecretKey, HpkePublicKey), MlsError> {
-        let node_secret = Zeroizing::new(kdf_derive_secret(cs, self, b"node").await?);
+        let node_secret = Zeroizing::new(kdf_derive_secret(cs, self, b"node")?);
 
         cs.kem_derive(&node_secret)
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))
     }
 }
@@ -115,14 +114,12 @@ impl<'a, P: CipherSuiteProvider> PathSecretGenerator<'a, P> {
             ..Self::new(cipher_suite_provider)
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn next_secret(&mut self) -> Result<PathSecret, MlsError> {
+    pub fn next_secret(&mut self) -> Result<PathSecret, MlsError> {
         let secret = if let Some(starting_with) = self.starting_with.take() {
             Ok(starting_with)
         } else if let Some(last) = self.last.take() {
             kdf_derive_secret(self.cipher_suite_provider, &last, b"path")
-                .await
+
                 .map(PathSecret::from)
         } else {
             PathSecret::random(self.cipher_suite_provider)
@@ -191,8 +188,8 @@ mod tests {
         load_test_case_json!(path_secret, TestCase::generate())
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_path_secret_generation() {
+    #[test]
+    fn test_path_secret_generation() {
         let cases = load_test_cases();
 
         for test_case in cases {
@@ -204,35 +201,35 @@ mod tests {
             let mut generator = PathSecretGenerator::starting_with(&cs_provider, first_secret);
 
             for expected in &test_case.generations {
-                let generated = hex::encode(&*generator.next_secret().await.unwrap());
+                let generated = hex::encode(&*generator.next_secret().unwrap());
                 assert_eq!(expected, &generated);
             }
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_first_path_is_random() {
+    #[test]
+    fn test_first_path_is_random() {
         let cs_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
         let mut generator = PathSecretGenerator::new(&cs_provider);
-        let first_secret = generator.next_secret().await.unwrap();
+        let first_secret = generator.next_secret().unwrap();
 
         for _ in 0..100 {
             let mut next_generator = PathSecretGenerator::new(&cs_provider);
-            let next_secret = next_generator.next_secret().await.unwrap();
+            let next_secret = next_generator.next_secret().unwrap();
             assert_ne!(first_secret, next_secret);
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_starting_with() {
+    #[test]
+    fn test_starting_with() {
         let cs_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
         let secret = PathSecret::random(&cs_provider).unwrap();
 
         let mut generator = PathSecretGenerator::starting_with(&cs_provider, secret.clone());
 
-        let first_secret = generator.next_secret().await.unwrap();
-        let second_secret = generator.next_secret().await.unwrap();
+        let first_secret = generator.next_secret().unwrap();
+        let second_secret = generator.next_secret().unwrap();
 
         assert_eq!(secret, first_secret);
         assert_ne!(first_secret, second_secret);

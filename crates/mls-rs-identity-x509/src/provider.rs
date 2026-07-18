@@ -99,9 +99,6 @@ where
         Ok(())
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 impl<IE, V> IdentityProvider for X509IdentityProvider<IE, V>
 where
     IE: X509IdentityExtractor + Send + Sync,
@@ -111,7 +108,7 @@ where
 
     /// Determine if a certificate is valid based on the behavior of the
     /// underlying validator provided.
-    async fn validate_member(
+    fn validate_member(
         &self,
         signing_identity: &SigningIdentity,
         timestamp: Option<MlsTime>,
@@ -122,7 +119,7 @@ where
 
     /// Produce a unique identity value to represent the entity controlling a
     /// certificate credential within an MLS group.
-    async fn identity(
+    fn identity(
         &self,
         signing_id: &SigningIdentity,
         _extensions: &ExtensionList,
@@ -135,7 +132,7 @@ where
     /// Determine if `successor` is controlled by the same entity as
     /// `predecessor` based on the behavior of the underlying identity
     /// extractor provided.
-    async fn valid_successor(
+    fn valid_successor(
         &self,
         predecessor: &SigningIdentity,
         successor: &SigningIdentity,
@@ -149,7 +146,7 @@ where
             .map_err(|e| X509IdentityError::IdentityExtractorError(e.into_any_error()))
     }
 
-    async fn validate_external_sender(
+    fn validate_external_sender(
         &self,
         signing_identity: &SigningIdentity,
         timestamp: Option<MlsTime>,

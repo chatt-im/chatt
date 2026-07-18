@@ -180,13 +180,6 @@ where
         self.kem1.seed_length_for_derive() + self.kem2.seed_length_for_derive()
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(all(target_arch = "wasm32", mls_build_async), maybe_async::must_be_async(?Send))]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), mls_build_async),
-    maybe_async::must_be_async
-)]
 impl<KEM1, KEM2, PRG, C2, C7, RO> KemType for GhpKemCombiner<KEM1, KEM2, PRG, C2, C7, RO>
 where
     KEM1: KemType,
@@ -203,22 +196,22 @@ where
         self.kem_id
     }
 
-    async fn generate_deterministic(
+    fn generate_deterministic(
         &self,
         seed: &[u8],
     ) -> Result<(HpkeSecretKey, HpkePublicKey), Error> {
         self.derive_key_pair(seed)
     }
 
-    async fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Error> {
+    fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Error> {
         self.generate_key_pair()
     }
 
-    async fn encap(&self, remote_key: &HpkePublicKey) -> Result<KemResult, Error> {
+    fn encap(&self, remote_key: &HpkePublicKey) -> Result<KemResult, Error> {
         self.encap(remote_key)
     }
 
-    async fn decap(
+    fn decap(
         &self,
         enc: &[u8],
         secret_key: &HpkeSecretKey,

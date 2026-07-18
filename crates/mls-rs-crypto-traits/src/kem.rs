@@ -17,12 +17,6 @@ use mockall::automock;
 use zeroize::ZeroizeOnDrop;
 
 /// A trait that provides the required KEM functions
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(all(target_arch = "wasm32", mls_build_async), maybe_async::must_be_async(?Send))]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), mls_build_async),
-    maybe_async::must_be_async
-)]
 #[cfg_attr(feature = "mock", automock(type Error = crate::mock::TestError;))]
 pub trait KemType: Send + Sync + Sized {
     type Error: IntoAnyError + Send + Sync;
@@ -30,17 +24,17 @@ pub trait KemType: Send + Sync + Sized {
     /// KEM Id, as specified in RFC 9180, Section 5.1 and Table 2.
     fn kem_id(&self) -> u16;
 
-    async fn generate_deterministic(
+    fn generate_deterministic(
         &self,
         seed: &[u8],
     ) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error>;
 
-    async fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error>;
+    fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error>;
     fn public_key_validate(&self, key: &HpkePublicKey) -> Result<(), Self::Error>;
 
-    async fn encap(&self, remote_key: &HpkePublicKey) -> Result<KemResult, Self::Error>;
+    fn encap(&self, remote_key: &HpkePublicKey) -> Result<KemResult, Self::Error>;
 
-    async fn decap(
+    fn decap(
         &self,
         enc: &[u8],
         secret_key: &HpkeSecretKey,

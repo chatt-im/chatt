@@ -107,8 +107,7 @@ where
     /// Based on RFC 9180 Single-Shot APIs. This function combines the action
     /// of the [setup_sender](Hpke::setup_sender) and then calling [seal](ContextS::seal)
     /// on the resulting [ContextS](self::ContextS).
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn seal(
+    pub fn seal(
         &self,
         remote_key: &HpkePublicKey,
         info: &[u8],
@@ -116,19 +115,18 @@ where
         aad: Option<&[u8]>,
         pt: &[u8],
     ) -> Result<HpkeCiphertext, HpkeError> {
-        let (kem_output, mut ctx) = self.setup_sender(remote_key, info, psk).await?;
+        let (kem_output, mut ctx) = self.setup_sender(remote_key, info, psk)?;
 
         Ok(HpkeCiphertext {
             kem_output,
-            ciphertext: ctx.seal(aad, pt).await?,
+            ciphertext: ctx.seal(aad, pt)?,
         })
     }
 
     /// Based on RFC 9180 Single-Shot APIs. This function combines the action
     /// of the [setup_receiver](Hpke::setup_receiver) and then calling
     /// [open](ContextR::open) on the resulting [ContextR](self::ContextR).
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn open(
+    pub fn open(
         &self,
         ciphertext: &HpkeCiphertext,
         local_secret: &HpkeSecretKey,
@@ -145,9 +143,9 @@ where
                 info,
                 psk,
             )
-            .await?;
+            ?;
 
-        hpke_ctx.open(aad, &ciphertext.ciphertext).await
+        hpke_ctx.open(aad, &ciphertext.ciphertext)
     }
 
     /// Generate an HPKE context using the base setup mode. This function returns a tuple
@@ -155,8 +153,7 @@ where
     /// [setup_receiver](Hpke::setup_receiver), as well as the [ContextS](self::ContextS)
     /// that can be used to generate AEAD ciphertexts. Note that for ECDH based kem
     /// functions, `remote_key` is expected to be in uncompressed public key format.
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn setup_sender(
+    pub fn setup_sender(
         &self,
         remote_key: &HpkePublicKey,
         info: &[u8],
@@ -167,12 +164,12 @@ where
         let kem_res = self
             .kem
             .encap(remote_key)
-            .await
+
             .map_err(|e| HpkeError::KemError(e.into_any_error()))?;
 
         let ctx = self
             .key_schedule(mode, kem_res.shared_secret(), info, psk)
-            .await?;
+            ?;
 
         Ok((kem_res.enc().to_owned(), ContextS(ctx)))
     }
@@ -182,8 +179,7 @@ where
     /// the KEM type being used. This function returns an HPKE context that can be used for AEAD
     /// decryption. Note that for ECDH based kem functions, `local_secret`
     /// is expected to be in raw byte key format.
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn setup_receiver(
+    pub fn setup_receiver(
         &self,
         enc: &[u8],
         local_secret: &HpkeSecretKey,
@@ -196,33 +192,29 @@ where
         let shared_secret = self
             .kem
             .decap(enc, local_secret, local_public)
-            .await
+
             .map_err(|e| HpkeError::KemError(e.into_any_error()))?;
 
         self.key_schedule(mode, &shared_secret, info, psk)
-            .await
+
             .map(ContextR)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn derive(&self, ikm: &[u8]) -> Result<(HpkeSecretKey, HpkePublicKey), HpkeError> {
+    pub fn derive(&self, ikm: &[u8]) -> Result<(HpkeSecretKey, HpkePublicKey), HpkeError> {
         let dkp_prk = self
             .kem_kdf
             .labeled_extract(&[], b"dkp_prk", ikm)
-            .await
+
             .map_err(|e| HpkeError::KdfError(e.into_any_error()))?;
 
         self.kem
             .generate_deterministic(&dkp_prk)
-            .await
+
             .map_err(|e| HpkeError::KemError(e.into_any_error()))
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), HpkeError> {
+    pub fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), HpkeError> {
         self.kem
             .generate()
-            .await
+
             .map_err(|e| HpkeError::KemError(e.into_any_error()))
     }
 
@@ -231,9 +223,7 @@ where
             .public_key_validate(key)
             .map_err(|e| HpkeError::KemError(e.into_any_error()))
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn key_schedule(
+    fn key_schedule(
         &self,
         mode: HpkeModeId,
         shared_secret: &[u8],
@@ -247,19 +237,19 @@ where
         let psk_id_hash = self
             .kdf
             .labeled_extract(&[], b"psk_id_hash", psk.id)
-            .await
+
             .map_err(|e| HpkeError::KdfError(e.into_any_error()))?;
 
         let info_hash = self
             .kdf
             .labeled_extract(&[], b"info_hash", info)
-            .await
+
             .map_err(|e| HpkeError::KdfError(e.into_any_error()))?;
 
         let secret = self
             .kdf
             .labeled_extract(shared_secret, b"secret", psk.value)
-            .await
+
             .map(Zeroizing::new)
             .map_err(|e| HpkeError::KdfError(e.into_any_error()))?;
 
@@ -274,7 +264,7 @@ where
             let key = self
                 .kdf
                 .labeled_expand(&secret, b"key", &key_schedule_context, aead.key_size())
-                .await
+
                 .map_err(|e| HpkeError::KdfError(e.into_any_error()))?;
 
             let base_nonce = self
@@ -285,7 +275,7 @@ where
                     &key_schedule_context,
                     aead.nonce_size(),
                 )
-                .await
+
                 .map_err(|e| HpkeError::KdfError(e.into_any_error()))?;
 
             Some(EncryptionContext::new(base_nonce, aead.clone(), key)?)
@@ -298,7 +288,7 @@ where
         let exporter_secret = self
             .kdf
             .labeled_expand(&secret, b"exp", &key_schedule_context, len)
-            .await
+
             .map_err(|e| HpkeError::KdfError(e.into_any_error()))?;
 
         Ok(Context::new(
