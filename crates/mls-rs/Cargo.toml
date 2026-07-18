@@ -39,9 +39,9 @@ self_remove_proposal = ["mls-rs-core/self_remove_proposal"]
 export_key_generation = []
 gsma_rcs_e2ee_feature = ["mls-rs-core/gsma_rcs_e2ee_feature"]
 
-std = ["mls-rs-core/std", "mls-rs-codec/std", "mls-rs-identity-x509?/std", "hex/std", "itertools/use_std", "zeroize/std", "dep:debug_tree", "dep:thiserror", "serde?/std", "subtle/std"]
+std = ["mls-rs-core/std", "mls-rs-codec/std", "mls-rs-identity-x509?/std", "hex?/std", "itertools/use_std", "zeroize/std", "dep:debug_tree", "dep:thiserror", "serde?/std", "subtle/std"]
 
-serde = ["mls-rs-core/serde", "zeroize/serde", "dep:serde", "dep:hex"]
+serde = ["mls-rs-core/serde", "zeroize/serde", "dep:serde", "dep:hex", "hex/serde"]
 
 # SQLite support
 sqlite = ["std", "mls-rs-provider-sqlite/sqlite"]
@@ -75,7 +75,7 @@ rayon = { version = "1", optional = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 once_cell = { version = "1.18", optional = true }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
-hex = { version = "^0.4.3", default-features = false, features = ["serde", "alloc"], optional = true }
+hex = { version = "^0.4.3", default-features = false, features = ["alloc"], optional = true }
 
 # Only for benchmarks
 mls-rs-crypto-awslc = { path = "../mls-rs-crypto-awslc", optional = true, version = "0.25" }
