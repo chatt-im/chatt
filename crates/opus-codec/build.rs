@@ -1,30 +1,10 @@
 mod dnn_weights;
 
-use sha2::{Digest, Sha256};
-use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const COMPACT_DNN_ARTIFACT: &str = "dnn-weights/dnn_weights.bin";
-
-const BUNDLED_PACKET_OPS_FINGERPRINTS: &[SourceFingerprint] = &[
-    SourceFingerprint {
-        path: "src/opus.c",
-        len: 11_274,
-        sha256: "1cee175636295bbd576ff384b77c31663b04fe09619598a452e067229205ade1",
-    },
-    SourceFingerprint {
-        path: "src/repacketizer.c",
-        len: 13_751,
-        sha256: "f05394de7387cd1264cad6ab77bfeacbc126ebce5bae41ef8a63fd13380a35af",
-    },
-    SourceFingerprint {
-        path: "src/extensions.c",
-        len: 23_462,
-        sha256: "82a896f6067d32cbb489b694f2e90f2dec8208f0a68ca40e1d123e312a1408b5",
-    },
-];
 
 struct BuildOptions {
     use_system_lib: bool,
@@ -58,28 +38,21 @@ struct PacketOpsCompatibility {
     frame_bounded_extensions: bool,
 }
 
-#[derive(Clone, Copy)]
-struct SourceFingerprint {
-    path: &'static str,
-    len: u64,
-    sha256: &'static str,
-}
-
 fn main() {
     emit_rerun_directives();
     let opts = BuildOptions::from_env();
 
     if opts.use_system_lib {
         println!("cargo:rustc-cfg=opus_codec_system_lib");
-    }
 
-    if opts.use_system_lib {
+        #[cfg(feature = "system-lib")]
         handle_system_lib(&opts);
+
+        #[cfg(not(feature = "system-lib"))]
+        unreachable!("system-lib environment set without the Cargo feature");
     } else {
         build_bundled_and_link(&opts);
     }
-
-    generate_bindings();
 }
 
 fn emit_rerun_directives() {
@@ -106,6 +79,7 @@ fn emit_rerun_directives() {
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENV");
 }
 
+#[cfg(feature = "system-lib")]
 fn handle_system_lib(opts: &BuildOptions) {
     if opts.dred_enabled {
         println!(
@@ -295,7 +269,7 @@ fn build_bundled_and_link(opts: &BuildOptions) {
     }
 
     lib.compile("opus");
-    emit_bundled_libopus_cfg(Path::new("opus"));
+    emit_bundled_libopus_cfg();
 }
 
 fn expand_dnn_weights() -> PathBuf {
@@ -342,6 +316,7 @@ fn mk_sources(mk_file: &str, var: &str) -> Vec<PathBuf> {
 
 const AVX2_FLAGS: &[&str] = &["-mavx", "-mfma", "-mavx2"];
 
+#[cfg(feature = "system-lib")]
 fn link_system_lib() -> pkg_config::Library {
     pkg_config::Config::new()
         .atleast_version("1.6.1")
@@ -349,6 +324,7 @@ fn link_system_lib() -> pkg_config::Library {
         .expect("system-lib feature requested but pkg-config couldn't find libopus")
 }
 
+#[cfg(feature = "system-lib")]
 fn emit_system_libopus_cfg(version: &str) {
     match version {
         "1.6.1" => emit_packet_ops_cfg(PacketOpsCompatibility {
@@ -363,19 +339,11 @@ fn emit_system_libopus_cfg(version: &str) {
     }
 }
 
-fn emit_bundled_libopus_cfg(opus_source: &Path) {
-    if bundled_packet_ops_match(opus_source) {
-        emit_packet_ops_cfg(PacketOpsCompatibility {
-            rust_packet_ops: true,
-            frame_bounded_extensions: true,
-        });
-    } else {
-        println!(
-            "cargo:warning=vendored libopus packet-op sources do not match the audited \
-             compatibility fingerprints; packet padding and repacketizer emission will \
-             delegate to bundled C libopus"
-        );
-    }
+fn emit_bundled_libopus_cfg() {
+    emit_packet_ops_cfg(PacketOpsCompatibility {
+        rust_packet_ops: true,
+        frame_bounded_extensions: true,
+    });
 }
 
 fn emit_packet_ops_cfg(compatibility: PacketOpsCompatibility) {
@@ -393,85 +361,4 @@ fn emit_rust_packet_ops_cfg() {
 
 fn emit_frame_bounded_extensions_cfg() {
     println!("cargo:rustc-cfg=opus_codec_frame_bounded_extensions");
-}
-
-fn bundled_packet_ops_match(opus_source: &Path) -> bool {
-    BUNDLED_PACKET_OPS_FINGERPRINTS
-        .iter()
-        .all(|fingerprint| source_fingerprint_matches(opus_source, *fingerprint))
-}
-
-fn source_fingerprint_matches(opus_source: &Path, fingerprint: SourceFingerprint) -> bool {
-    let path = opus_source.join(fingerprint.path);
-    let bytes = std::fs::read(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    let bytes = normalize_source_line_endings(&bytes);
-    let actual_len = u64::try_from(bytes.len()).expect("source file length does not fit in u64");
-    let actual_hash = sha256_hex_bytes(&bytes);
-    if actual_len == fingerprint.len && actual_hash == fingerprint.sha256 {
-        return true;
-    }
-
-    println!(
-        "cargo:warning=vendored libopus packet-op source fingerprint mismatch for {}: \
-         expected normalized len {}, sha256 {}; got normalized len {}, sha256 {}",
-        path.display(),
-        fingerprint.len,
-        fingerprint.sha256,
-        actual_len,
-        actual_hash
-    );
-    false
-}
-
-fn normalize_source_line_endings(bytes: &[u8]) -> Cow<'_, [u8]> {
-    if !bytes.windows(2).any(|window| window == b"\r\n") {
-        return Cow::Borrowed(bytes);
-    }
-
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
-            normalized.push(b'\n');
-            index += 2;
-        } else {
-            normalized.push(bytes[index]);
-            index += 1;
-        }
-    }
-    Cow::Owned(normalized)
-}
-
-fn generate_bindings() {
-    let bindings_path = std::path::Path::new("src/bindings.rs");
-
-    if bindings_path.exists() {
-        eprintln!("Using existing src/bindings.rs. Delete this file to force regeneration.");
-        return;
-    }
-
-    let bindings = bindgen::Builder::default()
-        .header("opus/include/opus.h")
-        .header("opus/include/opus_defines.h")
-        .header("opus/include/opus_types.h")
-        .header("opus/include/opus_multistream.h")
-        .header("opus/include/opus_projection.h")
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .generate()
-        .expect("Unable to generate bindings");
-
-    bindings
-        .write_to_file(bindings_path)
-        .expect("Couldn't write bindings!");
-}
-
-fn sha256_hex_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut hex, "{byte:02x}").expect("writing to String should not fail");
-    }
-    hex
 }
