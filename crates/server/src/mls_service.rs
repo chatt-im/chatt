@@ -73,7 +73,7 @@ impl MlsService {
         let identities = ChattIdentityProvider::new(server_id.clone());
         let validator = PublicGroupValidator::new(identities.clone());
         let store = MlsStore::open(data_dir.as_deref())?;
-        let loaded = store.load()?;
+        let loaded = store.snapshot_state();
         let mut service = Self {
             server_id,
             store,
@@ -830,6 +830,7 @@ impl MlsService {
         let sequence = previous
             .head_sequence
             .checked_add(1)
+            .filter(|sequence| *sequence < u64::MAX)
             .ok_or_else(|| "MLS delivery sequence is exhausted".to_string())?;
         let mut global = before.global.clone();
         let welcome_delivery = if let Some(welcome) = &bundle.welcome {
@@ -1180,7 +1181,7 @@ impl MlsService {
         if report.deleted_events > 0 {
             self.rooms = self
                 .store
-                .load()?
+                .snapshot_state()
                 .rooms
                 .into_iter()
                 .map(|room| (room.descriptor.room_id, room))
@@ -1411,7 +1412,8 @@ impl MlsService {
                 return Err("MLS room map key does not match its descriptor".to_string());
             }
             if room.oldest_available_sequence == 0
-                || room.oldest_available_sequence > room.head_sequence.saturating_add(1)
+                || room.head_sequence == u64::MAX
+                || room.oldest_available_sequence > room.head_sequence + 1
                 || room
                     .required_devices
                     .windows(2)

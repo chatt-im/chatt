@@ -18,7 +18,10 @@ use jsony::Jsony;
 use rpc::{
     identity::SignedDeviceRoster,
     ids::{DeviceId, EventId, RoomId, UserId},
-    mls::{EncryptedRoomDescriptor, MlsDeliveryEvent, MlsWelcome, MlsWelcomeBundle},
+    mls::{
+        EncryptedRoomDescriptor, MAX_MLS_WELCOMES_PER_COMMIT, MlsDeliveryEvent, MlsWelcome,
+        MlsWelcomeBundle,
+    },
 };
 
 const SNAPSHOT_VERSION: u32 = 1;
@@ -493,13 +496,12 @@ impl MlsStore {
         }
     }
 
-    pub fn load(&self) -> Result<LoadedState, String> {
+    pub fn snapshot_state(&self) -> LoadedState {
         let state = self.state.read().unwrap();
-        validate_memory(&state)?;
-        Ok(LoadedState {
+        LoadedState {
             global: state.global.clone(),
             rooms: state.rooms.values().cloned().collect(),
-        })
+        }
     }
 
     pub fn replace_global(&self, global: &GlobalRecord) -> Result<(), String> {
@@ -707,6 +709,7 @@ impl MlsStore {
                     let sequence = room
                         .head_sequence
                         .checked_add(1)
+                        .filter(|sequence| *sequence < u64::MAX)
                         .ok_or_else(|| "MLS delivery sequence is exhausted".to_string())?;
                     let stored_at = now_unix_ms.max(room.last_event_time_unix_ms);
                     let event = MlsDeliveryEvent::Application {
@@ -776,13 +779,15 @@ impl MlsStore {
             .rooms
             .get(&room_id.0)
             .ok_or_else(|| "encrypted room does not exist".to_string())?;
-        let start = after.saturating_add(1).max(room.oldest_available_sequence);
-        let events = state
-            .events
-            .range((room_id.0, start)..=(room_id.0, u64::MAX))
-            .take(limit)
-            .map(|(_, stored)| stored.event.clone())
-            .collect();
+        let events = match after.checked_add(1) {
+            Some(start) => state
+                .events
+                .range((room_id.0, start.max(room.oldest_available_sequence))..=(room_id.0, u64::MAX))
+                .take(limit)
+                .map(|(_, stored)| stored.event.clone())
+                .collect(),
+            None => Vec::new(),
+        };
         Ok(EventBatch {
             events,
             oldest_available_sequence: room.oldest_available_sequence,
@@ -882,10 +887,13 @@ impl MlsStore {
     }
 
     pub fn welcomes(&self, device_id: DeviceId, after: u64) -> Result<Vec<MlsWelcome>, String> {
+        let Some(start) = after.checked_add(1) else {
+            return Ok(Vec::new());
+        };
         let state = self.state.read().unwrap();
         state
             .device_welcomes
-            .range((device_id.0, after.saturating_add(1))..=(device_id.0, u64::MAX))
+            .range((device_id.0, start)..=(device_id.0, u64::MAX))
             .map(|(_, delivery_id)| {
                 let stored = state
                     .welcomes
@@ -903,14 +911,10 @@ impl MlsStore {
     }
 
     pub fn welcome_head(&self, device_id: DeviceId) -> Result<u64, String> {
-        Ok(self
-            .state
-            .read()
-            .unwrap()
-            .device_welcomes
-            .range((device_id.0, 0)..=(device_id.0, u64::MAX))
-            .next_back()
-            .map_or(0, |(_, delivery_id)| *delivery_id))
+        Ok(welcome_head_memory(
+            &self.state.read().unwrap(),
+            device_id,
+        ))
     }
 
     pub fn acknowledge_welcome(
@@ -918,28 +922,31 @@ impl MlsStore {
         device_id: DeviceId,
         delivery_id: u64,
     ) -> Result<bool, String> {
-        let current = self
-            .state
-            .read()
-            .unwrap()
-            .welcome_cursors
-            .get(&device_id.0)
-            .copied()
-            .unwrap_or_default();
-        if delivery_id > current {
-            self.commit(
-                StateDelta {
-                    welcome_cursors: vec![WelcomeCursorCheckpoint {
-                        delivery_id,
-                        device_id: device_id.0,
-                    }],
-                    ..StateDelta::default()
-                },
-                false,
-            )?;
-            return Ok(true);
+        {
+            let state = self.state.read().unwrap();
+            let current = state
+                .welcome_cursors
+                .get(&device_id.0)
+                .copied()
+                .unwrap_or_default();
+            if delivery_id <= current {
+                return Ok(false);
+            }
+            if delivery_id > welcome_head_memory(&state, device_id) {
+                return Err("MLS Welcome acknowledgement is beyond the inbox head".to_string());
+            }
         }
-        Ok(false)
+        self.commit(
+            StateDelta {
+                welcome_cursors: vec![WelcomeCursorCheckpoint {
+                    delivery_id,
+                    device_id: device_id.0,
+                }],
+                ..StateDelta::default()
+            },
+            false,
+        )?;
+        Ok(true)
     }
 
     pub fn persist_welcome_acknowledgement(&self, device_id: DeviceId) -> Result<(), String> {
@@ -987,8 +994,8 @@ impl MlsStore {
             }
             match selected {
                 Some((mut report, mut delta)) => {
-                    let (more, welcomes) = plan_cleanup_welcomes(&state, now_unix_ms, batch_limit)?;
-                    report.more_work |= more;
+                    let (_, welcomes) = plan_cleanup_welcomes(&state, now_unix_ms, batch_limit)?;
+                    report.more_work = true;
                     delta.deleted_welcome_targets = welcomes;
                     (report, delta)
                 }
@@ -1181,6 +1188,21 @@ fn remove_event_memory(state: &mut MemoryState, room_id: RoomId, sequence: u64) 
 
 fn fragmented_payload_bytes(state: &MemoryState) -> u64 {
     state.retired_payload_bytes
+}
+
+fn welcome_head_memory(state: &MemoryState, device_id: DeviceId) -> u64 {
+    let pending = state
+        .device_welcomes
+        .range((device_id.0, 0)..=(device_id.0, u64::MAX))
+        .next_back()
+        .map_or(0, |(_, delivery_id)| *delivery_id);
+    pending.max(
+        state
+            .welcome_cursors
+            .get(&device_id.0)
+            .copied()
+            .unwrap_or_default(),
+    )
 }
 
 fn ensure_event_available(
@@ -1480,10 +1502,20 @@ fn plan_cleanup_welcomes(
 }
 
 fn validate_memory(state: &MemoryState) -> Result<(), String> {
+    if state.global.next_welcome_delivery_id == 0 {
+        return Err("persisted MLS Welcome delivery head is invalid".to_string());
+    }
     for room in state.rooms.values() {
         let id = room.descriptor.room_id;
+        let Some(after_head) = room.head_sequence.checked_add(1) else {
+            return Err("persisted MLS room has exhausted its delivery sequence".to_string());
+        };
         if room.oldest_available_sequence == 0
-            || room.oldest_available_sequence > room.head_sequence.saturating_add(1)
+            || room.oldest_available_sequence > after_head
+            || room
+                .required_devices
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
         {
             return Err("persisted MLS room has an invalid retained range".to_string());
         }
@@ -1496,25 +1528,12 @@ fn validate_memory(state: &MemoryState) -> Result<(), String> {
                 if *sequence != expected || stored.event.sequence() != expected {
                     return Err("persisted MLS delivery sequence is not contiguous".to_string());
                 }
-                match &stored.event {
-                    MlsDeliveryEvent::Application { event_id, .. }
-                        if state.event_ids.get(&(id.0, event_id.0)) != Some(&expected) =>
-                    {
-                        return Err(
-                            "persisted MLS application index is inconsistent".to_string()
-                        );
-                    }
-                    MlsDeliveryEvent::Commit { parent_epoch, .. }
-                        if state.commit_epochs.get(&(id.0, *parent_epoch)) != Some(&expected) =>
-                    {
-                        return Err("persisted MLS commit index is inconsistent".to_string());
-                    }
-                    _ => {}
-                }
-                expected = expected.saturating_add(1);
+                expected = expected
+                    .checked_add(1)
+                    .ok_or_else(|| "persisted MLS delivery sequence is exhausted".to_string())?;
             }
         }
-        if expected != room.head_sequence.saturating_add(1) {
+        if expected != after_head {
             return Err("persisted MLS delivery head does not match its log".to_string());
         }
         for device in &room.required_devices {
@@ -1522,6 +1541,121 @@ fn validate_memory(state: &MemoryState) -> Result<(), String> {
                 return Err("persisted MLS required device has no cursor".to_string());
             }
         }
+    }
+
+    let mut application_events = 0usize;
+    let mut commit_events = 0usize;
+    for (&(room_id, sequence), stored) in &state.events {
+        let room = state
+            .rooms
+            .get(&room_id)
+            .ok_or_else(|| "persisted MLS event references a missing room".to_string())?;
+        if sequence < room.oldest_available_sequence
+            || sequence > room.head_sequence
+            || stored.event.sequence() != sequence
+        {
+            return Err("persisted MLS event lies outside its room log".to_string());
+        }
+        match &stored.event {
+            MlsDeliveryEvent::Application { event_id, .. } => {
+                application_events += 1;
+                if state.event_ids.get(&(room_id, event_id.0)) != Some(&sequence) {
+                    return Err("persisted MLS application index is inconsistent".to_string());
+                }
+            }
+            MlsDeliveryEvent::Commit { parent_epoch, .. } => {
+                commit_events += 1;
+                if state.commit_epochs.get(&(room_id, *parent_epoch)) != Some(&sequence) {
+                    return Err("persisted MLS commit index is inconsistent".to_string());
+                }
+            }
+        }
+    }
+    if application_events != state.event_ids.len() || commit_events != state.commit_epochs.len() {
+        return Err("persisted MLS delivery indexes contain orphan entries".to_string());
+    }
+
+    for (&(room_id, device_id), cursor) in &state.device_cursors {
+        let room = state
+            .rooms
+            .get(&room_id)
+            .ok_or_else(|| "persisted MLS cursor references a missing room".to_string())?;
+        if room
+            .required_devices
+            .binary_search(&DeviceId(device_id))
+            .is_err()
+        {
+            return Err("persisted MLS cursor references a non-required device".to_string());
+        }
+        if cursor.starting_sequence == 0
+            || cursor.starting_sequence > cursor.highest_contiguous_sequence
+            || cursor.highest_contiguous_sequence > room.head_sequence
+            || cursor.rejoin_required_through.is_some_and(|watermark| {
+                watermark < cursor.highest_contiguous_sequence || watermark > room.head_sequence
+            })
+        {
+            return Err("persisted MLS device cursor is inconsistent".to_string());
+        }
+    }
+
+    for (&delivery_id, welcome) in &state.welcomes {
+        if delivery_id == 0 || delivery_id >= state.global.next_welcome_delivery_id {
+            return Err("persisted MLS Welcome delivery id is inconsistent".to_string());
+        }
+        let room = state
+            .rooms
+            .get(&welcome.bundle.descriptor.room_id.0)
+            .ok_or_else(|| "persisted MLS Welcome references a missing room".to_string())?;
+        if welcome.bundle.descriptor != room.descriptor
+            || welcome.sequence == 0
+            || welcome.sequence > room.head_sequence
+            || welcome.bundle.device_ids.is_empty()
+            || welcome.bundle.device_ids.len() > MAX_MLS_WELCOMES_PER_COMMIT
+            || welcome
+                .bundle
+                .device_ids
+                .iter()
+                .enumerate()
+                .any(|(index, device)| welcome.bundle.device_ids[index + 1..].contains(device))
+        {
+            return Err("persisted MLS Welcome metadata is inconsistent".to_string());
+        }
+        let Some(target_count) = state.welcome_target_counts.get(&delivery_id) else {
+            return Err("persisted MLS Welcome targets are inconsistent".to_string());
+        };
+        if *target_count == 0 || usize::from(*target_count) > welcome.bundle.device_ids.len() {
+            return Err("persisted MLS Welcome target count is inconsistent".to_string());
+        }
+        if welcome.sequence >= room.oldest_available_sequence
+            && !state
+                .events
+                .get(&(room.descriptor.room_id.0, welcome.sequence))
+                .is_some_and(|stored| matches!(&stored.event, MlsDeliveryEvent::Commit { .. }))
+        {
+            return Err("persisted MLS Welcome does not reference a retained commit".to_string());
+        }
+    }
+    let mut actual_target_counts = BTreeMap::<u64, u16>::new();
+    for &(device_id, delivery_id) in &state.device_welcomes {
+        let welcome = state
+            .welcomes
+            .get(&delivery_id)
+            .ok_or_else(|| "persisted MLS Welcome target references a missing value".to_string())?;
+        if !welcome.bundle.device_ids.contains(&DeviceId(device_id)) {
+            return Err("persisted MLS Welcome target is inconsistent".to_string());
+        }
+        let count = actual_target_counts.entry(delivery_id).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| "persisted MLS Welcome target count is too large".to_string())?;
+    }
+    if actual_target_counts != state.welcome_target_counts {
+        return Err("persisted MLS Welcome target counts are inconsistent".to_string());
+    }
+    if state.welcome_cursors.values().any(|delivery_id| {
+        *delivery_id == 0 || *delivery_id >= state.global.next_welcome_delivery_id
+    }) {
+        return Err("persisted MLS Welcome cursor is inconsistent".to_string());
     }
     Ok(())
 }
@@ -2030,10 +2164,13 @@ fn load_checkpoint(path: &Path) -> Result<MemoryState, String> {
         {
             return Err("MLS checkpoint contains a duplicate Welcome target".to_string());
         }
-        *state
+        let count = state
             .welcome_target_counts
             .entry(row.delivery_id)
-            .or_default() += 1;
+            .or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| "MLS checkpoint Welcome target count is too large".to_string())?;
     }
     for row in welcome_cursors {
         if state
@@ -2044,7 +2181,6 @@ fn load_checkpoint(path: &Path) -> Result<MemoryState, String> {
             return Err("MLS checkpoint contains a duplicate Welcome cursor".to_string());
         }
     }
-    validate_memory(&state)?;
     Ok(state)
 }
 
@@ -2126,12 +2262,36 @@ mod tests {
             .unwrap();
     }
 
+    fn create_with_welcome(store: &MlsStore, room: &RoomRecord, devices: Vec<DeviceId>) {
+        let bundle = MlsWelcomeBundle {
+            device_ids: devices,
+            descriptor: room.descriptor.clone(),
+            welcome: vec![8],
+        };
+        store
+            .create_room(
+                &GlobalRecord {
+                    next_welcome_delivery_id: 2,
+                    ..GlobalRecord::default()
+                },
+                room,
+                &MlsDeliveryEvent::Commit {
+                    sequence: 1,
+                    parent_epoch: 0,
+                    epoch: 1,
+                    commit: vec![9],
+                },
+                Some((1, &bundle)),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn schema_version_is_created_and_reopened() {
         let temp = tempfile::tempdir().unwrap();
         let store = MlsStore::open(Some(temp.path())).unwrap();
         drop(store);
-        let loaded = MlsStore::open(Some(temp.path())).unwrap().load().unwrap();
+        let loaded = MlsStore::open(Some(temp.path())).unwrap().snapshot_state();
         assert!(loaded.rooms.is_empty());
         assert_eq!(loaded.global.next_welcome_delivery_id, 1);
     }
@@ -2195,6 +2355,58 @@ mod tests {
     }
 
     #[test]
+    fn maximum_fetch_cursors_return_empty_and_sequence_maximum_is_reserved() {
+        let store = MlsStore::open(None).unwrap();
+        let device = DeviceId([25; 16]);
+        create_with_welcome(&store, &room(25, vec![device], 100), vec![device]);
+
+        assert!(store.events(RoomId(25), u64::MAX, 10).unwrap().events.is_empty());
+        assert!(store.welcomes(device, u64::MAX).unwrap().is_empty());
+
+        store
+            .state
+            .write()
+            .unwrap()
+            .rooms
+            .get_mut(&25)
+            .unwrap()
+            .head_sequence = u64::MAX - 1;
+        let error = store
+            .append_application(RoomId(25), device, 1, EventId([25; 16]), &[1], 200)
+            .unwrap_err();
+        assert!(error.contains("sequence is exhausted"));
+
+        store
+            .state
+            .write()
+            .unwrap()
+            .rooms
+            .get_mut(&25)
+            .unwrap()
+            .head_sequence = u64::MAX;
+        assert!(validate_memory(&store.state.read().unwrap())
+            .unwrap_err()
+            .contains("exhausted its delivery sequence"));
+    }
+
+    #[test]
+    fn welcome_acknowledgement_is_bounded_and_head_survives_cleanup() {
+        let mut store = MlsStore::open(None).unwrap();
+        let device = DeviceId([26; 16]);
+        create_with_welcome(&store, &room(26, vec![device], 100), vec![device]);
+
+        let error = store.acknowledge_welcome(device, 2).unwrap_err();
+        assert!(error.contains("beyond the inbox head"));
+        assert_eq!(store.welcome_head(device).unwrap(), 1);
+        assert!(store.acknowledge_welcome(device, 1).unwrap());
+        store.cleanup(100, 10).unwrap();
+
+        assert!(store.welcomes(device, 0).unwrap().is_empty());
+        assert_eq!(store.welcome_head(device).unwrap(), 1);
+        assert!(!store.acknowledge_welcome(device, 1).unwrap());
+    }
+
+    #[test]
     fn final_checkpoint_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
         let device = DeviceId([8; 16]);
@@ -2222,6 +2434,92 @@ mod tests {
 
         let reopened = MlsStore::open(Some(temp.path())).unwrap();
         assert!(reopened.events(RoomId(24), 0, 10).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn partially_acknowledged_welcome_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let acknowledged = DeviceId([27; 16]);
+        let pending = DeviceId([28; 16]);
+        let mut store = MlsStore::open(Some(temp.path())).unwrap();
+        create_with_welcome(
+            &store,
+            &room(27, vec![acknowledged, pending], 100),
+            vec![acknowledged, pending],
+        );
+        store.acknowledge_welcome(acknowledged, 1).unwrap();
+        store
+            .persist_welcome_acknowledgement(acknowledged)
+            .unwrap();
+        store.cleanup(100, 10).unwrap();
+        drop(store);
+
+        let reopened = MlsStore::open(Some(temp.path())).unwrap();
+        assert!(reopened.welcomes(acknowledged, 0).unwrap().is_empty());
+        assert_eq!(reopened.welcome_head(acknowledged).unwrap(), 1);
+        assert_eq!(reopened.welcomes(pending, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn startup_rejects_orphaned_welcome_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = DeviceId([29; 16]);
+        let store = MlsStore::open(None).unwrap();
+        create_with_welcome(&store, &room(29, vec![device], 100), vec![device]);
+        let mut state = store.state.read().unwrap().clone();
+        state.welcomes.clear();
+        write_checkpoint(
+            &temp.path().join("mls-state.bin"),
+            &serialize_checkpoint(&state),
+        )
+        .unwrap();
+
+        let error = MlsStore::open(Some(temp.path())).unwrap_err();
+        assert!(error.contains("target references a missing value"));
+    }
+
+    #[test]
+    fn validation_rejects_cross_index_inconsistencies() {
+        let device = DeviceId([30; 16]);
+        let store = MlsStore::open(None).unwrap();
+        create_with_welcome(&store, &room(30, vec![device], 100), vec![device]);
+        let valid = store.state.read().unwrap().clone();
+        validate_memory(&valid).unwrap();
+
+        let mut orphan_event = valid.clone();
+        orphan_event.rooms.clear();
+        assert!(validate_memory(&orphan_event)
+            .unwrap_err()
+            .contains("event references a missing room"));
+
+        let mut orphan_index = valid.clone();
+        orphan_index.event_ids.insert((30, [7; 16]), 1);
+        assert!(validate_memory(&orphan_index)
+            .unwrap_err()
+            .contains("indexes contain orphan entries"));
+
+        let mut orphan_cursor = valid.clone();
+        orphan_cursor.device_cursors.insert(
+            (31, device.0),
+            DeviceCursor {
+                highest_contiguous_sequence: 1,
+                starting_sequence: 1,
+                last_ack_unix_ms: 100,
+                rejoin_required_through: None,
+            },
+        );
+        assert!(validate_memory(&orphan_cursor)
+            .unwrap_err()
+            .contains("cursor references a missing room"));
+
+        let mut missing_welcome_room = valid;
+        missing_welcome_room.rooms.clear();
+        missing_welcome_room.events.clear();
+        missing_welcome_room.commit_epochs.clear();
+        missing_welcome_room.device_cursors.clear();
+        assert!(validate_memory(&missing_welcome_room)
+            .unwrap_err()
+            .contains("Welcome references a missing room"));
     }
 
     #[test]
@@ -2282,7 +2580,7 @@ mod tests {
         assert!(store.replace_global(&global).is_err());
         let error = store.replace_global(&global).unwrap_err();
         assert!(error.contains("earlier write failure"));
-        assert_eq!(store.load().unwrap().global.next_welcome_delivery_id, 1);
+        assert_eq!(store.snapshot_state().global.next_welcome_delivery_id, 1);
     }
 
     #[test]
@@ -2405,7 +2703,9 @@ mod tests {
         assert!(first.more_work);
         let second = store.cleanup(300, 2).unwrap();
         assert_eq!(second.deleted_events, 1);
-        assert!(!second.more_work);
+        assert!(second.more_work);
+        let final_pass = store.cleanup(300, 2).unwrap();
+        assert!(!final_pass.more_work);
         assert!(store.events(RoomId(20), 0, 10).unwrap().events.is_empty());
         assert_eq!(
             store
@@ -2413,6 +2713,23 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn cleanup_drains_multiple_rooms_before_reporting_idle() {
+        let mut store = MlsStore::open(None).unwrap();
+        create(&store, &room(40, Vec::new(), 100));
+        create(&store, &room(41, Vec::new(), 100));
+
+        let first = store.cleanup(100, 10).unwrap();
+        assert_eq!(first.deleted_events, 1);
+        assert!(first.more_work);
+        let second = store.cleanup(100, 10).unwrap();
+        assert_eq!(second.deleted_events, 1);
+        assert!(second.more_work);
+        let final_pass = store.cleanup(100, 10).unwrap();
+        assert_eq!(final_pass.deleted_events, 0);
+        assert!(!final_pass.more_work);
     }
 
     #[test]
