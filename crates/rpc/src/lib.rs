@@ -10,6 +10,7 @@ pub mod ids;
 pub mod media;
 pub mod mls;
 pub mod msgref;
+pub mod qos;
 pub mod recv;
 pub mod video;
 

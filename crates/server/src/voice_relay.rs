@@ -17,6 +17,7 @@ use rpc::{
 use std::{
     io,
     net::SocketAddr,
+    os::fd::AsRawFd,
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -242,6 +243,14 @@ impl VoiceRelayHandle {
         p2p_enabled: bool,
     ) -> io::Result<Self> {
         let udp_local_addr = udp.local_addr()?;
+        if let Err(error) = rpc::qos::apply_voice_qos(udp.as_raw_fd(), udp_local_addr) {
+            kvlog::warn!(
+                "voice udp qos unavailable",
+                addr = %udp_local_addr,
+                dscp = rpc::qos::VOICE_DSCP,
+                error = %error
+            );
+        }
         let poll = Poll::new()?;
         poll.registry()
             .register(&mut udp, UDP, Interest::READABLE)?;

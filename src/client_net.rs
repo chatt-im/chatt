@@ -1,11 +1,15 @@
 use chatt_mls::LocalInstallation;
 use hashbrown::{HashMap, HashSet};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    net::{IpAddr, SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},
+    net::{
+        IpAddr, SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs,
+        UdpSocket as StdUdpSocket,
+    },
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
@@ -328,6 +332,19 @@ fn recv_udp_datagram(
     buf: &mut [u8],
 ) -> io::Result<Option<(usize, SocketAddr)>> {
     recv_datagram_with(buf, |buf| socket.recv_from(buf))
+}
+
+fn bind_voice_udp_socket(addr: SocketAddr) -> io::Result<StdUdpSocket> {
+    let socket = bind_udp_socket(addr, UdpSocketOptions::default())?;
+    if let Err(error) = rpc::qos::apply_voice_qos(socket.as_raw_fd(), addr) {
+        kvlog::warn!(
+            "voice udp qos unavailable",
+            addr = %addr,
+            dscp = rpc::qos::VOICE_DSCP,
+            error = %error
+        );
+    }
+    Ok(socket)
 }
 
 #[cfg(test)]
@@ -1479,14 +1496,11 @@ fn run_worker_inner(
         },
         None => None,
     };
-    let std_udp = match bind_udp_socket(
-        if server_udp_addr.is_ipv4() {
+    let std_udp = match bind_voice_udp_socket(if server_udp_addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
-        },
-        UdpSocketOptions::default(),
-    ) {
+        }) {
         Ok(socket) => socket,
         Err(error) => {
             return SessionEnd::ConnectFailed(format!("failed to bind UDP socket: {error}"));
@@ -8533,7 +8547,7 @@ impl WorkerState {
             });
         let mut last_error = None;
         for _ in 0..8 {
-            match bind_udp_socket(bind_addr, UdpSocketOptions::default()) {
+            match bind_voice_udp_socket(bind_addr) {
                 Ok(socket) => {
                     let local_addr = socket
                         .local_addr()
@@ -10381,6 +10395,36 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn voice_udp_bind_applies_ef_qos() {
+        let socket = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_eq!(
+            socket_int_option(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS) & !0b11,
+            (rpc::qos::VOICE_DSCP as i32) << 2
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            socket_int_option(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PRIORITY),
+            6
+        );
+    }
+
+    fn socket_int_option(fd: libc::c_int, level: libc::c_int, option: libc::c_int) -> i32 {
+        let mut value = 0;
+        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                option,
+                &mut value as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        value
+    }
 
     fn user(id: u64) -> UserId {
         UserId(id)
