@@ -1488,27 +1488,31 @@ fn validate_memory(state: &MemoryState) -> Result<(), String> {
             return Err("persisted MLS room has an invalid retained range".to_string());
         }
         let mut expected = room.oldest_available_sequence;
-        for ((_, sequence), stored) in state
-            .events
-            .range((id.0, room.oldest_available_sequence)..=(id.0, room.head_sequence))
-        {
-            if *sequence != expected || stored.event.sequence() != expected {
-                return Err("persisted MLS delivery sequence is not contiguous".to_string());
-            }
-            match &stored.event {
-                MlsDeliveryEvent::Application { event_id, .. }
-                    if state.event_ids.get(&(id.0, event_id.0)) != Some(&expected) =>
-                {
-                    return Err("persisted MLS application index is inconsistent".to_string());
+        if room.oldest_available_sequence <= room.head_sequence {
+            for ((_, sequence), stored) in state
+                .events
+                .range((id.0, room.oldest_available_sequence)..=(id.0, room.head_sequence))
+            {
+                if *sequence != expected || stored.event.sequence() != expected {
+                    return Err("persisted MLS delivery sequence is not contiguous".to_string());
                 }
-                MlsDeliveryEvent::Commit { parent_epoch, .. }
-                    if state.commit_epochs.get(&(id.0, *parent_epoch)) != Some(&expected) =>
-                {
-                    return Err("persisted MLS commit index is inconsistent".to_string());
+                match &stored.event {
+                    MlsDeliveryEvent::Application { event_id, .. }
+                        if state.event_ids.get(&(id.0, event_id.0)) != Some(&expected) =>
+                    {
+                        return Err(
+                            "persisted MLS application index is inconsistent".to_string()
+                        );
+                    }
+                    MlsDeliveryEvent::Commit { parent_epoch, .. }
+                        if state.commit_epochs.get(&(id.0, *parent_epoch)) != Some(&expected) =>
+                    {
+                        return Err("persisted MLS commit index is inconsistent".to_string());
+                    }
+                    _ => {}
                 }
-                _ => {}
+                expected = expected.saturating_add(1);
             }
-            expected = expected.saturating_add(1);
         }
         if expected != room.head_sequence.saturating_add(1) {
             return Err("persisted MLS delivery head does not match its log".to_string());
@@ -2203,6 +2207,21 @@ mod tests {
         drop(store);
         let reopened = MlsStore::open(Some(temp.path())).unwrap();
         assert_eq!(reopened.events(RoomId(14), 0, 10).unwrap().events.len(), 2);
+    }
+
+    #[test]
+    fn empty_retained_room_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = DeviceId([24; 16]);
+        let mut store = MlsStore::open(Some(temp.path())).unwrap();
+        create(&store, &room(24, vec![device], 100));
+        store.acknowledge(RoomId(24), device, 1, 200).unwrap();
+        let report = store.cleanup(200, 10).unwrap();
+        assert_eq!(report.deleted_events, 1);
+        drop(store);
+
+        let reopened = MlsStore::open(Some(temp.path())).unwrap();
+        assert!(reopened.events(RoomId(24), 0, 10).unwrap().events.is_empty());
     }
 
     #[test]
