@@ -35,23 +35,19 @@ pub mod storage {
 }
 
 use storage::{
-    RedbApplicationStorage, RedbGroupStateStorage, RedbKeyPackageStorage,
-    RedbPreSharedKeyStorage,
+    RedbApplicationStorage, RedbGroupStateStorage, RedbKeyPackageStorage, RedbPreSharedKeyStorage,
 };
 
 const SCHEMA_VERSION: u64 = 1;
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
-pub(crate) const GROUPS: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("mls_groups");
-pub(crate) const EPOCHS: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("mls_epochs");
+pub(crate) const GROUPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_groups");
+pub(crate) const EPOCHS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_epochs");
 pub(crate) const KEY_PACKAGES: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("mls_key_packages");
 pub(crate) const KEY_PACKAGE_EXPIRY: MultimapTableDefinition<u64, &[u8]> =
     MultimapTableDefinition::new("mls_key_package_expiry");
-pub(crate) const PSKS: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("mls_psks");
+pub(crate) const PSKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_psks");
 pub(crate) const APPLICATION_DATA: TableDefinition<&str, &[u8]> =
     TableDefinition::new("application_data");
 pub(crate) const PROVIDER_METADATA: TableDefinition<&str, u64> =

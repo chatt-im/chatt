@@ -105,11 +105,9 @@ pub(crate) enum TerminalEvent {
     PairingFailed(String),
     DevicePairingIdentityExists {
         message: String,
-        transfer_password: String,
     },
     DevicePairingFailed {
         message: String,
-        transfer_password: String,
     },
 }
 

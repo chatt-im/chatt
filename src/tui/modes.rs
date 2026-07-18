@@ -271,7 +271,11 @@ pub(crate) enum BindingResolution {
 }
 
 #[cfg(test)]
-pub(crate) fn resolve_binding(app: &mut TestApp, layer: LayerId, key: KeyEvent) -> BindingResolution {
+pub(crate) fn resolve_binding(
+    app: &mut TestApp,
+    layer: LayerId,
+    key: KeyEvent,
+) -> BindingResolution {
     let mut cx = app.view_cx();
     resolve_binding_cx(&mut cx, layer, key)
 }
@@ -3743,8 +3747,7 @@ mod tests {
         }
 
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
-        let cursor_message =
-            |app: &TestApp| app.view.active.chat.cursor().map(|c| c.message);
+        let cursor_message = |app: &TestApp| app.view.active.chat.cursor().map(|c| c.message);
         assert_eq!(cursor_message(&app), Some(2));
 
         room.process_input(&mut app, key('k'));

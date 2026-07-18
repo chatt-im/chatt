@@ -6,11 +6,11 @@ use mls_rs::{
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs_crypto_awslc::AwsLcCryptoProvider;
 use rpc::{
+    control::FileContentEncoding,
     identity::{
         DeviceCertificateBody, DeviceRosterBody, SignedDeviceRoster, account_id,
         authority_public_key, mls_client_id, sign_device_certificate, sign_device_roster,
     },
-    control::FileContentEncoding,
     ids::{DeviceId, EventId, FileTransferId, RoomId, UserId},
     mls::{
         ChattEventContent, EncryptedRoomDescriptor, MLS_PROTOCOL_VERSION, MlsChattEvent,
@@ -328,8 +328,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         .unwrap();
     drop(alice_client);
 
-    let alice_client =
-        PersistentClient::reopen(&alice_path, identities.clone()).unwrap();
+    let alice_client = PersistentClient::reopen(&alice_path, identities.clone()).unwrap();
     assert_eq!(
         alice_client
             .encrypt_outgoing(&descriptor, event.event_id)
@@ -343,7 +342,10 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         .retry_stale_outgoing(descriptor.room_id, event.event_id, encrypted.0 + 1)
         .unwrap();
     assert!(matches!(
-        alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
+        alice_client
+            .outbox(descriptor.room_id, event.event_id)
+            .unwrap()
+            .state,
         chatt_mls::OutboxState::PendingEncryption
     ));
     let reencrypted = alice_client
@@ -356,14 +358,19 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
         chatt_mls::OutboxState::PendingDelivery { epoch, .. } if epoch == reencrypted.0
     ));
-    assert!(alice_client
-        .mark_outgoing_delivered(descriptor.room_id, event.event_id, 2)
-        .unwrap());
+    assert!(
+        alice_client
+            .mark_outgoing_delivered(descriptor.room_id, event.event_id, 2)
+            .unwrap()
+    );
     alice_client
         .retry_stale_outgoing(descriptor.room_id, event.event_id, encrypted.0 + 1)
         .unwrap();
     assert!(matches!(
-        alice_client.outbox(descriptor.room_id, event.event_id).unwrap().state,
+        alice_client
+            .outbox(descriptor.room_id, event.event_id)
+            .unwrap()
+            .state,
         chatt_mls::OutboxState::Delivered {
             sequence: 2,
             epoch: _,
@@ -372,8 +379,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         }
     ));
     drop(alice_client);
-    let alice_client =
-        PersistentClient::reopen(&alice_path, identities.clone()).unwrap();
+    let alice_client = PersistentClient::reopen(&alice_path, identities.clone()).unwrap();
     assert!(matches!(
         alice_client.pending_ui_dispatches().unwrap().as_slice(),
         [dispatch] if dispatch.sequence == 2 && dispatch.event == event
@@ -395,9 +401,11 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
     let (delayed_epoch, delayed_ciphertext) = alice_client
         .encrypt_outgoing(&descriptor, delayed.event_id)
         .unwrap();
-    assert!(!alice_client
-        .mark_outgoing_delivered(descriptor.room_id, delayed.event_id, 4)
-        .unwrap());
+    assert!(
+        !alice_client
+            .mark_outgoing_delivered(descriptor.room_id, delayed.event_id, 4)
+            .unwrap()
+    );
     assert_eq!(alice_client.cursor(descriptor.room_id).unwrap(), 2);
     assert!(matches!(
         alice_client
@@ -495,10 +503,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         .unwrap();
     let pending = alice_client.pending_outbox().unwrap();
     assert_eq!(
-        pending
-            .iter()
-            .map(|entry| &entry.event)
-            .collect::<Vec<_>>(),
+        pending.iter().map(|entry| &entry.event).collect::<Vec<_>>(),
         vec![&first_same_timestamp, &second_same_timestamp],
     );
 
@@ -522,11 +527,13 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
     drop(alice_client);
 
     let alice_client = PersistentClient::reopen(&alice_path, identities).unwrap();
-    assert!(alice_client
-        .pending_outbox()
-        .unwrap()
-        .iter()
-        .any(|entry| entry.event == file));
+    assert!(
+        alice_client
+            .pending_outbox()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.event == file)
+    );
     assert!(matches!(
         alice_client.pending_file_uploads().unwrap().as_slice(),
         [upload]

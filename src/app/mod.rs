@@ -4,8 +4,8 @@ pub(crate) mod command;
 pub(crate) mod commands;
 pub(crate) mod device_pair;
 pub(crate) mod dialogs;
-pub(crate) mod participants;
 mod pairing;
+pub(crate) mod participants;
 pub(crate) mod room;
 pub(crate) mod room_settings;
 pub(crate) mod server;
@@ -41,8 +41,8 @@ use crate::{
         BaseScreen, DirtySections, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
     },
     client_net::{
-        NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE, PairingEvent, TerminalVerb,
-        TransferDirection, UploadFileRequest,
+        NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE, PairingEvent,
+        TerminalVerb, TransferDirection, UploadFileRequest,
     },
     config::{
         self, Config, NotificationSoundMode, ServerEntry, SoundboardClip, ThemeSelection,
@@ -71,8 +71,8 @@ use audio_supervisor::{
     AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, RebuildCause,
 };
 use commands::slash_command_help;
-use pairing::{PairingCoordinator, PairingInput, PairingJob};
 pub(crate) use pairing::{PairCompletion, PendingPair};
+use pairing::{PairingCoordinator, PairingInput, PairingJob};
 use shared::CoreRw;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
@@ -83,8 +83,8 @@ pub(crate) use room::{
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
     ServerEditDraft, ServerEditEvent, ServerSelectItem, alias_from_tcp_addr, default_join_alias,
-    default_join_username,
-    random_open_pair_recovery_token, random_token, server_entry_from_invite, unique_server_alias,
+    default_join_username, random_open_pair_recovery_token, random_token, server_entry_from_invite,
+    unique_server_alias,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,7 +261,6 @@ impl StatusState {
             false
         }
     }
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1219,7 +1218,10 @@ impl PairingEventSender {
     }
 
     pub(crate) fn send(&self, event: PairingEvent) -> Result<(), mpsc::SendError<AppEvent>> {
-        self.tx.send(AppEvent::Pairing { attempt: self.attempt, event })
+        self.tx.send(AppEvent::Pairing {
+            attempt: self.attempt,
+            event,
+        })
     }
 }
 
@@ -1404,7 +1406,6 @@ impl App {
     pub(crate) fn shared_session(&self) -> Arc<parking_lot::RwLock<RoomSession>> {
         self.room.shared()
     }
-
 
     pub(crate) fn register_client(
         &mut self,
@@ -1667,15 +1668,9 @@ impl App {
             }
             CoreCommand::SubmitDevicePair {
                 pairing_string,
-                transfer_password,
                 device_name,
                 overwrite_existing,
-            } => self.submit_device_pairing(
-                pairing_string,
-                transfer_password,
-                device_name,
-                overwrite_existing,
-            ),
+            } => self.submit_device_pairing(pairing_string, device_name, overwrite_existing),
             CoreCommand::GenerateDeviceLink => {
                 self.send_network_command(NetworkCommand::CreateDeviceLink, true);
             }
@@ -1863,9 +1858,9 @@ impl App {
                     kvlog::debug!("ignored stale network event", generation);
                 }
             }
-            AppEvent::Pairing { attempt, event } => self.apply_pairing_input(
-                PairingInput::Worker { attempt, event },
-            ),
+            AppEvent::Pairing { attempt, event } => {
+                self.apply_pairing_input(PairingInput::Worker { attempt, event })
+            }
             AppEvent::AudioDeviceRefresh(refresh) => self.handle_audio_device_refresh(refresh),
             AppEvent::AudioDeviceProbe(probe) => self.handle_audio_device_probe(probe.result),
             AppEvent::Soundboard(event) => self.handle_soundboard_event(event),
@@ -3158,7 +3153,6 @@ impl App {
     fn submit_device_pairing(
         &mut self,
         pairing_string: String,
-        transfer_password: String,
         device_name: String,
         overwrite_existing: bool,
     ) {
@@ -3172,7 +3166,7 @@ impl App {
                 udp_probe_addr: ticket.udp_probe_addr.clone(),
                 username: "pairing".to_string(),
                 token: String::new(),
-                server_public_key: ticket.server_public_key.clone(),
+                server_public_key: rpc::crypto::encode_hex(&ticket.server_public_key),
                 ..ServerEntry::default()
             };
             let client_config = server.client_config(&self.config, self.download_store.clone());
@@ -3190,7 +3184,6 @@ impl App {
                 job: PairingJob::Device {
                     config: client_config,
                     ticket,
-                    transfer_password,
                     device_name,
                     overwrite_existing,
                 },
@@ -3521,7 +3514,6 @@ impl App {
         self.pairing = pairing.handle(self, input);
     }
 
-
     fn handle_soundboard_event(&mut self, event: SoundboardEvent) {
         match event.result {
             Ok(report) => {
@@ -3774,15 +3766,58 @@ impl App {
             NetworkEvent::Chat(record) => {
                 let room_id = record.message.room_id;
                 let raw_message_id = record.message.message_id.0;
-                let mls_sequence = (raw_message_id & (1 << 63) != 0)
-                    .then_some(raw_message_id & !(1 << 63));
+                let mls_sequence =
+                    (raw_message_id & (1 << 63) != 0).then_some(raw_message_id & !(1 << 63));
                 (|| {
-                let message = &record.message;
-                let viewed = self.room.viewed_room == Some(message.room_id);
-                if message.target.is_some() {
-                    let update = self
-                        .room
-                        .authenticated_mutation_received(&record, self.user_id);
+                    let message = &record.message;
+                    let viewed = self.room.viewed_room == Some(message.room_id);
+                    if message.target.is_some() {
+                        let update = self
+                            .room
+                            .authenticated_mutation_received(&record, self.user_id);
+                        let Some(update) = update else {
+                            return;
+                        };
+                        if let Some(regression) = update.message_id_regression {
+                            self.report_message_id_regression(regression);
+                            return;
+                        }
+                        if update.read_advanced {
+                            self.mark_room_catalog_dirty();
+                        }
+                        if matches!(&update.outcome, MutationOutcome::AppliedDelete) {
+                            let target = message.target.expect("mutation record");
+                            self.pending_web_deletes.remove(&(message.room_id, target));
+                        }
+                        let target = message.target.expect("mutation record");
+                        let delete = message.flags.deleted();
+                        self.pop_mutation_owner(message.room_id, target, delete);
+                        if viewed && let Some(feed) = &self.web_feed {
+                            match update.outcome {
+                                MutationOutcome::AppliedEdit(folded) => {
+                                    let client_view = self.web_client_view();
+                                    feed.send(crate::web_server::WebMessage::from_chat(
+                                        &folded,
+                                        &|target| client_view.web_ref_for(&self.room, target),
+                                        self.user_id,
+                                        self.room.message_unverified(
+                                            folded.room_id,
+                                            folded.message_id,
+                                            self.user_id,
+                                        ),
+                                    ));
+                                }
+                                MutationOutcome::AppliedDelete => {
+                                    let target = message.target.expect("mutation record");
+                                    feed.send_delete(target.0);
+                                }
+                                MutationOutcome::Ignored | MutationOutcome::Pending => {}
+                            }
+                        }
+                        return;
+                    }
+                    let feed_message = (viewed && self.web_feed.is_some()).then(|| message.clone());
+                    let update = RoomSession::chat_received(&mut self.room, record, self.user_id);
                     let Some(update) = update else {
                         return;
                     };
@@ -3790,73 +3825,30 @@ impl App {
                         self.report_message_id_regression(regression);
                         return;
                     }
+                    if !update.fresh {
+                        return;
+                    }
                     if update.read_advanced {
                         self.mark_room_catalog_dirty();
                     }
-                    if matches!(&update.outcome, MutationOutcome::AppliedDelete) {
-                        let target = message.target.expect("mutation record");
-                        self.pending_web_deletes.remove(&(message.room_id, target));
-                    }
-                    let target = message.target.expect("mutation record");
-                    let delete = message.flags.deleted();
-                    self.pop_mutation_owner(message.room_id, target, delete);
-                    if viewed && let Some(feed) = &self.web_feed {
-                        match update.outcome {
-                            MutationOutcome::AppliedEdit(folded) => {
-                                let client_view = self.web_client_view();
-                                feed.send(crate::web_server::WebMessage::from_chat(
-                                    &folded,
-                                    &|target| client_view.web_ref_for(&self.room, target),
-                                    self.user_id,
-                                    self.room.message_unverified(
-                                        folded.room_id,
-                                        folded.message_id,
-                                        self.user_id,
-                                    ),
-                                ));
-                            }
-                            MutationOutcome::AppliedDelete => {
-                                let target = message.target.expect("mutation record");
-                                feed.send_delete(target.0);
-                            }
-                            MutationOutcome::Ignored | MutationOutcome::Pending => {}
-                        }
-                    }
-                    return;
-                }
-                let feed_message = (viewed && self.web_feed.is_some()).then(|| message.clone());
-                let update = RoomSession::chat_received(&mut self.room, record, self.user_id);
-                let Some(update) = update else {
-                    return;
-                };
-                if let Some(regression) = update.message_id_regression {
-                    self.report_message_id_regression(regression);
-                    return;
-                }
-                if !update.fresh {
-                    return;
-                }
-                if update.read_advanced {
-                    self.mark_room_catalog_dirty();
-                }
-                if let Some(message) = feed_message
-                    && let Some(feed) = &self.web_feed
-                {
-                    let client_view = self.web_client_view();
-                    feed.send(crate::web_server::WebMessage::from_chat(
-                        &message,
-                        &|target| client_view.web_ref_for(&self.room, target),
-                        self.user_id,
-                        self.room.message_unverified(
-                            message.room_id,
-                            message.message_id,
+                    if let Some(message) = feed_message
+                        && let Some(feed) = &self.web_feed
+                    {
+                        let client_view = self.web_client_view();
+                        feed.send(crate::web_server::WebMessage::from_chat(
+                            &message,
+                            &|target| client_view.web_ref_for(&self.room, target),
                             self.user_id,
-                        ),
-                    ));
-                }
-                if !update.local {
-                    self.play_notification(NotificationSound::MessageReceived);
-                }
+                            self.room.message_unverified(
+                                message.room_id,
+                                message.message_id,
+                                self.user_id,
+                            ),
+                        ));
+                    }
+                    if !update.local {
+                        self.play_notification(NotificationSound::MessageReceived);
+                    }
                 })();
                 if let Some(sequence) = mls_sequence {
                     self.send_network_command(
@@ -4316,8 +4308,7 @@ impl App {
                     self.disconnect_network();
                     self.navigate_all(BaseScreen::Servers { query: None });
                     if let Some(attempt) = attempt {
-                        let previous =
-                            std::mem::replace(&mut self.command_client, attempt.owner);
+                        let previous = std::mem::replace(&mut self.command_client, attempt.owner);
                         self.replace_with_server_edit_focused(&attempt.server_label, "Username");
                         self.set_error("username already in use; choose another");
                         self.command_client = previous;
@@ -4358,14 +4349,12 @@ impl App {
             NetworkEvent::DeviceLinkCreated {
                 redemption_secret_hash,
                 pairing_string,
-                transfer_password,
                 expires_at_ms,
             } => {
                 self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::DeviceLink(
                     device_pair::DeviceLinkDialog::new(
                         redemption_secret_hash,
                         pairing_string,
-                        transfer_password,
                         expires_at_ms,
                         self.config.ui.default_bindings,
                     ),
@@ -8101,7 +8090,6 @@ impl App {
             });
         }
     }
-
 }
 
 fn handle_audio_picker_key(
@@ -8276,8 +8264,8 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::testing::TestApp;
+    use super::*;
     use crate::{bindings::BindCommand, tui::Action};
     use crate::{
         settings::SettingsDraft,

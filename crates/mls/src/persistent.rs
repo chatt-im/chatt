@@ -11,11 +11,7 @@
 //! security boundary. MLS storage still needs authenticated encryption backed
 //! by an externally protected key; that is intentionally deferred.
 
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::Mutex,
-};
+use std::{collections::HashMap, path::Path, sync::Mutex};
 
 use aws_lc_rs::digest;
 use jsony::Jsony;
@@ -122,7 +118,10 @@ pub struct OutboxEntry {
 #[jsony(Binary)]
 pub enum OutboxState {
     PendingEncryption,
-    PendingDelivery { epoch: u64, ciphertext: Vec<u8> },
+    PendingDelivery {
+        epoch: u64,
+        ciphertext: Vec<u8>,
+    },
     Delivered {
         sequence: u64,
         epoch: u64,
@@ -141,12 +140,20 @@ pub enum ProcessedDelivery {
         sequence: u64,
         event: Option<MlsChattEvent>,
     },
-    Commit { sequence: u64, epoch: u64 },
+    Commit {
+        sequence: u64,
+        epoch: u64,
+    },
     /// The MLS application was authentic and advanced the secret tree, but
     /// its Chatt payload was malformed or did not match the public envelope.
     /// Such a message must not pin the ordered delivery cursor forever.
-    RejectedApplication { sequence: u64, reason: String },
-    AlreadyProcessed { sequence: u64 },
+    RejectedApplication {
+        sequence: u64,
+        reason: String,
+    },
+    AlreadyProcessed {
+        sequence: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -238,10 +245,7 @@ impl PersistentClient {
         )
     }
 
-    pub fn reopen(
-        path: &Path,
-        identities: ChattIdentityProvider,
-    ) -> Result<Self, String> {
+    pub fn reopen(path: &Path, identities: ChattIdentityProvider) -> Result<Self, String> {
         let storage = open_storage(path)?;
         let application = storage.application_data_storage();
         let bytes = application
@@ -583,10 +587,7 @@ impl PersistentClient {
             return Err("external rejoin produced an unexpected MLS group state".to_string());
         }
         let resulting_group_info = group
-            .group_info_message_allowing_ext_commit_with_extensions(
-                true,
-                ExtensionList::new(),
-            )
+            .group_info_message_allowing_ext_commit_with_extensions(true, ExtensionList::new())
             .map_err(|error| error.to_string())?
             .to_bytes()
             .map_err(|error| error.to_string())?;
@@ -713,7 +714,10 @@ impl PersistentClient {
                     queued_order,
                 }),
             ),
-            Item::new(outbox_order_key().to_string(), jsony::to_binary(&queued_order)),
+            Item::new(
+                outbox_order_key().to_string(),
+                jsony::to_binary(&queued_order),
+            ),
         ];
         if let Some(upload) = upload {
             items.push(Item::new(
@@ -802,7 +806,9 @@ impl PersistentClient {
             return Err("queued MLS UI dispatch is ahead of the delivery cursor".to_string());
         }
         if !dispatch_already_queued && cursor >= sequence {
-            return Err("MLS outbox event lacks a UI dispatch behind the delivery cursor".to_string());
+            return Err(
+                "MLS outbox event lacks a UI dispatch behind the delivery cursor".to_string(),
+            );
         }
         let emit_now = at_ordered_head && !dispatch_already_queued;
         debug_assert!(!emit_now || cursor.checked_add(1) == Some(sequence));
@@ -918,9 +924,7 @@ impl PersistentClient {
         if let MlsDeliveryEvent::Application { epoch, .. } = delivery
             && *epoch != group.context().epoch()
         {
-            return Err(
-                "ordered MLS application does not belong to the current epoch".to_string(),
-            );
+            return Err("ordered MLS application does not belong to the current epoch".to_string());
         }
         if let MlsDeliveryEvent::Application {
             epoch,
@@ -957,11 +961,8 @@ impl PersistentClient {
                 OutboxState::PendingEncryption => (false, false),
             };
             if is_own_delivery {
-                let dispatch_queued = self.mark_outgoing_delivered(
-                    descriptor.room_id,
-                    *event_id,
-                    sequence,
-                )?;
+                let dispatch_queued =
+                    self.mark_outgoing_delivered(descriptor.room_id, *event_id, sequence)?;
                 return Ok(ProcessedDelivery::Outgoing {
                     sequence,
                     event: (should_emit && dispatch_queued).then_some(entry.event),
@@ -1100,11 +1101,7 @@ impl PersistentClient {
                     .map_err(|error| error.to_string())?;
                 after_group_write()?;
                 if let Ok(cached) = &opened {
-                    self.set_cursor_with_dispatch(
-                        descriptor.room_id,
-                        sequence,
-                        &cached.event,
-                    )?;
+                    self.set_cursor_with_dispatch(descriptor.room_id, sequence, &cached.event)?;
                 } else {
                     self.set_cursor(descriptor.room_id, sequence)?;
                 }
@@ -1239,9 +1236,11 @@ impl PersistentClient {
             .collect::<Result<Vec<OutboxEntry>, String>>()?;
         entries.retain(|entry| !matches!(entry.state, OutboxState::Delivered { .. }));
         entries.sort_by_key(|entry| entry.queued_order);
-        debug_assert!(entries.windows(2).all(|entries| {
-            entries[0].queued_order < entries[1].queued_order
-        }));
+        debug_assert!(
+            entries
+                .windows(2)
+                .all(|entries| { entries[0].queued_order < entries[1].queued_order })
+        );
         Ok(entries)
     }
 
@@ -1260,11 +1259,7 @@ impl PersistentClient {
         Ok(pending)
     }
 
-    pub fn acknowledge_ui_dispatch(
-        &self,
-        room_id: RoomId,
-        sequence: u64,
-    ) -> Result<(), String> {
+    pub fn acknowledge_ui_dispatch(&self, room_id: RoomId, sequence: u64) -> Result<(), String> {
         self.application
             .delete(&ui_dispatch_key(room_id, sequence))
             .map(|_| ())
@@ -1411,10 +1406,7 @@ impl PersistentClient {
         )))
     }
 
-    pub fn has_pending_commit(
-        &self,
-        descriptor: &EncryptedRoomDescriptor,
-    ) -> Result<bool, String> {
+    pub fn has_pending_commit(&self, descriptor: &EncryptedRoomDescriptor) -> Result<bool, String> {
         self.load_group(descriptor)
             .map(|group| group.has_pending_commit())
     }
@@ -1451,9 +1443,7 @@ impl PersistentClient {
                 "MLS delivery cursor cannot regress from {current} to {sequence}"
             ));
         }
-        if sequence > current
-            && current.checked_add(1) != Some(sequence)
-        {
+        if sequence > current && current.checked_add(1) != Some(sequence) {
             return Err(format!(
                 "MLS delivery cursor cannot skip from {current} to {sequence}"
             ));
@@ -1578,10 +1568,7 @@ impl PersistentClient {
                     descriptor_key(descriptor.room_id),
                     jsony::to_binary(descriptor),
                 ),
-                Item::new(
-                    cursor_key(descriptor.room_id),
-                    jsony::to_binary(&sequence),
-                ),
+                Item::new(cursor_key(descriptor.room_id), jsony::to_binary(&sequence)),
             ])
             .map_err(|error| error.to_string())?;
         debug_assert_eq!(self.cursor(descriptor.room_id).ok(), Some(sequence));
@@ -1739,10 +1726,7 @@ mod tests {
             .remove(0);
         let bundle = alice
             .client
-            .create_room(
-                &descriptor,
-                &[(bob.bootstrap.device_id, package.package)],
-            )
+            .create_room(&descriptor, &[(bob.bootstrap.device_id, package.package)])
             .unwrap();
         alice.client.accept_pending_commit(&descriptor, 1).unwrap();
         let shared = bundle.welcome.as_ref().unwrap();
@@ -1794,11 +1778,10 @@ mod tests {
         assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 1);
 
         assert_eq!(
-            bob.client.process_delivery_with_hook(
-                &descriptor,
-                &delivery,
-                || Err("injected receiver crash".to_string()),
-            ),
+            bob.client
+                .process_delivery_with_hook(&descriptor, &delivery, || Err(
+                    "injected receiver crash".to_string()
+                ),),
             Err("injected receiver crash".to_string()),
         );
         assert_eq!(bob.client.cursor(descriptor.room_id).unwrap(), 1);
@@ -1961,10 +1944,7 @@ mod tests {
             .remove(0);
         let initial = alice
             .client
-            .create_room(
-                &descriptor,
-                &[(bob.bootstrap.device_id, package.package)],
-            )
+            .create_room(&descriptor, &[(bob.bootstrap.device_id, package.package)])
             .unwrap();
         alice.client.accept_pending_commit(&descriptor, 1).unwrap();
         let shared = initial.welcome.as_ref().unwrap();
@@ -2001,7 +1981,10 @@ mod tests {
         );
         assert_eq!(alice.client.cursor(descriptor.room_id).unwrap(), 1);
         assert!(matches!(
-            alice.client.process_delivery(&descriptor, &delivery).unwrap(),
+            alice
+                .client
+                .process_delivery(&descriptor, &delivery)
+                .unwrap(),
             ProcessedDelivery::Commit {
                 sequence: 2,
                 epoch: 2

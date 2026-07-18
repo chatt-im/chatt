@@ -554,6 +554,32 @@ pub(crate) fn expand_key(prk: &hkdf::Prk, label: &'static [u8]) -> [u8; KEY_LEN]
     out
 }
 
+/// Keys derived from the random root capability embedded in a device-link
+/// ticket. Only the derived redemption secret is disclosed to the server; the
+/// root capability and enrollment key remain client-side.
+pub struct DeviceLinkKeys {
+    pub redemption_secret: [u8; KEY_LEN],
+    pub enrollment_key: [u8; KEY_LEN],
+}
+
+/// Domain-separates the server redemption capability from the key protecting
+/// the server-retained enrollment bundle. This deliberately reuses the same
+/// HKDF-SHA256 extract/expand path as the live transport handshake above.
+pub fn derive_device_link_keys(
+    pairing_secret: &[u8],
+    server_public_key: &[u8],
+) -> Result<DeviceLinkKeys, CryptoError> {
+    if pairing_secret.len() != KEY_LEN || server_public_key.len() != ED25519_PUBLIC_KEY_LEN {
+        return Err(CryptoError::InvalidKey);
+    }
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, server_public_key);
+    let prk = salt.extract(pairing_secret);
+    Ok(DeviceLinkKeys {
+        redemption_secret: expand_key(&prk, b"chatt device-link redemption v3"),
+        enrollment_key: expand_key(&prk, b"chatt device-link enrollment key v3"),
+    })
+}
+
 /// Which side of a dedicated video connection is deriving keys.
 ///
 /// The chatt client (whether it publishes a capture or views one) sends on the
@@ -1185,6 +1211,20 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, other);
         assert_ne!(first.0 & (1 << 63), 0);
+    }
+
+    #[test]
+    fn device_link_keys_are_domain_separated_and_server_bound() {
+        let root = [0x42; KEY_LEN];
+        let first = derive_device_link_keys(&root, &[0x11; ED25519_PUBLIC_KEY_LEN]).unwrap();
+        let repeated = derive_device_link_keys(&root, &[0x11; ED25519_PUBLIC_KEY_LEN]).unwrap();
+        let other_server = derive_device_link_keys(&root, &[0x12; ED25519_PUBLIC_KEY_LEN]).unwrap();
+
+        assert_ne!(first.redemption_secret, first.enrollment_key);
+        assert_eq!(first.redemption_secret, repeated.redemption_secret);
+        assert_eq!(first.enrollment_key, repeated.enrollment_key);
+        assert_ne!(first.redemption_secret, other_server.redemption_secret);
+        assert_ne!(first.enrollment_key, other_server.enrollment_key);
     }
 
     #[test]

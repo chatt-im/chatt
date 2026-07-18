@@ -129,7 +129,6 @@ pub(crate) enum CoreCommand {
     SubmitPairPassword(String),
     SubmitDevicePair {
         pairing_string: String,
-        transfer_password: String,
         device_name: String,
         overwrite_existing: bool,
     },

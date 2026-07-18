@@ -123,7 +123,7 @@ pub enum ClientControl {
         redemption_secret_hash: Vec<u8>,
     },
     /// Fetches an opaque enrollment bundle before authentication. Fetching is
-    /// non-consuming so a mistyped transfer password can be retried.
+    /// non-consuming so an interrupted activation can be retried.
     FetchDeviceLink {
         redemption_secret: String,
     },
@@ -747,7 +747,8 @@ pub fn max_file_wire_bytes(encoding: FileContentEncoding, original_size: u64) ->
             let stream = max_file_wire_bytes(FileContentEncoding::Zstd, original_size);
             // Padmé expands the sealed stream by at most 1/8th.
             let stream = stream.saturating_add(stream / 8);
-            let chunks = stream / (MAX_FILE_CHUNK_BYTES - crate::mls::FILE_CHUNK_OVERHEAD) as u64 + 2;
+            let chunks =
+                stream / (MAX_FILE_CHUNK_BYTES - crate::mls::FILE_CHUNK_OVERHEAD) as u64 + 2;
             stream.saturating_add(chunks.saturating_mul(crate::mls::FILE_CHUNK_OVERHEAD as u64))
         }
     }
@@ -830,11 +831,14 @@ pub struct InviteTicket {
 #[jsony(Binary, version)]
 pub struct DeviceLinkTicket {
     pub version: u16,
-    pub redemption_secret: String,
+    /// Root capability used client-side to derive both the server redemption
+    /// token and the enrollment-bundle key. The root itself is never sent to
+    /// the server.
+    pub pairing_secret: [u8; crate::crypto::KEY_LEN],
     pub tcp_addr: String,
     pub udp_addr: String,
     pub udp_probe_addr: Option<String>,
-    pub server_public_key: String,
+    pub server_public_key: [u8; crate::crypto::ED25519_PUBLIC_KEY_LEN],
 }
 
 pub fn encode_client_hello(value: &ClientHello) -> Vec<u8> {
@@ -899,10 +903,10 @@ pub fn decode_invite_ticket(value: &str) -> Result<InviteTicket, String> {
 pub fn encode_device_link_ticket(value: &DeviceLinkTicket) -> Result<String, String> {
     validate_device_link_ticket(value)?;
     let payload = jsony::to_binary(value);
-    let mut out =
-        String::with_capacity(DEVICE_LINK_STRING_PREFIX.len() + encoded_base64_len(payload.len()));
+    let encoded = crate::base32::encode(&payload);
+    let mut out = String::with_capacity(DEVICE_LINK_STRING_PREFIX.len() + encoded.len());
     out.push_str(DEVICE_LINK_STRING_PREFIX);
-    encode_base64url_no_pad(&payload, &mut out);
+    out.push_str(&encoded);
     Ok(out)
 }
 
@@ -914,7 +918,8 @@ pub fn decode_device_link_ticket(value: &str) -> Result<DeviceLinkTicket, String
     let payload = value
         .strip_prefix(DEVICE_LINK_STRING_PREFIX)
         .ok_or_else(|| "device pairing string has an unknown prefix".to_string())?;
-    let bytes = decode_base64url_no_pad(payload)?;
+    let bytes = crate::base32::decode(payload)
+        .ok_or_else(|| "device pairing string is not valid base32".to_string())?;
     let ticket: DeviceLinkTicket = bounded_decode(&bytes)?;
     validate_device_link_ticket(&ticket)?;
     Ok(ticket)
@@ -1199,21 +1204,6 @@ fn validate_invite_ticket(value: &InviteTicket) -> Result<(), String> {
 fn validate_device_link_ticket(value: &DeviceLinkTicket) -> Result<(), String> {
     if value.version != crate::PROTOCOL_VERSION {
         return Err(format!("unsupported device-link version {}", value.version));
-    }
-    validate_auth_field("device-link redemption secret", &value.redemption_secret)?;
-    if value.redemption_secret.len() < MIN_PAIRING_SECRET_BYTES {
-        return Err("device-link redemption secret is too short".to_string());
-    }
-    let secret = crate::crypto::decode_hex(&value.redemption_secret)
-        .map_err(|_| "device-link redemption secret is not valid hex".to_string())?;
-    if secret.len() != crate::crypto::KEY_LEN {
-        return Err("device-link redemption secret has the wrong length".to_string());
-    }
-    validate_auth_field("server public key", &value.server_public_key)?;
-    let key = crate::crypto::decode_hex(&value.server_public_key)
-        .map_err(|_| "device-link server key is not valid hex".to_string())?;
-    if key.len() != crate::crypto::ED25519_PUBLIC_KEY_LEN {
-        return Err("device-link server key has the wrong length".to_string());
     }
     validate_endpoint("device-link TCP address", &value.tcp_addr)?;
     validate_endpoint("device-link UDP address", &value.udp_addr)?;
@@ -1685,6 +1675,33 @@ mod tests {
 
         assert!(encoded.starts_with(JOIN_STRING_PREFIX));
         assert_eq!(decode_invite_ticket(&encoded).unwrap(), ticket);
+    }
+
+    #[test]
+    fn device_link_ticket_round_trips_compact_base32_string() {
+        let ticket = DeviceLinkTicket {
+            version: crate::PROTOCOL_VERSION,
+            pairing_secret: [0x5a; crate::crypto::KEY_LEN],
+            tcp_addr: "127.0.0.1:41000".to_string(),
+            udp_addr: "127.0.0.1:41000".to_string(),
+            udp_probe_addr: Some("127.0.0.1:41002".to_string()),
+            server_public_key: crate::crypto::dev_server_public_key(),
+        };
+
+        let encoded = encode_device_link_ticket(&ticket).unwrap();
+        let payload = encoded.strip_prefix(DEVICE_LINK_STRING_PREFIX).unwrap();
+
+        assert!(
+            payload
+                .bytes()
+                .all(|byte| crate::base32::decode_value(byte).is_some())
+        );
+        assert!(
+            encoded.len() < 256,
+            "device pairing string grew to {} bytes",
+            encoded.len()
+        );
+        assert_eq!(decode_device_link_ticket(&encoded).unwrap(), ticket);
     }
 
     #[test]

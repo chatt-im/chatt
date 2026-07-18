@@ -85,10 +85,7 @@ impl RedbGroupStateStorage {
         }
     }
 
-    fn get_snapshot_data(
-        &self,
-        group_id: &[u8],
-    ) -> Result<Option<Vec<u8>>, RedbDataStorageError> {
+    fn get_snapshot_data(&self, group_id: &[u8]) -> Result<Option<Vec<u8>>, RedbDataStorageError> {
         let transaction = self.database.begin_read().map_err(database_error)?;
         let table = transaction.open_table(GROUPS).map_err(database_error)?;
         Ok(table
@@ -149,7 +146,11 @@ impl RedbGroupStateStorage {
 
             for epoch in inserts {
                 let key = epoch_key(group_id, epoch.id)?;
-                if epochs.get(key.as_slice()).map_err(database_error)?.is_some() {
+                if epochs
+                    .get(key.as_slice())
+                    .map_err(database_error)?
+                    .is_some()
+                {
                     return Err(RedbDataStorageError::DuplicateEpoch(epoch.id));
                 }
                 epochs
@@ -159,7 +160,11 @@ impl RedbGroupStateStorage {
 
             for epoch in updates {
                 let key = epoch_key(group_id, epoch.id)?;
-                if epochs.get(key.as_slice()).map_err(database_error)?.is_none() {
+                if epochs
+                    .get(key.as_slice())
+                    .map_err(database_error)?
+                    .is_none()
+                {
                     return Err(RedbDataStorageError::MissingEpoch(epoch.id));
                 }
                 epochs

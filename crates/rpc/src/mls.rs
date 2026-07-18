@@ -6,8 +6,8 @@
 use crate::crypto::{
     CryptoError, KEY_LEN, KeyMaterial, TAG_LEN, open_in_place_with_aad, seal_in_place_append_tag,
 };
-use jsony::Jsony;
 use aws_lc_rs::digest;
+use jsony::Jsony;
 
 use crate::ids::{AccountId, DeviceId, EventId, FileTransferId, MessageId, RoomId};
 
@@ -319,9 +319,7 @@ pub fn validate_commit_bundle(bundle: &MlsCommitBundle) -> Result<(), String> {
     }
     validate_mls_bytes(&bundle.commit, "commit")?;
     if let Some(welcome) = &bundle.welcome {
-        if welcome.device_ids.is_empty()
-            || welcome.device_ids.len() > MAX_MLS_WELCOMES_PER_COMMIT
-        {
+        if welcome.device_ids.is_empty() || welcome.device_ids.len() > MAX_MLS_WELCOMES_PER_COMMIT {
             return Err("MLS commit contains an invalid Welcome target count".to_string());
         }
         let mut targets = welcome.device_ids.clone();

@@ -335,13 +335,7 @@ pub fn seal_media_into(
     packet: &mut Vec<u8>,
     scratch: &mut Vec<u8>,
 ) -> Result<(), MediaError> {
-    seal_media_ref_into(
-        protection,
-        counter,
-        &payload.borrowed(),
-        packet,
-        scratch,
-    )
+    seal_media_ref_into(protection, counter, &payload.borrowed(), packet, scratch)
 }
 
 /// Borrowed-payload counterpart to [`seal_media_into`]. This is used by
@@ -476,8 +470,7 @@ pub fn open_media_in_place<'a>(
             aad[0] = crypto::CHANNEL_MEDIA;
             aad[1..].copy_from_slice(&bytes[2..UDP_HEADER_LEN]);
             let body = &mut bytes[UDP_HEADER_LEN..];
-            let plaintext_len =
-                crypto::open_in_place_with_aad(recv, header.counter, &aad, body)?;
+            let plaintext_len = crypto::open_in_place_with_aad(recv, header.counter, &aad, body)?;
             let payload = decode_payload_ref(header.kind, &body[..plaintext_len])?;
             if !replay.update(header.counter) {
                 return Err(MediaError::Replay);
@@ -1025,7 +1018,10 @@ fn encode_voice_feedback(feedback: VoiceFeedback, out: &mut Vec<u8>) {
     out.extend_from_slice(&feedback.max_interarrival_jitter_ms.to_le_bytes());
 }
 
-fn encode_voice_payload(payload: &VoicePayloadRef<'_>, out: &mut Vec<u8>) -> Result<(), MediaError> {
+fn encode_voice_payload(
+    payload: &VoicePayloadRef<'_>,
+    out: &mut Vec<u8>,
+) -> Result<(), MediaError> {
     match payload {
         VoicePayloadRef::Opus(opus) => {
             if opus.is_empty() || opus.len() > MAX_VOICE_PAYLOAD_BYTES {

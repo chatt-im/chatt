@@ -137,7 +137,11 @@ impl E2eState {
         if current != *expected {
             return None;
         }
-        let mut pin = self.pins.iter().find(|pin| pin.user_id == expected.user_id.0)?.clone();
+        let mut pin = self
+            .pins
+            .iter()
+            .find(|pin| pin.user_id == expected.user_id.0)?
+            .clone();
         pin.trust_level = E2eTrustLevel::Verified;
         pin.change_from = None;
         Some(pin)
@@ -148,7 +152,11 @@ impl E2eState {
         if current != *expected || current.trust_level != E2eTrustLevel::Verified {
             return None;
         }
-        let mut pin = self.pins.iter().find(|pin| pin.user_id == expected.user_id.0)?.clone();
+        let mut pin = self
+            .pins
+            .iter()
+            .find(|pin| pin.user_id == expected.user_id.0)?
+            .clone();
         pin.trust_level = E2eTrustLevel::Accepted;
         pin.change_from = None;
         Some(pin)
@@ -158,7 +166,10 @@ impl E2eState {
         if !persisted {
             return true;
         }
-        let Some(current) = self.pins.iter_mut().find(|current| current.user_id == pin.user_id)
+        let Some(current) = self
+            .pins
+            .iter_mut()
+            .find(|current| current.user_id == pin.user_id)
         else {
             self.pins.push(pin.clone());
             return true;

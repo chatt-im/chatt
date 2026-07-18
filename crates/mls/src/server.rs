@@ -2,14 +2,12 @@ use std::fmt;
 
 use jsony::Jsony;
 use mls_rs::{
-    CryptoProvider,
-    MlsMessage,
+    CryptoProvider, MlsMessage, WireFormat,
     external_client::{
         ExternalClient, ExternalReceivedMessage, ExternalSnapshot,
         builder::{ExternalBaseConfig, WithCryptoProvider, WithIdentityProvider, WithMlsRules},
     },
     group::{CommitEffect, ContentType, proposal::Proposal},
-    WireFormat,
 };
 use mls_rs_crypto_awslc::AwsLcCryptoProvider;
 use rpc::mls::MlsCommitBundle;
@@ -259,10 +257,7 @@ impl PublicGroupValidator {
         Ok(())
     }
 
-    pub fn key_package_reference(
-        &self,
-        encoded: &[u8],
-    ) -> Result<Vec<u8>, PublicValidationError> {
+    pub fn key_package_reference(&self, encoded: &[u8]) -> Result<Vec<u8>, PublicValidationError> {
         self.validate_key_package(encoded)
             .map(|(reference, _)| reference)
     }
@@ -289,11 +284,12 @@ impl PublicGroupValidator {
     }
 }
 
-fn added_key_package_refs(
-    effect: &CommitEffect,
-) -> Result<Vec<Vec<u8>>, PublicValidationError> {
+fn added_key_package_refs(effect: &CommitEffect) -> Result<Vec<Vec<u8>>, PublicValidationError> {
     let epoch = match effect {
-        CommitEffect::NewEpoch(epoch) | CommitEffect::Removed { new_epoch: epoch, .. } => epoch,
+        CommitEffect::NewEpoch(epoch)
+        | CommitEffect::Removed {
+            new_epoch: epoch, ..
+        } => epoch,
         CommitEffect::ReInit(_) => return Ok(Vec::new()),
     };
     epoch

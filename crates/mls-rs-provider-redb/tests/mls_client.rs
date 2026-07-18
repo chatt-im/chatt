@@ -1,6 +1,9 @@
 use mls_rs::{
     client_builder::MlsConfig,
-    identity::{basic::{BasicCredential, BasicIdentityProvider}, SigningIdentity},
+    identity::{
+        basic::{BasicCredential, BasicIdentityProvider},
+        SigningIdentity,
+    },
     CipherSuite, CipherSuiteProvider, Client, CryptoProvider,
 };
 use mls_rs_core::crypto::SignatureSecretKey;

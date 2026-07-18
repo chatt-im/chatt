@@ -1,5 +1,5 @@
-use extui::{Buffer, Rect, event::KeyEvent, event::MouseEvent};
 use aws_lc_rs::rand::SecureRandom;
+use extui::{Buffer, Rect, event::KeyEvent, event::MouseEvent};
 use rpc::{
     control::InviteTicket,
     crypto::{OPEN_PAIR_RECOVERY_PREFIX, encode_hex},

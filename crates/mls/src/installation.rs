@@ -77,12 +77,9 @@ impl LocalInstallation {
             .install_roster(&bootstrap.own_roster)
             .map_err(|error| error.to_string())?;
         let client = match signing {
-            Some((identity, secret)) => PersistentClient::open(
-                &database_path,
-                identities.clone(),
-                identity,
-                secret,
-            )?,
+            Some((identity, secret)) => {
+                PersistentClient::open(&database_path, identities.clone(), identity, secret)?
+            }
             None => PersistentClient::reopen(&database_path, identities.clone())?,
         };
         Ok((

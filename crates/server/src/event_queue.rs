@@ -54,11 +54,7 @@ pub(super) struct EventQueue<T> {
 }
 
 impl<T> EventQueue<T> {
-    pub(super) fn new(
-        notifier: Arc<EventNotifier>,
-        flag: u64,
-        producer: &'static str,
-    ) -> Self {
+    pub(super) fn new(notifier: Arc<EventNotifier>, flag: u64, producer: &'static str) -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
             notifier,

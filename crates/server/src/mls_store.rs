@@ -102,9 +102,13 @@ pub(super) enum AppendApplicationResult {
         room: RoomRecord,
         event: MlsDeliveryEvent,
     },
-    AlreadyStored { sequence: u64 },
+    AlreadyStored {
+        sequence: u64,
+    },
     Conflict,
-    StaleEpoch { current_epoch: u64 },
+    StaleEpoch {
+        current_epoch: u64,
+    },
     RevocationPending,
     RejoinRequired,
 }
@@ -422,7 +426,9 @@ fn snapshot_and_retire(
 
 impl std::fmt::Debug for MlsStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MlsStore").field("path", &self.path).finish()
+        f.debug_struct("MlsStore")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
@@ -430,9 +436,8 @@ impl MlsStore {
     pub fn open(data_dir: Option<&Path>) -> Result<Self, String> {
         let paths = data_dir
             .map(|data_dir| {
-                fs::create_dir_all(data_dir).map_err(|error| {
-                    format!("failed to create {}: {error}", data_dir.display())
-                })?;
+                fs::create_dir_all(data_dir)
+                    .map_err(|error| format!("failed to create {}: {error}", data_dir.display()))?;
                 Ok::<_, String>((
                     data_dir.join("mls-state.bin"),
                     data_dir.join("mls-state.wal"),
@@ -908,7 +913,11 @@ impl MlsStore {
             .map_or(0, |(_, delivery_id)| *delivery_id))
     }
 
-    pub fn acknowledge_welcome(&self, device_id: DeviceId, delivery_id: u64) -> Result<bool, String> {
+    pub fn acknowledge_welcome(
+        &self,
+        device_id: DeviceId,
+        delivery_id: u64,
+    ) -> Result<bool, String> {
         let current = self
             .state
             .read()
@@ -954,7 +963,11 @@ impl MlsStore {
         )
     }
 
-    pub fn cleanup(&mut self, now_unix_ms: u64, batch_limit: usize) -> Result<CleanupReport, String> {
+    pub fn cleanup(
+        &mut self,
+        now_unix_ms: u64,
+        batch_limit: usize,
+    ) -> Result<CleanupReport, String> {
         if batch_limit == 0 {
             return Ok(CleanupReport::default());
         }
@@ -974,8 +987,7 @@ impl MlsStore {
             }
             match selected {
                 Some((mut report, mut delta)) => {
-                    let (more, welcomes) =
-                        plan_cleanup_welcomes(&state, now_unix_ms, batch_limit)?;
+                    let (more, welcomes) = plan_cleanup_welcomes(&state, now_unix_ms, batch_limit)?;
                     report.more_work |= more;
                     delta.deleted_welcome_targets = welcomes;
                     (report, delta)
@@ -1186,7 +1198,9 @@ fn ensure_event_available(
             Err("MLS application event id unexpectedly already exists".to_string())
         }
         MlsDeliveryEvent::Commit { parent_epoch, .. }
-            if state.commit_epochs.contains_key(&(room_id.0, *parent_epoch)) =>
+            if state
+                .commit_epochs
+                .contains_key(&(room_id.0, *parent_epoch)) =>
         {
             Err("MLS commit parent epoch unexpectedly already exists".to_string())
         }
@@ -1204,7 +1218,9 @@ fn insert_event_memory(
     if state
         .events
         .get(&(room_id.0, sequence))
-        .is_some_and(|stored| stored.event == event && stored.stored_at_unix_ms == stored_at_unix_ms)
+        .is_some_and(|stored| {
+            stored.event == event && stored.stored_at_unix_ms == stored_at_unix_ms
+        })
     {
         return;
     }
@@ -1213,14 +1229,16 @@ fn insert_event_memory(
         MlsDeliveryEvent::Application { ciphertext, .. } => ciphertext.len(),
         MlsDeliveryEvent::Commit { commit, .. } => commit.len(),
     };
-    let payload_len = u32::try_from(payload_len)
-        .expect("MLS event exceeds the binary snapshot limit");
+    let payload_len =
+        u32::try_from(payload_len).expect("MLS event exceeds the binary snapshot limit");
     match &event {
         MlsDeliveryEvent::Application { event_id, .. } => {
             state.event_ids.insert((room_id.0, event_id.0), sequence);
         }
         MlsDeliveryEvent::Commit { parent_epoch, .. } => {
-            state.commit_epochs.insert((room_id.0, *parent_epoch), sequence);
+            state
+                .commit_epochs
+                .insert((room_id.0, *parent_epoch), sequence);
         }
     }
     state.events.insert(
@@ -1324,8 +1342,8 @@ fn insert_welcome_memory(
             .retired_payload_bytes
             .saturating_add(u64::from(previous.payload_len));
     }
-    let payload_len = u32::try_from(bundle.welcome.len())
-        .expect("MLS Welcome exceeds the binary snapshot limit");
+    let payload_len =
+        u32::try_from(bundle.welcome.len()).expect("MLS Welcome exceeds the binary snapshot limit");
     state.welcomes.insert(
         delivery_id,
         StoredWelcome {
@@ -1373,9 +1391,10 @@ fn plan_prune_room(
     let retention_ms = u64::from(room.retention_days).saturating_mul(24 * 60 * 60 * 1000);
     let cutoff = now_unix_ms.saturating_sub(retention_ms);
     let mut expiry = room.oldest_available_sequence.saturating_sub(1);
-    for (_, stored) in state.events.range(
-        (room_id.0, room.oldest_available_sequence)..=(room_id.0, room.head_sequence),
-    ) {
+    for (_, stored) in state
+        .events
+        .range((room_id.0, room.oldest_available_sequence)..=(room_id.0, room.head_sequence))
+    {
         if stored.stored_at_unix_ms >= cutoff {
             break;
         }
@@ -1444,9 +1463,8 @@ fn plan_cleanup_welcomes(
             .get(&welcome.bundle.descriptor.room_id.0)
             .ok_or_else(|| "MLS Welcome references a missing room".to_string())?;
         let expired = welcome.stored_at_unix_ms
-            < now_unix_ms.saturating_sub(
-                u64::from(room.retention_days).saturating_mul(24 * 60 * 60 * 1000),
-            );
+            < now_unix_ms
+                .saturating_sub(u64::from(room.retention_days).saturating_mul(24 * 60 * 60 * 1000));
         if acknowledged || expired {
             if remove_targets.len() == batch_limit {
                 more_work = true;
@@ -1470,9 +1488,10 @@ fn validate_memory(state: &MemoryState) -> Result<(), String> {
             return Err("persisted MLS room has an invalid retained range".to_string());
         }
         let mut expected = room.oldest_available_sequence;
-        for ((_, sequence), stored) in state.events.range(
-            (id.0, room.oldest_available_sequence)..=(id.0, room.head_sequence),
-        ) {
+        for ((_, sequence), stored) in state
+            .events
+            .range((id.0, room.oldest_available_sequence)..=(id.0, room.head_sequence))
+        {
             if *sequence != expected || stored.event.sequence() != expected {
                 return Err("persisted MLS delivery sequence is not contiguous".to_string());
             }
@@ -1578,7 +1597,10 @@ impl Persistence {
             {
                 self.poisoned = true;
             }
-            return Err(format!("failed to append {}: {error}", self.wal_path.display()));
+            return Err(format!(
+                "failed to append {}: {error}",
+                self.wal_path.display()
+            ));
         }
         self.wal_bytes = self.wal_bytes.saturating_add(frame.len() as u64);
         self.records_since_checkpoint = self.records_since_checkpoint.saturating_add(1);
@@ -1691,14 +1713,20 @@ fn replay_wal(path: &Path, state: &mut MemoryState) -> Result<(u64, u64), String
     while bytes.len().saturating_sub(offset) >= 12 {
         let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
         let checksum = u64::from_le_bytes(bytes[offset + 4..offset + 12].try_into().unwrap());
-        let Some(end) = offset.checked_add(12).and_then(|start| start.checked_add(len)) else {
+        let Some(end) = offset
+            .checked_add(12)
+            .and_then(|start| start.checked_add(len))
+        else {
             break;
         };
         let Some(body) = bytes.get(offset + 12..end) else {
             break;
         };
         if wal_checksum(body) != checksum {
-            return Err(format!("{} contains a corrupt MLS WAL record", path.display()));
+            return Err(format!(
+                "{} contains a corrupt MLS WAL record",
+                path.display()
+            ));
         }
         let delta = jsony::from_binary::<StateDelta>(body)
             .map_err(|error| format!("failed to decode {}: {error}", path.display()))?;
@@ -1757,8 +1785,8 @@ fn serialize_checkpoint(state: &MemoryState) -> Vec<u8> {
         .map(|(&(room_id, sequence), stored)| {
             let payload_offset = payloads.len() as u64;
             let encoded = jsony::to_binary(&stored.event);
-            let payload_len = u32::try_from(encoded.len())
-                .expect("MLS event exceeds the binary snapshot limit");
+            let payload_len =
+                u32::try_from(encoded.len()).expect("MLS event exceeds the binary snapshot limit");
             payloads.extend_from_slice(&encoded);
             EventCheckpoint {
                 sequence,
@@ -1915,12 +1943,8 @@ fn load_checkpoint(path: &Path) -> Result<MemoryState, String> {
         }
     }
     for row in events {
-        let event: MlsDeliveryEvent = decode_payload(
-            &payloads,
-            row.payload_offset,
-            row.payload_len,
-            "event",
-        )?;
+        let event: MlsDeliveryEvent =
+            decode_payload(&payloads, row.payload_offset, row.payload_len, "event")?;
         if event.sequence() != row.sequence {
             return Err("MLS checkpoint event metadata is inconsistent".to_string());
         }
@@ -1976,12 +2000,8 @@ fn load_checkpoint(path: &Path) -> Result<MemoryState, String> {
         }
     }
     for row in welcomes {
-        let bundle: MlsWelcomeBundle = decode_payload(
-            &payloads,
-            row.payload_offset,
-            row.payload_len,
-            "Welcome",
-        )?;
+        let bundle: MlsWelcomeBundle =
+            decode_payload(&payloads, row.payload_offset, row.payload_len, "Welcome")?;
         if state
             .welcomes
             .insert(
@@ -2262,7 +2282,14 @@ mod tests {
         let device = DeviceId([20; 16]);
         let store = MlsStore::open(Some(temp.path())).unwrap();
         create(&store, &room(18, vec![device], 100));
-        store.persistence.as_ref().unwrap().lock().unwrap().seal().unwrap();
+        store
+            .persistence
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .seal()
+            .unwrap();
         store
             .append_application(RoomId(18), device, 1, EventId([2; 16]), &[9; 32], 200)
             .unwrap();
@@ -2282,7 +2309,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = MlsStore::open(Some(temp.path())).unwrap();
         create(&store, &room(22, Vec::new(), 100));
-        store.persistence.as_ref().unwrap().lock().unwrap().wal_bytes = WAL_CHECKPOINT_BYTES;
+        store
+            .persistence
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .wal_bytes = WAL_CHECKPOINT_BYTES;
 
         assert!(store.checkpoint_if_needed().unwrap());
         store.snapshot_writer.as_ref().unwrap().flush().unwrap();

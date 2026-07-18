@@ -100,11 +100,8 @@ impl UserStore {
         username: String,
         token_hash: String,
     ) -> Result<UserConfig, String> {
-        let (user, users) = self.prepare_mark_user_paired(
-            internal_reference,
-            username,
-            token_hash,
-        )?;
+        let (user, users) =
+            self.prepare_mark_user_paired(internal_reference, username, token_hash)?;
         self.save_state(&users)?;
         self.users = users;
         Ok(user)

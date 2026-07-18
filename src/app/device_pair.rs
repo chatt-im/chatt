@@ -29,7 +29,6 @@ pub(crate) enum DevicePairEvent {
     Close,
     Submit {
         pairing_string: String,
-        transfer_password: String,
         device_name: String,
         overwrite_existing: bool,
     },
@@ -37,7 +36,6 @@ pub(crate) enum DevicePairEvent {
 
 pub(crate) struct DevicePairDialog {
     pairing_string: String,
-    transfer_password: String,
     device_name: String,
     show_secrets: bool,
     feedback: String,
@@ -52,11 +50,10 @@ impl DevicePairDialog {
         let initial_field = if pairing_string.trim().is_empty() {
             "Pairing string"
         } else {
-            "Transfer password"
+            "Device name"
         };
         Self {
             pairing_string,
-            transfer_password: String::new(),
             device_name: String::new(),
             show_secrets: false,
             feedback: "Enter the one-time link details".to_string(),
@@ -71,7 +68,7 @@ impl DevicePairDialog {
         let width = dialog_body_width(terminal_width);
         form::wrapped_line_count(PAIR_DESCRIPTION, width)
             .saturating_add(form::wrapped_line_count(&self.feedback, width))
-            .saturating_add(7)
+            .saturating_add(6)
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
@@ -91,7 +88,6 @@ impl DevicePairDialog {
             device_pair_form(
                 &mut form,
                 &mut self.pairing_string,
-                &mut self.transfer_password,
                 &mut self.device_name,
                 &mut self.show_secrets,
                 &self.feedback,
@@ -177,13 +173,7 @@ impl DevicePairDialog {
         self.feedback_error = true;
     }
 
-    pub(crate) fn device_pairing_failed(&mut self, error: String, transfer_password: String) {
-        self.transfer_password = transfer_password;
-        self.pairing_failed(error);
-    }
-
-    pub(crate) fn identity_exists(&mut self, message: String, transfer_password: String) {
-        self.transfer_password = transfer_password;
+    pub(crate) fn identity_exists(&mut self, message: String) {
         self.submitting = false;
         self.confirm_overwrite = true;
         self.feedback = message;
@@ -198,11 +188,7 @@ impl DevicePairDialog {
                 if self.submitting {
                     return DevicePairEvent::Consumed;
                 }
-                if let Some(error) = pair_validation(
-                    &self.pairing_string,
-                    &self.transfer_password,
-                    &self.device_name,
-                ) {
+                if let Some(error) = pair_validation(&self.pairing_string, &self.device_name) {
                     self.feedback = error;
                     self.feedback_error = true;
                     return DevicePairEvent::Consumed;
@@ -217,7 +203,6 @@ impl DevicePairDialog {
                 self.feedback_error = false;
                 DevicePairEvent::Submit {
                     pairing_string: self.pairing_string.trim().to_string(),
-                    transfer_password: std::mem::take(&mut self.transfer_password),
                     device_name: self.device_name.trim().to_string(),
                     overwrite_existing,
                 }
@@ -257,7 +242,6 @@ impl DevicePairDialog {
             device_pair_form(
                 &mut form,
                 &mut self.pairing_string,
-                &mut self.transfer_password,
                 &mut self.device_name,
                 &mut self.show_secrets,
                 &self.feedback,
@@ -273,14 +257,12 @@ impl DevicePairDialog {
 impl Drop for DevicePairDialog {
     fn drop(&mut self) {
         self.pairing_string.zeroize();
-        self.transfer_password.zeroize();
     }
 }
 
 fn device_pair_form(
     form: &mut Form<'_>,
     pairing_string: &mut String,
-    transfer_password: &mut String,
     device_name: &mut String,
     show_secrets: &mut bool,
     feedback: &str,
@@ -291,10 +273,8 @@ fn device_pair_form(
     form.description(PAIR_DESCRIPTION);
     if *show_secrets {
         form.text("Pairing string", pairing_string, required);
-        form.text("Transfer password", transfer_password, required);
     } else {
         form.secret_text("Pairing string", pairing_string, required);
-        form.secret_text("Transfer password", transfer_password, required);
     }
     form.text("Device name", device_name, device_name_error);
     form.checkbox("Show secrets", show_secrets);
@@ -345,9 +325,9 @@ fn device_name_error(value: &str) -> Option<String> {
     .then(|| "must be 1-64 bytes with no control characters".to_string())
 }
 
-fn pair_validation(ticket: &str, password: &str, name: &str) -> Option<String> {
-    if ticket.trim().is_empty() || password.trim().is_empty() {
-        Some("Pairing string and transfer password are required".to_string())
+fn pair_validation(ticket: &str, name: &str) -> Option<String> {
+    if ticket.trim().is_empty() {
+        Some("Pairing string is required".to_string())
     } else {
         device_name_error(name)
     }
@@ -356,7 +336,6 @@ fn pair_validation(ticket: &str, password: &str, name: &str) -> Option<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeviceLinkButton {
     CopyTicket,
-    CopyPassword,
     GenerateNew,
     CancelLink,
     Close,
@@ -365,7 +344,6 @@ pub(crate) enum DeviceLinkButton {
 pub(crate) struct DeviceLinkDialog {
     redemption_secret_hash: Vec<u8>,
     pairing_string: String,
-    transfer_password: String,
     expires_at_ms: u64,
     now_ms: u64,
     generate_armed: bool,
@@ -376,14 +354,12 @@ impl DeviceLinkDialog {
     pub(crate) fn new(
         redemption_secret_hash: Vec<u8>,
         pairing_string: String,
-        transfer_password: String,
         expires_at_ms: u64,
         bindings: FormBindings,
     ) -> Self {
         Self {
             redemption_secret_hash,
             pairing_string,
-            transfer_password,
             expires_at_ms,
             now_ms: 0,
             generate_armed: false,
@@ -398,7 +374,7 @@ impl DeviceLinkDialog {
         let ticket_rows = self.pairing_string.width().div_ceil(value_width);
         u16::try_from(ticket_rows)
             .unwrap_or(u16::MAX)
-            .saturating_add(5)
+            .saturating_add(4)
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme, now_ms: u64) {
@@ -418,7 +394,6 @@ impl DeviceLinkDialog {
         device_link_form(
             &mut form,
             &self.pairing_string,
-            &self.transfer_password,
             self.expires_at_ms,
             self.now_ms,
             self.generate_armed,
@@ -481,7 +456,6 @@ impl DeviceLinkDialog {
         }
         match button {
             DeviceLinkButton::CopyTicket => Some(&self.pairing_string),
-            DeviceLinkButton::CopyPassword => Some(&self.transfer_password),
             DeviceLinkButton::GenerateNew
             | DeviceLinkButton::CancelLink
             | DeviceLinkButton::Close => None,
@@ -529,7 +503,6 @@ impl DeviceLinkDialog {
             device_link_form(
                 &mut form,
                 &self.pairing_string,
-                &self.transfer_password,
                 self.expires_at_ms,
                 self.now_ms,
                 self.generate_armed,
@@ -547,21 +520,18 @@ fn dialog_body_width(terminal_width: u16) -> u16 {
 impl Drop for DeviceLinkDialog {
     fn drop(&mut self) {
         self.pairing_string.zeroize();
-        self.transfer_password.zeroize();
     }
 }
 
 fn device_link_form(
     form: &mut Form<'_>,
     ticket: &str,
-    password: &str,
     expires_at_ms: u64,
     now_ms: u64,
     generate_armed: bool,
 ) -> Option<DeviceLinkButton> {
     form.section_with_id("One-time link", LINK_SECTION);
     form.wrapped_static_row("Pairing string", ticket);
-    form.static_row("Password", password);
     let expiry = device_link_expiry(expires_at_ms, now_ms);
     form.static_row("Expires", &expiry);
     form.spacer(1);
@@ -582,12 +552,6 @@ fn device_link_form(
             label: "Copy ticket",
             value: DeviceLinkButton::CopyTicket,
             help: "Copy the one-time pairing string.",
-        },
-        ActionButton {
-            key: "copy-password",
-            label: "Copy password",
-            value: DeviceLinkButton::CopyPassword,
-            help: "Copy the six-word transfer password.",
         },
         ActionButton {
             key: "generate-new",
@@ -654,7 +618,6 @@ mod tests {
         let mut dialog = DeviceLinkDialog::new(
             vec![0; 32],
             "ticket".to_string(),
-            "password".to_string(),
             60_000,
             FormBindings::Standard,
         );
@@ -673,7 +636,6 @@ mod tests {
         let mut dialog = DeviceLinkDialog::new(
             hash.clone(),
             "ticket".to_string(),
-            "password".to_string(),
             60_000,
             FormBindings::Standard,
         );
@@ -710,8 +672,6 @@ mod tests {
         let mut dialog = DevicePairDialog::new("tcd1_ticket".to_string(), FormBindings::Standard);
         render_pair(&mut dialog, &theme);
 
-        dialog.paste("coral-lantern", &theme);
-        dialog.handle_key(key(KeyCode::Enter), &theme);
         dialog.paste("Alice's laptop", &theme);
         dialog.handle_key(key(KeyCode::Enter), &theme);
         dialog.handle_key(key(KeyCode::Tab), &theme);
@@ -720,12 +680,10 @@ mod tests {
         match dialog.handle_key(key(KeyCode::Enter), &theme) {
             DevicePairEvent::Submit {
                 pairing_string,
-                transfer_password,
                 device_name,
                 overwrite_existing,
             } => {
                 assert_eq!(pairing_string, "tcd1_ticket");
-                assert_eq!(transfer_password, "coral-lantern");
                 assert_eq!(device_name, "Alice's laptop");
                 assert!(!overwrite_existing);
             }
@@ -739,8 +697,6 @@ mod tests {
         let mut dialog = DevicePairDialog::new("tcd1_ticket".to_string(), FormBindings::Vim);
         render_pair(&mut dialog, &theme);
 
-        dialog.paste("coral-lantern", &theme);
-        dialog.handle_key(key(KeyCode::Char('j')), &theme);
         dialog.paste("Alice's laptop", &theme);
         dialog.handle_key(key(KeyCode::Char('j')), &theme);
         dialog.handle_key(key(KeyCode::Char('j')), &theme);
@@ -760,8 +716,6 @@ mod tests {
 
         dialog.paste("tcd1_ticket", &theme);
         dialog.handle_key(key(KeyCode::Enter), &theme);
-        dialog.paste("coral-lantern", &theme);
-        dialog.handle_key(key(KeyCode::Enter), &theme);
         dialog.paste("Alice's laptop", &theme);
         dialog.handle_key(key(KeyCode::Enter), &theme);
         assert!(!dialog.show_secrets);
@@ -770,29 +724,20 @@ mod tests {
 
         assert!(dialog.show_secrets);
         assert_eq!(dialog.pairing_string, "tcd1_ticket");
-        assert_eq!(dialog.transfer_password, "coral-lantern");
     }
 
     #[test]
     fn existing_identity_requires_explicit_overwrite_submission() {
         let mut dialog = DevicePairDialog::new("tcd1_ticket".to_string(), FormBindings::Standard);
-        dialog.transfer_password = "coral-lantern".to_string();
         dialog.device_name = "Alice's laptop".to_string();
-        dialog.identity_exists(
-            "Existing identity found. Overwrite it?".to_string(),
-            "coral-lantern".to_string(),
-        );
+        dialog.identity_exists("Existing identity found. Overwrite it?".to_string());
 
         assert!(dialog.confirm_overwrite);
-        assert_eq!(dialog.transfer_password, "coral-lantern");
         match dialog.activate(DevicePairButton::Pair) {
             DevicePairEvent::Submit {
-                overwrite_existing,
-                transfer_password,
-                ..
+                overwrite_existing, ..
             } => {
                 assert!(overwrite_existing);
-                assert_eq!(transfer_password, "coral-lantern");
             }
             _ => panic!("overwrite confirmation did not resubmit pairing"),
         }
@@ -803,11 +748,10 @@ mod tests {
         let dialog = DeviceLinkDialog::new(
             vec![0; 32],
             format!("tcd1_{}", "a".repeat(180)),
-            "coral-lantern".to_string(),
             0,
             FormBindings::Standard,
         );
 
-        assert_eq!(dialog.form_height(80), 9);
+        assert_eq!(dialog.form_height(80), 8);
     }
 }
