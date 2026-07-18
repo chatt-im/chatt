@@ -514,6 +514,11 @@ pub enum ServerControl {
         room_id: RoomId,
         epoch: u64,
     },
+    /// Room creation raced a device-roster update. The request was not
+    /// persisted; rebuild it from current rosters without reconnecting.
+    EncryptedRoomCreationStale {
+        room_id: RoomId,
+    },
     GroupInfo {
         room_id: RoomId,
         /// Present when this Chatt room already has an encrypted MLS group.

@@ -746,6 +746,7 @@ enum RoomCreationReply {
     Existing {
         room: mls_store::RoomRecord,
     },
+    StaleRoster,
 }
 
 /// Serializes authoritative MLS mutations and all durable storage I/O away
@@ -955,13 +956,19 @@ impl MlsWorker {
                     {
                         return Ok(RoomCreationReply::Existing { room });
                     }
-                    let epoch = service.create_room(
+                    let epoch = match service.create_room(
                         creator,
                         &creator_client_id,
                         descriptor,
                         &checkpoints,
                         bundle,
-                    )?;
+                    ) {
+                        Ok(epoch) => epoch,
+                        Err(mls_service::CreateRoomError::StaleRoster) => {
+                            return Ok(RoomCreationReply::StaleRoster);
+                        }
+                        Err(mls_service::CreateRoomError::Invalid(error)) => return Err(error),
+                    };
                     Ok(RoomCreationReply::Created {
                         epoch,
                         room: service.cached_room(room_id).expect("created room cache"),
@@ -5508,6 +5515,10 @@ impl Server {
                                 },
                             )
                         }
+                        RoomCreationReply::StaleRoster => self.send_control_to_token(
+                            token,
+                            &ServerControl::EncryptedRoomCreationStale { room_id },
+                        ),
                     });
                     (Some(token), result)
                 }
@@ -8827,6 +8838,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::KeyPackagesLow { .. } => "key_packages_low",
         ServerControl::KeyPackage { .. } => "key_package",
         ServerControl::EncryptedRoomCreated { .. } => "encrypted_room_created",
+        ServerControl::EncryptedRoomCreationStale { .. } => "encrypted_room_creation_stale",
         ServerControl::GroupInfo { .. } => "group_info",
         ServerControl::MlsCommitSubmitted { .. } => "mls_commit_submitted",
         ServerControl::MlsApplicationSubmitted { .. } => "mls_application_submitted",
@@ -9841,7 +9853,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_duplicate_room_creation_reconciles_loser_without_disconnect() {
+    fn queued_room_creation_conflicts_are_nonfatal() {
         let mut server = test_server();
         let server_id: [u8; 32] = server
             .server_key_pair
@@ -9911,10 +9923,31 @@ mod tests {
 
         let winner = Token(11);
         let loser = Token(22);
+        let stale = Token(33);
         let mut winner_peer = live_user(&mut server, winner, SessionId(1), UserId(1));
         let mut loser_peer = live_user(&mut server, loser, SessionId(2), UserId(1));
-        server.pending_mls.insert(winner);
-        server.pending_mls.insert(loser);
+        let mut stale_peer = live_user(&mut server, stale, SessionId(3), UserId(1));
+        server.pending_mls.extend([winner, loser, stale]);
+        let mut stale_checkpoints = checkpoints.clone();
+        stale_checkpoints[0].revision = stale_checkpoints[0].revision.saturating_add(1);
+        assert!(
+            server
+                .mls_worker
+                .enqueue_typed(MlsWriteRequest::CreateRoom {
+                    token: stale,
+                    creator: descriptor.creator,
+                    creator_client_id: alice
+                        .bootstrap
+                        .device_certificate
+                        .body
+                        .mls_client_id
+                        .clone(),
+                    descriptor: descriptor.clone(),
+                    checkpoints: stale_checkpoints,
+                    bundle: bundle.clone(),
+                    welcome_devices: Vec::new(),
+                })
+        );
         for token in [winner, loser] {
             assert!(
                 server
@@ -9935,11 +9968,21 @@ mod tests {
                     })
             );
         }
+        finish_mls_for_token(&mut server, stale);
         finish_mls_for_token(&mut server, winner);
         finish_mls_for_token(&mut server, loser);
 
+        assert!(server.clients.contains_key(&stale));
         assert!(server.clients.contains_key(&winner));
         assert!(server.clients.contains_key(&loser));
+        assert!(matches!(
+            read_until(&mut server, &mut stale_peer, |control| matches!(
+                control,
+                ServerControl::EncryptedRoomCreationStale { room_id: observed }
+                    if *observed == room_id
+            )),
+            ServerControl::EncryptedRoomCreationStale { .. }
+        ));
         assert!(matches!(
             read_until(&mut server, &mut winner_peer, |control| matches!(
                 control,

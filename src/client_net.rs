@@ -8055,6 +8055,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::KeyPackagesLow { .. } => "key_packages_low",
         ServerControl::KeyPackage { .. } => "key_package",
         ServerControl::EncryptedRoomCreated { .. } => "encrypted_room_created",
+        ServerControl::EncryptedRoomCreationStale { .. } => "encrypted_room_creation_stale",
         ServerControl::GroupInfo { .. } => "group_info",
         ServerControl::MlsCommitSubmitted { .. } => "mls_commit_submitted",
         ServerControl::MlsApplicationSubmitted { .. } => "mls_application_submitted",

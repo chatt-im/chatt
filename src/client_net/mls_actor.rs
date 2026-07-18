@@ -24,6 +24,7 @@ pub(super) fn handles_server_control(control: &ServerControl) -> bool {
             | ServerControl::MlsDeviceBound { .. }
             | ServerControl::KeyPackage { .. }
             | ServerControl::EncryptedRoomCreated { .. }
+            | ServerControl::EncryptedRoomCreationStale { .. }
             | ServerControl::MlsWelcomes { .. }
             | ServerControl::MlsEvents { .. }
             | ServerControl::MlsApplicationSubmitted { .. }
@@ -831,6 +832,9 @@ impl Actor {
                     after_sequence: 1,
                     limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
                 })?;
+            }
+            ServerControl::EncryptedRoomCreationStale { room_id } => {
+                self.retry_stale_room_creation(room_id)?;
             }
             ServerControl::MlsWelcomes {
                 welcomes,
@@ -2456,6 +2460,74 @@ impl Actor {
                 after_sequence,
                 limit: rpc::mls::MAX_MLS_EVENT_BATCH as u16,
             })?;
+        }
+        Ok(())
+    }
+
+    fn retry_stale_room_creation(&mut self, room_id: RoomId) -> Result<(), String> {
+        let installation = self
+            .installation
+            .as_ref()
+            .ok_or_else(|| "stale room creation arrived without local MLS state".to_string())?;
+        let Some(pending) = self.pending_mls_commits.remove(&room_id) else {
+            if installation.client.descriptor(room_id)?.is_some() {
+                return Ok(());
+            }
+            return Err("stale response arrived for an unrequested room creation".to_string());
+        };
+        let PendingMlsCommit::RoomCreation(descriptor) = pending else {
+            return Err("stale room creation response matched a membership update".to_string());
+        };
+        installation.client.reject_pending_commit(&descriptor)?;
+        self.delayed_mls_retries
+            .remove(&MlsRetryKey::Commit(room_id));
+        self.pending_mls_rooms.remove(&room_id);
+        self.pending_mls_group_infos.remove(&room_id);
+
+        let local_user = self
+            .user_id
+            .ok_or_else(|| "stale room creation arrived before authentication".to_string())?;
+        let mut member_users = match self.room_kinds.get(&room_id) {
+            Some(RoomKind::Private { members }) => members.clone(),
+            Some(RoomKind::Dm { user_a, user_b }) => vec![*user_a, *user_b],
+            Some(RoomKind::Public) => {
+                return Err("server rejected encrypted creation for a public room".to_string());
+            }
+            None => return Err("stale response arrived for an unknown room".to_string()),
+        };
+        member_users.sort_unstable();
+        member_users.dedup();
+        if !member_users.contains(&local_user) {
+            return Err("stale response arrived for a room outside this account".to_string());
+        }
+        let peer_users = member_users
+            .iter()
+            .copied()
+            .filter(|user_id| *user_id != local_user)
+            .collect::<Vec<_>>();
+        for user_id in &peer_users {
+            self.mls_installed_rosters.remove(user_id);
+        }
+        self.pending_mls_rooms.insert(
+            room_id,
+            PendingMlsRoom {
+                member_users,
+                rosters: HashMap::new(),
+                descriptor: None,
+                checkpoints: Vec::new(),
+                awaiting_packages: HashSet::new(),
+                missing_packages: HashSet::new(),
+                device_accounts: HashMap::new(),
+                packages: Vec::new(),
+            },
+        );
+        kvlog::info!(
+            "MLS room creation retrying after roster update",
+            room_id = room_id.0,
+        );
+        self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
+        for user_id in peer_users {
+            self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
         }
         Ok(())
     }
