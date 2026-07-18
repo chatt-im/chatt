@@ -97,7 +97,10 @@ pub(super) enum Input {
         user: UserSummary,
         online: bool,
     },
-    Server(ServerControl),
+    Server {
+        generation: u64,
+        control: ServerControl,
+    },
     Command(Command),
     Shutdown,
 }
@@ -133,12 +136,11 @@ pub(super) enum Output {
     },
     ServerComplete {
         generation: u64,
-        count: usize,
     },
     SessionReady {
         generation: u64,
     },
-    Error {
+    Fatal {
         generation: u64,
         message: String,
     },
@@ -298,6 +300,7 @@ struct Actor {
     ready_file_uploads: HashSet<(RoomId, EventId)>,
     next_compaction_at: Option<Instant>,
     reported_availability: Option<bool>,
+    failed_generation: Option<u64>,
 }
 
 impl Actor {
@@ -331,6 +334,7 @@ impl Actor {
             ready_file_uploads: HashSet::new(),
             next_compaction_at: None,
             reported_availability: None,
+            failed_generation: None,
         }
     }
 
@@ -359,36 +363,46 @@ impl Actor {
                 if shared.space_needed.swap(false, Ordering::AcqRel) {
                     self.output.0.notify();
                 }
-                let mut server_inputs = 0usize;
                 for input in inputs.drain(..) {
                     if matches!(input, Input::Shutdown) {
                         return;
                     }
-                    let server_input = matches!(&input, Input::Server(_));
+                    let server_generation = match &input {
+                        Input::Server { generation, .. } => Some(*generation),
+                        _ => None,
+                    };
                     let begin_input = matches!(&input, Input::BeginSession { .. });
-                    if let Err(message) = self.handle(input) {
-                        self.output.send(Output::Error {
+                    let session_boundary = matches!(
+                        &input,
+                        Input::BeginSession { .. } | Input::EndSession { .. }
+                    );
+                    let skip_failed_session = !session_boundary
+                        && self.failed_generation == Some(self.generation);
+                    let result = if skip_failed_session {
+                        Ok(())
+                    } else {
+                        self.handle(input)
+                    };
+                    if let Err(message) = result {
+                        self.failed_generation = Some(self.generation);
+                        self.output.send(Output::Fatal {
                             generation: self.generation,
                             message,
                         });
-                    }
-                    if server_input {
-                        server_inputs += 1;
                     } else if begin_input {
+                        self.failed_generation = None;
                         self.output.send(Output::SessionReady {
                             generation: self.generation,
                         });
                     }
-                }
-                if server_inputs != 0 {
-                    self.output.send(Output::ServerComplete {
-                        generation: self.generation,
-                        count: server_inputs,
-                    });
+                    if let Some(generation) = server_generation {
+                        self.output.send(Output::ServerComplete { generation });
+                    }
                 }
             }
             if let Err(message) = self.poll_delayed_mls_retries(Instant::now()) {
-                self.output.send(Output::Error {
+                self.failed_generation = Some(self.generation);
+                self.output.send(Output::Fatal {
                     generation: self.generation,
                     message,
                 });
@@ -483,7 +497,13 @@ impl Actor {
                 }
                 Ok(())
             }
-            Input::Server(control) => {
+            Input::Server {
+                generation,
+                control,
+            } => {
+                if generation != self.generation {
+                    return Ok(());
+                }
                 let result = self.handle_server_control(control);
                 self.send_availability();
                 result
@@ -2508,28 +2528,14 @@ impl Actor {
         for user_id in &peer_users {
             self.mls_installed_rosters.remove(user_id);
         }
-        self.pending_mls_rooms.insert(
-            room_id,
-            PendingMlsRoom {
-                member_users,
-                rosters: HashMap::new(),
-                descriptor: None,
-                checkpoints: Vec::new(),
-                awaiting_packages: HashSet::new(),
-                missing_packages: HashSet::new(),
-                device_accounts: HashMap::new(),
-                packages: Vec::new(),
-            },
-        );
+        self.mls_bound = false;
         kvlog::info!(
-            "MLS room creation retrying after roster update",
+            "MLS room creation refreshing local roster after stale checkpoint",
             room_id = room_id.0,
         );
-        self.queue_control(ClientControl::FetchGroupInfo { room_id })?;
-        for user_id in peer_users {
-            self.queue_control(ClientControl::FetchDeviceRoster { user_id })?;
-        }
-        Ok(())
+        self.queue_control(ClientControl::FetchDeviceRoster {
+            user_id: local_user,
+        })
     }
 
     fn handle_mls_key_package(
@@ -2725,6 +2731,51 @@ fn should_compact(stats: chatt_mls::RedbStorageStats) -> bool {
 mod tests {
     use super::*;
 
+    fn test_config(data_dir: Option<PathBuf>) -> ClientConfig {
+        ClientConfig {
+            tcp_addr: "127.0.0.1:1".to_string(),
+            udp_addr: "127.0.0.1:1".to_string(),
+            udp_probe_addr: None,
+            username: "test".to_string(),
+            token: "test".to_string(),
+            server_public_key: None,
+            data_dir,
+            e2e_peer_pins: Vec::new(),
+            require_native_encryption: true,
+            file_policy: FilePolicy::default(),
+            download_store: crate::receive_store::DownloadStore::new(1024 * 1024),
+            max_upload_bytes: 1024 * 1024,
+            upload_rate_bytes: 0,
+            p2p_enabled: false,
+            candidate_privacy: CandidatePrivacy::Disabled,
+            prefer_ipv6: false,
+        }
+    }
+
+    fn test_actor(config: ClientConfig) -> (Actor, Arc<OutputQueue>, Poll) {
+        let poll = Poll::new().unwrap();
+        let outputs = Arc::new(OutputQueue {
+            outputs: Mutex::new(Vec::new()),
+            waker: Arc::new(Waker::new(poll.registry(), WAKE).unwrap()),
+            stopped: AtomicBool::new(false),
+        });
+        let (events, _receiver) = mpsc::channel();
+        let actor = Actor::new(
+            config,
+            NetworkEventSender::for_test(events),
+            OutputSender(Arc::clone(&outputs)),
+        );
+        (actor, outputs, poll)
+    }
+
+    fn run_inputs(actor: Actor, inputs: Vec<Input>, outputs: &OutputQueue) -> Vec<Output> {
+        actor.run(Arc::new(InputQueue {
+            inputs: Mutex::new(inputs),
+            space_needed: AtomicBool::new(false),
+        }));
+        std::mem::take(&mut *outputs.outputs.lock().unwrap())
+    }
+
     fn stats(allocated_bytes: u64, fragmented_bytes: u64) -> chatt_mls::RedbStorageStats {
         chatt_mls::RedbStorageStats {
             allocated_bytes,
@@ -2750,5 +2801,205 @@ mod tests {
     fn leaves_small_lightly_fragmented_database_alone() {
         assert!(!should_compact(stats(40 * 1024 * 1024, 9 * 1024 * 1024)));
         assert!(!should_compact(stats(0, 0)));
+    }
+
+    #[test]
+    fn actor_failures_are_fatal_and_do_not_report_session_ready() {
+        let (actor, outputs, _poll) = test_actor(test_config(None));
+        let observed = run_inputs(
+            actor,
+            vec![
+                Input::DmOpened {
+                    room_id: RoomId(9),
+                    peer: UserId(2),
+                },
+                Input::Shutdown,
+            ],
+            &outputs,
+        );
+
+        assert!(observed.iter().any(|output| matches!(
+            output,
+            Output::Fatal { generation: 0, message }
+                if message == "DM opened before authentication"
+        )));
+        assert!(
+            observed
+                .iter()
+                .all(|output| !matches!(output, Output::SessionReady { .. }))
+        );
+    }
+
+    #[test]
+    fn server_completions_keep_their_input_generation_across_session_boundaries() {
+        let (mut actor, outputs, _poll) = test_actor(test_config(None));
+        actor.generation = 41;
+        let observed = run_inputs(
+            actor,
+            vec![
+                Input::Server {
+                    generation: 41,
+                    control: ServerControl::DeviceLinkCanceled {
+                        redemption_secret_hash: vec![1],
+                    },
+                },
+                Input::EndSession { generation: 41 },
+                Input::BeginSession {
+                    generation: 42,
+                    session_id: SessionId(42),
+                    user_id: UserId(1),
+                    rooms: Vec::new(),
+                    users: Vec::new(),
+                    server_public_key: [7; 32],
+                    device_name: "test".to_string(),
+                },
+                Input::Server {
+                    generation: 42,
+                    control: ServerControl::DeviceLinkCanceled {
+                        redemption_secret_hash: vec![2],
+                    },
+                },
+                Input::Shutdown,
+            ],
+            &outputs,
+        );
+        let generations = observed
+            .iter()
+            .filter_map(|output| match output {
+                Output::ServerComplete { generation } => Some(*generation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(generations, [41, 42]);
+        assert!(observed.iter().any(
+            |output| matches!(output, Output::SessionReady { generation: 42 })
+        ));
+    }
+
+    #[test]
+    fn stale_room_creation_refreshes_local_roster_before_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [11; 32];
+        let (alice, _) = LocalInstallation::open_or_create(
+            &temp.path().join("alice"),
+            server_id,
+            UserId(1),
+            "Alice",
+        )
+        .unwrap();
+        let (bob, _) = LocalInstallation::open_or_create(
+            &temp.path().join("bob"),
+            server_id,
+            UserId(2),
+            "Bob",
+        )
+        .unwrap();
+        alice.install_roster(&bob.bootstrap.own_roster).unwrap();
+        let descriptor = rpc::mls::EncryptedRoomDescriptor::new(
+            RoomId(9),
+            alice.bootstrap.account_id,
+            vec![alice.bootstrap.account_id, bob.bootstrap.account_id],
+            1,
+        )
+        .unwrap();
+        let package = bob
+            .client
+            .generate_key_packages(bob.bootstrap.device_id, 1)
+            .unwrap()
+            .remove(0);
+        alice
+            .client
+            .create_room(&descriptor, &[(bob.bootstrap.device_id, package.package)])
+            .unwrap();
+
+        let (mut actor, outputs, _poll) = test_actor(test_config(None));
+        actor.generation = 1;
+        actor.session_id = Some(SessionId(1));
+        actor.user_id = Some(UserId(1));
+        actor.mls_bound = true;
+        actor.installation = Some(alice);
+        actor.room_kinds.insert(
+            RoomId(9),
+            RoomKind::Dm {
+                user_a: UserId(1),
+                user_b: UserId(2),
+            },
+        );
+        actor.mls_installed_rosters.insert(UserId(2));
+        actor.pending_mls_commits.insert(
+            RoomId(9),
+            PendingMlsCommit::RoomCreation(descriptor),
+        );
+
+        actor.retry_stale_room_creation(RoomId(9)).unwrap();
+        let observed = std::mem::take(&mut *outputs.outputs.lock().unwrap());
+
+        assert!(!actor.mls_bound);
+        assert!(!actor.mls_installed_rosters.contains(&UserId(2)));
+        assert!(!actor.pending_mls_rooms.contains_key(&RoomId(9)));
+        assert!(!actor.pending_mls_commits.contains_key(&RoomId(9)));
+        assert_eq!(
+            observed
+                .iter()
+                .filter_map(|output| match output {
+                    Output::Control { control, .. } => Some(control.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [ClientControl::FetchDeviceRoster { user_id: UserId(1) }]
+        );
+
+        let own_roster = actor
+            .installation
+            .as_ref()
+            .unwrap()
+            .bootstrap
+            .own_roster
+            .clone();
+        let own_device = actor
+            .installation
+            .as_ref()
+            .unwrap()
+            .bootstrap
+            .device_id;
+        actor
+            .handle_server_control(ServerControl::DeviceRoster {
+                user_id: UserId(1),
+                initialized: true,
+                roster: Some(own_roster),
+            })
+            .unwrap();
+        actor
+            .handle_server_control(ServerControl::MlsDeviceBound {
+                device_id: own_device,
+                available_key_packages: MLS_KEY_PACKAGE_TARGET,
+            })
+            .unwrap();
+        let observed = std::mem::take(&mut *outputs.outputs.lock().unwrap());
+
+        assert!(actor.mls_bound);
+        assert!(actor.pending_mls_rooms.contains_key(&RoomId(9)));
+        assert!(observed.iter().any(|output| matches!(
+            output,
+            Output::Control {
+                control: ClientControl::BindMlsDevice { device_id, .. },
+                ..
+            } if *device_id == own_device
+        )));
+        assert!(observed.iter().any(|output| matches!(
+            output,
+            Output::Control {
+                control: ClientControl::FetchDeviceRoster { user_id: UserId(2) },
+                ..
+            }
+        )));
+        assert!(observed.iter().any(|output| matches!(
+            output,
+            Output::Control {
+                control: ClientControl::FetchGroupInfo { room_id: RoomId(9) },
+                ..
+            }
+        )));
     }
 }

@@ -3475,22 +3475,23 @@ impl WorkerState<'_> {
                 } if generation == self.mls_generation => {
                     self.mls_available = available;
                 }
-                mls_actor::Output::ServerComplete { generation, count }
+                mls_actor::Output::ServerComplete { generation }
                     if generation == self.mls_generation =>
                 {
-                    debug_assert!(self.mls_server_pending >= count);
-                    self.mls_server_pending = self.mls_server_pending.saturating_sub(count);
+                    debug_assert!(self.mls_server_pending != 0);
+                    self.mls_server_pending = self.mls_server_pending.saturating_sub(1);
                 }
                 mls_actor::Output::SessionReady { generation }
                     if generation == self.mls_generation =>
                 {
                     self.mls_session_ready = true;
                 }
-                mls_actor::Output::Error {
+                mls_actor::Output::Fatal {
                     generation,
                     message,
                 } if generation == self.mls_generation => {
-                    let _ = self.events.send(NetworkEvent::Error(message));
+                    let _ = self.events.send(NetworkEvent::Error(message.clone()));
+                    return Err(format!("client MLS failure: {message}"));
                 }
                 _ => {}
             }
@@ -5962,7 +5963,10 @@ impl WorkerState<'_> {
         );
         if mls_actor::handles_server_control(&control) {
             self.mls_server_pending += 1;
-            return self.queue_mls_input(mls_actor::Input::Server(control));
+            return self.queue_mls_input(mls_actor::Input::Server {
+                generation: self.mls_generation,
+                control,
+            });
         }
         match control {
             ServerControl::Authenticated {
