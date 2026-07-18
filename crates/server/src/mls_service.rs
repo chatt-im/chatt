@@ -534,13 +534,17 @@ impl MlsService {
         descriptor: EncryptedRoomDescriptor,
         checkpoints: &[RosterCheckpoint],
         bundle: MlsCommitBundle,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, CreateRoomError> {
         Self::validate_room_creation_envelope(creator, &descriptor, &bundle)?;
         if self.rooms.contains_key(&descriptor.room_id) {
-            return Err("encrypted room creator or room id is invalid".to_string());
+            return Err("encrypted room creator or room id is invalid".to_string().into());
         }
         if checkpoints.len() != descriptor.member_accounts.len() {
-            return Err("encrypted room roster checkpoints do not match".to_string());
+            return Err(
+                "encrypted room roster checkpoints do not match"
+                    .to_string()
+                    .into(),
+            );
         }
         for account in &descriptor.member_accounts {
             let roster = self
@@ -549,7 +553,7 @@ impl MlsService {
                 .find(|roster| roster.body.account_id == *account)
                 .ok_or_else(|| "encrypted room account has no current roster".to_string())?;
             if !checkpoints.contains(&roster_checkpoint(roster)) {
-                return Err("encrypted room roster checkpoint is stale".to_string());
+                return Err(CreateRoomError::StaleRoster);
             }
         }
         // Initial-commit validation needs the descriptor installed in its
@@ -579,11 +583,17 @@ impl MlsService {
             .observe_group_info(prior)
             .map_err(|error| error.to_string())?;
         if parent.epoch != 0 || parent.group_id != descriptor.mls_group_id {
-            return Err("room creation GroupInfo does not match descriptor".to_string());
+            return Err(
+                "room creation GroupInfo does not match descriptor"
+                    .to_string()
+                    .into(),
+            );
         }
         if parent.member_client_ids.as_slice() != [creator_client_id] {
             return Err(
-                "room creation parent must contain only the authenticated creator".to_string(),
+                "room creation parent must contain only the authenticated creator"
+                    .to_string()
+                    .into(),
             );
         }
         let applied = validation_validator
@@ -596,7 +606,11 @@ impl MlsService {
         )?;
         let next = applied.state;
         if applied.committer_client_id != creator_client_id {
-            return Err("initial commit was not signed by the authenticated device".to_string());
+            return Err(
+                "initial commit was not signed by the authenticated device"
+                    .to_string()
+                    .into(),
+            );
         }
         Self::validate_room_accounts(&validation_identities, &descriptor, &next)?;
         Self::validate_welcome_targets(
@@ -1427,6 +1441,27 @@ impl MlsService {
 }
 
 #[derive(Debug)]
+pub(super) enum CreateRoomError {
+    StaleRoster,
+    Invalid(String),
+}
+
+impl std::fmt::Display for CreateRoomError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleRoster => formatter.write_str("encrypted room roster checkpoint is stale"),
+            Self::Invalid(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl From<String> for CreateRoomError {
+    fn from(error: String) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+#[derive(Debug)]
 pub(super) enum PutRosterError {
     Conflict(Option<RosterCheckpoint>),
     Invalid(String),
@@ -1747,6 +1782,7 @@ mod tests {
                     reused_bundle,
                 )
                 .unwrap_err()
+                .to_string()
                 .contains("already committed KeyPackage")
         );
         let event = MlsChattEvent {

@@ -1,7 +1,7 @@
 //! Live client/server MLS regression matrix.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
@@ -137,10 +137,14 @@ struct Client {
     backlog: RefCell<VecDeque<NetworkEvent>>,
     observed_mls_messages: RefCell<HashMap<(RoomId, MessageId), crate::e2e::AuthenticatedChat>>,
     last_mls_sequence: RefCell<HashMap<RoomId, u64>>,
+    reconnects: Cell<usize>,
 }
 
 impl Client {
     fn observe_network_event(&self, event: &NetworkEvent) {
+        if matches!(event, NetworkEvent::ReconnectScheduled { .. }) {
+            self.reconnects.set(self.reconnects.get() + 1);
+        }
         let NetworkEvent::Chat(chat) = event else {
             return;
         };
@@ -208,6 +212,14 @@ impl Client {
                 |event| !matches!(event, NetworkEvent::Chat(chat) if chat.message.body == body)
             ),
             "client retained MLS message {body:?} outside its permitted history window",
+        );
+    }
+
+    fn assert_never_reconnected(&self, case: LinkedMatrixCase) {
+        assert_eq!(
+            self.reconnects.get(),
+            0,
+            "case {case:?}: client recovered through a network reconnect",
         );
     }
 }
@@ -328,6 +340,7 @@ fn spawn(config: ClientConfig) -> Client {
         backlog: RefCell::new(VecDeque::new()),
         observed_mls_messages: RefCell::new(HashMap::new()),
         last_mls_sequence: RefCell::new(HashMap::new()),
+        reconnects: Cell::new(0),
     }
 }
 
@@ -1134,6 +1147,9 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
         bob_stream,
         vec![0xb0, ((case.bits >> 4) & 0xff) as u8, 4, 5, 6, 7, 8],
     );
+    primary.assert_never_reconnected(case);
+    linked.assert_never_reconnected(case);
+    bob.assert_never_reconnected(case);
 }
 
 #[test]
