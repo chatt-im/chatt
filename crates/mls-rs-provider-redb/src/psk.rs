@@ -62,13 +62,10 @@ impl RedbPreSharedKeyStorage {
         }
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 impl PreSharedKeyStorage for RedbPreSharedKeyStorage {
     type Error = RedbDataStorageError;
 
-    async fn get(&self, id: &ExternalPskId) -> Result<Option<PreSharedKey>, Self::Error> {
+    fn get(&self, id: &ExternalPskId) -> Result<Option<PreSharedKey>, Self::Error> {
         RedbPreSharedKeyStorage::get(self, id)
     }
 }

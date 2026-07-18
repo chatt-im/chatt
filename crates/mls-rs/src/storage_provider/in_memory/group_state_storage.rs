@@ -167,27 +167,24 @@ impl Default for InMemoryGroupStateStorage {
         Self::new()
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 impl GroupStateStorage for InMemoryGroupStateStorage {
     type Error = Infallible;
 
-    async fn max_epoch_id(&self, group_id: &[u8]) -> Result<Option<u64>, Self::Error> {
+    fn max_epoch_id(&self, group_id: &[u8]) -> Result<Option<u64>, Self::Error> {
         Ok(self
             .lock()
             .get(group_id)
             .and_then(|group_data| group_data.epoch_data.back().map(|e| e.id)))
     }
 
-    async fn state(&self, group_id: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error> {
+    fn state(&self, group_id: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error> {
         Ok(self
             .lock()
             .get(group_id)
             .map(|data| data.state_data.clone()))
     }
 
-    async fn epoch(
+    fn epoch(
         &self,
         group_id: &[u8],
         epoch_id: u64,
@@ -198,7 +195,7 @@ impl GroupStateStorage for InMemoryGroupStateStorage {
             .and_then(|data| data.get_epoch(epoch_id).map(|ep| ep.data.clone())))
     }
 
-    async fn write(
+    fn write(
         &mut self,
         state: GroupState,
         epoch_inserts: Vec<EpochRecord>,
@@ -268,15 +265,15 @@ mod tests {
         assert_matches!(test_storage(0), Err(MlsError::NonZeroRetentionRequired))
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn existing_storage_can_have_larger_epoch_count() {
+    #[test]
+    fn existing_storage_can_have_larger_epoch_count() {
         let mut storage = test_storage(2).unwrap();
 
         let epoch_inserts = vec![test_epoch(0), test_epoch(1)];
 
         storage
             .write(test_snapshot(0), epoch_inserts, Vec::new())
-            .await
+
             .unwrap();
 
         assert_eq!(storage.test_data().epoch_data.len(), 2);
@@ -287,21 +284,21 @@ mod tests {
 
         storage
             .write(test_snapshot(1), epoch_inserts, Vec::new())
-            .await
+
             .unwrap();
 
         assert_eq!(storage.test_data().epoch_data.len(), 4);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn existing_storage_can_have_smaller_epoch_count() {
+    #[test]
+    fn existing_storage_can_have_smaller_epoch_count() {
         let mut storage = test_storage(4).unwrap();
 
         let epoch_inserts = vec![test_epoch(0), test_epoch(1), test_epoch(3), test_epoch(4)];
 
         storage
             .write(test_snapshot(1), epoch_inserts, Vec::new())
-            .await
+
             .unwrap();
 
         assert_eq!(storage.test_data().epoch_data.len(), 4);
@@ -312,24 +309,22 @@ mod tests {
 
         storage
             .write(test_snapshot(1), epoch_inserts, Vec::new())
-            .await
+
             .unwrap();
 
         assert_eq!(storage.test_data().epoch_data.len(), 2);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn epoch_insert_over_limit() {
-        test_epoch_insert_over_limit(false).await
+    #[test]
+    fn epoch_insert_over_limit() {
+        test_epoch_insert_over_limit(false)
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn epoch_insert_over_limit_with_update() {
-        test_epoch_insert_over_limit(true).await
+    #[test]
+    fn epoch_insert_over_limit_with_update() {
+        test_epoch_insert_over_limit(true)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn test_epoch_insert_over_limit(with_update: bool) {
+    fn test_epoch_insert_over_limit(with_update: bool) {
         let mut storage = test_storage(1).unwrap();
 
         let mut epoch_inserts = vec![test_epoch(0), test_epoch(1)];
@@ -340,7 +335,7 @@ mod tests {
 
         storage
             .write(snapshot.clone(), epoch_inserts.clone(), updates)
-            .await
+
             .unwrap();
 
         let stored = storage.test_data();

@@ -22,8 +22,7 @@ impl Deref for ProposalRef {
 }
 
 impl ProposalRef {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn from_content<CS: CipherSuiteProvider>(
+    pub(crate) fn from_content<CS: CipherSuiteProvider>(
         cipher_suite_provider: &CS,
         content: &AuthenticatedContent,
     ) -> Result<Self, MlsError> {
@@ -31,7 +30,7 @@ impl ProposalRef {
 
         Ok(ProposalRef(
             HashReference::compute(bytes, b"MLS 1.0 Proposal Reference", cipher_suite_provider)
-                .await?,
+                ?,
         ))
     }
 
@@ -108,10 +107,8 @@ mod test {
         #[serde(with = "hex::serde")]
         output: Vec<u8>,
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     #[cfg_attr(coverage_nightly, coverage(off))]
-    async fn generate_proposal_test_cases() -> Vec<TestCase> {
+    fn generate_proposal_test_cases() -> Vec<TestCase> {
         let mut test_cases = Vec::new();
 
         for (protocol_version, cipher_suite) in
@@ -121,14 +118,14 @@ mod test {
 
             let add = auth_content_from_proposal(
                 Proposal::Add(Box::new(AddProposal {
-                    key_package: test_key_package(protocol_version, cipher_suite, "alice").await,
+                    key_package: test_key_package(protocol_version, cipher_suite, "alice"),
                 })),
                 sender,
             );
 
             let update = auth_content_from_proposal(
                 Proposal::Update(UpdateProposal {
-                    leaf_node: get_basic_test_node(cipher_suite, "foo").await,
+                    leaf_node: get_basic_test_node(cipher_suite, "foo"),
                 }),
                 sender,
             );
@@ -151,7 +148,7 @@ mod test {
                 cipher_suite: cipher_suite.into(),
                 input: add.mls_encode_to_vec().unwrap(),
                 output: ProposalRef::from_content(&cipher_suite_provider, &add)
-                    .await
+
                     .unwrap()
                     .to_vec(),
             });
@@ -160,7 +157,7 @@ mod test {
                 cipher_suite: cipher_suite.into(),
                 input: update.mls_encode_to_vec().unwrap(),
                 output: ProposalRef::from_content(&cipher_suite_provider, &update)
-                    .await
+
                     .unwrap()
                     .to_vec(),
             });
@@ -169,7 +166,7 @@ mod test {
                 cipher_suite: cipher_suite.into(),
                 input: remove.mls_encode_to_vec().unwrap(),
                 output: ProposalRef::from_content(&cipher_suite_provider, &remove)
-                    .await
+
                     .unwrap()
                     .to_vec(),
             });
@@ -178,7 +175,7 @@ mod test {
                 cipher_suite: cipher_suite.into(),
                 input: group_context_ext.mls_encode_to_vec().unwrap(),
                 output: ProposalRef::from_content(&cipher_suite_provider, &group_context_ext)
-                    .await
+
                     .unwrap()
                     .to_vec(),
             });
@@ -188,8 +185,8 @@ mod test {
     }
 
     #[cfg(mls_build_async)]
-    async fn load_test_cases() -> Vec<TestCase> {
-        load_test_case_json!(proposal_ref, generate_proposal_test_cases().await)
+    fn load_test_cases() -> Vec<TestCase> {
+        load_test_case_json!(proposal_ref, generate_proposal_test_cases())
     }
 
     #[cfg(not(mls_build_async))]
@@ -197,9 +194,9 @@ mod test {
         load_test_case_json!(proposal_ref, generate_proposal_test_cases())
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_proposal_ref() {
-        let test_cases = load_test_cases().await;
+    #[test]
+    fn test_proposal_ref() {
+        let test_cases = load_test_cases();
 
         for one_case in test_cases {
             let Some(cs_provider) = try_test_cipher_suite_provider(one_case.cipher_suite) else {
@@ -210,7 +207,7 @@ mod test {
                 AuthenticatedContent::mls_decode(&mut one_case.input.as_slice()).unwrap();
 
             let proposal_ref = ProposalRef::from_content(&cs_provider, &proposal_content)
-                .await
+
                 .unwrap();
 
             let expected_out = ProposalRef(HashReference::from(one_case.output));

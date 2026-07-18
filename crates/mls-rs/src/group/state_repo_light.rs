@@ -43,9 +43,7 @@ where
             key_package_repo,
         })
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn write_to_storage(&mut self, group_snapshot: Snapshot) -> Result<(), MlsError> {
+    pub fn write_to_storage(&mut self, group_snapshot: Snapshot) -> Result<(), MlsError> {
         let group_state = GroupState {
             data: group_snapshot.mls_encode_to_vec()?.into(),
             id: group_snapshot.state.context.group_id,
@@ -53,13 +51,13 @@ where
 
         self.storage
             .write(group_state, Vec::new(), Vec::new())
-            .await
+
             .map_err(|e| MlsError::GroupStorageError(e.into_any_error()))?;
 
         if let Some(ref key_package_ref) = self.pending_key_package_removal {
             self.key_package_repo
                 .delete(key_package_ref)
-                .await
+
                 .map_err(|e| MlsError::KeyPackageRepoError(e.into_any_error()))?;
         }
 
@@ -81,14 +79,12 @@ mod tests {
     use alloc::vec;
 
     use super::GroupStateRepository;
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn test_snapshot(epoch_id: u64) -> Snapshot {
-        get_test_snapshot(TEST_CIPHER_SUITE, epoch_id).await
+    fn test_snapshot(epoch_id: u64) -> Snapshot {
+        get_test_snapshot(TEST_CIPHER_SUITE, epoch_id)
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_stored_groups_list() {
+    #[test]
+    fn test_stored_groups_list() {
         let mut test_repo = GroupStateRepository::new(
             InMemoryGroupStateStorage::default(),
             InMemoryKeyPackageStorage::default(),
@@ -97,19 +93,19 @@ mod tests {
         .unwrap();
 
         test_repo
-            .write_to_storage(test_snapshot(0).await)
-            .await
+            .write_to_storage(test_snapshot(0))
+
             .unwrap();
 
         assert_eq!(test_repo.storage.stored_groups(), vec![TEST_GROUP])
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn used_key_package_is_deleted() {
+    #[test]
+    fn used_key_package_is_deleted() {
         let key_package_repo = InMemoryKeyPackageStorage::default();
 
         let key_package = test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"member")
-            .await
+
             .0;
 
         let (id, data) = key_package.to_storage().unwrap();
@@ -125,7 +121,7 @@ mod tests {
 
         repo.key_package_repo.get(&key_package.reference).unwrap();
 
-        repo.write_to_storage(test_snapshot(4).await).await.unwrap();
+        repo.write_to_storage(test_snapshot(4)).unwrap();
 
         assert!(repo.key_package_repo.get(&key_package.reference).is_none());
     }

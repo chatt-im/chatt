@@ -52,8 +52,7 @@ pub struct TreeIndex {
 }
 
 #[cfg(feature = "tree_index")]
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(super) async fn index_insert<I: IdentityProvider>(
+pub(super) fn index_insert<I: IdentityProvider>(
     tree_index: &mut TreeIndex,
     new_leaf: &LeafNode,
     new_leaf_idx: LeafIndex,
@@ -63,7 +62,7 @@ pub(super) async fn index_insert<I: IdentityProvider>(
 ) -> Result<(), MlsError> {
     let new_id = id_provider
         .identity(&new_leaf.signing_identity, extensions)
-        .await
+
         .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))?;
 
     tree_index.insert(
@@ -76,8 +75,7 @@ pub(super) async fn index_insert<I: IdentityProvider>(
 }
 
 #[cfg(not(feature = "tree_index"))]
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(super) async fn index_insert<I: IdentityProvider>(
+pub(super) fn index_insert<I: IdentityProvider>(
     nodes: &NodeVec,
     new_leaf: &LeafNode,
     new_leaf_idx: LeafIndex,
@@ -92,7 +90,7 @@ pub(super) async fn index_insert<I: IdentityProvider>(
 
     let new_id = id_provider
         .identity(&new_leaf.signing_identity, extensions)
-        .await
+
         .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))?;
 
     for (i, leaf) in nodes.non_empty_leaves().filter(|(i, _)| i != &new_leaf_idx) {
@@ -106,7 +104,7 @@ pub(super) async fn index_insert<I: IdentityProvider>(
 
         let id = id_provider
             .identity(&leaf.signing_identity, extensions)
-            .await
+
             .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))?;
 
         (new_id != id)
@@ -344,21 +342,17 @@ mod tests {
         pub leaf_node: LeafNode,
         pub index: LeafIndex,
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn get_test_data(index: LeafIndex) -> TestData {
+    fn get_test_data(index: LeafIndex) -> TestData {
         let cipher_suite = TEST_CIPHER_SUITE;
-        let leaf_node = get_basic_test_node(cipher_suite, &format!("foo{}", *index)).await;
+        let leaf_node = get_basic_test_node(cipher_suite, &format!("foo{}", *index));
 
         TestData { leaf_node, index }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn test_setup() -> (Vec<TestData>, TreeIndex) {
+    fn test_setup() -> (Vec<TestData>, TreeIndex) {
         let mut test_data = Vec::new();
 
         for i in 0..10 {
-            test_data.push(get_test_data(LeafIndex::unchecked(i)).await);
+            test_data.push(get_test_data(LeafIndex::unchecked(i)));
         }
 
         let mut test_index = TreeIndex::new();
@@ -377,9 +371,9 @@ mod tests {
         (test_data, test_index)
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_insert() {
-        let (test_data, test_index) = test_setup().await;
+    #[test]
+    fn test_insert() {
+        let (test_data, test_index) = test_setup();
 
         assert_eq!(test_index.credential_signature_key.len(), test_data.len());
         assert_eq!(test_index.hpke_key.len(), test_data.len());
@@ -399,13 +393,13 @@ mod tests {
         })
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_insert_duplicate_credential_key() {
-        let (test_data, mut test_index) = test_setup().await;
+    #[test]
+    fn test_insert_duplicate_credential_key() {
+        let (test_data, mut test_index) = test_setup();
 
         let before_error = test_index.clone();
 
-        let mut new_key_package = get_basic_test_node(TEST_CIPHER_SUITE, "foo").await;
+        let mut new_key_package = get_basic_test_node(TEST_CIPHER_SUITE, "foo");
         new_key_package.signing_identity = test_data[1].leaf_node.signing_identity.clone();
 
         let res = test_index.insert(
@@ -421,13 +415,13 @@ mod tests {
         assert_eq!(before_error, test_index);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_insert_duplicate_hpke_key() {
+    #[test]
+    fn test_insert_duplicate_hpke_key() {
         let cipher_suite = TEST_CIPHER_SUITE;
-        let (test_data, mut test_index) = test_setup().await;
+        let (test_data, mut test_index) = test_setup();
         let before_error = test_index.clone();
 
-        let mut new_leaf_node = get_basic_test_node(cipher_suite, "foo").await;
+        let mut new_leaf_node = get_basic_test_node(cipher_suite, "foo");
         new_leaf_node.public_key = test_data[1].leaf_node.public_key.clone();
 
         let res = test_index.insert(
@@ -443,9 +437,9 @@ mod tests {
         assert_eq!(before_error, test_index);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_remove() {
-        let (test_data, mut test_index) = test_setup().await;
+    #[test]
+    fn test_remove() {
+        let (test_data, mut test_index) = test_setup();
 
         test_index.remove(
             &test_data[1].leaf_node,
@@ -473,12 +467,12 @@ mod tests {
     }
 
     #[cfg(feature = "custom_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn custom_proposals() {
+    #[test]
+    fn custom_proposals() {
         let test_proposal_id = ProposalType::new(42);
         let other_proposal_id = ProposalType::new(45);
 
-        let mut test_data_1 = get_test_data(LeafIndex::unchecked(0)).await;
+        let mut test_data_1 = get_test_data(LeafIndex::unchecked(0));
 
         test_data_1
             .leaf_node
@@ -486,7 +480,7 @@ mod tests {
             .proposals
             .push(test_proposal_id);
 
-        let mut test_data_2 = get_test_data(LeafIndex::unchecked(1)).await;
+        let mut test_data_2 = get_test_data(LeafIndex::unchecked(1));
 
         test_data_2
             .leaf_node

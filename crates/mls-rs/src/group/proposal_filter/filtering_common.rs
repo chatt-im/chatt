@@ -91,9 +91,7 @@ where
             psk_storage,
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn apply_proposals(
+    pub(crate) fn apply_proposals(
         &self,
         #[cfg(feature = "by_ref_proposal")] strategy: FilterStrategy,
         commit_sender: &Sender,
@@ -110,11 +108,11 @@ where
                     proposals,
                     commit_time,
                 )
-                .await
+
             }
             Sender::NewMemberCommit => {
                 self.apply_proposals_from_new_member(proposals, commit_time)
-                    .await
+
             }
             #[cfg(feature = "by_ref_proposal")]
             Sender::External(_) => Err(MlsError::ExternalSenderCannotCommit),
@@ -124,11 +122,9 @@ where
 
         Ok(output)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     // The lint below is triggered by the `proposals` parameter which may or may not be a borrow.
     #[allow(clippy::needless_borrow)]
-    async fn apply_proposals_from_new_member(
+    fn apply_proposals_from_new_member(
         &self,
         #[cfg(not(feature = "by_ref_proposal"))] proposals: &ProposalBundle,
         #[cfg(feature = "by_ref_proposal")] proposals: ProposalBundle,
@@ -147,7 +143,7 @@ where
             self.identity_provider,
             &self.original_context.extensions,
         )
-        .await?;
+        ?;
 
         ensure_proposals_in_external_commit_are_allowed(&proposals)?;
         ensure_no_proposal_by_ref(&proposals)?;
@@ -165,7 +161,7 @@ where
             proposals,
             self.psk_storage,
         )
-        .await?;
+        ?;
 
         let mut output = self
             .apply_proposal_changes(
@@ -174,7 +170,7 @@ where
                 proposals,
                 commit_time,
             )
-            .await?;
+            ?;
 
         output.external_init_index = Some(
             insert_external_leaf(
@@ -183,14 +179,12 @@ where
                 self.identity_provider,
                 &self.original_context.extensions,
             )
-            .await?,
+            ?,
         );
 
         Ok(output)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn apply_proposals_with_new_capabilities(
+    pub(super) fn apply_proposals_with_new_capabilities(
         &self,
         #[cfg(feature = "by_ref_proposal")] strategy: FilterStrategy,
         #[cfg(not(feature = "by_ref_proposal"))] proposals: &ProposalBundle,
@@ -213,7 +207,7 @@ where
                 &group_context_extensions_proposal.proposal,
                 commit_time,
             )
-            .await?;
+            ?;
 
         // Verify that capabilities and extensions are supported after modifications.
         // TODO: The newly inserted nodes have already been validated by `apply_tree_changes`
@@ -290,7 +284,7 @@ where
                         &self.original_context.extensions,
                         commit_time,
                     )
-                    .await
+
                 } else {
                     Err(e)
                 }
@@ -299,8 +293,7 @@ where
     }
 
     #[cfg(any(mls_build_async, not(feature = "rayon")))]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn validate_new_node<Ip: IdentityProvider, Cp: CipherSuiteProvider>(
+    pub fn validate_new_node<Ip: IdentityProvider, Cp: CipherSuiteProvider>(
         &self,
         leaf_node_validator: &LeafNodeValidator<'_, Ip, Cp>,
         key_package: &KeyPackage,
@@ -308,14 +301,14 @@ where
     ) -> Result<(), MlsError> {
         leaf_node_validator
             .check_if_valid(&key_package.leaf_node, ValidationContext::Add(commit_time))
-            .await?;
+            ?;
 
         validate_key_package_properties(
             key_package,
             self.original_context.protocol_version,
             self.cipher_suite_provider,
         )
-        .await
+
     }
 
     #[cfg(all(not(mls_build_async), feature = "rayon"))]
@@ -371,8 +364,7 @@ pub(crate) fn prepare_proposals_for_mls_rules(
 }
 
 #[cfg(feature = "psk")]
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn filter_out_invalid_psks<P, CP>(
+pub(crate) fn filter_out_invalid_psks<P, CP>(
     #[cfg(feature = "by_ref_proposal")] strategy: FilterStrategy,
     cipher_suite_provider: &CP,
     #[cfg(not(feature = "by_ref_proposal"))] proposals: &ProposalBundle,
@@ -418,7 +410,7 @@ where
         let external_id_is_valid = match &p.proposal.psk.key_id {
             JustPreSharedKeyID::External(id) => psk_storage
                 .contains(id)
-                .await
+
                 .map_err(|e| MlsError::PskStoreError(e.into_any_error()))
                 .and_then(|found| {
                     if found {
@@ -472,8 +464,7 @@ where
 }
 
 #[cfg(not(feature = "psk"))]
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn filter_out_invalid_psks<P, CP>(
+pub(crate) fn filter_out_invalid_psks<P, CP>(
     #[cfg(feature = "by_ref_proposal")] _: FilterStrategy,
     _: &CP,
     #[cfg(not(feature = "by_ref_proposal"))] _: &ProposalBundle,
@@ -523,9 +514,7 @@ fn ensure_proposals_in_external_commit_are_allowed(
         None => Ok(()),
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-async fn ensure_at_most_one_removal_for_self<C>(
+fn ensure_at_most_one_removal_for_self<C>(
     proposals: &ProposalBundle,
     external_leaf: &LeafNode,
     tree: &TreeKemPublic,
@@ -548,15 +537,13 @@ where
                 identity_provider,
                 extensions,
             )
-            .await
+
         }
         (Some(_), Some(_)) => Err(MlsError::ExternalCommitWithMoreThanOneRemove),
         (None, _) => Ok(()),
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-async fn ensure_removal_is_for_self<C>(
+fn ensure_removal_is_for_self<C>(
     removal: &RemoveProposal,
     external_leaf: &LeafNode,
     tree: &TreeKemPublic,
@@ -574,7 +561,7 @@ where
             &external_leaf.signing_identity,
             extensions,
         )
-        .await
+
         .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))?
         .then_some(())
         .ok_or(MlsError::ExternalCommitRemovesOtherIdentity)
@@ -589,14 +576,12 @@ fn ensure_no_proposal_by_ref(proposals: &ProposalBundle) -> Result<(), MlsError>
         .then_some(())
         .ok_or(MlsError::OnlyMembersCanCommitProposalsByRef)
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-async fn insert_external_leaf<I: IdentityProvider>(
+fn insert_external_leaf<I: IdentityProvider>(
     tree: &mut TreeKemPublic,
     leaf_node: LeafNode,
     identity_provider: &I,
     extensions: &ExtensionList,
 ) -> Result<LeafIndex, MlsError> {
     tree.add_leaf(leaf_node, identity_provider, extensions, None)
-        .await
+
 }

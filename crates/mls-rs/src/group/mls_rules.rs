@@ -127,8 +127,6 @@ impl EncryptionOptions {
 }
 
 /// A set of user controlled rules that customize the behavior of MLS.
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 pub trait MlsRules: Send + Sync {
     type Error: IntoAnyError;
 
@@ -152,7 +150,7 @@ pub trait MlsRules: Send + Sync {
     /// removes a moderator can result in adding a GroupContextExtensions proposal that updates
     /// the moderator list in the group context. The resulting `ProposalBundle` is validated
     /// by the library.
-    async fn filter_proposals(
+    fn filter_proposals(
         &self,
         direction: CommitDirection,
         source: CommitSource,
@@ -188,13 +186,9 @@ pub trait MlsRules: Send + Sync {
 
 macro_rules! delegate_mls_rules {
     ($implementer:ty) => {
-        #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-        #[cfg_attr(mls_build_async, maybe_async::must_be_async)]
         impl<T: MlsRules + ?Sized> MlsRules for $implementer {
             type Error = T::Error;
-
-            #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-            async fn filter_proposals(
+            fn filter_proposals(
                 &self,
                 direction: CommitDirection,
                 source: CommitSource,
@@ -204,7 +198,7 @@ macro_rules! delegate_mls_rules {
             ) -> Result<ProposalBundle, Self::Error> {
                 (**self)
                     .filter_proposals(direction, source, current_roster, context, proposals)
-                    .await
+
             }
 
             fn commit_options(
@@ -261,13 +255,10 @@ impl DefaultMlsRules {
         }
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 impl MlsRules for DefaultMlsRules {
     type Error = Infallible;
 
-    async fn filter_proposals(
+    fn filter_proposals(
         &self,
         _direction: CommitDirection,
         _source: CommitSource,

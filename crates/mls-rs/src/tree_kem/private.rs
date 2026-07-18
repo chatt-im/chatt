@@ -37,9 +37,7 @@ impl TreeKemPrivate {
             secret_keys: Default::default(),
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn update_secrets<P: CipherSuiteProvider>(
+    pub fn update_secrets<P: CipherSuiteProvider>(
         &mut self,
         cipher_suite_provider: &P,
         signer_index: LeafIndex,
@@ -68,7 +66,7 @@ impl TreeKemPrivate {
                 continue;
             }
 
-            let secret = node_secret_gen.next_secret().await?;
+            let secret = node_secret_gen.next_secret()?;
 
             let expected_pub_key = public_tree
                 .nodes
@@ -77,7 +75,7 @@ impl TreeKemPrivate {
                 .map(|n| n.public_key())
                 .ok_or(MlsError::PubKeyMismatch)?;
 
-            let (secret_key, public_key) = secret.to_hpke_key_pair(cipher_suite_provider).await?;
+            let (secret_key, public_key) = secret.to_hpke_key_pair(cipher_suite_provider)?;
 
             if expected_pub_key != &public_key {
                 return Err(MlsError::PubKeyMismatch);
@@ -128,20 +126,18 @@ mod tests {
     };
 
     use super::*;
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn random_hpke_secret_key() -> HpkeSecretKey {
+    fn random_hpke_secret_key() -> HpkeSecretKey {
         let (secret, _) = test_cipher_suite_provider(TEST_CIPHER_SUITE)
             .kem_derive(&random_bytes(32))
-            .await
+
             .unwrap();
 
         secret
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_create_self_leaf() {
-        let secret = random_hpke_secret_key().await;
+    #[test]
+    fn test_create_self_leaf() {
+        let secret = random_hpke_secret_key();
 
         let self_index = LeafIndex::unchecked(42);
 
@@ -155,19 +151,18 @@ mod tests {
     // Create a ratchet tree for Alice, Bob and Charlie. Alice generates an update path for
     // Charlie. Return (Public Tree, Charlie's private key, update path, path secret)
     // The ratchet tree returned has leaf indexes as [alice, bob, charlie]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn update_secrets_setup(
+    fn update_secrets_setup(
         cipher_suite: CipherSuite,
     ) -> (TreeKemPublic, TreeKemPrivate, TreeKemPrivate, PathSecret) {
         let cipher_suite_provider = test_cipher_suite_provider(cipher_suite);
 
         let (alice_leaf, alice_hpke_secret, alice_signing) =
-            get_basic_test_node_sig_key(cipher_suite, "alice").await;
+            get_basic_test_node_sig_key(cipher_suite, "alice");
 
-        let bob_leaf = get_basic_test_node(cipher_suite, "bob").await;
+        let bob_leaf = get_basic_test_node(cipher_suite, "bob");
 
         let (charlie_leaf, charlie_hpke_secret, _charlie_signing) =
-            get_basic_test_node_sig_key(cipher_suite, "charlie").await;
+            get_basic_test_node_sig_key(cipher_suite, "charlie");
 
         // Create a new public tree with Alice
         let (mut public_tree, mut alice_private) = TreeKemPublic::derive(
@@ -176,7 +171,7 @@ mod tests {
             &BasicIdentityProvider,
             &Default::default(),
         )
-        .await
+
         .unwrap();
 
         // Add bob and charlie to the tree
@@ -186,7 +181,7 @@ mod tests {
                 &BasicIdentityProvider,
                 &cipher_suite_provider,
             )
-            .await
+
             .unwrap();
 
         // Alice's secret key is longer now
@@ -195,7 +190,7 @@ mod tests {
         // Generate an update path for Alice
         let encap_gen = TreeKem::new(&mut public_tree, &mut alice_private)
             .encap(
-                &mut get_test_group_context(42, cipher_suite).await,
+                &mut get_test_group_context(42, cipher_suite),
                 &[],
                 &alice_signing,
                 Some(default_properties()),
@@ -204,7 +199,7 @@ mod tests {
                 #[cfg(test)]
                 &Default::default(),
             )
-            .await
+
             .unwrap();
 
         // Get a path secret from Alice for Charlie
@@ -217,12 +212,12 @@ mod tests {
         (public_tree, charlie_private, alice_private, path_secret)
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_update_secrets() {
+    #[test]
+    fn test_update_secrets() {
         let cipher_suite = TEST_CIPHER_SUITE;
 
         let (public_tree, mut charlie_private, alice_private, path_secret) =
-            update_secrets_setup(cipher_suite).await;
+            update_secrets_setup(cipher_suite);
 
         let existing_private = charlie_private.secret_keys.first().cloned().unwrap();
 
@@ -234,7 +229,7 @@ mod tests {
                 path_secret,
                 &public_tree,
             )
-            .await
+
             .unwrap();
 
         // Make sure that Charlie's private key didn't lose keys
@@ -250,12 +245,12 @@ mod tests {
         );
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_update_secrets_key_mismatch() {
+    #[test]
+    fn test_update_secrets_key_mismatch() {
         let cipher_suite = TEST_CIPHER_SUITE;
 
         let (mut public_tree, mut charlie_private, _, path_secret) =
-            update_secrets_setup(cipher_suite).await;
+            update_secrets_setup(cipher_suite);
 
         // Sabotage the public tree
         public_tree
@@ -272,15 +267,14 @@ mod tests {
                 path_secret,
                 &public_tree,
             )
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::PubKeyMismatch));
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn setup_direct_path(self_index: LeafIndex, leaf_count: u32) -> TreeKemPrivate {
-        let secret = random_hpke_secret_key().await;
+    fn setup_direct_path(self_index: LeafIndex, leaf_count: u32) -> TreeKemPrivate {
+        let secret = random_hpke_secret_key();
 
         let mut private_key = TreeKemPrivate::new_self_leaf(self_index, secret.clone());
 
@@ -292,12 +286,12 @@ mod tests {
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_update_leaf() {
+    #[test]
+    fn test_update_leaf() {
         let self_leaf = LeafIndex::unchecked(42);
-        let mut private_key = setup_direct_path(self_leaf, 128).await;
+        let mut private_key = setup_direct_path(self_leaf, 128);
 
-        let new_secret = random_hpke_secret_key().await;
+        let new_secret = random_hpke_secret_key();
 
         private_key.update_leaf(new_secret.clone());
 

@@ -68,8 +68,7 @@ impl From<Vec<u8>> for HashReference {
 }
 
 impl HashReference {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn compute<P: CipherSuiteProvider>(
+    pub fn compute<P: CipherSuiteProvider>(
         value: &[u8],
         label: &[u8],
         cipher_suite: &P,
@@ -79,7 +78,7 @@ impl HashReference {
 
         cipher_suite
             .hash(&input_bytes)
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))
             .map(HashReference)
     }
@@ -148,8 +147,8 @@ mod tests {
         panic!("Tests cannot be generated in async mode");
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_basic_crypto_test_vectors() {
+    #[test]
+    fn test_basic_crypto_test_vectors() {
         // The test vector can be found here https://github.com/mlswg/mls-implementations/blob/main/test-vectors/crypto-basics.json
         let test_cases: Vec<InteropTestCase> =
             load_test_case_json!(basic_crypto, generate_test_vector());
@@ -158,7 +157,7 @@ mod tests {
             if let Some(cs) = try_test_cipher_suite_provider(test_case.cipher_suite) {
                 let label = test_case.ref_hash.label.as_bytes();
                 let value = &test_case.ref_hash.value;
-                let computed = HashReference::compute(value, label, &cs).await.unwrap();
+                let computed = HashReference::compute(value, label, &cs).unwrap();
                 assert_eq!(&*computed, &test_case.ref_hash.out);
             }
         }

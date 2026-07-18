@@ -61,8 +61,7 @@ impl PskSecret {
     }
 
     #[cfg(feature = "psk")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn calculate<P: CipherSuiteProvider>(
+    pub(crate) fn calculate<P: CipherSuiteProvider>(
         input: &[PskSecretInput],
         cipher_suite_provider: &P,
     ) -> Result<PskSecret, MlsError> {
@@ -83,7 +82,7 @@ impl PskSecret {
                     &vec![0; cipher_suite_provider.kdf_extract_size()],
                     &psk_secret_input.psk,
                 )
-                .await
+
                 .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
 
             let psk_input = kdf_expand_with_label(
@@ -93,11 +92,11 @@ impl PskSecret {
                 &label.mls_encode_to_vec()?,
                 None,
             )
-            .await?;
+            ?;
 
             psk_secret = cipher_suite_provider
                 .kdf_extract(&psk_input, &psk_secret)
-                .await
+
                 .map(PskSecret)
                 .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
         }
@@ -206,9 +205,7 @@ mod tests {
         fn generate() -> Vec<TestScenario> {
             panic!("Tests cannot be generated in async mode");
         }
-
-        #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-        async fn compute_psk_secret<P: CipherSuiteProvider>(
+        fn compute_psk_secret<P: CipherSuiteProvider>(
             provider: &P,
             psks: Vec<PskInfo>,
         ) -> PskSecret {
@@ -217,19 +214,19 @@ mod tests {
                 .map(PskSecretInput::from)
                 .collect::<Vec<_>>();
 
-            PskSecret::calculate(&input, provider).await.unwrap()
+            PskSecret::calculate(&input, provider).unwrap()
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn expected_psk_secret_is_produced() {
+    #[test]
+    fn expected_psk_secret_is_produced() {
         let scenarios: Vec<TestScenario> =
             load_test_case_json!(psk_secret, TestScenario::generate());
 
         for scenario in scenarios {
             if let Some(provider) = try_test_cipher_suite_provider(scenario.cipher_suite) {
                 let computed =
-                    TestScenario::compute_psk_secret(&provider, scenario.psks.clone()).await;
+                    TestScenario::compute_psk_secret(&provider, scenario.psks.clone());
 
                 assert_eq!(scenario.psk_secret, computed.to_vec());
             }

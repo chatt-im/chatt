@@ -432,13 +432,6 @@ impl From<Unspecified> for AwsLcCryptoError {
 }
 
 impl IntoAnyError for AwsLcCryptoError {}
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(all(target_arch = "wasm32", mls_build_async), maybe_async::must_be_async(?Send))]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), mls_build_async),
-    maybe_async::must_be_async
-)]
 impl CipherSuiteProvider for AwsLcCipherSuite {
     type Error = AwsLcCryptoError;
 
@@ -449,25 +442,25 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
         self.cipher_suite
     }
 
-    async fn hash(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
+    fn hash(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
         self.hash.hash(data)
     }
 
-    async fn mac(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Self::Error> {
+    fn mac(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Self::Error> {
         self.hmac.hmac(key, data)
     }
 
-    async fn aead_seal(
+    fn aead_seal(
         &self,
         key: &[u8],
         data: &[u8],
         aad: Option<&[u8]>,
         nonce: &[u8],
     ) -> Result<Vec<u8>, Self::Error> {
-        self.aead.seal(key, data, aad, nonce).await
+        self.aead.seal(key, data, aad, nonce)
     }
 
-    async fn aead_open(
+    fn aead_open(
         &self,
         key: &[u8],
         ciphertext: &[u8],
@@ -476,7 +469,7 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
     ) -> Result<Zeroizing<Vec<u8>>, Self::Error> {
         self.aead
             .open(key, ciphertext, aad, nonce)
-            .await
+
             .map(Into::into)
     }
 
@@ -488,28 +481,28 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
         self.aead.nonce_size()
     }
 
-    async fn kdf_extract(
+    fn kdf_extract(
         &self,
         salt: &[u8],
         ikm: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, Self::Error> {
-        self.kdf.extract(salt, ikm).await.map(Into::into)
+        self.kdf.extract(salt, ikm).map(Into::into)
     }
 
-    async fn kdf_expand(
+    fn kdf_expand(
         &self,
         prk: &[u8],
         info: &[u8],
         len: usize,
     ) -> Result<Zeroizing<Vec<u8>>, Self::Error> {
-        self.kdf.expand(prk, info, len).await.map(Into::into)
+        self.kdf.expand(prk, info, len).map(Into::into)
     }
 
     fn kdf_extract_size(&self) -> usize {
         self.kdf.extract_size()
     }
 
-    async fn hpke_seal(
+    fn hpke_seal(
         &self,
         remote_key: &HpkePublicKey,
         info: &[u8],
@@ -523,11 +516,11 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
             #[cfg(feature = "post-quantum")]
             AwsLcHpke::Combined(hpke) => hpke.seal(remote_key, info, None, aad, pt),
         }
-        .await
+
         .map_err(Into::into)
     }
 
-    async fn hpke_seal_psk(
+    fn hpke_seal_psk(
         &self,
         remote_key: &HpkePublicKey,
         info: &[u8],
@@ -543,11 +536,11 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
             #[cfg(feature = "post-quantum")]
             AwsLcHpke::Combined(hpke) => hpke.seal(remote_key, info, psk_val, aad, pt),
         }
-        .await
+
         .map_err(Into::into)
     }
 
-    async fn hpke_open(
+    fn hpke_open(
         &self,
         ciphertext: &HpkeCiphertext,
         local_secret: &HpkeSecretKey,
@@ -568,11 +561,11 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
                 hpke.open(ciphertext, local_secret, local_public, info, None, aad)
             }
         }
-        .await
+
         .map_err(Into::into)
     }
 
-    async fn hpke_open_psk(
+    fn hpke_open_psk(
         &self,
         ciphertext: &HpkeCiphertext,
         local_secret: &HpkeSecretKey,
@@ -595,11 +588,11 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
                 hpke.open(ciphertext, local_secret, local_public, info, psk_val, aad)
             }
         }
-        .await
+
         .map_err(Into::into)
     }
 
-    async fn hpke_setup_s(
+    fn hpke_setup_s(
         &self,
         remote_key: &HpkePublicKey,
         info: &[u8],
@@ -611,11 +604,11 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
             #[cfg(feature = "post-quantum")]
             AwsLcHpke::Combined(hpke) => hpke.setup_sender(remote_key, info, None),
         }
-        .await
+
         .map_err(Into::into)
     }
 
-    async fn hpke_setup_r(
+    fn hpke_setup_r(
         &self,
         kem_output: &[u8],
         local_secret: &HpkeSecretKey,
@@ -635,11 +628,11 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
                 hpke.setup_receiver(kem_output, local_secret, local_public, info, None)
             }
         }
-        .await
+
         .map_err(Into::into)
     }
 
-    async fn kem_derive(&self, ikm: &[u8]) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
+    fn kem_derive(&self, ikm: &[u8]) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
         match &self.hpke {
             AwsLcHpke::Classical(hpke) => hpke.derive(ikm),
             #[cfg(feature = "post-quantum")]
@@ -647,11 +640,11 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
             #[cfg(feature = "post-quantum")]
             AwsLcHpke::Combined(hpke) => hpke.derive(ikm),
         }
-        .await
+
         .map_err(Into::into)
     }
 
-    async fn kem_generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
+    fn kem_generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
         match &self.hpke {
             AwsLcHpke::Classical(hpke) => hpke.generate(),
             #[cfg(feature = "post-quantum")]
@@ -659,7 +652,7 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
             #[cfg(feature = "post-quantum")]
             AwsLcHpke::Combined(hpke) => hpke.generate(),
         }
-        .await
+
         .map_err(Into::into)
     }
 
@@ -678,20 +671,20 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
         Ok(aws_lc_rs::rand::fill(out)?)
     }
 
-    async fn signature_key_generate(
+    fn signature_key_generate(
         &self,
     ) -> Result<(SignatureSecretKey, SignaturePublicKey), Self::Error> {
         self.signing.signature_key_generate()
     }
 
-    async fn signature_key_derive_public(
+    fn signature_key_derive_public(
         &self,
         secret_key: &SignatureSecretKey,
     ) -> Result<SignaturePublicKey, Self::Error> {
         self.signing.signature_key_derive_public(secret_key)
     }
 
-    async fn sign(
+    fn sign(
         &self,
         secret_key: &SignatureSecretKey,
         data: &[u8],
@@ -699,7 +692,7 @@ impl CipherSuiteProvider for AwsLcCipherSuite {
         self.signing.sign(secret_key, data)
     }
 
-    async fn verify(
+    fn verify(
         &self,
         public_key: &SignaturePublicKey,
         signature: &[u8],

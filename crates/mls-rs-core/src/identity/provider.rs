@@ -35,8 +35,6 @@ impl MemberValidationContext<'_> {
 
 /// Identity system that can be used to validate a
 /// [`SigningIdentity`](mls-rs-core::identity::SigningIdentity)
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 pub trait IdentityProvider: Send + Sync {
     /// Error type that this provider returns on internal failure.
     type Error: IntoAnyError;
@@ -46,7 +44,7 @@ pub trait IdentityProvider: Send + Sync {
     /// A `timestamp` value can optionally be supplied to aid with validation
     /// of a [`Credential`](mls-rs-core::identity::Credential) that requires
     /// time based context. For example, X.509 certificates can become expired.
-    async fn validate_member(
+    fn validate_member(
         &self,
         signing_identity: &SigningIdentity,
         timestamp: Option<MlsTime>,
@@ -59,7 +57,7 @@ pub trait IdentityProvider: Send + Sync {
     /// A `timestamp` value can optionally be supplied to aid with validation
     /// of a [`Credential`](mls-rs-core::identity::Credential) that requires
     /// time based context. For example, X.509 certificates can become expired.
-    async fn validate_external_sender(
+    fn validate_external_sender(
         &self,
         signing_identity: &SigningIdentity,
         timestamp: Option<MlsTime>,
@@ -75,7 +73,7 @@ pub trait IdentityProvider: Send + Sync {
     /// The identity does not need to be consistent for different
     /// group members: Alice might use `b"bob-123"` as the identity
     /// for Bob, while Bob on his side could use `b"Bob"` for himself.
-    async fn identity(
+    fn identity(
         &self,
         signing_identity: &SigningIdentity,
         extensions: &ExtensionList,
@@ -87,7 +85,7 @@ pub trait IdentityProvider: Send + Sync {
     /// new member via external commit. This function determines if a removal
     /// should be allowed by providing the target member to be removed as
     /// `predecessor` and the new member as `successor`.
-    async fn valid_successor(
+    fn valid_successor(
         &self,
         predecessor: &SigningIdentity,
         successor: &SigningIdentity,

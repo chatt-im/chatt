@@ -102,9 +102,7 @@ impl<'a, C: IdentityProvider, CP: CipherSuiteProvider> LeafNodeValidator<'a, C, 
 
         Ok(())
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn revalidate(
+    pub fn revalidate(
         &self,
         leaf_node: &LeafNode,
         group_id: &[u8],
@@ -119,7 +117,7 @@ impl<'a, C: IdentityProvider, CP: CipherSuiteProvider> LeafNodeValidator<'a, C, 
             }
         };
 
-        self.check_if_valid(leaf_node, context).await
+        self.check_if_valid(leaf_node, context)
     }
 
     pub fn validate_required_capabilities(&self, leaf_node: &LeafNode) -> Result<(), MlsError> {
@@ -177,9 +175,7 @@ impl<'a, C: IdentityProvider, CP: CipherSuiteProvider> LeafNodeValidator<'a, C, 
                 .ok_or(MlsError::RequiredCredentialNotFound(cred_type))
         })
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn check_if_valid(
+    pub(crate) fn check_if_valid(
         &self,
         leaf_node: &LeafNode,
         context: ValidationContext<'_>,
@@ -194,7 +190,7 @@ impl<'a, C: IdentityProvider, CP: CipherSuiteProvider> LeafNodeValidator<'a, C, 
                 context.generation_time(),
                 self.context,
             )
-            .await
+
             .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))?;
 
         // Verify that the credential signed the leaf node
@@ -204,7 +200,7 @@ impl<'a, C: IdentityProvider, CP: CipherSuiteProvider> LeafNodeValidator<'a, C, 
                 &leaf_node.signing_identity.signature_key,
                 &context.signing_context(),
             )
-            .await?;
+            ?;
 
         // If required capabilities are specified, verify the leaf node meets the requirements
         self.validate_required_capabilities(leaf_node)?;
@@ -301,54 +297,52 @@ mod tests {
             }
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn get_test_add_node() -> (LeafNode, SignatureSecretKey) {
-        let (signing_identity, secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"foo").await;
+    fn get_test_add_node() -> (LeafNode, SignatureSecretKey) {
+        let (signing_identity, secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"foo");
 
         let (leaf_node, _) =
-            get_test_node(TEST_CIPHER_SUITE, signing_identity, &secret, None, None).await;
+            get_test_node(TEST_CIPHER_SUITE, signing_identity, &secret, None, None);
 
         (leaf_node, secret)
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_basic_add_validation() {
+    #[test]
+    fn test_basic_add_validation() {
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
-        let (leaf_node, _) = get_test_add_node().await;
+        let (leaf_node, _) = get_test_add_node();
 
         let test_validator =
             LeafNodeValidator::new_for_test(&cipher_suite_provider, &BasicIdentityProvider);
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(None))
-            .await;
+            ;
 
         assert_matches!(res, Ok(_));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_failed_validation() {
+    #[test]
+    fn test_failed_validation() {
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
-        let (leaf_node, _) = get_test_add_node().await;
+        let (leaf_node, _) = get_test_add_node();
 
         let fail_test_validator =
             LeafNodeValidator::new_for_test(&cipher_suite_provider, &FailureIdentityProvider);
 
         let res = fail_test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(None))
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::IdentityProviderError(_)));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_basic_update_validation() {
+    #[test]
+    fn test_basic_update_validation() {
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
         let group_id = b"group_id";
 
-        let (mut leaf_node, secret) = get_test_add_node().await;
+        let (mut leaf_node, secret) = get_test_add_node();
 
         leaf_node
             .update(
@@ -360,7 +354,7 @@ mod tests {
                 None,
                 &secret,
             )
-            .await
+
             .unwrap();
 
         let test_validator =
@@ -368,17 +362,17 @@ mod tests {
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Update((group_id, 0, None)))
-            .await;
+            ;
 
         assert_matches!(res, Ok(_));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_basic_commit_validation() {
+    #[test]
+    fn test_basic_commit_validation() {
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
         let group_id = b"group_id";
 
-        let (mut leaf_node, secret) = get_test_add_node().await;
+        let (mut leaf_node, secret) = get_test_add_node();
 
         leaf_node.leaf_node_source = LeafNodeSource::Commit(hex!("f00d").into());
 
@@ -391,7 +385,7 @@ mod tests {
                 None,
                 &secret,
             )
-            .await
+
             .unwrap();
 
         let test_validator =
@@ -399,29 +393,29 @@ mod tests {
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Commit((group_id, 0, None)))
-            .await;
+            ;
 
         assert_matches!(res, Ok(_));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_incorrect_context() {
+    #[test]
+    fn test_incorrect_context() {
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
         let test_validator =
             LeafNodeValidator::new_for_test(&cipher_suite_provider, &BasicIdentityProvider);
 
-        let (mut leaf_node, secret) = get_test_add_node().await;
+        let (mut leaf_node, secret) = get_test_add_node();
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Update((b"foo", 0, None)))
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::InvalidLeafNodeSource));
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Commit((b"foo", 0, None)))
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::InvalidLeafNodeSource));
 
@@ -434,18 +428,18 @@ mod tests {
                 None,
                 &secret,
             )
-            .await
+
             .unwrap();
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(None))
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::InvalidLeafNodeSource));
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Commit((b"foo", 0, None)))
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::InvalidLeafNodeSource));
 
@@ -460,31 +454,31 @@ mod tests {
                 None,
                 &secret,
             )
-            .await
+
             .unwrap();
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(None))
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::InvalidLeafNodeSource));
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Update((b"foo", 0, None)))
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::InvalidLeafNodeSource));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_bad_signature() {
+    #[test]
+    fn test_bad_signature() {
         for cipher_suite in TestCryptoProvider::all_supported_cipher_suites() {
             let cipher_suite_provider = test_cipher_suite_provider(cipher_suite);
 
-            let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo").await;
+            let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo");
 
             let (mut leaf_node, _) =
-                get_test_node(cipher_suite, signing_identity, &secret, None, None).await;
+                get_test_node(cipher_suite, signing_identity, &secret, None, None);
 
             leaf_node.signature = random_bytes(leaf_node.signature.len());
 
@@ -493,15 +487,15 @@ mod tests {
 
             let res = test_validator
                 .check_if_valid(&leaf_node, ValidationContext::Add(None))
-                .await;
+                ;
 
             assert_matches!(res, Err(MlsError::InvalidSignature));
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_capabilities_mismatch() {
-        let (signing_identity, secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"foo").await;
+    #[test]
+    fn test_capabilities_mismatch() {
+        let (signing_identity, secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"foo");
 
         let mut extensions = ExtensionList::new();
 
@@ -519,7 +513,7 @@ mod tests {
             Some(capabilities),
             Some(extensions),
         )
-        .await;
+        ;
 
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
@@ -528,37 +522,37 @@ mod tests {
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(None))
-            .await;
+            ;
 
         assert_matches!(res,
             Err(MlsError::ExtensionNotInCapabilities(ext)) if ext == 42.into());
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_cipher_suite_mismatch() {
+    #[test]
+    fn test_cipher_suite_mismatch() {
         for another_cipher_suite in CipherSuite::all().filter(|cs| cs != &TEST_CIPHER_SUITE) {
             if let Some(cs) = try_test_cipher_suite_provider(*another_cipher_suite) {
-                let (leaf_node, _) = get_test_add_node().await;
+                let (leaf_node, _) = get_test_add_node();
 
                 let test_validator = LeafNodeValidator::new_for_test(&cs, &BasicIdentityProvider);
 
                 let res = test_validator
                     .check_if_valid(&leaf_node, ValidationContext::Add(None))
-                    .await;
+                    ;
 
                 assert_matches!(res, Err(MlsError::InvalidSignature));
             }
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_required_extension() {
+    #[test]
+    fn test_required_extension() {
         let required_capabilities = RequiredCapabilitiesExt {
             extensions: vec![43.into()],
             ..Default::default()
         };
 
-        let (leaf_node, _) = get_test_add_node().await;
+        let (leaf_node, _) = get_test_add_node();
 
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
@@ -575,7 +569,7 @@ mod tests {
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(None))
-            .await;
+            ;
 
         assert_matches!(
             res,
@@ -583,8 +577,8 @@ mod tests {
         );
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_required_proposal() {
+    #[test]
+    fn test_required_proposal() {
         let required_capabilities = RequiredCapabilitiesExt {
             proposals: vec![42.into()],
             ..Default::default()
@@ -592,7 +586,7 @@ mod tests {
 
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
-        let (leaf_node, _) = get_test_add_node().await;
+        let (leaf_node, _) = get_test_add_node();
 
         let group_context_extensions =
             core::iter::once(required_capabilities.into_extension().unwrap()).collect();
@@ -607,7 +601,7 @@ mod tests {
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(None))
-            .await;
+            ;
 
         assert_matches!(
             res,
@@ -627,14 +621,14 @@ mod tests {
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_required_credential() {
+    #[test]
+    fn test_required_credential() {
         let required_capabilities = RequiredCapabilitiesExt {
             credentials: vec![0.into()],
             ..Default::default()
         };
 
-        let (leaf_node, _) = get_test_add_node().await;
+        let (leaf_node, _) = get_test_add_node();
 
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
@@ -651,7 +645,7 @@ mod tests {
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(None))
-            .await;
+            ;
 
         assert_matches!(res,
             Err(MlsError::RequiredCredentialNotFound(ext)) if ext == 0.into()
@@ -659,9 +653,9 @@ mod tests {
     }
 
     #[cfg(feature = "std")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_add_lifetime() {
-        let (leaf_node, _) = get_test_add_node().await;
+    #[test]
+    fn test_add_lifetime() {
+        let (leaf_node, _) = get_test_add_node();
 
         let cipher_suite_provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
@@ -676,13 +670,13 @@ mod tests {
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(Some(good_lifetime)))
-            .await;
+            ;
 
         assert_matches!(res, Ok(()));
 
         let res = test_validator
             .check_if_valid(&leaf_node, ValidationContext::Add(Some(bad_lifetime)))
-            .await;
+            ;
 
         assert_matches!(
             res,
@@ -728,13 +722,10 @@ pub(crate) mod test_utils {
             Ok(self.into())
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    #[cfg_attr(mls_build_async, maybe_async::must_be_async)]
     impl IdentityProvider for FailureIdentityProvider {
         type Error = TestFailureError;
 
-        async fn validate_member(
+        fn validate_member(
             &self,
             _signing_identity: &SigningIdentity,
             _timestamp: Option<MlsTime>,
@@ -743,7 +734,7 @@ pub(crate) mod test_utils {
             Err(TestFailureError)
         }
 
-        async fn validate_external_sender(
+        fn validate_external_sender(
             &self,
             _signing_identity: &SigningIdentity,
             _timestamp: Option<MlsTime>,
@@ -753,7 +744,7 @@ pub(crate) mod test_utils {
         }
 
         #[cfg_attr(coverage_nightly, coverage(off))]
-        async fn identity(
+        fn identity(
             &self,
             signing_id: &SigningIdentity,
             _extensions: &ExtensionList,
@@ -762,7 +753,7 @@ pub(crate) mod test_utils {
         }
 
         #[cfg_attr(coverage_nightly, coverage(off))]
-        async fn valid_successor(
+        fn valid_successor(
             &self,
             _predecessor: &SigningIdentity,
             _successor: &SigningIdentity,

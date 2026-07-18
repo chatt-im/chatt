@@ -39,7 +39,7 @@ self_remove_proposal = ["mls-rs-core/self_remove_proposal"]
 export_key_generation = []
 gsma_rcs_e2ee_feature = ["mls-rs-core/gsma_rcs_e2ee_feature"]
 
-std = ["mls-rs-core/std", "mls-rs-codec/std", "mls-rs-identity-x509?/std", "hex/std", "futures/std", "itertools/use_std", "zeroize/std", "dep:debug_tree", "dep:thiserror", "serde?/std", "subtle/std"]
+std = ["mls-rs-core/std", "mls-rs-codec/std", "mls-rs-identity-x509?/std", "hex/std", "itertools/use_std", "zeroize/std", "dep:debug_tree", "dep:thiserror", "serde?/std", "subtle/std"]
 
 serde = ["mls-rs-core/serde", "zeroize/serde", "dep:serde", "dep:hex"]
 
@@ -64,7 +64,6 @@ itertools = { version = "0.14.0", default-features = false, features = ["use_all
 cfg-if = "1"
 debug_tree = { version = "0.4.0", optional = true }
 spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
-maybe-async = { version = "0.2.10" }
 subtle = { version = "2.6.1", default-features = false, features = ["i128"] }
 
 # Optional dependencies
@@ -81,18 +80,10 @@ hex = { version = "^0.4.3", default-features = false, features = ["serde", "allo
 # Only for benchmarks
 mls-rs-crypto-awslc = { path = "../mls-rs-crypto-awslc", optional = true, version = "0.25" }
 
-# Async mode dependencies
-[target.'cfg(mls_build_async)'.dependencies]
-futures = { version = "0.3.25", default-features = false, features = ["alloc"]}
-async-trait = "0.1.74"
-
 [target.'cfg(not(target_has_atomic = "ptr"))'.dependencies]
 portable-atomic = { version = "1.5.1", default-features = false, features = ["critical-section"] }
 portable-atomic-util = { version = "0.2", default-features = false, features = ["alloc"] }
 spin = { version = "0.10", default-features = false, features = ["portable_atomic"] }
-
-[target.'cfg(mls_build_async)'.dev-dependencies]
-futures-test = "0.3.25"
 
 [dev-dependencies]
 assert_matches = "1.5.0"

@@ -56,13 +56,10 @@ fn resolve_basic_identity(
         .as_basic()
         .ok_or_else(|| BasicIdentityProviderError(signing_id.credential.credential_type()))
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 impl IdentityProvider for BasicIdentityProvider {
     type Error = BasicIdentityProviderError;
 
-    async fn validate_member(
+    fn validate_member(
         &self,
         signing_identity: &SigningIdentity,
         _timestamp: Option<MlsTime>,
@@ -71,7 +68,7 @@ impl IdentityProvider for BasicIdentityProvider {
         resolve_basic_identity(signing_identity).map(|_| ())
     }
 
-    async fn validate_external_sender(
+    fn validate_external_sender(
         &self,
         signing_identity: &SigningIdentity,
         _timestamp: Option<MlsTime>,
@@ -80,7 +77,7 @@ impl IdentityProvider for BasicIdentityProvider {
         resolve_basic_identity(signing_identity).map(|_| ())
     }
 
-    async fn identity(
+    fn identity(
         &self,
         signing_identity: &SigningIdentity,
         _extensions: &ExtensionList,
@@ -88,7 +85,7 @@ impl IdentityProvider for BasicIdentityProvider {
         resolve_basic_identity(signing_identity).map(|b| b.identifier.to_vec())
     }
 
-    async fn valid_successor(
+    fn valid_successor(
         &self,
         predecessor: &SigningIdentity,
         successor: &SigningIdentity,

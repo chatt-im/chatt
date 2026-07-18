@@ -20,17 +20,11 @@ pub enum SamplingMethod {
 }
 
 /// A trait that provides the required DH functions, as in RFC 9180,Section 4.1
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(all(target_arch = "wasm32", mls_build_async), maybe_async::must_be_async(?Send))]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), mls_build_async),
-    maybe_async::must_be_async
-)]
 #[cfg_attr(feature = "mock", automock(type Error = crate::mock::TestError;))]
 pub trait DhType: Send + Sync {
     type Error: IntoAnyError + Send + Sync;
 
-    async fn dh(
+    fn dh(
         &self,
         secret_key: &HpkeSecretKey,
         public_key: &HpkePublicKey,
@@ -39,11 +33,11 @@ pub trait DhType: Send + Sync {
     /// Generate a fresh key pair. This is the only place where randomness is used in this
     /// module. The function could be implemented in the same way as `derive` with random
     /// `ikm`, but it could also be implemented directly with a crypto provider like OpenSSL.
-    async fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error>;
+    fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error>;
 
     /// Outputs the public key corresponding to the given secret key bytes. If the secret
     /// key is malformed, the function should return an error.
-    async fn to_public(&self, secret_key: &HpkeSecretKey) -> Result<HpkePublicKey, Self::Error>;
+    fn to_public(&self, secret_key: &HpkeSecretKey) -> Result<HpkePublicKey, Self::Error>;
 
     /// If the output is `Some(bitmask)`, then the `Kem::derive` function will generate
     /// the secret key by rejection sampling over random byte sequences with `bitmask`

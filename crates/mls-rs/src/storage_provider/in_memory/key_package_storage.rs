@@ -90,23 +90,20 @@ impl InMemoryKeyPackageStorage {
         return self.inner.lock();
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 impl KeyPackageStorage for InMemoryKeyPackageStorage {
     type Error = Infallible;
 
-    async fn delete(&mut self, id: &[u8]) -> Result<(), Self::Error> {
+    fn delete(&mut self, id: &[u8]) -> Result<(), Self::Error> {
         (*self).delete(id);
         Ok(())
     }
 
-    async fn insert(&mut self, id: Vec<u8>, pkg: KeyPackageData) -> Result<(), Self::Error> {
+    fn insert(&mut self, id: Vec<u8>, pkg: KeyPackageData) -> Result<(), Self::Error> {
         (*self).insert(id, pkg);
         Ok(())
     }
 
-    async fn get(&self, id: &[u8]) -> Result<Option<KeyPackageData>, Self::Error> {
+    fn get(&self, id: &[u8]) -> Result<Option<KeyPackageData>, Self::Error> {
         Ok(self.get(id))
     }
 }

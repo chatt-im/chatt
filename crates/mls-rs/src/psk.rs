@@ -136,12 +136,10 @@ struct PSKLabel<'a> {
 pub(crate) struct AlwaysFoundPskStorage;
 
 #[cfg(any(test, feature = "external_client"))]
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 impl PreSharedKeyStorage for AlwaysFoundPskStorage {
     type Error = Infallible;
 
-    async fn get(&self, _: &ExternalPskId) -> Result<Option<PreSharedKey>, Self::Error> {
+    fn get(&self, _: &ExternalPskId) -> Result<Option<PreSharedKey>, Self::Error> {
         Ok(Some(vec![].into()))
     }
 }

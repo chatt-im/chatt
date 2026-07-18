@@ -28,9 +28,7 @@ pub(crate) enum SignaturePublicKeysContainer<'a> {
     #[cfg(all(feature = "private_message", feature = "prior_epoch"))]
     List(&'a [Option<SignaturePublicKey>]),
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn verify_plaintext_authentication<P: CipherSuiteProvider>(
+pub(crate) fn verify_plaintext_authentication<P: CipherSuiteProvider>(
     cipher_suite_provider: &P,
     plaintext: PublicMessage,
     membership_key: Option<&[u8]>,
@@ -53,7 +51,7 @@ pub(crate) async fn verify_plaintext_authentication<P: CipherSuiteProvider>(
                     membership_key,
                     cipher_suite_provider,
                 )
-                .await?;
+                ?;
 
                 let plaintext_tag = tag.as_ref().ok_or(MlsError::InvalidMembershipTag)?;
 
@@ -79,7 +77,7 @@ pub(crate) async fn verify_plaintext_authentication<P: CipherSuiteProvider>(
         #[cfg(feature = "by_ref_proposal")]
         &external_signers,
     )
-    .await?;
+    ?;
 
     Ok(auth_content)
 }
@@ -94,9 +92,7 @@ fn external_signers(context: &GroupContext) -> Vec<SigningIdentity> {
             extern_senders_ext.allowed_senders
         })
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn verify_auth_content_signature<P: CipherSuiteProvider>(
+pub(crate) fn verify_auth_content_signature<P: CipherSuiteProvider>(
     cipher_suite_provider: &P,
     signature_keys_container: SignaturePublicKeysContainer<'_>,
     context: &GroupContext,
@@ -118,7 +114,7 @@ pub(crate) async fn verify_auth_content_signature<P: CipherSuiteProvider>(
 
     auth_content
         .verify(cipher_suite_provider, &sender_public_key, &context)
-        .await?;
+        ?;
 
     Ok(())
 }
@@ -256,12 +252,10 @@ mod tests {
 
     #[cfg(feature = "by_ref_proposal")]
     use crate::identity::test_utils::get_test_signing_identity;
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn make_signed_plaintext(group: &mut Group<TestClientConfig>) -> PublicMessage {
+    fn make_signed_plaintext(group: &mut Group<TestClientConfig>) -> PublicMessage {
         group
             .commit(vec![])
-            .await
+
             .unwrap()
             .commit_message
             .into_plaintext()
@@ -274,8 +268,7 @@ mod tests {
     }
 
     impl TestEnv {
-        #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-        async fn new() -> Self {
+        fn new() -> Self {
             let mut alice = test_group_custom(
                 TEST_PROTOCOL_VERSION,
                 TEST_CIPHER_SUITE,
@@ -283,20 +276,20 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            ;
 
             let (bob_client, bob_key_pkg) =
-                test_client_with_key_pkg(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, "bob").await;
+                test_client_with_key_pkg(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, "bob");
 
             let commit_output = alice
                 .commit_builder()
                 .add_member(bob_key_pkg)
                 .unwrap()
                 .build()
-                .await
+
                 .unwrap();
 
-            alice.apply_pending_commit().await.unwrap();
+            alice.apply_pending_commit().unwrap();
 
             let (bob, _) = Group::join(
                 &commit_output.welcome_messages[0],
@@ -305,7 +298,7 @@ mod tests {
                 bob_client.signer.unwrap(),
                 None,
             )
-            .await
+
             .unwrap();
 
             TestEnv {
@@ -315,11 +308,11 @@ mod tests {
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn valid_plaintext_is_verified() {
-        let mut env = TestEnv::new().await;
+    #[test]
+    fn valid_plaintext_is_verified() {
+        let mut env = TestEnv::new();
 
-        let message = make_signed_plaintext(&mut env.alice).await;
+        let message = make_signed_plaintext(&mut env.alice);
 
         verify_plaintext_authentication(
             &env.bob.cipher_suite_provider,
@@ -328,15 +321,15 @@ mod tests {
             &env.bob.state.context,
             super::SignaturePublicKeysContainer::RatchetTree(&env.bob.state.public_tree),
         )
-        .await
+
         .unwrap();
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn valid_auth_content_is_verified() {
-        let mut env = TestEnv::new().await;
+    #[test]
+    fn valid_auth_content_is_verified() {
+        let mut env = TestEnv::new();
 
-        let message = AuthenticatedContent::from(make_signed_plaintext(&mut env.alice).await);
+        let message = AuthenticatedContent::from(make_signed_plaintext(&mut env.alice));
 
         verify_auth_content_signature(
             &env.bob.cipher_suite_provider,
@@ -346,14 +339,14 @@ mod tests {
             #[cfg(feature = "by_ref_proposal")]
             &[],
         )
-        .await
+
         .unwrap();
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn invalid_plaintext_is_not_verified() {
-        let mut env = TestEnv::new().await;
-        let mut message = make_signed_plaintext(&mut env.alice).await;
+    #[test]
+    fn invalid_plaintext_is_not_verified() {
+        let mut env = TestEnv::new();
+        let mut message = make_signed_plaintext(&mut env.alice);
         message.auth.signature = MessageSignature::from(b"test".to_vec());
 
         message.membership_tag = env
@@ -364,7 +357,7 @@ mod tests {
                 env.alice.context(),
                 &test_cipher_suite_provider(env.alice.cipher_suite()),
             )
-            .await
+
             .unwrap()
             .into();
 
@@ -375,15 +368,15 @@ mod tests {
             &env.bob.state.context,
             SignaturePublicKeysContainer::RatchetTree(&env.bob.state.public_tree),
         )
-        .await;
+        ;
 
         assert_matches!(res, Err(MlsError::InvalidSignature));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn plaintext_from_member_requires_membership_tag() {
-        let mut env = TestEnv::new().await;
-        let mut message = make_signed_plaintext(&mut env.alice).await;
+    #[test]
+    fn plaintext_from_member_requires_membership_tag() {
+        let mut env = TestEnv::new();
+        let mut message = make_signed_plaintext(&mut env.alice);
         message.membership_tag = None;
 
         let res = verify_plaintext_authentication(
@@ -393,15 +386,15 @@ mod tests {
             &env.bob.state.context,
             SignaturePublicKeysContainer::RatchetTree(&env.bob.state.public_tree),
         )
-        .await;
+        ;
 
         assert_matches!(res, Err(MlsError::InvalidMembershipTag));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn plaintext_fails_with_invalid_membership_tag() {
-        let mut env = TestEnv::new().await;
-        let mut message = make_signed_plaintext(&mut env.alice).await;
+    #[test]
+    fn plaintext_fails_with_invalid_membership_tag() {
+        let mut env = TestEnv::new();
+        let mut message = make_signed_plaintext(&mut env.alice);
         message.membership_tag = Some(MembershipTag::from(b"test".to_vec()));
 
         let res = verify_plaintext_authentication(
@@ -411,14 +404,13 @@ mod tests {
             &env.bob.state.context,
             SignaturePublicKeysContainer::RatchetTree(&env.bob.state.public_tree),
         )
-        .await;
+        ;
 
         assert_matches!(res, Err(MlsError::InvalidMembershipTag));
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn test_new_member_proposal<F>(
+    fn test_new_member_proposal<F>(
         key_pkg_gen: KeyPackageGeneration,
         signer: &SignatureSecretKey,
         test_group: &TestGroup,
@@ -438,7 +430,7 @@ mod tests {
             WireFormat::PublicMessage,
             vec![],
         )
-        .await
+
         .unwrap();
 
         edit(&mut content);
@@ -450,7 +442,7 @@ mod tests {
 
         content
             .sign(&test_group.cipher_suite_provider, signer, &signing_context)
-            .await
+
             .unwrap();
 
         PublicMessage {
@@ -461,12 +453,12 @@ mod tests {
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn valid_proposal_from_new_member_is_verified() {
-        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+    #[test]
+    fn valid_proposal_from_new_member_is_verified() {
+        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
         let (key_pkg_gen, signer) =
-            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob").await;
-        let message = test_new_member_proposal(key_pkg_gen, &signer, &test_group, |_| {}).await;
+            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob");
+        let message = test_new_member_proposal(key_pkg_gen, &signer, &test_group, |_| {});
 
         verify_plaintext_authentication(
             &test_group.cipher_suite_provider,
@@ -475,18 +467,18 @@ mod tests {
             &test_group.state.context,
             SignaturePublicKeysContainer::RatchetTree(&test_group.state.public_tree),
         )
-        .await
+
         .unwrap();
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn proposal_from_new_member_must_not_have_membership_tag() {
-        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+    #[test]
+    fn proposal_from_new_member_must_not_have_membership_tag() {
+        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
         let (key_pkg_gen, signer) =
-            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob").await;
+            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob");
 
-        let mut message = test_new_member_proposal(key_pkg_gen, &signer, &test_group, |_| {}).await;
+        let mut message = test_new_member_proposal(key_pkg_gen, &signer, &test_group, |_| {});
         message.membership_tag = Some(MembershipTag::from(vec![]));
 
         let res = verify_plaintext_authentication(
@@ -496,24 +488,24 @@ mod tests {
             &test_group.state.context,
             SignaturePublicKeysContainer::RatchetTree(&test_group.state.public_tree),
         )
-        .await;
+        ;
 
         assert_matches!(res, Err(MlsError::MembershipTagForNonMember));
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn new_member_proposal_sender_must_be_add_proposal() {
-        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+    #[test]
+    fn new_member_proposal_sender_must_be_add_proposal() {
+        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
         let (key_pkg_gen, signer) =
-            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob").await;
+            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob");
 
         let message = test_new_member_proposal(key_pkg_gen, &signer, &test_group, |msg| {
             msg.content.content = Content::Proposal(Box::new(Proposal::Remove(RemoveProposal {
                 to_remove: LeafIndex::unchecked(0),
             })))
         })
-        .await;
+        ;
 
         let res: Result<AuthenticatedContent, MlsError> = verify_plaintext_authentication(
             &test_group.cipher_suite_provider,
@@ -522,22 +514,22 @@ mod tests {
             &test_group.state.context,
             SignaturePublicKeysContainer::RatchetTree(&test_group.state.public_tree),
         )
-        .await;
+        ;
 
         assert_matches!(res, Err(MlsError::ExpectedAddProposalForNewMemberProposal));
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn new_member_commit_must_be_external_commit() {
-        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+    #[test]
+    fn new_member_commit_must_be_external_commit() {
+        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
         let (key_pkg_gen, signer) =
-            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob").await;
+            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob");
 
         let message = test_new_member_proposal(key_pkg_gen, &signer, &test_group, |msg| {
             msg.content.sender = Sender::NewMemberCommit;
         })
-        .await;
+        ;
 
         let res = verify_plaintext_authentication(
             &test_group.cipher_suite_provider,
@@ -546,20 +538,20 @@ mod tests {
             &test_group.state.context,
             SignaturePublicKeysContainer::RatchetTree(&test_group.state.public_tree),
         )
-        .await;
+        ;
 
         assert_matches!(res, Err(MlsError::ExpectedCommitForNewMemberCommit));
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn valid_proposal_from_external_is_verified() {
+    #[test]
+    fn valid_proposal_from_external_is_verified() {
         let (bob_key_pkg_gen, _) =
-            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob").await;
+            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob");
 
-        let (ted_signing, ted_secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"ted").await;
+        let (ted_signing, ted_secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"ted");
 
-        let mut test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+        let mut test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
         let mut extensions = ExtensionList::default();
 
         extensions
@@ -573,15 +565,15 @@ mod tests {
             .set_group_context_ext(extensions)
             .unwrap()
             .build()
-            .await
+
             .unwrap();
 
-        test_group.apply_pending_commit().await.unwrap();
+        test_group.apply_pending_commit().unwrap();
 
         let message = test_new_member_proposal(bob_key_pkg_gen, &ted_secret, &test_group, |msg| {
             msg.content.sender = Sender::External(0)
         })
-        .await;
+        ;
 
         verify_plaintext_authentication(
             &test_group.cipher_suite_provider,
@@ -590,22 +582,22 @@ mod tests {
             &test_group.state.context,
             SignaturePublicKeysContainer::RatchetTree(&test_group.state.public_tree),
         )
-        .await
+
         .unwrap();
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn external_proposal_must_be_from_valid_sender() {
+    #[test]
+    fn external_proposal_must_be_from_valid_sender() {
         let (bob_key_pkg_gen, _) =
-            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob").await;
-        let (_, ted_secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"ted").await;
-        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob");
+        let (_, ted_secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"ted");
+        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
 
         let message = test_new_member_proposal(bob_key_pkg_gen, &ted_secret, &test_group, |msg| {
             msg.content.sender = Sender::External(0)
         })
-        .await;
+        ;
 
         let res = verify_plaintext_authentication(
             &test_group.cipher_suite_provider,
@@ -614,23 +606,23 @@ mod tests {
             &test_group.state.context,
             SignaturePublicKeysContainer::RatchetTree(&test_group.state.public_tree),
         )
-        .await;
+        ;
 
         assert_matches!(res, Err(MlsError::UnknownSigningIdentityForExternalSender));
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn proposal_from_external_sender_must_not_have_membership_tag() {
+    #[test]
+    fn proposal_from_external_sender_must_not_have_membership_tag() {
         let (bob_key_pkg_gen, _) =
-            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob").await;
+            test_member(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, b"bob");
 
-        let (_, ted_secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"ted").await;
+        let (_, ted_secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"ted");
 
-        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+        let test_group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
 
         let mut message =
-            test_new_member_proposal(bob_key_pkg_gen, &ted_secret, &test_group, |_| {}).await;
+            test_new_member_proposal(bob_key_pkg_gen, &ted_secret, &test_group, |_| {});
 
         message.membership_tag = Some(MembershipTag::from(vec![]));
 
@@ -641,7 +633,7 @@ mod tests {
             &test_group.state.context,
             SignaturePublicKeysContainer::RatchetTree(&test_group.state.public_tree),
         )
-        .await;
+        ;
 
         assert_matches!(res, Err(MlsError::MembershipTagForNonMember));
     }

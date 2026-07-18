@@ -99,9 +99,7 @@ impl KeyPackage {
     pub fn signing_identity(&self) -> &SigningIdentity {
         &self.leaf_node.signing_identity
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn to_reference<CP: CipherSuiteProvider>(
+    pub fn to_reference<CP: CipherSuiteProvider>(
         &self,
         cipher_suite_provider: &CP,
     ) -> Result<KeyPackageRef, MlsError> {
@@ -115,7 +113,7 @@ impl KeyPackage {
                 b"MLS 1.0 KeyPackage Reference",
                 cipher_suite_provider,
             )
-            .await?,
+            ?,
         ))
     }
 
@@ -169,26 +167,22 @@ pub(crate) mod test_utils {
     };
 
     use mls_rs_core::crypto::SignatureSecretKey;
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn test_key_package(
+    pub(crate) fn test_key_package(
         protocol_version: ProtocolVersion,
         cipher_suite: CipherSuite,
         id: &str,
     ) -> KeyPackage {
         test_key_package_with_signer(protocol_version, cipher_suite, id)
-            .await
+
             .0
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn test_key_package_with_signer(
+    pub(crate) fn test_key_package_with_signer(
         protocol_version: ProtocolVersion,
         cipher_suite: CipherSuite,
         id: &str,
     ) -> (KeyPackage, SignatureSecretKey) {
         let (signing_identity, secret_key) =
-            get_test_signing_identity(cipher_suite, id.as_bytes()).await;
+            get_test_signing_identity(cipher_suite, id.as_bytes());
 
         let generator = KeyPackageGenerator {
             protocol_version,
@@ -204,15 +198,13 @@ pub(crate) mod test_utils {
                 ExtensionList::default(),
                 ExtensionList::default(),
             )
-            .await
+
             .unwrap()
             .key_package;
 
         (key_package, secret_key)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn test_key_package_message(
+    pub(crate) fn test_key_package_message(
         protocol_version: ProtocolVersion,
         cipher_suite: CipherSuite,
         id: &str,
@@ -220,7 +212,7 @@ pub(crate) mod test_utils {
         MlsMessage::new(
             protocol_version,
             MlsMessagePayload::KeyPackage(
-                test_key_package(protocol_version, cipher_suite, id).await,
+                test_key_package(protocol_version, cipher_suite, id),
             ),
         )
     }
@@ -247,9 +239,8 @@ mod tests {
     }
 
     impl TestCase {
-        #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
         #[cfg_attr(coverage_nightly, coverage(off))]
-        async fn generate() -> Vec<TestCase> {
+        fn generate() -> Vec<TestCase> {
             let mut test_cases = Vec::new();
 
             for (i, (protocol_version, cipher_suite)) in ProtocolVersion::all()
@@ -257,11 +248,11 @@ mod tests {
                 .enumerate()
             {
                 let pkg =
-                    test_key_package(protocol_version, cipher_suite, &format!("alice{i}")).await;
+                    test_key_package(protocol_version, cipher_suite, &format!("alice{i}"));
 
                 let pkg_ref = pkg
                     .to_reference(&test_cipher_suite_provider(cipher_suite))
-                    .await
+
                     .unwrap();
 
                 let case = TestCase {
@@ -278,8 +269,8 @@ mod tests {
     }
 
     #[cfg(mls_build_async)]
-    async fn load_test_cases() -> Vec<TestCase> {
-        load_test_case_json!(key_package_ref, TestCase::generate().await)
+    fn load_test_cases() -> Vec<TestCase> {
+        load_test_case_json!(key_package_ref, TestCase::generate())
     }
 
     #[cfg(not(mls_build_async))]
@@ -287,9 +278,9 @@ mod tests {
         load_test_case_json!(key_package_ref, TestCase::generate())
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_key_package_ref() {
-        let cases = load_test_cases().await;
+    #[test]
+    fn test_key_package_ref() {
+        let cases = load_test_cases();
 
         for one_case in cases {
             let Some(provider) = try_test_cipher_suite_provider(one_case.cipher_suite) else {
@@ -298,20 +289,20 @@ mod tests {
 
             let key_package = KeyPackage::mls_decode(&mut one_case.input.as_slice()).unwrap();
 
-            let key_package_ref = key_package.to_reference(&provider).await.unwrap();
+            let key_package_ref = key_package.to_reference(&provider).unwrap();
 
             let expected_out = KeyPackageRef::from(one_case.output);
             assert_eq!(expected_out, key_package_ref);
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn key_package_ref_fails_invalid_cipher_suite() {
-        let key_package = test_key_package(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, "test").await;
+    #[test]
+    fn key_package_ref_fails_invalid_cipher_suite() {
+        let key_package = test_key_package(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE, "test");
 
         for another_cipher_suite in CipherSuite::all().filter(|cs| cs != &TEST_CIPHER_SUITE) {
             if let Some(cs) = try_test_cipher_suite_provider(*another_cipher_suite) {
-                let res = key_package.to_reference(&cs).await;
+                let res = key_package.to_reference(&cs);
 
                 assert_matches!(res, Err(MlsError::CipherSuiteMismatch));
             }

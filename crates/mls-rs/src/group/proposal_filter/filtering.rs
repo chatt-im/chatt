@@ -66,8 +66,7 @@ where
     P: PreSharedKeyStorage,
     CSP: CipherSuiteProvider,
 {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn apply_proposals_from_member(
+    pub(super) fn apply_proposals_from_member(
         &self,
         strategy: FilterStrategy,
         commit_sender: LeafIndex,
@@ -94,7 +93,7 @@ where
             &mut proposals,
             self.psk_storage,
         )
-        .await?;
+        ?;
 
         #[cfg(feature = "by_ref_proposal")]
         let proposals = filter_out_invalid_group_extensions(
@@ -103,7 +102,7 @@ where
             self.identity_provider,
             commit_time,
         )
-        .await?;
+        ?;
 
         let proposals = filter_out_extra_group_context_extensions(strategy, proposals)?;
 
@@ -121,11 +120,9 @@ where
         let proposals = filter_out_remove_if_self_remove_same_leaf(strategy, proposals)?;
 
         self.apply_proposal_changes(strategy, proposals, commit_time)
-            .await
-    }
 
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn apply_proposal_changes(
+    }
+    pub(super) fn apply_proposal_changes(
         &self,
         strategy: FilterStrategy,
         proposals: ProposalBundle,
@@ -134,7 +131,7 @@ where
         match proposals.group_context_extensions_proposal().cloned() {
             Some(p) => {
                 self.apply_proposals_with_new_capabilities(strategy, proposals, p, commit_time)
-                    .await
+
             }
             None => {
                 self.apply_tree_changes(
@@ -143,13 +140,11 @@ where
                     &self.original_context.extensions,
                     commit_time,
                 )
-                .await
+
             }
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn apply_tree_changes(
+    pub(super) fn apply_tree_changes(
         &self,
         strategy: FilterStrategy,
         proposals: ProposalBundle,
@@ -158,7 +153,7 @@ where
     ) -> Result<ApplyProposalsOutput, MlsError> {
         let mut applied_proposals = self
             .validate_new_nodes(strategy, proposals, new_extensions, commit_time)
-            .await?;
+            ?;
 
         let mut new_tree = self.original_tree.clone();
 
@@ -170,7 +165,7 @@ where
                 self.cipher_suite_provider,
                 strategy.is_ignore(),
             )
-            .await?;
+            ?;
 
         let new_context_extensions = applied_proposals
             .group_context_extensions_proposal()
@@ -184,9 +179,7 @@ where
             new_context_extensions,
         })
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn validate_new_nodes(
+    fn validate_new_nodes(
         &self,
         strategy: FilterStrategy,
         mut proposals: ProposalBundle,
@@ -207,7 +200,7 @@ where
         let bad_indices: Vec<_> = wrap_iter(proposals.update_proposals())
             .zip(wrap_iter(proposals.update_proposal_senders()))
             .enumerate()
-            .filter_map(|(i, (p, &sender_index))| async move {
+            .filter_map(|(i, (p, &sender_index))| {
                 let res = {
                     let leaf = &p.proposal.leaf_node;
 
@@ -220,7 +213,7 @@ where
                                 commit_time,
                             )),
                         )
-                        .await;
+                        ;
 
                     let old_leaf = match self.original_tree.get_leaf_node(sender_index) {
                         Ok(leaf) => leaf,
@@ -234,7 +227,7 @@ where
                             &leaf.signing_identity,
                             new_extensions,
                         )
-                        .await
+
                         .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))
                         .and_then(|valid| valid.then_some(()).ok_or(MlsError::InvalidSuccessor));
 
@@ -246,7 +239,7 @@ where
                     .transpose()
             })
             .try_collect()
-            .await?;
+            ?;
 
         bad_indices.into_iter().rev().for_each(|i| {
             proposals.remove::<UpdateProposal>(i);
@@ -255,17 +248,17 @@ where
 
         let bad_indices: Vec<_> = wrap_iter(proposals.add_proposals())
             .enumerate()
-            .filter_map(|(i, p)| async move {
+            .filter_map(|(i, p)| {
                 let res = self
                     .validate_new_node(leaf_node_validator, &p.proposal.key_package, commit_time)
-                    .await;
+                    ;
 
                 apply_strategy(strategy, p.is_by_reference(), res)
                     .map(|b| (!b).then_some(i))
                     .transpose()
             })
             .try_collect()
-            .await?;
+            ?;
 
         bad_indices
             .into_iter()
@@ -397,8 +390,7 @@ fn filter_out_removal_of_committer(
 }
 
 #[cfg(feature = "by_ref_proposal")]
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-async fn filter_out_invalid_group_extensions<C>(
+fn filter_out_invalid_group_extensions<C>(
     strategy: FilterStrategy,
     mut proposals: ProposalBundle,
     identity_provider: &C,
@@ -416,7 +408,7 @@ where
             Ok(None) => Ok(()),
             Ok(Some(extension)) => extension
                 .verify_all(identity_provider, commit_time, &p.proposal)
-                .await
+
                 .map_err(|e| MlsError::IdentityProviderError(e.into_any_error())),
             Err(e) => Err(MlsError::from(e)),
         };

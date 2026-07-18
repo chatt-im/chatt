@@ -163,8 +163,7 @@ impl<C: ClientConfig> ExternalCommitBuilder<C> {
     }
 
     /// Build the external commit using a GroupInfo message provided by an existing group member.
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn build(self, group_info: MlsMessage) -> Result<(Group<C>, MlsMessage), MlsError> {
+    pub fn build(self, group_info: MlsMessage) -> Result<(Group<C>, MlsMessage), MlsError> {
         let protocol_version = group_info.version;
 
         if !self.config.version_supported(protocol_version) {
@@ -193,7 +192,7 @@ impl<C: ClientConfig> ExternalCommitBuilder<C> {
             &cipher_suite,
             self.commit_time,
         )
-        .await?;
+        ?;
 
         let (leaf_node, _) = LeafNode::generate(
             &cipher_suite,
@@ -202,10 +201,10 @@ impl<C: ClientConfig> ExternalCommitBuilder<C> {
             &self.signer,
             self.config.lifetime(self.commit_time),
         )
-        .await?;
+        ?;
 
         let (init_secret, kem_output) =
-            InitSecret::encode_for_external(&cipher_suite, &external_pub_ext.external_pub).await?;
+            InitSecret::encode_for_external(&cipher_suite, &external_pub_ext.external_pub)?;
 
         let epoch_secrets = EpochSecrets {
             #[cfg(feature = "psk")]
@@ -225,7 +224,7 @@ impl<C: ClientConfig> ExternalCommitBuilder<C> {
             None,
             self.signer,
         )
-        .await?;
+        ?;
 
         #[cfg(feature = "psk")]
         let psk_ids = self
@@ -263,7 +262,7 @@ impl<C: ClientConfig> ExternalCommitBuilder<C> {
                 &group.state.context,
                 SignaturePublicKeysContainer::RatchetTree(&group.state.public_tree),
             )
-            .await?;
+            ?;
 
             group
                 .process_event_or_content(
@@ -273,7 +272,7 @@ impl<C: ClientConfig> ExternalCommitBuilder<C> {
                     None,
                     None,
                 )
-                .await?;
+                ?;
         }
 
         if let Some(r) = self.to_remove {
@@ -293,10 +292,10 @@ impl<C: ClientConfig> ExternalCommitBuilder<C> {
                 None,
                 self.commit_time,
             )
-            .await?;
+            ?;
 
         group.pending_commit = pending_commit.try_into()?;
-        group.apply_pending_commit().await?;
+        group.apply_pending_commit()?;
 
         Ok((group, commit_output.commit_message))
     }

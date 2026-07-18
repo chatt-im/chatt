@@ -39,13 +39,6 @@ impl AwsLcHkdf {
         }
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(all(target_arch = "wasm32", mls_build_async), maybe_async::must_be_async(?Send))]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), mls_build_async),
-    maybe_async::must_be_async
-)]
 impl mls_rs_crypto_traits::KdfType for AwsLcHkdf {
     type Error = AwsLcCryptoError;
 
@@ -53,7 +46,7 @@ impl mls_rs_crypto_traits::KdfType for AwsLcHkdf {
         self.0 as u16
     }
 
-    async fn expand(&self, prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>, Self::Error> {
+    fn expand(&self, prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>, Self::Error> {
         let mut out = vec![0u8; len];
         let hash = self.hash_function()?;
 
@@ -74,7 +67,7 @@ impl mls_rs_crypto_traits::KdfType for AwsLcHkdf {
         Ok(out)
     }
 
-    async fn extract(&self, salt: &[u8], ikm: &[u8]) -> Result<Vec<u8>, Self::Error> {
+    fn extract(&self, salt: &[u8], ikm: &[u8]) -> Result<Vec<u8>, Self::Error> {
         let mut out = vec![0u8; self.extract_size()];
         let hash = self.hash_function()?;
 

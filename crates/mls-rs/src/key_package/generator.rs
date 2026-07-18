@@ -77,15 +77,12 @@ impl<CP> KeyPackageGenerator<'_, CP>
 where
     CP: CipherSuiteProvider,
 {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn sign(&self, package: &mut KeyPackage) -> Result<(), MlsError> {
+    pub(super) fn sign(&self, package: &mut KeyPackage) -> Result<(), MlsError> {
         package
             .sign(self.cipher_suite_provider, self.signing_key, &())
-            .await
-    }
 
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn generate(
+    }
+    pub fn generate(
         &self,
         lifetime: Lifetime,
         capabilities: Capabilities,
@@ -95,7 +92,7 @@ where
         let (init_secret_key, public_init) = self
             .cipher_suite_provider
             .kem_generate()
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
 
         let properties = ConfigProperties {
@@ -110,7 +107,7 @@ where
             self.signing_key,
             lifetime,
         )
-        .await?;
+        ?;
 
         let mut package = KeyPackage {
             version: self.protocol_version,
@@ -123,9 +120,9 @@ where
 
         package.grease(self.cipher_suite_provider)?;
 
-        self.sign(&mut package).await?;
+        self.sign(&mut package)?;
 
-        let reference = package.to_reference(self.cipher_suite_provider).await?;
+        let reference = package.to_reference(self.cipher_suite_provider)?;
 
         Ok(KeyPackageGeneration {
             key_package: package,
@@ -175,8 +172,8 @@ mod tests {
         Lifetime::years(1, None).unwrap()
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_key_generation() {
+    #[test]
+    fn test_key_generation() {
         for (protocol_version, cipher_suite) in ProtocolVersion::all().flat_map(|p| {
             TestCryptoProvider::all_supported_cipher_suites()
                 .into_iter()
@@ -185,7 +182,7 @@ mod tests {
             let cipher_suite_provider = test_cipher_suite_provider(cipher_suite);
 
             let (signing_identity, signing_key) =
-                get_test_signing_identity(cipher_suite, b"foo").await;
+                get_test_signing_identity(cipher_suite, b"foo");
 
             let key_package_ext = test_key_package_ext(32);
             let leaf_node_ext = test_leaf_node_ext(42);
@@ -210,7 +207,7 @@ mod tests {
                     key_package_ext.clone(),
                     leaf_node_ext.clone(),
                 )
-                .await
+
                 .unwrap();
 
             assert_matches!(generated.key_package.leaf_node.leaf_node_source,
@@ -244,7 +241,7 @@ mod tests {
 
             let sealed = cipher_suite_provider
                 .hpke_seal(&generated.key_package.hpke_init_key, &[], None, &test_data)
-                .await
+
                 .unwrap();
 
             let opened = cipher_suite_provider
@@ -255,7 +252,7 @@ mod tests {
                     &[],
                     None,
                 )
-                .await
+
                 .unwrap();
 
             assert_eq!(*opened, test_data);
@@ -268,7 +265,7 @@ mod tests {
                     &generated.key_package.leaf_node,
                     ValidationContext::Add(None),
                 )
-                .await
+
                 .unwrap();
 
             validate_key_package_properties(
@@ -276,20 +273,20 @@ mod tests {
                 protocol_version,
                 &cipher_suite_provider,
             )
-            .await
+
             .unwrap();
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_randomness() {
+    #[test]
+    fn test_randomness() {
         for (protocol_version, cipher_suite) in ProtocolVersion::all().flat_map(|p| {
             TestCryptoProvider::all_supported_cipher_suites()
                 .into_iter()
                 .map(move |cs| (p, cs))
         }) {
             let (signing_identity, signing_key) =
-                get_test_signing_identity(cipher_suite, b"foo").await;
+                get_test_signing_identity(cipher_suite, b"foo");
 
             let test_generator = KeyPackageGenerator {
                 protocol_version,
@@ -305,7 +302,7 @@ mod tests {
                     ExtensionList::default(),
                     ExtensionList::default(),
                 )
-                .await
+
                 .unwrap();
 
             for _ in 0..100 {
@@ -316,7 +313,7 @@ mod tests {
                         ExtensionList::default(),
                         ExtensionList::default(),
                     )
-                    .await
+
                     .unwrap();
 
                 assert_ne!(

@@ -20,9 +20,7 @@ use crate::{
 };
 
 use super::{AuthenticatedContent, ConfirmationTag};
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn create<P: CipherSuiteProvider>(
+pub(crate) fn create<P: CipherSuiteProvider>(
     cipher_suite_provider: &P,
     interim_transcript_hash: &InterimTranscriptHash,
     content: &AuthenticatedContent,
@@ -48,7 +46,7 @@ pub(crate) async fn create<P: CipherSuiteProvider>(
 
     cipher_suite_provider
         .hash(&hash_input)
-        .await
+
         .map(Into::into)
         .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))
 }
@@ -84,8 +82,7 @@ impl From<Vec<u8>> for InterimTranscriptHash {
 }
 
 impl InterimTranscriptHash {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn create<P: CipherSuiteProvider>(
+    pub fn create<P: CipherSuiteProvider>(
         cipher_suite_provider: &P,
         confirmed: &ConfirmedTranscriptHash,
         confirmation_tag: &ConfirmationTag,
@@ -99,7 +96,7 @@ impl InterimTranscriptHash {
 
         cipher_suite_provider
             .hash(&[&confirmed[..], &input].concat())
-            .await
+
             .map(Into::into)
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))
     }
@@ -155,8 +152,8 @@ mod tests {
         pub interim_transcript_hash_after: Vec<u8>,
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn transcript_hash() {
+    #[test]
+    fn transcript_hash() {
         let test_cases: Vec<TestCase> =
             load_test_case_json!(interop_transcript_hashes, generate_test_vector());
 
@@ -176,7 +173,7 @@ mod tests {
 
             let matches = conf_tag
                 .matches(conf_key, &conf_hash_after, &cs)
-                .await
+
                 .unwrap();
 
             assert!(matches);
@@ -186,7 +183,7 @@ mod tests {
                 &test_case.interim_transcript_hash_before.into(),
                 &auth_content,
             )
-            .await
+
             .unwrap();
 
             assert_eq!(*expected_interim, test_case.interim_transcript_hash_after);

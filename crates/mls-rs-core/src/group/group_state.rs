@@ -60,17 +60,14 @@ impl EpochRecord {
 /// group. It is up to the implementer of this trait to provide a mechanism
 /// to delete records that can be used by an application.
 ///
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 pub trait GroupStateStorage: Send + Sync {
     type Error: IntoAnyError;
 
     /// Fetch a group state from storage.
-    async fn state(&self, group_id: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error>;
+    fn state(&self, group_id: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error>;
 
     /// Lazy load cached epoch data from a particular group.
-    async fn epoch(
+    fn epoch(
         &self,
         group_id: &[u8],
         epoch_id: u64,
@@ -95,7 +92,7 @@ pub trait GroupStateStorage: Send + Sync {
     /// of this trait. Calls to [`write`](GroupStateStorage::write) should
     /// optimally be a single atomic transaction in order to avoid partial writes
     /// that may corrupt the group state.
-    async fn write(
+    fn write(
         &mut self,
         state: GroupState,
         epoch_inserts: Vec<EpochRecord>,
@@ -104,5 +101,5 @@ pub trait GroupStateStorage: Send + Sync {
 
     /// The [`EpochRecord::id`] value that is associated with a stored
     /// prior epoch for a particular group.
-    async fn max_epoch_id(&self, group_id: &[u8]) -> Result<Option<u64>, Self::Error>;
+    fn max_epoch_id(&self, group_id: &[u8]) -> Result<Option<u64>, Self::Error>;
 }

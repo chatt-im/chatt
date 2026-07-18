@@ -67,8 +67,7 @@ impl Deref for ParentHash {
 }
 
 impl ParentHash {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn new<P: CipherSuiteProvider>(
+    pub fn new<P: CipherSuiteProvider>(
         cipher_suite_provider: &P,
         public_key: &HpkePublicKey,
         parent_hash: &ParentHash,
@@ -84,7 +83,7 @@ impl ParentHash {
 
         let hash = cipher_suite_provider
             .hash(&input_bytes)
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
 
         Ok(Self(hash))
@@ -113,8 +112,7 @@ impl Node {
 }
 
 impl TreeKemPublic {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn parent_hash_for_leaf<P: CipherSuiteProvider>(
+    fn parent_hash_for_leaf<P: CipherSuiteProvider>(
         &mut self,
         cipher_suite_provider: &P,
         index: LeafIndex,
@@ -134,7 +132,7 @@ impl TreeKemPublic {
                 &hash,
                 &self.tree_hashes.current[node.copath as usize],
             )
-            .await?;
+            ?;
 
             parent.parent_hash = core::mem::replace(&mut hash, calculated);
         }
@@ -144,19 +142,18 @@ impl TreeKemPublic {
 
     // Updates all of the required parent hash values, and returns the calculated parent hash value for the leaf node
     // If an update path is provided, additionally verify that the calculated parent hash matches
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn update_parent_hashes<P: CipherSuiteProvider>(
+    pub(crate) fn update_parent_hashes<P: CipherSuiteProvider>(
         &mut self,
         index: LeafIndex,
         verify_leaf_hash: bool,
         cipher_suite_provider: &P,
     ) -> Result<(), MlsError> {
         // First update the relevant original hashes used for parent hash computation.
-        self.update_hashes(&[index], cipher_suite_provider).await?;
+        self.update_hashes(&[index], cipher_suite_provider)?;
 
         let leaf_hash = self
             .parent_hash_for_leaf(cipher_suite_provider, index)
-            .await?;
+            ?;
 
         let leaf = self.nodes.borrow_as_leaf_mut(index)?;
 
@@ -175,15 +172,13 @@ impl TreeKemPublic {
         }
 
         // Update hashes after changes to the tree.
-        self.update_hashes(&[index], cipher_suite_provider).await
+        self.update_hashes(&[index], cipher_suite_provider)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(super) async fn validate_parent_hashes<P: CipherSuiteProvider>(
+    pub(super) fn validate_parent_hashes<P: CipherSuiteProvider>(
         &self,
         cipher_suite_provider: &P,
     ) -> Result<(), MlsError> {
-        let original_hashes = self.compute_original_hashes(cipher_suite_provider).await?;
+        let original_hashes = self.compute_original_hashes(cipher_suite_provider)?;
 
         let nodes_to_validate = self
             .nodes
@@ -206,7 +201,7 @@ impl TreeKemPublic {
                 &original_hashes,
                 &mut nodes_to_validate,
             )
-            .await?;
+            ?;
         }
 
         // The check passes iff all non-blank nodes are validated.
@@ -216,9 +211,7 @@ impl TreeKemPublic {
             Err(MlsError::ParentHashMismatch)
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn validate_chain<P: CipherSuiteProvider>(
+    fn validate_chain<P: CipherSuiteProvider>(
         &self,
         leaf_index: LeafIndex,
         num_leaves: u32,
@@ -255,7 +248,7 @@ impl TreeKemPublic {
                 &p_parent.parent_hash,
                 &original_hashes[ps.sibling as usize],
             )
-            .await?;
+            ?;
 
             if n_node.get_parent_hash() == Some(calculated) {
                 // Check that "n is in the resolution of c, and the intersection of p's unmerged_leaves with the subtree
@@ -315,15 +308,13 @@ pub(crate) mod test_utils {
     };
 
     use alloc::vec;
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn test_parent(
+    pub(crate) fn test_parent(
         cipher_suite: CipherSuite,
         unmerged_leaves: Vec<LeafIndex>,
     ) -> Parent {
         let (_, public_key) = test_cipher_suite_provider(cipher_suite)
             .kem_generate()
-            .await
+
             .unwrap();
 
         Parent {
@@ -332,18 +323,15 @@ pub(crate) mod test_utils {
             unmerged_leaves,
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn test_parent_node(
+    pub(crate) fn test_parent_node(
         cipher_suite: CipherSuite,
         unmerged_leaves: Vec<LeafIndex>,
     ) -> Node {
-        Node::Parent(test_parent(cipher_suite, unmerged_leaves).await)
+        Node::Parent(test_parent(cipher_suite, unmerged_leaves))
     }
 
     // Create figure 12 from MLS RFC
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn get_test_tree_fig_12(cipher_suite: CipherSuite) -> TreeKemPublic {
+    pub(crate) fn get_test_tree_fig_12(cipher_suite: CipherSuite) -> TreeKemPublic {
         let cipher_suite_provider = test_cipher_suite_provider(cipher_suite);
 
         let mut tree = TreeKemPublic::new();
@@ -351,40 +339,40 @@ pub(crate) mod test_utils {
         let mut leaves = Vec::new();
 
         for l in ["A", "B", "C", "D", "E", "F", "G"] {
-            leaves.push(get_basic_test_node(cipher_suite, l).await);
+            leaves.push(get_basic_test_node(cipher_suite, l));
         }
 
         tree.add_leaves(leaves, &BasicIdentityProvider, &cipher_suite_provider)
-            .await
+
             .unwrap();
 
-        tree.nodes[1] = Some(test_parent_node(cipher_suite, vec![]).await);
-        tree.nodes[3] = Some(test_parent_node(cipher_suite, vec![LeafIndex::unchecked(3)]).await);
+        tree.nodes[1] = Some(test_parent_node(cipher_suite, vec![]));
+        tree.nodes[3] = Some(test_parent_node(cipher_suite, vec![LeafIndex::unchecked(3)]));
 
         tree.nodes[7] = Some(
             test_parent_node(
                 cipher_suite,
                 vec![LeafIndex::unchecked(3), LeafIndex::unchecked(6)],
             )
-            .await,
+            ,
         );
 
-        tree.nodes[9] = Some(test_parent_node(cipher_suite, vec![LeafIndex::unchecked(5)]).await);
+        tree.nodes[9] = Some(test_parent_node(cipher_suite, vec![LeafIndex::unchecked(5)]));
 
         tree.nodes[11] = Some(
             test_parent_node(
                 cipher_suite,
                 vec![LeafIndex::unchecked(5), LeafIndex::unchecked(6)],
             )
-            .await,
+            ,
         );
 
         tree.update_parent_hashes(LeafIndex::unchecked(0), false, &cipher_suite_provider)
-            .await
+
             .unwrap();
 
         tree.update_parent_hashes(LeafIndex::unchecked(4), false, &cipher_suite_provider)
-            .await
+
             .unwrap();
 
         tree
@@ -405,15 +393,15 @@ mod tests {
     #[cfg(feature = "rfc_compliant")]
     use alloc::vec;
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_missing_parent_hash() {
+    #[test]
+    fn test_missing_parent_hash() {
         let cs = test_cipher_suite_provider(TEST_CIPHER_SUITE);
-        let mut test_tree = TreeWithSigners::make_full_tree(8, &cs).await.tree;
+        let mut test_tree = TreeWithSigners::make_full_tree(8, &cs).tree;
 
         *test_tree
             .nodes
             .borrow_as_leaf_mut(LeafIndex::unchecked(0))
-            .unwrap() = get_basic_test_node(TEST_CIPHER_SUITE, "foo").await;
+            .unwrap() = get_basic_test_node(TEST_CIPHER_SUITE, "foo");
 
         let missing_parent_hash_res = test_tree
             .update_parent_hashes(
@@ -421,7 +409,7 @@ mod tests {
                 true,
                 &test_cipher_suite_provider(TEST_CIPHER_SUITE),
             )
-            .await;
+            ;
 
         assert_matches!(
             missing_parent_hash_res,
@@ -429,10 +417,10 @@ mod tests {
         );
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_parent_hash_mismatch() {
+    #[test]
+    fn test_parent_hash_mismatch() {
         let cs = test_cipher_suite_provider(TEST_CIPHER_SUITE);
-        let mut test_tree = TreeWithSigners::make_full_tree(8, &cs).await.tree;
+        let mut test_tree = TreeWithSigners::make_full_tree(8, &cs).tree;
 
         let unexpected_parent_hash = ParentHash::from(hex!("f00d"));
 
@@ -448,30 +436,30 @@ mod tests {
                 true,
                 &test_cipher_suite_provider(TEST_CIPHER_SUITE),
             )
-            .await;
+            ;
 
         assert_matches!(invalid_parent_hash_res, Err(MlsError::ParentHashMismatch));
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_parent_hash_invalid() {
+    #[test]
+    fn test_parent_hash_invalid() {
         let cs = test_cipher_suite_provider(TEST_CIPHER_SUITE);
-        let mut test_tree = TreeWithSigners::make_full_tree(8, &cs).await.tree;
+        let mut test_tree = TreeWithSigners::make_full_tree(8, &cs).tree;
 
         test_tree.nodes[2] = None;
 
         let res = test_tree
             .validate_parent_hashes(&test_cipher_suite_provider(TEST_CIPHER_SUITE))
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::ParentHashMismatch));
     }
 
     #[cfg(feature = "rfc_compliant")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_premature_validation_termination() {
+    #[test]
+    fn test_premature_validation_termination() {
         let cs = test_cipher_suite_provider(TEST_CIPHER_SUITE);
-        let mut test_tree = TreeWithSigners::make_full_tree(8, &cs).await;
+        let mut test_tree = TreeWithSigners::make_full_tree(8, &cs);
         test_tree.remove_member(6);
 
         // Corrupt a parent hash that should be validated but might be skipped due to early return
@@ -485,7 +473,7 @@ mod tests {
         let res = test_tree
             .tree
             .validate_parent_hashes(&test_cipher_suite_provider(TEST_CIPHER_SUITE))
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::ParentHashMismatch));
     }

@@ -49,10 +49,8 @@ pub fn is_edwards(cs: u16) -> bool {
     ]
     .contains(&cs.into())
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn generate_basic_client<C: CryptoProvider + Clone>(
+pub fn generate_basic_client<C: CryptoProvider + Clone>(
     cipher_suite: CipherSuite,
     protocol_version: ProtocolVersion,
     id: usize,
@@ -64,7 +62,7 @@ pub async fn generate_basic_client<C: CryptoProvider + Clone>(
 ) -> Client<impl MlsConfig> {
     let cs = crypto.cipher_suite_provider(cipher_suite).unwrap();
 
-    let (secret_key, public_key) = cs.signature_key_generate().await.unwrap();
+    let (secret_key, public_key) = cs.signature_key_generate().unwrap();
     let credential = get_test_basic_credential(alloc::format!("{id}").into_bytes());
 
     let identity = SigningIdentity::new(credential, public_key);
@@ -98,10 +96,8 @@ pub async fn generate_basic_client<C: CryptoProvider + Clone>(
 
     builder.build()
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn get_test_groups<C: CryptoProvider + Clone>(
+pub fn get_test_groups<C: CryptoProvider + Clone>(
     version: ProtocolVersion,
     cipher_suite: CipherSuite,
     num_participants: usize,
@@ -119,11 +115,11 @@ pub async fn get_test_groups<C: CryptoProvider + Clone>(
         crypto,
         None,
     )
-    .await;
+    ;
 
     let mut creator_group = creator
         .create_group(Default::default(), Default::default(), None)
-        .await
+
         .unwrap();
 
     let mut receiver_clients = Vec::new();
@@ -139,19 +135,19 @@ pub async fn get_test_groups<C: CryptoProvider + Clone>(
             crypto,
             None,
         )
-        .await;
+        ;
         let kp = client
             .generate_key_package_message(Default::default(), Default::default(), None)
-            .await
+
             .unwrap();
 
         receiver_clients.push(client);
         commit_builder = commit_builder.add_member(kp.clone()).unwrap();
     }
 
-    let welcome = commit_builder.build().await.unwrap().welcome_messages;
+    let welcome = commit_builder.build().unwrap().welcome_messages;
 
-    creator_group.apply_pending_commit().await.unwrap();
+    creator_group.apply_pending_commit().unwrap();
 
     let tree_data = creator_group.export_tree().into_owned();
 
@@ -160,7 +156,7 @@ pub async fn get_test_groups<C: CryptoProvider + Clone>(
     for client in &receiver_clients {
         let (test_client, _info) = client
             .join_group(Some(tree_data.clone()), &welcome[0], None)
-            .await
+
             .unwrap();
 
         groups.push(test_client);
@@ -168,10 +164,8 @@ pub async fn get_test_groups<C: CryptoProvider + Clone>(
 
     groups
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn all_process_message<C: MlsConfig>(
+pub fn all_process_message<C: MlsConfig>(
     groups: &mut [Group<C>],
     message: &MlsMessage,
     sender: usize,
@@ -181,10 +175,10 @@ pub async fn all_process_message<C: MlsConfig>(
         if sender != group.current_member_index() as usize {
             group
                 .process_incoming_message(message.clone())
-                .await
+
                 .unwrap();
         } else if is_commit {
-            group.apply_pending_commit().await.unwrap();
+            group.apply_pending_commit().unwrap();
         }
     }
 }

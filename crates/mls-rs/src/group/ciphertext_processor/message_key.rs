@@ -16,9 +16,7 @@ impl MessageKey {
     pub(crate) fn new(key: MessageKeyData) -> MessageKey {
         MessageKey(key)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn encrypt<P: CipherSuiteProvider>(
+    pub(crate) fn encrypt<P: CipherSuiteProvider>(
         &self,
         provider: &P,
         data: &[u8],
@@ -32,11 +30,9 @@ impl MessageKey {
                 Some(aad),
                 &reuse_guard.apply(&self.0.nonce),
             )
-            .await
-    }
 
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn decrypt<P: CipherSuiteProvider>(
+    }
+    pub(crate) fn decrypt<P: CipherSuiteProvider>(
         &self,
         provider: &P,
         data: &[u8],
@@ -50,7 +46,7 @@ impl MessageKey {
                 Some(aad),
                 &reuse_guard.apply(&self.0.nonce),
             )
-            .await
+
     }
 }
 

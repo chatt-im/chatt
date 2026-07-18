@@ -129,13 +129,6 @@ impl<'a> SharedSecretDetails<'a> {
         }
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(all(target_arch = "wasm32", mls_build_async), maybe_async::must_be_async(?Send))]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), mls_build_async),
-    maybe_async::must_be_async
-)]
 impl<KEM1, KEM2, H, VH, F> KemType for CombinedKem<KEM1, KEM2, H, VH, F>
 where
     KEM1: FixedLengthKemType,
@@ -151,14 +144,14 @@ where
         15
     }
 
-    async fn generate_deterministic(
+    fn generate_deterministic(
         &self,
         seed: &[u8],
     ) -> Result<(HpkeSecretKey, HpkePublicKey), Error> {
-        self.generate_deterministic(seed).await
+        self.generate_deterministic(seed)
     }
 
-    async fn encap(&self, remote_key: &HpkePublicKey) -> Result<KemResult, Error> {
+    fn encap(&self, remote_key: &HpkePublicKey) -> Result<KemResult, Error> {
         let (pk1, pk2) = self.parse_key(remote_key, self.kem1.public_key_size())?;
 
         let pk1 = pk1.into();
@@ -167,13 +160,13 @@ where
         let ct1 = self
             .kem1
             .encap(&pk1)
-            .await
+
             .map_err(|e| Error::KemError(e.into_any_error()))?;
 
         let ct2 = self
             .kem2
             .encap(&pk2)
-            .await
+
             .map_err(|e| Error::KemError(e.into_any_error()))?;
 
         let enc = [&ct1.enc[..], &ct2.enc].concat();
@@ -195,7 +188,7 @@ where
         Ok(KemResult { shared_secret, enc })
     }
 
-    async fn decap(
+    fn decap(
         &self,
         enc: &[u8],
         secret_key: &HpkeSecretKey,
@@ -213,13 +206,13 @@ where
         let shared_secret1 = self
             .kem1
             .decap(&enc1, &sk1, &pk1)
-            .await
+
             .map_err(|e| Error::KemError(e.into_any_error()))?;
 
         let shared_secret2 = self
             .kem2
             .decap(&enc2, &sk2, &pk2)
-            .await
+
             .map_err(|e| Error::KemError(e.into_any_error()))?;
 
         let ss_details1 = SharedSecretDetails::new(&shared_secret1, &enc1, &pk1);
@@ -244,17 +237,17 @@ where
         Ok(())
     }
 
-    async fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
+    fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
         let (sk1, pk1) = self
             .kem1
             .generate()
-            .await
+
             .map_err(|e| Error::KemError(e.into_any_error()))?;
 
         let (sk2, pk2) = self
             .kem2
             .generate()
-            .await
+
             .map_err(|e| Error::KemError(e.into_any_error()))?;
 
         let sk = [sk1.as_ref(), &sk2].concat();
@@ -297,8 +290,7 @@ where
     VH: VariableLengthHash,
     F: SharedSecretHashInput,
 {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn generate_deterministic(
+    fn generate_deterministic(
         &self,
         ikm: &[u8],
     ) -> Result<(HpkeSecretKey, HpkePublicKey), Error> {
@@ -309,11 +301,9 @@ where
 
         let (ikm1, ikm2) = ikm.split_at(self.kem1.seed_length_for_derive());
 
-        self.generate_key_pair_derand(ikm1, ikm2).await
+        self.generate_key_pair_derand(ikm1, ikm2)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn generate_key_pair_derand(
+    pub fn generate_key_pair_derand(
         &self,
         ikm1: &[u8],
         ikm2: &[u8],
@@ -321,13 +311,13 @@ where
         let (sk1, pk1) = self
             .kem1
             .generate_deterministic(ikm1)
-            .await
+
             .map_err(|e| Error::KemError(e.into_any_error()))?;
 
         let (sk2, pk2) = self
             .kem2
             .generate_deterministic(ikm2)
-            .await
+
             .map_err(|e| Error::KemError(e.into_any_error()))?;
 
         let sk = [sk1.as_ref(), &sk2].concat();

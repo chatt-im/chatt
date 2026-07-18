@@ -131,8 +131,7 @@ impl RawGroupState {
     }
 
     #[cfg(feature = "tree_index")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn import<C>(self, identity_provider: &C) -> Result<GroupState, MlsError>
+    pub(crate) fn import<C>(self, identity_provider: &C) -> Result<GroupState, MlsError>
     where
         C: IdentityProvider,
     {
@@ -150,7 +149,7 @@ impl RawGroupState {
 
         public_tree
             .initialize_index_if_necessary(identity_provider, &context.extensions)
-            .await?;
+            ?;
 
         Ok(GroupState {
             #[cfg(feature = "by_ref_proposal")]
@@ -164,8 +163,7 @@ impl RawGroupState {
     }
 
     #[cfg(not(feature = "tree_index"))]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn import(self) -> Result<GroupState, MlsError> {
+    pub(crate) fn import(self) -> Result<GroupState, MlsError> {
         let context = self.context;
 
         #[cfg(feature = "by_ref_proposal")]
@@ -195,9 +193,8 @@ where
     /// Write the current state of the group to the
     /// [`GroupStorageProvider`](crate::GroupStateStorage)
     /// that is currently in use by the group.
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn write_to_storage(&mut self) -> Result<(), MlsError> {
-        self.state_repo.write_to_storage(self.snapshot()?).await
+    pub fn write_to_storage(&mut self) -> Result<(), MlsError> {
+        self.state_repo.write_to_storage(self.snapshot()?)
     }
 
     /// Write the current state of the group to the
@@ -205,12 +202,11 @@ where
     /// that is currently in use by the group.
     /// The tree is not included in the state and can be stored
     /// separately by calling [`Group::export_tree`].
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn write_to_storage_without_ratchet_tree(&mut self) -> Result<(), MlsError> {
+    pub fn write_to_storage_without_ratchet_tree(&mut self) -> Result<(), MlsError> {
         let mut snapshot = self.snapshot()?;
         snapshot.state.public_tree.nodes = Default::default();
 
-        self.state_repo.write_to_storage(snapshot).await
+        self.state_repo.write_to_storage(snapshot)
     }
 
     pub(crate) fn snapshot(&self) -> Result<Snapshot, MlsError> {
@@ -226,9 +222,7 @@ where
             signer: self.signer.clone(),
         })
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn from_snapshot(config: C, snapshot: Snapshot) -> Result<Self, MlsError> {
+    pub(crate) fn from_snapshot(config: C, snapshot: Snapshot) -> Result<Self, MlsError> {
         let cipher_suite_provider = cipher_suite_provider(
             config.crypto_provider(),
             snapshot.state.context.cipher_suite,
@@ -253,7 +247,7 @@ where
                     #[cfg(feature = "tree_index")]
                     &identity_provider,
                 )
-                .await?,
+                ?,
             private_tree: snapshot.private_tree,
             key_schedule: snapshot.key_schedule,
             #[cfg(feature = "by_ref_proposal")]
@@ -302,12 +296,10 @@ pub(crate) mod test_utils {
     };
 
     use super::{RawGroupState, Snapshot};
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn get_test_snapshot(cipher_suite: CipherSuite, epoch_id: u64) -> Snapshot {
+    pub(crate) fn get_test_snapshot(cipher_suite: CipherSuite, epoch_id: u64) -> Snapshot {
         Snapshot {
             state: RawGroupState {
-                context: get_test_group_context(epoch_id, cipher_suite).await,
+                context: get_test_group_context(epoch_id, cipher_suite),
                 #[cfg(feature = "by_ref_proposal")]
                 proposals: Default::default(),
                 #[cfg(feature = "by_ref_proposal")]
@@ -316,7 +308,7 @@ pub(crate) mod test_utils {
                 interim_transcript_hash: InterimTranscriptHash::from(vec![]),
                 pending_reinit: None,
                 confirmation_tag: ConfirmationTag::empty(&test_cipher_suite_provider(cipher_suite))
-                    .await,
+                    ,
             },
             private_tree: TreeKemPrivate::new(LeafIndex::unchecked(0)),
             epoch_secrets: get_test_epoch_secrets(cipher_suite),
@@ -345,8 +337,8 @@ mod tests {
     };
 
     #[cfg(all(feature = "std", feature = "by_ref_proposal"))]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn legacy_interop() {
+    #[test]
+    fn legacy_interop() {
         let mut storage = InMemoryGroupStateStorage::new();
 
         let legacy_snapshot = include_bytes!(concat!(
@@ -361,27 +353,25 @@ mod tests {
 
         storage
             .write(group_state, Default::default(), Default::default())
-            .await
+
             .unwrap();
 
         let client = TestClientBuilder::new_for_test()
             .group_state_storage(storage)
             .build();
 
-        let mut group = client.load_group(b"group").await.unwrap();
+        let mut group = client.load_group(b"group").unwrap();
 
         group
             .apply_pending_commit_backwards_compatible()
-            .await
+
             .unwrap();
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn snapshot_restore(group: TestGroup) {
+    fn snapshot_restore(group: TestGroup) {
         let snapshot = group.snapshot().unwrap();
 
         let group_restored = Group::from_snapshot(group.config.clone(), snapshot)
-            .await
+
             .unwrap();
 
         assert!(Group::equal_group_state(&group, &group_restored));
@@ -393,39 +383,39 @@ mod tests {
             .equal_internals(&group.state.public_tree))
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn snapshot_with_pending_commit_can_be_serialized_to_json() {
-        let mut group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
-        group.commit(vec![]).await.unwrap();
+    #[test]
+    fn snapshot_with_pending_commit_can_be_serialized_to_json() {
+        let mut group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
+        group.commit(vec![]).unwrap();
 
-        snapshot_restore(group).await
+        snapshot_restore(group)
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn snapshot_with_pending_updates_can_be_serialized_to_json() {
-        let mut group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+    #[test]
+    fn snapshot_with_pending_updates_can_be_serialized_to_json() {
+        let mut group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
 
         // Creating the update proposal will add it to pending updates
-        let update_proposal = group.update_proposal().await;
+        let update_proposal = group.update_proposal();
 
         // This will insert the proposal into the internal proposal cache
-        let _ = group.proposal_message(update_proposal, vec![]).await;
+        let _ = group.proposal_message(update_proposal, vec![]);
 
-        snapshot_restore(group).await
+        snapshot_restore(group)
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn snapshot_can_be_serialized_to_json_with_internals() {
-        let group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+    #[test]
+    fn snapshot_can_be_serialized_to_json_with_internals() {
+        let group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE);
 
-        snapshot_restore(group).await
+        snapshot_restore(group)
     }
 
     #[cfg(feature = "serde")]
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn serde() {
-        let snapshot = super::test_utils::get_test_snapshot(TEST_CIPHER_SUITE, 5).await;
+    #[test]
+    fn serde() {
+        let snapshot = super::test_utils::get_test_snapshot(TEST_CIPHER_SUITE, 5);
         let json = serde_json::to_string_pretty(&snapshot).unwrap();
         let recovered = serde_json::from_str(&json).unwrap();
         assert_eq!(snapshot, recovered);

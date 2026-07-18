@@ -54,8 +54,6 @@ impl KeyPackageData {
 }
 
 /// Storage trait that maintains key package secrets.
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 pub trait KeyPackageStorage: Send + Sync {
     /// Error type that the underlying storage mechanism returns on internal
     /// failure.
@@ -70,16 +68,16 @@ pub trait KeyPackageStorage: Send + Sync {
     ///
     /// [`KeyPackageData`] internally contains secret key values. The
     /// provided delete mechanism should securely erase data.
-    async fn delete(&mut self, id: &[u8]) -> Result<(), Self::Error>;
+    fn delete(&mut self, id: &[u8]) -> Result<(), Self::Error>;
 
     /// Store [`KeyPackageData`] that can be accessed by `id` in the future.
     ///
     /// This function is automatically called whenever a new key package is created.
-    async fn insert(&mut self, id: Vec<u8>, pkg: KeyPackageData) -> Result<(), Self::Error>;
+    fn insert(&mut self, id: Vec<u8>, pkg: KeyPackageData) -> Result<(), Self::Error>;
 
     /// Retrieve [`KeyPackageData`] by its `id`.
     ///
     /// `None` should be returned in the event that no key packages are found
     /// that match `id`.
-    async fn get(&self, id: &[u8]) -> Result<Option<KeyPackageData>, Self::Error>;
+    fn get(&self, id: &[u8]) -> Result<Option<KeyPackageData>, Self::Error>;
 }

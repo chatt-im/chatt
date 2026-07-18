@@ -65,8 +65,7 @@ where
     /// is determined using the
     /// [`IdentityProvider`](crate::IdentityProvider)
     /// that is currently in use by this group instance.
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn branch(
+    pub fn branch(
         &self,
         sub_group_id: Vec<u8>,
         new_key_packages: Vec<MlsMessage>,
@@ -80,12 +79,11 @@ where
                 self.current_user_leaf_node()?.ungreased_extensions(),
                 self.roster(),
             )
-            .await
+
     }
 
     /// Join a subgroup that was created by [`Group::branch`].
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn join_subgroup(
+    pub fn join_subgroup(
         &self,
         welcome: &MlsMessage,
         tree_data: Option<ExportedTree<'_>>,
@@ -93,7 +91,7 @@ where
     ) -> Result<(Group<C>, NewMemberInfo), MlsError> {
         self.branch_group_creator(timestamp, vec![])?
             .join(welcome, tree_data, false, self.roster())
-            .await
+
     }
 
     /// Generate a [`ReinitClient`] that can be used to create or join a new group
@@ -163,14 +161,13 @@ where
 impl<C: ClientConfig + Clone> ReinitClient<C> {
     /// Generate a key package for the new group. The key package can
     /// be used in [`ReinitClient::commit`].
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn generate_key_package(
+    pub fn generate_key_package(
         &self,
         timestamp: Option<MlsTime>,
     ) -> Result<MlsMessage, MlsError> {
         self.client
             .generate_key_package_message(Default::default(), Default::default(), timestamp)
-            .await
+
     }
 
     fn group_creator(self, timestamp: Option<MlsTime>) -> GroupCreator<C> {
@@ -194,8 +191,7 @@ impl<C: ClientConfig + Clone> ReinitClient<C> {
     ///
     /// This function will fail if the number of members in the reinitialized
     /// group is not the same as the prior group roster.
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn commit(
+    pub fn commit(
         mut self,
         new_key_packages: Vec<MlsMessage>,
         new_leaf_node_extensions: ExtensionList,
@@ -212,12 +208,11 @@ impl<C: ClientConfig + Clone> ReinitClient<C> {
                 new_leaf_node_extensions,
                 old_public_tree.roster(),
             )
-            .await
+
     }
 
     /// Join a reinitialized group that was created by [`ReinitClient::commit`].
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn join(
+    pub fn join(
         mut self,
         welcome: &MlsMessage,
         tree_data: Option<ExportedTree<'_>>,
@@ -227,7 +222,7 @@ impl<C: ClientConfig + Clone> ReinitClient<C> {
 
         self.group_creator(timestamp)
             .join(welcome, tree_data, true, old_public_tree.roster())
-            .await
+
     }
 }
 
@@ -244,8 +239,7 @@ struct GroupCreator<C> {
 }
 
 impl<C: ClientConfig> GroupCreator<C> {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn create(
+    fn create(
         self,
         new_key_packages: Vec<MlsMessage>,
         signing_identity: SigningIdentity,
@@ -264,7 +258,7 @@ impl<C: ClientConfig> GroupCreator<C> {
             self.signer,
             self.timestamp,
         )
-        .await?;
+        ?;
 
         // Install the resumption psk in the new group
         group.previous_psk = Some(self.psk_input);
@@ -276,19 +270,17 @@ impl<C: ClientConfig> GroupCreator<C> {
             commit = commit.add_member(kp)?;
         }
 
-        let commit = commit.build().await?;
-        group.apply_pending_commit().await?;
+        let commit = commit.build()?;
+        group.apply_pending_commit()?;
 
         // Uninstall the resumption psk on success (in case of failure, the new group is discarded anyway)
         group.previous_psk = None;
 
-        check_that_subgroup_is_a_subset(old_roster, &group, self.typ).await?;
+        check_that_subgroup_is_a_subset(old_roster, &group, self.typ)?;
 
         Ok((group, commit.welcome_messages))
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn join(
+    fn join(
         self,
         welcome: &MlsMessage,
         tree_data: Option<ExportedTree<'_>>,
@@ -303,9 +295,9 @@ impl<C: ClientConfig> GroupCreator<C> {
             Some(self.psk_input),
             self.timestamp,
         )
-        .await?;
+        ?;
 
-        check_that_subgroup_is_a_subset(old_roster, &group, self.typ).await?;
+        check_that_subgroup_is_a_subset(old_roster, &group, self.typ)?;
 
         // The version and cipher_suite values in the Welcome message are the same as those used
         // by the old group.
@@ -331,9 +323,7 @@ enum GroupCreationType {
     Branch,
     Reinit,
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-async fn check_that_subgroup_is_a_subset<C: ClientConfig>(
+fn check_that_subgroup_is_a_subset<C: ClientConfig>(
     old_roster: Roster<'_>,
     new_group: &Group<C>,
     typ: GroupCreationType,
@@ -347,8 +337,8 @@ async fn check_that_subgroup_is_a_subset<C: ClientConfig>(
     let provider = new_group.identity_provider();
     let extensions = new_group.context().extensions();
 
-    let old_identities = collect_identities(extensions, old_roster, &provider).await?;
-    let new_identities = collect_identities(extensions, new_group.roster(), &provider).await?;
+    let old_identities = collect_identities(extensions, old_roster, &provider)?;
+    let new_identities = collect_identities(extensions, new_group.roster(), &provider)?;
 
     new_identities
         .is_subset(&old_identities)
@@ -377,7 +367,7 @@ fn collect_identities<I: IdentityProvider>(
 
 #[cfg(feature = "std")]
 #[cfg(mls_build_async)]
-async fn collect_identities<I: IdentityProvider>(
+fn collect_identities<I: IdentityProvider>(
     extensions: &ExtensionList,
     roster: Roster<'_>,
     provider: &I,
@@ -387,12 +377,12 @@ async fn collect_identities<I: IdentityProvider>(
         .map(async move |m| {
             provider
                 .identity(&m.signing_identity, extensions)
-                .await
+
                 .map_err(|e| MlsError::IdentityProviderError(e.into_any_error()))
         })
         .collect::<FuturesUnordered<_>>()
         .try_collect()
-        .await
+
 }
 
 #[cfg(not(feature = "std"))]

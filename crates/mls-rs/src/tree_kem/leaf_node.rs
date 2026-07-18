@@ -59,8 +59,7 @@ pub struct ConfigProperties {
 }
 
 impl LeafNode {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn generate<CSP>(
+    pub fn generate<CSP>(
         cipher_suite_provider: &CSP,
         properties: ConfigProperties,
         signing_identity: SigningIdentity,
@@ -72,7 +71,7 @@ impl LeafNode {
     {
         let (secret_key, public_key) = cipher_suite_provider
             .kem_generate()
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
 
         let mut leaf_node = LeafNode {
@@ -92,13 +91,11 @@ impl LeafNode {
                 signer,
                 &LeafNodeSigningContext::default(),
             )
-            .await?;
+            ?;
 
         Ok((leaf_node, secret_key))
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn update<P: CipherSuiteProvider>(
+    pub fn update<P: CipherSuiteProvider>(
         &mut self,
         cipher_suite_provider: &P,
         group_id: &[u8],
@@ -109,7 +106,7 @@ impl LeafNode {
     ) -> Result<HpkeSecretKey, MlsError> {
         let (secret, public) = cipher_suite_provider
             .kem_generate()
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
 
         self.public_key = public;
@@ -132,14 +129,13 @@ impl LeafNode {
             signer,
             &(group_id, leaf_index).into(),
         )
-        .await?;
+        ?;
 
         Ok(secret)
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn commit<P: CipherSuiteProvider>(
+    pub fn commit<P: CipherSuiteProvider>(
         &mut self,
         cipher_suite_provider: &P,
         group_id: &[u8],
@@ -150,7 +146,7 @@ impl LeafNode {
     ) -> Result<HpkeSecretKey, MlsError> {
         let (secret, public) = cipher_suite_provider
             .kem_generate()
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
 
         self.public_key = public;
@@ -169,7 +165,7 @@ impl LeafNode {
             signer,
             &(group_id, leaf_index).into(),
         )
-        .await?;
+        ?;
 
         Ok(secret)
     }
@@ -282,8 +278,7 @@ pub(crate) mod test_utils {
     use super::*;
 
     #[allow(unused)]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn get_test_node(
+    pub fn get_test_node(
         cipher_suite: CipherSuite,
         signing_identity: SigningIdentity,
         secret: &SignatureSecretKey,
@@ -298,11 +293,9 @@ pub(crate) mod test_utils {
             extensions.unwrap_or_default(),
             Lifetime::years(1, None).unwrap(),
         )
-        .await
-    }
 
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn get_test_node_with_lifetime(
+    }
+    pub fn get_test_node_with_lifetime(
         cipher_suite: CipherSuite,
         signing_identity: SigningIdentity,
         secret: &SignatureSecretKey,
@@ -322,14 +315,13 @@ pub(crate) mod test_utils {
             secret,
             lifetime,
         )
-        .await
+
         .unwrap()
     }
 
     #[allow(unused)]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn get_basic_test_node(cipher_suite: CipherSuite, id: &str) -> LeafNode {
-        get_basic_test_node_sig_key(cipher_suite, id).await.0
+    pub fn get_basic_test_node(cipher_suite: CipherSuite, id: &str) -> LeafNode {
+        get_basic_test_node_sig_key(cipher_suite, id).0
     }
 
     #[allow(unused)]
@@ -339,15 +331,13 @@ pub(crate) mod test_utils {
             extensions: Default::default(),
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn get_basic_test_node_capabilities(
+    pub fn get_basic_test_node_capabilities(
         cipher_suite: CipherSuite,
         id: &str,
         capabilities: Capabilities,
     ) -> (LeafNode, HpkeSecretKey, SignatureSecretKey) {
         let (signing_identity, signature_key) =
-            get_test_signing_identity(cipher_suite, id.as_bytes()).await;
+            get_test_signing_identity(cipher_suite, id.as_bytes());
 
         LeafNode::generate(
             &test_cipher_suite_provider(cipher_suite),
@@ -359,17 +349,15 @@ pub(crate) mod test_utils {
             &signature_key,
             Lifetime::years(1, None).unwrap(),
         )
-        .await
+
         .map(|(leaf, hpke_secret_key)| (leaf, hpke_secret_key, signature_key))
         .unwrap()
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn get_basic_test_node_sig_key(
+    pub fn get_basic_test_node_sig_key(
         cipher_suite: CipherSuite,
         id: &str,
     ) -> (LeafNode, HpkeSecretKey, SignatureSecretKey) {
-        get_basic_test_node_capabilities(cipher_suite, id, get_test_capabilities()).await
+        get_basic_test_node_capabilities(cipher_suite, id, get_test_capabilities())
     }
 
     #[allow(unused)]
@@ -417,14 +405,14 @@ mod tests {
     use crate::identity::test_utils::get_test_signing_identity;
     use assert_matches::assert_matches;
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_node_generation() {
+    #[test]
+    fn test_node_generation() {
         let capabilities = get_test_capabilities();
         let extensions = get_test_extensions();
         let lifetime = Lifetime::years(1, None).unwrap();
 
         for cipher_suite in TestCryptoProvider::all_supported_cipher_suites() {
-            let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo").await;
+            let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo");
 
             let (leaf_node, secret_key) = get_test_node_with_lifetime(
                 cipher_suite,
@@ -434,7 +422,7 @@ mod tests {
                 extensions.clone(),
                 lifetime.clone(),
             )
-            .await;
+            ;
 
             assert_eq!(leaf_node.ungreased_capabilities(), capabilities);
             assert_eq!(leaf_node.ungreased_extensions(), extensions);
@@ -454,12 +442,12 @@ mod tests {
 
             let sealed = provider
                 .hpke_seal(&leaf_node.public_key, &[], None, &test_data)
-                .await
+
                 .unwrap();
 
             let opened = provider
                 .hpke_open(&sealed, &secret_key, &leaf_node.public_key, &[], None)
-                .await
+
                 .unwrap();
 
             assert_eq!(*opened, test_data);
@@ -470,38 +458,38 @@ mod tests {
                     &signing_identity.signature_key,
                     &LeafNodeSigningContext::default(),
                 )
-                .await
+
                 .unwrap();
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_node_generation_randomness() {
+    #[test]
+    fn test_node_generation_randomness() {
         let cipher_suite = TEST_CIPHER_SUITE;
 
-        let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo").await;
+        let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo");
 
         let (first_leaf, first_secret) =
-            get_test_node(cipher_suite, signing_identity.clone(), &secret, None, None).await;
+            get_test_node(cipher_suite, signing_identity.clone(), &secret, None, None);
 
         for _ in 0..100 {
             let (next_leaf, next_secret) =
-                get_test_node(cipher_suite, signing_identity.clone(), &secret, None, None).await;
+                get_test_node(cipher_suite, signing_identity.clone(), &secret, None, None);
 
             assert_ne!(first_secret, next_secret);
             assert_ne!(first_leaf.public_key, next_leaf.public_key);
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_node_update_no_meta_changes() {
+    #[test]
+    fn test_node_update_no_meta_changes() {
         for cipher_suite in TestCryptoProvider::all_supported_cipher_suites() {
             let cipher_suite_provider = test_cipher_suite_provider(cipher_suite);
 
-            let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo").await;
+            let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo");
 
             let (mut leaf, leaf_secret) =
-                get_test_node(cipher_suite, signing_identity.clone(), &secret, None, None).await;
+                get_test_node(cipher_suite, signing_identity.clone(), &secret, None, None);
 
             let original_leaf = leaf.clone();
 
@@ -514,7 +502,7 @@ mod tests {
                     None,
                     &secret,
                 )
-                .await
+
                 .unwrap();
 
             assert_ne!(new_secret, leaf_secret);
@@ -538,16 +526,16 @@ mod tests {
                 &signing_identity.signature_key,
                 &(b"group".as_slice(), 0).into(),
             )
-            .await
+
             .unwrap();
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_node_update_meta_changes() {
+    #[test]
+    fn test_node_update_meta_changes() {
         let cipher_suite = TEST_CIPHER_SUITE;
 
-        let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo").await;
+        let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo");
 
         let new_properties = ConfigProperties {
             capabilities: get_test_capabilities(),
@@ -555,7 +543,7 @@ mod tests {
         };
 
         let (mut leaf, _) =
-            get_test_node(cipher_suite, signing_identity, &secret, None, None).await;
+            get_test_node(cipher_suite, signing_identity, &secret, None, None);
 
         leaf.update(
             &test_cipher_suite_provider(cipher_suite),
@@ -565,22 +553,22 @@ mod tests {
             None,
             &secret,
         )
-        .await
+
         .unwrap();
 
         assert_eq!(leaf.ungreased_capabilities(), new_properties.capabilities);
         assert_eq!(leaf.ungreased_extensions(), new_properties.extensions);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_node_commit_no_meta_changes() {
+    #[test]
+    fn test_node_commit_no_meta_changes() {
         for cipher_suite in TestCryptoProvider::all_supported_cipher_suites() {
             let cipher_suite_provider = test_cipher_suite_provider(cipher_suite);
 
-            let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo").await;
+            let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo");
 
             let (mut leaf, leaf_secret) =
-                get_test_node(cipher_suite, signing_identity.clone(), &secret, None, None).await;
+                get_test_node(cipher_suite, signing_identity.clone(), &secret, None, None);
 
             let original_leaf = leaf.clone();
 
@@ -593,7 +581,7 @@ mod tests {
                     None,
                     &secret,
                 )
-                .await
+
                 .unwrap();
 
             assert_ne!(new_secret, leaf_secret);
@@ -616,18 +604,18 @@ mod tests {
                 &signing_identity.signature_key,
                 &(b"group".as_slice(), 0).into(),
             )
-            .await
+
             .unwrap();
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_node_commit_meta_changes() {
+    #[test]
+    fn test_node_commit_meta_changes() {
         let cipher_suite = TEST_CIPHER_SUITE;
 
-        let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo").await;
+        let (signing_identity, secret) = get_test_signing_identity(cipher_suite, b"foo");
         let (mut leaf, _) =
-            get_test_node(cipher_suite, signing_identity, &secret, None, None).await;
+            get_test_node(cipher_suite, signing_identity, &secret, None, None);
 
         let new_properties = ConfigProperties {
             capabilities: get_test_capabilities(),
@@ -635,7 +623,7 @@ mod tests {
         };
 
         // The new identity has a fresh public key
-        let new_signing_identity = get_test_signing_identity(cipher_suite, b"foo").await.0;
+        let new_signing_identity = get_test_signing_identity(cipher_suite, b"foo").0;
 
         leaf.commit(
             &test_cipher_suite_provider(cipher_suite),
@@ -645,7 +633,7 @@ mod tests {
             Some(new_signing_identity.clone()),
             &secret,
         )
-        .await
+
         .unwrap();
 
         assert_eq!(leaf.capabilities, new_properties.capabilities);
@@ -653,11 +641,11 @@ mod tests {
         assert_eq!(leaf.signing_identity, new_signing_identity);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn context_is_signed() {
+    #[test]
+    fn context_is_signed() {
         let provider = test_cipher_suite_provider(TEST_CIPHER_SUITE);
 
-        let (signing_identity, secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"foo").await;
+        let (signing_identity, secret) = get_test_signing_identity(TEST_CIPHER_SUITE, b"foo");
 
         let (mut leaf, _) = get_test_node(
             TEST_CIPHER_SUITE,
@@ -666,10 +654,10 @@ mod tests {
             None,
             None,
         )
-        .await;
+        ;
 
         leaf.sign(&provider, &secret, &(b"foo".as_slice(), 0).into())
-            .await
+
             .unwrap();
 
         let res = leaf
@@ -678,7 +666,7 @@ mod tests {
                 &signing_identity.signature_key,
                 &(b"foo".as_slice(), 1).into(),
             )
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::InvalidSignature));
 
@@ -688,7 +676,7 @@ mod tests {
                 &signing_identity.signature_key,
                 &(b"bar".as_slice(), 0).into(),
             )
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::InvalidSignature));
     }

@@ -223,13 +223,10 @@ fn decode_epoch_id(key: &[u8], group_id: &[u8]) -> Result<u64, RedbDataStorageEr
         .ok_or_else(|| RedbDataStorageError::CorruptRecord("invalid epoch key".into()))?;
     Ok(u64::from_be_bytes(epoch))
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(mls_build_async, maybe_async::must_be_async)]
 impl GroupStateStorage for RedbGroupStateStorage {
     type Error = RedbDataStorageError;
 
-    async fn write(
+    fn write(
         &mut self,
         state: GroupState,
         inserts: Vec<EpochRecord>,
@@ -238,11 +235,11 @@ impl GroupStateStorage for RedbGroupStateStorage {
         self.update_group_state(&state.id, &state.data, inserts, updates)
     }
 
-    async fn state(&self, group_id: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error> {
+    fn state(&self, group_id: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error> {
         Ok(self.get_snapshot_data(group_id)?.map(Into::into))
     }
 
-    async fn epoch(
+    fn epoch(
         &self,
         group_id: &[u8],
         epoch_id: u64,
@@ -250,7 +247,7 @@ impl GroupStateStorage for RedbGroupStateStorage {
         Ok(self.get_epoch_data(group_id, epoch_id)?.map(Into::into))
     }
 
-    async fn max_epoch_id(&self, group_id: &[u8]) -> Result<Option<u64>, Self::Error> {
+    fn max_epoch_id(&self, group_id: &[u8]) -> Result<Option<u64>, Self::Error> {
         self.get_max_epoch_id(group_id)
     }
 }

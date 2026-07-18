@@ -79,15 +79,15 @@ impl ValidationTestCase {
 }
 
 #[cfg(feature = "rfc_compliant")]
-#[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+#[test]
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn validation() {
+fn validation() {
     use crate::group::test_utils::get_test_group_context;
 
     #[cfg(mls_build_async)]
     let test_cases: Vec<ValidationTestCase> = load_test_case_json!(
         interop_tree_validation,
-        generate_validation_test_vector().await
+        generate_validation_test_vector()
     );
 
     #[cfg(not(mls_build_async))]
@@ -104,10 +104,10 @@ async fn validation() {
             &BasicIdentityProvider,
             &Default::default(),
         )
-        .await
+
         .unwrap();
 
-        let tree_hash = tree.tree_hash(&cs).await.unwrap();
+        let tree_hash = tree.tree_hash(&cs).unwrap();
 
         tree.tree_hashes
             .current
@@ -123,21 +123,20 @@ async fn validation() {
                 assert_eq!(&tree.nodes.get_resolution_index(i as u32).unwrap(), res)
             });
 
-        let mut context = get_test_group_context(1, test_case.cipher_suite.into()).await;
+        let mut context = get_test_group_context(1, test_case.cipher_suite.into());
         context.tree_hash = tree_hash;
         context.group_id = test_case.group_id;
 
         TreeValidator::new(&cs, &context, &BasicIdentityProvider)
             .validate(&mut tree, None)
-            .await
+
             .unwrap();
     }
 }
 
 #[cfg(feature = "rfc_compliant")]
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn generate_validation_test_vector() -> Vec<ValidationTestCase> {
+fn generate_validation_test_vector() -> Vec<ValidationTestCase> {
     let mut test_cases = vec![];
 
     for cs in CipherSuite::all() {
@@ -149,50 +148,50 @@ async fn generate_validation_test_vector() -> Vec<ValidationTestCase> {
 
         // Generate trees with increasing complexity. Start: full complete trees
         for n_leaves in [2, 4, 8, 32] {
-            trees.push(TreeWithSigners::make_full_tree(n_leaves, &cs).await);
+            trees.push(TreeWithSigners::make_full_tree(n_leaves, &cs));
         }
 
         // Internal blanks, no skipping : 8 leaves, 0 commits removing 2, 3 and adding new member
-        let mut tree = TreeWithSigners::make_full_tree(8, &cs).await;
+        let mut tree = TreeWithSigners::make_full_tree(8, &cs);
         tree.remove_member(2);
         tree.remove_member(3);
-        tree.add_member("Bob", &cs).await;
-        tree.update_committer_path(0, &cs).await;
+        tree.add_member("Bob", &cs);
+        tree.update_committer_path(0, &cs);
         trees.push(tree);
 
         // Blanks at the end, no skipping
         for n_leaves in [3, 5, 7, 33] {
-            trees.push(TreeWithSigners::make_full_tree(n_leaves, &cs).await);
+            trees.push(TreeWithSigners::make_full_tree(n_leaves, &cs));
         }
 
         // Internal blanks, with skipping : 8 leaves, 0 commits removing 1, 2, 3
-        let mut tree = TreeWithSigners::make_full_tree(8, &cs).await;
+        let mut tree = TreeWithSigners::make_full_tree(8, &cs);
         [1, 2, 3].into_iter().for_each(
             #[cfg_attr(coverage_nightly, coverage(off))]
             |i| tree.remove_member(i),
         );
-        tree.update_committer_path(0, &cs).await;
+        tree.update_committer_path(0, &cs);
         trees.push(tree);
 
         // Blanks at the end, with skipping
         for n_leaves in [6, 34] {
-            trees.push(TreeWithSigners::make_full_tree(n_leaves, &cs).await);
+            trees.push(TreeWithSigners::make_full_tree(n_leaves, &cs));
         }
 
         // Unmerged leaves, no skipping : 7 leaves; 0 commits adding a member
-        let mut tree = TreeWithSigners::make_full_tree(7, &cs).await;
-        tree.add_member("Bob", &cs).await;
-        tree.update_committer_path(0, &cs).await;
+        let mut tree = TreeWithSigners::make_full_tree(7, &cs);
+        tree.add_member("Bob", &cs);
+        tree.update_committer_path(0, &cs);
         trees.push(tree);
 
         // Unmerged leaves, with skipping : figure 20 in the RFC
-        let mut tree = TreeWithSigners::make_full_tree(7, &cs).await;
+        let mut tree = TreeWithSigners::make_full_tree(7, &cs);
         tree.remove_member(5);
-        tree.update_committer_path(0, &cs).await;
-        tree.update_committer_path(4, &cs).await;
-        tree.add_member("Bob", &cs).await;
+        tree.update_committer_path(0, &cs);
+        tree.update_committer_path(4, &cs);
+        tree.add_member("Bob", &cs);
         tree.tree.tree_hashes.current = vec![];
-        tree.tree.tree_hash(&cs).await.unwrap();
+        tree.tree.tree_hash(&cs).unwrap();
         trees.push(tree);
 
         // Generate tests

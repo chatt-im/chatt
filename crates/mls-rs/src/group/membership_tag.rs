@@ -72,8 +72,7 @@ impl From<Vec<u8>> for MembershipTag {
 }
 
 impl MembershipTag {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn create<P: CipherSuiteProvider>(
+    pub(crate) fn create<P: CipherSuiteProvider>(
         authenticated_content: &AuthenticatedContent,
         group_context: &GroupContext,
         membership_key: &[u8],
@@ -88,7 +87,7 @@ impl MembershipTag {
 
         let tag = cipher_suite_provider
             .mac(membership_key, &serialized_tbm)
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
 
         Ok(MembershipTag(tag))
@@ -148,8 +147,8 @@ mod tests {
         load_test_case_json!(membership_tag, generate_test_cases())
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_membership_tag() {
+    #[test]
+    fn test_membership_tag() {
         for case in load_test_cases() {
             let Some(cs_provider) = try_test_cipher_suite_provider(case.cipher_suite) else {
                 continue;
@@ -157,11 +156,11 @@ mod tests {
 
             let tag = MembershipTag::create(
                 &get_test_auth_content(),
-                &get_test_group_context(1, cs_provider.cipher_suite()).await,
+                &get_test_group_context(1, cs_provider.cipher_suite()),
                 b"membership_key".as_ref(),
                 &test_cipher_suite_provider(cs_provider.cipher_suite()),
             )
-            .await
+
             .unwrap();
 
             assert_eq!(**tag, case.tag);

@@ -53,19 +53,15 @@ impl DerefMut for TestGroup {
 
 impl TestGroup {
     #[cfg(feature = "external_client")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn propose(&mut self, proposal: Proposal) -> MlsMessage {
-        self.proposal_message(proposal, vec![]).await.unwrap()
+    pub(crate) fn propose(&mut self, proposal: Proposal) -> MlsMessage {
+        self.proposal_message(proposal, vec![]).unwrap()
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn update_proposal(&mut self) -> Proposal {
-        self.group.update_proposal(None, None, None).await.unwrap()
+    pub(crate) fn update_proposal(&mut self) -> Proposal {
+        self.group.update_proposal(None, None, None).unwrap()
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn join_with_custom_config<F>(
+    pub(crate) fn join_with_custom_config<F>(
         &mut self,
         name: &str,
         custom_kp: bool,
@@ -83,9 +79,9 @@ impl TestGroup {
                 Default::default(),
                 &mut config,
             )
-            .await
+
         } else {
-            test_client_with_key_pkg(self.protocol_version(), self.cipher_suite(), name).await
+            test_client_with_key_pkg(self.protocol_version(), self.cipher_suite(), name)
         };
 
         // Add new member to the group
@@ -99,11 +95,11 @@ impl TestGroup {
             .add_member(new_key_package)
             .unwrap()
             .build()
-            .await
+
             .unwrap();
 
         // Apply the commit to the original group
-        self.apply_pending_commit().await.unwrap();
+        self.apply_pending_commit().unwrap();
 
         config(&mut new_client.config);
 
@@ -115,38 +111,31 @@ impl TestGroup {
             new_client.signer.clone().unwrap(),
             None,
         )
-        .await?;
+        ?;
 
         let new_test_group = TestGroup { group: new_group };
 
         Ok((new_test_group, commit_message))
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn join(&mut self, name: &str) -> (TestGroup, MlsMessage) {
+    pub(crate) fn join(&mut self, name: &str) -> (TestGroup, MlsMessage) {
         self.join_with_custom_config(name, false, |_| ())
-            .await
+
             .unwrap()
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn process_pending_commit(
+    pub(crate) fn process_pending_commit(
         &mut self,
     ) -> Result<CommitMessageDescription, MlsError> {
-        self.apply_pending_commit().await
+        self.apply_pending_commit()
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn process_message(
+    pub(crate) fn process_message(
         &mut self,
         message: MlsMessage,
     ) -> Result<ReceivedMessage, MlsError> {
-        self.process_incoming_message(message).await
+        self.process_incoming_message(message)
     }
 
     #[cfg(feature = "private_message")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn make_plaintext(&mut self, content: Content) -> MlsMessage {
+    pub(crate) fn make_plaintext(&mut self, content: Content) -> MlsMessage {
         let auth_content = AuthenticatedContent::new_signed(
             &self.cipher_suite_provider,
             &self.state.context,
@@ -156,15 +145,13 @@ impl TestGroup {
             WireFormat::PublicMessage,
             Vec::new(),
         )
-        .await
+
         .unwrap();
 
-        self.format_for_wire(auth_content).await.unwrap()
+        self.format_for_wire(auth_content).unwrap()
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn get_test_group_context(epoch: u64, cipher_suite: CipherSuite) -> GroupContext {
+pub(crate) fn get_test_group_context(epoch: u64, cipher_suite: CipherSuite) -> GroupContext {
     let cs = test_cipher_suite_provider(cipher_suite);
 
     GroupContext {
@@ -172,8 +159,8 @@ pub(crate) async fn get_test_group_context(epoch: u64, cipher_suite: CipherSuite
         cipher_suite,
         group_id: TEST_GROUP.to_vec(),
         epoch,
-        tree_hash: cs.hash(&[1, 2, 3]).await.unwrap(),
-        confirmed_transcript_hash: cs.hash(&[3, 2, 1]).await.unwrap().into(),
+        tree_hash: cs.hash(&[1, 2, 3]).unwrap(),
+        confirmed_transcript_hash: cs.hash(&[3, 2, 1]).unwrap().into(),
         extensions: ExtensionList::from(vec![]),
     }
 }
@@ -206,14 +193,12 @@ pub(crate) fn group_extensions() -> ExtensionList {
 pub(crate) fn lifetime() -> Lifetime {
     Lifetime::years(1, None).unwrap()
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn test_member(
+pub(crate) fn test_member(
     protocol_version: ProtocolVersion,
     cipher_suite: CipherSuite,
     identifier: &[u8],
 ) -> (KeyPackageGeneration, SignatureSecretKey) {
-    let (signing_identity, signing_key) = get_test_signing_identity(cipher_suite, identifier).await;
+    let (signing_identity, signing_key) = get_test_signing_identity(cipher_suite, identifier);
 
     let key_package_generator = KeyPackageGenerator {
         protocol_version,
@@ -229,14 +214,12 @@ pub(crate) async fn test_member(
             ExtensionList::default(),
             ExtensionList::default(),
         )
-        .await
+
         .unwrap();
 
     (key_package, signing_key)
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn test_group_custom(
+pub(crate) fn test_group_custom(
     protocol_version: ProtocolVersion,
     cipher_suite: CipherSuite,
     extension_types: Vec<ExtensionType>,
@@ -246,7 +229,7 @@ pub(crate) async fn test_group_custom(
     let leaf_extensions = leaf_extensions.unwrap_or_default();
     let commit_options = commit_options.unwrap_or_default();
 
-    let (signing_identity, secret_key) = get_test_signing_identity(cipher_suite, b"member").await;
+    let (signing_identity, secret_key) = get_test_signing_identity(cipher_suite, b"member");
     let group = TestClientBuilder::new_for_test()
         .mls_rules(DefaultMlsRules::default().with_commit_options(commit_options))
         .extension_types(extension_types)
@@ -260,14 +243,12 @@ pub(crate) async fn test_group_custom(
             leaf_extensions,
             None,
         )
-        .await
+
         .unwrap();
 
     TestGroup { group }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn test_group(
+pub(crate) fn test_group(
     protocol_version: ProtocolVersion,
     cipher_suite: CipherSuite,
 ) -> TestGroup {
@@ -278,11 +259,9 @@ pub(crate) async fn test_group(
         None,
         None,
     )
-    .await
-}
 
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn test_group_custom_config<F>(
+}
+pub(crate) fn test_group_custom_config<F>(
     protocol_version: ProtocolVersion,
     cipher_suite: CipherSuite,
     custom: F,
@@ -290,7 +269,7 @@ pub(crate) async fn test_group_custom_config<F>(
 where
     F: FnOnce(TestClientBuilder) -> TestClientBuilder,
 {
-    let (signing_identity, secret_key) = get_test_signing_identity(cipher_suite, b"member").await;
+    let (signing_identity, secret_key) = get_test_signing_identity(cipher_suite, b"member");
 
     let client_builder = TestClientBuilder::new_for_test().used_protocol_version(protocol_version);
 
@@ -303,47 +282,41 @@ where
             Default::default(),
             None,
         )
-        .await
+
         .unwrap();
 
     TestGroup { group }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn test_n_member_group(
+pub(crate) fn test_n_member_group(
     protocol_version: ProtocolVersion,
     cipher_suite: CipherSuite,
     num_members: usize,
 ) -> Vec<TestGroup> {
-    let group = test_group(protocol_version, cipher_suite).await;
+    let group = test_group(protocol_version, cipher_suite);
 
     let mut groups = vec![group];
 
     for i in 1..num_members {
-        let (new_group, commit) = groups.get_mut(0).unwrap().join(&format!("name {i}")).await;
-        process_commit(&mut groups, commit, 0).await;
+        let (new_group, commit) = groups.get_mut(0).unwrap().join(&format!("name {i}"));
+        process_commit(&mut groups, commit, 0);
         groups.push(new_group);
     }
 
     groups
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn process_commit(groups: &mut [TestGroup], commit: MlsMessage, excluded: u32) {
+pub(crate) fn process_commit(groups: &mut [TestGroup], commit: MlsMessage, excluded: u32) {
     for g in groups
         .iter_mut()
         .filter(|g| g.current_member_index() != excluded)
     {
-        g.process_message(commit.clone()).await.unwrap();
+        g.process_message(commit.clone()).unwrap();
     }
 }
 
 pub(crate) fn get_test_25519_key(key_byte: u8) -> HpkePublicKey {
     vec![key_byte; 32].into()
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn get_test_groups_with_features(
+pub(crate) fn get_test_groups_with_features(
     n: usize,
     extensions: ExtensionList,
     leaf_extensions: ExtensionList,
@@ -352,7 +325,7 @@ pub(crate) async fn get_test_groups_with_features(
 
     for i in 0..n {
         let (identity, secret_key) =
-            get_test_signing_identity(TEST_CIPHER_SUITE, format!("member{i}").as_bytes()).await;
+            get_test_signing_identity(TEST_CIPHER_SUITE, format!("member{i}").as_bytes());
 
         clients.push(
             TestClientBuilder::new_for_test()
@@ -369,7 +342,7 @@ pub(crate) async fn get_test_groups_with_features(
             leaf_extensions.clone(),
             None,
         )
-        .await
+
         .unwrap();
 
     let mut groups = vec![group];
@@ -377,7 +350,7 @@ pub(crate) async fn get_test_groups_with_features(
     for client in clients.iter().skip(1) {
         let key_package = client
             .generate_key_package_message(Default::default(), leaf_extensions.clone(), None)
-            .await
+
             .unwrap();
 
         let commit_output = groups[0]
@@ -385,22 +358,22 @@ pub(crate) async fn get_test_groups_with_features(
             .add_member(key_package)
             .unwrap()
             .build()
-            .await
+
             .unwrap();
 
-        groups[0].apply_pending_commit().await.unwrap();
+        groups[0].apply_pending_commit().unwrap();
 
         for group in groups.iter_mut().skip(1) {
             group
                 .process_incoming_message(commit_output.commit_message.clone())
-                .await
+
                 .unwrap();
         }
 
         groups.push(
             client
                 .join_group(None, &commit_output.welcome_messages[0], None)
-                .await
+
                 .unwrap()
                 .0,
         );
@@ -439,22 +412,14 @@ impl DerefMut for GroupWithoutKeySchedule {
 
 #[cfg(feature = "rfc_compliant")]
 impl GroupWithoutKeySchedule {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn new(cs: CipherSuite) -> Self {
+    pub fn new(cs: CipherSuite) -> Self {
         Self {
-            inner: test_group(TEST_PROTOCOL_VERSION, cs).await.group,
+            inner: test_group(TEST_PROTOCOL_VERSION, cs).group,
             secrets: None,
             provisional_public_state: None,
         }
     }
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(all(target_arch = "wasm32", mls_build_async), maybe_async::must_be_async(?Send))]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), mls_build_async),
-    maybe_async::must_be_async
-)]
 impl MessageProcessor for GroupWithoutKeySchedule {
     type CipherSuiteProvider = <Group<TestClientConfig> as MessageProcessor>::CipherSuiteProvider;
     type OutputType = <Group<TestClientConfig> as MessageProcessor>::OutputType;
@@ -512,7 +477,7 @@ impl MessageProcessor for GroupWithoutKeySchedule {
         self.inner.min_epoch_available()
     }
 
-    async fn apply_update_path(
+    fn apply_update_path(
         &mut self,
         sender: LeafIndex,
         update_path: &ValidatedUpdatePath,
@@ -520,27 +485,27 @@ impl MessageProcessor for GroupWithoutKeySchedule {
     ) -> Result<Option<(TreeKemPrivate, PathSecret)>, MlsError> {
         self.inner
             .apply_update_path(sender, update_path, provisional_state)
-            .await
+
     }
 
     #[cfg(feature = "private_message")]
     #[cfg_attr(coverage_nightly, coverage(off))]
-    async fn process_ciphertext(
+    fn process_ciphertext(
         &mut self,
         cipher_text: &PrivateMessage,
     ) -> Result<EventOrContent<Self::OutputType>, MlsError> {
-        self.inner.process_ciphertext(cipher_text).await
+        self.inner.process_ciphertext(cipher_text)
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
-    async fn verify_plaintext_authentication(
+    fn verify_plaintext_authentication(
         &self,
         message: PublicMessage,
     ) -> Result<EventOrContent<Self::OutputType>, MlsError> {
-        self.inner.verify_plaintext_authentication(message).await
+        self.inner.verify_plaintext_authentication(message)
     }
 
-    async fn update_key_schedule(
+    fn update_key_schedule(
         &mut self,
         secrets: Option<(TreeKemPrivate, PathSecret)>,
         _interim_transcript_hash: InterimTranscriptHash,
@@ -553,12 +518,12 @@ impl MessageProcessor for GroupWithoutKeySchedule {
     }
 
     #[cfg(all(feature = "export_key_generation", feature = "private_message"))]
-    async fn get_unauthenticated_key_generation_from_sender_data(
+    fn get_unauthenticated_key_generation_from_sender_data(
         &mut self,
         cipher_text: &PrivateMessage,
     ) -> Result<Option<u32>, MlsError> {
         self.inner
             .get_unauthenticated_key_generation_from_sender_data(cipher_text)
-            .await
+
     }
 }

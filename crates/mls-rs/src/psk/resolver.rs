@@ -34,8 +34,7 @@ where
 impl<GS: GroupStateStorage, K: KeyPackageStorage, PS: PreSharedKeyStorage>
     PskResolver<'_, GS, K, PS>
 {
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn resolve_resumption(&self, psk_id: &ResumptionPsk) -> Result<PreSharedKey, MlsError> {
+    fn resolve_resumption(&self, psk_id: &ResumptionPsk) -> Result<PreSharedKey, MlsError> {
         if let Some(ctx) = self.group_context {
             if ctx.epoch == psk_id.psk_epoch && ctx.group_id == psk_id.psk_group_id.0 {
                 let epoch = self.current_epoch.ok_or(MlsError::OldGroupStateNotFound)?;
@@ -45,32 +44,28 @@ impl<GS: GroupStateStorage, K: KeyPackageStorage, PS: PreSharedKeyStorage>
 
         #[cfg(feature = "prior_epoch")]
         if let Some(eps) = self.prior_epochs {
-            if let Some(psk) = eps.resumption_secret(psk_id).await? {
+            if let Some(psk) = eps.resumption_secret(psk_id)? {
                 return Ok(psk);
             }
         }
 
         Err(MlsError::OldGroupStateNotFound)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn resolve_external(&self, psk_id: &ExternalPskId) -> Result<PreSharedKey, MlsError> {
+    fn resolve_external(&self, psk_id: &ExternalPskId) -> Result<PreSharedKey, MlsError> {
         self.psk_store
             .get(psk_id)
-            .await
+
             .map_err(|e| MlsError::PskStoreError(e.into_any_error()))?
             .ok_or(MlsError::MissingRequiredPsk)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn resolve(&self, id: &[PreSharedKeyID]) -> Result<Vec<PskSecretInput>, MlsError> {
+    fn resolve(&self, id: &[PreSharedKeyID]) -> Result<Vec<PskSecretInput>, MlsError> {
         let mut secret_inputs = Vec::new();
 
         for id in id {
             let psk = match &id.key_id {
-                JustPreSharedKeyID::External(external) => self.resolve_external(external).await,
+                JustPreSharedKeyID::External(external) => self.resolve_external(external),
                 JustPreSharedKeyID::Resumption(resumption) => {
-                    self.resolve_resumption(resumption).await
+                    self.resolve_resumption(resumption)
                 }
             }?;
 
@@ -82,14 +77,12 @@ impl<GS: GroupStateStorage, K: KeyPackageStorage, PS: PreSharedKeyStorage>
 
         Ok(secret_inputs)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn resolve_to_secret<P: CipherSuiteProvider>(
+    pub fn resolve_to_secret<P: CipherSuiteProvider>(
         &self,
         id: &[PreSharedKeyID],
         cipher_suite_provider: &P,
     ) -> Result<PskSecret, MlsError> {
-        let psk = self.resolve(id).await?;
-        PskSecret::calculate(&psk, cipher_suite_provider).await
+        let psk = self.resolve(id)?;
+        PskSecret::calculate(&psk, cipher_suite_provider)
     }
 }

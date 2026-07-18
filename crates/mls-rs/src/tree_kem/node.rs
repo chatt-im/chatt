@@ -467,13 +467,11 @@ pub(crate) mod test_utils {
     use crate::{
         client::test_utils::TEST_CIPHER_SUITE, tree_kem::leaf_node::test_utils::get_basic_test_node,
     };
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn get_test_node_vec() -> NodeVec {
+    pub(crate) fn get_test_node_vec() -> NodeVec {
         let mut nodes = vec![None; 7];
 
-        nodes[0] = get_basic_test_node(TEST_CIPHER_SUITE, "A").await.into();
-        nodes[4] = get_basic_test_node(TEST_CIPHER_SUITE, "C").await.into();
+        nodes[0] = get_basic_test_node(TEST_CIPHER_SUITE, "A").into();
+        nodes[4] = get_basic_test_node(TEST_CIPHER_SUITE, "C").into();
 
         nodes[5] = Parent {
             public_key: b"CD".to_vec().into(),
@@ -482,7 +480,7 @@ pub(crate) mod test_utils {
         }
         .into();
 
-        nodes[6] = get_basic_test_node(TEST_CIPHER_SUITE, "D").await.into();
+        nodes[6] = get_basic_test_node(TEST_CIPHER_SUITE, "D").into();
 
         NodeVec::from(nodes)
     }
@@ -500,8 +498,8 @@ mod tests {
         },
     };
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn node_key_getters() {
+    #[test]
+    fn node_key_getters() {
         let test_node_parent: Node = Parent {
             public_key: b"pub".to_vec().into(),
             parent_hash: ParentHash::empty(),
@@ -509,17 +507,17 @@ mod tests {
         }
         .into();
 
-        let test_leaf = get_basic_test_node(TEST_CIPHER_SUITE, "B").await;
+        let test_leaf = get_basic_test_node(TEST_CIPHER_SUITE, "B");
         let test_node_leaf: Node = test_leaf.clone().into();
 
         assert_eq!(test_node_parent.public_key().as_ref(), b"pub");
         assert_eq!(test_node_leaf.public_key(), &test_leaf.public_key);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_empty_leaves() {
-        let mut test_vec = get_test_node_vec().await;
-        let mut test_vec_clone = get_test_node_vec().await;
+    #[test]
+    fn test_empty_leaves() {
+        let mut test_vec = get_test_node_vec();
+        let mut test_vec_clone = get_test_node_vec();
         let empty_leaves: Vec<(LeafIndex, &mut Option<Node>)> = test_vec.empty_leaves().collect();
         assert_eq!(
             [(LeafIndex::unchecked(1), &mut test_vec_clone[2])].as_ref(),
@@ -527,26 +525,26 @@ mod tests {
         );
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_direct_path() {
-        let test_vec = get_test_node_vec().await;
+    #[test]
+    fn test_direct_path() {
+        let test_vec = get_test_node_vec();
         // Tree math is already tested in that module, just ensure equality
         let expected = 0.direct_copath(&4);
         let actual = test_vec.direct_copath(LeafIndex::unchecked(0));
         assert_eq!(actual, expected);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_filtered_direct_path_co_path() {
-        let test_vec = get_test_node_vec().await;
+    #[test]
+    fn test_filtered_direct_path_co_path() {
+        let test_vec = get_test_node_vec();
         let expected = [true, false];
         let actual = test_vec.filtered(LeafIndex::unchecked(0)).unwrap();
         assert_eq!(actual, expected);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_get_parent_node() {
-        let mut test_vec = get_test_node_vec().await;
+    #[test]
+    fn test_get_parent_node() {
+        let mut test_vec = get_test_node_vec();
 
         // If the node is a leaf it should fail
         assert!(test_vec.borrow_as_parent_mut(0).is_err());
@@ -566,9 +564,9 @@ mod tests {
         assert_eq!(test_vec.borrow_as_parent_mut(5).unwrap(), &mut expected);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_get_resolution() {
-        let test_vec = get_test_node_vec().await;
+    #[test]
+    fn test_get_resolution() {
+        let test_vec = get_test_node_vec();
 
         let resolution_node_5 = test_vec.get_resolution_index(5).unwrap();
         let resolution_node_2 = test_vec.get_resolution_index(2).unwrap();
@@ -579,9 +577,9 @@ mod tests {
         assert_eq!(&resolution_node_3, &[0, 5, 4]);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_get_or_fill_existing() {
-        let mut test_vec = get_test_node_vec().await;
+    #[test]
+    fn test_get_or_fill_existing() {
+        let mut test_vec = get_test_node_vec();
         let mut test_vec2 = test_vec.clone();
 
         let expected = test_vec[5].as_parent_mut().unwrap();
@@ -592,9 +590,9 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_get_or_fill_empty() {
-        let mut test_vec = get_test_node_vec().await;
+    #[test]
+    fn test_get_or_fill_empty() {
+        let mut test_vec = get_test_node_vec();
 
         let mut expected = Parent {
             public_key: vec![0u8; 4].into(),
@@ -609,9 +607,9 @@ mod tests {
         assert_eq!(actual, &mut expected);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_leaf_count() {
-        let test_vec = get_test_node_vec().await;
+    #[test]
+    fn test_leaf_count() {
+        let test_vec = get_test_node_vec();
         assert_eq!(test_vec.len(), 7);
         assert_eq!(test_vec.occupied_leaf_count(), 3);
         assert_eq!(
@@ -620,15 +618,15 @@ mod tests {
         );
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_total_leaf_count() {
-        let test_vec = get_test_node_vec().await;
+    #[test]
+    fn test_total_leaf_count() {
+        let test_vec = get_test_node_vec();
         assert_eq!(test_vec.occupied_leaf_count(), 3);
         assert_eq!(test_vec.total_leaf_count(), 4);
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn max_leaf_index() {
+    #[test]
+    fn max_leaf_index() {
         let test_index = LeafIndex::try_from(1).unwrap();
 
         let serialized = test_index.mls_encode_to_vec().unwrap();
@@ -642,8 +640,8 @@ mod tests {
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn max_leaf_index_failure() {
+    #[test]
+    fn max_leaf_index_failure() {
         let res = LeafIndex::try_from(MAX_LEAF_INDEX + 1);
         assert_matches!(res, Err(MlsError::InvalidTreeIndex));
 

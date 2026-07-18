@@ -437,9 +437,7 @@ impl ProposalMessageDescription {
     pub fn proposal_ref(&self) -> Vec<u8> {
         self.proposal_ref.to_vec()
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub(crate) async fn new<C: CipherSuiteProvider>(
+    pub(crate) fn new<C: CipherSuiteProvider>(
         cs: &C,
         content: &AuthenticatedContent,
         proposal: Proposal,
@@ -448,7 +446,7 @@ impl ProposalMessageDescription {
             authenticated_data: content.content.authenticated_data.clone(),
             proposal,
             sender: content.content.sender.try_into()?,
-            proposal_ref: ProposalRef::from_content(cs, content).await?,
+            proposal_ref: ProposalRef::from_content(cs, content)?,
         })
     }
 }
@@ -467,13 +465,6 @@ pub(crate) enum EventOrContent<E> {
     Event(E),
     Content(AuthenticatedContent),
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-#[cfg_attr(all(target_arch = "wasm32", mls_build_async), maybe_async::must_be_async(?Send))]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), mls_build_async),
-    maybe_async::must_be_async
-)]
 pub(crate) trait MessageProcessor: Send + Sync {
     type OutputType: TryFrom<ApplicationMessageDescription, Error = MlsError>
         + From<CommitMessageDescription>
@@ -488,7 +479,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
     type CipherSuiteProvider: CipherSuiteProvider;
     type PreSharedKeyStorage: PreSharedKeyStorage;
 
-    async fn process_incoming_message(
+    fn process_incoming_message(
         &mut self,
         message: MlsMessage,
         #[cfg(feature = "by_ref_proposal")] cache_proposal: bool,
@@ -499,10 +490,10 @@ pub(crate) trait MessageProcessor: Send + Sync {
             cache_proposal,
             None,
         )
-        .await
+
     }
 
-    async fn process_incoming_message_with_time(
+    fn process_incoming_message_with_time(
         &mut self,
         message: MlsMessage,
         #[cfg(feature = "by_ref_proposal")] cache_proposal: bool,
@@ -523,7 +514,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
 
         let event_or_content = self
             .get_event_from_incoming_message(message, time_sent)
-            .await?;
+            ?;
 
         self.process_event_or_content(
             event_or_content,
@@ -533,10 +524,10 @@ pub(crate) trait MessageProcessor: Send + Sync {
             unauthn_key_gen_in_app_msg,
             time_sent,
         )
-        .await
+
     }
 
-    async fn get_event_from_incoming_message(
+    fn get_event_from_incoming_message(
         &mut self,
         message: MlsMessage,
         time: Option<MlsTime>,
@@ -545,10 +536,10 @@ pub(crate) trait MessageProcessor: Send + Sync {
 
         match message.payload {
             MlsMessagePayload::Plain(plaintext) => {
-                self.verify_plaintext_authentication(plaintext).await
+                self.verify_plaintext_authentication(plaintext)
             }
             #[cfg(feature = "private_message")]
-            MlsMessagePayload::Cipher(cipher_text) => self.process_ciphertext(&cipher_text).await,
+            MlsMessagePayload::Cipher(cipher_text) => self.process_ciphertext(&cipher_text),
             MlsMessagePayload::GroupInfo(group_info) => {
                 validate_group_info_member(
                     self.group_state(),
@@ -556,7 +547,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
                     &group_info,
                     self.cipher_suite_provider(),
                 )
-                .await?;
+                ?;
 
                 Ok(EventOrContent::Event(group_info.into()))
             }
@@ -567,14 +558,14 @@ pub(crate) trait MessageProcessor: Send + Sync {
             }
             MlsMessagePayload::KeyPackage(key_package) => {
                 self.validate_key_package(&key_package, message.version, time)
-                    .await?;
+                    ?;
 
                 Ok(EventOrContent::Event(key_package.into()))
             }
         }
     }
 
-    async fn process_event_or_content(
+    fn process_event_or_content(
         &mut self,
         event_or_content: EventOrContent<Self::OutputType>,
         #[cfg(feature = "by_ref_proposal")] cache_proposal: bool,
@@ -593,14 +584,14 @@ pub(crate) trait MessageProcessor: Send + Sync {
                     unauthn_key_gen_in_app_msg,
                     time_sent,
                 )
-                .await?
+                ?
             }
         };
 
         Ok(msg)
     }
 
-    async fn process_auth_content(
+    fn process_auth_content(
         &mut self,
         auth_content: AuthenticatedContent,
         #[cfg(feature = "by_ref_proposal")] cache_proposal: bool,
@@ -625,12 +616,12 @@ pub(crate) trait MessageProcessor: Send + Sync {
             }
             Content::Commit(_) => self
                 .process_commit(auth_content, time_sent)
-                .await
+
                 .map(Self::OutputType::from),
             #[cfg(feature = "by_ref_proposal")]
             Content::Proposal(ref proposal) => self
                 .process_proposal(&auth_content, proposal, cache_proposal)
-                .await
+
                 .map(Self::OutputType::from),
         }?;
 
@@ -660,8 +651,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
     }
 
     #[cfg(feature = "by_ref_proposal")]
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn process_proposal(
+    fn process_proposal(
         &mut self,
         auth_content: &AuthenticatedContent,
         proposal: &Proposal,
@@ -672,7 +662,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
             auth_content,
             proposal.clone(),
         )
-        .await?;
+        ?;
 
         let group_state = self.group_state_mut();
 
@@ -687,7 +677,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
         Ok(proposal)
     }
 
-    async fn process_commit(
+    fn process_commit(
         &mut self,
         auth_content: AuthenticatedContent,
         time_sent: Option<MlsTime>,
@@ -702,7 +692,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
             &self.group_state().interim_transcript_hash,
             &auth_content,
         )
-        .await?;
+        ?;
 
         #[cfg(any(feature = "private_message", feature = "by_ref_proposal"))]
         let commit = match auth_content.content.content {
@@ -736,7 +726,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
                 time_sent,
                 CommitDirection::Receive,
             )
-            .await?;
+            ?;
 
         let sender = commit_sender(&auth_content.content.sender, &provisional_state)?;
 
@@ -773,7 +763,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
                     time_sent,
                     &group_state.context,
                 )
-                .await?,
+                ?,
             ),
             None => None,
         };
@@ -813,7 +803,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
         let new_secrets = match update_path {
             Some(update_path) if !is_self_removed => {
                 self.apply_update_path(sender, &update_path, &mut provisional_state)
-                    .await
+
             }
             _ => Ok(None),
         }?;
@@ -825,13 +815,13 @@ pub(crate) trait MessageProcessor: Send + Sync {
         provisional_state
             .public_tree
             .update_hashes(&[sender], self.cipher_suite_provider())
-            .await?;
+            ?;
 
         // Update the tree hash in the new context
         provisional_state.group_context.tree_hash = provisional_state
             .public_tree
             .tree_hash(self.cipher_suite_provider())
-            .await?;
+            ?;
 
         if let Some(confirmation_tag) = &auth_content.auth.confirmation_tag {
             if !is_self_removed {
@@ -842,7 +832,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
                     confirmation_tag,
                     provisional_state,
                 )
-                .await?;
+                ?;
             }
             Ok(CommitMessageDescription {
                 is_external: matches!(auth_content.content.sender, Sender::NewMemberCommit),
@@ -970,7 +960,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
             .ok_or(MlsError::InvalidWelcomeMessage)
     }
 
-    async fn validate_key_package(
+    fn validate_key_package(
         &self,
         key_package: &KeyPackage,
         version: ProtocolVersion,
@@ -979,28 +969,28 @@ pub(crate) trait MessageProcessor: Send + Sync {
         let cs = self.cipher_suite_provider();
         let id = self.identity_provider();
 
-        validate_key_package(key_package, version, cs, &id, time).await
+        validate_key_package(key_package, version, cs, &id, time)
     }
 
     #[cfg(feature = "private_message")]
-    async fn process_ciphertext(
+    fn process_ciphertext(
         &mut self,
         cipher_text: &PrivateMessage,
     ) -> Result<EventOrContent<Self::OutputType>, MlsError>;
 
-    async fn verify_plaintext_authentication(
+    fn verify_plaintext_authentication(
         &self,
         message: PublicMessage,
     ) -> Result<EventOrContent<Self::OutputType>, MlsError>;
 
     #[cfg(all(feature = "export_key_generation", feature = "private_message"))]
     /// Returns the unauthenticated key generation used to decrypt the private message.
-    async fn get_unauthenticated_key_generation_from_sender_data(
+    fn get_unauthenticated_key_generation_from_sender_data(
         &mut self,
         cipher_text: &PrivateMessage,
     ) -> Result<Option<u32>, MlsError>;
 
-    async fn apply_update_path(
+    fn apply_update_path(
         &mut self,
         sender: LeafIndex,
         update_path: &ValidatedUpdatePath,
@@ -1015,11 +1005,11 @@ pub(crate) trait MessageProcessor: Send + Sync {
                 self.identity_provider(),
                 self.cipher_suite_provider(),
             )
-            .await
+
             .map(|_| None)
     }
 
-    async fn update_key_schedule(
+    fn update_key_schedule(
         &mut self,
         secrets: Option<(TreeKemPrivate, PathSecret)>,
         interim_transcript_hash: InterimTranscriptHash,
@@ -1027,9 +1017,7 @@ pub(crate) trait MessageProcessor: Send + Sync {
         provisional_public_state: ProvisionalState,
     ) -> Result<(), MlsError>;
 }
-
-#[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-pub(crate) async fn validate_key_package<C: CipherSuiteProvider, I: IdentityProvider>(
+pub(crate) fn validate_key_package<C: CipherSuiteProvider, I: IdentityProvider>(
     key_package: &KeyPackage,
     version: ProtocolVersion,
     cs: &C,
@@ -1050,9 +1038,9 @@ pub(crate) async fn validate_key_package<C: CipherSuiteProvider, I: IdentityProv
 
     validator
         .check_if_valid(&key_package.leaf_node, context)
-        .await?;
+        ?;
 
-    validate_key_package_properties(key_package, version, cs).await?;
+    validate_key_package_properties(key_package, version, cs)?;
 
     Ok(())
 }
@@ -1069,14 +1057,14 @@ mod tests {
 
     use super::{CommitEffect, NewEpoch};
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn commit_effect_codec() {
+    #[test]
+    fn commit_effect_codec() {
         let epoch = NewEpoch {
             epoch: 7,
             prior_state: GroupState {
                 #[cfg(feature = "by_ref_proposal")]
                 proposals: crate::group::ProposalCache::new(TEST_PROTOCOL_VERSION, vec![]),
-                context: get_test_group_context(7, 7.into()).await,
+                context: get_test_group_context(7, 7.into()),
                 public_tree: Default::default(),
                 interim_transcript_hash: vec![].into(),
                 pending_reinit: None,

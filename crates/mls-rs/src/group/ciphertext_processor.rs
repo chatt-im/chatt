@@ -64,9 +64,7 @@ where
             cipher_suite_provider,
         }
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn next_encryption_key(
+    pub fn next_encryption_key(
         &mut self,
         key_type: KeyType,
     ) -> Result<MessageKeyData, MlsError> {
@@ -76,11 +74,9 @@ where
             .epoch_secrets_mut()
             .secret_tree
             .next_message_key(&self.cipher_suite_provider, self_index, key_type)
-            .await
-    }
 
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn decryption_key(
+    }
+    pub fn decryption_key(
         &mut self,
         sender: LeafIndex,
         key_type: KeyType,
@@ -92,11 +88,9 @@ where
             .epoch_secrets_mut()
             .secret_tree
             .message_key_generation(&self.cipher_suite_provider, sender, key_type, generation)
-            .await
-    }
 
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn seal(
+    }
+    pub fn seal(
         &mut self,
         auth_content: AuthenticatedContent,
         padding: PaddingMode,
@@ -143,7 +137,7 @@ where
         // reuse safe by xor the reuse guard with the first 4 bytes
         let self_index = self.group_state.self_index();
 
-        let key_data = self.next_encryption_key(key_type).await?;
+        let key_data = self.next_encryption_key(key_type)?;
         let generation = key_data.generation;
 
         let ciphertext = MessageKey::new(key_data)
@@ -153,7 +147,7 @@ where
                 &aad.mls_encode_to_vec()?,
                 &reuse_guard,
             )
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
 
         // Construct an mls sender data struct using the plaintext sender info, the generation
@@ -177,9 +171,9 @@ where
             &ciphertext,
             &self.cipher_suite_provider,
         )
-        .await?;
+        ?;
 
-        let encrypted_sender_data = sender_data_key.seal(&sender_data, &sender_data_aad).await?;
+        let encrypted_sender_data = sender_data_key.seal(&sender_data, &sender_data_aad)?;
 
         Ok(PrivateMessage {
             group_id: self.group_state.group_context().group_id.clone(),
@@ -190,15 +184,13 @@ where
             ciphertext,
         })
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    pub async fn open(
+    pub fn open(
         &mut self,
         ciphertext: &PrivateMessage,
     ) -> Result<AuthenticatedContent, MlsError> {
         // Decrypt the sender data with the derived sender_key and sender_nonce from the message
         // epoch's key schedule
-        let sender_data = self.open_sender_data(ciphertext).await?;
+        let sender_data = self.open_sender_data(ciphertext)?;
 
         if self.group_state.self_index() == sender_data.sender {
             return Err(MlsError::CantProcessMessageFromSelf);
@@ -213,7 +205,7 @@ where
         // Decrypt the content of the message using the grabbed key
         let key = self
             .decryption_key(sender_data.sender, key_type, sender_data.generation)
-            .await?;
+            ?;
 
         let sender = Sender::Member(*sender_data.sender);
 
@@ -224,7 +216,7 @@ where
                 &PrivateContentAAD::from(ciphertext).mls_encode_to_vec()?,
                 &sender_data.reuse_guard,
             )
-            .await
+
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))?;
 
         let ciphertext_content =
@@ -245,10 +237,8 @@ where
 
         Ok(auth_content)
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     /// Decrypts the sender data with a key and nonce derived from the key schedule and a sample of the ciphertext.
-    pub async fn open_sender_data(
+    pub fn open_sender_data(
         &mut self,
         ciphertext: &PrivateMessage,
     ) -> Result<SenderData, MlsError> {
@@ -263,11 +253,11 @@ where
             &ciphertext.ciphertext,
             &self.cipher_suite_provider,
         )
-        .await?;
+        ?;
 
         sender_data_key
             .open(&ciphertext.encrypted_sender_data, &sender_data_aad)
-            .await
+
     }
 }
 
@@ -305,12 +295,10 @@ mod test {
     ) -> CiphertextProcessor<'_, impl GroupStateProvider, impl CipherSuiteProvider> {
         CiphertextProcessor::new(&mut group.group, test_cipher_suite_provider(cipher_suite))
     }
-
-    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
-    async fn test_data(cipher_suite: CipherSuite) -> TestData {
+    fn test_data(cipher_suite: CipherSuite) -> TestData {
         let provider = test_cipher_suite_provider(cipher_suite);
 
-        let group = test_group(TEST_PROTOCOL_VERSION, cipher_suite).await;
+        let group = test_group(TEST_PROTOCOL_VERSION, cipher_suite);
 
         let content = AuthenticatedContent::new_signed(
             &provider,
@@ -321,43 +309,43 @@ mod test {
             WireFormat::PrivateMessage,
             vec![],
         )
-        .await
+
         .unwrap();
 
         TestData { group, content }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_encrypt_decrypt() {
+    #[test]
+    fn test_encrypt_decrypt() {
         for cipher_suite in TestCryptoProvider::all_supported_cipher_suites() {
             for padding in [
                 PaddingMode::None,
                 PaddingMode::StepFunction,
                 PaddingMode::Padme,
             ] {
-                let mut test_data = test_data(cipher_suite).await;
+                let mut test_data = test_data(cipher_suite);
                 let mut receiver_group = test_data.group.clone();
 
                 let mut ciphertext_processor = test_processor(&mut test_data.group, cipher_suite);
 
                 let ciphertext = ciphertext_processor
                     .seal(test_data.content.clone(), padding)
-                    .await
+
                     .unwrap();
 
                 receiver_group.private_tree.self_index = LeafIndex::unchecked(1);
 
                 let mut receiver_processor = test_processor(&mut receiver_group, cipher_suite);
 
-                let decrypted = receiver_processor.open(&ciphertext).await.unwrap();
+                let decrypted = receiver_processor.open(&ciphertext).unwrap();
 
                 assert_eq!(decrypted, test_data.content);
             }
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_open_sender_data() {
+    #[test]
+    fn test_open_sender_data() {
         for cipher_suite in TestCryptoProvider::all_supported_cipher_suites() {
             for padding in [
                 PaddingMode::None,
@@ -365,11 +353,11 @@ mod test {
                 PaddingMode::Padme,
             ] {
                 // Sender's LeafIndex is 0.
-                let mut test_data = test_data(cipher_suite).await;
+                let mut test_data = test_data(cipher_suite);
                 let mut ciphertext_processor = test_processor(&mut test_data.group, cipher_suite);
                 let ciphertext = ciphertext_processor
                     .seal(test_data.content.clone(), padding)
-                    .await
+
                     .unwrap();
 
                 let mut receiver_group = test_data.group.clone();
@@ -378,7 +366,7 @@ mod test {
 
                 let sender_data = receiver_processor
                     .open_sender_data(&ciphertext)
-                    .await
+
                     .unwrap();
                 assert_matches!(
                     sender_data,
@@ -389,64 +377,64 @@ mod test {
         }
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_padding_use() {
-        let mut test_data = test_data(TEST_CIPHER_SUITE).await;
+    #[test]
+    fn test_padding_use() {
+        let mut test_data = test_data(TEST_CIPHER_SUITE);
         let mut ciphertext_processor = test_processor(&mut test_data.group, TEST_CIPHER_SUITE);
 
         let ciphertext_step = ciphertext_processor
             .seal(test_data.content.clone(), PaddingMode::StepFunction)
-            .await
+
             .unwrap();
 
         let ciphertext_no_pad = ciphertext_processor
             .seal(test_data.content.clone(), PaddingMode::None)
-            .await
+
             .unwrap();
 
         assert!(ciphertext_step.ciphertext.len() > ciphertext_no_pad.ciphertext.len());
 
         let ciphertext_padme = ciphertext_processor
             .seal(test_data.content.clone(), PaddingMode::Padme)
-            .await
+
             .unwrap();
 
         assert!(ciphertext_padme.ciphertext.len() > ciphertext_no_pad.ciphertext.len());
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_invalid_sender() {
-        let mut test_data = test_data(TEST_CIPHER_SUITE).await;
+    #[test]
+    fn test_invalid_sender() {
+        let mut test_data = test_data(TEST_CIPHER_SUITE);
         test_data.content.content.sender = Sender::Member(3);
 
         let mut ciphertext_processor = test_processor(&mut test_data.group, TEST_CIPHER_SUITE);
 
         let res = ciphertext_processor
             .seal(test_data.content, PaddingMode::None)
-            .await;
+            ;
 
         assert_matches!(res, Err(MlsError::InvalidSender))
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_cant_process_from_self() {
-        let mut test_data = test_data(TEST_CIPHER_SUITE).await;
+    #[test]
+    fn test_cant_process_from_self() {
+        let mut test_data = test_data(TEST_CIPHER_SUITE);
 
         let mut ciphertext_processor = test_processor(&mut test_data.group, TEST_CIPHER_SUITE);
 
         let ciphertext = ciphertext_processor
             .seal(test_data.content, PaddingMode::None)
-            .await
+
             .unwrap();
 
-        let res = ciphertext_processor.open(&ciphertext).await;
+        let res = ciphertext_processor.open(&ciphertext);
 
         assert_matches!(res, Err(MlsError::CantProcessMessageFromSelf))
     }
 
-    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
-    async fn test_decryption_error() {
-        let mut test_data = test_data(TEST_CIPHER_SUITE).await;
+    #[test]
+    fn test_decryption_error() {
+        let mut test_data = test_data(TEST_CIPHER_SUITE);
         let mut receiver_group = test_data.group.clone();
         let mut ciphertext_processor = test_processor(&mut test_data.group, TEST_CIPHER_SUITE);
 
@@ -457,13 +445,13 @@ mod test {
         ] {
             let mut ciphertext = ciphertext_processor
                 .seal(test_data.content.clone(), padding)
-                .await
+
                 .unwrap();
 
             ciphertext.ciphertext = random_bytes(ciphertext.ciphertext.len());
             receiver_group.private_tree.self_index = LeafIndex::unchecked(1);
 
-            let res = ciphertext_processor.open(&ciphertext).await;
+            let res = ciphertext_processor.open(&ciphertext);
 
             assert!(res.is_err());
         }
