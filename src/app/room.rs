@@ -75,6 +75,11 @@ pub(crate) struct HistoryFetchCompletion {
     resident_newest_before: Option<MessageKey>,
 }
 
+pub(crate) struct ResidentMessagePage {
+    pub messages: Vec<ChatMessage>,
+    pub has_older: bool,
+}
+
 /// One row of the room switcher and rooms strip, in catalog order (public and
 /// private rooms by id, then DMs whose ids sort last).
 #[derive(Clone, Debug)]
@@ -1761,6 +1766,17 @@ impl RoomSession {
         self.attached_views.remove(&client_id);
     }
 
+    pub(crate) fn selected_room_for(
+        &self,
+        client_id: crate::client_channel::ClientId,
+    ) -> Option<RoomId> {
+        if client_id == crate::client_channel::ClientId::PRIMARY {
+            self.viewed_room
+        } else {
+            self.attached_views.get(&client_id).copied()
+        }
+    }
+
     fn room_is_viewed(&self, room_id: RoomId) -> bool {
         self.viewed_room == Some(room_id)
             || self
@@ -2236,6 +2252,142 @@ impl RoomSession {
         }
     }
 
+    /// A side-effect-free history projection for any materialized room.
+    pub(crate) fn history_for(&self, room_id: RoomId) -> room_history::LoadedHistory {
+        let Some(room) = self.rooms.get(&room_id) else {
+            return room_history::LoadedHistory::default();
+        };
+        room_history::LoadedHistory {
+            messages: room.visible_messages().cloned().collect(),
+            files: room.files.clone(),
+            mutations: Vec::new(),
+            provenance: room
+                .message_provenance
+                .iter()
+                .map(|(id, provenance)| (*id, *provenance))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn resident_message_page(
+        &self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        limit: usize,
+        max_bytes: usize,
+        estimate: impl Fn(&ChatMessage) -> usize,
+    ) -> Option<ResidentMessagePage> {
+        let room = self.rooms.get(&room_id)?;
+        let resident = room.messages.as_slice();
+        let mut start = match before {
+            Some(before) => room.messages.position(before.0)?,
+            None => resident.len(),
+        };
+        let mut bytes = 0usize;
+        let mut messages = Vec::with_capacity(limit.min(start));
+        while start > 0 {
+            let message = &resident[start - 1];
+            if message.flags.deleted() {
+                start -= 1;
+                continue;
+            }
+            let message_bytes = estimate(message);
+            if !messages.is_empty()
+                && (messages.len() >= limit
+                    || bytes.saturating_add(message_bytes) > max_bytes)
+            {
+                break;
+            }
+            bytes = bytes.saturating_add(message_bytes);
+            messages.push(message.clone());
+            start -= 1;
+        }
+        messages.reverse();
+        let has_older = resident[..start]
+            .iter()
+            .any(|message| !message.flags.deleted());
+        Some(ResidentMessagePage {
+            messages,
+            has_older,
+        })
+    }
+
+    pub(crate) fn resident_file_detail(
+        &self,
+        room_id: RoomId,
+        key: &FileHistoryKey,
+    ) -> Option<&room_history::FileDetail> {
+        self.rooms.get(&room_id)?.files.get(key)
+    }
+
+    pub(crate) fn resident_message(
+        &self,
+        room_id: RoomId,
+        message_id: MessageId,
+    ) -> Option<&ChatMessage> {
+        let message = self.rooms.get(&room_id)?.message_by_key(message_id.0)?;
+        (!message.flags.deleted()).then_some(message)
+    }
+
+    pub(crate) fn history_cursor(&self, room_id: RoomId) -> (Option<MessageId>, bool) {
+        self.metas
+            .get(&room_id)
+            .map(|meta| (meta.history_before, meta.history_at_start))
+            .unwrap_or((None, true))
+    }
+
+    pub(crate) fn history_fetch_active(&self, room_id: RoomId) -> bool {
+        self.metas
+            .get(&room_id)
+            .is_some_and(|meta| meta.history_fetch != HistoryFetchState::Idle)
+    }
+
+    pub(crate) fn rpc_transfer_summaries(
+        &self,
+        room_id: RoomId,
+    ) -> Vec<rpc::daemon::model::TransferSummary> {
+        let Some(room) = self.rooms.get(&room_id) else { return Vec::new(); };
+        room.transfers.iter().map(|(transfer_id, status)| {
+            let file_name = room.files.iter()
+                .filter(|(key, _)| key.transfer_id == *transfer_id)
+                .max_by_key(|(key, _)| key.timestamp_ms)
+                .map(|(_, detail)| detail.file_name.clone())
+                .unwrap_or_else(|| format!("transfer {}", transfer_id.0));
+            let (direction, byte_len, transferred, status, error) = match status {
+                TransferStatus::Active(progress) => (
+                    match progress.direction {
+                        TransferDirection::Incoming => rpc::daemon::model::TransferDirection::Download,
+                        TransferDirection::Outgoing => rpc::daemon::model::TransferDirection::Upload,
+                    },
+                    progress.total,
+                    progress.transferred,
+                    rpc::daemon::model::TransferStatus::Active,
+                    None,
+                ),
+                TransferStatus::Terminal { verb, reason } => (
+                    rpc::daemon::model::TransferDirection::Download,
+                    0,
+                    0,
+                    match verb {
+                        TerminalVerb::Cancelled | TerminalVerb::Skipped => rpc::daemon::model::TransferStatus::Canceled,
+                        TerminalVerb::Failed => rpc::daemon::model::TransferStatus::Failed,
+                    },
+                    reason.clone(),
+                ),
+            };
+            rpc::daemon::model::TransferSummary {
+                transfer_id: *transfer_id,
+                room_id,
+                direction,
+                file_name,
+                byte_len,
+                transferred,
+                status,
+                error,
+            }
+        }).collect()
+    }
+
     /// Every known room in id order: `(room_id, meta)`.
     pub(crate) fn room_metas(&self) -> impl Iterator<Item = (RoomId, &RoomMeta)> {
         self.metas.iter().map(|(room_id, meta)| (*room_id, meta))
@@ -2248,6 +2400,22 @@ impl RoomSession {
     /// The catalog display name of `room_id`, when the room is known.
     pub(crate) fn room_name_of(&self, room_id: RoomId) -> Option<&str> {
         self.metas.get(&room_id).map(|meta| meta.name.as_str())
+    }
+
+    pub(crate) fn participant_summaries(
+        &self,
+        room_id: RoomId,
+    ) -> Vec<rpc::control::UserSummary> {
+        let Some(meta) = self.metas.get(&room_id) else { return Vec::new(); };
+        self.users
+            .values()
+            .filter(|user| match &meta.kind {
+                ClientRoomKind::Public => true,
+                ClientRoomKind::Private { members } => members.contains(&user.user_id),
+                ClientRoomKind::Dm { user_a, user_b } => user.user_id == *user_a || user.user_id == *user_b,
+            })
+            .cloned()
+            .collect()
     }
 
     /// Builds the switcher and rooms-strip rows: every known room in catalog
@@ -3448,6 +3616,53 @@ mod tests {
 
         assert_eq!(client.session.room_name_of(RoomId(1)), Some("room-1"));
         assert_eq!(client.session.room_name_of(RoomId(9)), None);
+    }
+
+    #[test]
+    fn resident_message_pages_are_contiguous_and_report_older_rows() {
+        let mut client = test_room();
+        enter(
+            &mut client,
+            vec![user(UserId(1), "alice")],
+            (1..=5)
+                .map(|id| message(id, UserId(1), &id.to_string()))
+                .collect(),
+            Some(UserId(1)),
+        );
+
+        let newest = client
+            .session
+            .resident_message_page(RoomId(1), None, 2, usize::MAX, |_| 1)
+            .unwrap();
+        assert_eq!(
+            newest
+                .messages
+                .iter()
+                .map(|message| message.message_id.0)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert!(newest.has_older);
+
+        let older = client
+            .session
+            .resident_message_page(
+                RoomId(1),
+                Some(MessageId(4)),
+                2,
+                usize::MAX,
+                |_| 1,
+            )
+            .unwrap();
+        assert_eq!(
+            older
+                .messages
+                .iter()
+                .map(|message| message.message_id.0)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(older.has_older);
     }
 
     #[test]

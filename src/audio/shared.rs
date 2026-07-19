@@ -1172,7 +1172,7 @@ pub(crate) fn db_to_gain(db: f32) -> f32 {
 }
 
 pub const DEFAULT_OUTPUT_VOLUME_PERCENT: f32 = 100.0;
-pub const MAX_OUTPUT_VOLUME_PERCENT: f32 = 130.0;
+pub const MAX_OUTPUT_VOLUME_PERCENT: f32 = rpc::daemon::MAX_OUTPUT_VOLUME_PERCENT;
 
 pub fn normalize_output_volume_percent(value: f32) -> f32 {
     if value.is_finite() {
