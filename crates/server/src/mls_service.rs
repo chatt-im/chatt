@@ -151,6 +151,23 @@ impl MlsService {
         self.rosters.get(&user_id)
     }
 
+    fn delivery_rosters(
+        &self,
+        descriptor: &EncryptedRoomDescriptor,
+    ) -> Result<Vec<SignedDeviceRoster>, String> {
+        descriptor
+            .member_accounts
+            .iter()
+            .map(|account_id| {
+                self.rosters
+                    .values()
+                    .find(|roster| roster.body.account_id == *account_id)
+                    .cloned()
+                    .ok_or_else(|| "encrypted room account has no current roster".to_string())
+            })
+            .collect()
+    }
+
     pub fn initialized(&self, user_id: UserId) -> bool {
         self.initialized_accounts.contains(&user_id)
     }
@@ -662,6 +679,7 @@ impl MlsService {
             sequence,
             parent_epoch: 0,
             epoch: next.epoch,
+            rosters: self.delivery_rosters(&descriptor)?,
             commit: bundle.commit,
         };
         self.store.create_room(&global, &room, &event, welcome)?;
@@ -864,6 +882,7 @@ impl MlsService {
             sequence,
             parent_epoch: expected_epoch,
             epoch: room.public_state.epoch,
+            rosters: self.delivery_rosters(&previous.descriptor)?,
             commit: bundle.commit,
         };
         self.store
@@ -1074,11 +1093,13 @@ impl MlsService {
         self.validator
             .validate_application(&room.public_state, &ciphertext)
             .map_err(|error| error.to_string())?;
+        let rosters = self.delivery_rosters(&room.descriptor)?;
         match self.store.append_application(
             room_id,
             device_id,
             epoch,
             event_id,
+            rosters,
             &ciphertext,
             unix_time_ms(),
         )? {

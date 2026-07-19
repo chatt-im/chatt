@@ -480,6 +480,7 @@ impl PersistentClient {
             sequence,
             parent_epoch: pending.parent_epoch,
             epoch: pending.epoch,
+            rosters: Vec::new(),
             commit: pending.commit,
         };
         let mut group = self.load_group(descriptor)?;
@@ -929,6 +930,7 @@ impl PersistentClient {
         G: FnOnce() -> Result<(), String>,
     {
         descriptor.validate()?;
+        self.install_delivery_rosters(descriptor, delivery)?;
         let sequence = delivery.sequence();
         let cursor = self.cursor(descriptor.room_id)?;
         if sequence <= cursor {
@@ -1450,6 +1452,32 @@ impl PersistentClient {
             .map_err(|error| error.to_string())
     }
 
+    fn install_delivery_rosters(
+        &self,
+        descriptor: &EncryptedRoomDescriptor,
+        delivery: &MlsDeliveryEvent,
+    ) -> Result<(), String> {
+        let rosters = match delivery {
+            MlsDeliveryEvent::Commit { rosters, .. }
+            | MlsDeliveryEvent::Application { rosters, .. } => rosters,
+        };
+        let mut accounts = rosters
+            .iter()
+            .map(|roster| roster.body.account_id)
+            .collect::<Vec<_>>();
+        accounts.sort_unstable();
+        accounts.dedup();
+        if accounts != descriptor.member_accounts {
+            return Err("MLS delivery roster snapshots do not match the room".to_string());
+        }
+        for roster in rosters {
+            self.identities
+                .install_historical_roster(roster)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn outbox_entry(&self, room_id: RoomId, event_id: EventId) -> Result<OutboxEntry, String> {
         let bytes = self
             .application
@@ -1673,6 +1701,7 @@ impl DeliveryMarker {
                 parent_epoch,
                 epoch,
                 commit,
+                ..
             } => Self::Commit {
                 sequence: *sequence,
                 parent_epoch: *parent_epoch,
@@ -1714,6 +1743,17 @@ mod tests {
     };
 
     use crate::{LocalInstallation, ProcessedDelivery};
+
+    fn delivery_rosters(
+        installations: &[&LocalInstallation],
+    ) -> Vec<rpc::identity::SignedDeviceRoster> {
+        let mut rosters = installations
+            .iter()
+            .map(|installation| installation.bootstrap.own_roster.clone())
+            .collect::<Vec<_>>();
+        rosters.sort_by_key(|roster| roster.body.account_id);
+        rosters
+    }
 
     #[test]
     fn receiver_crash_after_plaintext_cache_reprocesses_once() {
@@ -1785,6 +1825,7 @@ mod tests {
             sequence: 2,
             epoch,
             event_id: event.event_id,
+            rosters: delivery_rosters(&[&alice, &bob]),
             ciphertext,
         };
 
@@ -1844,6 +1885,7 @@ mod tests {
             sequence: 3,
             epoch,
             event_id: crash_after_write.event_id,
+            rosters: delivery_rosters(&[&alice, &bob]),
             ciphertext,
         };
         assert_eq!(
@@ -1884,6 +1926,7 @@ mod tests {
                         sequence: 4,
                         epoch,
                         event_id: EventId([44; 16]),
+                        rosters: delivery_rosters(&[&alice, &bob]),
                         ciphertext,
                     },
                 )
@@ -1906,6 +1949,7 @@ mod tests {
                         sequence: 5,
                         epoch,
                         event_id: EventId([45; 16]),
+                        rosters: delivery_rosters(&[&alice, &bob]),
                         ciphertext: replayed.clone(),
                     },
                 )
@@ -1917,6 +1961,7 @@ mod tests {
             sequence: 5,
             parent_epoch: epoch,
             epoch: epoch + 1,
+            rosters: delivery_rosters(&[&alice, &bob]),
             commit: vec![0xff],
         };
         assert!(matches!(
@@ -1991,6 +2036,7 @@ mod tests {
             sequence: 2,
             parent_epoch: 1,
             epoch: 2,
+            rosters: delivery_rosters(&[&alice, &bob]),
             commit: rejoin.commit,
         };
         assert_eq!(

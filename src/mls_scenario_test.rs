@@ -19,7 +19,9 @@ use std::{
 };
 
 use rpc::{
-    control::{ChatMessage, MessageFlags, decode_device_link_ticket},
+    control::{
+        ChatMessage, MAX_HISTORY_FETCH_MESSAGES, MessageFlags, decode_device_link_ticket,
+    },
     crypto::dev_server_seed_hex,
     ids::{DeviceId, FileTransferId, MessageId, RoomId, UserId},
 };
@@ -715,8 +717,22 @@ struct PendingTicket {
     sponsor: String,
     secret_hash: Vec<u8>,
     pairing_string: String,
-    canceled: bool,
-    redeemed: bool,
+    state: TicketState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TicketState {
+    Active,
+    Unavailable,
+    Redeemed,
+}
+
+fn invalidate_server_device_links(tickets: &mut BTreeMap<String, PendingTicket>) {
+    for ticket in tickets.values_mut() {
+        if ticket.state == TicketState::Active {
+            ticket.state = TicketState::Unavailable;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -777,6 +793,37 @@ struct ScenarioRunner {
     expected_errors: BTreeSet<String>,
     observed_expected_errors: BTreeSet<String>,
     recent_events: VecDeque<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WaitBudget {
+    timeout: Duration,
+    campaign_limited: bool,
+}
+
+fn wait_budget(
+    deadline: Option<Instant>,
+    maximum: Duration,
+    now: Instant,
+) -> Result<WaitBudget, String> {
+    let Some(deadline) = deadline else {
+        return Ok(WaitBudget {
+            timeout: maximum,
+            campaign_limited: false,
+        });
+    };
+    let remaining = deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "scenario campaign deadline reached".to_string())?;
+    Ok(WaitBudget {
+        timeout: remaining.min(maximum),
+        campaign_limited: remaining <= maximum,
+    })
+}
+
+fn discard_backlogged_mls_bindings(events: &mut VecDeque<NetworkEvent>) {
+    events.retain(|event| !matches!(event, NetworkEvent::MlsDeviceBound { .. }));
 }
 
 impl ScenarioRunner {
@@ -857,15 +904,8 @@ impl ScenarioRunner {
         Ok(runner)
     }
 
-    fn remaining(&self, maximum: Duration) -> Result<Duration, String> {
-        match self.deadline {
-            Some(deadline) => deadline
-                .checked_duration_since(Instant::now())
-                .map(|remaining| remaining.min(maximum))
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(|| "scenario campaign deadline reached".to_string()),
-            None => Ok(maximum),
-        }
+    fn remaining(&self, maximum: Duration) -> Result<WaitBudget, String> {
+        wait_budget(self.deadline, maximum, Instant::now())
     }
 
     fn server_ref(&self) -> &ScenarioServer {
@@ -1046,8 +1086,8 @@ impl ScenarioRunner {
                 .remove(index)
                 .unwrap());
         }
-        let timeout = self.remaining(maximum)?;
-        let deadline = Instant::now() + timeout;
+        let budget = self.remaining(maximum)?;
+        let deadline = Instant::now() + budget.timeout;
         loop {
             let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
                 format!(
@@ -1079,6 +1119,9 @@ impl ScenarioRunner {
                         .push_back(event);
                 }
                 Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) if budget.campaign_limited => {
+                    return Err("scenario campaign deadline reached".to_string());
+                }
                 Err(error) => {
                     return Err(format!(
                         "{label}: {device} event channel failed: {error}; recent events: {:?}",
@@ -1093,6 +1136,17 @@ impl ScenarioRunner {
         self.wait_event(device, label, DEFAULT_ACTION_TIMEOUT, |event| {
             matches!(event, NetworkEvent::Authenticated { .. })
         })?;
+        // A prior session can leave a duplicate bind notification in the
+        // scenario backlog. Once the new authentication is observed, only a
+        // subsequent bind can prove that this session's MLS actor is ready.
+        let runtime = self
+            .devices
+            .get_mut(device)
+            .unwrap()
+            .runtime
+            .as_mut()
+            .unwrap();
+        discard_backlogged_mls_bindings(&mut runtime.backlog);
         let bound = self.wait_event(device, label, DEFAULT_ACTION_TIMEOUT, |event| {
             matches!(event, NetworkEvent::MlsDeviceBound { .. })
         })?;
@@ -1335,7 +1389,7 @@ impl ScenarioRunner {
             NetworkCommand::FetchHistory {
                 room_id,
                 before: None,
-                limit: 512,
+                limit: MAX_HISTORY_FETCH_MESSAGES,
             },
         )?;
         let event = self.wait_event(device, "scenario history", DEFAULT_ACTION_TIMEOUT, |event| {
@@ -1513,8 +1567,7 @@ impl ScenarioRunner {
                 sponsor: sponsor.to_string(),
                 secret_hash: redemption_secret_hash,
                 pairing_string,
-                canceled: false,
-                redeemed: false,
+                state: TicketState::Active,
             },
         );
         Ok(())
@@ -1528,8 +1581,8 @@ impl ScenarioRunner {
         if pending.sponsor != sponsor {
             return Err(format!("ticket {ticket} belongs to {}", pending.sponsor));
         }
-        if pending.canceled {
-            return Err(format!("ticket {ticket} is already canceled"));
+        if pending.state != TicketState::Active {
+            return Err(format!("ticket {ticket} is no longer active"));
         }
         let secret_hash = pending.secret_hash.clone();
         self.send_command(
@@ -1544,7 +1597,7 @@ impl ScenarioRunner {
             DEFAULT_ACTION_TIMEOUT,
             |event| matches!(event, NetworkEvent::DeviceLinkCanceled),
         )?;
-        self.tickets.get_mut(ticket).unwrap().canceled = true;
+        self.tickets.get_mut(ticket).unwrap().state = TicketState::Unavailable;
         Ok(())
     }
 
@@ -1614,8 +1667,8 @@ impl ScenarioRunner {
             return Err(format!("ticket {ticket} links {sponsor_user:?}, not {user:?}"));
         }
         let pairing_string = pending.pairing_string.clone();
-        let canceled = pending.canceled;
-        if pending.redeemed {
+        let unavailable = pending.state == TicketState::Unavailable;
+        if pending.state == TicketState::Redeemed {
             return Err(format!("ticket {ticket} was already redeemed"));
         }
         let pair_config = scenario_client_config(
@@ -1626,9 +1679,9 @@ impl ScenarioRunner {
             "unused",
         )?;
         let result = self.pair_from_ticket(pair_config, &pairing_string, device);
-        if canceled {
+        if unavailable {
             if result.is_ok() {
-                return Err(format!("canceled ticket {ticket} was redeemed"));
+                return Err(format!("unavailable ticket {ticket} was redeemed"));
             }
             return Ok(());
         }
@@ -1661,7 +1714,7 @@ impl ScenarioRunner {
         for room in rooms {
             self.send_text(device, &room, &format!("__link-{device}-{room}"))?;
         }
-        self.tickets.get_mut(ticket).unwrap().redeemed = true;
+        self.tickets.get_mut(ticket).unwrap().state = TicketState::Redeemed;
         Ok(())
     }
 
@@ -1957,6 +2010,7 @@ impl ScenarioRunner {
         let tcp = old.tcp.clone();
         let udp = old.udp.clone();
         old.stop();
+        invalidate_server_device_links(&mut self.tickets);
         self.server = Some(start_scenario_server(&self.root, Some((&tcp, &udp)))?);
         let online = self
             .devices
@@ -1991,6 +2045,7 @@ impl ScenarioRunner {
         let tcp = old.tcp.clone();
         let udp = old.udp.clone();
         old.stop();
+        invalidate_server_device_links(&mut self.tickets);
         self.server = Some(start_scenario_server(&self.root, Some((&tcp, &udp)))?);
         for device in order {
             self.start_device(device)?;
@@ -2280,8 +2335,7 @@ fn candidate_actions(
             < 3
             && !runner.tickets.values().any(|ticket| {
                 runner.devices[&ticket.sponsor].user == user
-                    && !ticket.canceled
-                    && !ticket.redeemed
+                    && ticket.state == TicketState::Active
             })
         {
             candidates.push(Action::CreateLink {
@@ -2296,13 +2350,13 @@ fn candidate_actions(
     }
 
     for (ticket, pending) in &runner.tickets {
-        if !pending.redeemed {
+        if pending.state != TicketState::Redeemed {
             let user = runner.devices[&pending.sponsor].user;
             candidates.push(Action::RedeemLink {
                 ticket: ticket.clone(),
                 device: next_linked_device(runner, user),
             });
-            if !pending.canceled
+            if pending.state == TicketState::Active
                 && runner.devices[&pending.sponsor].runtime.is_some()
             {
                 candidates.push(Action::CancelLink {
@@ -2574,15 +2628,21 @@ fn run_generated_scenario(
     output_dir: &Path,
 ) -> Result<(), CampaignFailure> {
     let log_span = ScenarioLogSpan::enter(seed);
-    let mut runner = ScenarioRunner::new(seed, Some(deadline)).map_err(|error| CampaignFailure {
-        trace: Trace {
-            seed,
-            actions: Vec::new(),
-        },
-        error,
-        path: output_dir.join(format!("{seed:016x}-setup.trace")),
-        span: log_span.id,
-    })?;
+    let mut runner = match ScenarioRunner::new(seed, Some(deadline)) {
+        Ok(runner) => runner,
+        Err(error) if error == "scenario campaign deadline reached" => return Ok(()),
+        Err(error) => {
+            return Err(CampaignFailure {
+                trace: Trace {
+                    seed,
+                    actions: Vec::new(),
+                },
+                error,
+                path: output_dir.join(format!("{seed:016x}-setup.trace")),
+                span: log_span.id,
+            });
+        }
+    };
     let mut rng = ScenarioRng(seed);
     let mut counters = GeneratorCounters::default();
     for step in 0..maximum_steps {
@@ -2617,6 +2677,9 @@ fn run_generated_scenario(
             .observe(&runner, &action);
     }
     if let Err(error) = runner.checkpoint() {
+        if error == "scenario campaign deadline reached" {
+            return Ok(());
+        }
         let path = runner
             .write_failure(output_dir, "failure", &error)
             .unwrap_or_else(|_| output_dir.join(format!("{seed:016x}-failure.trace")));
@@ -2945,6 +3008,81 @@ mod tests {
         assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
         assert!(parse_duration("0s").is_err());
+    }
+
+    #[test]
+    fn wait_budget_distinguishes_action_timeout_from_campaign_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            wait_budget(None, Duration::from_secs(15), now).unwrap(),
+            WaitBudget {
+                timeout: Duration::from_secs(15),
+                campaign_limited: false,
+            }
+        );
+        assert_eq!(
+            wait_budget(
+                Some(now + Duration::from_secs(30)),
+                Duration::from_secs(15),
+                now,
+            )
+            .unwrap(),
+            WaitBudget {
+                timeout: Duration::from_secs(15),
+                campaign_limited: false,
+            }
+        );
+        assert_eq!(
+            wait_budget(
+                Some(now + Duration::from_millis(500)),
+                Duration::from_secs(15),
+                now,
+            )
+            .unwrap(),
+            WaitBudget {
+                timeout: Duration::from_millis(500),
+                campaign_limited: true,
+            }
+        );
+    }
+
+    #[test]
+    fn authentication_discards_bindings_backlogged_by_an_older_session() {
+        let mut events = VecDeque::from([
+            NetworkEvent::MlsDeviceBound {
+                device_id: DeviceId([1; 16]),
+            },
+            NetworkEvent::Status("keep".into()),
+            NetworkEvent::MlsDeviceBound {
+                device_id: DeviceId([2; 16]),
+            },
+        ]);
+
+        discard_backlogged_mls_bindings(&mut events);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events.front(), Some(NetworkEvent::Status(message)) if message == "keep"));
+    }
+
+    #[test]
+    fn server_restart_invalidates_only_outstanding_device_links() {
+        let ticket = |state| PendingTicket {
+            sponsor: "alice.0".into(),
+            secret_hash: vec![1; 32],
+            pairing_string: "ticket".into(),
+            state,
+        };
+        let mut tickets = BTreeMap::from([
+            ("active".into(), ticket(TicketState::Active)),
+            ("unavailable".into(), ticket(TicketState::Unavailable)),
+            ("redeemed".into(), ticket(TicketState::Redeemed)),
+        ]);
+
+        invalidate_server_device_links(&mut tickets);
+
+        assert_eq!(tickets["active"].state, TicketState::Unavailable);
+        assert_eq!(tickets["unavailable"].state, TicketState::Unavailable);
+        assert_eq!(tickets["redeemed"].state, TicketState::Redeemed);
     }
 
     #[test]
