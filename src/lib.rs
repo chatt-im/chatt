@@ -26,6 +26,8 @@ mod markdown;
 pub mod mdns;
 #[cfg(test)]
 mod mls_e2e_test;
+#[cfg(test)]
+mod mls_scenario_test;
 pub mod network;
 pub mod packet_log;
 mod paths;
