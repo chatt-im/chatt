@@ -1,11 +1,11 @@
 //! The served-file index: the single source of truth for what `/files/<name>`
 //! resolves to.
 //!
-//! Every completed download registers a served name here. In-memory downloads
-//! ([`DownloadTarget::Memory`]) keep their bytes in a size-bounded FIFO ring;
-//! persistent downloads register the absolute path they were saved to after the
-//! file is complete, so files written to a per-room or per-server directory the
-//! web server does not mount are still reachable. Served names are allocated
+//! Every completed download and locally readable outgoing upload registers a
+//! served name here. In-memory downloads ([`DownloadTarget::Memory`]) keep their
+//! bytes in a size-bounded FIFO ring; persistent files register their absolute
+//! path after completion, so files outside directories mounted by the web server
+//! remain reachable. Served names are allocated
 //! through one place and never reused for the process lifetime after completion,
 //! so an evicted memory file cannot be shadowed by a later file of the same name
 //! and memory and disk names never collide.
@@ -58,6 +58,10 @@ struct Inner {
     entries: HashMap<String, Entry>,
     /// Served names of persistent downloads mapped to their absolute path.
     disk: HashMap<String, PathBuf>,
+    /// Disk entries backed by staged files owned by the store. Unlike ordinary
+    /// persistent downloads and user-selected upload sources, these files are
+    /// removed when the last store handle is dropped.
+    owned_disk: HashSet<String>,
     metadata: HashMap<String, AttachmentMetadata>,
     attachment_names: HashMap<AttachmentId, String>,
     /// Served names reserved by in-flight persistent downloads. These block
@@ -131,6 +135,17 @@ impl DiskReservation {
     /// Makes this pending served name resolve to `path`, returning the committed
     /// name. After this point the name is never reused for this process lifetime.
     pub fn commit(mut self, path: PathBuf) -> String {
+        self.commit_inner(path, false)
+    }
+
+    /// Makes this pending served name resolve to a store-owned staged file.
+    /// The file remains available to local frontends for the store's lifetime
+    /// and is removed when the final [`DownloadStore`] handle is dropped.
+    pub fn commit_owned(mut self, path: PathBuf) -> String {
+        self.commit_inner(path, true)
+    }
+
+    fn commit_inner(&mut self, path: PathBuf, owned: bool) -> String {
         let mut inner = self.store.0.lock().unwrap();
         inner.pending_disk.remove(&self.name);
         inner.used_names.insert(self.name.clone());
@@ -143,6 +158,9 @@ impl DiskReservation {
             inner.metadata.insert(self.name.clone(), metadata);
         }
         inner.disk.insert(self.name.clone(), path);
+        if owned {
+            inner.owned_disk.insert(self.name.clone());
+        }
         self.active = false;
         self.name.clone()
     }
@@ -184,6 +202,7 @@ impl DownloadStore {
             order: VecDeque::new(),
             entries: HashMap::new(),
             disk: HashMap::new(),
+            owned_disk: HashSet::new(),
             metadata: HashMap::new(),
             attachment_names: HashMap::new(),
             pending_disk: HashSet::new(),
@@ -420,6 +439,16 @@ impl Inner {
     }
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for name in &self.owned_disk {
+            if let Some(path) = self.disk.get(name) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// Yields the sanitized `requested` name and then its `-N` variants until
 /// `accept` returns a value, mirroring the on-disk collision suffixing used for
 /// persistent downloads. Returns `None` if 10,000 candidates are all rejected.
@@ -550,6 +579,24 @@ mod tests {
         store.register_disk(disk.clone(), PathBuf::from("/tmp/foo-1.png"));
         assert!(matches!(store.resolve(&disk), Some(Source::Disk(_))));
         assert!(matches!(store.resolve(&mem), Some(Source::Memory { .. })));
+    }
+
+    #[test]
+    fn owned_disk_entry_removes_staged_file_with_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("staged.mp4");
+        std::fs::write(&path, b"video bytes").unwrap();
+        let store = DownloadStore::new(1024);
+        let reservation = store
+            .reserve_disk_name("staged.mp4".to_string())
+            .unwrap();
+
+        let name = reservation.commit_owned(path.clone());
+        assert!(matches!(store.resolve(&name), Some(Source::Disk(_))));
+        assert!(path.exists());
+
+        drop(store);
+        assert!(!path.exists());
     }
 
     #[test]
