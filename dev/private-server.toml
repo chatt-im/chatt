@@ -13,3 +13,13 @@ max-file-size-mb = 52428800
 [[rooms]]
 id = 1
 name = "lobby"
+
+[[rooms]]
+id = 2
+name = "group"
+members = ["alice", "bob", "carol"]
+
+[[rooms]]
+id = 3
+name = "later"
+members = ["alice", "bob", "carol"]
