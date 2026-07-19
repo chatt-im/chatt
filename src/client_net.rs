@@ -96,9 +96,10 @@ const MAX_PENDING_MLS_FILE_ITEMS: usize = 1024;
 const MAX_PENDING_MLS_FILE_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_MLS_FILE_GLOBAL_ITEMS: usize = 8192;
 /// Keep a small burst reserve without making every fresh installation perform
-/// dozens of public-key operations before it can join a room. The server
-/// notifies the owner after every consume, so this is a latency reserve rather
-/// than a long-lived prekey inventory.
+/// dozens of public-key operations before it can join a room. One package is
+/// an RFC 9750 last-resort fallback and the rest are one-time packages. The
+/// server notifies the owner after every consume, so this is a latency reserve
+/// rather than a long-lived prekey inventory.
 const MLS_KEY_PACKAGE_TARGET: u16 = 4;
 const MLS_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MLS_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);

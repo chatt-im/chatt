@@ -21,6 +21,7 @@ use mls_rs::{
         BaseConfig, WithCryptoProvider, WithGroupStateStorage, WithIdentityProvider,
         WithKeyPackageRepo, WithMlsRules, WithPskStore,
     },
+    extension::{MlsExtension, recommended::LastResortKeyPackageExt},
     group::{CommitEffect, ReceivedMessage},
     identity::{SigningIdentity, basic::BasicCredential},
 };
@@ -283,6 +284,7 @@ impl PersistentClient {
             .crypto_provider(AwsLcCryptoProvider::default())
             .identity_provider(identities.historical_group_info_observer())
             .mls_rules(ChattMlsPolicy::new(identities.clone()))
+            .extension_type(LastResortKeyPackageExt::extension_type())
             .signing_identity(signing_identity, signing_secret.clone(), CIPHER_SUITE)
             .build();
         Ok(Self {
@@ -329,14 +331,51 @@ impl PersistentClient {
         device_id: DeviceId,
         count: usize,
     ) -> Result<Vec<PublishedKeyPackage>, String> {
+        self.generate_key_package_batch(device_id, count, false)
+    }
+
+    /// Generates a fresh delivery-service pool with one reusable fallback.
+    ///
+    /// RFC 9750 section 5.1 permits a specially designated last-resort
+    /// KeyPackage to be reused when one-time packages have been exhausted. It
+    /// remains last in the batch so the delivery service can prefer one-time
+    /// packages without additional scheduling metadata.
+    pub fn generate_initial_key_packages(
+        &self,
+        device_id: DeviceId,
+        count: usize,
+    ) -> Result<Vec<PublishedKeyPackage>, String> {
+        self.generate_key_package_batch(device_id, count, true)
+    }
+
+    fn generate_key_package_batch(
+        &self,
+        device_id: DeviceId,
+        count: usize,
+        include_last_resort: bool,
+    ) -> Result<Vec<PublishedKeyPackage>, String> {
         if count == 0 || count > rpc::mls::MAX_MLS_KEY_PACKAGES_PER_REQUEST {
             return Err("invalid KeyPackage generation count".to_string());
         }
         (0..count)
-            .map(|_| {
+            .map(|index| {
+                let key_package_extensions = if include_last_resort && index + 1 == count {
+                    vec![
+                        LastResortKeyPackageExt
+                            .into_extension()
+                            .map_err(|error| error.to_string())?,
+                    ]
+                    .into()
+                } else {
+                    ExtensionList::new()
+                };
                 let message = self
                     .client
-                    .generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None)
+                    .generate_key_package_message(
+                        key_package_extensions,
+                        ExtensionList::new(),
+                        None,
+                    )
                     .map_err(|error| error.to_string())?;
                 Ok(PublishedKeyPackage {
                     device_id,
@@ -368,7 +407,7 @@ impl PersistentClient {
             }
             return Ok(packages);
         }
-        let packages = self.generate_key_packages(device_id, count)?;
+        let packages = self.generate_initial_key_packages(device_id, count)?;
         self.application
             .insert(PENDING_PAIR_KEY_PACKAGES_KEY, &jsony::to_binary(&packages))
             .map_err(|error| error.to_string())?;

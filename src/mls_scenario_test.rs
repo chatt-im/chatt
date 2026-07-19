@@ -736,6 +736,19 @@ fn invalidate_server_device_links(tickets: &mut BTreeMap<String, PendingTicket>)
     }
 }
 
+fn invalidate_account_device_links(
+    tickets: &mut BTreeMap<String, PendingTicket>,
+    user: User,
+) {
+    for ticket in tickets.values_mut() {
+        if ticket.state == TicketState::Active
+            && device_user(&ticket.sponsor).is_ok_and(|sponsor| sponsor == user)
+        {
+            ticket.state = TicketState::Unavailable;
+        }
+    }
+}
+
 #[derive(Clone)]
 enum PendingKind {
     Text { body: String },
@@ -899,6 +912,16 @@ impl ScenarioRunner {
                 },
             );
             runner.wait_authenticated(&label, "initial authentication")?;
+        }
+        // Traces model lifecycle transitions after the fixed rooms have a
+        // shared cryptographic baseline. Authentication alone is not that
+        // boundary: genesis races continue asynchronously and an immediate
+        // stop could otherwise turn an unrelated trace into a lost-creation
+        // test. One modeled message per room proves every initial member has
+        // installed and processed the same MLS group before action zero.
+        let initial_rooms = runner.rooms.keys().cloned().collect::<Vec<_>>();
+        for room in initial_rooms {
+            runner.send_text("alice.0", &room, &format!("__scenario-initialized-{room}"))?;
         }
         Ok(runner)
     }
@@ -1763,6 +1786,7 @@ impl ScenarioRunner {
             self.wait_revoked(target)?;
             self.devices.get_mut(target).unwrap().runtime.take();
         }
+        invalidate_account_device_links(&mut self.tickets, actor_user);
         let rooms = self.devices[target]
             .room_starts
             .keys()
@@ -3096,6 +3120,36 @@ mod tests {
         assert_eq!(tickets["active"].state, TicketState::Unavailable);
         assert_eq!(tickets["unavailable"].state, TicketState::Unavailable);
         assert_eq!(tickets["redeemed"].state, TicketState::Redeemed);
+    }
+
+    #[test]
+    fn roster_change_invalidates_only_accounts_outstanding_device_links() {
+        let ticket = |sponsor: &str, state| PendingTicket {
+            sponsor: sponsor.into(),
+            secret_hash: vec![1; 32],
+            pairing_string: "ticket".into(),
+            state,
+        };
+        let mut tickets = BTreeMap::from([
+            (
+                "alice-active".into(),
+                ticket("alice.0", TicketState::Active),
+            ),
+            (
+                "alice-redeemed".into(),
+                ticket("alice.0", TicketState::Redeemed),
+            ),
+            (
+                "bob-active".into(),
+                ticket("bob.0", TicketState::Active),
+            ),
+        ]);
+
+        invalidate_account_device_links(&mut tickets, User::Alice);
+
+        assert_eq!(tickets["alice-active"].state, TicketState::Unavailable);
+        assert_eq!(tickets["alice-redeemed"].state, TicketState::Redeemed);
+        assert_eq!(tickets["bob-active"].state, TicketState::Active);
     }
 
     #[test]

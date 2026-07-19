@@ -1,0 +1,9 @@
+chatt-mls-scenario-v1
+seed 0x55504c4f41445331
+
+upload alice.0 group-all e0 success
+upload bob.0 group-all e1 fail
+upload carol.0 group-all e2 cancel
+upload alice.0 group-all e3 decline
+upload bob.0 group-all e4 restart
+checkpoint

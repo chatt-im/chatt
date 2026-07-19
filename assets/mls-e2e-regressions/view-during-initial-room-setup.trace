@@ -1,0 +1,6 @@
+chatt-mls-scenario-v1
+seed 0xa2d594a2bdc09a67
+
+# This seed can bind Carol before the group descriptor reaches her MLS actor.
+# The fallback history request must remain within the shared protocol limit.
+view carol.0 group-all

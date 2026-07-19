@@ -3880,6 +3880,10 @@ impl Server {
         self.device_links.retain(|_, link| link.expires_at > now);
     }
 
+    fn invalidate_device_links_for_roster_change(&mut self, user_id: UserId) {
+        self.device_links.retain(|_, link| link.user_id != user_id);
+    }
+
     fn authenticate_client(
         &mut self,
         token: Token,
@@ -5417,6 +5421,11 @@ impl Server {
                     let result = match result {
                         Ok((checkpoint, state)) => (|| {
                             self.install_mls_cache(state)?;
+                            // Device-link enrollment is sealed against the roster that was
+                            // current when the link was created. Any separately published
+                            // roster transition makes both a pending redemption and an
+                            // already-redeemed retry stale.
+                            self.invalidate_device_links_for_roster_change(user_id);
                             if initial && let Some(session) = self.sessions.get_mut(&session_id) {
                                 session.bootstrap_credential_hash = None;
                             }
@@ -5704,7 +5713,8 @@ impl Server {
                     result,
                 } => {
                     let result = result.map(|(available, cached)| {
-                        self.mls.install_cached_key_packages(device_id, cached);
+                        self.mls
+                            .install_cached_key_packages(device_id, cached, available);
                         let tokens = self
                             .sessions
                             .values()
@@ -5727,7 +5737,8 @@ impl Server {
                     result,
                 } => {
                     let result = result.and_then(|(package, available, cached)| {
-                        self.mls.install_cached_key_packages(device_id, cached);
+                        self.mls
+                            .install_cached_key_packages(device_id, cached, available);
                         self.send_control_to_token(
                             token,
                             &ServerControl::KeyPackage { device_id, package },
@@ -8855,7 +8866,10 @@ fn collect_latest_welcomes(
         .iter()
         .map(|device_id| {
             let head = mls.welcome_head(*device_id)?;
-            let welcomes = mls.welcomes(*device_id, head.saturating_sub(1))?;
+            // A push must not advance the client over an older unprocessed
+            // Welcome. Deliver the full pending suffix; in the steady state
+            // acknowledgements keep this to the newly appended Welcome.
+            let welcomes = mls.welcomes(*device_id, mls.welcome_cursor(*device_id))?;
             Ok((*device_id, welcomes, head))
         })
         .collect()
@@ -10174,6 +10188,45 @@ mod tests {
                 redemption_secret_hash: secret_hash,
             }
         );
+    }
+
+    #[test]
+    fn roster_change_invalidates_all_device_links_for_the_account() {
+        let mut server = test_server();
+        let alice = UserId(1);
+        let bob = UserId(2);
+        let roster = test_mls_roster(&server, alice, [1; 32], &[(1, "test")], 1);
+        let link = |user_id, redemption| DeviceLinkState {
+            user_id,
+            enrollment_bundle: vec![1],
+            current_roster: roster.clone(),
+            expires_at: Instant::now() + DEVICE_LINK_TTL,
+            redemption,
+        };
+        server.device_links.insert(
+            vec![1; 32],
+            link(alice, DeviceLinkRedemption::Active),
+        );
+        server.device_links.insert(
+            vec![2; 32],
+            link(
+                alice,
+                DeviceLinkRedemption::Redeemed {
+                    device_id: DeviceId([2; 16]),
+                    credential_hash: "hash".into(),
+                    attempt_id: rpc::ids::PairAttemptId([2; 16]),
+                },
+            ),
+        );
+        server.device_links.insert(
+            vec![3; 32],
+            link(bob, DeviceLinkRedemption::Active),
+        );
+
+        server.invalidate_device_links_for_roster_change(alice);
+
+        assert_eq!(server.device_links.len(), 1);
+        assert_eq!(server.device_links[&vec![3; 32]].user_id, bob);
     }
 
     #[test]

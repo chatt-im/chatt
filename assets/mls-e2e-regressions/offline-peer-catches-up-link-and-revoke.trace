@@ -1,0 +1,10 @@
+chatt-mls-scenario-v1
+seed 0xacf19b93d753b893
+
+# Bob must validate the linked device's earlier commit even though the current
+# Alice roster has already revoked that device when Bob reconnects.
+create-link alice.0 t0
+stop bob.0
+redeem-link t0 alice.1
+revoke alice.0 alice.1
+start bob.0

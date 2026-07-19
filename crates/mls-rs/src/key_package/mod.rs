@@ -99,6 +99,12 @@ impl KeyPackage {
     pub fn signing_identity(&self) -> &SigningIdentity {
         &self.leaf_node.signing_identity
     }
+
+    /// Extensions carried directly by this KeyPackage.
+    pub fn extensions(&self) -> &ExtensionList {
+        &self.extensions
+    }
+
     pub fn to_reference<CP: CipherSuiteProvider>(
         &self,
         cipher_suite_provider: &CP,

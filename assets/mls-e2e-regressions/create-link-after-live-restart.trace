@@ -1,0 +1,7 @@
+chatt-mls-scenario-v1
+seed 0x5fbf1ebf35c13687
+
+# A duplicate pre-restart bind notification must not satisfy the restarted
+# session's MLS-ready barrier.
+server-restart live
+create-link carol.0 t0

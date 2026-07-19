@@ -49,6 +49,10 @@ pub(super) struct GlobalRecord {
     pub retired_key_packages: Vec<[u8; 32]>,
     pub issued_key_packages: Vec<Vec<u8>>,
     pub used_key_packages: Vec<Vec<u8>>,
+    /// Hash references of every current or rotated last-resort KeyPackage.
+    /// Rotated references remain here so already issued commits can still be
+    /// validated after a server restart.
+    pub last_resort_key_packages: Vec<Vec<u8>>,
     pub next_welcome_delivery_id: u64,
     pub credentials: Vec<DeviceCredential>,
     pub device_owners: Vec<(DeviceId, UserId)>,
@@ -916,6 +920,16 @@ impl MlsStore {
 
     pub fn welcome_head(&self, device_id: DeviceId) -> Result<u64, String> {
         Ok(welcome_head_memory(&self.state.read().unwrap(), device_id))
+    }
+
+    pub fn welcome_cursor(&self, device_id: DeviceId) -> u64 {
+        self.state
+            .read()
+            .unwrap()
+            .welcome_cursors
+            .get(&device_id.0)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn acknowledge_welcome(
