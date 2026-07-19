@@ -547,6 +547,11 @@ pub enum NetworkCommand {
     CancelDeviceLink {
         redemption_secret_hash: Vec<u8>,
     },
+    /// Wakes a disconnected client after an embedded test server has finished
+    /// restarting. Production clients discover remote availability through
+    /// their bounded reconnect schedule instead.
+    #[cfg(test)]
+    RetryConnection,
     Shutdown,
 }
 
@@ -1478,9 +1483,13 @@ fn run_worker(
             SessionEnd::Disconnected(reason) => {
                 reconnect.reset();
                 kvlog::warn!("network session disconnected", reason = reason.as_str());
-                if schedule_reconnect(&events, &commands, &mut reconnect, &reason).is_shutdown() {
-                    break;
-                }
+                // A socket event already told us that an established session
+                // ended. Retry it immediately once instead of imposing the
+                // connection-attempt backoff before discovering whether the
+                // server is already available again. If it is not, the next
+                // iteration ends in ConnectFailed and uses the ordinary
+                // bounded backoff below.
+                report_reconnect_scheduled(&events, Duration::ZERO, &reason);
             }
             SessionEnd::AuthFailed { code, reason } => {
                 kvlog::warn!("network auth failed", code, reason = reason.as_str());
@@ -1641,6 +1650,7 @@ fn run_worker_inner(
         disconnect_reason: None,
         auth_failure: None,
         local_identity_failure: None,
+        shutdown_requested: false,
     };
     worker.loop_work.queue_tcp_read();
 
@@ -1780,6 +1790,7 @@ fn run_worker_inner(
         }
         if command_drain == CommandDrainOutcome::Disconnected {
             worker.shutdown = true;
+            worker.shutdown_requested = true;
         }
         if worker.shutdown {
             break;
@@ -1798,16 +1809,16 @@ fn run_worker_inner(
             worker.debug_assert_no_immediate_work(command_drain);
         }
     }
-    if let Some((code, reason)) = worker.auth_failure.take() {
-        SessionEnd::AuthFailed { code, reason }
-    } else if let Some(message) = worker.local_identity_failure.take() {
-        SessionEnd::LocalIdentityUnavailable(message)
-    } else if let Some(reason) = worker.disconnect_reason.take() {
-        SessionEnd::Disconnected(reason)
-    } else {
+    let session_end = select_session_end(
+        worker.shutdown_requested,
+        worker.auth_failure.take(),
+        worker.local_identity_failure.take(),
+        worker.disconnect_reason.take(),
+    );
+    if matches!(session_end, SessionEnd::Shutdown) {
         kvlog::info!("network worker shutdown requested");
-        SessionEnd::Shutdown
     }
+    session_end
 }
 
 fn report_initial_udp_bind_send_error(events: &NetworkEventSender, error: Option<io::Error>) {
@@ -1824,6 +1835,25 @@ enum SessionEnd {
     AuthFailed { code: u16, reason: String },
     LocalIdentityUnavailable(String),
     Fatal(String),
+}
+
+fn select_session_end(
+    shutdown_requested: bool,
+    auth_failure: Option<(u16, String)>,
+    local_identity_failure: Option<String>,
+    disconnect_reason: Option<String>,
+) -> SessionEnd {
+    if shutdown_requested {
+        SessionEnd::Shutdown
+    } else if let Some((code, reason)) = auth_failure {
+        SessionEnd::AuthFailed { code, reason }
+    } else if let Some(message) = local_identity_failure {
+        SessionEnd::LocalIdentityUnavailable(message)
+    } else if let Some(reason) = disconnect_reason {
+        SessionEnd::Disconnected(reason)
+    } else {
+        SessionEnd::Shutdown
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1898,6 +1928,15 @@ fn schedule_reconnect(
     reason: &str,
 ) -> RetryWait {
     let delay = reconnect.next_delay();
+    report_reconnect_scheduled(events, delay, reason);
+    wait_for_reconnect(commands, delay)
+}
+
+fn report_reconnect_scheduled(
+    events: &NetworkEventSender,
+    delay: Duration,
+    reason: &str,
+) {
     kvlog::info!(
         "network reconnect scheduled",
         delay_ms = delay.as_millis() as u64,
@@ -1907,7 +1946,6 @@ fn schedule_reconnect(
         retry_in: delay,
         reason: reason.to_string(),
     });
-    wait_for_reconnect(commands, delay)
 }
 
 fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> RetryWait {
@@ -1917,6 +1955,11 @@ fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> R
             return RetryWait::Retry;
         };
         match commands.recv_timeout(remaining) {
+            #[cfg(test)]
+            Ok(NetworkCommand::RetryConnection) => {
+                kvlog::info!("network reconnect woken by embedded server lifecycle");
+                return RetryWait::Retry;
+            }
             Ok(NetworkCommand::Shutdown) => {
                 kvlog::info!("shutdown command handling while disconnected");
                 return RetryWait::Shutdown;
@@ -2199,6 +2242,9 @@ struct WorkerState<'a> {
     disconnect_reason: Option<String>,
     auth_failure: Option<(u16, String)>,
     local_identity_failure: Option<String>,
+    /// Distinguishes a terminal local request from a session failure which
+    /// should reconnect. Both may be observed in the same poll iteration.
+    shutdown_requested: bool,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -3531,6 +3577,11 @@ impl WorkerState<'_> {
                     },
                 ))?;
             }
+            #[cfg(test)]
+            NetworkCommand::RetryConnection => {
+                // The embedded server may have restarted quickly enough that
+                // this lifecycle wake raced with a successful reconnect.
+            }
             NetworkCommand::SetP2pEnabled(enabled) => {
                 // P2P would bypass an outer secure link, so it stays off in
                 // external-secure-link mode regardless of a runtime toggle.
@@ -3608,6 +3659,7 @@ impl WorkerState<'_> {
             NetworkCommand::Shutdown => {
                 kvlog::info!("shutdown command handling");
                 self.shutdown = true;
+                self.shutdown_requested = true;
             }
         }
         Ok(())
@@ -5880,6 +5932,8 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
         NetworkCommand::CancelDeviceLink { .. } => "cancel_device_link",
+        #[cfg(test)]
+        NetworkCommand::RetryConnection => "retry_connection",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -7141,6 +7195,39 @@ mod tests {
         schedule.reset();
 
         assert_eq!(schedule.next_delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn embedded_server_lifecycle_wakes_reconnect_backoff() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(NetworkCommand::RetryConnection).unwrap();
+
+        assert!(matches!(
+            wait_for_reconnect(&rx, Duration::from_secs(60)),
+            RetryWait::Retry
+        ));
+    }
+
+    #[test]
+    fn explicit_shutdown_wins_simultaneous_disconnect() {
+        assert!(matches!(
+            select_session_end(
+                false,
+                None,
+                None,
+                Some("server closed connection".to_string()),
+            ),
+            SessionEnd::Disconnected(_)
+        ));
+        assert!(matches!(
+            select_session_end(
+                true,
+                None,
+                None,
+                Some("server closed connection".to_string()),
+            ),
+            SessionEnd::Shutdown
+        ));
     }
 
     #[test]

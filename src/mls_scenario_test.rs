@@ -2043,6 +2043,12 @@ impl ScenarioRunner {
             .filter(|(_, device)| device.runtime.is_some() && !device.revoked)
             .map(|(label, _)| label.clone())
             .collect::<Vec<_>>();
+        // The replacement listener is ready now. Wake clients that observed
+        // the shutdown during the bind gap instead of waiting for their
+        // production reconnect timer.
+        for device in &online {
+            self.send_command(device, NetworkCommand::RetryConnection)?;
+        }
         for device in online {
             self.wait_authenticated(&device, "live server restart")?;
             self.catch_up_device(&device)?;
