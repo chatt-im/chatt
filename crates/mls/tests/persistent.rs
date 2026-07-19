@@ -25,6 +25,15 @@ struct Device {
     signing_secret: SignatureSecretKey,
 }
 
+fn delivery_rosters(rosters: &[&SignedDeviceRoster]) -> Vec<SignedDeviceRoster> {
+    let mut rosters = rosters
+        .iter()
+        .map(|roster| (*roster).clone())
+        .collect::<Vec<_>>();
+    rosters.sort_by_key(|roster| roster.body.account_id);
+    rosters
+}
+
 fn device(server: &[u8], user: u64, authority_byte: u8, device_byte: u8) -> Device {
     let cipher = AwsLcCryptoProvider::default()
         .cipher_suite_provider(CIPHER_SUITE)
@@ -193,6 +202,7 @@ fn redb_reopen_preserves_exact_outbox_and_received_history() {
         sequence: 2,
         epoch,
         event_id: event.event_id,
+        rosters: delivery_rosters(&[&alice.roster, &bob.roster]),
         ciphertext,
     };
     let ProcessedDelivery::Application(received) =
@@ -449,6 +459,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
                     sequence: 3,
                     epoch: preceding_epoch,
                     event_id: preceding.event_id,
+                    rosters: delivery_rosters(&[&alice.roster, &bob.roster]),
                     ciphertext: preceding_ciphertext,
                 },
             )
@@ -463,6 +474,7 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
                     sequence: 4,
                     epoch: delayed_epoch,
                     event_id: delayed.event_id,
+                    rosters: delivery_rosters(&[&alice.roster, &bob.roster]),
                     ciphertext: delayed_ciphertext,
                 },
             )
@@ -626,6 +638,7 @@ fn accepted_local_commit_waits_for_earlier_same_epoch_applications() {
         sequence: 2,
         parent_epoch: join_parent,
         epoch: join_parent + 1,
+        rosters: delivery_rosters(&[&alice.roster, &replacement_roster]),
         commit: join.commit,
     };
     assert!(matches!(
@@ -678,6 +691,7 @@ fn accepted_local_commit_waits_for_earlier_same_epoch_applications() {
                     sequence: 3,
                     epoch,
                     event_id: event.event_id,
+                    rosters: delivery_rosters(&[&alice.roster, &replacement_roster]),
                     ciphertext,
                 },
             )
@@ -692,6 +706,7 @@ fn accepted_local_commit_waits_for_earlier_same_epoch_applications() {
                     sequence: 4,
                     parent_epoch,
                     epoch: parent_epoch + 1,
+                    rosters: delivery_rosters(&[&alice.roster, &replacement_roster]),
                     commit: commit.commit,
                 },
             )
@@ -771,6 +786,7 @@ fn external_rejoin_replaces_lost_local_state_and_opens_future_messages() {
         sequence: 2,
         parent_epoch: 1,
         epoch: 2,
+        rosters: delivery_rosters(&[&alice.roster, &bob.roster]),
         commit: rejoin.commit.clone(),
     };
     assert!(matches!(
@@ -801,6 +817,7 @@ fn external_rejoin_replaces_lost_local_state_and_opens_future_messages() {
                 sequence: 3,
                 epoch,
                 event_id: event.event_id,
+                rosters: delivery_rosters(&[&alice.roster, &bob.roster]),
                 ciphertext,
             },
         )

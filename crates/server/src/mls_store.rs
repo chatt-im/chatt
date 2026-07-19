@@ -660,6 +660,7 @@ impl MlsStore {
         device_id: DeviceId,
         expected_epoch: u64,
         event_id: EventId,
+        rosters: Vec<SignedDeviceRoster>,
         ciphertext: &[u8],
         now_unix_ms: u64,
     ) -> Result<AppendApplicationResult, String> {
@@ -716,6 +717,7 @@ impl MlsStore {
                         sequence,
                         epoch: expected_epoch,
                         event_id,
+                        rosters,
                         ciphertext: ciphertext.to_vec(),
                     };
                     room.head_sequence = sequence;
@@ -2255,6 +2257,7 @@ mod tests {
                     sequence: 1,
                     parent_epoch: 0,
                     epoch: 1,
+                    rosters: Vec::new(),
                     commit: vec![9],
                 },
                 None,
@@ -2279,6 +2282,7 @@ mod tests {
                     sequence: 1,
                     parent_epoch: 0,
                     epoch: 1,
+                    rosters: Vec::new(),
                     commit: vec![9],
                 },
                 Some((1, &bundle)),
@@ -2312,7 +2316,15 @@ mod tests {
         let reader = store.read_handle();
         create(&store, &room(23, vec![device], 100));
         store
-            .append_application(RoomId(23), device, 1, EventId([23; 16]), &[1], 150)
+            .append_application(
+                RoomId(23),
+                device,
+                1,
+                EventId([23; 16]),
+                Vec::new(),
+                &[1],
+                150,
+            )
             .unwrap();
         let wal_path = temp.path().join("mls-state.wal");
         let before = fs::metadata(&wal_path).unwrap().len();
@@ -2332,7 +2344,15 @@ mod tests {
         create(&store, &room(11, vec![device], 100));
         for (room_id, byte) in [(RoomId(10), 1), (RoomId(10), 2), (RoomId(11), 3)] {
             store
-                .append_application(room_id, device, 1, EventId([byte; 16]), &[byte], 200)
+                .append_application(
+                    room_id,
+                    device,
+                    1,
+                    EventId([byte; 16]),
+                    Vec::new(),
+                    &[byte],
+                    200,
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -2372,7 +2392,15 @@ mod tests {
             .unwrap()
             .head_sequence = u64::MAX - 1;
         let error = store
-            .append_application(RoomId(25), device, 1, EventId([25; 16]), &[1], 200)
+            .append_application(
+                RoomId(25),
+                device,
+                1,
+                EventId([25; 16]),
+                Vec::new(),
+                &[1],
+                200,
+            )
             .unwrap_err();
         assert!(error.contains("sequence is exhausted"));
 
@@ -2413,7 +2441,15 @@ mod tests {
         let store = MlsStore::open(Some(temp.path())).unwrap();
         create(&store, &room(14, vec![device], 100));
         store
-            .append_application(RoomId(14), device, 1, EventId([1; 16]), &[1], 200)
+            .append_application(
+                RoomId(14),
+                device,
+                1,
+                EventId([1; 16]),
+                Vec::new(),
+                &[1],
+                200,
+            )
             .unwrap();
         store.acknowledge(RoomId(14), device, 2, 300).unwrap();
         drop(store);
@@ -2529,7 +2565,15 @@ mod tests {
         let store = MlsStore::open(Some(temp.path())).unwrap();
         create(&store, &room(16, vec![device], 100));
         store
-            .append_application(RoomId(16), device, 1, EventId([1; 16]), &[7; 32], 200)
+            .append_application(
+                RoomId(16),
+                device,
+                1,
+                EventId([1; 16]),
+                Vec::new(),
+                &[7; 32],
+                200,
+            )
             .unwrap();
         assert!(!temp.path().join("mls-state.bin").exists());
         assert!(
@@ -2608,7 +2652,15 @@ mod tests {
             .seal()
             .unwrap();
         store
-            .append_application(RoomId(18), device, 1, EventId([2; 16]), &[9; 32], 200)
+            .append_application(
+                RoomId(18),
+                device,
+                1,
+                EventId([2; 16]),
+                Vec::new(),
+                &[9; 32],
+                200,
+            )
             .unwrap();
         let writer = store.snapshot_writer.as_ref().unwrap();
         writer.request().unwrap();
@@ -2646,7 +2698,15 @@ mod tests {
         let device = DeviceId([8; 16]);
         create(&store, &room(15, vec![device], 100));
         store
-            .append_application(RoomId(15), device, 1, EventId([1; 16]), &[1; 1024], 200)
+            .append_application(
+                RoomId(15),
+                device,
+                1,
+                EventId([1; 16]),
+                Vec::new(),
+                &[1; 1024],
+                200,
+            )
             .unwrap();
         store.acknowledge(RoomId(15), device, 2, 300).unwrap();
         store.cleanup(300, 10).unwrap();
@@ -2671,6 +2731,7 @@ mod tests {
                 device,
                 1,
                 EventId([3; 16]),
+                Vec::new(),
                 &[5; 1024 * 1024],
                 200,
             )
@@ -2694,7 +2755,15 @@ mod tests {
         create(&store, &room(20, vec![device], 100));
         for byte in [1, 2] {
             store
-                .append_application(RoomId(20), device, 1, EventId([byte; 16]), &[byte], 200)
+                .append_application(
+                    RoomId(20),
+                    device,
+                    1,
+                    EventId([byte; 16]),
+                    Vec::new(),
+                    &[byte],
+                    200,
+                )
                 .unwrap();
         }
         store.acknowledge(RoomId(20), device, 3, 300).unwrap();
@@ -2738,7 +2807,15 @@ mod tests {
         let device = DeviceId([9; 16]);
         create(&store, &room(30, vec![device], 200));
         store
-            .append_application(RoomId(30), device, 1, EventId([1; 16]), &[1], 100)
+            .append_application(
+                RoomId(30),
+                device,
+                1,
+                EventId([1; 16]),
+                Vec::new(),
+                &[1],
+                100,
+            )
             .unwrap();
         let day = 24 * 60 * 60 * 1000;
         let early = store.cleanup(day + 150, 10).unwrap();

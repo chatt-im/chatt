@@ -247,12 +247,14 @@ pub enum MlsDeliveryEvent {
         sequence: u64,
         parent_epoch: u64,
         epoch: u64,
+        rosters: Vec<crate::identity::SignedDeviceRoster>,
         commit: Vec<u8>,
     },
     Application {
         sequence: u64,
         epoch: u64,
         event_id: EventId,
+        rosters: Vec<crate::identity::SignedDeviceRoster>,
         ciphertext: Vec<u8>,
     },
 }
@@ -463,6 +465,7 @@ mod tests {
             sequence,
             epoch: 1,
             event_id: EventId([sequence as u8; 16]),
+            rosters: Vec::new(),
             ciphertext: vec![1],
         };
         validate_event_batch(&[event(1), event(2)]).unwrap();

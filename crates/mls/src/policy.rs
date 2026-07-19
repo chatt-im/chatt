@@ -86,6 +86,10 @@ struct PolicyState {
     /// Certificates in the current authority-signed roster, used for all new
     /// MLS membership decisions.
     devices: HashMap<Vec<u8>, CertifiedDevice>,
+    /// Every authority-certified credential observed in a signed roster.
+    /// Historical delivery validation uses this cache without reactivating a
+    /// device in `devices` or rolling back the current roster checkpoint.
+    historical_devices: HashMap<Vec<u8>, CertifiedDevice>,
     /// Highest authenticated roster revision installed for each account.
     ///
     /// The delivery service can replay an older, still-valid signed roster.
@@ -157,6 +161,10 @@ impl ChattIdentityProvider {
         for certificate in &roster.body.active_devices {
             let client_id = certificate.body.mls_client_id.clone();
             let device = certified_device(certificate);
+            state
+                .historical_devices
+                .entry(client_id.clone())
+                .or_insert_with(|| device.clone());
             state.devices.insert(client_id, device);
         }
         state.rosters.insert(roster.body.account_id, checkpoint);
@@ -168,6 +176,33 @@ impl ChattIdentityProvider {
                 .count(),
             roster.body.active_devices.len(),
         );
+        Ok(())
+    }
+
+    /// Adds credentials from an authenticated historical delivery snapshot
+    /// without changing which devices are currently active.
+    pub fn install_historical_roster(
+        &self,
+        roster: &SignedDeviceRoster,
+    ) -> Result<(), PolicyError> {
+        validate_device_roster(roster, &self.server_id, roster.body.user_id)
+            .map_err(PolicyError::InvalidRoster)?;
+        let mut state = self.state.write().map_err(|_| PolicyError::LockPoisoned)?;
+        for certificate in &roster.body.active_devices {
+            let client_id = certificate.body.mls_client_id.clone();
+            let device = certified_device(certificate);
+            if let Some(existing) = state.historical_devices.get(&client_id)
+                && (existing.account_id != device.account_id
+                    || existing.user_id != device.user_id
+                    || existing.device_id != device.device_id
+                    || existing.signature_key != device.signature_key)
+            {
+                return Err(PolicyError::InvalidRoster(
+                    "historical device credential equivocates".to_string(),
+                ));
+            }
+            state.historical_devices.entry(client_id).or_insert(device);
+        }
         Ok(())
     }
 
@@ -203,8 +238,12 @@ impl ChattIdentityProvider {
     ) -> Result<CertifiedDevice, PolicyError> {
         let client_id = basic_client_id(signing_identity)?;
         let state = self.state.read().map_err(|_| PolicyError::LockPoisoned)?;
-        let device = state
-            .devices
+        let devices = if self.allow_historical_group_info {
+            &state.historical_devices
+        } else {
+            &state.devices
+        };
+        let device = devices
             .get(client_id)
             .ok_or(PolicyError::UnknownDevice)?;
         if signing_identity.signature_key.as_ref() != device.signature_key {
@@ -687,6 +726,29 @@ mod tests {
                 .unwrap(),
             first.body.account_id
         );
+    }
+
+    #[test]
+    fn historical_roster_certifies_without_reactivating_revoked_device() {
+        let server = b"server";
+        let first = roster(server, UserId(1), &[1; 32], DeviceId([1; 16]), &[11; 32]);
+        let old_identity = signing_identity(&first);
+        let mut current = roster(server, UserId(1), &[1; 32], DeviceId([2; 16]), &[12; 32]);
+        current.body.revision = 2;
+        let current = sign_device_roster(current.body, &[1; 32]).unwrap();
+        let identities = ChattIdentityProvider::new(server.to_vec());
+        identities.install_roster(&current).unwrap();
+        identities.install_historical_roster(&first).unwrap();
+
+        assert!(!identities.is_active(&old_identity).unwrap());
+        assert!(matches!(
+            identities.validate_member(&old_identity, None, MemberValidationContext::None),
+            Err(PolicyError::UnknownDevice)
+        ));
+        identities
+            .historical_group_info_observer()
+            .validate_member(&old_identity, None, MemberValidationContext::None)
+            .unwrap();
     }
 
     #[test]
