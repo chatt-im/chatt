@@ -407,6 +407,38 @@ impl UploadFileRequest {
     }
 }
 
+/// Makes the next test upload of `path` fail once its source cursor reaches
+/// `bytes`. The fault lives outside [`UploadFileRequest`] so the production
+/// request shape and durable-resume path stay unchanged.
+#[cfg(test)]
+pub(crate) fn fail_upload_source_after_for_test(path: PathBuf, bytes: u64) {
+    TEST_UPLOAD_SOURCE_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path, bytes);
+}
+
+#[cfg(test)]
+static TEST_UPLOAD_SOURCE_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn take_test_upload_source_failure(path: &Path, offset: u64) -> bool {
+    let mut failures = TEST_UPLOAD_SOURCE_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failures
+        .get(path)
+        .is_some_and(|fail_after| offset >= *fail_after)
+    {
+        failures.remove(path);
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug)]
 pub enum NetworkCommand {
     SendChat {
@@ -5772,6 +5804,10 @@ fn upload_ready_now(upload: &OutgoingUpload, pending: usize, throttle: &UploadTh
 }
 
 fn read_upload_source(upload: &mut OutgoingUpload, limit: usize) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    if take_test_upload_source_failure(&upload.source_path, upload.source_offset) {
+        return Err(io::Error::other("injected upload source read failure"));
+    }
     if upload.source_prefix_offset < upload.source_prefix.len() {
         let end = upload
             .source_prefix_offset
