@@ -8278,6 +8278,8 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::ListE2eDevices => "list_e2e_devices",
         NetworkCommand::CreateDeviceLink => "create_device_link",
         NetworkCommand::CancelDeviceLink { .. } => "cancel_device_link",
+        #[cfg(test)]
+        NetworkCommand::RetryConnection => "retry_connection",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
