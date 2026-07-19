@@ -49,8 +49,8 @@ capture-silence-ramp-ms = 10
 
 [soundboard]
 enabled = true
-#\loss = "none"
-loss = "random_60"
+loss = "none"
+#loss = "random_60"
 #loss = "congested_wifi"
 seed = 8388357047376790533
 

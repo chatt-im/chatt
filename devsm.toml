@@ -7,6 +7,7 @@ sh = '''
 rm -f /tmp/chatt-server.kvlog
 cargo run $CARGO_FLAGS -p server -- --logfile /tmp/chatt-server.kvlog serve $CHATT_SERVER_CONFIG
 '''
+env.RUST_BACKTRACE = "1"
 env.CHATT_RUN_DIR = { if.profile = "public", then = "/tmp/public-dev-chatt-server/", or_else = { if.profile = "plaintext", then = "/tmp/plaintext-dev-chatt-server/", or_else = "/tmp/private-dev-chatt-server/" } }
 env.CHATT_SERVER_CONFIG = { if.profile = "public", then = "dev/public-server.toml", or_else = { if.profile = "plaintext", then = "dev/plaintext-server.toml", or_else = "dev/private-server.toml" } }
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
@@ -17,6 +18,34 @@ ready.timeout = 10.0
 info = "Local chatt development server"
 
 [action.alice]
+profiles = ["default", "pop"]
+require = ["server"]
+managed = false
+allow_multiple = true
+cli.forward_arguments = true
+env.RUST_BACKTRACE = "1"
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
+env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
+env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
+env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
+sh = '''
+RUNTIME_CONFIG=/tmp/chatt-dev/config/alice.toml
+if [ ! -e "$RUNTIME_CONFIG" ]; then
+  mkdir -p "$(dirname "$RUNTIME_CONFIG")"
+  cp dev/chatt-alice.toml "$RUNTIME_CONFIG"
+fi
+if [ "$#" -gt 0 ]; then
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" "$@"
+else
+  rm -f /tmp/chatt-alice.kvlog
+  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" --logfile /tmp/chatt-alice.kvlog
+fi
+'''
+info = "Run the Alice client; trailing args run a chatt subcommand against it"
+
+[action.alice-v3]
 profiles = ["default", "pop"]
 require = ["server"]
 managed = false
@@ -35,10 +64,10 @@ if [ ! -e "$RUNTIME_CONFIG" ]; then
   cp dev/chatt-alice.toml "$RUNTIME_CONFIG"
 fi
 if [ "$#" -gt 0 ]; then
-  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" "$@"
+  /tmp/rust-target/release-v3/chatt --config "$RUNTIME_CONFIG" "$@"
 else
   rm -f /tmp/chatt-alice.kvlog
-  cargo run $CARGO_FLAGS -p chatt -- --config "$RUNTIME_CONFIG" --logfile /tmp/chatt-alice.kvlog
+  /tmp/rust-target/release-v3/chatt --config "$RUNTIME_CONFIG" --logfile /tmp/chatt-alice.kvlog
 fi
 '''
 info = "Run the Alice client; trailing args run a chatt subcommand against it"
@@ -156,12 +185,18 @@ cmd = ["cargo", "nextest", "run", "--workspace", { var = "args" }]
 cli.forward_arguments = true
 env.CARGO_TERM_COLOR = "never"
 
+[action.test-mls-scenarios]
+cmd = ["cargo", "+nightly", "nextest", "run", "-p", "chatt", "--features", "nightly-test-spans", "--run-ignored", "ignored-only", "mls_live_stateful_scenario_campaign"]
+env.CARGO_TERM_COLOR = "never"
+env.RUST_BACKTRACE = "1"
+info = "Run the bounded stateful MLS scenario campaign into /tmp/chatt-mls-scenarios.kvlog; use `devsm exec` when setting CHATT_MLS_SCENARIO_*"
+
 [action.json-snapshot-client-logs]
 sh = '''
 kvlog /tmp/chatt-server.kvlog --json > /tmp/chatt-server.json
 kvlog /tmp/chatt-alice.kvlog --json > /tmp/chatt-alice.json
-kvlog /tmp/chatt-alice-2.kvlog --json > /tmp/chatt-alice-2.json || true
 kvlog /tmp/chatt-soundboard.kvlog --json > /tmp/chatt-soundboard.json
+kvlog /tmp/chatt-alice-2.kvlog --json > /tmp/chatt-alice-2.json || true
 '''
 
 [action.bench]
