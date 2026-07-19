@@ -23,6 +23,12 @@ use crate::mls_store::{
 
 const MAX_KEY_PACKAGES_PER_DEVICE: usize = 64;
 
+#[derive(Clone, Debug)]
+struct CurrentLastResortKeyPackage {
+    hash: [u8; 32],
+    reference: Vec<u8>,
+}
+
 /// MLS validation and authorization caches. [`MlsStore`] is the durable
 /// authority; delivery history is never retained in this long-lived object.
 #[derive(Debug)]
@@ -39,6 +45,17 @@ pub(super) struct MlsService {
     retired_key_packages: HashSet<[u8; 32]>,
     issued_key_packages: HashSet<Vec<u8>>,
     used_key_packages: HashSet<Vec<u8>>,
+    /// Current and rotated last-resort KeyPackage references. Rotated
+    /// references remain authorized for commits prepared before rotation.
+    last_resort_key_packages: HashSet<Vec<u8>>,
+    /// Per-device metadata for the fallback currently at the back of its
+    /// queue. Keeping this out of the wire queue avoids reparsing and hashing
+    /// every package whenever availability is queried.
+    current_last_resort_key_packages: HashMap<DeviceId, CurrentLastResortKeyPackage>,
+    /// Worker replies update the network-loop cache without copying the full
+    /// global MLS state. The durability worker leaves this empty and computes
+    /// availability directly from its authoritative package state.
+    cached_key_package_counts: HashMap<DeviceId, u16>,
     rooms: HashMap<RoomId, RoomRecord>,
     next_welcome_delivery_id: u64,
     credentials: Vec<DeviceCredential>,
@@ -87,6 +104,9 @@ impl MlsService {
             retired_key_packages: HashSet::new(),
             issued_key_packages: HashSet::new(),
             used_key_packages: HashSet::new(),
+            last_resort_key_packages: HashSet::new(),
+            current_last_resort_key_packages: HashMap::new(),
+            cached_key_package_counts: HashMap::new(),
             rooms: HashMap::new(),
             next_welcome_delivery_id: 1,
             credentials: Vec::new(),
@@ -143,8 +163,10 @@ impl MlsService {
         &mut self,
         device_id: DeviceId,
         packages: Vec<Vec<u8>>,
+        available: u16,
     ) {
         self.key_packages.insert(device_id, packages.into());
+        self.cached_key_package_counts.insert(device_id, available);
     }
 
     pub fn roster(&self, user_id: UserId) -> Option<&SignedDeviceRoster> {
@@ -232,13 +254,23 @@ impl MlsService {
             return Err("MLS device id is already owned by another account".to_string());
         }
         validate_key_packages(&packages)?;
-        self.validate_fresh_key_packages(&roster, &packages)?;
+        let package_metadata = self.validate_fresh_key_packages(&roster, &packages)?;
         if packages.is_empty()
             || packages
                 .iter()
                 .any(|package| package.device_id != device_id)
         {
             return Err("paired KeyPackages do not belong to the new device".to_string());
+        }
+        if package_metadata
+            .iter()
+            .filter(|(_, last_resort)| *last_resort)
+            .count()
+            != 1
+        {
+            return Err(
+                "paired KeyPackages must contain exactly one last-resort package".to_string(),
+            );
         }
         if certificate.body.mls_client_id.is_empty()
             || self
@@ -255,12 +287,29 @@ impl MlsService {
             .map_err(|error| error.to_string())?;
         let checkpoint = roster_checkpoint(&roster);
         self.rosters.insert(user_id, roster);
+        let mut current_last_resort = None;
+        let mut packages = packages
+            .into_iter()
+            .zip(package_metadata)
+            .map(|(package, (reference, last_resort))| {
+                if last_resort {
+                    self.last_resort_key_packages.insert(reference.clone());
+                    current_last_resort = Some(CurrentLastResortKeyPackage {
+                        hash: key_package_hash(&package.package),
+                        reference,
+                    });
+                }
+                (package.package, last_resort)
+            })
+            .collect::<Vec<_>>();
+        packages.sort_by_key(|(_, last_resort)| *last_resort);
         self.key_packages.insert(
             device_id,
-            packages
-                .into_iter()
-                .map(|package| package.package)
-                .collect(),
+            packages.into_iter().map(|(package, _)| package).collect(),
+        );
+        self.current_last_resort_key_packages.insert(
+            device_id,
+            current_last_resort.expect("paired KeyPackages contain one last-resort package"),
         );
         self.credentials.push(DeviceCredential {
             user_id,
@@ -369,6 +418,10 @@ impl MlsService {
             .filter(|certificate| removed.contains(&certificate.body.mls_client_id))
         {
             self.key_packages.remove(&certificate.body.device_id);
+            self.current_last_resort_key_packages
+                .remove(&certificate.body.device_id);
+            self.cached_key_package_counts
+                .remove(&certificate.body.device_id);
             self.credentials.retain(|credential| {
                 credential.device_id != certificate.body.device_id || credential.user_id != user_id
             });
@@ -422,14 +475,18 @@ impl MlsService {
         }
         let before = self.snapshot();
         let mut batch_hashes = HashSet::new();
+        let mut batch_has_last_resort = false;
         let mut new_packages = Vec::new();
         for package in packages {
-            let (_, client_id) = self
+            let (reference, client_id, last_resort) = self
                 .validator
                 .validate_key_package(&package.package)
                 .map_err(|error| error.to_string())?;
             if client_id != certificate.body.mls_client_id {
                 return Err("KeyPackage credential does not match its device".to_string());
+            }
+            if last_resort && std::mem::replace(&mut batch_has_last_resort, true) {
+                return Err("KeyPackage batch contains multiple last-resort packages".to_string());
             }
             let hash = key_package_hash(&package.package);
             if self.retired_key_packages.contains(&hash) {
@@ -451,18 +508,63 @@ impl MlsService {
                 Some(_) => {
                     return Err("KeyPackage is already published by another device".to_string());
                 }
-                None => new_packages.push(package.package),
+                None => new_packages.push((package.package, reference, last_resort)),
             }
         }
+        let current_last_resort = self
+            .current_last_resort_key_packages
+            .get(&device_id)
+            .cloned();
+        let new_last_resort = new_packages.iter().find(|(_, _, last_resort)| *last_resort);
+        let replace_last_resort = match (&current_last_resort, new_last_resort) {
+            (Some(current), Some((_, new_reference, _))) if &current.reference != new_reference => {
+                true
+            }
+            _ => false,
+        };
         let current_len = self.key_packages.get(&device_id).map_or(0, VecDeque::len);
-        if current_len + new_packages.len() > MAX_KEY_PACKAGES_PER_DEVICE {
+        let replaced = usize::from(replace_last_resort);
+        if current_len - replaced + new_packages.len() > MAX_KEY_PACKAGES_PER_DEVICE {
             return Err("device KeyPackage pool is full".to_string());
         }
         let pool = self.key_packages.entry(device_id).or_default();
-        for package in new_packages {
+        let retained_last_resort = current_last_resort.as_ref().and_then(|current| {
+            let package = pool
+                .pop_back()
+                .expect("last-resort metadata has a queued package");
+            debug_assert_eq!(key_package_hash(&package), current.hash);
+            (!replace_last_resort).then_some(package)
+        });
+        if replace_last_resort {
+            let current = current_last_resort
+                .as_ref()
+                .expect("last-resort replacement has an existing package");
+            self.retired_key_packages.insert(current.hash);
+            self.current_last_resort_key_packages.remove(&device_id);
+        }
+        // Always consume ordinary packages first. This minimizes fallback
+        // reuse as recommended by RFC 9750 section 5.1.
+        new_packages.sort_by_key(|(_, _, last_resort)| *last_resort);
+        let mut new_last_resort = None;
+        for (package, reference, last_resort) in new_packages {
+            if last_resort {
+                self.last_resort_key_packages.insert(reference.clone());
+                self.current_last_resort_key_packages.insert(
+                    device_id,
+                    CurrentLastResortKeyPackage {
+                        hash: key_package_hash(&package),
+                        reference,
+                    },
+                );
+                new_last_resort = Some(package);
+            } else {
+                pool.push_back(package);
+            }
+        }
+        if let Some(package) = retained_last_resort.or(new_last_resort) {
             pool.push_back(package);
         }
-        let available = pool.len() as u16;
+        let available = self.authoritative_key_package_count(device_id)?;
         if let Err(error) = self.persist_global() {
             return Err(self.rollback(before, error));
         }
@@ -473,35 +575,64 @@ impl MlsService {
         let before = self.snapshot();
         let package = self
             .key_packages
-            .get_mut(&device_id)
-            .and_then(VecDeque::pop_front);
+            .get(&device_id)
+            .and_then(|packages| packages.front())
+            .cloned();
+        let mut state_changed = false;
         if let Some(package) = &package {
-            self.retired_key_packages.insert(key_package_hash(package));
-            let reference = match self.validator.key_package_reference(package) {
-                Ok(reference) => reference,
-                Err(error) => return Err(self.rollback(before, error.to_string())),
+            let package_hash = key_package_hash(package);
+            let current_last_resort = self.current_last_resort_key_packages.get(&device_id);
+            let last_resort =
+                current_last_resort.is_some_and(|current| current.hash == package_hash);
+            let reference = if let Some(current) = current_last_resort.filter(|_| last_resort) {
+                current.reference.clone()
+            } else {
+                self.validator
+                    .stored_key_package_reference(package)
+                    .map_err(|error| self.rollback(before.clone(), error.to_string()))?
             };
-            self.issued_key_packages.insert(reference);
+            if !last_resort {
+                self.key_packages
+                    .get_mut(&device_id)
+                    .expect("peeked KeyPackage queue still exists")
+                    .pop_front();
+                self.retired_key_packages.insert(package_hash);
+                state_changed = true;
+            }
+            state_changed |= self.issued_key_packages.insert(reference);
         }
-        if package.is_some()
-            && let Err(error) = self.persist_global()
-        {
+        if state_changed && let Err(error) = self.persist_global() {
             return Err(self.rollback(before, error));
         }
         Ok(package)
     }
 
     pub fn key_package_count(&self, device_id: DeviceId) -> u16 {
-        self.key_packages
+        self.cached_key_package_counts
             .get(&device_id)
-            .map_or(0, |packages| packages.len() as u16)
+            .copied()
+            .unwrap_or_else(|| {
+                self.authoritative_key_package_count(device_id)
+                    .unwrap_or_default()
+            })
+    }
+
+    fn authoritative_key_package_count(&self, device_id: DeviceId) -> Result<u16, String> {
+        let count = self.key_packages.get(&device_id).map_or(0, VecDeque::len);
+        let used_last_resort = self
+            .current_last_resort_key_packages
+            .get(&device_id)
+            .is_some_and(|current| self.issued_key_packages.contains(&current.reference));
+        (count - usize::from(used_last_resort))
+            .try_into()
+            .map_err(|_| "device KeyPackage count exceeds protocol range".to_string())
     }
 
     fn validate_fresh_key_packages(
         &self,
         roster: &SignedDeviceRoster,
         packages: &[PublishedKeyPackage],
-    ) -> Result<(), String> {
+    ) -> Result<Vec<(Vec<u8>, bool)>, String> {
         let identities = ChattIdentityProvider::new(self.server_id.clone());
         for current in self.rosters.values() {
             identities
@@ -513,6 +644,7 @@ impl MlsService {
             .map_err(|error| error.to_string())?;
         let validator = PublicGroupValidator::new(identities);
         let mut hashes = HashSet::new();
+        let mut metadata = Vec::with_capacity(packages.len());
         for package in packages {
             let certificate = roster
                 .body
@@ -520,7 +652,7 @@ impl MlsService {
                 .iter()
                 .find(|certificate| certificate.body.device_id == package.device_id)
                 .ok_or_else(|| "KeyPackage does not name a device in the roster".to_string())?;
-            let (_, client_id) = validator
+            let (reference, client_id, last_resort) = validator
                 .validate_key_package(&package.package)
                 .map_err(|error| error.to_string())?;
             if client_id != certificate.body.mls_client_id {
@@ -540,8 +672,9 @@ impl MlsService {
             if !hashes.insert(hash) {
                 return Err("KeyPackage batch contains a duplicate".to_string());
             }
+            metadata.push((reference, last_resort));
         }
-        Ok(())
+        Ok(metadata)
     }
 
     pub fn create_room(
@@ -617,6 +750,7 @@ impl MlsService {
         Self::validate_added_key_packages(
             &self.issued_key_packages,
             &self.used_key_packages,
+            &self.last_resort_key_packages,
             &applied.added_key_package_refs,
         )?;
         let next = applied.state;
@@ -809,6 +943,7 @@ impl MlsService {
         if Self::validate_added_key_packages(
             &self.issued_key_packages,
             &self.used_key_packages,
+            &self.last_resort_key_packages,
             &applied.added_key_package_refs,
         )
         .is_err()
@@ -978,6 +1113,7 @@ impl MlsService {
     fn validate_added_key_packages(
         issued: &HashSet<Vec<u8>>,
         used: &HashSet<Vec<u8>>,
+        last_resort: &HashSet<Vec<u8>>,
         additions: &[Vec<u8>],
     ) -> Result<(), String> {
         let mut unique = HashSet::new();
@@ -988,7 +1124,7 @@ impl MlsService {
             if !issued.contains(reference) {
                 return Err("MLS commit adds a KeyPackage not issued by this server".to_string());
             }
-            if used.contains(reference) {
+            if used.contains(reference) && !last_resort.contains(reference) {
                 return Err("MLS commit reuses an already committed KeyPackage".to_string());
             }
         }
@@ -1160,6 +1296,10 @@ impl MlsService {
         self.store.welcome_head(device_id)
     }
 
+    pub fn welcome_cursor(&self, device_id: DeviceId) -> u64 {
+        self.store.welcome_cursor(device_id)
+    }
+
     pub fn acknowledge(
         &self,
         room_id: RoomId,
@@ -1280,6 +1420,7 @@ impl MlsService {
             },
             issued_key_packages: self.issued_key_packages.iter().cloned().collect(),
             used_key_packages: self.used_key_packages.iter().cloned().collect(),
+            last_resort_key_packages: self.last_resort_key_packages.iter().cloned().collect(),
             next_welcome_delivery_id: self.next_welcome_delivery_id,
             credentials: self.credentials.clone(),
             device_owners: self
@@ -1329,6 +1470,27 @@ impl MlsService {
         self.retired_key_packages = state.global.retired_key_packages.into_iter().collect();
         self.issued_key_packages = state.global.issued_key_packages.into_iter().collect();
         self.used_key_packages = state.global.used_key_packages.into_iter().collect();
+        self.last_resort_key_packages = state.global.last_resort_key_packages.into_iter().collect();
+        self.current_last_resort_key_packages.clear();
+        for (device_id, packages) in &self.key_packages {
+            let Some(package) = packages.back() else {
+                continue;
+            };
+            let reference = self
+                .validator
+                .stored_key_package_reference(package)
+                .map_err(|error| format!("invalid persisted MLS KeyPackage: {error}"))?;
+            if self.last_resort_key_packages.contains(&reference) {
+                self.current_last_resort_key_packages.insert(
+                    *device_id,
+                    CurrentLastResortKeyPackage {
+                        hash: key_package_hash(package),
+                        reference,
+                    },
+                );
+            }
+        }
+        self.cached_key_package_counts.clear();
         if !self.used_key_packages.is_subset(&self.issued_key_packages) {
             return Err("persisted MLS KeyPackage usage is inconsistent".to_string());
         }
@@ -1388,6 +1550,20 @@ impl MlsService {
             }
             if !self.device_owners.contains_key(device_id) {
                 return Err("MLS KeyPackage queue has no device owner".to_string());
+            }
+        }
+        for (device_id, current) in &self.current_last_resort_key_packages {
+            let Some(package) = self
+                .key_packages
+                .get(device_id)
+                .and_then(|packages| packages.back())
+            else {
+                return Err("MLS last-resort metadata has no queued package".to_string());
+            };
+            if key_package_hash(package) != current.hash
+                || !self.last_resort_key_packages.contains(&current.reference)
+            {
+                return Err("MLS last-resort metadata is inconsistent".to_string());
             }
         }
         let mut account_ids = HashSet::new();
@@ -1510,7 +1686,7 @@ mod tests {
         ids::{EventId, RoomId, UserId},
         mls::{
             ChattEventContent, EncryptedRoomDescriptor, MLS_PROTOCOL_VERSION, MlsChattEvent,
-            MlsSubmitOutcome,
+            MlsSubmitOutcome, MlsWelcome,
         },
     };
 
@@ -1692,6 +1868,201 @@ mod tests {
                 .publish_key_packages(user_id, installation.bootstrap.device_id, vec![package],)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn last_resort_key_package_is_reused_and_rotated_without_stranding_welcomes() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [27u8; 32];
+        let (alice, _) = LocalInstallation::open_or_create(
+            &temp.path().join("last-resort-alice"),
+            server_id,
+            UserId(1),
+            "alice",
+        )
+        .unwrap();
+        let (bob, _) = LocalInstallation::open_or_create(
+            &temp.path().join("last-resort-bob"),
+            server_id,
+            UserId(2),
+            "bob",
+        )
+        .unwrap();
+        alice.install_roster(&bob.bootstrap.own_roster).unwrap();
+        bob.install_roster(&alice.bootstrap.own_roster).unwrap();
+
+        let state_dir = temp.path().join("last-resort-server");
+        std::fs::create_dir(&state_dir).unwrap();
+        let mut service = MlsService::open(Some(state_dir.clone()), server_id.to_vec()).unwrap();
+        service
+            .put_roster(UserId(1), None, alice.bootstrap.own_roster.clone(), None)
+            .unwrap();
+        service
+            .put_roster(UserId(2), None, bob.bootstrap.own_roster.clone(), None)
+            .unwrap();
+
+        let initial = bob
+            .client
+            .generate_initial_key_packages(bob.bootstrap.device_id, 2)
+            .unwrap();
+        service
+            .publish_key_packages(UserId(2), bob.bootstrap.device_id, initial)
+            .unwrap();
+        let one_time = service
+            .take_key_package(bob.bootstrap.device_id)
+            .unwrap()
+            .unwrap();
+        let replenished = bob
+            .client
+            .generate_key_packages(bob.bootstrap.device_id, 1)
+            .unwrap()
+            .remove(0);
+        service
+            .publish_key_packages(
+                UserId(2),
+                bob.bootstrap.device_id,
+                vec![replenished.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            service.take_key_package(bob.bootstrap.device_id).unwrap(),
+            Some(replenished.package)
+        );
+        let fallback = service
+            .take_key_package(bob.bootstrap.device_id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(one_time, fallback);
+        assert_eq!(service.key_package_count(bob.bootstrap.device_id), 0);
+        assert_eq!(
+            service.take_key_package(bob.bootstrap.device_id).unwrap(),
+            Some(fallback.clone())
+        );
+
+        let replacement = bob
+            .client
+            .generate_initial_key_packages(bob.bootstrap.device_id, 2)
+            .unwrap();
+        assert_eq!(
+            service
+                .publish_key_packages(UserId(2), bob.bootstrap.device_id, replacement)
+                .unwrap(),
+            2
+        );
+        drop(service);
+
+        // Rotation must not invalidate commits prepared with the old fallback,
+        // including after the delivery service restarts. The recipient also
+        // has to retain the fallback private key across multiple Welcomes.
+        let mut service = MlsService::open(Some(state_dir), server_id.to_vec()).unwrap();
+        for room_id in [RoomId(70), RoomId(71)] {
+            let descriptor = EncryptedRoomDescriptor::new(
+                room_id,
+                alice.bootstrap.account_id,
+                vec![alice.bootstrap.account_id, bob.bootstrap.account_id],
+                u64::from(room_id.0),
+            )
+            .unwrap();
+            let bundle = alice
+                .client
+                .create_room(&descriptor, &[(bob.bootstrap.device_id, fallback.clone())])
+                .unwrap();
+            let welcome = bundle.welcome.as_ref().unwrap().clone();
+            service
+                .create_room(
+                    alice.bootstrap.account_id,
+                    &alice.bootstrap.device_certificate.body.mls_client_id,
+                    descriptor.clone(),
+                    &[
+                        roster_checkpoint(&alice.bootstrap.own_roster),
+                        roster_checkpoint(&bob.bootstrap.own_roster),
+                    ],
+                    bundle,
+                )
+                .unwrap();
+            alice.client.accept_pending_commit(&descriptor, 1).unwrap();
+            bob.client
+                .join_welcome(
+                    &descriptor,
+                    &MlsWelcome {
+                        delivery_id: u64::from(room_id.0),
+                        sequence: 1,
+                        device_id: bob.bootstrap.device_id,
+                        descriptor: welcome.descriptor,
+                        welcome: welcome.welcome,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn revoking_paired_device_discards_its_key_package_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [28u8; 32];
+        let user_id = UserId(1);
+        let (original, _) = LocalInstallation::open_or_create(
+            &temp.path().join("original"),
+            server_id,
+            user_id,
+            "original",
+        )
+        .unwrap();
+        let paired = LocalInstallation::create_pending_pair(
+            &temp.path().join("paired"),
+            server_id,
+            user_id,
+            "paired",
+            original.bootstrap.authority_seed,
+            &original.bootstrap.own_roster,
+            rpc::ids::PairAttemptId([1; 16]),
+            "redemption-secret",
+            "bearer-token",
+        )
+        .unwrap();
+        let paired_roster = paired.bootstrap.own_roster.clone();
+        let paired_device = paired.bootstrap.device_id;
+        let packages = paired
+            .client
+            .generate_initial_key_packages(paired_device, 2)
+            .unwrap();
+
+        let state_dir = temp.path().join("server");
+        std::fs::create_dir(&state_dir).unwrap();
+        let mut service = MlsService::open(Some(state_dir.clone()), server_id.to_vec()).unwrap();
+        let original_checkpoint = service
+            .put_roster(
+                user_id,
+                None,
+                original.bootstrap.own_roster.clone(),
+                None,
+            )
+            .unwrap();
+        let paired_checkpoint = service
+            .redeem_pair(
+                user_id,
+                original_checkpoint,
+                paired_roster,
+                paired_device,
+                "credential-hash".to_string(),
+                packages,
+            )
+            .unwrap();
+        let revoked_roster = paired.roster_without(paired_device).unwrap();
+
+        service
+            .put_roster(user_id, Some(paired_checkpoint), revoked_roster, None)
+            .unwrap();
+        assert!(!service.key_packages.contains_key(&paired_device));
+        assert!(
+            !service
+                .current_last_resort_key_packages
+                .contains_key(&paired_device)
+        );
+        service.validate_invariants().unwrap();
+        drop(service);
+
+        MlsService::open(Some(state_dir), server_id.to_vec()).unwrap();
     }
 
     #[test]

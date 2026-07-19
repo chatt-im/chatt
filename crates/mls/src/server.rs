@@ -3,6 +3,7 @@ use std::fmt;
 use jsony::Jsony;
 use mls_rs::{
     CryptoProvider, MlsMessage, WireFormat,
+    extension::{MlsExtension, recommended::LastResortKeyPackageExt},
     external_client::{
         ExternalClient, ExternalReceivedMessage, ExternalSnapshot,
         builder::{ExternalBaseConfig, WithCryptoProvider, WithIdentityProvider, WithMlsRules},
@@ -257,9 +258,20 @@ impl PublicGroupValidator {
         Ok(())
     }
 
-    pub fn key_package_reference(&self, encoded: &[u8]) -> Result<Vec<u8>, PublicValidationError> {
-        self.validate_key_package(encoded)
-            .map(|(reference, _)| reference)
+    /// Computes the reference for a KeyPackage that was already fully
+    /// validated before entering trusted delivery-service storage.
+    ///
+    /// This deliberately does not repeat signature or lifetime validation.
+    pub fn stored_key_package_reference(
+        &self,
+        encoded: &[u8],
+    ) -> Result<Vec<u8>, PublicValidationError> {
+        let message = MlsMessage::from_bytes(encoded)
+            .map_err(|error| PublicValidationError::Decode(error.to_string()))?;
+        let key_package = message
+            .as_key_package()
+            .ok_or(PublicValidationError::UnexpectedMessage)?;
+        key_package_reference(key_package)
     }
 
     /// Fully validates a KeyPackage and returns its reference plus the Basic
@@ -267,7 +279,7 @@ impl PublicGroupValidator {
     pub fn validate_key_package(
         &self,
         encoded: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>), PublicValidationError> {
+    ) -> Result<(Vec<u8>, Vec<u8>, bool), PublicValidationError> {
         let message = MlsMessage::from_bytes(encoded)
             .map_err(|error| PublicValidationError::Decode(error.to_string()))?;
         let key_package = self
@@ -280,7 +292,10 @@ impl PublicGroupValidator {
             .as_basic()
             .map(|credential| credential.identifier.clone())
             .ok_or(PublicValidationError::UnexpectedMessage)?;
-        Ok((key_package_reference(&key_package)?, client_id))
+        let last_resort = key_package
+            .extensions()
+            .has_extension(LastResortKeyPackageExt::extension_type());
+        Ok((key_package_reference(&key_package)?, client_id, last_resort))
     }
 }
 

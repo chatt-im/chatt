@@ -1,0 +1,8 @@
+chatt-mls-scenario-v1
+seed 0x30eeb2b9512c2cc7
+# A ticket sealed before a roster revocation must no longer redeem afterward.
+create-link alice.0 t0
+redeem-link t0 alice.1
+create-link alice.0 t1
+revoke alice.1 alice.0
+redeem-link t1 alice.2

@@ -822,11 +822,15 @@ impl Actor {
                 self.mls_bound = true;
                 let packages = if available_key_packages < MLS_KEY_PACKAGE_TARGET {
                     let count = usize::from(MLS_KEY_PACKAGE_TARGET - available_key_packages);
-                    Some(
+                    Some(if available_key_packages == 0 {
                         installation
                             .client
-                            .generate_key_packages(device_id, count)?,
-                    )
+                            .generate_initial_key_packages(device_id, count)?
+                    } else {
+                        installation
+                            .client
+                            .generate_key_packages(device_id, count)?
+                    })
                 } else {
                     None
                 };
@@ -880,9 +884,16 @@ impl Actor {
                 self.retry_stale_room_creation(room_id)?;
             }
             ServerControl::MlsWelcomes {
-                welcomes,
+                mut welcomes,
                 head_sequence,
             } => {
+                let installation = self
+                    .installation
+                    .as_ref()
+                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
+                let welcome_cursor = installation.client.welcome_cursor()?;
+                welcomes.sort_by_key(|welcome| welcome.delivery_id);
+                welcomes.retain(|welcome| welcome.delivery_id > welcome_cursor);
                 let delivered_any = !welcomes.is_empty();
                 let mut missing_rosters = HashSet::new();
                 for welcome in &welcomes {
@@ -898,12 +909,12 @@ impl Actor {
                     return Ok(());
                 }
                 self.pending_mls_welcome_rosters = None;
-                let installation = self
-                    .installation
-                    .as_ref()
-                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
                 let local_device = installation.bootstrap.device_id;
                 let mut fetches = Vec::new();
+                let processed_head = welcomes
+                    .last()
+                    .map(|welcome| welcome.delivery_id)
+                    .unwrap_or(head_sequence);
                 for welcome in welcomes {
                     if welcome.device_id != local_device {
                         return Err("server delivered a Welcome for another device".to_string());
@@ -941,7 +952,7 @@ impl Actor {
                         })?;
                     fetches.push((welcome.descriptor.room_id, welcome.sequence));
                 }
-                installation.client.set_welcome_cursor(head_sequence)?;
+                installation.client.set_welcome_cursor(processed_head)?;
                 let welcome_cursor = installation.client.welcome_cursor()?;
                 if welcome_cursor > 0 {
                     self.queue_control(ClientControl::AckMlsWelcome {
@@ -1587,10 +1598,16 @@ impl Actor {
                 if device_id != installation.bootstrap.device_id {
                     return Err("server sent another device's KeyPackage count".to_string());
                 }
-                let packages = installation.client.generate_key_packages(
-                    device_id,
-                    usize::from(MLS_KEY_PACKAGE_TARGET - available),
-                )?;
+                let count = usize::from(MLS_KEY_PACKAGE_TARGET - available);
+                let packages = if available == 0 {
+                    installation
+                        .client
+                        .generate_initial_key_packages(device_id, count)?
+                } else {
+                    installation
+                        .client
+                        .generate_key_packages(device_id, count)?
+                };
                 self.queue_control(ClientControl::PublishKeyPackages {
                     device_id,
                     packages,
@@ -1611,10 +1628,16 @@ impl Actor {
                         let installation = self.installation.as_ref().ok_or_else(|| {
                             "KeyPackage acknowledgement arrived without MLS state".to_string()
                         })?;
-                        let packages = installation.client.generate_key_packages(
-                            device_id,
-                            usize::from(MLS_KEY_PACKAGE_TARGET - available),
-                        )?;
+                        let count = usize::from(MLS_KEY_PACKAGE_TARGET - available);
+                        let packages = if available == 0 {
+                            installation
+                                .client
+                                .generate_initial_key_packages(device_id, count)?
+                        } else {
+                            installation
+                                .client
+                                .generate_key_packages(device_id, count)?
+                        };
                         self.queue_control(ClientControl::PublishKeyPackages {
                             device_id,
                             packages,
@@ -2519,7 +2542,9 @@ impl Actor {
                 event_fetches.push((*room_id, installation.client.cursor(*room_id)?));
                 continue;
             }
-            if self.pending_mls_rooms.contains_key(room_id) {
+            if self.pending_mls_rooms.contains_key(room_id)
+                || self.pending_mls_commits.contains_key(room_id)
+            {
                 continue;
             }
             let mut member_users = match kind {

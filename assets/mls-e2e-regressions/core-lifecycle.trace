@@ -1,0 +1,22 @@
+chatt-mls-scenario-v1
+seed 0x434f52454c494645
+
+send alice.0 group-all e0
+stop carol.0
+send bob.0 group-all e1
+start carol.0
+create-link alice.0 t0
+send bob.0 group-all e2
+restart alice.0
+redeem-link t0 alice.1
+send alice.1 group-all e3
+edit alice.1 group-all e0 e4
+edit bob.0 group-all e0 e5
+delete alice.0 group-all e0 e6
+edit alice.1 group-all e0 e7
+view alice.1 group-all
+batch group-all alice.0 e8 bob.0 e9
+server-restart live
+open-dm alice.0 bob dm-alice-bob
+send bob.0 dm-alice-bob e10
+checkpoint

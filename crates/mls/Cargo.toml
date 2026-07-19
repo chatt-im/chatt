@@ -16,6 +16,7 @@ mls-rs = { path = "../mls-rs", default-features = false, features = [
     "private_message",
     "out_of_order",
     "external_client",
+    "last_resort_key_package_ext",
 ] }
 mls-rs-core = { path = "../mls-rs-core", default-features = false, features = [
     "std",

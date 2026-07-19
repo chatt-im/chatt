@@ -1,0 +1,7 @@
+chatt-mls-scenario-v1
+seed 0xd950614200c506d5
+
+# Revocation must discard the linked device's last-resort KeyPackage metadata.
+create-link carol.0 t0
+redeem-link t0 carol.1
+revoke carol.0 carol.1
