@@ -7,14 +7,13 @@
 //! the voice thread swaps it into a reusable buffer before doing any socket or
 //! cryptographic work.
 
-use hashbrown::{HashMap, HashSet};
 use aws_lc_rs::rand::SecureRandom;
 use chatt_p2p::{
     Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind,
-    ReflexiveObservation, StunAuth, TraversalAgent,
-    interfaces::InterfaceSnapshot,
+    ReflexiveObservation, StunAuth, TraversalAgent, interfaces::InterfaceSnapshot,
     stun::StunMessage,
 };
+use hashbrown::{HashMap, HashSet};
 use mio::{Events, Interest, Poll, Token, Waker, net::UdpSocket};
 use rpc::{
     control::{P2pCandidate, P2pNatKind, P2pPeerInfo, ParticipantServerRtt},
@@ -45,23 +44,19 @@ use crate::{
 };
 
 use super::{
-    DIRECT_CONFIRM_WINDOW,
-    RELAY_KEEPALIVE_INTERVAL, RTT_PROBE_INTERVAL, RestartPortPolicy, UDP_BIND_RETRY_INTERVAL,
-    NetworkCommand,
-    NetworkEvent, allocate_local_voice_sequence, advance_local_voice_sequence_past,
-    audio_payload_from_media, configured_nat_kind, dispatch_voice_packet_to,
+    DIRECT_CONFIRM_WINDOW, DIRECT_FAILOVER_IDLE, ENCODER_FEEDBACK_ALPHA, ENCODER_PROFILE_HOLD,
+    INTERFACE_POLL_INTERVAL, MAX_RECENT_VOICE_SEQUENCES, NetworkCommand, NetworkEvent,
+    P2P_CONSENT_TIMEOUT, P2P_KEEPALIVE_INTERVAL, RECENT_VOICE_SEQUENCE_WORD_BITS,
+    RECENT_VOICE_SEQUENCE_WORDS, RELAY_KEEPALIVE_INTERVAL, RTT_PROBE_INTERVAL, RestartPortPolicy,
+    UDP_BIND_FAILURE_ATTEMPTS, UDP_BIND_RETRY_INTERVAL, advance_local_voice_sequence_past,
+    allocate_local_voice_sequence, apply_candidate_privacy, audio_payload_from_media,
+    candidate_from_control, candidate_from_control_with_addr, clamp_rtt_ms, combined_relay_rtt,
+    configured_nat_kind, connection_id_from_p2p_username, control_nat_kind,
+    dispatch_voice_packet_to, fold_rtt_ewma, ice_role_from_control, key_from_control,
     live_feedback_from_media, log_audio_pop_media_packet, media_feedback_from_live,
-    media_payload_from_audio, media_payload_kind, media_voice_payload_kind, random_u64,
-    take_rtt_sample, fold_rtt_ewma, clamp_rtt_ms, voice_payload_kind,
-    apply_candidate_privacy, candidate_from_control, candidate_from_control_with_addr,
-    combined_relay_rtt, connection_id_from_p2p_username, control_nat_kind,
-    ice_role_from_control, key_from_control, nat_from_control,
-    p2p_peer_is_republish, p2p_username, push_rtt_in_flight,
-    rtt_sample_is_stale, split_mdns_addr,
-    DIRECT_FAILOVER_IDLE, P2P_CONSENT_TIMEOUT, P2P_KEEPALIVE_INTERVAL,
-    UDP_BIND_FAILURE_ATTEMPTS, ENCODER_FEEDBACK_ALPHA, ENCODER_PROFILE_HOLD,
-    INTERFACE_POLL_INTERVAL, MAX_RECENT_VOICE_SEQUENCES, RECENT_VOICE_SEQUENCE_WORD_BITS,
-    RECENT_VOICE_SEQUENCE_WORDS,
+    media_payload_from_audio, media_payload_kind, media_voice_payload_kind, nat_from_control,
+    p2p_peer_is_republish, p2p_username, push_rtt_in_flight, random_u64, rtt_sample_is_stale,
+    split_mdns_addr, take_rtt_sample, voice_payload_kind,
 };
 
 const COMMANDS: Token = Token(0);
@@ -411,7 +406,6 @@ fn voice_sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
 /// other operations are no-ops. Otherwise tokens accrue at `rate` bytes per
 /// second, capped at one second's worth so a poll loop that parked between
 
-
 pub(super) struct PeerConnection {
     pub(super) user_id: UserId,
     pub(super) agent: TraversalAgent,
@@ -553,7 +547,6 @@ impl EncoderFeedbackController {
     }
 }
 
-
 struct MdnsPending {
     session_id: SessionId,
     control: P2pCandidate,
@@ -584,10 +577,8 @@ fn stream_owner_matches(
 }
 
 pub(super) fn bind_voice_udp_socket(addr: SocketAddr) -> io::Result<StdUdpSocket> {
-    let socket = chatt_p2p::socket::bind_udp_socket(
-        addr,
-        chatt_p2p::socket::UdpSocketOptions::default(),
-    )?;
+    let socket =
+        chatt_p2p::socket::bind_udp_socket(addr, chatt_p2p::socket::UdpSocketOptions::default())?;
     if let Err(error) = rpc::qos::apply_voice_qos(socket.as_raw_fd(), addr) {
         kvlog::warn!(
             "voice udp qos unavailable",
@@ -847,7 +838,10 @@ impl VoiceCommandSubmission {
                 mailbox.ingress_generation = Some(*generation);
                 mailbox.activated_generation = None;
                 mailbox.controls.retain(|command| {
-                    matches!(command, VoiceCommand::EndSession { .. } | VoiceCommand::Shutdown)
+                    matches!(
+                        command,
+                        VoiceCommand::EndSession { .. } | VoiceCommand::Shutdown
+                    )
                 });
                 mailbox.microphone.clear();
                 mailbox.feedback.clear();
@@ -974,7 +968,10 @@ impl VoiceCommandSubmission {
         Ok(())
     }
 
-    fn submit_playback_sink(&self, sink: Option<LivePlaybackSink>) -> Result<(), Option<LivePlaybackSink>> {
+    fn submit_playback_sink(
+        &self,
+        sink: Option<LivePlaybackSink>,
+    ) -> Result<(), Option<LivePlaybackSink>> {
         if self.closed.load(Ordering::Acquire) {
             return Err(sink);
         }
@@ -1040,9 +1037,7 @@ impl VoiceCommandSubmission {
             return Err(());
         }
         let mut mailbox = self.mailbox.lock().unwrap();
-        if self.closed.load(Ordering::Relaxed)
-            || mailbox.ingress_generation != Some(generation)
-        {
+        if self.closed.load(Ordering::Relaxed) || mailbox.ingress_generation != Some(generation) {
             return Err(());
         }
         mailbox.activated_generation = Some(generation);
@@ -1079,13 +1074,12 @@ impl VoiceInputSender {
                 .submission
                 .submit_microphone(None, frame)
                 .map_err(|frame| SendError(NetworkCommand::LocalVoicePacket(frame))),
-            NetworkCommand::SequencedLocalVoicePacket { sequence, frame } => {
-                self.submission
-                    .submit_microphone(Some(sequence), frame)
-                    .map_err(|frame| {
-                        SendError(NetworkCommand::SequencedLocalVoicePacket { sequence, frame })
-                    })
-            }
+            NetworkCommand::SequencedLocalVoicePacket { sequence, frame } => self
+                .submission
+                .submit_microphone(Some(sequence), frame)
+                .map_err(|frame| {
+                    SendError(NetworkCommand::SequencedLocalVoicePacket { sequence, frame })
+                }),
             NetworkCommand::SetPlaybackSink(sink) => self
                 .submission
                 .submit_playback_sink(sink)
@@ -1112,12 +1106,8 @@ impl TestVoiceReceiver {
         let mut microphone = VecDeque::new();
         let mut feedback = Vec::new();
         let mut sink = None;
-        self.submission.drain_into(
-            &mut controls,
-            &mut microphone,
-            &mut feedback,
-            &mut sink,
-        );
+        self.submission
+            .drain_into(&mut controls, &mut microphone, &mut feedback, &mut sink);
         assert!(controls.is_empty());
         assert!(feedback.is_empty());
         assert!(sink.is_none());
@@ -1159,9 +1149,7 @@ pub(super) struct VoiceOutputBatch {
 
 impl VoiceOutputBatch {
     pub(super) fn is_empty(&self) -> bool {
-        self.publish_p2p.is_none()
-            && self.session_failure.is_none()
-            && self.fatal_failure.is_none()
+        self.publish_p2p.is_none() && self.session_failure.is_none() && self.fatal_failure.is_none()
     }
 }
 
@@ -1257,7 +1245,6 @@ impl VoiceControl {
     pub(super) fn drain_outputs(&self, output: &mut VoiceOutputBatch) -> bool {
         self.outputs.drain_into(output)
     }
-
 }
 
 struct VoiceRuntime {
@@ -1424,10 +1411,7 @@ impl VoiceLoop {
         while !self.shutting_down {
             self.drain_commands();
             if self.udp_work {
-                self.udp_work = self
-                    .session
-                    .as_mut()
-                    .is_some_and(VoiceSession::read_udp);
+                self.udp_work = self.session.as_mut().is_some_and(VoiceSession::read_udp);
             }
             if self.mdns_work != 0 {
                 let work = std::mem::take(&mut self.mdns_work);
@@ -1458,9 +1442,9 @@ impl VoiceLoop {
             let timeout = if self.command_work || self.udp_work || self.mdns_work != 0 {
                 Duration::ZERO
             } else {
-                self.session
-                    .as_ref()
-                    .map_or(IDLE_POLL_TIMEOUT, |session| session.next_poll_timeout(Instant::now()))
+                self.session.as_ref().map_or(IDLE_POLL_TIMEOUT, |session| {
+                    session.next_poll_timeout(Instant::now())
+                })
             };
             match self.poll.poll(&mut self.poll_events, Some(timeout)) {
                 Ok(()) => {}
@@ -1618,7 +1602,9 @@ impl VoiceLoop {
                     session.voice_stopped(room_id, session_id, user_id, stream_id, local);
                 }
             }
-            VoiceCommand::RoomRttSnapshot { room_id, members, .. } => {
+            VoiceCommand::RoomRttSnapshot {
+                room_id, members, ..
+            } => {
                 if let Some(session) = self.session.as_mut()
                     && session.voice_room == Some(room_id)
                 {
@@ -1681,7 +1667,11 @@ impl VoiceLoop {
                     let _ = session.events.send(NetworkEvent::Error(error));
                 }
             }
-            VoiceCommand::RemovePeer { session_id, user_id, .. } => {
+            VoiceCommand::RemovePeer {
+                session_id,
+                user_id,
+                ..
+            } => {
                 if let Some(session) = self.session.as_mut() {
                     session.remove_peer(session_id, user_id);
                 }
@@ -1873,9 +1863,8 @@ impl VoiceSession {
         timeout = timeout.min(self.next_relay_keepalive.saturating_duration_since(now));
         timeout = timeout.min(self.next_rtt_probe.saturating_duration_since(now));
         if let Some(sample_at) = self.server_rtt_last_sample_at {
-            timeout = timeout.min(
-                (sample_at + super::RTT_STALE_AFTER).saturating_duration_since(now),
-            );
+            timeout =
+                timeout.min((sample_at + super::RTT_STALE_AFTER).saturating_duration_since(now));
         }
         if self.p2p_enabled && self.voice_room.is_some() {
             timeout = timeout.min(self.interface_monitor.next_wake(now));
@@ -2093,11 +2082,7 @@ impl VoiceSession {
     fn send_nat_probe(&mut self, probe_id: u8, addr: SocketAddr) {
         let counter = self.media_send_counter;
         self.media_send_counter = self.media_send_counter.wrapping_add(1);
-        match media::seal_media(
-            &self.media,
-            counter,
-            &MediaPayload::NatProbe { probe_id },
-        ) {
+        match media::seal_media(&self.media, counter, &MediaPayload::NatProbe { probe_id }) {
             Ok(packet) => self.send_udp_raw("nat_probe", None, addr, &packet),
             Err(error) => kvlog::warn!("nat probe seal failed", probe_id, error = %error),
         }
@@ -2148,20 +2133,19 @@ impl VoiceSession {
         self.udp_rebind_requested = false;
         let _ = poll.registry().deregister(&mut self.udp);
         self.restart_port_policy.record(self.udp_local_addr.port());
-        let bind_addr = RestartPortPolicy::bind_addr_for_restart(
-            if self.server_udp_addr.is_ipv4() {
+        let bind_addr =
+            RestartPortPolicy::bind_addr_for_restart(if self.server_udp_addr.is_ipv4() {
                 "0.0.0.0:0".parse().unwrap()
             } else {
                 "[::]:0".parse().unwrap()
-            },
-        );
+            });
         let mut last_error = None;
         for _ in 0..8 {
             match bind_voice_udp_socket(bind_addr) {
                 Ok(socket) => {
-                    let local_addr = socket.local_addr().map_err(|error| {
-                        format!("failed to read rebound UDP address: {error}")
-                    })?;
+                    let local_addr = socket
+                        .local_addr()
+                        .map_err(|error| format!("failed to read rebound UDP address: {error}"))?;
                     if !self.restart_port_policy.accepts(local_addr.port()) {
                         self.restart_port_policy.record(local_addr.port());
                         continue;
@@ -2170,7 +2154,9 @@ impl VoiceSession {
                     self.udp = UdpSocket::from_std(socket);
                     poll.registry()
                         .register(&mut self.udp, UDP, Interest::READABLE)
-                        .map_err(|error| format!("failed to register rebound UDP socket: {error}"))?;
+                        .map_err(|error| {
+                            format!("failed to register rebound UDP socket: {error}")
+                        })?;
                     self.reset_server_rtt();
                     self.bind_udp();
                     self.publish_p2p_candidates();
@@ -2181,7 +2167,9 @@ impl VoiceSession {
         }
         Err(format!(
             "failed to rebind UDP socket to fresh port{}",
-            last_error.map(|error| format!(": {error}")).unwrap_or_default()
+            last_error
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
         ))
     }
 
@@ -2623,13 +2611,16 @@ impl VoiceSession {
                 );
             } else {
                 match self.open_server_media(packet) {
-                    Ok((_, MediaPayload::Voice {
-                        stream_id,
-                        sequence,
-                        timestamp,
-                        flags,
-                        payload,
-                    })) => {
+                    Ok((
+                        _,
+                        MediaPayload::Voice {
+                            stream_id,
+                            sequence,
+                            timestamp,
+                            flags,
+                            payload,
+                        },
+                    )) => {
                         let payload_size = payload.len();
                         let payload_kind = media_voice_payload_kind(&payload);
                         kvlog::info!(
@@ -2677,11 +2668,14 @@ impl VoiceSession {
                             self.publish_all_relay_rtts();
                         }
                     }
-                    Ok((_, MediaPayload::VoiceFeedbackFrom {
-                        reporter,
-                        stream_id,
-                        feedback,
-                    })) => {
+                    Ok((
+                        _,
+                        MediaPayload::VoiceFeedbackFrom {
+                            reporter,
+                            stream_id,
+                            feedback,
+                        },
+                    )) => {
                         let feedback = live_feedback_from_media(stream_id, feedback);
                         self.handle_encoder_feedback(reporter, feedback, now);
                     }
@@ -2689,9 +2683,12 @@ impl VoiceSession {
                         self.send_media(&MediaPayload::Pong { nonce });
                     }
                     Ok((_, MediaPayload::Bind | MediaPayload::NatProbe { .. })) => {}
-                    Ok((_, MediaPayload::PeerVoice { .. }
+                    Ok((
+                        _,
+                        MediaPayload::PeerVoice { .. }
                         | MediaPayload::PeerVoiceFeedback { .. }
-                        | MediaPayload::VoiceFeedback { .. })) => {}
+                        | MediaPayload::VoiceFeedback { .. },
+                    )) => {}
                     Err(error) => {
                         kvlog::warn!("udp packet rejected", packet_size = len, error = %error);
                         let _ = self
@@ -2988,14 +2985,17 @@ impl VoiceSession {
         let outcome = {
             let peer = self.p2p_peers.get_mut(&session_id).unwrap();
             match media::open_peer_media(&peer.recv_key, &mut peer.recv_replay, packet) {
-                Ok((_, MediaPayload::PeerVoice {
-                    connection_id,
-                    stream_id,
-                    sequence,
-                    timestamp,
-                    flags,
-                    payload,
-                })) if connection_id == peer.connection_id
+                Ok((
+                    _,
+                    MediaPayload::PeerVoice {
+                        connection_id,
+                        stream_id,
+                        sequence,
+                        timestamp,
+                        flags,
+                        payload,
+                    },
+                )) if connection_id == peer.connection_id
                     && stream_owner_matches(inbound_streams, stream_id, session_id) =>
                 {
                     let action = peer.agent.observe_authenticated_packet(now, src);
@@ -3009,13 +3009,14 @@ impl VoiceSession {
                         action,
                     })
                 }
-                Ok((_, MediaPayload::PeerVoiceFeedback {
-                    connection_id,
-                    stream_id,
-                    feedback,
-                })) if connection_id == peer.connection_id
-                    && active_stream == Some(stream_id) =>
-                {
+                Ok((
+                    _,
+                    MediaPayload::PeerVoiceFeedback {
+                        connection_id,
+                        stream_id,
+                        feedback,
+                    },
+                )) if connection_id == peer.connection_id && active_stream == Some(stream_id) => {
                     let action = peer.agent.observe_authenticated_packet(now, src);
                     peer.last_direct_inbound = Some(now);
                     Ok(P2pMediaPacket::Feedback {
@@ -3032,11 +3033,12 @@ impl VoiceSession {
                 Ok((_, MediaPayload::Pong { nonce })) => {
                     let action = peer.agent.observe_authenticated_packet(now, src);
                     peer.last_direct_inbound = Some(now);
-                    let rtt_ms = take_rtt_sample(&mut peer.rtt_in_flight, nonce, now).map(|sample| {
-                        let rtt = fold_rtt_ewma(peer.rtt_ms, sample);
-                        peer.rtt_ms = Some(rtt);
-                        clamp_rtt_ms(rtt)
-                    });
+                    let rtt_ms =
+                        take_rtt_sample(&mut peer.rtt_in_flight, nonce, now).map(|sample| {
+                            let rtt = fold_rtt_ewma(peer.rtt_ms, sample);
+                            peer.rtt_ms = Some(rtt);
+                            clamp_rtt_ms(rtt)
+                        });
                     Ok(P2pMediaPacket::Pong { rtt_ms, action })
                 }
                 Ok(_) => Err("unexpected P2P media payload".to_string()),
@@ -3089,7 +3091,11 @@ impl VoiceSession {
                     "p2p",
                 );
             }
-            Ok(P2pMediaPacket::Feedback { stream_id, feedback, action }) => {
+            Ok(P2pMediaPacket::Feedback {
+                stream_id,
+                feedback,
+                action,
+            }) => {
                 if let Some(action) = action {
                     self.apply_p2p_actions(session_id, vec![action]);
                 }
@@ -3197,17 +3203,15 @@ impl VoiceSession {
             };
             let counter = peer.send_counter;
             peer.send_counter = peer.send_counter.wrapping_add(1);
-            Some((addr, media::seal_peer_media(&peer.send_key, counter, &payload)))
+            Some((
+                addr,
+                media::seal_peer_media(&peer.send_key, counter, &payload),
+            ))
         }) else {
             return;
         };
         match packet {
-            Ok(packet) => self.send_udp_raw(
-                "p2p_voice_feedback",
-                Some(session_id),
-                addr,
-                &packet,
-            ),
+            Ok(packet) => self.send_udp_raw("p2p_voice_feedback", Some(session_id), addr, &packet),
             Err(error) => kvlog::warn!("p2p feedback seal failed", error = %error),
         }
     }
@@ -3216,7 +3220,8 @@ impl VoiceSession {
         for action in actions {
             match action {
                 P2pAction::UseRelay { reason, .. } => {
-                    if let Some(user_id) = self.p2p_peers.get(&session_id).map(|peer| peer.user_id) {
+                    if let Some(user_id) = self.p2p_peers.get(&session_id).map(|peer| peer.user_id)
+                    {
                         let _ = self.events.send(NetworkEvent::PeerTransport {
                             user_id,
                             direct: false,
@@ -3396,20 +3401,17 @@ mod tests {
             mailbox.activated_generation = Some(4);
         }
         for sequence in 0..(MAX_QUEUED_MICROPHONE_PACKETS as u32 + 5) {
-            assert!(submission
-                .submit_microphone(Some(sequence), frame(sequence))
-                .is_ok());
+            assert!(
+                submission
+                    .submit_microphone(Some(sequence), frame(sequence))
+                    .is_ok()
+            );
         }
         let mut controls = VecDeque::new();
         let mut microphone = VecDeque::new();
         let mut feedback = Vec::new();
         let mut sink = None;
-        assert!(!submission.drain_into(
-            &mut controls,
-            &mut microphone,
-            &mut feedback,
-            &mut sink,
-        ));
+        assert!(!submission.drain_into(&mut controls, &mut microphone, &mut feedback, &mut sink,));
         let sequences = microphone
             .into_iter()
             .map(|packet| packet.sequence.unwrap())
@@ -3444,12 +3446,7 @@ mod tests {
         let mut microphone = VecDeque::new();
         let mut feedback = Vec::new();
         let mut sink = None;
-        assert!(!submission.drain_into(
-            &mut controls,
-            &mut microphone,
-            &mut feedback,
-            &mut sink,
-        ));
+        assert!(!submission.drain_into(&mut controls, &mut microphone, &mut feedback, &mut sink,));
         assert!(matches!(
             controls.pop_front(),
             Some(VoiceCommand::StartSession { generation: 2, .. })
@@ -3470,7 +3467,8 @@ mod tests {
         }
         assert!(submission.submit_microphone(None, frame(1)).is_ok());
         let mut events = Events::with_capacity(2);
-        poll.poll(&mut events, Some(Duration::from_secs(1))).unwrap();
+        poll.poll(&mut events, Some(Duration::from_secs(1)))
+            .unwrap();
         assert!(events.iter().any(|event| event.token() == COMMANDS));
     }
 
@@ -3478,12 +3476,14 @@ mod tests {
     fn session_controls_wait_for_voice_activation() {
         let (mut poll, submission) = submission();
         assert!(submission.submit(start_command(7)).is_ok());
-        assert!(submission
-            .submit(VoiceCommand::Authenticated {
-                generation: 7,
-                session_id: SessionId(4),
-            })
-            .is_ok());
+        assert!(
+            submission
+                .submit(VoiceCommand::Authenticated {
+                    generation: 7,
+                    session_id: SessionId(4),
+                })
+                .is_ok()
+        );
 
         let mut events = Events::with_capacity(2);
         poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
@@ -3492,23 +3492,14 @@ mod tests {
         let mut microphone = VecDeque::new();
         let mut feedback = Vec::new();
         let mut sink = None;
-        assert!(!submission.drain_into(
-            &mut controls,
-            &mut microphone,
-            &mut feedback,
-            &mut sink,
-        ));
+        assert!(!submission.drain_into(&mut controls, &mut microphone, &mut feedback, &mut sink,));
         assert!(controls.is_empty());
 
         assert!(submission.activate(7).is_ok());
-        poll.poll(&mut events, Some(Duration::from_secs(1))).unwrap();
+        poll.poll(&mut events, Some(Duration::from_secs(1)))
+            .unwrap();
         assert!(events.iter().any(|event| event.token() == COMMANDS));
-        assert!(!submission.drain_into(
-            &mut controls,
-            &mut microphone,
-            &mut feedback,
-            &mut sink,
-        ));
+        assert!(!submission.drain_into(&mut controls, &mut microphone, &mut feedback, &mut sink,));
         assert!(matches!(
             controls.pop_front(),
             Some(VoiceCommand::StartSession { generation: 7, .. })
@@ -3523,34 +3514,24 @@ mod tests {
     #[test]
     fn p2p_disable_is_retained_before_local_voice_starts() {
         let (_poll, submission) = submission();
-        assert!(submission
-            .submit(start_command_with_p2p(7, true))
-            .is_ok());
-        assert!(submission
-            .submit(VoiceCommand::SetP2pEnabled {
-                generation: 7,
-                enabled: false,
-            })
-            .is_ok());
+        assert!(submission.submit(start_command_with_p2p(7, true)).is_ok());
+        assert!(
+            submission
+                .submit(VoiceCommand::SetP2pEnabled {
+                    generation: 7,
+                    enabled: false,
+                })
+                .is_ok()
+        );
 
         let mut controls = VecDeque::new();
         let mut microphone = VecDeque::new();
         let mut feedback = Vec::new();
         let mut sink = None;
-        assert!(!submission.drain_into(
-            &mut controls,
-            &mut microphone,
-            &mut feedback,
-            &mut sink,
-        ));
+        assert!(!submission.drain_into(&mut controls, &mut microphone, &mut feedback, &mut sink,));
         assert!(controls.is_empty());
         assert!(submission.activate(7).is_ok());
-        assert!(!submission.drain_into(
-            &mut controls,
-            &mut microphone,
-            &mut feedback,
-            &mut sink,
-        ));
+        assert!(!submission.drain_into(&mut controls, &mut microphone, &mut feedback, &mut sink,));
         assert!(matches!(
             controls.pop_front(),
             Some(VoiceCommand::StartSession {
@@ -3577,23 +3558,30 @@ mod tests {
             mailbox.activated_generation = Some(1);
         }
         for _ in 0..MAX_QUEUED_CONTROL_COMMANDS {
-            assert!(submission
+            assert!(
+                submission
+                    .submit(VoiceCommand::Authenticated {
+                        generation: 1,
+                        session_id: SessionId(2),
+                    })
+                    .is_ok()
+            );
+        }
+        assert!(
+            submission
                 .submit(VoiceCommand::Authenticated {
                     generation: 1,
                     session_id: SessionId(2),
                 })
-                .is_ok());
-        }
-        assert!(submission
-            .submit(VoiceCommand::Authenticated {
-                generation: 1,
-                session_id: SessionId(2),
-            })
-            .is_err());
+                .is_err()
+        );
         assert!(submission.submit(VoiceCommand::Shutdown).is_ok());
         let mailbox = submission.mailbox.lock().unwrap();
         assert_eq!(mailbox.controls.len(), 1);
-        assert!(matches!(mailbox.controls.front(), Some(VoiceCommand::Shutdown)));
+        assert!(matches!(
+            mailbox.controls.front(),
+            Some(VoiceCommand::Shutdown)
+        ));
     }
 
     #[test]
@@ -3603,7 +3591,8 @@ mod tests {
         let output = VoiceOutputSubmission::new(waker);
         output.stop();
         let mut events = Events::with_capacity(2);
-        poll.poll(&mut events, Some(Duration::from_secs(1))).unwrap();
+        poll.poll(&mut events, Some(Duration::from_secs(1)))
+            .unwrap();
         assert!(events.iter().any(|event| event.token() == Token(9)));
         assert!(output.drain_into(&mut VoiceOutputBatch::default()));
     }
@@ -3627,38 +3616,35 @@ mod tests {
         };
         assert!(submission.submit_feedback(old).is_ok());
         assert!(submission.submit_feedback(newest).is_ok());
-        assert!(submission
-            .submit_playback_sink(Some(LivePlaybackSink::for_test()))
-            .is_ok());
+        assert!(
+            submission
+                .submit_playback_sink(Some(LivePlaybackSink::for_test()))
+                .is_ok()
+        );
         assert!(submission.submit_playback_sink(None).is_ok());
 
         let mut controls = VecDeque::new();
         let mut microphone = VecDeque::new();
         let mut feedback = Vec::new();
         let mut sink = None;
-        assert!(!submission.drain_into(
-            &mut controls,
-            &mut microphone,
-            &mut feedback,
-            &mut sink,
-        ));
+        assert!(!submission.drain_into(&mut controls, &mut microphone, &mut feedback, &mut sink,));
         assert_eq!(feedback.len(), 1);
         assert_eq!(feedback[0].feedback.highest_contiguous_sequence, 9);
         assert!(matches!(sink, Some(None)));
         sink = None;
 
-        assert!(submission
-            .submit(VoiceCommand::EndSession { generation: 1 })
-            .is_ok());
+        assert!(
+            submission
+                .submit(VoiceCommand::EndSession { generation: 1 })
+                .is_ok()
+        );
         assert!(submission.submit_feedback(old).is_ok());
         feedback.clear();
-        assert!(!submission.drain_into(
-            &mut controls,
-            &mut microphone,
-            &mut feedback,
-            &mut sink,
+        assert!(!submission.drain_into(&mut controls, &mut microphone, &mut feedback, &mut sink,));
+        assert!(matches!(
+            controls.pop_front(),
+            Some(VoiceCommand::EndSession { generation: 1 })
         ));
-        assert!(matches!(controls.pop_front(), Some(VoiceCommand::EndSession { generation: 1 })));
         assert!(feedback.is_empty());
     }
 
@@ -3713,13 +3699,7 @@ mod tests {
         assert!(received.received_at >= before && received.received_at <= after);
 
         session.voice_room = Some(RoomId(2));
-        session.voice_started(
-            RoomId(2),
-            SessionId(6),
-            UserId(7),
-            StreamId(8),
-            false,
-        );
+        session.voice_started(RoomId(2), SessionId(6), UserId(7), StreamId(8), false);
         assert!(stream_owner_matches(
             &session.inbound_streams,
             StreamId(8),
@@ -3766,13 +3746,7 @@ mod tests {
         ));
 
         session.voice_room = Some(RoomId(2));
-        session.voice_started(
-            RoomId(2),
-            SessionId(6),
-            UserId(7),
-            StreamId(8),
-            false,
-        );
+        session.voice_started(RoomId(2), SessionId(6), UserId(7), StreamId(8), false);
         session.dispatch_voice_packet(packet, "p2p");
         assert_eq!(session.pending_playback_packets.len(), 1);
     }
@@ -3861,12 +3835,8 @@ mod tests {
         ));
         let mut datagram = [0u8; 2048];
         let (len, _) = server.recv_from(&mut datagram).unwrap();
-        let opened = media::open_media(
-            &protection(55),
-            &mut AntiReplay::new(),
-            &datagram[..len],
-        )
-        .unwrap();
+        let opened =
+            media::open_media(&protection(55), &mut AntiReplay::new(), &datagram[..len]).unwrap();
         assert!(matches!(
             opened.payload,
             MediaPayload::VoiceFeedback { stream_id, .. } if stream_id == StreamId(8)
@@ -3887,8 +3857,7 @@ mod tests {
     #[test]
     fn generation_lifecycle_resets_packet_state_and_ignores_stale_commands() {
         let (mut actor, _main_poll) = direct_loop();
-        actor.playback_ingress =
-            PlaybackIngressState::Attached(LivePlaybackSink::for_test());
+        actor.playback_ingress = PlaybackIngressState::Attached(LivePlaybackSink::for_test());
         actor.apply_command(start_command(4));
         let session = actor.session.as_mut().unwrap();
         assert!(session.playback_ingress.sink().is_some());
@@ -3896,14 +3865,16 @@ mod tests {
         session.local_sequence = 77;
         session.voice_room = Some(RoomId(8));
         session.active_stream = Some(StreamId(12));
-        session.pending_playback_packets.push_back(crate::audio::RemoteVoicePacket {
-            stream_id: 12,
-            sequence: 1,
-            timestamp: 0,
-            flags: 0,
-            payload: VoicePayload::Opus(vec![1]),
-            received_at: Instant::now(),
-        });
+        session
+            .pending_playback_packets
+            .push_back(crate::audio::RemoteVoicePacket {
+                stream_id: 12,
+                sequence: 1,
+                timestamp: 0,
+                flags: 0,
+                payload: VoicePayload::Opus(vec![1]),
+                received_at: Instant::now(),
+            });
 
         actor.apply_command(VoiceCommand::EndSession { generation: 3 });
         assert!(actor.session.is_some());
@@ -3927,18 +3898,18 @@ mod tests {
         let main_poll = Poll::new().unwrap();
         let main_waker = Arc::new(Waker::new(main_poll.registry(), Token(9)).unwrap());
         let (event_tx, _event_rx) = mpsc::channel();
-        let handle = VoiceLoopHandle::spawn(
-            NetworkEventSender::for_test(event_tx),
-            main_waker,
-        )
-        .unwrap();
+        let handle =
+            VoiceLoopHandle::spawn(NetworkEventSender::for_test(event_tx), main_waker).unwrap();
         let control = handle.control();
         assert!(control.submit(start_command(1)).is_ok());
         assert!(control.activate(1).is_ok());
         let input = handle.input_sender();
         drop(handle);
         let command = NetworkCommand::LocalVoicePacket(frame(1));
-        assert!(matches!(input.send(command), Err(SendError(NetworkCommand::LocalVoicePacket(_)))));
+        assert!(matches!(
+            input.send(command),
+            Err(SendError(NetworkCommand::LocalVoicePacket(_)))
+        ));
     }
 
     #[test]
@@ -3946,22 +3917,15 @@ mod tests {
         let main_poll = Poll::new().unwrap();
         let main_waker = Arc::new(Waker::new(main_poll.registry(), Token(9)).unwrap());
         let (event_tx, _event_rx) = mpsc::channel();
-        let handle = VoiceLoopHandle::spawn(
-            NetworkEventSender::for_test(event_tx),
-            main_waker,
-        )
-        .unwrap();
+        let handle =
+            VoiceLoopHandle::spawn(NetworkEventSender::for_test(event_tx), main_waker).unwrap();
         let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
         server
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let udp = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
-        let bind = InitialUdpBind::prepare(
-            &udp,
-            &protection(78),
-            server.local_addr().unwrap(),
-        )
-        .unwrap();
+        let bind =
+            InitialUdpBind::prepare(&udp, &protection(78), server.local_addr().unwrap()).unwrap();
 
         bind.dispatch().unwrap();
         let mut empty = [0u8; 1];
@@ -3972,12 +3936,8 @@ mod tests {
 
         let mut datagram = [0u8; 2048];
         let (len, _) = server.recv_from(&mut datagram).unwrap();
-        let opened = media::open_media(
-            &protection(78),
-            &mut AntiReplay::new(),
-            &datagram[..len],
-        )
-        .unwrap();
+        let opened =
+            media::open_media(&protection(78), &mut AntiReplay::new(), &datagram[..len]).unwrap();
         assert_eq!(opened.header.counter, 0);
         assert_eq!(opened.payload, MediaPayload::Bind);
         assert!(handle.runtime.thread.lock().unwrap().is_none());
@@ -3988,11 +3948,8 @@ mod tests {
         let main_poll = Poll::new().unwrap();
         let main_waker = Arc::new(Waker::new(main_poll.registry(), Token(9)).unwrap());
         let (event_tx, _event_rx) = mpsc::channel();
-        let handle = VoiceLoopHandle::spawn(
-            NetworkEventSender::for_test(event_tx),
-            main_waker,
-        )
-        .unwrap();
+        let handle =
+            VoiceLoopHandle::spawn(NetworkEventSender::for_test(event_tx), main_waker).unwrap();
         assert!(handle.runtime.thread.lock().unwrap().is_none());
         let control = handle.control();
         let input = handle.input_sender();
@@ -4002,27 +3959,31 @@ mod tests {
             .unwrap();
         let udp = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
         udp.set_nonblocking(true).unwrap();
-        assert!(control
-            .submit(VoiceCommand::StartSession {
-                generation: 7,
-                udp,
-                media: protection(77),
-                initial_bind_attempted: false,
-                transport_mode: TransportMode::NativeEncrypted,
-                server_udp_addr: server.local_addr().unwrap(),
-                server_udp_probe_addr: None,
-                p2p_enabled: true,
-                candidate_privacy: CandidatePrivacy::Disabled,
-                prefer_ipv6: false,
-            })
-            .is_ok());
+        assert!(
+            control
+                .submit(VoiceCommand::StartSession {
+                    generation: 7,
+                    udp,
+                    media: protection(77),
+                    initial_bind_attempted: false,
+                    transport_mode: TransportMode::NativeEncrypted,
+                    server_udp_addr: server.local_addr().unwrap(),
+                    server_udp_probe_addr: None,
+                    p2p_enabled: true,
+                    candidate_privacy: CandidatePrivacy::Disabled,
+                    prefer_ipv6: false,
+                })
+                .is_ok()
+        );
         assert!(handle.runtime.thread.lock().unwrap().is_none());
-        assert!(control
-            .submit(VoiceCommand::Authenticated {
-                generation: 7,
-                session_id: SessionId(4),
-            })
-            .is_ok());
+        assert!(
+            control
+                .submit(VoiceCommand::Authenticated {
+                    generation: 7,
+                    session_id: SessionId(4),
+                })
+                .is_ok()
+        );
         assert!(control.activate(7).is_ok());
         assert!(handle.runtime.thread.lock().unwrap().is_some());
 
@@ -4033,16 +3994,18 @@ mod tests {
         assert_eq!(opened.header.counter, 0);
         assert_eq!(opened.payload, MediaPayload::Bind);
 
-        assert!(control
-            .submit(VoiceCommand::VoiceStarted {
-                generation: 7,
-                room_id: RoomId(2),
-                session_id: SessionId(4),
-                user_id: UserId(3),
-                stream_id: StreamId(9),
-                local: true,
-            })
-            .is_ok());
+        assert!(
+            control
+                .submit(VoiceCommand::VoiceStarted {
+                    generation: 7,
+                    room_id: RoomId(2),
+                    session_id: SessionId(4),
+                    user_id: UserId(3),
+                    stream_id: StreamId(9),
+                    local: true,
+                })
+                .is_ok()
+        );
         assert!(handle.runtime.thread.lock().unwrap().is_some());
         input
             .send(NetworkCommand::SequencedLocalVoicePacket {
@@ -4055,7 +4018,12 @@ mod tests {
         for _ in 0..3 {
             let (len, _) = server.recv_from(&mut datagram).unwrap();
             let opened = media::open_media(&protection(77), &mut replay, &datagram[..len]).unwrap();
-            if let MediaPayload::Voice { stream_id, sequence, .. } = opened.payload {
+            if let MediaPayload::Voice {
+                stream_id,
+                sequence,
+                ..
+            } = opened.payload
+            {
                 assert_eq!(stream_id, StreamId(9));
                 assert_eq!(sequence, 12);
                 received_voice = true;

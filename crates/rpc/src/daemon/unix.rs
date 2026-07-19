@@ -4,7 +4,10 @@ use std::{
     mem,
     os::{
         fd::{AsRawFd, OwnedFd, RawFd},
-        unix::{fs::{FileTypeExt, MetadataExt}, net::UnixStream},
+        unix::{
+            fs::{FileTypeExt, MetadataExt},
+            net::UnixStream,
+        },
     },
     path::{Path, PathBuf},
     time::Duration,
@@ -35,8 +38,11 @@ pub enum ConnectError {
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable(s) | Self::Permission(s) | Self::Incompatible(s)
-            | Self::Rejected(s) | Self::Protocol(s) => f.write_str(s),
+            Self::Unavailable(s)
+            | Self::Permission(s)
+            | Self::Incompatible(s)
+            | Self::Rejected(s)
+            | Self::Protocol(s) => f.write_str(s),
             Self::Io(e) => e.fmt(f),
         }
     }
@@ -66,12 +72,15 @@ pub fn control_socket_path() -> Result<PathBuf, String> {
 }
 
 pub fn validate_socket_path(path: &Path) -> Result<(), ConnectError> {
-    let parent = path.parent().ok_or_else(|| ConnectError::Permission("control socket has no parent directory".into()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ConnectError::Permission("control socket has no parent directory".into()))?;
     let dir = fs::metadata(parent).map_err(ConnectError::Io)?;
     let uid = unsafe { libc::geteuid() };
     if !dir.is_dir() || dir.uid() != uid || dir.mode() & 0o077 != 0 {
         return Err(ConnectError::Permission(format!(
-            "{} must be an owner-only directory owned by uid {uid}", parent.display()
+            "{} must be an owner-only directory owned by uid {uid}",
+            parent.display()
         )));
     }
     let socket = fs::symlink_metadata(path).map_err(|error| {
@@ -83,7 +92,8 @@ pub fn validate_socket_path(path: &Path) -> Result<(), ConnectError> {
     })?;
     if !socket.file_type().is_socket() || socket.uid() != uid || socket.mode() & 0o077 != 0 {
         return Err(ConnectError::Permission(format!(
-            "{} is not an owner-only socket owned by uid {uid}", path.display()
+            "{} is not an owner-only socket owned by uid {uid}",
+            path.display()
         )));
     }
     Ok(())
@@ -98,17 +108,29 @@ pub fn connect_to(path: &Path, hello: &ClientHello) -> Result<UnixStream, Connec
     hello.validate().map_err(ConnectError::Protocol)?;
     validate_socket_path(path)?;
     let mut stream = UnixStream::connect(path).map_err(|error| {
-        if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) {
-            ConnectError::Unavailable(format!("cannot connect to Chatt daemon at {}: {error}", path.display()))
+        if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ) {
+            ConnectError::Unavailable(format!(
+                "cannot connect to Chatt daemon at {}: {error}",
+                path.display()
+            ))
         } else {
             ConnectError::Io(error)
         }
     })?;
-    stream.set_read_timeout(Some(BOOTSTRAP_TIMEOUT)).map_err(ConnectError::Io)?;
-    stream.set_write_timeout(Some(BOOTSTRAP_TIMEOUT)).map_err(ConnectError::Io)?;
+    stream
+        .set_read_timeout(Some(BOOTSTRAP_TIMEOUT))
+        .map_err(ConnectError::Io)?;
+    stream
+        .set_write_timeout(Some(BOOTSTRAP_TIMEOUT))
+        .map_err(ConnectError::Io)?;
     let body = jsony::to_binary(hello);
     if body.len() > super::MAX_BOOTSTRAP_BYTES {
-        return Err(ConnectError::Protocol("daemon hello exceeds bootstrap limit".into()));
+        return Err(ConnectError::Protocol(
+            "daemon hello exceeds bootstrap limit".into(),
+        ));
     }
     let mut request = Vec::with_capacity(CONTROL_MAGIC.len() + 5 + body.len());
     request.extend_from_slice(CONTROL_MAGIC);
@@ -132,17 +154,22 @@ fn read_bootstrap_response(stream: &mut UnixStream) -> Result<(u8, String), Conn
     let mut magic = [0; CONTROL_MAGIC.len()];
     stream.read_exact(&mut magic).map_err(ConnectError::Io)?;
     if magic != CONTROL_MAGIC {
-        return Err(ConnectError::Protocol("invalid control response magic".into()));
+        return Err(ConnectError::Protocol(
+            "invalid control response magic".into(),
+        ));
     }
     let mut header = [0; 5];
     stream.read_exact(&mut header).map_err(ConnectError::Io)?;
     let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
     if len > MAX_RESPONSE_BYTES {
-        return Err(ConnectError::Protocol("control response exceeds limit".into()));
+        return Err(ConnectError::Protocol(
+            "control response exceeds limit".into(),
+        ));
     }
     let mut body = vec![0; len];
     stream.read_exact(&mut body).map_err(ConnectError::Io)?;
-    let message = String::from_utf8(body).map_err(|_| ConnectError::Protocol("control response is not UTF-8".into()))?;
+    let message = String::from_utf8(body)
+        .map_err(|_| ConnectError::Protocol("control response is not UTF-8".into()))?;
     Ok((header[0], message))
 }
 
@@ -152,16 +179,26 @@ pub fn peer_credentials(stream: &UnixStream) -> io::Result<(u32, u32)> {
         let mut cred: libc::ucred = unsafe { mem::zeroed() };
         let mut len = mem::size_of::<libc::ucred>() as libc::socklen_t;
         let result = unsafe {
-            libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
-                (&mut cred as *mut libc::ucred).cast(), &mut len)
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
         };
-        if result == -1 { return Err(io::Error::last_os_error()); }
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
         return Ok((cred.uid, cred.pid as u32));
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = stream;
-        Err(io::Error::new(io::ErrorKind::Unsupported, "peer credentials are not implemented on this platform"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "peer credentials are not implemented on this platform",
+        ))
     }
 }
 
@@ -195,10 +232,7 @@ impl FrameReader {
         self.recv_decoded(super::frame::decode_daemon)
     }
 
-    fn recv_decoded<T, E>(
-        &mut self,
-        decode: impl Fn(&[u8]) -> Result<T, E>,
-    ) -> io::Result<T>
+    fn recv_decoded<T, E>(&mut self, decode: impl Fn(&[u8]) -> Result<T, E>) -> io::Result<T>
     where
         E: std::fmt::Display,
     {
@@ -208,8 +242,9 @@ impl FrameReader {
                 super::MAX_FRAME_BYTES,
             ) {
                 Ok(Some((payload, consumed))) => {
-                    let decoded = decode(payload)
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+                    let decoded = decode(payload).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
                     self.buffer.consume(consumed);
                     return Ok(decoded);
                 }
@@ -245,17 +280,27 @@ impl FrameReader {
             }
         })?;
         if read == 0 {
-            let kind = if self.buffer.is_empty() { io::ErrorKind::UnexpectedEof } else { io::ErrorKind::InvalidData };
+            let kind = if self.buffer.is_empty() {
+                io::ErrorKind::UnexpectedEof
+            } else {
+                io::ErrorKind::InvalidData
+            };
             return Err(io::Error::new(kind, "EOF in daemon frame"));
         }
         let fds = take_rights(&msg)?;
         if msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
             // `fds` owns and closes every descriptor that fit in the truncated
             // control buffer before this error is returned.
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated daemon frame or ancillary data"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated daemon frame or ancillary data",
+            ));
         }
         if !fds.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected file descriptors in daemon frame"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected file descriptors in daemon frame",
+            ));
         }
         Ok(())
     }
@@ -268,11 +313,19 @@ fn take_rights(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
         let mut cmsg = libc::CMSG_FIRSTHDR(msg);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let data_len = ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
-                if data_len % mem::size_of::<RawFd>() != 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid SCM_RIGHTS payload")); }
+                let data_len =
+                    ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+                if data_len % mem::size_of::<RawFd>() != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid SCM_RIGHTS payload",
+                    ));
+                }
                 let count = data_len / mem::size_of::<RawFd>();
                 let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-                for index in 0..count { out.push(OwnedFd::from_raw_fd(*data.add(index))); }
+                for index in 0..count {
+                    out.push(OwnedFd::from_raw_fd(*data.add(index)));
+                }
             }
             cmsg = libc::CMSG_NXTHDR(msg, cmsg);
         }
@@ -314,16 +367,20 @@ impl FrameWriter {
 
     /// Writes an already encoded, length-prefixed frame without copying it.
     pub fn send_framed(&mut self, frame: &[u8], fds: &[RawFd]) -> io::Result<()> {
-        let Some((_, consumed)) = crate::frame::parse_frame_with_limit(
-            frame,
-            super::MAX_FRAME_BYTES,
-        )
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        let Some((_, consumed)) =
+            crate::frame::parse_frame_with_limit(frame, super::MAX_FRAME_BYTES)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
         else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "incomplete daemon frame"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "incomplete daemon frame",
+            ));
         };
         if consumed != frame.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "multiple daemon frames supplied"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multiple daemon frames supplied",
+            ));
         }
         send_frame_bytes(&mut self.stream, frame, fds)
     }
@@ -335,7 +392,10 @@ impl FrameWriter {
 
 fn send_frame_bytes(stream: &mut UnixStream, frame: &[u8], fds: &[RawFd]) -> io::Result<()> {
     if fds.len() > super::MAX_FDS_PER_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many file descriptors"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many file descriptors",
+        ));
     }
     let sent = if fds.is_empty() {
         0
@@ -346,8 +406,12 @@ fn send_frame_bytes(stream: &mut UnixStream, frame: &[u8], fds: &[RawFd]) -> io:
 }
 
 fn send_first_with_fds(stream: &UnixStream, frame: &[u8], fds: &[RawFd]) -> io::Result<usize> {
-    let mut iov = libc::iovec { iov_base: frame.as_ptr().cast_mut().cast(), iov_len: frame.len() };
-    let control_len = unsafe { libc::CMSG_SPACE((fds.len() * mem::size_of::<RawFd>()) as u32) } as usize;
+    let mut iov = libc::iovec {
+        iov_base: frame.as_ptr().cast_mut().cast(),
+        iov_len: frame.len(),
+    };
+    let control_len =
+        unsafe { libc::CMSG_SPACE((fds.len() * mem::size_of::<RawFd>()) as u32) } as usize;
     let mut control = vec![0u8; control_len];
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
     msg.msg_iov = &mut iov;
@@ -363,7 +427,16 @@ fn send_first_with_fds(stream: &UnixStream, frame: &[u8], fds: &[RawFd]) -> io::
         msg.msg_controllen = (*cmsg).cmsg_len;
     }
     let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
-    if sent == -1 { Err(io::Error::last_os_error()) } else if sent == 0 { Err(io::Error::new(io::ErrorKind::WriteZero, "zero-byte sendmsg")) } else { Ok(sent as usize) }
+    if sent == -1 {
+        Err(io::Error::last_os_error())
+    } else if sent == 0 {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "zero-byte sendmsg",
+        ))
+    } else {
+        Ok(sent as usize)
+    }
 }
 
 #[cfg(test)]
@@ -398,7 +471,9 @@ mod tests {
         let (left, right) = UnixStream::pair().unwrap();
         let file = fs::File::open("/dev/null").unwrap();
         let mut writer = FrameWriter::new(left);
-        writer.send_payload(b"descriptor", &[file.as_raw_fd()]).unwrap();
+        writer
+            .send_payload(b"descriptor", &[file.as_raw_fd()])
+            .unwrap();
         let error = FrameReader::new(right).recv_payload().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("unexpected file descriptors"));
@@ -431,7 +506,8 @@ mod tests {
     #[test]
     fn rejects_oversized_length_before_allocating_payload() {
         let (mut left, right) = UnixStream::pair().unwrap();
-        left.write_all(&(super::super::MAX_FRAME_BYTES as u32 + 1).to_le_bytes()).unwrap();
+        left.write_all(&(super::super::MAX_FRAME_BYTES as u32 + 1).to_le_bytes())
+            .unwrap();
         let error = FrameReader::new(right).recv_payload().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }

@@ -292,17 +292,16 @@ impl LocalInstallation {
         } = self;
         drop(client);
 
-        let compacted = RedbDataStorageEngine::compact_file(&database_path)
-            .map_err(|error| error.to_string());
-        let reopened = PersistentClient::reopen(&database_path, identities.clone()).map(|client| {
-            Self {
+        let compacted =
+            RedbDataStorageEngine::compact_file(&database_path).map_err(|error| error.to_string());
+        let reopened =
+            PersistentClient::reopen(&database_path, identities.clone()).map(|client| Self {
                 bootstrap,
                 client,
                 identities,
                 bootstrap_path,
                 database_path,
-            }
-        });
+            });
 
         match (compacted, reopened) {
             (Ok(compacted), Ok(installation)) => StorageCompactionOutcome::Complete {

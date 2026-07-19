@@ -20,16 +20,12 @@ use std::{
 };
 
 use aws_lc_rs::rand::SecureRandom;
-use chatt_p2p::{Candidate, CandidateKind, IceRole, NatKind, RestartPortPolicy};
 #[cfg(test)]
 use chatt_p2p::{
-    AgentConfig as P2pAgentConfig, StunAuth, TraversalAgent,
-    interfaces::InterfaceSnapshot,
+    AgentConfig as P2pAgentConfig, StunAuth, TraversalAgent, interfaces::InterfaceSnapshot,
 };
-use mio::{
-    Events, Interest, Poll, Token, Waker,
-    net::TcpStream,
-};
+use chatt_p2p::{Candidate, CandidateKind, IceRole, NatKind, RestartPortPolicy};
+use mio::{Events, Interest, Poll, Token, Waker, net::TcpStream};
 use rpc::{
     control::{
         ChatMessage, ChatMutationKind, ClientControl, DeviceLinkTicket, ERROR_AUTH_REJECTED,
@@ -47,8 +43,7 @@ use rpc::{
         encode_hex, generate_client_hello,
     },
     evented::{
-        MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error,
-        write_queue_to,
+        MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, write_queue_to,
     },
     frame, history,
     ids::{
@@ -61,9 +56,9 @@ use rpc::{
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(test)]
-use rpc::evented::ReadPumpOutcome;
-#[cfg(test)]
 use rpc::crypto::AntiReplay;
+#[cfg(test)]
+use rpc::evented::ReadPumpOutcome;
 #[cfg(test)]
 use std::net::IpAddr;
 
@@ -83,12 +78,12 @@ use crate::receive_store::{DiskReservation, Reservation};
 mod mls_actor;
 mod voice;
 
-use voice::{GatheredP2p, PeerConnection};
 #[cfg(test)]
 use voice::{
     EncoderFeedbackController, InterfaceMonitor, RecentVoiceSequenceResult, RecentVoiceSequences,
     direct_path_healthy, relay_suppressed,
 };
+use voice::{GatheredP2p, PeerConnection};
 
 const TCP: Token = Token(0);
 const WAKE: Token = Token(1);
@@ -1553,10 +1548,10 @@ fn run_worker_inner(
         None => None,
     };
     let std_udp = match voice::bind_voice_udp_socket(if server_udp_addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        }) {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    }) {
         Ok(socket) => socket,
         Err(error) => {
             return SessionEnd::ConnectFailed(format!("failed to bind UDP socket: {error}"));
@@ -2136,7 +2131,6 @@ fn read_blocking_frame(stream: &mut StdTcpStream) -> io::Result<Vec<u8>> {
     stream.read_exact(&mut payload)?;
     Ok(payload)
 }
-
 
 struct WorkerState<'a> {
     mls_runtime: &'a mls_actor::Runtime,
@@ -3013,8 +3007,9 @@ impl WorkerState<'_> {
             return Ok(());
         }
         let rpc::mls::ChattEventContent::File(announcement) = &entry.event.content else {
-            return Err("cannot resume encrypted upload: durable announcement is not a file"
-                .to_string());
+            return Err(
+                "cannot resume encrypted upload: durable announcement is not a file".to_string(),
+            );
         };
         let path = PathBuf::from(std::ffi::OsString::from_vec(intent.source_path.clone()));
         let request = UploadFileRequest {
@@ -3248,33 +3243,33 @@ impl WorkerState<'_> {
             let control = if let Some(control) = deferred {
                 control
             } else {
-            let total = match frame::parse_frame(self.read_buf.pending()) {
-                Ok(Some((_, total))) => {
-                    kvlog::debug!(
-                        "server frame received",
-                        frame_size = total - frame::LENGTH_PREFIX_LEN
-                    );
-                    total
+                let total = match frame::parse_frame(self.read_buf.pending()) {
+                    Ok(Some((_, total))) => {
+                        kvlog::debug!(
+                            "server frame received",
+                            frame_size = total - frame::LENGTH_PREFIX_LEN
+                        );
+                        total
+                    }
+                    Ok(None) => {
+                        self.pump_incoming_files(&mut wire_budget, &mut decoded_budget);
+                        break;
+                    }
+                    Err(error) => return Err(format!("invalid server frame: {error}")),
+                };
+                let frame = &self.read_buf.pending()[frame::LENGTH_PREFIX_LEN..total];
+                let plaintext = self
+                    .control
+                    .open_next(CHANNEL_CONTROL, frame)
+                    .map_err(|error| error.to_string())?;
+                self.read_buf.consume(total);
+                kvlog::debug!("server control decrypted", payload_size = plaintext.len());
+                if self.handle_history_chunk_payload(&plaintext)? {
+                    controls_since_file_pump += 1;
+                    controls_processed += 1;
+                    continue;
                 }
-                Ok(None) => {
-                    self.pump_incoming_files(&mut wire_budget, &mut decoded_budget);
-                    break;
-                }
-                Err(error) => return Err(format!("invalid server frame: {error}")),
-            };
-            let frame = &self.read_buf.pending()[frame::LENGTH_PREFIX_LEN..total];
-            let plaintext = self
-                .control
-                .open_next(CHANNEL_CONTROL, frame)
-                .map_err(|error| error.to_string())?;
-            self.read_buf.consume(total);
-            kvlog::debug!("server control decrypted", payload_size = plaintext.len());
-            if self.handle_history_chunk_payload(&plaintext)? {
-                controls_since_file_pump += 1;
-                controls_processed += 1;
-                continue;
-            }
-            decode_server_control(&plaintext)?
+                decode_server_control(&plaintext)?
             };
             if self.mls_server_pending != 0 && !mls_actor::handles_server_control(&control) {
                 self.deferred_server_control = Some(control);
@@ -3514,14 +3509,12 @@ impl WorkerState<'_> {
                 ))?;
             }
             NetworkCommand::RevokeE2eDevice { device_id } => {
-                self.queue_mls_input(mls_actor::Input::Command(
-                    mls_actor::Command::RevokeDevice(device_id),
-                ))?;
+                self.queue_mls_input(mls_actor::Input::Command(mls_actor::Command::RevokeDevice(
+                    device_id,
+                )))?;
             }
             NetworkCommand::ListE2eDevices => {
-                self.queue_mls_input(mls_actor::Input::Command(
-                    mls_actor::Command::ListDevices,
-                ))?;
+                self.queue_mls_input(mls_actor::Input::Command(mls_actor::Command::ListDevices))?;
             }
             NetworkCommand::CreateDeviceLink => {
                 self.queue_mls_input(mls_actor::Input::Command(
@@ -3834,14 +3827,12 @@ impl WorkerState<'_> {
         let Some(seal) = upload.seal.as_ref() else {
             return Ok(());
         };
-        self.queue_mls_input(mls_actor::Input::Command(
-            mls_actor::Command::FinishFile {
-                room_id: upload.room_id,
-                event_id: seal.event_id,
-                source_path: upload.source_path.clone(),
-                delete_source: upload.delete_source_when_done,
-            },
-        ))
+        self.queue_mls_input(mls_actor::Input::Command(mls_actor::Command::FinishFile {
+            room_id: upload.room_id,
+            event_id: seal.event_id,
+            source_path: upload.source_path.clone(),
+            delete_source: upload.delete_source_when_done,
+        }))
     }
 
     fn poll_uploads(&mut self) -> Result<(), String> {
@@ -5568,7 +5559,6 @@ impl WorkerState<'_> {
         }
     }
 
-
     fn room_requires_mls(&self, room_id: RoomId) -> bool {
         // Room metadata can reach linked workers at different times. Never
         // treat an as-yet unknown room as public: queueing its content in the
@@ -5592,7 +5582,6 @@ impl WorkerState<'_> {
         }
         debug_assert!(matched <= 1, "one MLS event unlocked multiple file uploads");
     }
-
 
     fn defer_mls_file_offer(&mut self, item: PendingMlsFileOffer) -> Result<(), String> {
         let room_id = item
@@ -5714,7 +5703,6 @@ impl WorkerState<'_> {
             .expect("index in bounds");
         let _ = self.cancel_outgoing_upload(upload, reason, UploadAbort::Declined);
     }
-
 }
 
 fn correlate_upload_accepted(
@@ -7236,7 +7224,10 @@ mod tests {
             .unwrap();
         sender.send(NetworkCommand::JoinVoice(RoomId(7))).unwrap();
 
-        assert!(matches!(main_rx.try_recv(), Ok(NetworkCommand::JoinVoice(RoomId(7)))));
+        assert!(matches!(
+            main_rx.try_recv(),
+            Ok(NetworkCommand::JoinVoice(RoomId(7)))
+        ));
         assert!(main_rx.try_recv().is_err());
         assert_eq!(voice_rx.drain_microphone_sequences(), vec![Some(44)]);
 
@@ -7277,15 +7268,16 @@ mod tests {
         assert_eq!(calls, 2);
 
         let mut calls = 0;
-        let drained: Option<(usize, SocketAddr)> = rpc::evented::recv_datagram_with(&mut buf, |_| {
-            calls += 1;
-            match calls {
-                1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
-                2 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
-                _ => unreachable!("receive loop should stop at WouldBlock"),
-            }
-        })
-        .unwrap();
+        let drained: Option<(usize, SocketAddr)> =
+            rpc::evented::recv_datagram_with(&mut buf, |_| {
+                calls += 1;
+                match calls {
+                    1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                    2 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                    _ => unreachable!("receive loop should stop at WouldBlock"),
+                }
+            })
+            .unwrap();
 
         assert_eq!(drained, None);
         assert_eq!(calls, 2);

@@ -17,9 +17,7 @@ use std::{
     sync::Arc,
 };
 
-use redb::{
-    CompactionError, Database, MultimapTableDefinition, ReadableTable, TableDefinition,
-};
+use redb::{CompactionError, Database, MultimapTableDefinition, ReadableTable, TableDefinition};
 use thiserror::Error;
 
 mod application;

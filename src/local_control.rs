@@ -27,8 +27,8 @@ mod imp {
     use jsony::Jsony;
     use sendfd::RecvWithFd;
 
-    pub use rpc::daemon::unix::{RUN_DIR_ENV, SOCKET_ENV};
     use rpc::daemon::unix::{CONTROL_MAGIC as MAGIC, OP_DAEMON_RPC};
+    pub use rpc::daemon::unix::{RUN_DIR_ENV, SOCKET_ENV};
     const OP_UPLOAD: u8 = 1;
     const OP_VOICE: u8 = 2;
     const OP_SCREENCAST: u8 = 3;
@@ -618,12 +618,11 @@ mod imp {
     fn socket_config() -> Result<SocketConfig, String> {
         let path = rpc::daemon::unix::control_socket_path()?;
         let private_dir = env::var_os(SOCKET_ENV).is_none().then(|| {
-            path.parent().expect("default control socket has a parent").to_path_buf()
+            path.parent()
+                .expect("default control socket has a parent")
+                .to_path_buf()
         });
-        Ok(SocketConfig {
-            path,
-            private_dir,
-        })
+        Ok(SocketConfig { path, private_dir })
     }
 
     fn prepare_socket_parent(config: &SocketConfig) -> Result<(), String> {
@@ -727,10 +726,12 @@ mod imp {
         let listener = match UnixListener::bind(path) {
             Ok(listener) => listener,
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => match stale_socket(path)? {
-                StaleSocket::Live => return Err(format!(
-                    "{LIVE_SOCKET_ERROR}{}; set {SOCKET_ENV} or {RUN_DIR_ENV} to use a different control socket",
-                    path.display()
-                )),
+                StaleSocket::Live => {
+                    return Err(format!(
+                        "{LIVE_SOCKET_ERROR}{}; set {SOCKET_ENV} or {RUN_DIR_ENV} to use a different control socket",
+                        path.display()
+                    ));
+                }
                 StaleSocket::Stale => {
                     fs::remove_file(path).map_err(|error| {
                         format!("failed to remove stale socket {}: {error}", path.display())
@@ -740,13 +741,18 @@ mod imp {
                     })?
                 }
             },
-            Err(error) => return Err(format!(
-                "failed to bind control socket {}: {error}",
-                path.display()
-            )),
+            Err(error) => {
+                return Err(format!(
+                    "failed to bind control socket {}: {error}",
+                    path.display()
+                ));
+            }
         };
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-            format!("failed to make control socket {} owner-only: {error}", path.display())
+            format!(
+                "failed to make control socket {} owner-only: {error}",
+                path.display()
+            )
         })?;
         Ok(listener)
     }
@@ -835,17 +841,32 @@ mod imp {
         }
         if let Ok((Request::DaemonRpc(hello), fds)) = request {
             if fds.count != 0 {
-                let _ = write_response(&mut stream, STATUS_ERROR, "daemon RPC bootstrap must not carry file descriptors");
+                let _ = write_response(
+                    &mut stream,
+                    STATUS_ERROR,
+                    "daemon RPC bootstrap must not carry file descriptors",
+                );
                 return;
             }
             let peer = match rpc::daemon::unix::peer_credentials(&stream) {
                 Ok((uid, pid)) if uid == current_uid() => RpcPeer { uid, pid },
                 Ok((uid, _)) => {
-                    let _ = write_response(&mut stream, STATUS_ERROR, &format!("daemon RPC peer uid {uid} does not match daemon uid {}", current_uid()));
+                    let _ = write_response(
+                        &mut stream,
+                        STATUS_ERROR,
+                        &format!(
+                            "daemon RPC peer uid {uid} does not match daemon uid {}",
+                            current_uid()
+                        ),
+                    );
                     return;
                 }
                 Err(error) => {
-                    let _ = write_response(&mut stream, STATUS_ERROR, &format!("cannot authenticate daemon RPC peer: {error}"));
+                    let _ = write_response(
+                        &mut stream,
+                        STATUS_ERROR,
+                        &format!("cannot authenticate daemon RPC peer: {error}"),
+                    );
                     return;
                 }
             };
@@ -854,18 +875,39 @@ mod imp {
                 return;
             }
             if hello.negotiated_version().is_none() {
-                let _ = write_response(&mut stream, STATUS_ERROR, "unsupported daemon RPC protocol version");
+                let _ = write_response(
+                    &mut stream,
+                    STATUS_ERROR,
+                    "unsupported daemon RPC protocol version",
+                );
                 return;
             }
-            for result in [stream.set_read_timeout(None), stream.set_write_timeout(None)] {
+            for result in [
+                stream.set_read_timeout(None),
+                stream.set_write_timeout(None),
+            ] {
                 if let Err(error) = result {
-                    let _ = write_response(&mut stream, STATUS_ERROR, &format!("failed to clear RPC timeout: {error}"));
+                    let _ = write_response(
+                        &mut stream,
+                        STATUS_ERROR,
+                        &format!("failed to clear RPC timeout: {error}"),
+                    );
                     return;
                 }
             }
-            if let Err(send_error) = events.send(crate::app::AppEvent::RpcClientAttach { stream, hello, peer }) {
-                let crate::app::AppEvent::RpcClientAttach { mut stream, .. } = send_error.0 else { unreachable!() };
-                let _ = write_response(&mut stream, STATUS_ERROR, "Chatt daemon stopped before accepting RPC client");
+            if let Err(send_error) = events.send(crate::app::AppEvent::RpcClientAttach {
+                stream,
+                hello,
+                peer,
+            }) {
+                let crate::app::AppEvent::RpcClientAttach { mut stream, .. } = send_error.0 else {
+                    unreachable!()
+                };
+                let _ = write_response(
+                    &mut stream,
+                    STATUS_ERROR,
+                    "Chatt daemon stopped before accepting RPC client",
+                );
             }
             return;
         }
@@ -1649,7 +1691,12 @@ mod imp {
             writer.write_all(&frame).unwrap();
             let (events_tx, events_rx) = mpsc::channel();
             handle_connection(reader, &EventSender(events_tx));
-            let crate::app::AppEvent::RpcClientAttach { stream, hello: actual, peer } = events_rx.try_recv().unwrap() else {
+            let crate::app::AppEvent::RpcClientAttach {
+                stream,
+                hello: actual,
+                peer,
+            } = events_rx.try_recv().unwrap()
+            else {
                 panic!("expected daemon RPC attach event");
             };
             assert_eq!(actual, hello);
@@ -2149,8 +2196,6 @@ mod imp {
 
 #[cfg(all(unix, test))]
 pub(crate) use imp::connect_attach_to_path;
-#[cfg(unix)]
-pub(crate) use imp::{RpcPeer, write_attach_ack, write_rpc_ack};
 pub(crate) use imp::{
     AttachConnectError, connect_attach, is_live_socket_error, read_last_server_hint,
     write_last_server_hint,
@@ -2160,3 +2205,5 @@ pub use imp::{
     send_client_logs, send_config_path, send_output_volume, send_reload_theme, send_report_bug,
     send_screencast, send_upload, send_voice,
 };
+#[cfg(unix)]
+pub(crate) use imp::{RpcPeer, write_attach_ack, write_rpc_ack};

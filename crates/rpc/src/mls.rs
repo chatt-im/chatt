@@ -240,6 +240,13 @@ pub struct MlsCommitBundle {
     pub group_info: Vec<u8>,
 }
 
+/// An independently authenticatable event retained by the delivery service.
+///
+/// `rosters` contains the authority-signed snapshots current when the event
+/// was accepted. Snapshots repeat across adjacent events by design: a client
+/// may resume at any retained sequence after its in-memory identity cache was
+/// lost. Consumers should cache successful validation by account and revision
+/// rather than repeat public-key verification for every event.
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub enum MlsDeliveryEvent {

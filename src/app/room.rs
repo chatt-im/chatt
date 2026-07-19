@@ -2293,8 +2293,7 @@ impl RoomSession {
             }
             let message_bytes = estimate(message);
             if !messages.is_empty()
-                && (messages.len() >= limit
-                    || bytes.saturating_add(message_bytes) > max_bytes)
+                && (messages.len() >= limit || bytes.saturating_add(message_bytes) > max_bytes)
             {
                 break;
             }
@@ -2346,46 +2345,59 @@ impl RoomSession {
         &self,
         room_id: RoomId,
     ) -> Vec<rpc::daemon::model::TransferSummary> {
-        let Some(room) = self.rooms.get(&room_id) else { return Vec::new(); };
-        room.transfers.iter().map(|(transfer_id, status)| {
-            let file_name = room.files.iter()
-                .filter(|(key, _)| key.transfer_id == *transfer_id)
-                .max_by_key(|(key, _)| key.timestamp_ms)
-                .map(|(_, detail)| detail.file_name.clone())
-                .unwrap_or_else(|| format!("transfer {}", transfer_id.0));
-            let (direction, byte_len, transferred, status, error) = match status {
-                TransferStatus::Active(progress) => (
-                    match progress.direction {
-                        TransferDirection::Incoming => rpc::daemon::model::TransferDirection::Download,
-                        TransferDirection::Outgoing => rpc::daemon::model::TransferDirection::Upload,
-                    },
-                    progress.total,
-                    progress.transferred,
-                    rpc::daemon::model::TransferStatus::Active,
-                    None,
-                ),
-                TransferStatus::Terminal { verb, reason } => (
-                    rpc::daemon::model::TransferDirection::Download,
-                    0,
-                    0,
-                    match verb {
-                        TerminalVerb::Cancelled | TerminalVerb::Skipped => rpc::daemon::model::TransferStatus::Canceled,
-                        TerminalVerb::Failed => rpc::daemon::model::TransferStatus::Failed,
-                    },
-                    reason.clone(),
-                ),
-            };
-            rpc::daemon::model::TransferSummary {
-                transfer_id: *transfer_id,
-                room_id,
-                direction,
-                file_name,
-                byte_len,
-                transferred,
-                status,
-                error,
-            }
-        }).collect()
+        let Some(room) = self.rooms.get(&room_id) else {
+            return Vec::new();
+        };
+        room.transfers
+            .iter()
+            .map(|(transfer_id, status)| {
+                let file_name = room
+                    .files
+                    .iter()
+                    .filter(|(key, _)| key.transfer_id == *transfer_id)
+                    .max_by_key(|(key, _)| key.timestamp_ms)
+                    .map(|(_, detail)| detail.file_name.clone())
+                    .unwrap_or_else(|| format!("transfer {}", transfer_id.0));
+                let (direction, byte_len, transferred, status, error) = match status {
+                    TransferStatus::Active(progress) => (
+                        match progress.direction {
+                            TransferDirection::Incoming => {
+                                rpc::daemon::model::TransferDirection::Download
+                            }
+                            TransferDirection::Outgoing => {
+                                rpc::daemon::model::TransferDirection::Upload
+                            }
+                        },
+                        progress.total,
+                        progress.transferred,
+                        rpc::daemon::model::TransferStatus::Active,
+                        None,
+                    ),
+                    TransferStatus::Terminal { verb, reason } => (
+                        rpc::daemon::model::TransferDirection::Download,
+                        0,
+                        0,
+                        match verb {
+                            TerminalVerb::Cancelled | TerminalVerb::Skipped => {
+                                rpc::daemon::model::TransferStatus::Canceled
+                            }
+                            TerminalVerb::Failed => rpc::daemon::model::TransferStatus::Failed,
+                        },
+                        reason.clone(),
+                    ),
+                };
+                rpc::daemon::model::TransferSummary {
+                    transfer_id: *transfer_id,
+                    room_id,
+                    direction,
+                    file_name,
+                    byte_len,
+                    transferred,
+                    status,
+                    error,
+                }
+            })
+            .collect()
     }
 
     /// Every known room in id order: `(room_id, meta)`.
@@ -2402,17 +2414,18 @@ impl RoomSession {
         self.metas.get(&room_id).map(|meta| meta.name.as_str())
     }
 
-    pub(crate) fn participant_summaries(
-        &self,
-        room_id: RoomId,
-    ) -> Vec<rpc::control::UserSummary> {
-        let Some(meta) = self.metas.get(&room_id) else { return Vec::new(); };
+    pub(crate) fn participant_summaries(&self, room_id: RoomId) -> Vec<rpc::control::UserSummary> {
+        let Some(meta) = self.metas.get(&room_id) else {
+            return Vec::new();
+        };
         self.users
             .values()
             .filter(|user| match &meta.kind {
                 ClientRoomKind::Public => true,
                 ClientRoomKind::Private { members } => members.contains(&user.user_id),
-                ClientRoomKind::Dm { user_a, user_b } => user.user_id == *user_a || user.user_id == *user_b,
+                ClientRoomKind::Dm { user_a, user_b } => {
+                    user.user_id == *user_a || user.user_id == *user_b
+                }
             })
             .cloned()
             .collect()
@@ -3646,13 +3659,7 @@ mod tests {
 
         let older = client
             .session
-            .resident_message_page(
-                RoomId(1),
-                Some(MessageId(4)),
-                2,
-                usize::MAX,
-                |_| 1,
-            )
+            .resident_message_page(RoomId(1), Some(MessageId(4)), 2, usize::MAX, |_| 1)
             .unwrap();
         assert_eq!(
             older

@@ -1461,13 +1461,15 @@ impl PersistentClient {
             MlsDeliveryEvent::Commit { rosters, .. }
             | MlsDeliveryEvent::Application { rosters, .. } => rosters,
         };
-        let mut accounts = rosters
-            .iter()
-            .map(|roster| roster.body.account_id)
-            .collect::<Vec<_>>();
-        accounts.sort_unstable();
-        accounts.dedup();
-        if accounts != descriptor.member_accounts {
+        // The server emits snapshots in the descriptor's canonical account
+        // order. Validate that order directly instead of allocating and
+        // sorting for every event in a delivery batch.
+        if rosters.len() != descriptor.member_accounts.len()
+            || rosters
+                .iter()
+                .map(|roster| roster.body.account_id)
+                .ne(descriptor.member_accounts.iter().copied())
+        {
             return Err("MLS delivery roster snapshots do not match the room".to_string());
         }
         for roster in rosters {
