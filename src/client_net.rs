@@ -716,10 +716,9 @@ pub enum NetworkEvent {
         verb: TerminalVerb,
         reason: Option<String>,
     },
-    /// A file transfer finished successfully with nothing to save locally (an
-    /// upload with no receive directory). Clears the progress overlay; the file
-    /// line reverts to its plain announcement. Downloads and saved uploads clear
-    /// via [`NetworkEvent::FileReceived`] instead.
+    /// An upload finished successfully. Clears the progress overlay immediately;
+    /// the subsequent [`NetworkEvent::FileReceived`] may redundantly clear it
+    /// after the configured copy or original-source fallback is registered.
     TransferComplete {
         room_id: RoomId,
         transfer_id: FileTransferId,
@@ -2434,8 +2433,9 @@ struct OutgoingUpload {
     name: String,
     size: u64,
     file: File,
-    /// Source path retained for durable encrypted-upload recovery. Staged
-    /// sources are unlinked only once their durable intent is completed.
+    /// Source path retained for durable encrypted-upload recovery. A staged
+    /// source is deleted with its durable intent unless it becomes the local
+    /// frontend fallback.
     source_path: PathBuf,
     delete_source_when_done: bool,
     source_offset: u64,
@@ -2456,6 +2456,10 @@ struct OutgoingUpload {
     /// the server, never round-tripped through it. Present in persistent and
     /// memory download modes, absent when receiving is off.
     local_copy: Option<UploadLocalCopy>,
+    /// The original upload source, retained until a configured local copy lands.
+    /// If that copy is disabled or cannot be made (for example, a video larger
+    /// than the memory ring), this source becomes the locally served file.
+    fallback_source: Option<PendingUploadSource>,
     /// Intrinsic image size, parsed from the first chunk as it streams.
     dimensions: Option<(u32, u32)>,
     image_prefix: Vec<u8>,
@@ -2589,8 +2593,49 @@ impl UploadBody {
     }
 }
 
-/// The sender's own copy of an in-flight upload, mirroring the room's download
-/// mode: written to disk as it streams, or buffered into the in-memory ring.
+/// A sender-owned source reserved for local frontend access after its upload
+/// completes. Staged sources are deleted if the upload fails before commit and
+/// become store-owned after commit; ordinary user files are never deleted.
+struct PendingUploadSource {
+    store: crate::receive_store::DownloadStore,
+    path: PathBuf,
+    requested_name: String,
+    remove_on_drop: bool,
+    owned_on_commit: bool,
+}
+
+impl PendingUploadSource {
+    fn commit(mut self) -> Result<String, String> {
+        let reservation = crate::receive_store::allocate_name(
+            &self.requested_name,
+            |candidate| self.store.reserve_disk_name(candidate.to_string()),
+        )
+        .ok_or_else(|| {
+            format!(
+                "could not reserve a local served name for {}",
+                self.requested_name
+            )
+        })?;
+        let owned_on_commit = self.owned_on_commit;
+        self.remove_on_drop = false;
+        Ok(if owned_on_commit {
+            reservation.commit_owned(self.path.clone())
+        } else {
+            reservation.commit(self.path.clone())
+        })
+    }
+}
+
+impl Drop for PendingUploadSource {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The sender's own locally servable upload, either its existing source, a copy
+/// written to disk as it streams, or bytes buffered into the in-memory ring.
 enum UploadLocalCopy {
     Disk {
         path: PathBuf,
@@ -2601,6 +2646,22 @@ enum UploadLocalCopy {
         reservation: Reservation,
         bytes: Vec<u8>,
     },
+}
+
+fn reserve_upload_source(
+    store: &crate::receive_store::DownloadStore,
+    path: PathBuf,
+    requested_name: &str,
+    remove_on_drop: bool,
+    owned_on_commit: bool,
+) -> PendingUploadSource {
+    PendingUploadSource {
+        store: store.clone(),
+        path,
+        requested_name: requested_name.to_string(),
+        remove_on_drop,
+        owned_on_commit,
+    }
 }
 
 /// Where a completed local upload copy lives, so it can be surfaced as a
@@ -3087,6 +3148,12 @@ impl WorkerState<'_> {
         seal.mls_event_id = intent.event_id;
         seal.announcement_delivered =
             matches!(entry.state, chatt_mls::OutboxState::Delivered { .. });
+        if intent.delete_after_upload
+            && let Some(source) = upload.fallback_source.as_mut()
+        {
+            source.remove_on_drop = false;
+            source.owned_on_commit = true;
+        }
         self.next_file_transfer = self
             .next_file_transfer
             .max(announcement.transfer_id.0.wrapping_add(1).max(1));
@@ -3782,6 +3849,13 @@ impl WorkerState<'_> {
             .or(self.active_room)
             .ok_or_else(|| "no active room for upload".to_string())?;
         let seal = self.prepare_upload_seal(room_id, body.encoding(), digest)?;
+        let fallback_source = reserve_upload_source(
+            &self.config.download_store,
+            path.clone(),
+            &name,
+            delete_after_open && seal.is_none(),
+            delete_after_open,
+        );
         Ok(OutgoingUpload {
             transfer_id,
             server_metadata: None,
@@ -3802,14 +3876,10 @@ impl WorkerState<'_> {
             started: false,
             next_status_at: FILE_PROGRESS_STEP_BYTES.min(size),
             local_copy: None,
+            fallback_source: Some(fallback_source),
             dimensions: None,
             image_prefix: Vec::new(),
             seal,
-        })
-        .inspect(|upload| {
-            if delete_after_open && upload.seal.is_none() {
-                let _ = fs::remove_file(&path);
-            }
         })
     }
 
@@ -3999,48 +4069,52 @@ impl WorkerState<'_> {
             // Keep a local copy of the sender's own upload so the uploader's own
             // views can serve it, mirroring the room's download mode. The server
             // excludes the sender from the file fanout, so this local copy is the
-            // only way the uploader's web log renders and serves its own upload.
-            // Off mode keeps none: the sender already holds the original.
-            match self
-                .config
-                .file_policy
-                .for_room(upload.room_id)
-                .target
-                .clone()
-            {
-                DownloadTarget::Persistent(receive_dir) => {
-                    match create_receive_file(
-                        &self.config.download_store,
-                        &receive_dir,
-                        &upload.name,
-                    ) {
-                        Ok(receive) => {
-                            upload.local_copy = Some(UploadLocalCopy::Disk {
-                                path: receive.path,
-                                file: receive.file,
-                                reservation: receive.reservation,
-                            })
-                        }
-                        Err(error) => {
-                            let _ = self.events.send(NetworkEvent::Error(format!(
-                                "failed to keep a local copy of {}: {error}",
-                                upload.name
-                            )));
+            // preferred way the uploader's web log renders and serves its own
+            // upload. Off mode makes no copy and uses the original-source
+            // fallback at completion.
+            if upload.local_copy.is_none() {
+                match self
+                    .config
+                    .file_policy
+                    .for_room(upload.room_id)
+                    .target
+                    .clone()
+                {
+                    DownloadTarget::Persistent(receive_dir) => {
+                        match create_receive_file(
+                            &self.config.download_store,
+                            &receive_dir,
+                            &upload.name,
+                        ) {
+                            Ok(receive) => {
+                                upload.local_copy = Some(UploadLocalCopy::Disk {
+                                    path: receive.path,
+                                    file: receive.file,
+                                    reservation: receive.reservation,
+                                })
+                            }
+                            Err(error) => {
+                                let _ = self.events.send(NetworkEvent::Error(format!(
+                                    "failed to keep a local copy of {}: {error}",
+                                    upload.name
+                                )));
+                            }
                         }
                     }
-                }
-                DownloadTarget::Memory => {
-                    // Buffer into the ring like a received file. If it does not
-                    // fit, the upload still proceeds; only the local copy is
-                    // skipped.
-                    if let Some(reservation) = self.config.download_store.reserve(upload.size) {
-                        upload.local_copy = Some(UploadLocalCopy::Memory {
-                            reservation,
-                            bytes: Vec::with_capacity(upload.size as usize),
-                        });
+                    DownloadTarget::Memory => {
+                        // Buffer into the ring like a received file. If it does not
+                        // fit, the upload still proceeds; only the local copy is
+                        // skipped.
+                        if let Some(reservation) = self.config.download_store.reserve(upload.size)
+                        {
+                            upload.local_copy = Some(UploadLocalCopy::Memory {
+                                reservation,
+                                bytes: Vec::with_capacity(upload.size as usize),
+                            });
+                        }
                     }
+                    DownloadTarget::Off => {}
                 }
-                DownloadTarget::Off => {}
             }
             let _ = self.events.send(NetworkEvent::Status(format!(
                 "uploading {} ({})",
@@ -4300,9 +4374,9 @@ impl WorkerState<'_> {
             format_bytes(upload.size)
         )));
         // Terminal clear for the progress overlay. An uploader with a receive
-        // directory also clears via the `FileReceived` in `finish_local_copy`
-        // (a redundant but harmless second clear); one without a directory never
-        // emits `FileReceived`, so this is its only clear path.
+        // directory also clears via the `FileReceived` in `finish_local_copy`.
+        // The original-source fallback now emits that event in off mode too, so
+        // the second clear is redundant but harmless in every mode.
         if let Some(meta) = upload.server_metadata.as_ref() {
             let _ = self.events.send(NetworkEvent::TransferComplete {
                 room_id: meta.room_id,
@@ -4429,40 +4503,61 @@ impl WorkerState<'_> {
     /// Flushes the uploader's local copy and emits [`NetworkEvent::FileReceived`]
     /// so local views render the file the same way they render a received one.
     fn finish_local_copy(&mut self, upload: &mut OutgoingUpload) {
-        let Some(copy) = upload.local_copy.take() else {
-            return;
-        };
-        let location = match copy {
-            UploadLocalCopy::Disk {
+        let location = match upload.local_copy.take() {
+            Some(UploadLocalCopy::Disk {
                 path,
                 mut file,
                 reservation,
-            } => {
+            }) => {
                 if let Err(error) = file.flush() {
                     let _ = fs::remove_file(&path);
                     let _ = self.events.send(NetworkEvent::Error(format!(
                         "failed to flush local copy {}: {error}",
                         path.display()
                     )));
-                    return;
+                    None
+                } else {
+                    Some(LocalFileLocation::Disk(reservation.commit(path)))
                 }
-                LocalFileLocation::Disk(reservation.commit(path))
             }
-            UploadLocalCopy::Memory { reservation, bytes } => {
+            Some(UploadLocalCopy::Memory { reservation, bytes }) => {
                 match self
                     .config
                     .download_store
                     .insert_reserved(reservation, &upload.name, bytes)
                 {
-                    Some(name) => LocalFileLocation::Memory(name),
+                    Some(name) => Some(LocalFileLocation::Memory(name)),
                     None => {
                         let _ = self.events.send(NetworkEvent::Error(format!(
                             "could not keep {} in the in-memory download buffer",
                             upload.name
                         )));
-                        return;
+                        None
                     }
                 }
+            }
+            None => None,
+        };
+        let location = match location {
+            Some(location) => {
+                upload.fallback_source.take();
+                location
+            }
+            None => {
+                let Some(source) = upload.fallback_source.take() else {
+                    return;
+                };
+                let name = match source.commit() {
+                    Ok(name) => name,
+                    Err(error) => {
+                        let _ = self.events.send(NetworkEvent::Error(error));
+                        return;
+                    }
+                };
+                // A durable staged source has become store-owned, so the MLS
+                // completion record must no longer delete it.
+                upload.delete_source_when_done = false;
+                LocalFileLocation::Disk(name)
             }
         };
         if let Some(metadata) = upload.server_metadata.take() {
@@ -7855,6 +7950,7 @@ mod tests {
             started: false,
             next_status_at: 0,
             local_copy: None,
+            fallback_source: None,
             dimensions: None,
             image_prefix: Vec::new(),
             seal: Some(UploadSeal {
@@ -7910,6 +8006,7 @@ mod tests {
             started: false,
             next_status_at: FILE_PROGRESS_STEP_BYTES,
             local_copy: None,
+            fallback_source: None,
             dimensions: None,
             image_prefix: Vec::new(),
         };
@@ -7958,6 +8055,7 @@ mod tests {
                     .reserve_disk_name("local.bin".to_string())
                     .unwrap(),
             }),
+            fallback_source: None,
             dimensions: None,
             image_prefix: Vec::new(),
         };
@@ -8004,6 +8102,7 @@ mod tests {
             started: true,
             next_status_at: FILE_PROGRESS_STEP_BYTES,
             local_copy: None,
+            fallback_source: None,
             dimensions: None,
             image_prefix: Vec::new(),
         };
@@ -8093,6 +8192,7 @@ mod tests {
             started: true,
             next_status_at: 10,
             local_copy: None,
+            fallback_source: None,
             dimensions: None,
             image_prefix: Vec::new(),
         }]);
@@ -8161,6 +8261,45 @@ mod tests {
         let path = PathBuf::from("/tmp/x.png");
         let long = "a".repeat(MAX_FILE_NAME_BYTES + 1);
         assert!(upload_username(Some(long), &path).is_err());
+    }
+
+    #[test]
+    fn sender_source_fallback_registers_video_without_copying_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clip.mp4");
+        fs::write(&path, b"video bytes larger than a tiny memory ring").unwrap();
+        let store = crate::receive_store::DownloadStore::new(1);
+        assert!(store.reserve(path.metadata().unwrap().len()).is_none());
+
+        let source = reserve_upload_source(&store, path.clone(), "clip.mp4", false, false);
+        let served_name = source.commit().expect("register original upload source");
+
+        let metadata = store
+            .attachment_metadata(&served_name)
+            .expect("registered attachment metadata");
+        assert_eq!(metadata.byte_len, path.metadata().unwrap().len());
+        assert!(metadata.content_type.starts_with("video/"));
+        assert!(matches!(
+            store.resolve_attachment(metadata.id),
+            Some(crate::receive_store::Source::Disk(source)) if source == path
+        ));
+    }
+
+    #[test]
+    fn sender_source_fallback_does_not_rename_preferred_memory_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("photo.png");
+        fs::write(&path, b"image bytes").unwrap();
+        let store = crate::receive_store::DownloadStore::new(1024);
+        let fallback = reserve_upload_source(&store, path, "photo.png", false, false);
+
+        let reservation = store.reserve(11).unwrap();
+        let served_name = store
+            .insert_reserved(reservation, "photo.png", b"image bytes".to_vec())
+            .unwrap();
+
+        assert_eq!(served_name, "photo.png");
+        drop(fallback);
     }
 
     #[test]
