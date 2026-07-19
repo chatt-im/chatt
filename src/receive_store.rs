@@ -26,12 +26,23 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use rpc::daemon::model::AttachmentId;
+
 use crate::client_net::sanitize_file_name;
 
 /// A completed received file retained in memory.
 struct Entry {
     bytes: Arc<Vec<u8>>,
     content_type: &'static str,
+    metadata: AttachmentMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentMetadata {
+    pub id: AttachmentId,
+    pub digest: [u8; 32],
+    pub byte_len: u64,
+    pub content_type: &'static str,
 }
 
 struct Inner {
@@ -47,6 +58,8 @@ struct Inner {
     entries: HashMap<String, Entry>,
     /// Served names of persistent downloads mapped to their absolute path.
     disk: HashMap<String, PathBuf>,
+    metadata: HashMap<String, AttachmentMetadata>,
+    attachment_names: HashMap<AttachmentId, String>,
     /// Served names reserved by in-flight persistent downloads. These block
     /// collisions while the partial exists but are not servable until committed.
     pending_disk: HashSet<String>,
@@ -121,6 +134,10 @@ impl DiskReservation {
         let mut inner = self.store.0.lock().unwrap();
         inner.pending_disk.remove(&self.name);
         inner.used_names.insert(self.name.clone());
+        if let Some(metadata) = attachment_metadata_file(&path, darkhttp::content_type(Path::new(&self.name))) {
+            inner.attachment_names.insert(metadata.id, self.name.clone());
+            inner.metadata.insert(self.name.clone(), metadata);
+        }
         inner.disk.insert(self.name.clone(), path);
         self.active = false;
         self.name.clone()
@@ -163,6 +180,8 @@ impl DownloadStore {
             order: VecDeque::new(),
             entries: HashMap::new(),
             disk: HashMap::new(),
+            metadata: HashMap::new(),
+            attachment_names: HashMap::new(),
             pending_disk: HashSet::new(),
             used_names: HashSet::new(),
         })))
@@ -225,6 +244,7 @@ impl DownloadStore {
         })?;
         inner.evict_to_fit(len);
         let content_type = darkhttp::content_type(Path::new(&name));
+        let metadata = attachment_metadata(&bytes, content_type);
         inner.total_bytes += len;
         inner.order.push_back(name.clone());
         inner.used_names.insert(name.clone());
@@ -233,8 +253,11 @@ impl DownloadStore {
             Entry {
                 bytes: Arc::new(bytes),
                 content_type,
+                metadata: metadata.clone(),
             },
         );
+        inner.attachment_names.insert(metadata.id, name.clone());
+        inner.metadata.insert(name.clone(), metadata);
         Some(name)
     }
 
@@ -277,6 +300,10 @@ impl DownloadStore {
         let mut inner = self.0.lock().unwrap();
         inner.pending_disk.remove(&name);
         inner.used_names.insert(name.clone());
+        if let Some(metadata) = attachment_metadata_file(&path, darkhttp::content_type(Path::new(&name))) {
+            inner.attachment_names.insert(metadata.id, name.clone());
+            inner.metadata.insert(name.clone(), metadata);
+        }
         inner.disk.insert(name, path);
     }
 
@@ -295,6 +322,19 @@ impl DownloadStore {
             .map(|path| Source::Disk(path.clone()))
     }
 
+    pub fn attachment_metadata(&self, served_name: &str) -> Option<AttachmentMetadata> {
+        self.0.lock().unwrap().metadata.get(served_name).cloned()
+    }
+
+    pub fn resolve_attachment(&self, id: AttachmentId) -> Option<Source> {
+        let inner = self.0.lock().unwrap();
+        let name = inner.attachment_names.get(&id)?;
+        if let Some(entry) = inner.entries.get(name) {
+            return Some(Source::Memory { bytes: entry.bytes.clone(), content_type: entry.content_type });
+        }
+        inner.disk.get(name).map(|path| Source::Disk(path.clone()))
+    }
+
     /// Returns the in-memory bytes and content type for `served_name`, if it is a
     /// resident memory entry. A test convenience; serving goes through
     /// [`resolve`](Self::resolve).
@@ -306,6 +346,34 @@ impl DownloadStore {
             .get(served_name)
             .map(|entry| (entry.bytes.clone(), entry.content_type))
     }
+}
+
+fn attachment_metadata(bytes: &[u8], content_type: &'static str) -> AttachmentMetadata {
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+    let mut digest_bytes = [0; 32];
+    digest_bytes.copy_from_slice(digest.as_ref());
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest_bytes[..16]);
+    AttachmentMetadata { id: AttachmentId(id), digest: digest_bytes, byte_len: bytes.len() as u64, content_type }
+}
+
+fn attachment_metadata_file(path: &Path, content_type: &'static str) -> Option<AttachmentMetadata> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let byte_len = file.metadata().ok()?.len();
+    let mut context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 { break; }
+        context.update(&buffer[..read]);
+    }
+    let digest = context.finish();
+    let mut digest_bytes = [0; 32];
+    digest_bytes.copy_from_slice(digest.as_ref());
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest_bytes[..16]);
+    Some(AttachmentMetadata { id: AttachmentId(id), digest: digest_bytes, byte_len, content_type })
 }
 
 impl Inner {
@@ -324,6 +392,8 @@ impl Inner {
             };
             if let Some(entry) = self.entries.remove(&name) {
                 self.total_bytes -= entry.bytes.len() as u64;
+                self.attachment_names.remove(&entry.metadata.id);
+                self.metadata.remove(&name);
             }
         }
     }

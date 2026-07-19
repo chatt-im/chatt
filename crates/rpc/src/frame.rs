@@ -36,11 +36,18 @@ pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) -> Result<(), FrameError>
 /// the returned length instead of draining per frame, so the buffer tail is
 /// not memmoved once per frame.
 pub fn parse_frame(buffer: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
+    parse_frame_with_limit(buffer, MAX_FRAME_LEN)
+}
+
+pub fn parse_frame_with_limit(
+    buffer: &[u8],
+    max_frame_len: usize,
+) -> Result<Option<(&[u8], usize)>, FrameError> {
     let Some(prefix) = buffer.get(..LENGTH_PREFIX_LEN) else {
         return Ok(None);
     };
     let len = u32::from_le_bytes(prefix.try_into().unwrap()) as usize;
-    if len > MAX_FRAME_LEN {
+    if len > max_frame_len {
         return Err(FrameError::TooLarge);
     }
     let total = LENGTH_PREFIX_LEN + len;

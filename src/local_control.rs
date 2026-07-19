@@ -27,11 +27,8 @@ mod imp {
     use jsony::Jsony;
     use sendfd::RecvWithFd;
 
-    pub const SOCKET_ENV: &str = "CHATT_CONTROL_SOCKET";
-    pub const RUN_DIR_ENV: &str = "CHATT_RUN_DIR";
-
-    const SOCKET_NAME: &str = "control.sock";
-    const MAGIC: &[u8] = b"chatt-control-v1\0";
+    pub use rpc::daemon::unix::{RUN_DIR_ENV, SOCKET_ENV};
+    use rpc::daemon::unix::{CONTROL_MAGIC as MAGIC, OP_DAEMON_RPC};
     const OP_UPLOAD: u8 = 1;
     const OP_VOICE: u8 = 2;
     const OP_SCREENCAST: u8 = 3;
@@ -68,6 +65,12 @@ mod imp {
         pub pid: u32,
         /// Reserved for per-terminal UI preferences in the attach protocol.
         pub ui_overrides: Option<Vec<u8>>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct RpcPeer {
+        pub(crate) uid: u32,
+        pub(crate) pid: u32,
     }
 
     /// A voice-control intent forwarded from the CLI to the running client. The
@@ -569,6 +572,7 @@ mod imp {
         ClientLogs { follow: bool },
         ReportBug(String),
         Attach(ClientHello),
+        DaemonRpc(rpc::daemon::frame::ClientHello),
     }
 
     struct ReceivedFds {
@@ -612,31 +616,13 @@ mod imp {
     }
 
     fn socket_config() -> Result<SocketConfig, String> {
-        if let Some(path) = env::var_os(SOCKET_ENV) {
-            let path = PathBuf::from(path);
-            if path.as_os_str().is_empty() {
-                return Err(format!("{SOCKET_ENV} must not be empty"));
-            }
-            return Ok(SocketConfig {
-                path,
-                private_dir: None,
-            });
-        }
-
-        let run_dir = if let Some(path) = env::var_os(RUN_DIR_ENV) {
-            PathBuf::from(path)
-        } else if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
-            PathBuf::from(path).join("chatt")
-        } else {
-            env::temp_dir().join(format!("chatt-{}", current_uid()))
-        };
-
-        if run_dir.as_os_str().is_empty() {
-            return Err(format!("{RUN_DIR_ENV} must not be empty"));
-        }
+        let path = rpc::daemon::unix::control_socket_path()?;
+        let private_dir = env::var_os(SOCKET_ENV).is_none().then(|| {
+            path.parent().expect("default control socket has a parent").to_path_buf()
+        });
         Ok(SocketConfig {
-            path: run_dir.join(SOCKET_NAME),
-            private_dir: Some(run_dir),
+            path,
+            private_dir,
         })
     }
 
@@ -738,10 +724,10 @@ mod imp {
     }
 
     fn bind_listener(path: &Path) -> Result<UnixListener, String> {
-        match UnixListener::bind(path) {
-            Ok(listener) => Ok(listener),
+        let listener = match UnixListener::bind(path) {
+            Ok(listener) => listener,
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => match stale_socket(path)? {
-                StaleSocket::Live => Err(format!(
+                StaleSocket::Live => return Err(format!(
                     "{LIVE_SOCKET_ERROR}{}; set {SOCKET_ENV} or {RUN_DIR_ENV} to use a different control socket",
                     path.display()
                 )),
@@ -751,14 +737,18 @@ mod imp {
                     })?;
                     UnixListener::bind(path).map_err(|error| {
                         format!("failed to bind control socket {}: {error}", path.display())
-                    })
+                    })?
                 }
             },
-            Err(error) => Err(format!(
+            Err(error) => return Err(format!(
                 "failed to bind control socket {}: {error}",
                 path.display()
             )),
-        }
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            format!("failed to make control socket {} owner-only: {error}", path.display())
+        })?;
+        Ok(listener)
     }
 
     enum StaleSocket {
@@ -843,6 +833,42 @@ mod imp {
             }
             return;
         }
+        if let Ok((Request::DaemonRpc(hello), fds)) = request {
+            if fds.count != 0 {
+                let _ = write_response(&mut stream, STATUS_ERROR, "daemon RPC bootstrap must not carry file descriptors");
+                return;
+            }
+            let peer = match rpc::daemon::unix::peer_credentials(&stream) {
+                Ok((uid, pid)) if uid == current_uid() => RpcPeer { uid, pid },
+                Ok((uid, _)) => {
+                    let _ = write_response(&mut stream, STATUS_ERROR, &format!("daemon RPC peer uid {uid} does not match daemon uid {}", current_uid()));
+                    return;
+                }
+                Err(error) => {
+                    let _ = write_response(&mut stream, STATUS_ERROR, &format!("cannot authenticate daemon RPC peer: {error}"));
+                    return;
+                }
+            };
+            if let Err(error) = hello.validate() {
+                let _ = write_response(&mut stream, STATUS_ERROR, &error);
+                return;
+            }
+            if hello.negotiated_version().is_none() {
+                let _ = write_response(&mut stream, STATUS_ERROR, "unsupported daemon RPC protocol version");
+                return;
+            }
+            for result in [stream.set_read_timeout(None), stream.set_write_timeout(None)] {
+                if let Err(error) = result {
+                    let _ = write_response(&mut stream, STATUS_ERROR, &format!("failed to clear RPC timeout: {error}"));
+                    return;
+                }
+            }
+            if let Err(send_error) = events.send(crate::app::AppEvent::RpcClientAttach { stream, hello, peer }) {
+                let crate::app::AppEvent::RpcClientAttach { mut stream, .. } = send_error.0 else { unreachable!() };
+                let _ = write_response(&mut stream, STATUS_ERROR, "Chatt daemon stopped before accepting RPC client");
+            }
+            return;
+        }
         let response = match request {
             Ok((Request::ClientLogs { .. }, _)) => unreachable!("handled above"),
             Ok((Request::ReportBug(description), _)) => {
@@ -889,6 +915,7 @@ mod imp {
                 }
             }
             Ok((Request::Attach(_), _)) => unreachable!("handled above"),
+            Ok((Request::DaemonRpc(_), _)) => unreachable!("handled above"),
             Ok((Request::Voice(command), _)) => match events.send(command) {
                 Ok(()) => Response {
                     status: STATUS_OK,
@@ -1192,6 +1219,9 @@ mod imp {
             OP_ATTACH => jsony::from_binary(&body)
                 .map(Request::Attach)
                 .map_err(|error| format!("invalid attach hello: {error}")),
+            OP_DAEMON_RPC => jsony::from_binary(&body)
+                .map(Request::DaemonRpc)
+                .map_err(|error| format!("invalid daemon RPC hello: {error}")),
             opcode => Err(format!("unknown control request opcode {opcode}")),
         }?;
         Ok((request, fds))
@@ -1352,6 +1382,16 @@ mod imp {
         }
     }
 
+    pub(crate) fn write_rpc_ack(
+        stream: &mut UnixStream,
+        result: Result<u32, &str>,
+    ) -> Result<(), String> {
+        match result {
+            Ok(client_id) => write_response(stream, STATUS_OK, &client_id.to_string()),
+            Err(error) => write_response(stream, STATUS_ERROR, error),
+        }
+    }
+
     #[derive(Debug)]
     pub(crate) enum AttachConnectError {
         NoMaster,
@@ -1497,7 +1537,7 @@ mod imp {
     }
 
     fn current_uid() -> u32 {
-        unsafe { libc::getuid() }
+        unsafe { libc::geteuid() }
     }
 
     #[cfg(test)]
@@ -1594,6 +1634,29 @@ mod imp {
             let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
             assert_ne!(flags, -1);
             assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+
+        #[test]
+        fn daemon_rpc_dispatch_hands_off_authenticated_stream_without_fds() {
+            let hello = rpc::daemon::frame::ClientHello::current("test-gui");
+            let body = jsony::to_binary(&hello);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(MAGIC);
+            frame.push(OP_DAEMON_RPC);
+            frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&body);
+            let (mut writer, reader) = UnixStream::pair().unwrap();
+            writer.write_all(&frame).unwrap();
+            let (events_tx, events_rx) = mpsc::channel();
+            handle_connection(reader, &EventSender(events_tx));
+            let crate::app::AppEvent::RpcClientAttach { stream, hello: actual, peer } = events_rx.try_recv().unwrap() else {
+                panic!("expected daemon RPC attach event");
+            };
+            assert_eq!(actual, hello);
+            assert_eq!(peer.uid, current_uid());
+            assert_eq!(peer.pid, std::process::id());
+            assert_eq!(stream.read_timeout().unwrap(), None);
+            assert_eq!(stream.write_timeout().unwrap(), None);
         }
 
         #[test]
@@ -2087,7 +2150,7 @@ mod imp {
 #[cfg(all(unix, test))]
 pub(crate) use imp::connect_attach_to_path;
 #[cfg(unix)]
-pub(crate) use imp::write_attach_ack;
+pub(crate) use imp::{RpcPeer, write_attach_ack, write_rpc_ack};
 pub(crate) use imp::{
     AttachConnectError, connect_attach, is_live_socket_error, read_last_server_hint,
     write_last_server_hint,

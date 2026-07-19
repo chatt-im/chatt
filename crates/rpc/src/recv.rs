@@ -68,6 +68,31 @@ impl RecvBuffer {
     /// Any partial frame left from the previous read is moved to the front of
     /// the buffer first — the only copy this buffer ever makes.
     pub fn fill(&mut self, socket: &impl AsRawFd, max_read: usize) -> io::Result<usize> {
+        self.fill_with(max_read, |destination, len| {
+            loop {
+                let read = unsafe { libc::read(socket.as_raw_fd(), destination.cast(), len) };
+                if read >= 0 {
+                    return Ok(read as usize);
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        })
+    }
+
+    /// Fills the buffer through a transport-specific receive operation.
+    ///
+    /// The callback receives writable spare capacity and must return the number
+    /// of bytes it initialized. Keeping allocation and cursor management here
+    /// lets Unix transports use `recvmsg` (for ancillary-data validation) while
+    /// still landing bytes directly in this reusable buffer.
+    pub(crate) fn fill_with(
+        &mut self,
+        max_read: usize,
+        mut receive: impl FnMut(*mut u8, usize) -> io::Result<usize>,
+    ) -> io::Result<usize> {
         debug_assert!(max_read > 0);
         if self.start > 0 {
             self.buf.copy_within(self.start.., 0);
@@ -78,23 +103,15 @@ impl RecvBuffer {
         if self.buf.capacity() - len < max_read {
             self.buf.reserve(max_read);
         }
-        loop {
-            let read = unsafe {
-                libc::read(
-                    socket.as_raw_fd(),
-                    self.buf.as_mut_ptr().add(len).cast(),
-                    max_read,
-                )
-            };
-            if read >= 0 {
-                unsafe { self.buf.set_len(len + read as usize) };
-                return Ok(read as usize);
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
+        let read = receive(unsafe { self.buf.as_mut_ptr().add(len) }, max_read)?;
+        if read > max_read {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "receive operation exceeded its destination buffer",
+            ));
         }
+        unsafe { self.buf.set_len(len + read) };
+        Ok(read)
     }
 
     /// Detaches and returns the backing buffer holding exactly

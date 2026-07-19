@@ -4,6 +4,7 @@ pub(crate) mod command;
 pub(crate) mod commands;
 pub(crate) mod device_pair;
 pub(crate) mod dialogs;
+pub(crate) mod frontend;
 mod pairing;
 pub(crate) mod participants;
 pub(crate) mod room;
@@ -789,6 +790,19 @@ pub(crate) enum AppEvent {
         stdout: std::fs::File,
         hello: local_control::ClientHello,
     },
+    #[cfg(unix)]
+    RpcClientAttach {
+        stream: std::os::unix::net::UnixStream,
+        hello: rpc::daemon::frame::ClientHello,
+        peer: local_control::RpcPeer,
+    },
+    #[cfg(unix)]
+    RpcClientFrame {
+        client_id: crate::client_channel::ClientId,
+        frame: rpc::daemon::frame::ClientFrame,
+    },
+    #[cfg(unix)]
+    RpcClientExited(crate::client_channel::ClientId),
     ClientDetached(crate::client_channel::ClientId),
     ClientExited(crate::client_channel::ClientId),
     OutputVolume {
@@ -1870,6 +1884,12 @@ impl App {
             #[cfg(unix)]
             AppEvent::ClientAttach { .. } => {
                 unreachable!("client attach events are owned by the daemon runtime")
+            }
+            #[cfg(unix)]
+            AppEvent::RpcClientAttach { .. }
+            | AppEvent::RpcClientFrame { .. }
+            | AppEvent::RpcClientExited(_) => {
+                unreachable!("RPC client events are owned by the daemon runtime")
             }
             AppEvent::ClientDetached(_) | AppEvent::ClientExited(_) => {
                 unreachable!("client lifecycle events are owned by the daemon runtime")
