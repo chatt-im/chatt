@@ -58,6 +58,11 @@ const DEFAULT_MAX_STEPS: usize = 64;
 const DEFAULT_SEED: u64 = 0x7363_656e_6172_696f;
 const REGRESSION_DIR: &str = "assets/mls-e2e-regressions";
 const DEFAULT_CAMPAIGN_LOG: &str = "/tmp/chatt-mls-scenarios.kvlog";
+// Scenario servers must reclaim their listener addresses across a restart.
+// Keep those addresses below the ephemeral source-port ranges used by the
+// supported hosts so reconnecting clients cannot claim them during the gap.
+const SCENARIO_SERVER_PORT_START: u16 = 20_000;
+const SCENARIO_SERVER_PORT_END: u16 = 30_000;
 
 #[cfg(feature = "nightly-test-spans")]
 fn init_scenario_logging(path: &Path) -> kvlog::collector::LoggerGuard {
@@ -522,6 +527,35 @@ struct ScenarioServer {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+struct ScenarioServerBindCoordinator(Mutex<()>);
+
+impl ScenarioServerBindCoordinator {
+    const fn new() -> Self {
+        Self(Mutex::new(()))
+    }
+
+    fn bind<T>(&self, bind: impl FnOnce() -> T) -> T {
+        let _guard = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        bind()
+    }
+
+    fn replace<T>(&self, stop: impl FnOnce(), bind: impl FnOnce() -> T) -> T {
+        let _guard = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        stop();
+        bind()
+    }
+}
+
+static SCENARIO_SERVER_BINDS: ScenarioServerBindCoordinator =
+    ScenarioServerBindCoordinator::new();
+static NEXT_SCENARIO_SERVER_PORT: AtomicU64 = AtomicU64::new(0);
+
 impl ScenarioServer {
     fn stop(mut self) {
         let _ = self.admin.send(AdminCommand::Shutdown);
@@ -584,10 +618,10 @@ fn scenario_users() -> Vec<UserConfig> {
         .collect()
 }
 
-fn start_scenario_server(
+fn scenario_server_config(
     root: &Path,
     addresses: Option<(&str, &str)>,
-) -> Result<ScenarioServer, String> {
+) -> Result<ServerConfig, String> {
     let mut config = ServerConfig::default();
     config.network.tcp_addr = addresses
         .map(|(tcp, _)| tcp.parse())
@@ -610,7 +644,17 @@ fn start_scenario_server(
     config.security.transport_mode = TransportModeConfig::NativeEncrypted;
     config.storage.data_dir = Some(root.join("server").display().to_string());
     config.rooms = scenario_rooms();
-    let mut server = Server::bind(config).map_err(|error| error.to_string())?;
+    Ok(config)
+}
+
+fn bind_scenario_server(config: ServerConfig) -> Result<Server, String> {
+    let tcp = config.network.tcp_addr;
+    let udp = config.network.udp_addr();
+    Server::bind(config)
+        .map_err(|error| format!("binding scenario server at TCP {tcp} and UDP {udp}: {error}"))
+}
+
+fn launch_scenario_server(mut server: Server) -> Result<ScenarioServer, String> {
     server
         .seed_users(scenario_users())
         .map_err(|error| error.to_string())?;
@@ -635,6 +679,39 @@ fn start_scenario_server(
         admin,
         worker: Some(worker),
     })
+}
+
+fn scenario_server_port(allocation: u64) -> u16 {
+    let count = u64::from(SCENARIO_SERVER_PORT_END - SCENARIO_SERVER_PORT_START);
+    SCENARIO_SERVER_PORT_START + (allocation % count) as u16
+}
+
+fn start_scenario_server(root: &Path) -> Result<ScenarioServer, String> {
+    let server = SCENARIO_SERVER_BINDS.bind(|| {
+        for _ in SCENARIO_SERVER_PORT_START..SCENARIO_SERVER_PORT_END {
+            let allocation = NEXT_SCENARIO_SERVER_PORT.fetch_add(1, Ordering::Relaxed);
+            let address = format!("127.0.0.1:{}", scenario_server_port(allocation));
+            let config = scenario_server_config(root, Some((&address, &address)))?;
+            match Server::bind(config) {
+                Ok(server) => return Ok(server),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => {
+                    return Err(format!("binding scenario server at {address}: {error}"));
+                }
+            }
+        }
+        Err(format!(
+            "no scenario server port available in {}..{}",
+            SCENARIO_SERVER_PORT_START, SCENARIO_SERVER_PORT_END
+        ))
+    })?;
+    launch_scenario_server(server)
+}
+
+fn replace_scenario_server(root: &Path, old: ScenarioServer) -> Result<ScenarioServer, String> {
+    let config = scenario_server_config(root, Some((&old.tcp, &old.udp)))?;
+    let server = SCENARIO_SERVER_BINDS.replace(|| old.stop(), || bind_scenario_server(config))?;
+    launch_scenario_server(server)
 }
 
 fn scenario_client_config(
@@ -843,7 +920,7 @@ impl ScenarioRunner {
         let root = TempDir::new(&format!("mls-scenario-{seed:016x}"));
         fs::create_dir_all(root.join("server"))
             .map_err(|error| format!("creating scenario server root: {error}"))?;
-        let server = start_scenario_server(&root, None)?;
+        let server = start_scenario_server(&root)?;
         let mut rooms = BTreeMap::new();
         rooms.insert(
             "group-all".to_string(),
@@ -2032,11 +2109,9 @@ impl ScenarioRunner {
 
     fn restart_server_live(&mut self) -> Result<(), String> {
         let old = self.server.take().expect("scenario server exists");
-        let tcp = old.tcp.clone();
-        let udp = old.udp.clone();
-        old.stop();
+        let server = replace_scenario_server(&self.root, old)?;
         invalidate_server_device_links(&mut self.tickets);
-        self.server = Some(start_scenario_server(&self.root, Some((&tcp, &udp)))?);
+        self.server = Some(server);
         let online = self
             .devices
             .iter()
@@ -2073,11 +2148,9 @@ impl ScenarioRunner {
             self.stop_device(device)?;
         }
         let old = self.server.take().expect("scenario server exists");
-        let tcp = old.tcp.clone();
-        let udp = old.udp.clone();
-        old.stop();
+        let server = replace_scenario_server(&self.root, old)?;
         invalidate_server_device_links(&mut self.tickets);
-        self.server = Some(start_scenario_server(&self.root, Some((&tcp, &udp)))?);
+        self.server = Some(server);
         for device in order {
             self.start_device(device)?;
         }
@@ -2734,6 +2807,7 @@ fn run_generated_scenario(
 
 fn failure_class(error: &str) -> &'static str {
     for (needle, class) in [
+        ("Address already in use", "address-in-use"),
         ("timed out", "timeout"),
         ("more than once", "duplicate"),
         ("pre-membership", "history-window"),
@@ -2964,6 +3038,67 @@ fn mls_live_stateful_scenario_generator_smoke() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_replacement_keeps_initial_binds_out_of_the_port_handoff_gap() {
+        let coordinator = Arc::new(ScenarioServerBindCoordinator::new());
+        let (event_tx, event_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let replacement_coordinator = Arc::clone(&coordinator);
+            let replacement_events = event_tx.clone();
+            scope.spawn(move || {
+                replacement_coordinator.replace(
+                    || {
+                        replacement_events.send("released").unwrap();
+                        continue_rx.recv().unwrap();
+                    },
+                    || replacement_events.send("rebound").unwrap(),
+                );
+            });
+
+            assert_eq!(event_rx.recv().unwrap(), "released");
+
+            let competing_coordinator = Arc::clone(&coordinator);
+            let competing_events = event_tx.clone();
+            scope.spawn(move || {
+                competing_events.send("attempting").unwrap();
+                competing_coordinator
+                    .bind(|| competing_events.send("competing-bind").unwrap());
+            });
+
+            assert_eq!(event_rx.recv().unwrap(), "attempting");
+            continue_tx.send(()).unwrap();
+            assert_eq!(event_rx.recv().unwrap(), "rebound");
+            assert_eq!(event_rx.recv().unwrap(), "competing-bind");
+        });
+    }
+
+    #[test]
+    fn address_in_use_has_a_distinct_shrinking_failure_class() {
+        assert_eq!(
+            failure_class("binding scenario server: Address already in use (os error 98)"),
+            "address-in-use"
+        );
+        assert_ne!(
+            failure_class(
+                "cold restart order must name each online device once; online={}, order=[]"
+            ),
+            "address-in-use"
+        );
+    }
+
+    #[test]
+    fn scenario_server_port_allocations_stay_in_the_non_ephemeral_pool() {
+        let count = u64::from(SCENARIO_SERVER_PORT_END - SCENARIO_SERVER_PORT_START);
+        assert_eq!(scenario_server_port(0), SCENARIO_SERVER_PORT_START);
+        assert_eq!(
+            scenario_server_port(count - 1),
+            SCENARIO_SERVER_PORT_END - 1
+        );
+        assert_eq!(scenario_server_port(count), SCENARIO_SERVER_PORT_START);
+    }
 
     #[test]
     fn trace_format_round_trips_every_action_shape() {
