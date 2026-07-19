@@ -784,7 +784,9 @@ impl MlsStore {
         let events = match after.checked_add(1) {
             Some(start) => state
                 .events
-                .range((room_id.0, start.max(room.oldest_available_sequence))..=(room_id.0, u64::MAX))
+                .range(
+                    (room_id.0, start.max(room.oldest_available_sequence))..=(room_id.0, u64::MAX),
+                )
                 .take(limit)
                 .map(|(_, stored)| stored.event.clone())
                 .collect(),
@@ -913,10 +915,7 @@ impl MlsStore {
     }
 
     pub fn welcome_head(&self, device_id: DeviceId) -> Result<u64, String> {
-        Ok(welcome_head_memory(
-            &self.state.read().unwrap(),
-            device_id,
-        ))
+        Ok(welcome_head_memory(&self.state.read().unwrap(), device_id))
     }
 
     pub fn acknowledge_welcome(
@@ -2380,7 +2379,13 @@ mod tests {
         let device = DeviceId([25; 16]);
         create_with_welcome(&store, &room(25, vec![device], 100), vec![device]);
 
-        assert!(store.events(RoomId(25), u64::MAX, 10).unwrap().events.is_empty());
+        assert!(
+            store
+                .events(RoomId(25), u64::MAX, 10)
+                .unwrap()
+                .events
+                .is_empty()
+        );
         assert!(store.welcomes(device, u64::MAX).unwrap().is_empty());
 
         store
@@ -2412,9 +2417,11 @@ mod tests {
             .get_mut(&25)
             .unwrap()
             .head_sequence = u64::MAX;
-        assert!(validate_memory(&store.state.read().unwrap())
-            .unwrap_err()
-            .contains("exhausted its delivery sequence"));
+        assert!(
+            validate_memory(&store.state.read().unwrap())
+                .unwrap_err()
+                .contains("exhausted its delivery sequence")
+        );
     }
 
     #[test]
@@ -2469,7 +2476,13 @@ mod tests {
         drop(store);
 
         let reopened = MlsStore::open(Some(temp.path())).unwrap();
-        assert!(reopened.events(RoomId(24), 0, 10).unwrap().events.is_empty());
+        assert!(
+            reopened
+                .events(RoomId(24), 0, 10)
+                .unwrap()
+                .events
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2484,9 +2497,7 @@ mod tests {
             vec![acknowledged, pending],
         );
         store.acknowledge_welcome(acknowledged, 1).unwrap();
-        store
-            .persist_welcome_acknowledgement(acknowledged)
-            .unwrap();
+        store.persist_welcome_acknowledgement(acknowledged).unwrap();
         store.cleanup(100, 10).unwrap();
         drop(store);
 
@@ -2524,15 +2535,19 @@ mod tests {
 
         let mut orphan_event = valid.clone();
         orphan_event.rooms.clear();
-        assert!(validate_memory(&orphan_event)
-            .unwrap_err()
-            .contains("event references a missing room"));
+        assert!(
+            validate_memory(&orphan_event)
+                .unwrap_err()
+                .contains("event references a missing room")
+        );
 
         let mut orphan_index = valid.clone();
         orphan_index.event_ids.insert((30, [7; 16]), 1);
-        assert!(validate_memory(&orphan_index)
-            .unwrap_err()
-            .contains("indexes contain orphan entries"));
+        assert!(
+            validate_memory(&orphan_index)
+                .unwrap_err()
+                .contains("indexes contain orphan entries")
+        );
 
         let mut orphan_cursor = valid.clone();
         orphan_cursor.device_cursors.insert(
@@ -2544,18 +2559,22 @@ mod tests {
                 rejoin_required_through: None,
             },
         );
-        assert!(validate_memory(&orphan_cursor)
-            .unwrap_err()
-            .contains("cursor references a missing room"));
+        assert!(
+            validate_memory(&orphan_cursor)
+                .unwrap_err()
+                .contains("cursor references a missing room")
+        );
 
         let mut missing_welcome_room = valid;
         missing_welcome_room.rooms.clear();
         missing_welcome_room.events.clear();
         missing_welcome_room.commit_epochs.clear();
         missing_welcome_room.device_cursors.clear();
-        assert!(validate_memory(&missing_welcome_room)
-            .unwrap_err()
-            .contains("Welcome references a missing room"));
+        assert!(
+            validate_memory(&missing_welcome_room)
+                .unwrap_err()
+                .contains("Welcome references a missing room")
+        );
     }
 
     #[test]

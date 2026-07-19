@@ -188,7 +188,11 @@ impl StateSnapshot {
         for room in &self.rooms {
             room.validate()?;
         }
-        if self.rooms.windows(2).any(|rooms| rooms[0].id >= rooms[1].id) {
+        if self
+            .rooms
+            .windows(2)
+            .any(|rooms| rooms[0].id >= rooms[1].id)
+        {
             return Err("room catalog must be strictly ordered by id".into());
         }
         if let Some(room) = &self.room {

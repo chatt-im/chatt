@@ -134,8 +134,12 @@ impl DiskReservation {
         let mut inner = self.store.0.lock().unwrap();
         inner.pending_disk.remove(&self.name);
         inner.used_names.insert(self.name.clone());
-        if let Some(metadata) = attachment_metadata_file(&path, darkhttp::content_type(Path::new(&self.name))) {
-            inner.attachment_names.insert(metadata.id, self.name.clone());
+        if let Some(metadata) =
+            attachment_metadata_file(&path, darkhttp::content_type(Path::new(&self.name)))
+        {
+            inner
+                .attachment_names
+                .insert(metadata.id, self.name.clone());
             inner.metadata.insert(self.name.clone(), metadata);
         }
         inner.disk.insert(self.name.clone(), path);
@@ -300,7 +304,9 @@ impl DownloadStore {
         let mut inner = self.0.lock().unwrap();
         inner.pending_disk.remove(&name);
         inner.used_names.insert(name.clone());
-        if let Some(metadata) = attachment_metadata_file(&path, darkhttp::content_type(Path::new(&name))) {
+        if let Some(metadata) =
+            attachment_metadata_file(&path, darkhttp::content_type(Path::new(&name)))
+        {
             inner.attachment_names.insert(metadata.id, name.clone());
             inner.metadata.insert(name.clone(), metadata);
         }
@@ -330,7 +336,10 @@ impl DownloadStore {
         let inner = self.0.lock().unwrap();
         let name = inner.attachment_names.get(&id)?;
         if let Some(entry) = inner.entries.get(name) {
-            return Some(Source::Memory { bytes: entry.bytes.clone(), content_type: entry.content_type });
+            return Some(Source::Memory {
+                bytes: entry.bytes.clone(),
+                content_type: entry.content_type,
+            });
         }
         inner.disk.get(name).map(|path| Source::Disk(path.clone()))
     }
@@ -354,7 +363,12 @@ fn attachment_metadata(bytes: &[u8], content_type: &'static str) -> AttachmentMe
     digest_bytes.copy_from_slice(digest.as_ref());
     let mut id = [0; 16];
     id.copy_from_slice(&digest_bytes[..16]);
-    AttachmentMetadata { id: AttachmentId(id), digest: digest_bytes, byte_len: bytes.len() as u64, content_type }
+    AttachmentMetadata {
+        id: AttachmentId(id),
+        digest: digest_bytes,
+        byte_len: bytes.len() as u64,
+        content_type,
+    }
 }
 
 fn attachment_metadata_file(path: &Path, content_type: &'static str) -> Option<AttachmentMetadata> {
@@ -365,7 +379,9 @@ fn attachment_metadata_file(path: &Path, content_type: &'static str) -> Option<A
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer).ok()?;
-        if read == 0 { break; }
+        if read == 0 {
+            break;
+        }
         context.update(&buffer[..read]);
     }
     let digest = context.finish();
@@ -373,7 +389,12 @@ fn attachment_metadata_file(path: &Path, content_type: &'static str) -> Option<A
     digest_bytes.copy_from_slice(digest.as_ref());
     let mut id = [0; 16];
     id.copy_from_slice(&digest_bytes[..16]);
-    Some(AttachmentMetadata { id: AttachmentId(id), digest: digest_bytes, byte_len, content_type })
+    Some(AttachmentMetadata {
+        id: AttachmentId(id),
+        digest: digest_bytes,
+        byte_len,
+        content_type,
+    })
 }
 
 impl Inner {

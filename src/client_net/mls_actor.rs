@@ -1,9 +1,6 @@
 use super::*;
 
-use std::sync::{
-    Mutex,
-    atomic::AtomicBool,
-};
+use std::sync::{Mutex, atomic::AtomicBool};
 
 const REQUEST_CAPACITY: usize = 64;
 const COMPACTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -385,8 +382,8 @@ impl Actor {
                         &input,
                         Input::BeginSession { .. } | Input::EndSession { .. }
                     );
-                    let skip_failed_session = !session_boundary
-                        && self.failed_generation == Some(self.generation);
+                    let skip_failed_session =
+                        !session_boundary && self.failed_generation == Some(self.generation);
                     let result = if skip_failed_session {
                         Ok(())
                     } else {
@@ -1793,7 +1790,8 @@ impl Actor {
                 source_path,
                 delete_after_upload,
             } => {
-                let installation = self.installation
+                let installation = self
+                    .installation
                     .as_ref()
                     .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
                 installation.client.queue_file_outgoing(
@@ -1951,12 +1949,11 @@ impl Actor {
     }
 
     fn mark_mls_upload_announcement_delivered(&mut self, room_id: RoomId, event_id: EventId) {
-        self.output
-            .send(Output::MarkFileAnnouncementDelivered {
-                generation: self.generation,
-                room_id,
-                event_id,
-            });
+        self.output.send(Output::MarkFileAnnouncementDelivered {
+            generation: self.generation,
+            room_id,
+            event_id,
+        });
     }
 
     fn emit_mls_chatt_event(
@@ -2725,7 +2722,6 @@ impl Actor {
         Ok(())
     }
 
-
     fn queue_control(&self, control: ClientControl) -> Result<(), String> {
         self.output.send(Output::Control {
             generation: self.generation,
@@ -2793,9 +2789,9 @@ impl Actor {
                 let reopen_failed = installation.is_none();
                 self.installation = installation;
                 if reopen_failed {
-                    let _ = self.events.send(NetworkEvent::LocalIdentityUnavailable {
-                        message: error,
-                    });
+                    let _ = self
+                        .events
+                        .send(NetworkEvent::LocalIdentityUnavailable { message: error });
                     self.mls_bound = false;
                 } else {
                     let _ = self.events.send(NetworkEvent::Error(error));
@@ -2960,9 +2956,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(generations, [41, 42]);
-        assert!(observed.iter().any(
-            |output| matches!(output, Output::SessionReady { generation: 42 })
-        ));
+        assert!(
+            observed
+                .iter()
+                .any(|output| matches!(output, Output::SessionReady { generation: 42 }))
+        );
     }
 
     #[test]
@@ -3015,10 +3013,9 @@ mod tests {
             },
         );
         actor.mls_installed_rosters.insert(UserId(2));
-        actor.pending_mls_commits.insert(
-            RoomId(9),
-            PendingMlsCommit::RoomCreation(descriptor),
-        );
+        actor
+            .pending_mls_commits
+            .insert(RoomId(9), PendingMlsCommit::RoomCreation(descriptor));
 
         actor.retry_stale_room_creation(RoomId(9)).unwrap();
         let observed = std::mem::take(&mut *outputs.outputs.lock().unwrap());
@@ -3045,12 +3042,7 @@ mod tests {
             .bootstrap
             .own_roster
             .clone();
-        let own_device = actor
-            .installation
-            .as_ref()
-            .unwrap()
-            .bootstrap
-            .device_id;
+        let own_device = actor.installation.as_ref().unwrap().bootstrap.device_id;
         actor
             .handle_server_control(ServerControl::DeviceRoster {
                 user_id: UserId(1),
@@ -3096,13 +3088,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let server_id = [12; 32];
         let alice_path = temp.path().join("alice");
-        let (alice, _) = LocalInstallation::open_or_create(
-            &alice_path,
-            server_id,
-            UserId(1),
-            "Alice",
-        )
-        .unwrap();
+        let (alice, _) =
+            LocalInstallation::open_or_create(&alice_path, server_id, UserId(1), "Alice").unwrap();
         let (mut bob, _) = LocalInstallation::open_or_create(
             &temp.path().join("bob"),
             server_id,
@@ -3167,33 +3154,20 @@ mod tests {
                 &descriptor,
                 &[
                     (bob.bootstrap.device_id, bob_package.package),
-                    (
-                        bob_second.bootstrap.device_id,
-                        bob_second_package.package,
-                    ),
+                    (bob_second.bootstrap.device_id, bob_second_package.package),
                     (carol.bootstrap.device_id, carol_package.package),
                 ],
             )
             .unwrap();
-        alice
-            .client
-            .accept_pending_commit(&descriptor, 1)
-            .unwrap();
-        let bob_without_second = bob
-            .roster_without(bob_second.bootstrap.device_id)
-            .unwrap();
+        alice.client.accept_pending_commit(&descriptor, 1).unwrap();
+        let bob_without_second = bob.roster_without(bob_second.bootstrap.device_id).unwrap();
         bob.replace_own_roster(bob_without_second.clone()).unwrap();
         drop(alice);
 
         // Reopening restores only the local certified device. Peer rosters
         // arrive asynchronously after the server binds this installation.
-        let (alice, created) = LocalInstallation::open_or_create(
-            &alice_path,
-            server_id,
-            UserId(1),
-            "Alice",
-        )
-        .unwrap();
+        let (alice, created) =
+            LocalInstallation::open_or_create(&alice_path, server_id, UserId(1), "Alice").unwrap();
         assert!(!created);
         let (mut actor, outputs, _poll) = test_actor(test_config(None));
         actor.generation = 1;
@@ -3230,13 +3204,20 @@ mod tests {
             })
             .unwrap();
         assert_eq!(actor.pending_mls_history.len(), 1);
-        assert!(!outputs.outputs.lock().unwrap().iter().any(|output| matches!(
-            output,
-            Output::Control {
-                control: ClientControl::SubmitCommitBundle { .. },
-                ..
-            }
-        )));
+        assert!(
+            !outputs
+                .outputs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|output| matches!(
+                    output,
+                    Output::Control {
+                        control: ClientControl::SubmitCommitBundle { .. },
+                        ..
+                    }
+                ))
+        );
         outputs.outputs.lock().unwrap().clear();
 
         actor
@@ -3247,17 +3228,24 @@ mod tests {
             })
             .unwrap();
         assert!(actor.pending_mls_history.is_empty());
-        assert!(outputs.outputs.lock().unwrap().iter().any(|output| matches!(
-            output,
-            Output::Control {
-                control: ClientControl::SubmitCommitBundle {
-                    room_id: RoomId(9),
-                    expected_epoch: 1,
-                    ..
-                },
-                ..
-            }
-        )));
+        assert!(
+            outputs
+                .outputs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|output| matches!(
+                    output,
+                    Output::Control {
+                        control: ClientControl::SubmitCommitBundle {
+                            room_id: RoomId(9),
+                            expected_epoch: 1,
+                            ..
+                        },
+                        ..
+                    }
+                ))
+        );
     }
 
     #[test]
@@ -3300,9 +3288,11 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert!(peer_rosters
-            .iter()
-            .all(|(_, _, roster)| roster.body.account_id < local_account));
+        assert!(
+            peer_rosters
+                .iter()
+                .all(|(_, _, roster)| roster.body.account_id < local_account)
+        );
         for (_, _, roster) in &peer_rosters {
             local.install_roster(roster).unwrap();
         }
@@ -3334,7 +3324,10 @@ mod tests {
 
         let pending = actor.pending_mls_rooms.get(&RoomId(9)).unwrap();
         assert_eq!(
-            pending.descriptor.as_ref().map(|descriptor| descriptor.creator),
+            pending
+                .descriptor
+                .as_ref()
+                .map(|descriptor| descriptor.creator),
             Some(local_account)
         );
         let requested = outputs

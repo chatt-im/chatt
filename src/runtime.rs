@@ -5,7 +5,10 @@ use std::{
     os::fd::IntoRawFd,
     os::unix::net::UnixStream,
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Once, mpsc::{self, Receiver, SyncSender, TrySendError}},
+    sync::{
+        Arc, Once,
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -103,17 +106,21 @@ impl RpcClientSender {
                 Ok(())
             }
             Err(TrySendError::Full(QueuedRpcFrame::Frame(framed))) => {
-                self.queued_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+                self.queued_bytes
+                    .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
                 recycle_rpc_buffer(&self.buffers, framed);
                 Err("RPC client outbound queue is full".into())
             }
             Err(TrySendError::Disconnected(QueuedRpcFrame::Frame(framed))) => {
-                self.queued_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+                self.queued_bytes
+                    .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
                 recycle_rpc_buffer(&self.buffers, framed);
                 Err("RPC client writer stopped".into())
             }
-            Err(TrySendError::Full(QueuedRpcFrame::Shutdown)
-                | TrySendError::Disconnected(QueuedRpcFrame::Shutdown)) => {
+            Err(
+                TrySendError::Full(QueuedRpcFrame::Shutdown)
+                | TrySendError::Disconnected(QueuedRpcFrame::Shutdown),
+            ) => {
                 unreachable!("send only queues frame values")
             }
         }
@@ -470,21 +477,43 @@ fn handle_runtime_event(
                 Err(error) => kvlog::warn!("terminal client attach failed", error = %error),
             }
         }
-        AppEvent::RpcClientAttach { mut stream, hello, peer } => {
+        AppEvent::RpcClientAttach {
+            mut stream,
+            hello,
+            peer,
+        } => {
             if rpc_clients.len() >= rpc::daemon::MAX_RPC_CLIENTS {
-                let _ = crate::local_control::write_rpc_ack(&mut stream, Err("too many daemon RPC clients"));
+                let _ = crate::local_control::write_rpc_ack(
+                    &mut stream,
+                    Err("too many daemon RPC clients"),
+                );
                 return;
             }
             if *next_client_id > u64::from(u32::MAX) {
-                let _ = crate::local_control::write_rpc_ack(&mut stream, Err("frontend client id space exhausted"));
+                let _ = crate::local_control::write_rpc_ack(
+                    &mut stream,
+                    Err("frontend client id space exhausted"),
+                );
                 return;
             }
             let id = ClientId(*next_client_id as u32);
             *next_client_id += 1;
-            match spawn_rpc_client(app, id, stream, &hello, event_sender.clone(), daemon_instance) {
+            match spawn_rpc_client(
+                app,
+                id,
+                stream,
+                &hello,
+                event_sender.clone(),
+                daemon_instance,
+            ) {
                 Ok(client) => {
                     rpc_clients.insert(id, client);
-                    kvlog::info!("daemon RPC client attached", client_id = id.0, peer_pid = peer.pid, peer_uid = peer.uid);
+                    kvlog::info!(
+                        "daemon RPC client attached",
+                        client_id = id.0,
+                        peer_pid = peer.pid,
+                        peer_uid = peer.uid
+                    );
                 }
                 Err(error) => kvlog::warn!("daemon RPC client attach failed", error = %error),
             }
@@ -542,7 +571,10 @@ fn spawn_rpc_client(
     instance_id: DaemonInstanceId,
 ) -> Result<RemoteRpcClient, String> {
     let Some(version) = hello.negotiated_version() else {
-        let _ = crate::local_control::write_rpc_ack(&mut stream, Err("unsupported daemon RPC protocol version"));
+        let _ = crate::local_control::write_rpc_ack(
+            &mut stream,
+            Err("unsupported daemon RPC protocol version"),
+        );
         return Err("unsupported daemon RPC protocol version".into());
     };
     let reader_stream = stream.try_clone().map_err(|error| error.to_string())?;
@@ -600,16 +632,13 @@ fn spawn_rpc_client(
         first_event_seq: 1,
         limits,
     };
-    if let Err(error) = sender
-        .send(&DaemonFrame::Welcome(welcome))
-        .and_then(|()| {
-            sender.send(&DaemonFrame::Snapshot {
-                instance_id,
-                event_seq: 1,
-                snapshot: snapshot.clone(),
-            })
+    if let Err(error) = sender.send(&DaemonFrame::Welcome(welcome)).and_then(|()| {
+        sender.send(&DaemonFrame::Snapshot {
+            instance_id,
+            event_seq: 1,
+            snapshot: snapshot.clone(),
         })
-    {
+    }) {
         sender.shutdown();
         sender.abort();
         let _ = reader_thread.join();
@@ -654,7 +683,13 @@ fn rpc_reader_loop(
                     );
                     break;
                 }
-                if events.send(AppEvent::RpcClientFrame { client_id: id, frame }).is_err() {
+                if events
+                    .send(AppEvent::RpcClientFrame {
+                        client_id: id,
+                        frame,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -737,7 +772,11 @@ fn send_rpc_event(
     delta: StateDelta,
 ) -> Result<(), String> {
     let seq = client.next_event_seq;
-    client.sender.send(&DaemonFrame::Event(StateEvent { instance_id, event_seq: seq, delta }))?;
+    client.sender.send(&DaemonFrame::Event(StateEvent {
+        instance_id,
+        event_seq: seq,
+        delta,
+    }))?;
     client.next_event_seq = seq.wrapping_add(1);
     Ok(())
 }
@@ -792,11 +831,9 @@ fn complete_pending_rpc_history(
         client.pending_history = None;
         return Ok(());
     }
-    if let Some(page) = app.rpc_resident_history_page(
-        request.room_id,
-        request.before,
-        request.limit,
-    ) {
+    if let Some(page) =
+        app.rpc_resident_history_page(request.room_id, request.before, request.limit)
+    {
         send_rpc_history_page(client, instance_id, request.room_id, page)?;
         client.pending_history = None;
     } else if !app.room.history_fetch_active(request.room_id) {
@@ -1015,7 +1052,9 @@ fn handle_rpc_command(
                     },
                 };
                 if let Some(client) = clients.get_mut(&id) {
-                    client.sender.send_or_abort(&DaemonFrame::RequestResult(result));
+                    client
+                        .sender
+                        .send_or_abort(&DaemonFrame::RequestResult(result));
                 }
                 return;
             }
@@ -1030,7 +1069,9 @@ fn handle_rpc_command(
                     operation: rpc::daemon::frame::Operation::LoadOlder,
                     outcome: rpc::daemon::frame::RequestOutcome::Accepted,
                 };
-                if client.sender.send_or_abort(&DaemonFrame::RequestResult(result))
+                if client
+                    .sender
+                    .send_or_abort(&DaemonFrame::RequestResult(result))
                     && send_rpc_history_page(client, instance_id, room_id, page).is_err()
                 {
                     client.sender.abort();
@@ -1072,11 +1113,17 @@ fn handle_rpc_command(
             }
             return;
         }
-        rpc::daemon::frame::ClientFrame::FinishUpload { request_id, finished } => {
+        rpc::daemon::frame::ClientFrame::FinishUpload {
+            request_id,
+            finished,
+        } => {
             finish_rpc_upload(app, clients, id, request_id, finished);
             return;
         }
-        rpc::daemon::frame::ClientFrame::CancelUpload { request_id, transfer_id } => {
+        rpc::daemon::frame::ClientFrame::CancelUpload {
+            request_id,
+            transfer_id,
+        } => {
             if let Some(client) = clients.get_mut(&id) {
                 let removed = client.uploads.lock().remove(&transfer_id).is_some();
                 let outcome = if removed {
@@ -1087,29 +1134,58 @@ fn handle_rpc_command(
                         message: "upload transfer is not active".into(),
                     }
                 };
-                let result = rpc::daemon::frame::RequestResult { request_id, operation: rpc::daemon::frame::Operation::CancelUpload, outcome };
-                client.sender.send_or_abort(&DaemonFrame::RequestResult(result));
+                let result = rpc::daemon::frame::RequestResult {
+                    request_id,
+                    operation: rpc::daemon::frame::Operation::CancelUpload,
+                    outcome,
+                };
+                client
+                    .sender
+                    .send_or_abort(&DaemonFrame::RequestResult(result));
             }
             return;
         }
-        rpc::daemon::frame::ClientFrame::CancelBulkTransfer { request_id, transfer_id } => {
+        rpc::daemon::frame::ClientFrame::CancelBulkTransfer {
+            request_id,
+            transfer_id,
+        } => {
             if let Some(client) = clients.get_mut(&id)
                 && client.sender.cancel_bulk(transfer_id)
             {
-                let result = rpc::daemon::frame::RequestResult { request_id, operation: rpc::daemon::frame::Operation::CancelBulkTransfer, outcome: rpc::daemon::frame::RequestOutcome::Accepted };
-                if client.sender.send_or_abort(&DaemonFrame::RequestResult(result)) {
-                    client.sender.send_or_abort(&DaemonFrame::BulkCanceled { transfer_id, reason: "canceled by frontend".into() });
+                let result = rpc::daemon::frame::RequestResult {
+                    request_id,
+                    operation: rpc::daemon::frame::Operation::CancelBulkTransfer,
+                    outcome: rpc::daemon::frame::RequestOutcome::Accepted,
+                };
+                if client
+                    .sender
+                    .send_or_abort(&DaemonFrame::RequestResult(result))
+                {
+                    client.sender.send_or_abort(&DaemonFrame::BulkCanceled {
+                        transfer_id,
+                        reason: "canceled by frontend".into(),
+                    });
                 }
                 return;
             }
-            let effect = app.handle_rpc_frame(id, rpc::daemon::frame::ClientFrame::CancelBulkTransfer { request_id, transfer_id });
-            let Some(client) = clients.get_mut(&id) else { return; };
+            let effect = app.handle_rpc_frame(
+                id,
+                rpc::daemon::frame::ClientFrame::CancelBulkTransfer {
+                    request_id,
+                    transfer_id,
+                },
+            );
+            let Some(client) = clients.get_mut(&id) else {
+                return;
+            };
             handle_rpc_effect(app, client, id, effect, instance_id);
             return;
         }
         frame => {
             let effect = app.handle_rpc_frame(id, frame);
-            let Some(client) = clients.get_mut(&id) else { return; };
+            let Some(client) = clients.get_mut(&id) else {
+                return;
+            };
             handle_rpc_effect(app, client, id, effect, instance_id);
             return;
         }
@@ -1126,32 +1202,55 @@ fn handle_rpc_effect(
     use crate::app::frontend::RpcCommandEffect;
     match effect {
         RpcCommandEffect::Reply(result) => {
-            client.sender.send_or_abort(&DaemonFrame::RequestResult(result));
+            client
+                .sender
+                .send_or_abort(&DaemonFrame::RequestResult(result));
         }
         RpcCommandEffect::Snapshot(request_id) => {
-            let result = rpc::daemon::frame::RequestResult { request_id, operation: rpc::daemon::frame::Operation::RequestSnapshot, outcome: rpc::daemon::frame::RequestOutcome::Accepted };
-            if client.sender.send_or_abort(&DaemonFrame::RequestResult(result))
+            let result = rpc::daemon::frame::RequestResult {
+                request_id,
+                operation: rpc::daemon::frame::Operation::RequestSnapshot,
+                outcome: rpc::daemon::frame::RequestOutcome::Accepted,
+            };
+            if client
+                .sender
+                .send_or_abort(&DaemonFrame::RequestResult(result))
                 && send_rpc_snapshot(app, id, client, instance_id).is_err()
             {
                 client.sender.abort();
             }
         }
         RpcCommandEffect::Pong(request_id, nonce) => {
-            client.sender.send_or_abort(&DaemonFrame::Pong { request_id, nonce });
+            client
+                .sender
+                .send_or_abort(&DaemonFrame::Pong { request_id, nonce });
         }
         RpcCommandEffect::Disconnect(result) => {
-            if client.sender.send_or_abort(&DaemonFrame::RequestResult(result)) {
+            if client
+                .sender
+                .send_or_abort(&DaemonFrame::RequestResult(result))
+            {
                 client.sender.shutdown();
             }
         }
-        RpcCommandEffect::BeginRead { result, read, descriptor, source } => {
+        RpcCommandEffect::BeginRead {
+            result,
+            read,
+            descriptor,
+            source,
+        } => {
             if !client.sender.begin_bulk(read.transfer_id) {
                 let rejected = rpc::daemon::frame::RequestResult {
                     request_id: result.request_id,
                     operation: result.operation,
-                    outcome: rpc::daemon::frame::RequestOutcome::Rejected { code: 429, message: "too many active attachment reads".into() },
+                    outcome: rpc::daemon::frame::RequestOutcome::Rejected {
+                        code: 429,
+                        message: "too many active attachment reads".into(),
+                    },
                 };
-                client.sender.send_or_abort(&DaemonFrame::RequestResult(rejected));
+                client
+                    .sender
+                    .send_or_abort(&DaemonFrame::RequestResult(rejected));
                 return;
             }
             let sender = client.sender.clone();
@@ -1165,10 +1264,12 @@ fn handle_rpc_effect(
                     if start_rx.recv().is_ok() {
                         stream_rpc_attachment(sender, transfer_id, descriptor, source);
                     }
-                })
-            {
+                }) {
                 Ok(_) => {
-                    if client.sender.send_or_abort(&DaemonFrame::RequestResult(result)) {
+                    if client
+                        .sender
+                        .send_or_abort(&DaemonFrame::RequestResult(result))
+                    {
                         let _ = start_tx.send(());
                     } else {
                         client.sender.cancel_bulk(transfer_id);
@@ -1184,28 +1285,56 @@ fn handle_rpc_effect(
                             message: format!("cannot start attachment transfer: {error}"),
                         },
                     };
-                    client.sender.send_or_abort(&DaemonFrame::RequestResult(rejected));
+                    client
+                        .sender
+                        .send_or_abort(&DaemonFrame::RequestResult(rejected));
                 }
             }
         }
         RpcCommandEffect::BeginUpload { request_id, upload } => {
             let mut uploads = client.uploads.lock();
             let outcome = if uploads.len() >= rpc::daemon::MAX_CONCURRENT_TRANSFERS {
-                rpc::daemon::frame::RequestOutcome::Rejected { code: 429, message: "too many active uploads".into() }
+                rpc::daemon::frame::RequestOutcome::Rejected {
+                    code: 429,
+                    message: "too many active uploads".into(),
+                }
             } else if uploads.contains_key(&upload.transfer_id) {
-                rpc::daemon::frame::RequestOutcome::Rejected { code: 409, message: "upload transfer id is already active".into() }
+                rpc::daemon::frame::RequestOutcome::Rejected {
+                    code: 409,
+                    message: "upload transfer id is already active".into(),
+                }
             } else {
-                match tempfile::Builder::new().prefix("chatt-rpc-upload-").tempfile() {
+                match tempfile::Builder::new()
+                    .prefix("chatt-rpc-upload-")
+                    .tempfile()
+                {
                     Ok(file) => {
-                        uploads.insert(upload.transfer_id, RpcUpload { upload, file, offset: 0, digest: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256) });
+                        uploads.insert(
+                            upload.transfer_id,
+                            RpcUpload {
+                                upload,
+                                file,
+                                offset: 0,
+                                digest: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
+                            },
+                        );
                         rpc::daemon::frame::RequestOutcome::Accepted
                     }
-                    Err(error) => rpc::daemon::frame::RequestOutcome::Rejected { code: 500, message: format!("cannot create upload staging file: {error}") },
+                    Err(error) => rpc::daemon::frame::RequestOutcome::Rejected {
+                        code: 500,
+                        message: format!("cannot create upload staging file: {error}"),
+                    },
                 }
             };
             drop(uploads);
-            let result = rpc::daemon::frame::RequestResult { request_id, operation: rpc::daemon::frame::Operation::BeginUpload, outcome };
-            client.sender.send_or_abort(&DaemonFrame::RequestResult(result));
+            let result = rpc::daemon::frame::RequestResult {
+                request_id,
+                operation: rpc::daemon::frame::Operation::BeginUpload,
+                outcome,
+            };
+            client
+                .sender
+                .send_or_abort(&DaemonFrame::RequestResult(result));
         }
         RpcCommandEffect::None => {}
     }
@@ -1220,17 +1349,30 @@ fn handle_rpc_upload_chunk(
     let mut uploads = uploads.lock();
     let error = match uploads.get_mut(&chunk.transfer_id) {
         None => Some("upload chunk has no active transfer".to_string()),
-        Some(upload) if chunk.offset != upload.offset => Some("upload chunk offset is not contiguous".to_string()),
-        Some(upload) if upload.offset.saturating_add(chunk.bytes.len() as u64) > upload.upload.byte_len => Some("upload chunk exceeds declared length".to_string()),
+        Some(upload) if chunk.offset != upload.offset => {
+            Some("upload chunk offset is not contiguous".to_string())
+        }
+        Some(upload)
+            if upload.offset.saturating_add(chunk.bytes.len() as u64) > upload.upload.byte_len =>
+        {
+            Some("upload chunk exceeds declared length".to_string())
+        }
         Some(upload) => match upload.file.write_all(&chunk.bytes) {
-            Ok(()) => { upload.digest.update(&chunk.bytes); upload.offset += chunk.bytes.len() as u64; None }
+            Ok(()) => {
+                upload.digest.update(&chunk.bytes);
+                upload.offset += chunk.bytes.len() as u64;
+                None
+            }
             Err(error) => Some(error.to_string()),
         },
     };
     if let Some(reason) = error {
         uploads.remove(&chunk.transfer_id);
         drop(uploads);
-        sender.send_or_abort(&DaemonFrame::BulkCanceled { transfer_id: chunk.transfer_id, reason });
+        sender.send_or_abort(&DaemonFrame::BulkCanceled {
+            transfer_id: chunk.transfer_id,
+            reason,
+        });
     }
 }
 
@@ -1242,31 +1384,62 @@ fn finish_rpc_upload(
     finished: rpc::daemon::bulk::BulkFinished,
 ) {
     use std::io::Write;
-    let Some(client) = clients.get_mut(&id) else { return; };
+    let Some(client) = clients.get_mut(&id) else {
+        return;
+    };
     let staged = client.uploads.lock().remove(&finished.transfer_id);
     let outcome = match staged {
-        None => rpc::daemon::frame::RequestOutcome::Rejected { code: 409, message: "upload has no active transfer".into() },
+        None => rpc::daemon::frame::RequestOutcome::Rejected {
+            code: 409,
+            message: "upload has no active transfer".into(),
+        },
         Some(mut staged) => {
             let actual = staged.digest.finish();
-            if staged.offset != staged.upload.byte_len || staged.offset != finished.byte_len
+            if staged.offset != staged.upload.byte_len
+                || staged.offset != finished.byte_len
                 || actual.as_ref() != finished.digest
             {
-                rpc::daemon::frame::RequestOutcome::Rejected { code: 422, message: "upload length or digest verification failed".into() }
-            } else if let Err(error) = staged.file.flush().and_then(|_| staged.file.as_file().sync_all()) {
-                rpc::daemon::frame::RequestOutcome::Rejected { code: 500, message: error.to_string() }
+                rpc::daemon::frame::RequestOutcome::Rejected {
+                    code: 422,
+                    message: "upload length or digest verification failed".into(),
+                }
+            } else if let Err(error) = staged
+                .file
+                .flush()
+                .and_then(|_| staged.file.as_file().sync_all())
+            {
+                rpc::daemon::frame::RequestOutcome::Rejected {
+                    code: 500,
+                    message: error.to_string(),
+                }
             } else {
                 match staged.file.keep() {
-                    Ok((_file, path)) => match app.queue_rpc_upload(staged.upload.room_id, path, staged.upload.file_name) {
+                    Ok((_file, path)) => match app.queue_rpc_upload(
+                        staged.upload.room_id,
+                        path,
+                        staged.upload.file_name,
+                    ) {
                         Ok(()) => rpc::daemon::frame::RequestOutcome::Accepted,
-                        Err(message) => rpc::daemon::frame::RequestOutcome::Rejected { code: 503, message },
+                        Err(message) => {
+                            rpc::daemon::frame::RequestOutcome::Rejected { code: 503, message }
+                        }
                     },
-                    Err(error) => rpc::daemon::frame::RequestOutcome::Rejected { code: 500, message: error.error.to_string() },
+                    Err(error) => rpc::daemon::frame::RequestOutcome::Rejected {
+                        code: 500,
+                        message: error.error.to_string(),
+                    },
                 }
             }
         }
     };
-    let result = rpc::daemon::frame::RequestResult { request_id, operation: rpc::daemon::frame::Operation::FinishUpload, outcome };
-    client.sender.send_or_abort(&DaemonFrame::RequestResult(result));
+    let result = rpc::daemon::frame::RequestResult {
+        request_id,
+        operation: rpc::daemon::frame::Operation::FinishUpload,
+        outcome,
+    };
+    client
+        .sender
+        .send_or_abort(&DaemonFrame::RequestResult(result));
 }
 
 fn stream_rpc_attachment(
@@ -1289,7 +1462,9 @@ fn stream_rpc_attachment(
         match source {
             crate::receive_store::Source::Memory { bytes, .. } => {
                 for chunk in bytes.chunks(rpc::daemon::MAX_CHUNK_BYTES) {
-                    if !sender.bulk_active(transfer_id) { return Err("attachment read canceled".into()); }
+                    if !sender.bulk_active(transfer_id) {
+                        return Err("attachment read canceled".into());
+                    }
                     sender.send(&DaemonFrame::BulkChunk(rpc::daemon::bulk::BulkChunk {
                         transfer_id,
                         offset,
@@ -1302,10 +1477,14 @@ fn stream_rpc_attachment(
                 let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
                 let mut buffer = Vec::with_capacity(rpc::daemon::MAX_CHUNK_BYTES);
                 loop {
-                    if !sender.bulk_active(transfer_id) { return Err("attachment read canceled".into()); }
+                    if !sender.bulk_active(transfer_id) {
+                        return Err("attachment read canceled".into());
+                    }
                     buffer.resize(rpc::daemon::MAX_CHUNK_BYTES, 0);
                     let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
-                    if read == 0 { break; }
+                    if read == 0 {
+                        break;
+                    }
                     buffer.truncate(read);
                     let frame = DaemonFrame::BulkChunk(rpc::daemon::bulk::BulkChunk {
                         transfer_id,
@@ -1324,14 +1503,19 @@ fn stream_rpc_attachment(
         if offset != descriptor.byte_len {
             return Err("attachment length changed while streaming".into());
         }
-        sender.send(&DaemonFrame::BulkFinished(rpc::daemon::bulk::BulkFinished {
-            transfer_id,
-            byte_len: offset,
-            digest: descriptor.digest,
-        }))
+        sender.send(&DaemonFrame::BulkFinished(
+            rpc::daemon::bulk::BulkFinished {
+                transfer_id,
+                byte_len: offset,
+                digest: descriptor.digest,
+            },
+        ))
     })();
     if let Err(reason) = result {
-        sender.send_or_abort(&DaemonFrame::BulkCanceled { transfer_id, reason });
+        sender.send_or_abort(&DaemonFrame::BulkCanceled {
+            transfer_id,
+            reason,
+        });
     }
     sender.cancel_bulk(transfer_id);
 }
@@ -1339,8 +1523,12 @@ fn stream_rpc_attachment(
 fn shutdown_rpc(client: &mut RemoteRpcClient) {
     client.sender.shutdown();
     let _ = client.control.shutdown(std::net::Shutdown::Both);
-    if let Some(thread) = client.reader_thread.take() { let _ = thread.join(); }
-    if let Some(thread) = client.writer_thread.take() { let _ = thread.join(); }
+    if let Some(thread) = client.reader_thread.take() {
+        let _ = thread.join();
+    }
+    if let Some(thread) = client.writer_thread.take() {
+        let _ = thread.join();
+    }
 }
 
 fn spawn_remote_client(
@@ -1582,10 +1770,14 @@ mod tests {
             bytes: vec![1],
         });
         assert!(sender.send(&bulk).is_err());
-        assert!(sender.send(&rpc::daemon::frame::DaemonFrame::Pong {
-            request_id: rpc::daemon::model::RequestId(1),
-            nonce: 1,
-        }).is_ok());
+        assert!(
+            sender
+                .send(&rpc::daemon::frame::DaemonFrame::Pong {
+                    request_id: rpc::daemon::model::RequestId(1),
+                    nonce: 1,
+                })
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1739,7 +1931,15 @@ mod tests {
         let mut rpc_clients = HashMap::new();
         let mut next_client_id = 1;
         let instance_id = daemon_instance_id();
-        handle_runtime_event(&mut app, event, &mut clients, &mut rpc_clients, &mut next_client_id, &sender, instance_id);
+        handle_runtime_event(
+            &mut app,
+            event,
+            &mut clients,
+            &mut rpc_clients,
+            &mut next_client_id,
+            &sender,
+            instance_id,
+        );
         assert_eq!(clients.len(), 1, "attach registers one remote client");
         // Like the runtime loop, waiting happens with the shared state open to
         // the render thread; holding the core guards would block its setup.
@@ -1777,7 +1977,15 @@ mod tests {
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .expect("daemon event before the teardown deadline");
             app.acquire_core_state();
-            handle_runtime_event(&mut app, event, &mut clients, &mut rpc_clients, &mut next_client_id, &sender, instance_id);
+            handle_runtime_event(
+                &mut app,
+                event,
+                &mut clients,
+                &mut rpc_clients,
+                &mut next_client_id,
+                &sender,
+                instance_id,
+            );
             app.release_core_state();
             for client in clients.values() {
                 client.channel.wake_sections(DirtySections::ALL);

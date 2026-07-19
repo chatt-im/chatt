@@ -1,12 +1,6 @@
 //! Best-effort socket quality-of-service settings for real-time voice media.
 
-use std::{
-    error::Error,
-    fmt,
-    io,
-    net::SocketAddr,
-    os::fd::RawFd,
-};
+use std::{error::Error, fmt, io, net::SocketAddr, os::fd::RawFd};
 
 /// Expedited Forwarding DSCP, recommended for low-delay voice bearer traffic.
 pub const VOICE_DSCP: u8 = 46;
@@ -113,9 +107,7 @@ mod tests {
         apply_voice_qos(socket.as_raw_fd(), socket.local_addr().unwrap()).unwrap();
 
         assert_eq!(
-            get_int_option(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS)
-                .unwrap()
-                & !0b11,
+            get_int_option(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS).unwrap() & !0b11,
             VOICE_TRAFFIC_CLASS
         );
         #[cfg(target_os = "linux")]
@@ -133,12 +125,7 @@ mod tests {
         apply_voice_qos(socket.as_raw_fd(), socket.local_addr().unwrap()).unwrap();
 
         assert_eq!(
-            get_int_option(
-                socket.as_raw_fd(),
-                libc::IPPROTO_IPV6,
-                libc::IPV6_TCLASS,
-            )
-            .unwrap()
+            get_int_option(socket.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_TCLASS,).unwrap()
                 & !0b11,
             VOICE_TRAFFIC_CLASS
         );

@@ -554,14 +554,14 @@ impl MlsService {
     ) -> Result<u64, CreateRoomError> {
         Self::validate_room_creation_envelope(creator, &descriptor, &bundle)?;
         if self.rooms.contains_key(&descriptor.room_id) {
-            return Err("encrypted room creator or room id is invalid".to_string().into());
+            return Err("encrypted room creator or room id is invalid"
+                .to_string()
+                .into());
         }
         if checkpoints.len() != descriptor.member_accounts.len() {
-            return Err(
-                "encrypted room roster checkpoints do not match"
-                    .to_string()
-                    .into(),
-            );
+            return Err("encrypted room roster checkpoints do not match"
+                .to_string()
+                .into());
         }
         for account in &descriptor.member_accounts {
             let roster = self
@@ -600,11 +600,9 @@ impl MlsService {
             .observe_group_info(prior)
             .map_err(|error| error.to_string())?;
         if parent.epoch != 0 || parent.group_id != descriptor.mls_group_id {
-            return Err(
-                "room creation GroupInfo does not match descriptor"
-                    .to_string()
-                    .into(),
-            );
+            return Err("room creation GroupInfo does not match descriptor"
+                .to_string()
+                .into());
         }
         if parent.member_client_ids.as_slice() != [creator_client_id] {
             return Err(
@@ -623,11 +621,9 @@ impl MlsService {
         )?;
         let next = applied.state;
         if applied.committer_client_id != creator_client_id {
-            return Err(
-                "initial commit was not signed by the authenticated device"
-                    .to_string()
-                    .into(),
-            );
+            return Err("initial commit was not signed by the authenticated device"
+                .to_string()
+                .into());
         }
         Self::validate_room_accounts(&validation_identities, &descriptor, &next)?;
         Self::validate_welcome_targets(

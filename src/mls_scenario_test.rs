@@ -19,9 +19,7 @@ use std::{
 };
 
 use rpc::{
-    control::{
-        ChatMessage, MAX_HISTORY_FETCH_MESSAGES, MessageFlags, decode_device_link_ticket,
-    },
+    control::{ChatMessage, MAX_HISTORY_FETCH_MESSAGES, MessageFlags, decode_device_link_ticket},
     crypto::dev_server_seed_hex,
     ids::{DeviceId, FileTransferId, MessageId, RoomId, UserId},
 };
@@ -66,7 +64,10 @@ fn init_scenario_logging(path: &Path) -> kvlog::collector::LoggerGuard {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!("remove previous MLS scenario log {}: {error}", path.display()),
+        Err(error) => panic!(
+            "remove previous MLS scenario log {}: {error}",
+            path.display()
+        ),
     }
     thread::add_spawn_hook(|_| {
         let parent = kvlog::SpanID::current();
@@ -762,9 +763,7 @@ impl PendingEvent {
                     && message.flags == MessageFlags::default()
             }
             PendingKind::Edit { target, body } => {
-                message.body == *body
-                    && message.target == Some(*target)
-                    && message.flags.edited()
+                message.body == *body && message.target == Some(*target) && message.flags.edited()
             }
             PendingKind::Delete { target } => {
                 message.body.is_empty()
@@ -955,11 +954,7 @@ impl ScenarioRunner {
         Ok(())
     }
 
-    fn observe_mls_chat(
-        &mut self,
-        device: &str,
-        chat: &AuthenticatedChat,
-    ) -> Result<(), String> {
+    fn observe_mls_chat(&mut self, device: &str, chat: &AuthenticatedChat) -> Result<(), String> {
         let message = &chat.message;
         let room_name = self
             .room_names
@@ -1020,7 +1015,9 @@ impl ScenarioRunner {
             .get_mut(device)
             .ok_or_else(|| format!("unknown scenario device {device}"))?;
         if state.revoked {
-            return Err(format!("revoked device {device} observed a future MLS message"));
+            return Err(format!(
+                "revoked device {device} observed a future MLS message"
+            ));
         }
         let start = state.room_starts.get(&room_name).copied().ok_or_else(|| {
             format!("device {device} observed a message from unauthorized room {room_name}")
@@ -1089,12 +1086,14 @@ impl ScenarioRunner {
         let budget = self.remaining(maximum)?;
         let deadline = Instant::now() + budget.timeout;
         loop {
-            let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-                format!(
-                    "{label}: timed out waiting on {device}; recent events: {:?}",
-                    self.recent_tail()
-                )
-            })?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "{label}: timed out waiting on {device}; recent events: {:?}",
+                        self.recent_tail()
+                    )
+                })?;
             let received = {
                 let runtime = self
                     .devices
@@ -1276,16 +1275,15 @@ impl ScenarioRunner {
             .user;
         let room_id = self.room(room)?.id;
         let body = format!("message:{event}");
-        self.begin_pending(event, room, sender, PendingKind::Text { body: body.clone() })?;
+        self.begin_pending(
+            event,
+            room,
+            sender,
+            PendingKind::Text { body: body.clone() },
+        )?;
         let index = self.pending[event].base_index;
         let receivers = self.online_entitled(room, index);
-        self.send_command(
-            device,
-            NetworkCommand::SendChat {
-                room_id,
-                body,
-            },
-        )?;
+        self.send_command(device, NetworkCommand::SendChat { room_id, body })?;
         for receiver in receivers {
             self.wait_pending_on(&receiver, event)?;
         }
@@ -1422,7 +1420,9 @@ impl ScenarioRunner {
         let expected_folded = fold_messages(&expected);
         let observed_folded = fold_messages(&observed);
         if observed_folded != expected_folded {
-            return Err(format!("device {device} folded history for {room} diverged"));
+            return Err(format!(
+                "device {device} folded history for {room} diverged"
+            ));
         }
         Ok(())
     }
@@ -1481,9 +1481,12 @@ impl ScenarioRunner {
         };
         for message in expected {
             let expected = message.clone();
-            self.wait_event(device, "offline MLS catch-up", DEFAULT_ACTION_TIMEOUT, move |event| {
-                matches!(event, NetworkEvent::Chat(chat) if chat.message == expected)
-            })?;
+            self.wait_event(
+                device,
+                "offline MLS catch-up",
+                DEFAULT_ACTION_TIMEOUT,
+                move |event| matches!(event, NetworkEvent::Chat(chat) if chat.message == expected),
+            )?;
         }
         Ok(())
     }
@@ -1664,7 +1667,9 @@ impl ScenarioRunner {
             .ok_or_else(|| format!("unknown ticket {ticket}"))?;
         let sponsor_user = self.devices[&pending.sponsor].user;
         if user != sponsor_user {
-            return Err(format!("ticket {ticket} links {sponsor_user:?}, not {user:?}"));
+            return Err(format!(
+                "ticket {ticket} links {sponsor_user:?}, not {user:?}"
+            ));
         }
         let pairing_string = pending.pairing_string.clone();
         let unavailable = pending.state == TicketState::Unavailable;
@@ -1767,7 +1772,10 @@ impl ScenarioRunner {
             self.send_text(
                 actor,
                 &room,
-                &format!("__revoke-{target}-{room}-{}", self.rooms[&room].events.len()),
+                &format!(
+                    "__revoke-{target}-{room}-{}",
+                    self.rooms[&room].events.len()
+                ),
             )?;
         }
         Ok(())
@@ -1853,7 +1861,9 @@ impl ScenarioRunner {
         let observed = fs::read(&path)
             .map_err(|error| format!("reading received file {}: {error}", path.display()))?;
         if observed != payload {
-            return Err(format!("device {device} received incorrect bytes for {name}"));
+            return Err(format!(
+                "device {device} received incorrect bytes for {name}"
+            ));
         }
         Ok(())
     }
@@ -1873,11 +1883,9 @@ impl ScenarioRunner {
             .user;
         let room_id = self.room(room)?.id;
         let name = format!("file-{event}.bin");
-        let payload_seed = event
-            .bytes()
-            .fold(0x6669_6c65_2d65_3265_u64, |seed, byte| {
-                seed.rotate_left(7) ^ u64::from(byte)
-            });
+        let payload_seed = event.bytes().fold(0x6669_6c65_2d65_3265_u64, |seed, byte| {
+            seed.rotate_left(7) ^ u64::from(byte)
+        });
         let mut payload_rng = ScenarioRng(payload_seed);
         let mut payload = vec![0u8; 256 * 1024];
         for chunk in payload.chunks_mut(8) {
@@ -1933,11 +1941,8 @@ impl ScenarioRunner {
                 self.send_command(device, NetworkCommand::SetUploadRate(0))?;
             }
             UploadOutcome::Cancel => {
-                let transfer_id = self.wait_transfer_progress(
-                    device,
-                    room_id,
-                    TransferDirection::Outgoing,
-                )?;
+                let transfer_id =
+                    self.wait_transfer_progress(device, room_id, TransferDirection::Outgoing)?;
                 self.send_command(device, NetworkCommand::CancelTransfer { transfer_id })?;
                 self.wait_event(
                     device,
@@ -1988,11 +1993,7 @@ impl ScenarioRunner {
                 self.send_command(device, NetworkCommand::SetUploadRate(0))?;
             }
             UploadOutcome::Restart => {
-                self.wait_transfer_progress(
-                    device,
-                    room_id,
-                    TransferDirection::Outgoing,
-                )?;
+                self.wait_transfer_progress(device, room_id, TransferDirection::Outgoing)?;
                 self.restart_device(device)?;
                 for receiver in announcement_receivers
                     .into_iter()
@@ -2121,7 +2122,10 @@ impl ScenarioRunner {
             self.trace.actions.push(action.clone());
         }
         if !self.pending.is_empty() {
-            return Err(format!("scenario ended with pending events: {:?}", self.pending.keys()));
+            return Err(format!(
+                "scenario ended with pending events: {:?}",
+                self.pending.keys()
+            ));
         }
         self.checkpoint()
     }
@@ -2133,7 +2137,12 @@ impl ScenarioRunner {
         self.execute(&action)
     }
 
-    fn write_failure(&self, output_dir: &Path, suffix: &str, error: &str) -> Result<PathBuf, String> {
+    fn write_failure(
+        &self,
+        output_dir: &Path,
+        suffix: &str,
+        error: &str,
+    ) -> Result<PathBuf, String> {
         fs::create_dir_all(output_dir)
             .map_err(|io_error| format!("creating {}: {io_error}", output_dir.display()))?;
         let path = output_dir.join(format!("{:016x}-{suffix}.trace", self.trace.seed));
@@ -2248,11 +2257,7 @@ impl Coverage {
 }
 
 fn rooms_for_online_device(runner: &ScenarioRunner, device: &str) -> Vec<String> {
-    runner.devices[device]
-        .room_starts
-        .keys()
-        .cloned()
-        .collect()
+    runner.devices[device].room_starts.keys().cloned().collect()
 }
 
 fn next_linked_device(runner: &ScenarioRunner, user: User) -> String {
@@ -2260,7 +2265,11 @@ fn next_linked_device(runner: &ScenarioRunner, user: User) -> String {
         .devices
         .keys()
         .filter(|label| device_user(label).ok() == Some(user))
-        .filter_map(|label| label.split_once('.').and_then(|(_, index)| index.parse::<usize>().ok()))
+        .filter_map(|label| {
+            label
+                .split_once('.')
+                .and_then(|(_, index)| index.parse::<usize>().ok())
+        })
         .max()
         .unwrap_or(0)
         + 1;
@@ -2308,7 +2317,10 @@ fn candidate_actions(
             ];
             let outcome = outcomes[rng.index(outcomes.len())];
             if outcome != UploadOutcome::Decline
-                || runner.online_entitled(&room, runner.rooms[&room].events.len()).len() > 1
+                || runner
+                    .online_entitled(&room, runner.rooms[&room].events.len())
+                    .len()
+                    > 1
             {
                 candidates.push(Action::Upload {
                     device: device.clone(),
@@ -2334,8 +2346,7 @@ fn candidate_actions(
             .count()
             < 3
             && !runner.tickets.values().any(|ticket| {
-                runner.devices[&ticket.sponsor].user == user
-                    && ticket.state == TicketState::Active
+                runner.devices[&ticket.sponsor].user == user && ticket.state == TicketState::Active
             })
         {
             candidates.push(Action::CreateLink {
@@ -2431,9 +2442,7 @@ fn candidate_actions(
             let targets = runner
                 .devices
                 .iter()
-                .filter(|(label, device)| {
-                    device.user == user && !device.revoked && *label != actor
-                })
+                .filter(|(label, device)| device.user == user && !device.revoked && *label != actor)
                 .map(|(label, _)| label.clone())
                 .collect::<Vec<_>>();
             let Some(target) = targets.get(rng.index(targets.len().max(1))) else {
@@ -2865,7 +2874,10 @@ fn regression_paths() -> Result<Vec<PathBuf>, String> {
     let mut paths = fs::read_dir(&directory)
         .map_err(|error| format!("reading {}: {error}", directory.display()))?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|extension| extension == "trace"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "trace")
+        })
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
@@ -2876,7 +2888,8 @@ fn mls_live_stateful_scenario_regression_corpus() {
     let paths = regression_paths().expect("read MLS scenario regression corpus");
     assert!(!paths.is_empty(), "MLS scenario regression corpus is empty");
     for path in paths {
-        let trace = Trace::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let trace =
+            Trace::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         let mut runner = ScenarioRunner::new(trace.seed, None)
             .unwrap_or_else(|error| panic!("{} setup: {error}", path.display()));
         runner

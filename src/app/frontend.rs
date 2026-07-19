@@ -28,7 +28,10 @@ pub(crate) enum RpcCommandEffect {
         descriptor: AttachmentDescriptor,
         source: crate::receive_store::Source,
     },
-    BeginUpload { request_id: RequestId, upload: BeginUpload },
+    BeginUpload {
+        request_id: RequestId,
+        upload: BeginUpload,
+    },
     None,
 }
 
@@ -62,8 +65,17 @@ impl App {
                 behind_head: meta.unread == 0 && meta.head > meta.last_read,
                 voice_active: !meta.voice_users.is_empty(),
                 trust: match (&meta.kind, self.room.e2e_trust_state(id)) {
-                    (ClientRoomKind::Dm { .. }, Some(super::room::DmTrustState::Verified { .. })) => TrustState::Verified,
-                    (ClientRoomKind::Dm { .. }, Some(super::room::DmTrustState::Accepted { change_from: Some(_), .. })) => TrustState::Changed,
+                    (
+                        ClientRoomKind::Dm { .. },
+                        Some(super::room::DmTrustState::Verified { .. }),
+                    ) => TrustState::Verified,
+                    (
+                        ClientRoomKind::Dm { .. },
+                        Some(super::room::DmTrustState::Accepted {
+                            change_from: Some(_),
+                            ..
+                        }),
+                    ) => TrustState::Changed,
                     (ClientRoomKind::Dm { .. }, _) => TrustState::Unverified,
                     _ => TrustState::NotApplicable,
                 },
@@ -92,7 +104,9 @@ impl App {
                 output_volume: self.config.audio.output_volume,
                 joined_room: self.room.voice_room,
             },
-            transfers: selected_room.map_or_else(Vec::new, |room_id| self.room.rpc_transfer_summaries(room_id)),
+            transfers: selected_room.map_or_else(Vec::new, |room_id| {
+                self.room.rpc_transfer_summaries(room_id)
+            }),
         }
     }
 
@@ -118,10 +132,7 @@ impl App {
             .collect();
         let (room_cursor, room_at_start) = self.room.history_cursor(room_id);
         let (older_cursor, at_start) = if has_older {
-            (
-                messages.first().map(|message| message.message_id),
-                false,
-            )
+            (messages.first().map(|message| message.message_id), false)
         } else {
             (room_cursor, room_at_start)
         };
@@ -130,16 +141,19 @@ impl App {
             messages,
             older_cursor,
             at_start,
-            participants: self.room.participant_summaries(room_id).into_iter().map(|user| {
-                rpc::daemon::model::Participant {
+            participants: self
+                .room
+                .participant_summaries(room_id)
+                .into_iter()
+                .map(|user| rpc::daemon::model::Participant {
                     user_id: user.user_id,
                     name: user.username,
                     online: user.online,
                     speaking: false,
                     muted: user.voice_status.muted,
                     deafened: user.voice_status.deafened,
-                }
-            }).collect(),
+                })
+                .collect(),
         }
     }
 
@@ -211,71 +225,180 @@ impl App {
         match frame {
             ClientFrame::Ping { request_id, nonce } => RpcCommandEffect::Pong(request_id, nonce),
             ClientFrame::RequestSnapshot { request_id } => RpcCommandEffect::Snapshot(request_id),
-            ClientFrame::Disconnect { request_id } => RpcCommandEffect::Disconnect(accepted(request_id, Operation::Disconnect)),
-            ClientFrame::SelectRoom { request_id, room_id } => {
+            ClientFrame::Disconnect { request_id } => {
+                RpcCommandEffect::Disconnect(accepted(request_id, Operation::Disconnect))
+            }
+            ClientFrame::SelectRoom {
+                request_id,
+                room_id,
+            } => {
                 let previous = std::mem::replace(&mut self.command_client, client_id);
                 let selected = self.set_viewed_room(room_id);
                 self.command_client = previous;
                 if selected {
                     RpcCommandEffect::Reply(accepted(request_id, Operation::SelectRoom))
                 } else {
-                    RpcCommandEffect::Reply(rejected(request_id, Operation::SelectRoom, 404, "room is not available"))
+                    RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::SelectRoom,
+                        404,
+                        "room is not available",
+                    ))
                 }
             }
-            ClientFrame::LoadOlder { request_id, room_id, before, limit } => {
+            ClientFrame::LoadOlder {
+                request_id,
+                room_id,
+                before,
+                limit,
+            } => {
                 if self.room.selected_room_for(client_id) != Some(room_id) {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::LoadOlder, 409, "room is not selected by this client"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::LoadOlder,
+                        409,
+                        "room is not selected by this client",
+                    ));
                 }
                 let (expected_before, at_start) = self.room.history_cursor(room_id);
                 if at_start {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::LoadOlder, 409, "no older history is currently available"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::LoadOlder,
+                        409,
+                        "no older history is currently available",
+                    ));
                 }
                 if before != expected_before {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::LoadOlder, 409, "history cursor is stale"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::LoadOlder,
+                        409,
+                        "history cursor is stale",
+                    ));
                 }
-                let Some((_, canonical_before, canonical_limit)) = self.room.older_history_request(room_id) else {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::LoadOlder, 409, "an older-history fetch is already active"));
+                let Some((_, canonical_before, canonical_limit)) =
+                    self.room.older_history_request(room_id)
+                else {
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::LoadOlder,
+                        409,
+                        "an older-history fetch is already active",
+                    ));
                 };
                 let limit = limit.max(1).min(canonical_limit);
-                if self.send_network_command(NetworkCommand::FetchHistory { room_id, before: canonical_before, limit }, false) {
+                if self.send_network_command(
+                    NetworkCommand::FetchHistory {
+                        room_id,
+                        before: canonical_before,
+                        limit,
+                    },
+                    false,
+                ) {
                     RpcCommandEffect::Reply(accepted(request_id, Operation::LoadOlder))
                 } else {
                     self.room.abort_history_fetch(room_id, canonical_before);
-                    RpcCommandEffect::Reply(rejected(request_id, Operation::LoadOlder, 503, "not connected"))
+                    RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::LoadOlder,
+                        503,
+                        "not connected",
+                    ))
                 }
             }
-            ClientFrame::SendMessage { request_id, room_id, body } => {
+            ClientFrame::SendMessage {
+                request_id,
+                room_id,
+                body,
+            } => {
                 if body.trim().is_empty() {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::SendMessage, 422, "chat message is empty"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::SendMessage,
+                        422,
+                        "chat message is empty",
+                    ));
                 }
                 if self.room.room_meta(room_id).is_none() {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::SendMessage, 404, "room is not available"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::SendMessage,
+                        404,
+                        "room is not available",
+                    ));
                 }
                 if self.send_network_command(NetworkCommand::SendChat { room_id, body }, true) {
                     RpcCommandEffect::Reply(accepted(request_id, Operation::SendMessage))
                 } else {
-                    RpcCommandEffect::Reply(rejected(request_id, Operation::SendMessage, 503, "not connected"))
+                    RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::SendMessage,
+                        503,
+                        "not connected",
+                    ))
                 }
             }
-            ClientFrame::EditMessage { request_id, room_id, target, body } => {
+            ClientFrame::EditMessage {
+                request_id,
+                room_id,
+                target,
+                body,
+            } => {
                 if body.trim().is_empty() {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::EditMessage, 422, "chat message is empty"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::EditMessage,
+                        422,
+                        "chat message is empty",
+                    ));
                 }
                 if !self.rpc_owns_message(room_id, target) {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::EditMessage, 403, "message cannot be edited"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::EditMessage,
+                        403,
+                        "message cannot be edited",
+                    ));
                 }
-                if self.send_network_command(NetworkCommand::EditChat { room_id, target, body }, true) {
+                if self.send_network_command(
+                    NetworkCommand::EditChat {
+                        room_id,
+                        target,
+                        body,
+                    },
+                    true,
+                ) {
                     RpcCommandEffect::Reply(accepted(request_id, Operation::EditMessage))
                 } else {
-                    RpcCommandEffect::Reply(rejected(request_id, Operation::EditMessage, 503, "not connected"))
+                    RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::EditMessage,
+                        503,
+                        "not connected",
+                    ))
                 }
             }
-            ClientFrame::DeleteMessage { request_id, room_id, target } => {
+            ClientFrame::DeleteMessage {
+                request_id,
+                room_id,
+                target,
+            } => {
                 if !self.rpc_owns_message(room_id, target) {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::DeleteMessage, 403, "message cannot be deleted"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::DeleteMessage,
+                        403,
+                        "message cannot be deleted",
+                    ));
                 }
                 if self.network.is_none() {
-                    RpcCommandEffect::Reply(rejected(request_id, Operation::DeleteMessage, 503, "not connected"))
+                    RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::DeleteMessage,
+                        503,
+                        "not connected",
+                    ))
                 } else {
                     self.delete_chat_messages(room_id, vec![target]);
                     RpcCommandEffect::Reply(accepted(request_id, Operation::DeleteMessage))
@@ -285,7 +408,10 @@ impl App {
                 self.set_mute(muted);
                 RpcCommandEffect::Reply(accepted(request_id, Operation::SetMuted))
             }
-            ClientFrame::SetDeafened { request_id, deafened } => {
+            ClientFrame::SetDeafened {
+                request_id,
+                deafened,
+            } => {
                 self.set_deafen(deafened);
                 RpcCommandEffect::Reply(accepted(request_id, Operation::SetDeafened))
             }
@@ -293,9 +419,17 @@ impl App {
                 self.set_output_volume(volume);
                 RpcCommandEffect::Reply(accepted(request_id, Operation::SetOutputVolume))
             }
-            ClientFrame::JoinVoice { request_id, room_id } => {
+            ClientFrame::JoinVoice {
+                request_id,
+                room_id,
+            } => {
                 if self.network.is_none() || self.room.room_meta(room_id).is_none() {
-                    RpcCommandEffect::Reply(rejected(request_id, Operation::JoinVoice, 503, "voice room is unavailable"))
+                    RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::JoinVoice,
+                        503,
+                        "voice room is unavailable",
+                    ))
                 } else {
                     self.join_voice_room(room_id);
                     RpcCommandEffect::Reply(accepted(request_id, Operation::JoinVoice))
@@ -307,34 +441,89 @@ impl App {
             }
             ClientFrame::BeginUpload { request_id, upload } => {
                 if self.room.room_meta(upload.room_id).is_none() {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::BeginUpload, 404, "upload room is unavailable"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::BeginUpload,
+                        404,
+                        "upload room is unavailable",
+                    ));
                 }
                 if self.network.is_none() {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::BeginUpload, 503, "not connected"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::BeginUpload,
+                        503,
+                        "not connected",
+                    ));
                 }
                 if upload.byte_len > self.config.files.max_upload_bytes() {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::BeginUpload, 413, "upload exceeds configured size limit"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::BeginUpload,
+                        413,
+                        "upload exceeds configured size limit",
+                    ));
                 }
                 RpcCommandEffect::BeginUpload { request_id, upload }
             }
-            ClientFrame::FinishUpload { request_id, .. } => RpcCommandEffect::Reply(rejected(request_id, Operation::FinishUpload, 409, "upload has no runtime staging state")),
-            ClientFrame::CancelUpload { request_id, .. } => RpcCommandEffect::Reply(accepted(request_id, Operation::CancelUpload)),
+            ClientFrame::FinishUpload { request_id, .. } => RpcCommandEffect::Reply(rejected(
+                request_id,
+                Operation::FinishUpload,
+                409,
+                "upload has no runtime staging state",
+            )),
+            ClientFrame::CancelUpload { request_id, .. } => {
+                RpcCommandEffect::Reply(accepted(request_id, Operation::CancelUpload))
+            }
             ClientFrame::BeginAttachmentRead { request_id, read } => {
                 if self.room.selected_room_for(client_id) != Some(read.room_id) {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::BeginAttachmentRead, 403, "attachment room is not selected by this client"));
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::BeginAttachmentRead,
+                        403,
+                        "attachment room is not selected by this client",
+                    ));
                 }
-                let Some((descriptor, source)) = self.rpc_attachment_source(read.room_id, read.attachment_id) else {
-                    return RpcCommandEffect::Reply(rejected(request_id, Operation::BeginAttachmentRead, 404, "attachment is unavailable"));
+                let Some((descriptor, source)) =
+                    self.rpc_attachment_source(read.room_id, read.attachment_id)
+                else {
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::BeginAttachmentRead,
+                        404,
+                        "attachment is unavailable",
+                    ));
                 };
-                RpcCommandEffect::BeginRead { result: accepted(request_id, Operation::BeginAttachmentRead), read, descriptor, source }
+                RpcCommandEffect::BeginRead {
+                    result: accepted(request_id, Operation::BeginAttachmentRead),
+                    read,
+                    descriptor,
+                    source,
+                }
             }
-            ClientFrame::CancelBulkTransfer { request_id, transfer_id } => {
+            ClientFrame::CancelBulkTransfer {
+                request_id,
+                transfer_id,
+            } => {
                 let _ = transfer_id;
-                RpcCommandEffect::Reply(rejected(request_id, Operation::CancelBulkTransfer, 404, "bulk transfer is not active"))
+                RpcCommandEffect::Reply(rejected(
+                    request_id,
+                    Operation::CancelBulkTransfer,
+                    404,
+                    "bulk transfer is not active",
+                ))
             }
-            ClientFrame::CancelFileTransfer { request_id, transfer_id } => {
+            ClientFrame::CancelFileTransfer {
+                request_id,
+                transfer_id,
+            } => {
                 if self.network.is_none() {
-                    RpcCommandEffect::Reply(rejected(request_id, Operation::CancelFileTransfer, 503, "not connected"))
+                    RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::CancelFileTransfer,
+                        503,
+                        "not connected",
+                    ))
                 } else {
                     self.cancel_transfer(transfer_id);
                     RpcCommandEffect::Reply(accepted(request_id, Operation::CancelFileTransfer))
@@ -355,7 +544,9 @@ impl App {
         detail: &crate::room_history::FileDetail,
     ) -> Option<AttachmentDescriptor> {
         let metadata = self.download_store.attachment_metadata(&detail.file_name)?;
-        let (width, height) = detail.dimensions().map_or((None, None), |(w, h)| (Some(w), Some(h)));
+        let (width, height) = detail
+            .dimensions()
+            .map_or((None, None), |(w, h)| (Some(w), Some(h)));
         let content_type = metadata.content_type.to_string();
         let media_kind = if content_type.starts_with("image/") {
             MediaKind::Image
@@ -385,10 +576,19 @@ impl App {
     ) -> Option<(AttachmentDescriptor, crate::receive_store::Source)> {
         let history = self.room.history_for(room_id);
         for message in history.messages {
-            let Some(transfer_id) = message.file_transfer_id else { continue; };
-            let key = crate::room_history::FileHistoryKey { timestamp_ms: message.timestamp_ms, transfer_id };
-            let Some(detail) = history.files.get(&key) else { continue; };
-            let Some(descriptor) = self.rpc_attachment_descriptor(detail) else { continue; };
+            let Some(transfer_id) = message.file_transfer_id else {
+                continue;
+            };
+            let key = crate::room_history::FileHistoryKey {
+                timestamp_ms: message.timestamp_ms,
+                transfer_id,
+            };
+            let Some(detail) = history.files.get(&key) else {
+                continue;
+            };
+            let Some(descriptor) = self.rpc_attachment_descriptor(detail) else {
+                continue;
+            };
             if descriptor.id == attachment_id {
                 let source = self.download_store.resolve_attachment(attachment_id)?;
                 return Some((descriptor, source));
@@ -412,7 +612,13 @@ impl App {
             name_override: Some(name),
             delete_after_open: true,
         };
-        if self.send_network_command(NetworkCommand::UploadFile { room_id: Some(room_id), request }, true) {
+        if self.send_network_command(
+            NetworkCommand::UploadFile {
+                room_id: Some(room_id),
+                request,
+            },
+            true,
+        ) {
             Ok(())
         } else {
             let _ = std::fs::remove_file(path);
@@ -437,11 +643,27 @@ fn rpc_message_size_estimate(message: &rpc::control::ChatMessage) -> usize {
 }
 
 fn accepted(request_id: RequestId, operation: Operation) -> RequestResult {
-    RequestResult { request_id, operation, outcome: RequestOutcome::Accepted }
+    RequestResult {
+        request_id,
+        operation,
+        outcome: RequestOutcome::Accepted,
+    }
 }
 
-fn rejected(request_id: RequestId, operation: Operation, code: u16, message: &str) -> RequestResult {
-    RequestResult { request_id, operation, outcome: RequestOutcome::Rejected { code, message: message.into() } }
+fn rejected(
+    request_id: RequestId,
+    operation: Operation,
+    code: u16,
+    message: &str,
+) -> RequestResult {
+    RequestResult {
+        request_id,
+        operation,
+        outcome: RequestOutcome::Rejected {
+            code,
+            message: message.into(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -456,20 +678,46 @@ mod tests {
     fn rpc_frontends_keep_independent_selected_rooms() {
         let mut app = App::new(crate::config::Config::default(), None).unwrap();
         let rooms = vec![
-            RoomInfo { room_id: RoomId(1), name: "one".into(), kind: WireRoomKind::Public, head: None, voice_users: Vec::new() },
-            RoomInfo { room_id: RoomId(2), name: "two".into(), kind: WireRoomKind::Public, head: None, voice_users: Vec::new() },
+            RoomInfo {
+                room_id: RoomId(1),
+                name: "one".into(),
+                kind: WireRoomKind::Public,
+                head: None,
+                voice_users: Vec::new(),
+            },
+            RoomInfo {
+                room_id: RoomId(2),
+                name: "two".into(),
+                kind: WireRoomKind::Public,
+                head: None,
+                voice_users: Vec::new(),
+            },
         ];
         app.room.authenticated(
             &rooms,
-            vec![UserSummary { user_id: UserId(1), username: "alice".into(), online: true, connected_at_ms: 1, voice_status: ParticipantVoiceStatus::default() }],
-            RoomId(1), Some(RoomId(1)), Some(UserId(1)),
+            vec![UserSummary {
+                user_id: UserId(1),
+                username: "alice".into(),
+                online: true,
+                connected_at_ms: 1,
+                voice_status: ParticipantVoiceStatus::default(),
+            }],
+            RoomId(1),
+            Some(RoomId(1)),
+            Some(UserId(1)),
         );
         let first = ClientId(1);
         let second = ClientId(2);
         app.register_rpc_client(first);
         app.register_rpc_client(second);
         assert!(matches!(
-            app.handle_rpc_frame(first, ClientFrame::SelectRoom { request_id: RequestId(1), room_id: RoomId(2) }),
+            app.handle_rpc_frame(
+                first,
+                ClientFrame::SelectRoom {
+                    request_id: RequestId(1),
+                    room_id: RoomId(2)
+                }
+            ),
             RpcCommandEffect::Reply(_)
         ));
         assert_eq!(app.rpc_snapshot(first).selected_room, Some(RoomId(2)));

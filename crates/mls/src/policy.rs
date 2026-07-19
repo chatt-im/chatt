@@ -90,6 +90,15 @@ struct PolicyState {
     /// Historical delivery validation uses this cache without reactivating a
     /// device in `devices` or rolling back the current roster checkpoint.
     historical_devices: HashMap<Vec<u8>, CertifiedDevice>,
+    /// Authority-validated historical roster snapshots, keyed by account and
+    /// revision.
+    ///
+    /// Retained delivery events deliberately repeat these snapshots so that
+    /// each event remains authenticatable after a reconnect or restart. Keep
+    /// the exact-value fast path in `install_historical_roster`: validating
+    /// every copy turns event processing into `events * room_members` public
+    /// key verifications and has repeatedly regressed the E2E matrix.
+    historical_rosters: HashMap<(AccountId, u64), SignedDeviceRoster>,
     /// Highest authenticated roster revision installed for each account.
     ///
     /// The delivery service can replay an older, still-valid signed roster.
@@ -126,11 +135,12 @@ impl ChattIdentityProvider {
     }
 
     /// Replaces all active certificates for an account with one validated
-    /// current roster. Historical certificates are intentionally not kept.
+    /// current roster. Superseded certificates remain historical-only.
     pub fn install_roster(&self, roster: &SignedDeviceRoster) -> Result<(), PolicyError> {
         let checkpoint = roster_checkpoint(roster);
         {
             let state = self.state.read().map_err(|_| PolicyError::LockPoisoned)?;
+            historical_roster_cache_hit(&state, roster)?;
             if let Some(current) = state.rosters.get(&roster.body.account_id) {
                 if *current == checkpoint {
                     return Ok(());
@@ -145,6 +155,7 @@ impl ChattIdentityProvider {
         validate_device_roster(roster, &self.server_id, roster.body.user_id)
             .map_err(PolicyError::InvalidRoster)?;
         let mut state = self.state.write().map_err(|_| PolicyError::LockPoisoned)?;
+        historical_roster_cache_hit(&state, roster)?;
         if let Some(current) = state.rosters.get(&roster.body.account_id) {
             if *current == checkpoint {
                 return Ok(());
@@ -167,6 +178,10 @@ impl ChattIdentityProvider {
                 .or_insert_with(|| device.clone());
             state.devices.insert(client_id, device);
         }
+        state.historical_rosters.insert(
+            (roster.body.account_id, roster.body.revision),
+            roster.clone(),
+        );
         state.rosters.insert(roster.body.account_id, checkpoint);
         debug_assert_eq!(
             state
@@ -185,9 +200,21 @@ impl ChattIdentityProvider {
         &self,
         roster: &SignedDeviceRoster,
     ) -> Result<(), PolicyError> {
+        // This read-side hit is the normal delivery path: one distinct roster
+        // is normally repeated across many events. Compare the complete signed
+        // value so a same-revision equivocation is never mistaken for a hit.
+        {
+            let state = self.state.read().map_err(|_| PolicyError::LockPoisoned)?;
+            if historical_roster_cache_hit(&state, roster)? {
+                return Ok(());
+            }
+        }
         validate_device_roster(roster, &self.server_id, roster.body.user_id)
             .map_err(PolicyError::InvalidRoster)?;
         let mut state = self.state.write().map_err(|_| PolicyError::LockPoisoned)?;
+        if historical_roster_cache_hit(&state, roster)? {
+            return Ok(());
+        }
         for certificate in &roster.body.active_devices {
             let client_id = certificate.body.mls_client_id.clone();
             let device = certified_device(certificate);
@@ -203,6 +230,10 @@ impl ChattIdentityProvider {
             }
             state.historical_devices.entry(client_id).or_insert(device);
         }
+        state.historical_rosters.insert(
+            (roster.body.account_id, roster.body.revision),
+            roster.clone(),
+        );
         Ok(())
     }
 
@@ -243,9 +274,7 @@ impl ChattIdentityProvider {
         } else {
             &state.devices
         };
-        let device = devices
-            .get(client_id)
-            .ok_or(PolicyError::UnknownDevice)?;
+        let device = devices.get(client_id).ok_or(PolicyError::UnknownDevice)?;
         if signing_identity.signature_key.as_ref() != device.signature_key {
             return Err(PolicyError::SignatureKeyMismatch);
         }
@@ -552,6 +581,22 @@ fn basic_client_id(signing_identity: &SigningIdentity) -> Result<&[u8], PolicyEr
         .ok_or(PolicyError::UnsupportedCredential)
 }
 
+fn historical_roster_cache_hit(
+    state: &PolicyState,
+    roster: &SignedDeviceRoster,
+) -> Result<bool, PolicyError> {
+    match state
+        .historical_rosters
+        .get(&(roster.body.account_id, roster.body.revision))
+    {
+        Some(existing) if existing == roster => Ok(true),
+        Some(_) => Err(PolicyError::InvalidRoster(
+            "historical device roster revision equivocates".to_string(),
+        )),
+        None => Ok(false),
+    }
+}
+
 fn certified_device(certificate: &SignedDeviceCertificate) -> CertifiedDevice {
     CertifiedDevice {
         account_id: certificate.body.account_id,
@@ -749,6 +794,37 @@ mod tests {
             .historical_group_info_observer()
             .validate_member(&old_identity, None, MemberValidationContext::None)
             .unwrap();
+    }
+
+    #[test]
+    fn historical_roster_cache_rejects_same_revision_equivocation() {
+        let server = b"server";
+        let first = roster(server, UserId(1), &[1; 32], DeviceId([1; 16]), &[11; 32]);
+        let conflicting = roster(server, UserId(1), &[1; 32], DeviceId([2; 16]), &[12; 32]);
+        let identities = ChattIdentityProvider::new(server.to_vec());
+
+        identities.install_historical_roster(&first).unwrap();
+        identities.install_historical_roster(&first).unwrap();
+        assert!(matches!(
+            identities.install_historical_roster(&conflicting),
+            Err(PolicyError::InvalidRoster(error))
+                if error == "historical device roster revision equivocates"
+        ));
+    }
+
+    #[test]
+    fn current_roster_seeds_historical_validation_cache() {
+        let server = b"server";
+        let roster = roster(server, UserId(1), &[1; 32], DeviceId([1; 16]), &[11; 32]);
+        let identities = ChattIdentityProvider::new(server.to_vec());
+        identities.install_roster(&roster).unwrap();
+
+        // A different server identity makes fresh roster validation fail. The
+        // shared cache must recognize this exact signed value before reaching
+        // that public-key validation path.
+        let mut observer = identities.clone();
+        observer.server_id = Arc::new(b"different server".to_vec());
+        observer.install_historical_roster(&roster).unwrap();
     }
 
     #[test]

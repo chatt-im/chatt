@@ -5,9 +5,8 @@ use crate::ids::{FileTransferId, MessageId, RoomId};
 use super::{
     bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished, BulkStarted},
     model::{
-        BulkTransferId, ConnectionState, DaemonInstanceId,
-        Message, Participant, RequestId, RoomSnapshot, RoomSummary, StateSnapshot,
-        TransferSummary, TrustState, VoiceState,
+        BulkTransferId, ConnectionState, DaemonInstanceId, Message, Participant, RequestId,
+        RoomSnapshot, RoomSummary, StateSnapshot, TransferSummary, TrustState, VoiceState,
     },
 };
 
@@ -75,9 +74,7 @@ impl NegotiatedLimits {
         if self.chunk_bytes == 0 || self.chunk_bytes as usize > super::MAX_CHUNK_BYTES {
             return Err("negotiated chunk limit is invalid".into());
         }
-        if self.message_bytes == 0
-            || self.message_bytes as usize > super::MAX_MESSAGE_BODY_BYTES
-        {
+        if self.message_bytes == 0 || self.message_bytes as usize > super::MAX_MESSAGE_BODY_BYTES {
             return Err("negotiated message limit is invalid".into());
         }
         if self.upload_bytes == 0 {
@@ -151,23 +148,66 @@ pub struct RequestResult {
 #[derive(Clone, Debug, PartialEq, Jsony)]
 #[jsony(Binary, version)]
 pub enum StateDelta {
-    ConnectionChanged { connection: ConnectionState, active_server: Option<String> },
-    RoomCatalogReset { rooms: Vec<RoomSummary> },
-    RoomUpserted { room: RoomSummary },
-    RoomRemoved { room_id: RoomId },
-    RoomUnreadChanged { room_id: RoomId, unread: u32, behind_head: bool },
-    ActiveRoomChanged { room_id: Option<RoomId> },
+    ConnectionChanged {
+        connection: ConnectionState,
+        active_server: Option<String>,
+    },
+    RoomCatalogReset {
+        rooms: Vec<RoomSummary>,
+    },
+    RoomUpserted {
+        room: RoomSummary,
+    },
+    RoomRemoved {
+        room_id: RoomId,
+    },
+    RoomUnreadChanged {
+        room_id: RoomId,
+        unread: u32,
+        behind_head: bool,
+    },
+    ActiveRoomChanged {
+        room_id: Option<RoomId>,
+    },
     RoomSnapshot(RoomSnapshot),
-    MessagesPrepended { room_id: RoomId, messages: Vec<Message>, older_cursor: Option<MessageId>, at_start: bool },
-    HistoryStateChanged { room_id: RoomId, older_cursor: Option<MessageId>, at_start: bool },
-    MessageUpserted { message: Message },
-    MessageDeleted { room_id: RoomId, message_id: MessageId },
-    ParticipantsChanged { room_id: RoomId, participants: Vec<Participant> },
-    SecurityChanged { room_id: RoomId, trust: TrustState },
-    TransferChanged { transfer: TransferSummary },
-    TransferRemoved { transfer_id: FileTransferId },
-    VoiceStateChanged { voice: VoiceState },
-    ResyncRequired { reason: String },
+    MessagesPrepended {
+        room_id: RoomId,
+        messages: Vec<Message>,
+        older_cursor: Option<MessageId>,
+        at_start: bool,
+    },
+    HistoryStateChanged {
+        room_id: RoomId,
+        older_cursor: Option<MessageId>,
+        at_start: bool,
+    },
+    MessageUpserted {
+        message: Message,
+    },
+    MessageDeleted {
+        room_id: RoomId,
+        message_id: MessageId,
+    },
+    ParticipantsChanged {
+        room_id: RoomId,
+        participants: Vec<Participant>,
+    },
+    SecurityChanged {
+        room_id: RoomId,
+        trust: TrustState,
+    },
+    TransferChanged {
+        transfer: TransferSummary,
+    },
+    TransferRemoved {
+        transfer_id: FileTransferId,
+    },
+    VoiceStateChanged {
+        voice: VoiceState,
+    },
+    ResyncRequired {
+        reason: String,
+    },
     DaemonStopping,
 }
 
@@ -182,26 +222,86 @@ pub struct StateEvent {
 #[derive(Clone, Debug, PartialEq, Jsony)]
 #[jsony(Binary, version)]
 pub enum ClientFrame {
-    SelectRoom { request_id: RequestId, room_id: RoomId },
-    LoadOlder { request_id: RequestId, room_id: RoomId, before: Option<MessageId>, limit: u16 },
-    SendMessage { request_id: RequestId, room_id: RoomId, body: String },
-    EditMessage { request_id: RequestId, room_id: RoomId, target: MessageId, body: String },
-    DeleteMessage { request_id: RequestId, room_id: RoomId, target: MessageId },
-    BeginUpload { request_id: RequestId, upload: BeginUpload },
+    SelectRoom {
+        request_id: RequestId,
+        room_id: RoomId,
+    },
+    LoadOlder {
+        request_id: RequestId,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        limit: u16,
+    },
+    SendMessage {
+        request_id: RequestId,
+        room_id: RoomId,
+        body: String,
+    },
+    EditMessage {
+        request_id: RequestId,
+        room_id: RoomId,
+        target: MessageId,
+        body: String,
+    },
+    DeleteMessage {
+        request_id: RequestId,
+        room_id: RoomId,
+        target: MessageId,
+    },
+    BeginUpload {
+        request_id: RequestId,
+        upload: BeginUpload,
+    },
     UploadChunk(BulkChunk),
-    FinishUpload { request_id: RequestId, finished: BulkFinished },
-    CancelUpload { request_id: RequestId, transfer_id: BulkTransferId },
-    BeginAttachmentRead { request_id: RequestId, read: BeginAttachmentRead },
-    CancelBulkTransfer { request_id: RequestId, transfer_id: BulkTransferId },
-    CancelFileTransfer { request_id: RequestId, transfer_id: FileTransferId },
-    SetMuted { request_id: RequestId, muted: bool },
-    SetDeafened { request_id: RequestId, deafened: bool },
-    JoinVoice { request_id: RequestId, room_id: RoomId },
-    LeaveVoice { request_id: RequestId },
-    SetOutputVolume { request_id: RequestId, volume: f32 },
-    Ping { request_id: RequestId, nonce: u64 },
-    RequestSnapshot { request_id: RequestId },
-    Disconnect { request_id: RequestId },
+    FinishUpload {
+        request_id: RequestId,
+        finished: BulkFinished,
+    },
+    CancelUpload {
+        request_id: RequestId,
+        transfer_id: BulkTransferId,
+    },
+    BeginAttachmentRead {
+        request_id: RequestId,
+        read: BeginAttachmentRead,
+    },
+    CancelBulkTransfer {
+        request_id: RequestId,
+        transfer_id: BulkTransferId,
+    },
+    CancelFileTransfer {
+        request_id: RequestId,
+        transfer_id: FileTransferId,
+    },
+    SetMuted {
+        request_id: RequestId,
+        muted: bool,
+    },
+    SetDeafened {
+        request_id: RequestId,
+        deafened: bool,
+    },
+    JoinVoice {
+        request_id: RequestId,
+        room_id: RoomId,
+    },
+    LeaveVoice {
+        request_id: RequestId,
+    },
+    SetOutputVolume {
+        request_id: RequestId,
+        volume: f32,
+    },
+    Ping {
+        request_id: RequestId,
+        nonce: u64,
+    },
+    RequestSnapshot {
+        request_id: RequestId,
+    },
+    Disconnect {
+        request_id: RequestId,
+    },
 }
 
 impl ClientFrame {
@@ -235,14 +335,24 @@ impl ClientFrame {
 #[jsony(Binary, version)]
 pub enum DaemonFrame {
     Welcome(Welcome),
-    Snapshot { instance_id: DaemonInstanceId, event_seq: u64, snapshot: StateSnapshot },
+    Snapshot {
+        instance_id: DaemonInstanceId,
+        event_seq: u64,
+        snapshot: StateSnapshot,
+    },
     Event(StateEvent),
     RequestResult(RequestResult),
-    Pong { request_id: RequestId, nonce: u64 },
+    Pong {
+        request_id: RequestId,
+        nonce: u64,
+    },
     BulkStarted(BulkStarted),
     BulkChunk(BulkChunk),
     BulkFinished(BulkFinished),
-    BulkCanceled { transfer_id: BulkTransferId, reason: String },
+    BulkCanceled {
+        transfer_id: BulkTransferId,
+        reason: String,
+    },
 }
 
 pub fn encode_client(frame: &ClientFrame) -> Result<Vec<u8>, String> {
@@ -254,10 +364,7 @@ pub fn encode_client(frame: &ClientFrame) -> Result<Vec<u8>, String> {
 ///
 /// The prefix is reserved before `jsony` writes the payload, so framing does
 /// not require a second allocation or a payload copy.
-pub fn encode_client_framed_into(
-    frame: &ClientFrame,
-    output: &mut Vec<u8>,
-) -> Result<(), String> {
+pub fn encode_client_framed_into(frame: &ClientFrame, output: &mut Vec<u8>) -> Result<(), String> {
     validate_client(frame)?;
     bounded_encode_framed_into(frame, output)
 }
@@ -274,10 +381,7 @@ pub fn encode_daemon(frame: &DaemonFrame) -> Result<Vec<u8>, String> {
 }
 
 /// Serializes a complete length-prefixed daemon frame into reusable storage.
-pub fn encode_daemon_framed_into(
-    frame: &DaemonFrame,
-    output: &mut Vec<u8>,
-) -> Result<(), String> {
+pub fn encode_daemon_framed_into(frame: &DaemonFrame, output: &mut Vec<u8>) -> Result<(), String> {
     validate_daemon(frame)?;
     bounded_encode_framed_into(frame, output)
 }
@@ -307,8 +411,8 @@ fn bounded_encode_framed_into<T: jsony::ToBinary>(
         output.clear();
         return Err("daemon frame exceeds maximum length".into());
     }
-    let payload_len = u32::try_from(payload_len)
-        .map_err(|_| "daemon frame length does not fit in u32")?;
+    let payload_len =
+        u32::try_from(payload_len).map_err(|_| "daemon frame length does not fit in u32")?;
     output[..crate::frame::LENGTH_PREFIX_LEN].copy_from_slice(&payload_len.to_le_bytes());
     Ok(())
 }
@@ -342,7 +446,9 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         {
             return Err("output volume is outside the supported range".into());
         }
-        ClientFrame::LoadOlder { limit, .. } if *limit == 0 || *limit > crate::control::MAX_HISTORY_FETCH_MESSAGES => {
+        ClientFrame::LoadOlder { limit, .. }
+            if *limit == 0 || *limit > crate::control::MAX_HISTORY_FETCH_MESSAGES =>
+        {
             return Err("history request limit is invalid".into());
         }
         ClientFrame::BeginUpload { upload, .. } => {
@@ -370,7 +476,11 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
 
 fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
     match frame {
-        DaemonFrame::Snapshot { instance_id, event_seq, snapshot } => {
+        DaemonFrame::Snapshot {
+            instance_id,
+            event_seq,
+            snapshot,
+        } => {
             validate_instance_and_sequence(*instance_id, *event_seq)?;
             snapshot.validate()
         }
@@ -402,7 +512,10 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         }
         DaemonFrame::BulkStarted(started) => started.validate(),
         DaemonFrame::BulkFinished(finished) => finished.validate(),
-        DaemonFrame::BulkCanceled { transfer_id, reason } => {
+        DaemonFrame::BulkCanceled {
+            transfer_id,
+            reason,
+        } => {
             if transfer_id.0 == 0 {
                 return Err("transfer id must be nonzero".into());
             }
@@ -431,7 +544,9 @@ fn validate_delta(delta: &StateDelta) -> Result<(), String> {
         }
         StateDelta::RoomUpserted { room } => room.validate(),
         StateDelta::RoomSnapshot(room) => room.validate(),
-        StateDelta::MessagesPrepended { room_id, messages, .. } => {
+        StateDelta::MessagesPrepended {
+            room_id, messages, ..
+        } => {
             if messages.len() > super::MAX_MESSAGES {
                 return Err("message collection exceeds limit".into());
             }
@@ -464,9 +579,7 @@ fn validate_delta(delta: &StateDelta) -> Result<(), String> {
             Err("transfer id must be nonzero".into())
         }
         StateDelta::VoiceStateChanged { voice } => voice.validate(),
-        StateDelta::ResyncRequired { reason } => {
-            super::model::check_nonempty_string(reason)
-        }
+        StateDelta::ResyncRequired { reason } => super::model::check_nonempty_string(reason),
         _ => Ok(()),
     }
 }
@@ -502,15 +615,26 @@ mod tests {
             room_id: RoomId(2),
             body: "hello".into(),
         };
-        assert_eq!(decode_client(&encode_client(&client).unwrap()).unwrap(), client);
+        assert_eq!(
+            decode_client(&encode_client(&client).unwrap()).unwrap(),
+            client
+        );
 
-        let daemon = DaemonFrame::Pong { request_id: RequestId(7), nonce: 9 };
-        assert_eq!(decode_daemon(&encode_daemon(&daemon).unwrap()).unwrap(), daemon);
+        let daemon = DaemonFrame::Pong {
+            request_id: RequestId(7),
+            nonce: 9,
+        };
+        assert_eq!(
+            decode_daemon(&encode_daemon(&daemon).unwrap()).unwrap(),
+            daemon
+        );
     }
 
     #[test]
     fn rejects_zero_request_id_and_large_chunk() {
-        let frame = ClientFrame::RequestSnapshot { request_id: RequestId(0) };
+        let frame = ClientFrame::RequestSnapshot {
+            request_id: RequestId(0),
+        };
         assert!(encode_client(&frame).is_err());
         let frame = ClientFrame::UploadChunk(BulkChunk {
             transfer_id: BulkTransferId(1),
@@ -530,12 +654,10 @@ mod tests {
         let mut buffer = Vec::new();
         encode_client_framed_into(&first, &mut buffer).unwrap();
         let capacity = buffer.capacity();
-        let (payload, consumed) = crate::frame::parse_frame_with_limit(
-            &buffer,
-            super::super::MAX_FRAME_BYTES,
-        )
-        .unwrap()
-        .unwrap();
+        let (payload, consumed) =
+            crate::frame::parse_frame_with_limit(&buffer, super::super::MAX_FRAME_BYTES)
+                .unwrap()
+                .unwrap();
         assert_eq!(consumed, buffer.len());
         assert_eq!(decode_client(payload).unwrap(), first);
 
@@ -545,28 +667,30 @@ mod tests {
         };
         encode_client_framed_into(&second, &mut buffer).unwrap();
         assert_eq!(buffer.capacity(), capacity);
-        let (payload, _) = crate::frame::parse_frame_with_limit(
-            &buffer,
-            super::super::MAX_FRAME_BYTES,
-        )
-        .unwrap()
-        .unwrap();
+        let (payload, _) =
+            crate::frame::parse_frame_with_limit(&buffer, super::super::MAX_FRAME_BYTES)
+                .unwrap()
+                .unwrap();
         assert_eq!(decode_client(payload).unwrap(), second);
     }
 
     #[test]
     fn rejects_empty_chunks_and_out_of_range_volume() {
-        assert!(encode_client(&ClientFrame::UploadChunk(BulkChunk {
-            transfer_id: BulkTransferId(1),
-            offset: 0,
-            bytes: Vec::new(),
-        }))
-        .is_err());
-        assert!(encode_client(&ClientFrame::SetOutputVolume {
-            request_id: RequestId(1),
-            volume: super::super::MAX_OUTPUT_VOLUME_PERCENT + 1.0,
-        })
-        .is_err());
+        assert!(
+            encode_client(&ClientFrame::UploadChunk(BulkChunk {
+                transfer_id: BulkTransferId(1),
+                offset: 0,
+                bytes: Vec::new(),
+            }))
+            .is_err()
+        );
+        assert!(
+            encode_client(&ClientFrame::SetOutputVolume {
+                request_id: RequestId(1),
+                volume: super::super::MAX_OUTPUT_VOLUME_PERCENT + 1.0,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -575,29 +699,103 @@ mod tests {
         let room_id = RoomId(2);
         let transfer_id = BulkTransferId(3);
         let frames = vec![
-            ClientFrame::SelectRoom { request_id, room_id },
-            ClientFrame::LoadOlder { request_id, room_id, before: Some(MessageId(4)), limit: 20 },
-            ClientFrame::SendMessage { request_id, room_id, body: "hello".into() },
-            ClientFrame::EditMessage { request_id, room_id, target: MessageId(4), body: "edit".into() },
-            ClientFrame::DeleteMessage { request_id, room_id, target: MessageId(4) },
-            ClientFrame::BeginUpload { request_id, upload: BeginUpload { transfer_id, room_id, file_name: "a.png".into(), byte_len: 2 } },
-            ClientFrame::UploadChunk(BulkChunk { transfer_id, offset: 0, bytes: vec![1, 2] }),
-            ClientFrame::FinishUpload { request_id, finished: BulkFinished { transfer_id, byte_len: 2, digest: [1; 32] } },
-            ClientFrame::CancelUpload { request_id, transfer_id },
-            ClientFrame::BeginAttachmentRead { request_id, read: BeginAttachmentRead { transfer_id, room_id, attachment_id: super::super::model::AttachmentId([2; 16]) } },
-            ClientFrame::CancelBulkTransfer { request_id, transfer_id },
-            ClientFrame::CancelFileTransfer { request_id, transfer_id: FileTransferId(4) },
-            ClientFrame::SetMuted { request_id, muted: true },
-            ClientFrame::SetDeafened { request_id, deafened: true },
-            ClientFrame::JoinVoice { request_id, room_id },
+            ClientFrame::SelectRoom {
+                request_id,
+                room_id,
+            },
+            ClientFrame::LoadOlder {
+                request_id,
+                room_id,
+                before: Some(MessageId(4)),
+                limit: 20,
+            },
+            ClientFrame::SendMessage {
+                request_id,
+                room_id,
+                body: "hello".into(),
+            },
+            ClientFrame::EditMessage {
+                request_id,
+                room_id,
+                target: MessageId(4),
+                body: "edit".into(),
+            },
+            ClientFrame::DeleteMessage {
+                request_id,
+                room_id,
+                target: MessageId(4),
+            },
+            ClientFrame::BeginUpload {
+                request_id,
+                upload: BeginUpload {
+                    transfer_id,
+                    room_id,
+                    file_name: "a.png".into(),
+                    byte_len: 2,
+                },
+            },
+            ClientFrame::UploadChunk(BulkChunk {
+                transfer_id,
+                offset: 0,
+                bytes: vec![1, 2],
+            }),
+            ClientFrame::FinishUpload {
+                request_id,
+                finished: BulkFinished {
+                    transfer_id,
+                    byte_len: 2,
+                    digest: [1; 32],
+                },
+            },
+            ClientFrame::CancelUpload {
+                request_id,
+                transfer_id,
+            },
+            ClientFrame::BeginAttachmentRead {
+                request_id,
+                read: BeginAttachmentRead {
+                    transfer_id,
+                    room_id,
+                    attachment_id: super::super::model::AttachmentId([2; 16]),
+                },
+            },
+            ClientFrame::CancelBulkTransfer {
+                request_id,
+                transfer_id,
+            },
+            ClientFrame::CancelFileTransfer {
+                request_id,
+                transfer_id: FileTransferId(4),
+            },
+            ClientFrame::SetMuted {
+                request_id,
+                muted: true,
+            },
+            ClientFrame::SetDeafened {
+                request_id,
+                deafened: true,
+            },
+            ClientFrame::JoinVoice {
+                request_id,
+                room_id,
+            },
             ClientFrame::LeaveVoice { request_id },
-            ClientFrame::SetOutputVolume { request_id, volume: 75.0 },
-            ClientFrame::Ping { request_id, nonce: 9 },
+            ClientFrame::SetOutputVolume {
+                request_id,
+                volume: 75.0,
+            },
+            ClientFrame::Ping {
+                request_id,
+                nonce: 9,
+            },
             ClientFrame::RequestSnapshot { request_id },
             ClientFrame::Disconnect { request_id },
         ];
         for frame in frames {
-            assert_eq!(decode_client(&encode_client(&frame).unwrap()).unwrap(), frame);
+            assert_eq!(
+                decode_client(&encode_client(&frame).unwrap()).unwrap(),
+                frame
+            );
         }
     }
 
@@ -607,23 +805,82 @@ mod tests {
         let transfer_id = BulkTransferId(3);
         let instance_id = DaemonInstanceId([4; 16]);
         let descriptor = super::super::model::AttachmentDescriptor {
-            id: super::super::model::AttachmentId([2; 16]), file_name: "a.png".into(),
-            media_kind: super::super::model::MediaKind::Image, content_type: "image/png".into(),
-            byte_len: 2, digest: [1; 32], width: Some(2), height: Some(1),
+            id: super::super::model::AttachmentId([2; 16]),
+            file_name: "a.png".into(),
+            media_kind: super::super::model::MediaKind::Image,
+            content_type: "image/png".into(),
+            byte_len: 2,
+            digest: [1; 32],
+            width: Some(2),
+            height: Some(1),
         };
         let frames = vec![
-            DaemonFrame::Welcome(Welcome { version: 1, instance_id, daemon_build: "test".into(), connection: ConnectionState::Online, active_server: Some("local".into()), first_event_seq: 1, limits: NegotiatedLimits::default() }),
-            DaemonFrame::Snapshot { instance_id, event_seq: 1, snapshot: StateSnapshot { connection: ConnectionState::Online, active_server: Some("local".into()), local_identity: Some("alice".into()), rooms: Vec::new(), selected_room: None, room: None, voice: VoiceState { muted: false, deafened: false, output_volume: 100.0, joined_room: None }, transfers: Vec::new() } },
-            DaemonFrame::Event(StateEvent { instance_id, event_seq: 2, delta: StateDelta::DaemonStopping }),
-            DaemonFrame::RequestResult(RequestResult { request_id, operation: Operation::Ping, outcome: RequestOutcome::Accepted }),
-            DaemonFrame::Pong { request_id, nonce: 9 },
-            DaemonFrame::BulkStarted(BulkStarted { transfer_id, attachment: descriptor }),
-            DaemonFrame::BulkChunk(BulkChunk { transfer_id, offset: 0, bytes: vec![1, 2] }),
-            DaemonFrame::BulkFinished(BulkFinished { transfer_id, byte_len: 2, digest: [1; 32] }),
-            DaemonFrame::BulkCanceled { transfer_id, reason: "canceled".into() },
+            DaemonFrame::Welcome(Welcome {
+                version: 1,
+                instance_id,
+                daemon_build: "test".into(),
+                connection: ConnectionState::Online,
+                active_server: Some("local".into()),
+                first_event_seq: 1,
+                limits: NegotiatedLimits::default(),
+            }),
+            DaemonFrame::Snapshot {
+                instance_id,
+                event_seq: 1,
+                snapshot: StateSnapshot {
+                    connection: ConnectionState::Online,
+                    active_server: Some("local".into()),
+                    local_identity: Some("alice".into()),
+                    rooms: Vec::new(),
+                    selected_room: None,
+                    room: None,
+                    voice: VoiceState {
+                        muted: false,
+                        deafened: false,
+                        output_volume: 100.0,
+                        joined_room: None,
+                    },
+                    transfers: Vec::new(),
+                },
+            },
+            DaemonFrame::Event(StateEvent {
+                instance_id,
+                event_seq: 2,
+                delta: StateDelta::DaemonStopping,
+            }),
+            DaemonFrame::RequestResult(RequestResult {
+                request_id,
+                operation: Operation::Ping,
+                outcome: RequestOutcome::Accepted,
+            }),
+            DaemonFrame::Pong {
+                request_id,
+                nonce: 9,
+            },
+            DaemonFrame::BulkStarted(BulkStarted {
+                transfer_id,
+                attachment: descriptor,
+            }),
+            DaemonFrame::BulkChunk(BulkChunk {
+                transfer_id,
+                offset: 0,
+                bytes: vec![1, 2],
+            }),
+            DaemonFrame::BulkFinished(BulkFinished {
+                transfer_id,
+                byte_len: 2,
+                digest: [1; 32],
+            }),
+            DaemonFrame::BulkCanceled {
+                transfer_id,
+                reason: "canceled".into(),
+            },
         ];
         for frame in frames {
-            assert_eq!(decode_daemon(&encode_daemon(&frame).unwrap()).unwrap(), frame);
+            assert_eq!(
+                decode_daemon(&encode_daemon(&frame).unwrap()).unwrap(),
+                frame
+            );
         }
     }
 }
