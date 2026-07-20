@@ -13,6 +13,7 @@ use crate::web_server::WebFeedSender;
 
 const MAX_PENDING_FRAMES: usize = 2;
 const MAX_BOOTSTRAP_FRAMES: usize = 90;
+const MAX_PENDING_BYTES: usize = rpc::video::MAX_VIDEO_FRAME_LEN;
 const FAST_START_MAX_BYTES: usize = rpc::video::MAX_VIDEO_FRAME_LEN;
 
 #[derive(Clone)]
@@ -47,6 +48,7 @@ struct NativeQueue {
 #[derive(Default)]
 struct QueueState {
     frames: VecDeque<SharedVideoFrame>,
+    pending_bytes: usize,
     seen_keyframe: bool,
     awaiting_keyframe: bool,
     bootstrapping: bool,
@@ -75,25 +77,33 @@ impl VideoFrameFanout {
     }
 
     pub fn send(&self, frame: SharedVideoFrame) {
+        let Ok(Some((parsed, consumed))) = rpc::video::parse_video_frame(frame.as_slice()) else {
+            return;
+        };
+        if consumed != frame.len() {
+            return;
+        }
+        let stream_id = StreamId(parsed.stream_id);
+        let is_key = parsed.is_key;
         if let Some(web) = &self.inner.web {
             web.send_video_frame(frame.clone());
         }
-        let bytes = frame.as_slice();
-        if bytes.len() < rpc::video::VIDEO_FRAME_HEADER_LEN {
-            return;
-        }
-        let stream_id = StreamId(u32::from_le_bytes(bytes[13..17].try_into().unwrap()));
-        let is_key = bytes[12] == 1;
-        let mut state = self.inner.state.lock().unwrap();
-        state
-            .fast_start
-            .entry(stream_id)
-            .or_default()
-            .push(stream_id, frame.clone(), is_key);
-        for ((_, id), queue) in &state.native {
-            if *id == stream_id {
-                queue.push(frame.clone(), is_key);
-            }
+        let queues = {
+            let mut state = self.inner.state.lock().unwrap();
+            state
+                .fast_start
+                .entry(stream_id)
+                .or_default()
+                .push(stream_id, frame.clone(), is_key);
+            state
+                .native
+                .iter()
+                .filter(|((_, id), _)| *id == stream_id)
+                .map(|(_, queue)| queue.clone())
+                .collect::<Vec<_>>()
+        };
+        for queue in queues {
+            queue.push(frame.clone(), is_key);
         }
     }
 
@@ -191,7 +201,9 @@ impl NativeFastStart {
         } else if self.frames.is_empty() {
             return;
         }
-        if self.bytes.saturating_add(frame.retained_bytes()) > FAST_START_MAX_BYTES {
+        if self.frames.len() >= MAX_BOOTSTRAP_FRAMES
+            || self.bytes.saturating_add(frame.retained_bytes()) > FAST_START_MAX_BYTES
+        {
             kvlog::warn!(
                 "native video fast start cache overflowed; waiting for keyframe",
                 stream_id = stream_id.0,
@@ -212,6 +224,11 @@ impl NativeQueue {
     fn seed(&self, frames: &VecDeque<SharedVideoFrame>) {
         let mut state = self.state.lock().unwrap();
         state.frames.extend(frames.iter().cloned());
+        state.pending_bytes = state
+            .frames
+            .iter()
+            .map(SharedVideoFrame::retained_bytes)
+            .sum();
         state.seen_keyframe = !state.frames.is_empty();
         state.bootstrapping = !state.frames.is_empty();
         self.ready.notify_one();
@@ -242,23 +259,33 @@ impl NativeQueue {
             if !is_key {
                 return;
             }
-            state.frames.clear();
+            state.clear_frames();
             state.awaiting_keyframe = false;
-        } else if state.frames.len()
-            >= if state.bootstrapping {
+        } else {
+            let frame_limit = if state.bootstrapping {
                 MAX_BOOTSTRAP_FRAMES
             } else {
                 MAX_PENDING_FRAMES
-            }
-        {
-            if is_key {
-                state.frames.clear();
-            } else {
-                state.awaiting_keyframe = true;
-                state.bootstrapping = false;
-                return;
+            };
+            let over_limit = state.frames.len() >= frame_limit
+                || state.pending_bytes.saturating_add(frame.retained_bytes())
+                    > MAX_PENDING_BYTES;
+            if over_limit {
+                if is_key {
+                    state.clear_frames();
+                } else {
+                    state.awaiting_keyframe = true;
+                    state.bootstrapping = false;
+                    return;
+                }
             }
         }
+        if frame.retained_bytes() > MAX_PENDING_BYTES {
+            state.awaiting_keyframe = true;
+            state.bootstrapping = false;
+            return;
+        }
+        state.pending_bytes += frame.retained_bytes();
         state.frames.push_back(frame);
         self.ready.notify_one();
     }
@@ -267,6 +294,7 @@ impl NativeQueue {
         let mut state = self.state.lock().unwrap();
         loop {
             if let Some(frame) = state.frames.pop_front() {
+                state.pending_bytes -= frame.retained_bytes();
                 state.written_frames += 1;
                 if state.frames.is_empty() {
                     state.bootstrapping = false;
@@ -283,8 +311,15 @@ impl NativeQueue {
     fn close(&self) {
         let mut state = self.state.lock().unwrap();
         state.closed = true;
-        state.frames.clear();
+        state.clear_frames();
         self.ready.notify_all();
+    }
+}
+
+impl QueueState {
+    fn clear_frames(&mut self) {
+        self.frames.clear();
+        self.pending_bytes = 0;
     }
 }
 
@@ -351,6 +386,15 @@ mod tests {
         ))
     }
 
+    fn frame_with_payload(stream_id: u32, key: bool, payload_len: usize) -> SharedVideoFrame {
+        SharedVideoFrame::from_vec(rpc::video::encode_video_frame(
+            0,
+            key,
+            stream_id,
+            &vec![0; payload_len],
+        ))
+    }
+
     #[test]
     fn slow_queue_resumes_only_at_a_fresh_keyframe() {
         let queue = NativeQueue {
@@ -395,5 +439,31 @@ mod tests {
         assert_eq!(first[12], 1);
         assert_eq!(second[4], 4);
         assert_eq!(second[12], 0);
+    }
+
+    #[test]
+    fn native_queue_byte_overflow_waits_for_a_fresh_keyframe() {
+        let queue = NativeQueue {
+            viewer_id: 1,
+            stream_id: StreamId(1),
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let payload_len = MAX_PENDING_BYTES / 2;
+        queue.push(frame_with_payload(1, true, payload_len), true);
+        queue.push(frame_with_payload(1, false, payload_len), false);
+        {
+            let state = queue.state.lock().unwrap();
+            assert!(state.awaiting_keyframe);
+            assert_eq!(state.frames.len(), 1);
+            assert!(state.pending_bytes <= MAX_PENDING_BYTES);
+        }
+
+        queue.push(frame(1, true, 9), true);
+        let recovered = queue.pop().unwrap();
+        assert_eq!(recovered.as_slice()[4], 9);
+        let state = queue.state.lock().unwrap();
+        assert_eq!(state.pending_bytes, 0);
+        assert!(!state.awaiting_keyframe);
     }
 }

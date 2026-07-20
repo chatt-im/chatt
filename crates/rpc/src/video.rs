@@ -189,10 +189,17 @@ impl SharedVideoFrame {
     pub fn copy_from_slice(slice: &[u8]) -> Self {
         let mut buf = Vec::with_capacity(slice.len());
         buf.extend_from_slice(slice);
+        Self::from_vec(buf)
+    }
+
+    /// Takes ownership of a complete plaintext frame allocation without
+    /// copying it. Spare capacity remains charged by [`Self::retained_bytes`].
+    pub fn from_vec(buf: Vec<u8>) -> Self {
+        let len = buf.len();
         Self {
             buf: Arc::new(buf),
             off: 0,
-            len: slice.len(),
+            len,
         }
     }
 
@@ -390,14 +397,24 @@ pub fn read_video_record(
     Ok(outcome)
 }
 
-/// One decoded inner frame: its presentation timestamp, keyframe flag, source
-/// stream id, and the length-prefixed video bitstream body.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Frame {
+/// Metadata decoded from the fixed portion of one inner video frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoFrameHeader {
+    /// Total frame length, including [`VIDEO_FRAME_HEADER_LEN`].
+    pub size: usize,
     pub ts_ms: i64,
     pub is_key: bool,
     pub stream_id: u32,
-    pub data: Vec<u8>,
+}
+
+/// A borrowed inner video frame. Parsing never copies the bitstream or moves
+/// later bytes in the receive buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoFrame<'a> {
+    pub ts_ms: i64,
+    pub is_key: bool,
+    pub stream_id: u32,
+    pub data: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,9 +487,11 @@ pub fn encode_video_frame(ts_ms: i64, is_key: bool, stream_id: u32, body: &[u8])
     out
 }
 
-/// Pops one inner frame from `buffer`, draining it. Returns `None` when fewer
-/// than one whole frame is buffered.
-pub fn pop_video_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, VideoFrameError> {
+/// Parses the fixed header at the front of `buffer`, returning `None` until all
+/// [`VIDEO_FRAME_HEADER_LEN`] bytes are available.
+pub fn parse_video_frame_header(
+    buffer: &[u8],
+) -> Result<Option<VideoFrameHeader>, VideoFrameError> {
     if buffer.len() < VIDEO_FRAME_HEADER_LEN {
         return Ok(None);
     }
@@ -483,20 +502,39 @@ pub fn pop_video_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, VideoFrame
     if size > MAX_VIDEO_FRAME_LEN {
         return Err(VideoFrameError::TooLarge);
     }
-    if buffer.len() < size {
+    let is_key = match buffer[12] {
+        0 => false,
+        1 => true,
+        _ => return Err(VideoFrameError::BadHeader),
+    };
+    Ok(Some(VideoFrameHeader {
+        size,
+        ts_ms: i64::from_le_bytes(buffer[4..12].try_into().unwrap()),
+        is_key,
+        stream_id: u32::from_le_bytes(buffer[13..17].try_into().unwrap()),
+    }))
+}
+
+/// Parses one complete inner frame from the front of `buffer` without copying,
+/// returning the borrowed frame and the number of bytes it occupies.
+pub fn parse_video_frame(
+    buffer: &[u8],
+) -> Result<Option<(VideoFrame<'_>, usize)>, VideoFrameError> {
+    let Some(header) = parse_video_frame_header(buffer)? else {
+        return Ok(None);
+    };
+    if buffer.len() < header.size {
         return Ok(None);
     }
-    let ts_ms = i64::from_le_bytes(buffer[4..12].try_into().unwrap());
-    let is_key = buffer[12] == 1;
-    let stream_id = u32::from_le_bytes(buffer[13..17].try_into().unwrap());
-    let data = buffer[VIDEO_FRAME_HEADER_LEN..size].to_vec();
-    buffer.drain(..size);
-    Ok(Some(Frame {
-        ts_ms,
-        is_key,
-        stream_id,
-        data,
-    }))
+    Ok(Some((
+        VideoFrame {
+            ts_ms: header.ts_ms,
+            is_key: header.is_key,
+            stream_id: header.stream_id,
+            data: &buffer[VIDEO_FRAME_HEADER_LEN..header.size],
+        },
+        header.size,
+    )))
 }
 
 pub fn encode_video_hello(value: &VideoHello) -> Vec<u8> {
@@ -586,20 +624,20 @@ mod tests {
     fn video_frame_round_trips() {
         let mut buffer = Vec::new();
         write_video_frame(&mut buffer, 33, true, 7, &[1, 2, 3, 4]);
-        let frame = pop_video_frame(&mut buffer).unwrap().unwrap();
+        let (frame, consumed) = parse_video_frame(&buffer).unwrap().unwrap();
         assert_eq!(frame.ts_ms, 33);
         assert!(frame.is_key);
         assert_eq!(frame.stream_id, 7);
-        assert_eq!(frame.data, vec![1, 2, 3, 4]);
-        assert!(buffer.is_empty());
+        assert_eq!(frame.data, [1, 2, 3, 4]);
+        assert_eq!(consumed, buffer.len());
     }
 
     #[test]
-    fn pop_video_frame_waits_for_whole_frame() {
+    fn parse_video_frame_waits_for_whole_frame() {
         let mut full = Vec::new();
         write_video_frame(&mut full, 0, false, 1, &[9; 16]);
-        let mut partial = full[..full.len() - 1].to_vec();
-        assert_eq!(pop_video_frame(&mut partial).unwrap(), None);
+        let partial = &full[..full.len() - 1];
+        assert_eq!(parse_video_frame(partial).unwrap(), None);
     }
 
     #[test]
@@ -635,7 +673,17 @@ mod tests {
         let size = (MAX_VIDEO_FRAME_LEN + 1) as u32;
         buffer.extend_from_slice(&size.to_le_bytes());
         buffer.extend_from_slice(&[0u8; VIDEO_FRAME_HEADER_LEN]);
-        assert_eq!(pop_video_frame(&mut buffer), Err(VideoFrameError::TooLarge));
+        assert_eq!(
+            parse_video_frame(&buffer),
+            Err(VideoFrameError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_video_key_flag() {
+        let mut buffer = encode_video_frame(0, false, 1, b"body");
+        buffer[12] = 2;
+        assert_eq!(parse_video_frame(&buffer), Err(VideoFrameError::BadHeader));
     }
 
     #[test]
@@ -685,6 +733,15 @@ mod tests {
         let clone = frame.clone();
         assert_eq!(clone.as_slice().as_ptr(), frame.as_slice().as_ptr());
         assert_eq!(clone.retained_bytes(), frame.retained_bytes());
+    }
+
+    #[test]
+    fn shared_frame_takes_owned_allocation_without_copying() {
+        let bytes = b"owned frame".to_vec();
+        let pointer = bytes.as_ptr();
+        let frame = SharedVideoFrame::from_vec(bytes);
+        assert_eq!(frame.as_slice(), b"owned frame");
+        assert_eq!(frame.as_slice().as_ptr(), pointer);
     }
 
     #[test]

@@ -124,10 +124,8 @@ struct PublisherConn {
     stream_id: u32,
     codec: Codec,
     copy_stats: CopyStats,
-    /// Reusable plaintext frame body, rebuilt in place each [`Self::send_frame`].
-    inner: Vec<u8>,
     /// Reusable length-prefixed sealed record, rebuilt in place each
-    /// [`Self::send_frame`], so steady-state publishing allocates nothing.
+    /// [`Self::send_frame`].
     record: Vec<u8>,
 }
 
@@ -136,7 +134,7 @@ struct PublisherConn {
 /// without per-frame log noise.
 struct CopyStats {
     plaintext_bytes: u64,
-    self_view_bytes: u64,
+    shared_bytes: u64,
     sealed_bytes: u64,
     frames: u64,
     last_log: Instant,
@@ -148,7 +146,7 @@ impl CopyStats {
     fn new() -> Self {
         Self {
             plaintext_bytes: 0,
-            self_view_bytes: 0,
+            shared_bytes: 0,
             sealed_bytes: 0,
             frames: 0,
             last_log: Instant::now(),
@@ -162,7 +160,8 @@ impl CopyStats {
         kvlog::debug!(
             "video publish copy stats",
             plaintext_bytes = self.plaintext_bytes,
-            self_view_bytes = self.self_view_bytes,
+            shared_bytes = self.shared_bytes,
+            fanout_copy_bytes = 0,
             sealed_bytes = self.sealed_bytes,
             frames = self.frames
         );
@@ -181,12 +180,16 @@ impl PublisherConn {
         frame: &CapturedFrame,
         fanout: &VideoFrameFanout,
     ) -> Result<u64, String> {
-        self.inner.clear();
-        encode_publish_frame_into(frame, self.stream_id, self.codec, &mut self.inner);
-        self.copy_stats.plaintext_bytes += self.inner.len() as u64;
-        self.copy_stats.self_view_bytes += self.inner.len() as u64;
-        fanout.send(SharedVideoFrame::copy_from_slice(&self.inner));
-        let sealed_len = self.record_protection.sealed_len(self.inner.len());
+        // The allocation built here is the allocation retained by local/web/RPC
+        // fanout. Sealing reads from it directly, avoiding the previous second
+        // full-frame allocation and copy into `SharedVideoFrame`.
+        let mut inner = Vec::with_capacity(video::VIDEO_FRAME_HEADER_LEN + frame.data.len());
+        encode_publish_frame_into(frame, self.stream_id, self.codec, &mut inner);
+        let shared = SharedVideoFrame::from_vec(inner);
+        self.copy_stats.plaintext_bytes += shared.len() as u64;
+        self.copy_stats.shared_bytes += shared.len() as u64;
+        fanout.send(shared.clone());
+        let sealed_len = self.record_protection.sealed_len(shared.len());
         if sealed_len > video::MAX_VIDEO_FRAME_LEN {
             return Err("sealed video record exceeds maximum length".to_string());
         }
@@ -194,7 +197,7 @@ impl PublisherConn {
         self.record
             .extend_from_slice(&(sealed_len as u32).to_le_bytes());
         self.record_protection
-            .seal_next_into(CHANNEL_VIDEO, &self.inner, &mut self.record)
+            .seal_next_into(CHANNEL_VIDEO, shared.as_slice(), &mut self.record)
             .map_err(|error| error.to_string())?;
         let bytes = self.record.len() as u64;
         self.copy_stats.sealed_bytes += bytes;
@@ -481,7 +484,6 @@ fn connect(
         stream_id: stream_id.0,
         codec,
         copy_stats: CopyStats::new(),
-        inner: Vec::new(),
         record: Vec::new(),
     })
 }
@@ -513,13 +515,14 @@ mod tests {
             is_key: true,
             data,
         };
-        let mut inner = encode_publish_frame(&frame, 9, Codec::H264);
-        let parsed = video::pop_video_frame(&mut inner).unwrap().unwrap();
+        let inner = encode_publish_frame(&frame, 9, Codec::H264);
+        let (parsed, consumed) = video::parse_video_frame(&inner).unwrap().unwrap();
         assert_eq!(parsed.stream_id, 9);
         assert!(parsed.is_key);
         assert_eq!(parsed.ts_ms, 5);
+        assert_eq!(consumed, inner.len());
         // Only the IDR slice survives, length-prefixed; SPS/PPS are stripped.
-        assert_eq!(parsed.data, vec![0, 0, 0, 3, 0x65, 0xaa, 0xbb]);
+        assert_eq!(parsed.data, [0, 0, 0, 3, 0x65, 0xaa, 0xbb]);
     }
 
     #[test]
