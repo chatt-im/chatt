@@ -73,29 +73,30 @@ pub fn annex_b_to_length_prefixed_into(codec: Codec, access_unit: &[u8], out: &m
     }
 }
 
-/// Converts a WebCodecs length-prefixed access unit back to Annex-B. Screen
-/// sharing always negotiates four-byte lengths, but the descriptor is checked
-/// by [`configuration_to_annex_b`] before playback starts.
-pub fn length_prefixed_to_annex_b(access_unit: &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(access_unit.len());
+/// Converts a WebCodecs length-prefixed access unit back to Annex-B in place.
+///
+/// Screen sharing always negotiates four-byte NAL lengths, exactly the width of
+/// the Annex-B start code that replaces each length. Callers can therefore read
+/// a frame directly into its final output allocation and patch only the length
+/// fields, without allocating or copying the video payload.
+pub fn length_prefixed_to_annex_b_in_place(access_unit: &mut [u8]) -> Result<(), String> {
     let mut cursor = 0usize;
     while cursor < access_unit.len() {
         let length_bytes = access_unit
             .get(cursor..cursor + 4)
             .ok_or_else(|| "truncated video NAL length".to_string())?;
         let length = u32::from_be_bytes(length_bytes.try_into().unwrap()) as usize;
+        access_unit[cursor..cursor + 4].copy_from_slice(&[0, 0, 0, 1]);
         cursor += 4;
         if length == 0 || cursor.saturating_add(length) > access_unit.len() {
             return Err("invalid video NAL length".into());
         }
-        out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(&access_unit[cursor..cursor + length]);
         cursor += length;
     }
-    if out.is_empty() {
+    if access_unit.is_empty() {
         return Err("video access unit contains no NAL units".into());
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Extracts parameter sets from an `avcC` or `hvcC` decoder descriptor and
@@ -238,9 +239,19 @@ mod conversion_tests {
     #[test]
     fn length_prefixed_access_unit_round_trips_to_annex_b() {
         let annex_b = [0, 0, 0, 1, 0x65, 0x88, 0x84];
-        let length_prefixed = annex_b_to_length_prefixed(Codec::H264, &annex_b);
-        assert_eq!(length_prefixed_to_annex_b(&length_prefixed).unwrap(), annex_b);
-        assert!(length_prefixed_to_annex_b(&[0, 0, 0, 8, 1]).is_err());
+        let mut length_prefixed = annex_b_to_length_prefixed(Codec::H264, &annex_b);
+        let pointer = length_prefixed.as_ptr();
+        let capacity = length_prefixed.capacity();
+        length_prefixed_to_annex_b_in_place(&mut length_prefixed).unwrap();
+        assert_eq!(length_prefixed, annex_b);
+        assert_eq!(length_prefixed.as_ptr(), pointer);
+        assert_eq!(length_prefixed.capacity(), capacity);
+
+        let mut truncated = vec![0, 0, 0, 8, 1];
+        assert!(length_prefixed_to_annex_b_in_place(&mut truncated).is_err());
+        let mut zero_length = vec![0, 0, 0, 0];
+        assert!(length_prefixed_to_annex_b_in_place(&mut zero_length).is_err());
+        assert!(length_prefixed_to_annex_b_in_place(&mut []).is_err());
     }
 
     #[test]
