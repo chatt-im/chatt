@@ -1,10 +1,9 @@
 use jsony::Jsony;
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony, toml_spanner::Toml,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
+#[cfg_attr(feature = "toml", derive(toml_spanner::Toml))]
 #[jsony(Binary)]
-#[toml(Toml)]
+#[cfg_attr(feature = "toml", toml(Toml))]
 pub struct UserId(pub u64);
 
 impl std::fmt::Display for UserId {
@@ -13,11 +12,10 @@ impl std::fmt::Display for UserId {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony, toml_spanner::Toml,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
+#[cfg_attr(feature = "toml", derive(toml_spanner::Toml))]
 #[jsony(Binary)]
-#[toml(Toml)]
+#[cfg_attr(feature = "toml", toml(Toml))]
 pub struct RoomId(pub u32);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
