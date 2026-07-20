@@ -25,7 +25,7 @@ use rpc::{
 
 use crate::app::{AppEvent, EventSender, ScreencastProgress};
 use crate::client_net::{CommandSender, NetworkCommand};
-use crate::web_server::WebFeedSender;
+use super::VideoFrameFanout;
 
 use super::VideoTransport;
 use super::capture::{self, Capture, CapturedFrame};
@@ -86,7 +86,7 @@ pub fn start(
     commands: CommandSender,
     tcp_addr: String,
     video_transport: VideoTransport,
-    web_feed: Option<WebFeedSender>,
+    fanout: VideoFrameFanout,
     events: EventSender,
 ) -> Result<ScreencastHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -105,7 +105,7 @@ pub fn start(
                 commands,
                 tcp_addr,
                 video_transport,
-                web_feed,
+                fanout,
                 events,
                 manager_stop,
             )
@@ -172,22 +172,20 @@ impl CopyStats {
 
 impl PublisherConn {
     /// Converts one captured frame to the length-prefixed wire body, seals it,
-    /// and writes it to the server. When `web_feed` is present the same plaintext
-    /// body is forwarded to the local browser so a sharer sees their own stream
+    /// and writes it to the server. The same plaintext body is fanned out to
+    /// local viewers so a sharer sees their own stream
     /// without a server round-trip. The body carries `stream_id` so the browser
     /// routes it to the matching decoder.
     fn send_frame(
         &mut self,
         frame: &CapturedFrame,
-        web_feed: Option<&WebFeedSender>,
+        fanout: &VideoFrameFanout,
     ) -> Result<u64, String> {
         self.inner.clear();
         encode_publish_frame_into(frame, self.stream_id, self.codec, &mut self.inner);
         self.copy_stats.plaintext_bytes += self.inner.len() as u64;
-        if let Some(feed) = web_feed {
-            self.copy_stats.self_view_bytes += self.inner.len() as u64;
-            feed.send_video_frame(SharedVideoFrame::copy_from_slice(&self.inner));
-        }
+        self.copy_stats.self_view_bytes += self.inner.len() as u64;
+        fanout.send(SharedVideoFrame::copy_from_slice(&self.inner));
         let sealed_len = self.record_protection.sealed_len(self.inner.len());
         if sealed_len > video::MAX_VIDEO_FRAME_LEN {
             return Err("sealed video record exceeds maximum length".to_string());
@@ -272,7 +270,7 @@ fn run_manager(
     commands: CommandSender,
     tcp_addr: String,
     video_transport: VideoTransport,
-    web_feed: Option<WebFeedSender>,
+    fanout: VideoFrameFanout,
     events: EventSender,
     stop: Arc<AtomicBool>,
 ) {
@@ -306,7 +304,7 @@ fn run_manager(
                 Ok(mut publisher) => {
                     let mut failed = false;
                     for frame in buffered.drain(..) {
-                        match publisher.send_frame(&frame, web_feed.as_ref()) {
+                        match publisher.send_frame(&frame, &fanout) {
                             Ok(bytes) => stats.record(stream_id, bytes, &events),
                             Err(reason) => {
                                 error = Some(format!("screen publish failed: {reason}"));
@@ -372,7 +370,7 @@ fn run_manager(
                     start_share_sent_at = Some(Instant::now());
                 }
                 match &mut conn {
-                    Some(publisher) => match publisher.send_frame(&frame, web_feed.as_ref()) {
+                    Some(publisher) => match publisher.send_frame(&frame, &fanout) {
                         Ok(bytes) => {
                             stats.record(StreamId(publisher.stream_id), bytes, &events);
                         }

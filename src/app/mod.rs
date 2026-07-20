@@ -452,6 +452,8 @@ pub(crate) struct App {
     audio_events: AudioEventLog,
     /// The browser chat-log feed, present only when `[web] enabled = true`.
     web_feed: Option<crate::web_server::WebFeedSender>,
+    /// Routes each plaintext screen-share frame to web and native viewers.
+    video_fanout: crate::video::VideoFrameFanout,
     /// Web-originated deletes awaiting either a mutation echo or an explicit
     /// server rejection, keyed by room because ids are room-local.
     pending_web_deletes: HashSet<(RoomId, MessageId)>,
@@ -471,6 +473,9 @@ pub(crate) struct App {
     screencast_stream_id: Option<StreamId>,
     /// Active inbound viewer connections, keyed by stream id.
     subscribers: HashMap<StreamId, crate::video::SubscriberHandle>,
+    /// Streams with at least one browser viewer. The web server reports stop
+    /// only after its final subscribed socket leaves.
+    web_viewing_shares: HashSet<StreamId>,
     /// Video connection authentication/protection selected by the current
     /// session handshake.
     video_transport: Option<crate::video::VideoTransport>,
@@ -491,7 +496,10 @@ pub(crate) enum LocalVoiceMode {
 struct AvailableShare {
     room_id: RoomId,
     view_secret: Vec<u8>,
+    sender_name: String,
     codec: String,
+    coded_width: u32,
+    coded_height: u32,
     /// The decoder `extra_data` descriptor (`avcC`/`hvcC`), built by the
     /// publisher from the stream's parameter sets.
     extradata: Vec<u8>,
@@ -1327,6 +1335,7 @@ impl App {
         } else {
             None
         };
+        let video_fanout = crate::video::VideoFrameFanout::new(web_feed.clone());
         let mic_muted = Arc::new(AtomicBool::new(false));
         let deafened = Arc::new(AtomicBool::new(false));
         let app = Self {
@@ -1385,6 +1394,7 @@ impl App {
             supervisor: SupervisorState::default(),
             audio_events: AudioEventLog::default(),
             web_feed,
+            video_fanout,
             pending_web_deletes: HashSet::new(),
             web_command_capture: None,
             download_store,
@@ -1392,6 +1402,7 @@ impl App {
             cached_screencast_start: None,
             screencast_stream_id: None,
             subscribers: HashMap::new(),
+            web_viewing_shares: HashSet::new(),
             video_transport: None,
             active_tcp_addr: None,
             config: CoreRw::new(config),
@@ -2043,7 +2054,7 @@ impl App {
                     argv: argv.clone(),
                     hevc,
                 };
-                let web_feed = self.web_feed.clone();
+                let video_fanout = self.video_fanout.clone();
                 let events = self.events.sender();
                 let Some(video_transport) = self.video_transport else {
                     self.fail_screencast_start(
@@ -2057,7 +2068,7 @@ impl App {
                     network.sender(),
                     tcp_addr,
                     video_transport,
-                    web_feed,
+                    video_fanout,
                     events,
                 ) {
                     Ok(handle) => {
@@ -2149,9 +2160,11 @@ impl App {
                     .send(NetworkCommand::StopShare { stream_id });
             }
             self.room.available_shares.remove(&stream_id);
+            self.web_viewing_shares.remove(&stream_id);
             if let Some(feed) = &self.web_feed {
                 feed.send_share_ended(stream_id.0, share_ended_envelope(stream_id));
             }
+            self.video_fanout.close_stream(stream_id);
         }
         if let Some(mut handle) = self.screencast.take() {
             handle.stop();
@@ -2165,10 +2178,14 @@ impl App {
             self.room.screencast_status.clear_active();
         }
         self.screencast_stream_id = None;
+        for stream_id in self.room.available_shares.keys().copied().collect::<Vec<_>>() {
+            self.video_fanout.close_stream(stream_id);
+        }
         self.room.available_shares.clear();
         for (_, mut subscriber) in self.subscribers.drain() {
             subscriber.stop();
         }
+        self.web_viewing_shares.clear();
     }
 
     fn clear_shares_for_voice_room(&mut self, room_id: RoomId) {
@@ -2180,6 +2197,8 @@ impl App {
             .collect::<Vec<_>>();
         for stream_id in stream_ids {
             self.room.available_shares.remove(&stream_id);
+            self.web_viewing_shares.remove(&stream_id);
+            self.video_fanout.close_stream(stream_id);
             if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
                 subscriber.stop();
             }
@@ -2558,6 +2577,7 @@ impl App {
         }
         let config = share_config_envelope(stream_id, &share.codec, &share.extradata);
         let view_secret = share.view_secret.clone();
+        self.web_viewing_shares.insert(stream_id);
         feed.send_share_config(client, stream_id.0, config);
 
         // The user's own share is teed to the browser by the publisher, and an
@@ -2599,13 +2619,17 @@ impl App {
             view_secret,
             tcp_addr,
             video_transport,
-            feed,
+            self.video_fanout.clone(),
         );
         self.subscribers.insert(stream_id, handle);
         self.set_status("viewing screen share");
     }
 
     fn stop_view(&mut self, stream_id: StreamId) {
+        self.web_viewing_shares.remove(&stream_id);
+        if self.video_fanout.has_native(stream_id) {
+            return;
+        }
         if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
             subscriber.stop();
         }
@@ -4233,7 +4257,10 @@ impl App {
                     AvailableShare {
                         room_id,
                         view_secret: Vec::new(),
+                        sender_name: sender.clone(),
                         codec: codec.clone(),
+                        coded_width,
+                        coded_height,
                         extradata: extradata.clone(),
                     },
                 );
@@ -4270,7 +4297,10 @@ impl App {
                     AvailableShare {
                         room_id,
                         view_secret,
+                        sender_name: sender_name.clone(),
                         codec: codec.clone(),
+                        coded_width,
+                        coded_height,
                         extradata: extradata.clone(),
                     },
                 );
@@ -4297,6 +4327,8 @@ impl App {
                     self.teardown_own_share(false);
                 } else {
                     self.room.available_shares.remove(&stream_id);
+                    self.web_viewing_shares.remove(&stream_id);
+                    self.video_fanout.close_stream(stream_id);
                     if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
                         subscriber.stop();
                     }

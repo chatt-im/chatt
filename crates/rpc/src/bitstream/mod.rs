@@ -73,6 +73,109 @@ pub fn annex_b_to_length_prefixed_into(codec: Codec, access_unit: &[u8], out: &m
     }
 }
 
+/// Converts a WebCodecs length-prefixed access unit back to Annex-B. Screen
+/// sharing always negotiates four-byte lengths, but the descriptor is checked
+/// by [`configuration_to_annex_b`] before playback starts.
+pub fn length_prefixed_to_annex_b(access_unit: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(access_unit.len());
+    let mut cursor = 0usize;
+    while cursor < access_unit.len() {
+        let length_bytes = access_unit
+            .get(cursor..cursor + 4)
+            .ok_or_else(|| "truncated video NAL length".to_string())?;
+        let length = u32::from_be_bytes(length_bytes.try_into().unwrap()) as usize;
+        cursor += 4;
+        if length == 0 || cursor.saturating_add(length) > access_unit.len() {
+            return Err("invalid video NAL length".into());
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&access_unit[cursor..cursor + length]);
+        cursor += length;
+    }
+    if out.is_empty() {
+        return Err("video access unit contains no NAL units".into());
+    }
+    Ok(out)
+}
+
+/// Extracts parameter sets from an `avcC` or `hvcC` decoder descriptor and
+/// emits the Annex-B extradata expected by NUT/FFmpeg.
+pub fn configuration_to_annex_b(codec: Codec, configuration: &[u8]) -> Result<Vec<u8>, String> {
+    match codec {
+        Codec::H264 => avcc_to_annex_b(configuration),
+        Codec::Hevc => hvcc_to_annex_b(configuration),
+    }
+}
+
+fn avcc_to_annex_b(configuration: &[u8]) -> Result<Vec<u8>, String> {
+    if configuration.len() < 7 || configuration[0] != 1 || configuration[4] & 3 != 3 {
+        return Err("invalid avcC decoder configuration".into());
+    }
+    let mut cursor = 6usize;
+    let sps_count = configuration[5] & 0x1f;
+    let mut out = Vec::new();
+    for _ in 0..sps_count {
+        append_configuration_nal(configuration, &mut cursor, &mut out)?;
+    }
+    let pps_count = *configuration
+        .get(cursor)
+        .ok_or_else(|| "truncated avcC PPS count".to_string())?;
+    cursor += 1;
+    for _ in 0..pps_count {
+        append_configuration_nal(configuration, &mut cursor, &mut out)?;
+    }
+    if out.is_empty() {
+        return Err("avcC contains no parameter sets".into());
+    }
+    Ok(out)
+}
+
+fn hvcc_to_annex_b(configuration: &[u8]) -> Result<Vec<u8>, String> {
+    if configuration.len() < 23 || configuration[0] != 1 || configuration[21] & 3 != 3 {
+        return Err("invalid hvcC decoder configuration".into());
+    }
+    let arrays = configuration[22] as usize;
+    let mut cursor = 23usize;
+    let mut out = Vec::new();
+    for _ in 0..arrays {
+        cursor = cursor
+            .checked_add(1)
+            .filter(|cursor| *cursor + 2 <= configuration.len())
+            .ok_or_else(|| "truncated hvcC array".to_string())?;
+        let count = u16::from_be_bytes(configuration[cursor..cursor + 2].try_into().unwrap());
+        cursor += 2;
+        for _ in 0..count {
+            append_configuration_nal(configuration, &mut cursor, &mut out)?;
+        }
+    }
+    if out.is_empty() {
+        return Err("hvcC contains no parameter sets".into());
+    }
+    Ok(out)
+}
+
+fn append_configuration_nal(
+    configuration: &[u8],
+    cursor: &mut usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let length_bytes = configuration
+        .get(*cursor..*cursor + 2)
+        .ok_or_else(|| "truncated decoder configuration NAL length".to_string())?;
+    let length = u16::from_be_bytes(length_bytes.try_into().unwrap()) as usize;
+    *cursor += 2;
+    let nal = configuration
+        .get(*cursor..*cursor + length)
+        .ok_or_else(|| "truncated decoder configuration NAL".to_string())?;
+    if nal.is_empty() {
+        return Err("empty decoder configuration NAL".into());
+    }
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out.extend_from_slice(nal);
+    *cursor += length;
+    Ok(())
+}
+
 /// Iterates the `(start, end)` byte ranges of each NAL in an Annex-B stream,
 /// handling both 3- and 4-byte start codes. The ranges exclude the start codes.
 /// The NAL header layout differs by codec, so the type is decoded per codec.
@@ -125,6 +228,36 @@ impl Iterator for NalIterator<'_> {
             self.pos += 1;
         }
         self.start.take().map(|start| (start, self.data.len()))
+    }
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    #[test]
+    fn length_prefixed_access_unit_round_trips_to_annex_b() {
+        let annex_b = [0, 0, 0, 1, 0x65, 0x88, 0x84];
+        let length_prefixed = annex_b_to_length_prefixed(Codec::H264, &annex_b);
+        assert_eq!(length_prefixed_to_annex_b(&length_prefixed).unwrap(), annex_b);
+        assert!(length_prefixed_to_annex_b(&[0, 0, 0, 8, 1]).is_err());
+    }
+
+    #[test]
+    fn avcc_parameter_sets_convert_to_annex_b() {
+        let sps = [0x67, 0x42, 0xc0, 0x1e];
+        let pps = [0x68, 0xce, 0x06];
+        let avcc = h264::build_avcc_extra_data(&sps, &pps);
+        assert_eq!(
+            configuration_to_annex_b(Codec::H264, &avcc).unwrap(),
+            [
+                &[0, 0, 0, 1],
+                sps.as_slice(),
+                &[0, 0, 0, 1],
+                pps.as_slice(),
+            ]
+            .concat()
+        );
     }
 }
 

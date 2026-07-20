@@ -2,7 +2,7 @@ use std::{
     any::Any,
     collections::{HashMap, HashSet},
     io,
-    os::fd::IntoRawFd,
+    os::fd::{AsRawFd, IntoRawFd, OwnedFd},
     os::unix::net::UnixStream,
     panic::{self, AssertUnwindSafe},
     sync::{
@@ -51,6 +51,7 @@ struct RemoteRpcClient {
     uploads: Arc<Mutex<HashMap<rpc::daemon::model::BulkTransferId, RpcUpload>>>,
     pending_history: Option<RpcHistoryRequest>,
     last_snapshot: rpc::daemon::model::StateSnapshot,
+    live_viewers: HashMap<rpc::ids::StreamId, crate::video::NativeViewerHandle>,
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +69,10 @@ struct RpcUpload {
 }
 
 enum QueuedRpcFrame {
-    Frame(Vec<u8>),
+    Frame {
+        framed: Vec<u8>,
+        fds: Vec<OwnedFd>,
+    },
     Shutdown,
 }
 
@@ -84,6 +88,10 @@ struct RpcClientSender {
 
 impl RpcClientSender {
     fn send(&self, frame: &DaemonFrame) -> Result<(), String> {
+        self.send_with_fds(frame, Vec::new())
+    }
+
+    fn send_with_fds(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), String> {
         let is_bulk_chunk = matches!(frame, DaemonFrame::BulkChunk(_));
         let mut framed = self.buffers.lock().pop().unwrap_or_default();
         if let Err(error) = rpc::daemon::frame::encode_daemon_framed_into(frame, &mut framed) {
@@ -100,18 +108,18 @@ impl RpcClientSender {
             recycle_rpc_buffer(&self.buffers, framed);
             return Err("RPC client outbound queue is full".into());
         }
-        match self.tx.try_send(QueuedRpcFrame::Frame(framed)) {
+        match self.tx.try_send(QueuedRpcFrame::Frame { framed, fds }) {
             Ok(()) => {
                 self.complete_request(frame);
                 Ok(())
             }
-            Err(TrySendError::Full(QueuedRpcFrame::Frame(framed))) => {
+            Err(TrySendError::Full(QueuedRpcFrame::Frame { framed, .. })) => {
                 self.queued_bytes
                     .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
                 recycle_rpc_buffer(&self.buffers, framed);
                 Err("RPC client outbound queue is full".into())
             }
-            Err(TrySendError::Disconnected(QueuedRpcFrame::Frame(framed))) => {
+            Err(TrySendError::Disconnected(QueuedRpcFrame::Frame { framed, .. })) => {
                 self.queued_bytes
                     .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
                 recycle_rpc_buffer(&self.buffers, framed);
@@ -175,6 +183,7 @@ impl RpcClientSender {
         let request_id = match frame {
             DaemonFrame::RequestResult(result) => Some(result.request_id),
             DaemonFrame::Pong { request_id, .. } => Some(*request_id),
+            DaemonFrame::LiveShareOpened { request_id, .. } => Some(*request_id),
             _ => None,
         };
         if let Some(request_id) = request_id {
@@ -528,6 +537,11 @@ fn handle_runtime_event(
         AppEvent::RpcClientExited(id) => {
             app.retire_client(id);
             if let Some(mut client) = rpc_clients.remove(&id) {
+                let live_streams = client.live_viewers.keys().copied().collect::<Vec<_>>();
+                client.live_viewers.clear();
+                for stream_id in live_streams {
+                    app.stop_rpc_live_share(stream_id);
+                }
                 shutdown_rpc(&mut client);
                 kvlog::info!("daemon RPC client detached", client_id = id.0);
             }
@@ -655,6 +669,7 @@ fn spawn_rpc_client(
         uploads,
         pending_history: None,
         last_snapshot: snapshot,
+        live_viewers: HashMap::new(),
     })
 }
 
@@ -711,9 +726,10 @@ fn rpc_writer_loop(
     let mut writer = rpc::daemon::unix::FrameWriter::new(stream);
     while let Ok(queued) = rx.recv() {
         match queued {
-            QueuedRpcFrame::Frame(framed) => {
+            QueuedRpcFrame::Frame { framed, fds } => {
                 let bytes = framed.len();
-                let result = writer.send_framed(&framed, &[]);
+                let raw_fds = fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+                let result = writer.send_framed(&framed, &raw_fds);
                 queued_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
                 recycle_rpc_buffer(&buffers, framed);
                 if result.is_err() {
@@ -795,6 +811,11 @@ fn sync_rpc_projection(
         next_room.older_cursor = previous.older_cursor;
         next_room.at_start = previous.at_start;
     }
+    client.live_viewers.retain(|stream_id, _| {
+        next.live_shares
+            .iter()
+            .any(|share| share.stream_id == *stream_id)
+    });
     if client.last_snapshot.selected_room != next.selected_room
         || client.last_snapshot.room.as_ref().map(|room| room.room_id)
             != next.room.as_ref().map(|room| room.room_id)
@@ -904,6 +925,29 @@ fn projection_deltas(
         deltas.push(StateDelta::VoiceStateChanged {
             voice: next.voice.clone(),
         });
+    }
+    for share in &next.live_shares {
+        if old
+            .live_shares
+            .iter()
+            .find(|old| old.stream_id == share.stream_id)
+            != Some(share)
+        {
+            deltas.push(StateDelta::LiveShareUpserted {
+                share: share.clone(),
+            });
+        }
+    }
+    for share in &old.live_shares {
+        if !next
+            .live_shares
+            .iter()
+            .any(|next| next.stream_id == share.stream_id)
+        {
+            deltas.push(StateDelta::LiveShareRemoved {
+                stream_id: share.stream_id,
+            });
+        }
     }
     for transfer in &next.transfers {
         if old
@@ -1019,6 +1063,89 @@ fn handle_rpc_command(
     instance_id: DaemonInstanceId,
 ) {
     match frame {
+        rpc::daemon::frame::ClientFrame::StartLiveShare {
+            request_id,
+            stream_id,
+        } => {
+            let already_playing = clients
+                .get(&id)
+                .is_some_and(|client| client.live_viewers.contains_key(&stream_id));
+            if already_playing {
+                send_live_share_rejection(
+                    clients,
+                    id,
+                    request_id,
+                    rpc::daemon::frame::Operation::StartLiveShare,
+                    409,
+                    "screen share is already playing",
+                );
+                return;
+            }
+            let (daemon_stream, frontend_stream) = match UnixStream::pair() {
+                Ok(pair) => pair,
+                Err(error) => {
+                    send_live_share_rejection(
+                        clients,
+                        id,
+                        request_id,
+                        rpc::daemon::frame::Operation::StartLiveShare,
+                        500,
+                        &format!("cannot create screen share transport: {error}"),
+                    );
+                    return;
+                }
+            };
+            let handle = match app.start_rpc_live_share(id, stream_id, daemon_stream) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    send_live_share_rejection(
+                        clients,
+                        id,
+                        request_id,
+                        rpc::daemon::frame::Operation::StartLiveShare,
+                        409,
+                        &error,
+                    );
+                    return;
+                }
+            };
+            let frontend_fd: OwnedFd = frontend_stream.into();
+            let opened = DaemonFrame::LiveShareOpened {
+                request_id,
+                stream_id,
+            };
+            let Some(client) = clients.get_mut(&id) else {
+                return;
+            };
+            if client
+                .sender
+                .send_with_fds(&opened, vec![frontend_fd])
+                .is_ok()
+            {
+                client.live_viewers.insert(stream_id, handle);
+            } else {
+                client.sender.abort();
+            }
+            return;
+        }
+        rpc::daemon::frame::ClientFrame::StopLiveShare {
+            request_id,
+            stream_id,
+        } => {
+            if let Some(client) = clients.get_mut(&id) {
+                client.live_viewers.remove(&stream_id);
+                app.stop_rpc_live_share(stream_id);
+                let result = rpc::daemon::frame::RequestResult {
+                    request_id,
+                    operation: rpc::daemon::frame::Operation::StopLiveShare,
+                    outcome: rpc::daemon::frame::RequestOutcome::Accepted,
+                };
+                client
+                    .sender
+                    .send_or_abort(&DaemonFrame::RequestResult(result));
+            }
+            return;
+        }
         rpc::daemon::frame::ClientFrame::LoadOlder {
             request_id,
             room_id,
@@ -1190,6 +1317,31 @@ fn handle_rpc_command(
             return;
         }
     }
+}
+
+fn send_live_share_rejection(
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: rpc::daemon::model::RequestId,
+    operation: rpc::daemon::frame::Operation,
+    code: u16,
+    message: &str,
+) {
+    let Some(client) = clients.get_mut(&id) else {
+        return;
+    };
+    client
+        .sender
+        .send_or_abort(&DaemonFrame::RequestResult(
+            rpc::daemon::frame::RequestResult {
+                request_id,
+                operation,
+                outcome: rpc::daemon::frame::RequestOutcome::Rejected {
+                    code,
+                    message: message.into(),
+                },
+            },
+        ));
 }
 
 fn handle_rpc_effect(
@@ -1521,6 +1673,7 @@ fn stream_rpc_attachment(
 }
 
 fn shutdown_rpc(client: &mut RemoteRpcClient) {
+    client.live_viewers.clear();
     client.sender.shutdown();
     let _ = client.control.shutdown(std::net::Shutdown::Both);
     if let Some(thread) = client.reader_thread.take() {

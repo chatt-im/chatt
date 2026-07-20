@@ -82,6 +82,21 @@ impl App {
             })
             .collect();
         let room = selected_room.map(|room_id| self.rpc_room_snapshot(room_id));
+        let mut live_shares = self
+            .room
+            .available_shares
+            .iter()
+            .map(|(stream_id, share)| rpc::daemon::model::LiveShare {
+                room_id: share.room_id,
+                stream_id: *stream_id,
+                sender_name: share.sender_name.clone(),
+                codec: share.codec.clone(),
+                coded_width: share.coded_width,
+                coded_height: share.coded_height,
+                extradata: share.extradata.clone(),
+            })
+            .collect::<Vec<_>>();
+        live_shares.sort_by_key(|share| share.stream_id);
         StateSnapshot {
             connection: if self.user_id.is_some() {
                 ConnectionState::Online
@@ -107,6 +122,64 @@ impl App {
             transfers: selected_room.map_or_else(Vec::new, |room_id| {
                 self.room.rpc_transfer_summaries(room_id)
             }),
+            live_shares,
+        }
+    }
+
+    pub(crate) fn start_rpc_live_share(
+        &mut self,
+        client_id: ClientId,
+        stream_id: rpc::ids::StreamId,
+        stream: std::os::unix::net::UnixStream,
+    ) -> Result<crate::video::NativeViewerHandle, String> {
+        let share = self
+            .room
+            .available_shares
+            .get(&stream_id)
+            .ok_or_else(|| "that screen share is no longer available".to_string())?;
+        if self.room.voice_room != Some(share.room_id) {
+            return Err("join the share's voice room before viewing".into());
+        }
+        let view_secret = share.view_secret.clone();
+        let own_share = self.screencast_stream_id == Some(stream_id);
+        let tcp_addr = self.active_tcp_addr.clone();
+        let session_id = self.session_id;
+        let video_transport = self.video_transport;
+        let handle = self
+            .video_fanout
+            .add_native(client_id.0 as u64, stream_id, stream)?;
+        if own_share || self.subscribers.contains_key(&stream_id) {
+            return Ok(handle);
+        }
+        let Some(tcp_addr) = tcp_addr else {
+            return Err("not connected to a server".into());
+        };
+        let Some(session_id) = session_id else {
+            return Err("the voice session is no longer active".into());
+        };
+        let Some(video_transport) = video_transport else {
+            return Err("video transport is not ready".into());
+        };
+        let subscriber = crate::video::start_subscriber(
+            session_id,
+            stream_id,
+            view_secret,
+            tcp_addr,
+            video_transport,
+            self.video_fanout.clone(),
+        );
+        self.subscribers.insert(stream_id, subscriber);
+        Ok(handle)
+    }
+
+    pub(crate) fn stop_rpc_live_share(&mut self, stream_id: rpc::ids::StreamId) {
+        if self.video_fanout.has_native(stream_id)
+            || self.web_viewing_shares.contains(&stream_id)
+        {
+            return;
+        }
+        if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
+            subscriber.stop();
         }
     }
 
@@ -227,6 +300,9 @@ impl App {
             ClientFrame::RequestSnapshot { request_id } => RpcCommandEffect::Snapshot(request_id),
             ClientFrame::Disconnect { request_id } => {
                 RpcCommandEffect::Disconnect(accepted(request_id, Operation::Disconnect))
+            }
+            ClientFrame::StartLiveShare { .. } | ClientFrame::StopLiveShare { .. } => {
+                RpcCommandEffect::None
             }
             ClientFrame::SelectRoom {
                 request_id,
@@ -723,5 +799,30 @@ mod tests {
         assert_eq!(app.rpc_snapshot(first).selected_room, Some(RoomId(2)));
         assert_eq!(app.rpc_snapshot(second).selected_room, Some(RoomId(1)));
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+    }
+
+    #[test]
+    fn rpc_snapshot_exposes_live_share_decoder_metadata() {
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
+        let stream_id = rpc::ids::StreamId(11);
+        app.room.available_shares.insert(
+            stream_id,
+            crate::app::AvailableShare {
+                room_id: RoomId(7),
+                view_secret: vec![9; 32],
+                sender_name: "alice".into(),
+                codec: "avc1.42C00D".into(),
+                coded_width: 320,
+                coded_height: 240,
+                extradata: vec![1, 2, 3],
+            },
+        );
+        let snapshot = app.rpc_snapshot(ClientId::PRIMARY);
+        assert_eq!(snapshot.live_shares.len(), 1);
+        let share = &snapshot.live_shares[0];
+        assert_eq!(share.stream_id, stream_id);
+        assert_eq!(share.sender_name, "alice");
+        assert_eq!((share.coded_width, share.coded_height), (320, 240));
+        assert_eq!(share.extradata, vec![1, 2, 3]);
     }
 }

@@ -206,6 +206,12 @@ pub struct FrameReader {
     stream: UnixStream,
     buffer: crate::recv::RecvBuffer,
     control: Vec<u8>,
+    current_fds: Vec<OwnedFd>,
+}
+
+pub struct ReceivedFrame<T> {
+    pub frame: T,
+    pub fds: Vec<OwnedFd>,
 }
 
 impl FrameReader {
@@ -217,6 +223,7 @@ impl FrameReader {
             stream,
             buffer: crate::recv::RecvBuffer::new(),
             control: vec![0; control_len],
+            current_fds: Vec::new(),
         }
     }
 
@@ -230,6 +237,12 @@ impl FrameReader {
 
     pub fn recv_daemon(&mut self) -> io::Result<super::frame::DaemonFrame> {
         self.recv_decoded(super::frame::decode_daemon)
+    }
+
+    pub fn recv_daemon_with_fds(
+        &mut self,
+    ) -> io::Result<ReceivedFrame<super::frame::DaemonFrame>> {
+        self.recv_decoded_with_fds(super::frame::decode_daemon)
     }
 
     fn recv_decoded<T, E>(&mut self, decode: impl Fn(&[u8]) -> Result<T, E>) -> io::Result<T>
@@ -246,7 +259,43 @@ impl FrameReader {
                         io::Error::new(io::ErrorKind::InvalidData, error.to_string())
                     })?;
                     self.buffer.consume(consumed);
+                    if !self.current_fds.is_empty() {
+                        self.current_fds.clear();
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unexpected file descriptors in daemon frame",
+                        ));
+                    }
                     return Ok(decoded);
+                }
+                Ok(None) => {}
+                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+            self.recv_more()?;
+        }
+    }
+
+    fn recv_decoded_with_fds<T, E>(
+        &mut self,
+        decode: impl Fn(&[u8]) -> Result<T, E>,
+    ) -> io::Result<ReceivedFrame<T>>
+    where
+        E: std::fmt::Display,
+    {
+        loop {
+            match crate::frame::parse_frame_with_limit(
+                self.buffer.pending(),
+                super::MAX_FRAME_BYTES,
+            ) {
+                Ok(Some((payload, consumed))) => {
+                    let frame = decode(payload).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    self.buffer.consume(consumed);
+                    return Ok(ReceivedFrame {
+                        frame,
+                        fds: mem::take(&mut self.current_fds),
+                    });
                 }
                 Ok(None) => {}
                 Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
@@ -259,7 +308,27 @@ impl FrameReader {
         let mut msg: libc::msghdr = unsafe { mem::zeroed() };
         let fd = self.stream.as_raw_fd();
         let control = &mut self.control;
-        let read = self.buffer.fill_with(64 * 1024, |destination, len| {
+        // Never read across a frame boundary. SCM_RIGHTS on a Unix stream is
+        // attached to a byte position, not to a message, so bounding recvmsg
+        // this way lets us associate every descriptor with exactly one frame.
+        let pending = self.buffer.pending();
+        let wanted = if pending.len() < crate::frame::LENGTH_PREFIX_LEN {
+            crate::frame::LENGTH_PREFIX_LEN - pending.len()
+        } else {
+            let payload_len = u32::from_le_bytes(
+                pending[..crate::frame::LENGTH_PREFIX_LEN]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            if payload_len > super::MAX_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "daemon frame exceeds maximum length",
+                ));
+            }
+            crate::frame::LENGTH_PREFIX_LEN + payload_len - pending.len()
+        };
+        let read = self.buffer.fill_with(wanted, |destination, len| {
             let mut iov = libc::iovec {
                 iov_base: destination.cast(),
                 iov_len: len,
@@ -296,12 +365,7 @@ impl FrameReader {
                 "truncated daemon frame or ancillary data",
             ));
         }
-        if !fds.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected file descriptors in daemon frame",
-            ));
-        }
+        self.current_fds.extend(fds);
         Ok(())
     }
 }
@@ -363,6 +427,16 @@ impl FrameWriter {
         super::frame::encode_daemon_framed_into(frame, &mut self.buffer)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         send_frame_bytes(&mut self.stream, &self.buffer, &[])
+    }
+
+    pub fn send_daemon_with_fds(
+        &mut self,
+        frame: &super::frame::DaemonFrame,
+        fds: &[RawFd],
+    ) -> io::Result<()> {
+        super::frame::encode_daemon_framed_into(frame, &mut self.buffer)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        send_frame_bytes(&mut self.stream, &self.buffer, fds)
     }
 
     /// Writes an already encoded, length-prefixed frame without copying it.
@@ -456,6 +530,33 @@ mod tests {
         let mut reader = FrameReader::new(right);
         assert_eq!(reader.recv_payload().unwrap(), b"one");
         assert_eq!(reader.recv_payload().unwrap(), b"two");
+    }
+
+    #[test]
+    fn descriptors_are_associated_with_their_exact_daemon_frame() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let (video, _peer) = UnixStream::pair().unwrap();
+        let mut writer = FrameWriter::new(left);
+        let first = super::super::frame::DaemonFrame::Pong {
+            request_id: super::super::model::RequestId(1),
+            nonce: 9,
+        };
+        let opened = super::super::frame::DaemonFrame::LiveShareOpened {
+            request_id: super::super::model::RequestId(2),
+            stream_id: crate::ids::StreamId(7),
+        };
+        writer.send_daemon(&first).unwrap();
+        writer
+            .send_daemon_with_fds(&opened, &[video.as_raw_fd()])
+            .unwrap();
+
+        let mut reader = FrameReader::new(right);
+        let received = reader.recv_daemon_with_fds().unwrap();
+        assert_eq!(received.frame, first);
+        assert!(received.fds.is_empty());
+        let received = reader.recv_daemon_with_fds().unwrap();
+        assert_eq!(received.frame, opened);
+        assert_eq!(received.fds.len(), 1);
     }
 
     #[test]

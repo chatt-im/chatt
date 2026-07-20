@@ -1,12 +1,13 @@
 use jsony::Jsony;
 
-use crate::ids::{FileTransferId, MessageId, RoomId};
+use crate::ids::{FileTransferId, MessageId, RoomId, StreamId};
 
 use super::{
     bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished, BulkStarted},
     model::{
-        BulkTransferId, ConnectionState, DaemonInstanceId, Message, Participant, RequestId,
-        RoomSnapshot, RoomSummary, StateSnapshot, TransferSummary, TrustState, VoiceState,
+        BulkTransferId, ConnectionState, DaemonInstanceId, LiveShare, Message, Participant,
+        RequestId, RoomSnapshot, RoomSummary, StateSnapshot, TransferSummary, TrustState,
+        VoiceState,
     },
 };
 
@@ -125,6 +126,8 @@ pub enum Operation {
     JoinVoice,
     LeaveVoice,
     SetOutputVolume,
+    StartLiveShare,
+    StopLiveShare,
     Ping,
     RequestSnapshot,
     Disconnect,
@@ -204,6 +207,12 @@ pub enum StateDelta {
     },
     VoiceStateChanged {
         voice: VoiceState,
+    },
+    LiveShareUpserted {
+        share: LiveShare,
+    },
+    LiveShareRemoved {
+        stream_id: StreamId,
     },
     ResyncRequired {
         reason: String,
@@ -292,6 +301,14 @@ pub enum ClientFrame {
         request_id: RequestId,
         volume: f32,
     },
+    StartLiveShare {
+        request_id: RequestId,
+        stream_id: StreamId,
+    },
+    StopLiveShare {
+        request_id: RequestId,
+        stream_id: StreamId,
+    },
     Ping {
         request_id: RequestId,
         nonce: u64,
@@ -323,6 +340,8 @@ impl ClientFrame {
             | Self::JoinVoice { request_id, .. }
             | Self::LeaveVoice { request_id }
             | Self::SetOutputVolume { request_id, .. }
+            | Self::StartLiveShare { request_id, .. }
+            | Self::StopLiveShare { request_id, .. }
             | Self::Ping { request_id, .. }
             | Self::RequestSnapshot { request_id }
             | Self::Disconnect { request_id } => Some(*request_id),
@@ -342,6 +361,10 @@ pub enum DaemonFrame {
     },
     Event(StateEvent),
     RequestResult(RequestResult),
+    LiveShareOpened {
+        request_id: RequestId,
+        stream_id: StreamId,
+    },
     Pong {
         request_id: RequestId,
         nonce: u64,
@@ -507,6 +530,9 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
             validate_delta(&event.delta)
         }
         DaemonFrame::RequestResult(result) => validate_result(result),
+        DaemonFrame::LiveShareOpened { request_id, .. } if request_id.0 == 0 => {
+            Err("request id must be nonzero".into())
+        }
         DaemonFrame::Pong { request_id, .. } if request_id.0 == 0 => {
             Err("request id must be nonzero".into())
         }
@@ -521,7 +547,7 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
             }
             super::model::check_nonempty_string(reason)
         }
-        DaemonFrame::Pong { .. } => Ok(()),
+        DaemonFrame::Pong { .. } | DaemonFrame::LiveShareOpened { .. } => Ok(()),
     }
 }
 
@@ -579,6 +605,7 @@ fn validate_delta(delta: &StateDelta) -> Result<(), String> {
             Err("transfer id must be nonzero".into())
         }
         StateDelta::VoiceStateChanged { voice } => voice.validate(),
+        StateDelta::LiveShareUpserted { share } => share.validate(),
         StateDelta::ResyncRequired { reason } => super::model::check_nonempty_string(reason),
         _ => Ok(()),
     }
@@ -784,6 +811,14 @@ mod tests {
                 request_id,
                 volume: 75.0,
             },
+            ClientFrame::StartLiveShare {
+                request_id,
+                stream_id: StreamId(5),
+            },
+            ClientFrame::StopLiveShare {
+                request_id,
+                stream_id: StreamId(5),
+            },
             ClientFrame::Ping {
                 request_id,
                 nonce: 9,
@@ -816,7 +851,7 @@ mod tests {
         };
         let frames = vec![
             DaemonFrame::Welcome(Welcome {
-                version: 1,
+                version: super::super::PROTOCOL_MAX_VERSION,
                 instance_id,
                 daemon_build: "test".into(),
                 connection: ConnectionState::Online,
@@ -841,6 +876,7 @@ mod tests {
                         joined_room: None,
                     },
                     transfers: Vec::new(),
+                    live_shares: Vec::new(),
                 },
             },
             DaemonFrame::Event(StateEvent {
@@ -853,6 +889,10 @@ mod tests {
                 operation: Operation::Ping,
                 outcome: RequestOutcome::Accepted,
             }),
+            DaemonFrame::LiveShareOpened {
+                request_id,
+                stream_id: StreamId(5),
+            },
             DaemonFrame::Pong {
                 request_id,
                 nonce: 9,
