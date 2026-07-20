@@ -1,6 +1,6 @@
 use jsony::Jsony;
 
-use crate::ids::{FileTransferId, MessageId, RoomId, UserId};
+use crate::ids::{FileTransferId, MessageId, RoomId, StreamId, UserId};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
@@ -154,6 +154,18 @@ pub struct TransferSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
+pub struct LiveShare {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+    pub sender_name: String,
+    pub codec: String,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub extradata: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
 pub struct RoomSnapshot {
     pub room_id: RoomId,
     pub messages: Vec<Message>,
@@ -173,6 +185,7 @@ pub struct StateSnapshot {
     pub room: Option<RoomSnapshot>,
     pub voice: VoiceState,
     pub transfers: Vec<TransferSummary>,
+    pub live_shares: Vec<LiveShare>,
 }
 
 impl StateSnapshot {
@@ -182,6 +195,9 @@ impl StateSnapshot {
         }
         if self.transfers.len() > super::MAX_TRANSFERS {
             return Err("transfer collection exceeds limit".into());
+        }
+        if self.live_shares.len() > super::MAX_LIVE_SHARES {
+            return Err("live share collection exceeds limit".into());
         }
         check_opt_string(&self.active_server)?;
         check_opt_string(&self.local_identity)?;
@@ -221,6 +237,30 @@ impl StateSnapshot {
             {
                 return Err("duplicate transfer id".into());
             }
+        }
+        for share in &self.live_shares {
+            share.validate()?;
+        }
+        if self
+            .live_shares
+            .windows(2)
+            .any(|shares| shares[0].stream_id >= shares[1].stream_id)
+        {
+            return Err("live shares must be strictly ordered by stream id".into());
+        }
+        Ok(())
+    }
+}
+
+impl LiveShare {
+    pub fn validate(&self) -> Result<(), String> {
+        check_nonempty_string(&self.sender_name)?;
+        check_nonempty_string(&self.codec)?;
+        if self.coded_width == 0 || self.coded_height == 0 {
+            return Err("live share dimensions must be nonzero".into());
+        }
+        if self.extradata.len() > super::MAX_FRAME_BYTES {
+            return Err("live share codec data exceeds limit".into());
         }
         Ok(())
     }

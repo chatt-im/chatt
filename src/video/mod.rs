@@ -8,6 +8,7 @@
 //! voice and restarts are cheap.
 
 pub mod capture;
+mod fanout;
 mod nut;
 mod publisher;
 mod subscriber;
@@ -27,6 +28,7 @@ use rpc::{
 
 pub use publisher::{ScreencastHandle, start as start_screencast};
 pub use subscriber::{SubscriberHandle, start as start_subscriber};
+pub use fanout::{NativeViewerHandle, VideoFrameFanout};
 
 /// Fixed plaintext for the auth record. Its contents are irrelevant, opening it
 /// is what proves the peer derived the per-stream key.

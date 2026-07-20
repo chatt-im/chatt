@@ -19,9 +19,7 @@ use rpc::{
     video::{SharedVideoFrame, VideoRecordReader, VideoRole},
 };
 
-use crate::web_server::WebFeedSender;
-
-use super::VideoTransport;
+use super::{VideoFrameFanout, VideoTransport};
 
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
@@ -90,7 +88,7 @@ pub fn start(
     view_secret: Vec<u8>,
     tcp_addr: String,
     video_transport: VideoTransport,
-    feed: WebFeedSender,
+    fanout: VideoFrameFanout,
 ) -> SubscriberHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
@@ -103,7 +101,7 @@ pub fn start(
                 &view_secret,
                 &tcp_addr,
                 video_transport,
-                &feed,
+                &fanout,
                 &thread_stop,
             )
         })
@@ -117,7 +115,7 @@ fn run(
     secret: &[u8],
     tcp_addr: &str,
     video_transport: VideoTransport,
-    feed: &WebFeedSender,
+    fanout: &VideoFrameFanout,
     stop: &AtomicBool,
 ) {
     while !stop.load(Ordering::SeqCst) {
@@ -127,7 +125,7 @@ fn run(
             secret,
             tcp_addr,
             video_transport,
-            feed,
+            fanout,
             stop,
         ) {
             Ok(()) => break,
@@ -150,7 +148,7 @@ fn run_once(
     secret: &[u8],
     tcp_addr: &str,
     video_transport: VideoTransport,
-    feed: &WebFeedSender,
+    fanout: &VideoFrameFanout,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let (stream, mut record_protection, mut recv) = super::open_video_connection(
@@ -176,14 +174,14 @@ fn run_once(
             .map_err(|error| error.to_string())?;
         copy_stats.copied_bytes += taken as u64;
         recv.consume(taken);
-        forward_ready_record(&mut reader, &mut record_protection, feed, &mut copy_stats)?;
+        forward_ready_record(&mut reader, &mut record_protection, fanout, &mut copy_stats)?;
     }
 
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        forward_ready_record(&mut reader, &mut record_protection, feed, &mut copy_stats)?;
+        forward_ready_record(&mut reader, &mut record_protection, fanout, &mut copy_stats)?;
         match reader.fill(&stream, super::VIDEO_READ_CHUNK_BYTES) {
             Ok(0) => return Err("video connection closed".to_string()),
             Ok(_) => {}
@@ -203,7 +201,7 @@ fn run_once(
 fn forward_ready_record(
     reader: &mut VideoRecordReader,
     record_protection: &mut RecordProtection,
-    feed: &WebFeedSender,
+    fanout: &VideoFrameFanout,
     copy_stats: &mut CopyStats,
 ) -> Result<(), String> {
     let Some(record) = reader.take_record() else {
@@ -213,7 +211,7 @@ fn forward_ready_record(
     copy_stats.shipped_bytes += frame.len() as u64;
     copy_stats.frames += 1;
     copy_stats.maybe_log();
-    feed.send_video_frame(frame);
+    fanout.send(frame);
     Ok(())
 }
 
