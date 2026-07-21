@@ -27,8 +27,8 @@ mod imp {
     use jsony::Jsony;
     use sendfd::RecvWithFd;
 
-    use rpc::daemon::unix::{CONTROL_MAGIC as MAGIC, OP_DAEMON_RPC};
-    pub use rpc::daemon::unix::{RUN_DIR_ENV, SOCKET_ENV};
+    use local_rpc::unix::{CONTROL_MAGIC as MAGIC, OP_DAEMON_RPC};
+    pub use local_rpc::unix::{RUN_DIR_ENV, SOCKET_ENV};
     const OP_UPLOAD: u8 = 1;
     const OP_VOICE: u8 = 2;
     const OP_SCREENCAST: u8 = 3;
@@ -572,7 +572,7 @@ mod imp {
         ClientLogs { follow: bool },
         ReportBug(String),
         Attach(ClientHello),
-        DaemonRpc(rpc::daemon::frame::ClientHello),
+        DaemonRpc(local_rpc::frame::ClientHello),
     }
 
     struct ReceivedFds {
@@ -616,7 +616,7 @@ mod imp {
     }
 
     fn socket_config() -> Result<SocketConfig, String> {
-        let path = rpc::daemon::unix::control_socket_path()?;
+        let path = local_rpc::unix::control_socket_path()?;
         let private_dir = env::var_os(SOCKET_ENV).is_none().then(|| {
             path.parent()
                 .expect("default control socket has a parent")
@@ -848,7 +848,7 @@ mod imp {
                 );
                 return;
             }
-            let peer = match rpc::daemon::unix::peer_credentials(&stream) {
+            let peer = match local_rpc::unix::peer_credentials(&stream) {
                 Ok((uid, pid)) if uid == current_uid() => RpcPeer { uid, pid },
                 Ok((uid, _)) => {
                     let _ = write_response(
@@ -1680,7 +1680,7 @@ mod imp {
 
         #[test]
         fn daemon_rpc_dispatch_hands_off_authenticated_stream_without_fds() {
-            let hello = rpc::daemon::frame::ClientHello::current("test-gui");
+            let hello = local_rpc::frame::ClientHello::current("test-gui");
             let body = jsony::to_binary(&hello);
             let mut frame = Vec::new();
             frame.extend_from_slice(MAGIC);

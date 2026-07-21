@@ -204,7 +204,7 @@ pub fn peer_credentials(stream: &UnixStream) -> io::Result<(u32, u32)> {
 
 pub struct FrameReader {
     stream: UnixStream,
-    buffer: crate::recv::RecvBuffer,
+    buffer: crate::recv_buffer::RecvBuffer,
     control: Vec<u8>,
     current_fds: Vec<OwnedFd>,
 }
@@ -221,7 +221,7 @@ impl FrameReader {
         } as usize;
         Self {
             stream,
-            buffer: crate::recv::RecvBuffer::new(),
+            buffer: crate::recv_buffer::RecvBuffer::new(),
             control: vec![0; control_len],
             current_fds: Vec::new(),
         }
@@ -248,7 +248,7 @@ impl FrameReader {
         E: std::fmt::Display,
     {
         loop {
-            match crate::frame::parse_frame_with_limit(
+            match crate::framing::parse_frame_with_limit(
                 self.buffer.pending(),
                 super::MAX_FRAME_BYTES,
             ) {
@@ -281,7 +281,7 @@ impl FrameReader {
         E: std::fmt::Display,
     {
         loop {
-            match crate::frame::parse_frame_with_limit(
+            match crate::framing::parse_frame_with_limit(
                 self.buffer.pending(),
                 super::MAX_FRAME_BYTES,
             ) {
@@ -310,11 +310,11 @@ impl FrameReader {
         // attached to a byte position, not to a message, so bounding recvmsg
         // this way lets us associate every descriptor with exactly one frame.
         let pending = self.buffer.pending();
-        let wanted = if pending.len() < crate::frame::LENGTH_PREFIX_LEN {
-            crate::frame::LENGTH_PREFIX_LEN - pending.len()
+        let wanted = if pending.len() < crate::framing::LENGTH_PREFIX_LEN {
+            crate::framing::LENGTH_PREFIX_LEN - pending.len()
         } else {
             let payload_len = u32::from_le_bytes(
-                pending[..crate::frame::LENGTH_PREFIX_LEN]
+                pending[..crate::framing::LENGTH_PREFIX_LEN]
                     .try_into()
                     .unwrap(),
             ) as usize;
@@ -324,7 +324,7 @@ impl FrameReader {
                     "daemon frame exceeds maximum length",
                 ));
             }
-            crate::frame::LENGTH_PREFIX_LEN + payload_len - pending.len()
+            crate::framing::LENGTH_PREFIX_LEN + payload_len - pending.len()
         };
         let read = self.buffer.fill_with(wanted, |destination, len| {
             let mut iov = libc::iovec {
@@ -410,7 +410,7 @@ impl FrameWriter {
 
     pub fn send_payload(&mut self, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
         self.buffer.clear();
-        crate::frame::encode_frame(payload, &mut self.buffer)
+        crate::framing::encode_frame(payload, &mut self.buffer)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         send_frame_bytes(&mut self.stream, &self.buffer, fds)
     }
@@ -440,7 +440,7 @@ impl FrameWriter {
     /// Writes an already encoded, length-prefixed frame without copying it.
     pub fn send_framed(&mut self, frame: &[u8], fds: &[RawFd]) -> io::Result<()> {
         let Some((_, consumed)) =
-            crate::frame::parse_frame_with_limit(frame, super::MAX_FRAME_BYTES)
+            crate::framing::parse_frame_with_limit(frame, super::MAX_FRAME_BYTES)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
         else {
             return Err(io::Error::new(
@@ -520,8 +520,8 @@ mod tests {
     fn framed_pair_handles_fragmentation_and_multiple_frames() {
         let (mut left, right) = UnixStream::pair().unwrap();
         let mut bytes = Vec::new();
-        crate::frame::encode_frame(b"one", &mut bytes).unwrap();
-        crate::frame::encode_frame(b"two", &mut bytes).unwrap();
+        crate::framing::encode_frame(b"one", &mut bytes).unwrap();
+        crate::framing::encode_frame(b"two", &mut bytes).unwrap();
         let split = 2;
         left.write_all(&bytes[..split]).unwrap();
         left.write_all(&bytes[split..]).unwrap();
@@ -586,7 +586,7 @@ mod tests {
             .collect::<Vec<_>>();
         let fds = files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
         let mut frame = Vec::new();
-        crate::frame::encode_frame(b"overflow", &mut frame).unwrap();
+        crate::framing::encode_frame(b"overflow", &mut frame).unwrap();
         send_first_with_fds(&left, &frame, &fds).unwrap();
         let error = FrameReader::new(right).recv_payload().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);

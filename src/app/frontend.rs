@@ -1,16 +1,14 @@
 use std::sync::atomic::Ordering;
 
-use rpc::{
-    daemon::{
-        bulk::BeginAttachmentRead,
-        bulk::BeginUpload,
-        frame::{ClientFrame, Operation, RequestOutcome, RequestResult},
-        model::{
-            AttachmentDescriptor, AttachmentId, ConnectionState, MediaKind, Message, RequestId,
-            RoomKind, RoomSnapshot, RoomSummary, StateSnapshot, TrustState, VoiceState,
-        },
-    },
+use local_rpc::{
+    bulk::BeginAttachmentRead,
+    bulk::BeginUpload,
+    frame::{ClientFrame, Operation, RequestOutcome, RequestResult},
     ids::RoomId,
+    model::{
+        AttachmentDescriptor, AttachmentId, ConnectionState, MediaKind, Message, RequestId,
+        RoomKind, RoomSnapshot, RoomSummary, StateSnapshot, TrustState, VoiceState,
+    },
 };
 
 use crate::{client_channel::ClientId, client_net::NetworkCommand};
@@ -86,7 +84,7 @@ impl App {
             .room
             .available_shares
             .iter()
-            .map(|(stream_id, share)| rpc::daemon::model::LiveShare {
+            .map(|(stream_id, share)| local_rpc::model::LiveShare {
                 room_id: share.room_id,
                 stream_id: *stream_id,
                 sender_name: share.sender_name.clone(),
@@ -192,8 +190,8 @@ impl App {
             .resident_message_page(
                 room_id,
                 None,
-                rpc::daemon::MAX_MESSAGES,
-                rpc::daemon::MAX_ROOM_SNAPSHOT_BYTES,
+                local_rpc::MAX_MESSAGES,
+                local_rpc::MAX_ROOM_SNAPSHOT_BYTES,
                 rpc_message_size_estimate,
             )
             .unwrap_or_else(|| super::room::ResidentMessagePage {
@@ -221,7 +219,7 @@ impl App {
                 .room
                 .participant_summaries(room_id)
                 .into_iter()
-                .map(|user| rpc::daemon::model::Participant {
+                .map(|user| local_rpc::model::Participant {
                     user_id: user.user_id,
                     name: user.username,
                     online: user.online,
@@ -243,7 +241,7 @@ impl App {
             room_id,
             Some(before),
             usize::from(limit),
-            rpc::daemon::MAX_ROOM_SNAPSHOT_BYTES,
+            local_rpc::MAX_ROOM_SNAPSHOT_BYTES,
             rpc_message_size_estimate,
         )?;
         if page.messages.is_empty() {
@@ -664,7 +662,7 @@ impl App {
     fn rpc_attachment_source(
         &self,
         room_id: RoomId,
-        attachment_id: rpc::daemon::model::AttachmentId,
+        attachment_id: local_rpc::model::AttachmentId,
     ) -> Option<(AttachmentDescriptor, crate::receive_store::Source)> {
         if attachment_id.room_id != room_id {
             return None;

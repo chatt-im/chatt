@@ -169,6 +169,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "chatt",
+ "chatt-local-rpc",
  "jsony_bench",
  "nnnoiseless",
  "opus-codec",
@@ -322,6 +323,7 @@ dependencies = [
  "annotate-snippets 0.12.16",
  "aws-lc-rs",
  "bwrap",
+ "chatt-local-rpc",
  "chatt-mls",
  "chatt-p2p",
  "cpal",
@@ -361,6 +363,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "chatt-ids"
+version = "0.1.0"
+dependencies = [
+ "jsony",
+ "toml-spanner",
+]
+
+[[package]]
+name = "chatt-local-rpc"
+version = "0.1.0"
+dependencies = [
+ "chatt-ids",
+ "chatt-video",
+ "jsony",
+ "libc",
+]
+
+[[package]]
 name = "chatt-mls"
 version = "0.1.0"
 dependencies = [
@@ -382,6 +402,10 @@ dependencies = [
  "libc",
  "rpc",
 ]
+
+[[package]]
+name = "chatt-video"
+version = "0.1.0"
 
 [[package]]
 name = "clang-sys"
@@ -1758,10 +1782,11 @@ name = "rpc"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "chatt-ids",
+ "chatt-video",
  "jsony",
  "libc",
  "mio",
- "toml-spanner",
 ]
 
 [[package]]
