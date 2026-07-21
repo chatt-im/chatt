@@ -801,13 +801,13 @@ pub(crate) enum AppEvent {
     #[cfg(unix)]
     RpcClientAttach {
         stream: std::os::unix::net::UnixStream,
-        hello: rpc::daemon::frame::ClientHello,
+        hello: local_rpc::frame::ClientHello,
         peer: local_control::RpcPeer,
     },
     #[cfg(unix)]
     RpcClientFrame {
         client_id: crate::client_channel::ClientId,
-        frame: rpc::daemon::frame::ClientFrame,
+        frame: local_rpc::frame::ClientFrame,
     },
     #[cfg(unix)]
     RpcClientExited(crate::client_channel::ClientId),

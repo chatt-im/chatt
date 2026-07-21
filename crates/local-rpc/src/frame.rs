@@ -60,7 +60,7 @@ impl Default for NegotiatedLimits {
             frame_bytes: super::MAX_FRAME_BYTES as u32,
             chunk_bytes: super::MAX_CHUNK_BYTES as u32,
             message_bytes: super::MAX_MESSAGE_BODY_BYTES as u32,
-            upload_bytes: crate::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            upload_bytes: super::DEFAULT_UPLOAD_LIMIT_BYTES,
             concurrent_transfers: super::MAX_CONCURRENT_TRANSFERS as u16,
             outstanding_requests: super::MAX_OUTSTANDING_REQUESTS as u16,
         }
@@ -427,7 +427,7 @@ fn bounded_encode_framed_into<T: jsony::ToBinary>(
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
     output.clear();
-    output.extend_from_slice(&[0; crate::frame::LENGTH_PREFIX_LEN]);
+    output.extend_from_slice(&[0; crate::framing::LENGTH_PREFIX_LEN]);
     let payload_len = jsony::to_binary_into(value, &mut *output).len();
     if payload_len > super::MAX_FRAME_BYTES {
         output.clear();
@@ -435,7 +435,7 @@ fn bounded_encode_framed_into<T: jsony::ToBinary>(
     }
     let payload_len =
         u32::try_from(payload_len).map_err(|_| "daemon frame length does not fit in u32")?;
-    output[..crate::frame::LENGTH_PREFIX_LEN].copy_from_slice(&payload_len.to_le_bytes());
+    output[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(&payload_len.to_le_bytes());
     Ok(())
 }
 
@@ -469,7 +469,7 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
             return Err("output volume is outside the supported range".into());
         }
         ClientFrame::LoadOlder { limit, .. }
-            if *limit == 0 || *limit > crate::control::MAX_HISTORY_FETCH_MESSAGES =>
+            if *limit == 0 || *limit > super::MAX_HISTORY_REQUEST_MESSAGES =>
         {
             return Err("history request limit is invalid".into());
         }
@@ -679,7 +679,7 @@ mod tests {
         encode_client_framed_into(&first, &mut buffer).unwrap();
         let capacity = buffer.capacity();
         let (payload, consumed) =
-            crate::frame::parse_frame_with_limit(&buffer, super::super::MAX_FRAME_BYTES)
+            crate::framing::parse_frame_with_limit(&buffer, super::super::MAX_FRAME_BYTES)
                 .unwrap()
                 .unwrap();
         assert_eq!(consumed, buffer.len());
@@ -692,7 +692,7 @@ mod tests {
         encode_client_framed_into(&second, &mut buffer).unwrap();
         assert_eq!(buffer.capacity(), capacity);
         let (payload, _) =
-            crate::frame::parse_frame_with_limit(&buffer, super::super::MAX_FRAME_BYTES)
+            crate::framing::parse_frame_with_limit(&buffer, super::super::MAX_FRAME_BYTES)
                 .unwrap()
                 .unwrap();
         assert_eq!(decode_client(payload).unwrap(), second);

@@ -1,8 +1,7 @@
 pub mod base32;
-pub mod bitstream;
+pub use chatt_video::bitstream;
 pub mod control;
 pub mod crypto;
-pub mod daemon;
 pub mod evented;
 pub mod frame;
 pub mod history;

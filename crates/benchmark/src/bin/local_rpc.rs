@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rpc::daemon::{
+use local_rpc::{
     bulk::BulkChunk,
     frame::DaemonFrame,
     model::BulkTransferId,
@@ -14,7 +14,7 @@ use rpc::daemon::{
 
 const WARMUP_SAMPLES: usize = 20;
 const MEASURED_SAMPLES: usize = 250;
-const PAYLOAD_SIZES: &[usize] = &[64 * 1024, 192 * 1024, rpc::daemon::MAX_CHUNK_BYTES];
+const PAYLOAD_SIZES: &[usize] = &[64 * 1024, 192 * 1024, local_rpc::MAX_CHUNK_BYTES];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (writer_stream, reader_stream) = UnixStream::pair()?;
@@ -31,9 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Ok(frame) => {
-                        let _ = delivered_tx.send(Err(format!(
-                            "unexpected daemon frame: {frame:?}"
-                        )));
+                        let _ =
+                            delivered_tx.send(Err(format!("unexpected daemon frame: {frame:?}")));
                         break;
                     }
                     Err(error) => {

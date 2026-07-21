@@ -20,6 +20,7 @@ opus-codec = { path = "crates/opus-codec", features = ["dred"] }
 aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
 jsony = "0.1.10"
 rpc.path = "crates/rpc"
+local_rpc = { package = "chatt-local-rpc", path = "crates/local-rpc" }
 chatt-p2p.path = "crates/p2p"
 chatt-mls.path = "crates/mls"
 darkhttp.path = "crates/darkhttp"
@@ -86,6 +87,9 @@ server = { path = "crates/server" }
 [workspace]
 members = [
     "crates/benchmark",
+    "crates/ids",
+    "crates/video",
+    "crates/local-rpc",
     "crates/p2p",
     "crates/rpc",
     "crates/mls",

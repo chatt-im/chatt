@@ -1,0 +1,12 @@
+[package]
+name = "chatt-ids"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+toml = ["dep:toml-spanner"]
+
+[dependencies]
+jsony = "0.1.10"
+toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"], optional = true }

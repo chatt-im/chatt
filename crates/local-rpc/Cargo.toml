@@ -1,0 +1,13 @@
+[package]
+name = "chatt-local-rpc"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "local_rpc"
+
+[dependencies]
+chatt-ids = { path = "../ids" }
+chatt-video = { path = "../video" }
+jsony = "0.1.10"
+libc = "0.2"

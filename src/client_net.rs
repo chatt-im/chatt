@@ -2798,9 +2798,8 @@ impl ReceiveSink {
             work_budget: 0,
             capture_image_prefix,
             image_prefix: Vec::new(),
-            digest: verify_digest.then(|| {
-                aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256)
-            }),
+            digest: verify_digest
+                .then(|| aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256)),
         }
     }
 
@@ -8294,7 +8293,7 @@ mod tests {
             .expect("registered attachment metadata");
         assert_eq!(metadata.byte_len, path.metadata().unwrap().len());
         assert!(metadata.content_type.starts_with("video/"));
-        let attachment_id = rpc::daemon::model::AttachmentId {
+        let attachment_id = local_rpc::model::AttachmentId {
             room_id: RoomId(7),
             message_id: MessageId(16),
         };

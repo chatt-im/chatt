@@ -2350,7 +2350,7 @@ impl RoomSession {
     pub(crate) fn rpc_transfer_summaries(
         &self,
         room_id: RoomId,
-    ) -> Vec<rpc::daemon::model::TransferSummary> {
+    ) -> Vec<local_rpc::model::TransferSummary> {
         let Some(room) = self.rooms.get(&room_id) else {
             return Vec::new();
         };
@@ -2368,31 +2368,31 @@ impl RoomSession {
                     TransferStatus::Active(progress) => (
                         match progress.direction {
                             TransferDirection::Incoming => {
-                                rpc::daemon::model::TransferDirection::Download
+                                local_rpc::model::TransferDirection::Download
                             }
                             TransferDirection::Outgoing => {
-                                rpc::daemon::model::TransferDirection::Upload
+                                local_rpc::model::TransferDirection::Upload
                             }
                         },
                         progress.total,
                         progress.transferred,
-                        rpc::daemon::model::TransferStatus::Active,
+                        local_rpc::model::TransferStatus::Active,
                         None,
                     ),
                     TransferStatus::Terminal { verb, reason } => (
-                        rpc::daemon::model::TransferDirection::Download,
+                        local_rpc::model::TransferDirection::Download,
                         0,
                         0,
                         match verb {
                             TerminalVerb::Cancelled | TerminalVerb::Skipped => {
-                                rpc::daemon::model::TransferStatus::Canceled
+                                local_rpc::model::TransferStatus::Canceled
                             }
-                            TerminalVerb::Failed => rpc::daemon::model::TransferStatus::Failed,
+                            TerminalVerb::Failed => local_rpc::model::TransferStatus::Failed,
                         },
                         reason.clone(),
                     ),
                 };
-                rpc::daemon::model::TransferSummary {
+                local_rpc::model::TransferSummary {
                     transfer_id: *transfer_id,
                     room_id,
                     direction,

@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rpc::daemon::model::AttachmentId;
+use local_rpc::model::AttachmentId;
 
 use crate::client_net::sanitize_file_name;
 

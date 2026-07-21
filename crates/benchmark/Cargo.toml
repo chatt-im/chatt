@@ -13,6 +13,7 @@ nnnoiseless = { path = "../nnnoiseless" }
 opus-codec = { path = "../opus-codec", features = ["dred"] }
 sonora = "0.1.0"
 chatt = { path = "../.." }
+local_rpc = { package = "chatt-local-rpc", path = "../local-rpc" }
 rpc = { path = "../rpc" }
 
 [features]
