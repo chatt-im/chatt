@@ -20,8 +20,8 @@ pub use chatt_video::{bitstream, video};
 mod framing;
 mod recv_buffer;
 
-pub const PROTOCOL_MIN_VERSION: u16 = 3;
-pub const PROTOCOL_MAX_VERSION: u16 = 3;
+pub const PROTOCOL_MIN_VERSION: u16 = 4;
+pub const PROTOCOL_MAX_VERSION: u16 = 4;
 pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ROOM_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;

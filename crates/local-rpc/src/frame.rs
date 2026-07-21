@@ -775,8 +775,8 @@ mod tests {
                     transfer_id,
                     room_id,
                     attachment_id: super::super::model::AttachmentId {
-                        room_id,
-                        message_id: MessageId(2),
+                        timestamp_ms: 2,
+                        transfer_id: FileTransferId(2),
                     },
                 },
             },
@@ -835,8 +835,8 @@ mod tests {
         let instance_id = DaemonInstanceId([4; 16]);
         let descriptor = super::super::model::AttachmentDescriptor {
             id: super::super::model::AttachmentId {
-                room_id: RoomId(2),
-                message_id: MessageId(2),
+                timestamp_ms: 2,
+                transfer_id: FileTransferId(2),
             },
             file_name: "a.png".into(),
             media_kind: super::super::model::MediaKind::Image,

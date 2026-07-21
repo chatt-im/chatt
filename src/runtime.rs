@@ -1651,6 +1651,14 @@ fn handle_rpc_effect(
                 client.sender.cancel_bulk(transfer_id);
                 return;
             }
+            kvlog::info!(
+                "daemon attachment transfer routed",
+                bulk_transfer_id = transfer_id.0,
+                attachment_timestamp_ms = descriptor.id.timestamp_ms,
+                attachment_transfer_id = descriptor.id.transfer_id.0,
+                file_name = descriptor.file_name.as_str(),
+                byte_len = descriptor.byte_len
+            );
             if let Err(error) = client.sender.start_bulk(transfer_id, descriptor, source) {
                 kvlog::error!(
                     "could not start daemon attachment transfer",
@@ -2096,8 +2104,8 @@ mod tests {
         assert!(byte_len > local_rpc::MAX_QUEUED_BYTES);
         let descriptor = local_rpc::model::AttachmentDescriptor {
             id: local_rpc::model::AttachmentId {
-                room_id: rpc::ids::RoomId(3),
-                message_id: rpc::ids::MessageId(3),
+                timestamp_ms: 3,
+                transfer_id: rpc::ids::FileTransferId(3),
             },
             file_name: "large.mp4".into(),
             media_kind: local_rpc::model::MediaKind::Video,
@@ -2144,8 +2152,8 @@ mod tests {
                 transfer_id,
                 local_rpc::model::AttachmentDescriptor {
                     id: local_rpc::model::AttachmentId {
-                        room_id: rpc::ids::RoomId(3),
-                        message_id: rpc::ids::MessageId(4),
+                        timestamp_ms: 4,
+                        transfer_id: rpc::ids::FileTransferId(4),
                     },
                     file_name: "image.png".into(),
                     media_kind: local_rpc::model::MediaKind::Image,
