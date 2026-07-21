@@ -3,7 +3,7 @@ use jsony::Jsony;
 use crate::ids::{FileTransferId, MessageId, RoomId, StreamId};
 
 use super::{
-    bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished, BulkStarted},
+    bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished},
     model::{
         BulkTransferId, ConnectionState, DaemonInstanceId, LiveShare, Message, Participant,
         RequestId, RoomSnapshot, RoomSummary, StateSnapshot, TransferSummary, TrustState,
@@ -369,7 +369,6 @@ pub enum DaemonFrame {
         request_id: RequestId,
         nonce: u64,
     },
-    BulkStarted(BulkStarted),
     BulkChunk(BulkChunk),
     BulkFinished(BulkFinished),
     BulkCanceled {
@@ -536,7 +535,6 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::Pong { request_id, .. } if request_id.0 == 0 => {
             Err("request id must be nonzero".into())
         }
-        DaemonFrame::BulkStarted(started) => started.validate(),
         DaemonFrame::BulkFinished(finished) => finished.validate(),
         DaemonFrame::BulkCanceled {
             transfer_id,
@@ -665,7 +663,6 @@ mod tests {
         assert!(encode_client(&frame).is_err());
         let frame = ClientFrame::UploadChunk(BulkChunk {
             transfer_id: BulkTransferId(1),
-            offset: 0,
             bytes: vec![0; super::super::MAX_CHUNK_BYTES + 1],
         });
         assert!(encode_client(&frame).is_err());
@@ -706,7 +703,6 @@ mod tests {
         assert!(
             encode_client(&ClientFrame::UploadChunk(BulkChunk {
                 transfer_id: BulkTransferId(1),
-                offset: 0,
                 bytes: Vec::new(),
             }))
             .is_err()
@@ -763,16 +759,11 @@ mod tests {
             },
             ClientFrame::UploadChunk(BulkChunk {
                 transfer_id,
-                offset: 0,
                 bytes: vec![1, 2],
             }),
             ClientFrame::FinishUpload {
                 request_id,
-                finished: BulkFinished {
-                    transfer_id,
-                    byte_len: 2,
-                    digest: [1; 32],
-                },
+                finished: BulkFinished { transfer_id },
             },
             ClientFrame::CancelUpload {
                 request_id,
@@ -783,7 +774,10 @@ mod tests {
                 read: BeginAttachmentRead {
                     transfer_id,
                     room_id,
-                    attachment_id: super::super::model::AttachmentId([2; 16]),
+                    attachment_id: super::super::model::AttachmentId {
+                        room_id,
+                        message_id: MessageId(2),
+                    },
                 },
             },
             ClientFrame::CancelBulkTransfer {
@@ -840,12 +834,14 @@ mod tests {
         let transfer_id = BulkTransferId(3);
         let instance_id = DaemonInstanceId([4; 16]);
         let descriptor = super::super::model::AttachmentDescriptor {
-            id: super::super::model::AttachmentId([2; 16]),
+            id: super::super::model::AttachmentId {
+                room_id: RoomId(2),
+                message_id: MessageId(2),
+            },
             file_name: "a.png".into(),
             media_kind: super::super::model::MediaKind::Image,
             content_type: "image/png".into(),
             byte_len: 2,
-            digest: [1; 32],
             width: Some(2),
             height: Some(1),
         };
@@ -897,20 +893,31 @@ mod tests {
                 request_id,
                 nonce: 9,
             },
-            DaemonFrame::BulkStarted(BulkStarted {
-                transfer_id,
-                attachment: descriptor,
+            DaemonFrame::Event(StateEvent {
+                instance_id,
+                event_seq: 3,
+                delta: StateDelta::MessageUpserted {
+                    message: Message {
+                        room_id: RoomId(2),
+                        message_id: MessageId(2),
+                        sender_id: crate::ids::UserId(3),
+                        sender_name: "alice".into(),
+                        body: String::new(),
+                        timestamp_ms: 4,
+                        local: false,
+                        edited: false,
+                        unverified: false,
+                        notice: false,
+                        reference: None,
+                        attachment: Some(descriptor),
+                    },
+                },
             }),
             DaemonFrame::BulkChunk(BulkChunk {
                 transfer_id,
-                offset: 0,
                 bytes: vec![1, 2],
             }),
-            DaemonFrame::BulkFinished(BulkFinished {
-                transfer_id,
-                byte_len: 2,
-                digest: [1; 32],
-            }),
+            DaemonFrame::BulkFinished(BulkFinished { transfer_id }),
             DaemonFrame::BulkCanceled {
                 transfer_id,
                 reason: "canceled".into(),

@@ -10,8 +10,8 @@ pub mod model;
 #[cfg(unix)]
 pub mod unix;
 
-pub const PROTOCOL_MIN_VERSION: u16 = 2;
-pub const PROTOCOL_MAX_VERSION: u16 = 2;
+pub const PROTOCOL_MIN_VERSION: u16 = 3;
+pub const PROTOCOL_MAX_VERSION: u16 = 3;
 pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ROOM_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
@@ -22,11 +22,10 @@ pub const MAX_MESSAGES: usize = 2000;
 pub const MAX_PARTICIPANTS: usize = 4096;
 pub const MAX_TRANSFERS: usize = 32;
 pub const MAX_LIVE_SHARES: usize = 64;
-pub const MAX_CHUNK_BYTES: usize = 192 * 1024;
+pub const MAX_CHUNK_BYTES: usize = 1024 * 1024;
 pub const MAX_FDS_PER_FRAME: usize = 4;
 pub const MAX_RPC_CLIENTS: usize = 16;
 pub const MAX_OUTSTANDING_REQUESTS: usize = 128;
 pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
-pub const RESERVED_STATE_BYTES: usize = MAX_FRAME_BYTES + crate::frame::LENGTH_PREFIX_LEN;
 pub const MAX_CONCURRENT_TRANSFERS: usize = 4;
 pub const MAX_OUTPUT_VOLUME_PERCENT: f32 = 130.0;

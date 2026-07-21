@@ -172,6 +172,7 @@ dependencies = [
  "jsony_bench",
  "nnnoiseless",
  "opus-codec",
+ "rpc",
  "sonora 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 

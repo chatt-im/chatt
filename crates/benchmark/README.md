@@ -21,6 +21,17 @@ cargo run --release -p benchmark -- bench live/ingest_contention --progress
 cargo run --release -p benchmark -- bench crypto --progress
 ```
 
+Measure persistent local Unix-socket RPC delivery latency, including protocol
+serialization and decoding, for 64 KiB, the former 192 KiB chunk size, and the
+current 1 MiB chunk size:
+
+```sh
+cargo run --release -p benchmark --bin local_rpc
+```
+
+The report includes p50 and p95 wall latency plus p95 expressed as a fraction
+of a 120 Hz frame. It deliberately excludes disk I/O and image decoding.
+
 `crypto/*` isolates every AWS-LC primitive used by Chatt's fixed cipher choices:
 ChaCha20-Poly1305 for transport, AES-128-GCM for MLS, SHA-256, HMAC-SHA256,
 HKDF-SHA256, X25519, and Ed25519. AEAD, hash, and MAC routes cover small control

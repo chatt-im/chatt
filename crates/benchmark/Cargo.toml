@@ -2,6 +2,7 @@
 name = "benchmark"
 version = "0.1.0"
 edition = "2024"
+default-run = "benchmark"
 
 [dependencies]
 aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
@@ -12,6 +13,7 @@ nnnoiseless = { path = "../nnnoiseless" }
 opus-codec = { path = "../opus-codec", features = ["dred"] }
 sonora = "0.1.0"
 chatt = { path = "../.." }
+rpc = { path = "../rpc" }
 
 [features]
 default = []

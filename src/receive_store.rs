@@ -38,7 +38,6 @@ struct Entry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentMetadata {
-    pub digest: [u8; 32],
     pub byte_len: u64,
     pub content_type: &'static str,
 }
@@ -391,35 +390,15 @@ impl DownloadStore {
 }
 
 fn attachment_metadata(bytes: &[u8], content_type: &'static str) -> AttachmentMetadata {
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
-    let mut digest_bytes = [0; 32];
-    digest_bytes.copy_from_slice(digest.as_ref());
     AttachmentMetadata {
-        digest: digest_bytes,
         byte_len: bytes.len() as u64,
         content_type,
     }
 }
 
 fn attachment_metadata_file(path: &Path, content_type: &'static str) -> Option<AttachmentMetadata> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let byte_len = file.metadata().ok()?.len();
-    let mut context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        context.update(&buffer[..read]);
-    }
-    let digest = context.finish();
-    let mut digest_bytes = [0; 32];
-    digest_bytes.copy_from_slice(digest.as_ref());
     Some(AttachmentMetadata {
-        digest: digest_bytes,
-        byte_len,
+        byte_len: std::fs::metadata(path).ok()?.len(),
         content_type,
     })
 }
@@ -505,8 +484,14 @@ mod tests {
     fn distinct_upload_ids_can_bind_the_same_registered_source() {
         let store = DownloadStore::new(1024);
         let name = store.insert("clip.mp4", vec![1, 2, 3, 4]).unwrap();
-        let first = AttachmentId([1; 16]);
-        let second = AttachmentId([2; 16]);
+        let first = AttachmentId {
+            room_id: rpc::ids::RoomId(1),
+            message_id: rpc::ids::MessageId(1),
+        };
+        let second = AttachmentId {
+            room_id: rpc::ids::RoomId(1),
+            message_id: rpc::ids::MessageId(2),
+        };
 
         assert!(store.bind_attachment(first, &name));
         assert!(store.bind_attachment(second, &name));

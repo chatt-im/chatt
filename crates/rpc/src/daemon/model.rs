@@ -8,7 +8,10 @@ pub struct RequestId(pub u64);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
-pub struct AttachmentId(pub [u8; 16]);
+pub struct AttachmentId {
+    pub room_id: RoomId,
+    pub message_id: MessageId,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
@@ -60,7 +63,6 @@ pub struct AttachmentDescriptor {
     pub media_kind: MediaKind,
     pub content_type: String,
     pub byte_len: u64,
-    pub digest: [u8; 32],
     pub width: Option<u32>,
     pub height: Option<u32>,
 }

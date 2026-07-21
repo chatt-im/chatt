@@ -2781,11 +2781,16 @@ struct ReceiveSink {
     work_budget: usize,
     capture_image_prefix: bool,
     image_prefix: Vec<u8>,
-    digest: aws_lc_rs::digest::Context,
+    digest: Option<aws_lc_rs::digest::Context>,
 }
 
 impl ReceiveSink {
-    fn new(target: SinkTarget, expected: u64, capture_image_prefix: bool) -> Self {
+    fn new(
+        target: SinkTarget,
+        expected: u64,
+        capture_image_prefix: bool,
+        verify_digest: bool,
+    ) -> Self {
         Self {
             target,
             expected,
@@ -2793,7 +2798,9 @@ impl ReceiveSink {
             work_budget: 0,
             capture_image_prefix,
             image_prefix: Vec::new(),
-            digest: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
+            digest: verify_digest.then(|| {
+                aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256)
+            }),
         }
     }
 
@@ -2818,7 +2825,9 @@ impl Write for ReceiveSink {
         }
         let write_len = buf.len().min(self.work_budget);
         let written = self.target.write(&buf[..write_len])?;
-        self.digest.update(&buf[..written]);
+        if let Some(digest) = self.digest.as_mut() {
+            digest.update(&buf[..written]);
+        }
         if self.capture_image_prefix && self.image_prefix.len() < MAX_FILE_CHUNK_BYTES {
             let capture = written.min(MAX_FILE_CHUNK_BYTES - self.image_prefix.len());
             self.image_prefix.extend_from_slice(&buf[..capture]);
@@ -2961,20 +2970,22 @@ impl IncomingFile {
         if let Err(error) = sink.flush() {
             return Err((dest, metadata.file_name, error));
         }
-        let actual_digest: [u8; 32] = sink
-            .digest
-            .finish()
-            .as_ref()
-            .try_into()
-            .expect("SHA-256 digest has 32 bytes");
-        if let Some(expected) = seal.map(|seal| seal.digest)
-            && actual_digest != expected
-        {
-            return Err((
-                dest,
-                metadata.file_name,
-                io::Error::new(io::ErrorKind::InvalidData, "file digest mismatch"),
-            ));
+        if let Some(expected) = seal.map(|seal| seal.digest) {
+            let actual: [u8; 32] = sink
+                .digest
+                .take()
+                .expect("sealed file enables digest verification")
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 digest has 32 bytes");
+            if actual != expected {
+                return Err((
+                    dest,
+                    metadata.file_name,
+                    io::Error::new(io::ErrorKind::InvalidData, "file digest mismatch"),
+                ));
+            }
         }
         let dimensions = sink
             .capture_image_prefix
@@ -3773,7 +3784,6 @@ impl WorkerState<'_> {
             ));
         }
         let name = upload_username(name_override, &path)?;
-        let digest = file_sha256(&path)?;
         let mut file = open_upload_source(&path, false)
             .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
         let mut source_prefix = Vec::new();
@@ -3843,7 +3853,12 @@ impl WorkerState<'_> {
         let room_id = room_id
             .or(self.active_room)
             .ok_or_else(|| "no active room for upload".to_string())?;
-        let seal = self.prepare_upload_seal(room_id, body.encoding(), digest)?;
+        let seal = if self.room_requires_mls(room_id) {
+            let digest = file_sha256(&path)?;
+            self.prepare_upload_seal(room_id, body.encoding(), digest)?
+        } else {
+            None
+        };
         let fallback_source = reserve_upload_source(
             &self.config.download_store,
             path.clone(),
@@ -4865,7 +4880,12 @@ impl WorkerState<'_> {
         reservation: Option<Reservation>,
         seal: Option<IncomingSeal>,
     ) {
-        let sink = ReceiveSink::new(target, file.size, is_image_name(&file.file_name));
+        let sink = ReceiveSink::new(
+            target,
+            file.size,
+            is_image_name(&file.file_name),
+            seal.is_some(),
+        );
         let body = match file.encoding {
             FileContentEncoding::Identity => IncomingBody::Identity(sink),
             FileContentEncoding::Zstd => {
@@ -7704,6 +7724,7 @@ mod tests {
             SinkTarget::Disk(File::create(path).unwrap()),
             original_size,
             image,
+            false,
         );
         let body = match encoding {
             FileContentEncoding::Identity | FileContentEncoding::Sealed => {
@@ -8273,7 +8294,10 @@ mod tests {
             .expect("registered attachment metadata");
         assert_eq!(metadata.byte_len, path.metadata().unwrap().len());
         assert!(metadata.content_type.starts_with("video/"));
-        let attachment_id = rpc::daemon::model::AttachmentId([7; 16]);
+        let attachment_id = rpc::daemon::model::AttachmentId {
+            room_id: RoomId(7),
+            message_id: MessageId(16),
+        };
         assert!(store.bind_attachment(attachment_id, &served_name));
         assert!(matches!(
             store.resolve_attachment(attachment_id),
