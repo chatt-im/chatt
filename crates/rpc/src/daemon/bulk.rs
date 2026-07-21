@@ -1,19 +1,11 @@
 use jsony::Jsony;
 
-use super::model::{AttachmentDescriptor, AttachmentId, BulkTransferId};
-
-#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
-#[jsony(Binary, version)]
-pub struct BulkStarted {
-    pub transfer_id: BulkTransferId,
-    pub attachment: AttachmentDescriptor,
-}
+use super::model::{AttachmentId, BulkTransferId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub struct BulkChunk {
     pub transfer_id: BulkTransferId,
-    pub offset: u64,
     pub bytes: Vec<u8>,
 }
 
@@ -21,8 +13,6 @@ pub struct BulkChunk {
 #[jsony(Binary, version)]
 pub struct BulkFinished {
     pub transfer_id: BulkTransferId,
-    pub byte_len: u64,
-    pub digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -81,14 +71,5 @@ impl BulkFinished {
             return Err("transfer id must be nonzero".into());
         }
         Ok(())
-    }
-}
-
-impl BulkStarted {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.transfer_id.0 == 0 {
-            return Err("transfer id must be nonzero".into());
-        }
-        self.attachment.validate()
     }
 }

@@ -271,7 +271,7 @@ impl App {
                 transfer_id,
             };
             let detail = self.room.resident_file_detail(message.room_id, &key)?;
-            self.rpc_attachment_descriptor(key, detail)
+            self.rpc_attachment_descriptor(message.room_id, message.message_id, detail)
         });
         Message {
             room_id: message.room_id,
@@ -620,10 +620,14 @@ impl App {
 
     fn rpc_attachment_descriptor(
         &self,
-        key: crate::room_history::FileHistoryKey,
+        room_id: RoomId,
+        message_id: rpc::ids::MessageId,
         detail: &crate::room_history::FileDetail,
     ) -> Option<AttachmentDescriptor> {
-        let attachment_id = rpc_attachment_id(key);
+        let attachment_id = AttachmentId {
+            room_id,
+            message_id,
+        };
         if !self
             .download_store
             .bind_attachment(attachment_id, &detail.file_name)
@@ -652,7 +656,6 @@ impl App {
             media_kind,
             content_type,
             byte_len: metadata.byte_len,
-            digest: metadata.digest,
             width,
             height,
         })
@@ -663,8 +666,14 @@ impl App {
         room_id: RoomId,
         attachment_id: rpc::daemon::model::AttachmentId,
     ) -> Option<(AttachmentDescriptor, crate::receive_store::Source)> {
+        if attachment_id.room_id != room_id {
+            return None;
+        }
         let history = self.room.history_for(room_id);
         for message in history.messages {
+            if message.message_id != attachment_id.message_id {
+                continue;
+            }
             let Some(transfer_id) = message.file_transfer_id else {
                 continue;
             };
@@ -675,7 +684,9 @@ impl App {
             let Some(detail) = history.files.get(&key) else {
                 continue;
             };
-            let Some(descriptor) = self.rpc_attachment_descriptor(key, detail) else {
+            let Some(descriptor) =
+                self.rpc_attachment_descriptor(room_id, message.message_id, detail)
+            else {
                 continue;
             };
             if descriptor.id == attachment_id {
@@ -714,13 +725,6 @@ impl App {
             Err("not connected".into())
         }
     }
-}
-
-fn rpc_attachment_id(key: crate::room_history::FileHistoryKey) -> AttachmentId {
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&key.timestamp_ms.to_le_bytes());
-    bytes[8..].copy_from_slice(&key.transfer_id.0.to_le_bytes());
-    AttachmentId(bytes)
 }
 
 fn rpc_message_size_estimate(message: &rpc::control::ChatMessage) -> usize {
@@ -847,32 +851,26 @@ mod tests {
     }
 
     #[test]
-    fn attachment_identity_uses_timestamp_and_server_transfer_id() {
-        use rpc::ids::FileTransferId;
+    fn attachment_identity_uses_room_and_message() {
+        let first = AttachmentId {
+            room_id: RoomId(1),
+            message_id: rpc::ids::MessageId(7),
+        };
+        let next_message = AttachmentId {
+            room_id: RoomId(1),
+            message_id: rpc::ids::MessageId(8),
+        };
+        let other_room = AttachmentId {
+            room_id: RoomId(2),
+            message_id: rpc::ids::MessageId(7),
+        };
 
-        let first = rpc_attachment_id(crate::room_history::FileHistoryKey {
-            timestamp_ms: 1_000,
-            transfer_id: FileTransferId(7),
-        });
-        let next_transfer = rpc_attachment_id(crate::room_history::FileHistoryKey {
-            timestamp_ms: 1_000,
-            transfer_id: FileTransferId(8),
-        });
-        let reused_transfer = rpc_attachment_id(crate::room_history::FileHistoryKey {
-            timestamp_ms: 2_000,
-            transfer_id: FileTransferId(7),
-        });
-
-        assert_ne!(first, next_transfer);
-        assert_ne!(first, reused_transfer);
-        assert_eq!(&first.0[..8], &1_000u64.to_le_bytes());
-        assert_eq!(&first.0[8..], &7u64.to_le_bytes());
+        assert_ne!(first, next_message);
+        assert_ne!(first, other_room);
     }
 
     #[test]
     fn repeated_same_name_and_bytes_get_independent_rpc_attachment_ids() {
-        use rpc::ids::FileTransferId;
-
         let app = App::new(crate::config::Config::default(), None).unwrap();
         let served_name = app
             .download_store
@@ -883,24 +881,14 @@ mod tests {
             length: 16,
             packed_dims: 0,
         };
-        let first_key = crate::room_history::FileHistoryKey {
-            timestamp_ms: 1_000,
-            transfer_id: FileTransferId(7),
-        };
-        let second_key = crate::room_history::FileHistoryKey {
-            timestamp_ms: 2_000,
-            transfer_id: FileTransferId(8),
-        };
-
         let first = app
-            .rpc_attachment_descriptor(first_key, &detail)
+            .rpc_attachment_descriptor(RoomId(1), rpc::ids::MessageId(7), &detail)
             .expect("first descriptor");
         let second = app
-            .rpc_attachment_descriptor(second_key, &detail)
+            .rpc_attachment_descriptor(RoomId(1), rpc::ids::MessageId(8), &detail)
             .expect("second descriptor");
 
         assert_ne!(first.id, second.id);
-        assert_eq!(first.digest, second.digest);
         assert!(app.download_store.resolve_attachment(first.id).is_some());
         assert!(app.download_store.resolve_attachment(second.id).is_some());
     }
