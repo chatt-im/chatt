@@ -75,7 +75,17 @@ import {
 } from "./image-cache";
 import { appendDebugLog, debugFlagEnabled } from "./debug-log";
 import Icon, { IconSprite } from "./Icon";
-import PreviewPanel, { previewKey, type PreviewItem } from "./PreviewPanel";
+import PreviewPanel from "./PreviewPanel";
+import {
+  optionalPreviewNumber,
+  previewIdentityNumber,
+  previewKind,
+  previewKey,
+  promotePreviewHistory,
+  standalonePreviewFromSearch,
+  standalonePreviewUrl,
+  type PreviewItem,
+} from "./preview";
 import VideoPlayer from "./VideoPlayer";
 
 // Pixel tolerance when deciding the view is "at the bottom". Scroll positions
@@ -274,80 +284,23 @@ function fileUrl(name: string): string {
   return `/files/${encodeURIComponent(name)}`;
 }
 
-function previewKind(value: string | undefined): PreviewItem["kind"] | null {
-  switch (value) {
-    case "image":
-    case "video":
-    case "audio":
-    case "file":
-      return value;
-    default:
-      return null;
-  }
-}
-
-function optionalDataNumber(value: string | undefined): number | null {
-  if (!value) return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
 function previewItemFromRef(anchor: HTMLElement): PreviewItem | null {
   const name = anchor.dataset.mediaName;
   const kind = previewKind(anchor.dataset.mediaKind);
-  if (!name || !kind) return null;
+  const file_id = previewIdentityNumber(anchor.dataset.mediaFileId);
+  const timestamp_ms = previewIdentityNumber(anchor.dataset.mediaTimestampMs);
+  if (!name || !kind || file_id === null || timestamp_ms === null) return null;
   if (kind === "image") {
     return {
+      file_id,
+      timestamp_ms,
       kind,
       name,
-      width: optionalDataNumber(anchor.dataset.mediaWidth),
-      height: optionalDataNumber(anchor.dataset.mediaHeight),
+      width: optionalPreviewNumber(anchor.dataset.mediaWidth),
+      height: optionalPreviewNumber(anchor.dataset.mediaHeight),
     };
   }
-  return { kind, name };
-}
-
-function standalonePreviewFromLocation(): {
-  item: PreviewItem;
-  autoplay: AutoplayMode;
-} | null {
-  const params = new URLSearchParams(location.search);
-  const kind = previewKind(params.get("preview") ?? undefined);
-  const name = params.get("name");
-  if (!kind || !name) return null;
-
-  const autoplayValue = params.get("autoplay");
-  const autoplay: AutoplayMode =
-    autoplayValue === "muted" || autoplayValue === "with-audio"
-      ? autoplayValue
-      : "disabled";
-  if (kind !== "image") return { item: { kind, name }, autoplay };
-
-  return {
-    item: {
-      kind,
-      name,
-      width: optionalDataNumber(params.get("width") ?? undefined),
-      height: optionalDataNumber(params.get("height") ?? undefined),
-    },
-    autoplay,
-  };
-}
-
-function standalonePreviewUrl(
-  item: PreviewItem,
-  autoplay: AutoplayMode,
-): string {
-  const url = new URL("/", location.href);
-  url.searchParams.set("preview", item.kind);
-  url.searchParams.set("name", item.name);
-  url.searchParams.set("autoplay", autoplay);
-  if (item.kind === "image") {
-    if (item.width !== null) url.searchParams.set("width", String(item.width));
-    if (item.height !== null)
-      url.searchParams.set("height", String(item.height));
-  }
-  return url.href;
+  return { file_id, timestamp_ms, kind, name };
 }
 
 function imageDebugEnabled(): boolean {
@@ -966,6 +919,8 @@ function Attachment(props: {
             event.preventDefault();
             props.onOpenPreview(
               {
+                file_id: att().file_id,
+                timestamp_ms: att().timestamp_ms,
                 kind: "image",
                 name: att().name,
                 width: att().width,
@@ -1033,7 +988,12 @@ function Attachment(props: {
             type="button"
             onClick={(event) =>
               props.onOpenPreview(
-                { kind: "file", name: att().name },
+                {
+                  file_id: att().file_id,
+                  timestamp_ms: att().timestamp_ms,
+                  kind: "file",
+                  name: att().name,
+                },
                 event.currentTarget
               )
             }
@@ -1422,7 +1382,9 @@ function DeleteConfirmation(props: {
 }
 
 export default function App() {
-  const standalone = standalonePreviewFromLocation();
+  const standalone = standalonePreviewFromSearch(
+    new URLSearchParams(location.search),
+  );
   const scrollDebugActive = scrollDebugEnabled();
   if (standalone) {
     const key = previewKey(standalone.item);
@@ -1503,7 +1465,11 @@ export default function App() {
 
   function openPreview(item: PreviewItem, opener: HTMLElement) {
     if (viewer() === "tab") {
-      window.open(standalonePreviewUrl(item, autoplay()), "_blank", "noopener");
+      window.open(
+        standalonePreviewUrl(item, autoplay(), location.href),
+        "_blank",
+        "noopener",
+      );
       return;
     }
 
@@ -1511,15 +1477,7 @@ export default function App() {
     previewOpener = opener;
     batch(() => {
       setPreviewHistory((current) => {
-        const existing = current.find(
-          (candidate) => previewKey(candidate) === key
-        );
-        const nextItem = existing ?? item;
-        if (current[0] === nextItem) return current;
-        return [
-          nextItem,
-          ...current.filter((candidate) => previewKey(candidate) !== key),
-        ].slice(0, PREVIEW_HISTORY_LIMIT);
+        return promotePreviewHistory(current, item, PREVIEW_HISTORY_LIMIT);
       });
       setActivePreviewKey(key);
     });

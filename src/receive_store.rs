@@ -34,12 +34,10 @@ use crate::client_net::sanitize_file_name;
 struct Entry {
     bytes: Arc<Vec<u8>>,
     content_type: &'static str,
-    metadata: AttachmentMetadata,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentMetadata {
-    pub id: AttachmentId,
     pub digest: [u8; 32],
     pub byte_len: u64,
     pub content_type: &'static str,
@@ -152,9 +150,6 @@ impl DiskReservation {
         if let Some(metadata) =
             attachment_metadata_file(&path, darkhttp::content_type(Path::new(&self.name)))
         {
-            inner
-                .attachment_names
-                .insert(metadata.id, self.name.clone());
             inner.metadata.insert(self.name.clone(), metadata);
         }
         inner.disk.insert(self.name.clone(), path);
@@ -276,10 +271,8 @@ impl DownloadStore {
             Entry {
                 bytes: Arc::new(bytes),
                 content_type,
-                metadata: metadata.clone(),
             },
         );
-        inner.attachment_names.insert(metadata.id, name.clone());
         inner.metadata.insert(name.clone(), metadata);
         Some(name)
     }
@@ -326,7 +319,6 @@ impl DownloadStore {
         if let Some(metadata) =
             attachment_metadata_file(&path, darkhttp::content_type(Path::new(&name)))
         {
-            inner.attachment_names.insert(metadata.id, name.clone());
             inner.metadata.insert(name.clone(), metadata);
         }
         inner.disk.insert(name, path);
@@ -347,8 +339,30 @@ impl DownloadStore {
             .map(|path| Source::Disk(path.clone()))
     }
 
+    #[cfg(test)]
     pub fn attachment_metadata(&self, served_name: &str) -> Option<AttachmentMetadata> {
         self.0.lock().unwrap().metadata.get(served_name).cloned()
+    }
+
+    /// Associates one durable upload identity with an already registered
+    /// source. Multiple uploads may share a source when their bytes and served
+    /// name are identical, but callers still address them independently.
+    pub fn bind_attachment(&self, id: AttachmentId, served_name: &str) -> bool {
+        let mut inner = self.0.lock().unwrap();
+        if !inner.metadata.contains_key(served_name) {
+            return false;
+        }
+        if let Some(bound_name) = inner.attachment_names.get(&id) {
+            return bound_name == served_name;
+        }
+        inner.attachment_names.insert(id, served_name.to_string());
+        true
+    }
+
+    pub fn attachment_metadata_by_id(&self, id: AttachmentId) -> Option<AttachmentMetadata> {
+        let inner = self.0.lock().unwrap();
+        let name = inner.attachment_names.get(&id)?;
+        inner.metadata.get(name).cloned()
     }
 
     pub fn resolve_attachment(&self, id: AttachmentId) -> Option<Source> {
@@ -380,10 +394,7 @@ fn attachment_metadata(bytes: &[u8], content_type: &'static str) -> AttachmentMe
     let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
     let mut digest_bytes = [0; 32];
     digest_bytes.copy_from_slice(digest.as_ref());
-    let mut id = [0; 16];
-    id.copy_from_slice(&digest_bytes[..16]);
     AttachmentMetadata {
-        id: AttachmentId(id),
         digest: digest_bytes,
         byte_len: bytes.len() as u64,
         content_type,
@@ -406,10 +417,7 @@ fn attachment_metadata_file(path: &Path, content_type: &'static str) -> Option<A
     let digest = context.finish();
     let mut digest_bytes = [0; 32];
     digest_bytes.copy_from_slice(digest.as_ref());
-    let mut id = [0; 16];
-    id.copy_from_slice(&digest_bytes[..16]);
     Some(AttachmentMetadata {
-        id: AttachmentId(id),
         digest: digest_bytes,
         byte_len,
         content_type,
@@ -432,7 +440,8 @@ impl Inner {
             };
             if let Some(entry) = self.entries.remove(&name) {
                 self.total_bytes -= entry.bytes.len() as u64;
-                self.attachment_names.remove(&entry.metadata.id);
+                self.attachment_names
+                    .retain(|_, served_name| served_name != &name);
                 self.metadata.remove(&name);
             }
         }
@@ -490,6 +499,29 @@ mod tests {
         let (bytes, content_type) = store.get(&name).unwrap();
         assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
         assert_eq!(content_type, "image/png");
+    }
+
+    #[test]
+    fn distinct_upload_ids_can_bind_the_same_registered_source() {
+        let store = DownloadStore::new(1024);
+        let name = store.insert("clip.mp4", vec![1, 2, 3, 4]).unwrap();
+        let first = AttachmentId([1; 16]);
+        let second = AttachmentId([2; 16]);
+
+        assert!(store.bind_attachment(first, &name));
+        assert!(store.bind_attachment(second, &name));
+        assert_eq!(
+            store.attachment_metadata_by_id(first),
+            store.attachment_metadata_by_id(second)
+        );
+        assert!(matches!(
+            store.resolve_attachment(first),
+            Some(Source::Memory { .. })
+        ));
+        assert!(matches!(
+            store.resolve_attachment(second),
+            Some(Source::Memory { .. })
+        ));
     }
 
     #[test]

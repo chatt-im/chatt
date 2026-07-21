@@ -111,13 +111,22 @@ class Reader {
     if (this.u8() === 1) {
       const name = this.string();
       const kind = MEDIA_KINDS[this.u8()] ?? "file";
+      const file_id = this.u53();
+      const attachmentTimestamp = this.u53();
       let width: number | null = null;
       let height: number | null = null;
       if (this.u8() === 1) {
         width = this.u32();
         height = this.u32();
       }
-      attachment = { name, kind, width, height };
+      attachment = {
+        file_id,
+        timestamp_ms: attachmentTimestamp,
+        name,
+        kind,
+        width,
+        height,
+      };
     }
     const file_id = this.u8() === 1 ? this.u53() : null;
     const fragmentCount = this.u32();

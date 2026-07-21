@@ -11,22 +11,8 @@ import Icon from "./Icon";
 import ImageViewer from "./ImageViewer";
 import VideoPlayer from "./VideoPlayer";
 import type { IconName } from "./icons";
+import { previewKey, type PreviewItem } from "./preview";
 import type { AutoplayMode } from "./types";
-
-export type PreviewItem =
-  | { kind: "file"; name: string }
-  | { kind: "video"; name: string }
-  | { kind: "audio"; name: string }
-  | {
-      kind: "image";
-      name: string;
-      width: number | null;
-      height: number | null;
-    };
-
-export function previewKey(item: PreviewItem): string {
-  return `${item.kind}:${item.name}`;
-}
 
 function fileUrl(name: string): string {
   return `/files/${encodeURIComponent(name)}`;
