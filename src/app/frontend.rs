@@ -145,10 +145,15 @@ impl App {
         let tcp_addr = self.active_tcp_addr.clone();
         let session_id = self.session_id;
         let video_transport = self.video_transport;
-        let handle = self
-            .video_fanout
-            .add_native(client_id.0 as u64, stream_id, stream)?;
-        if own_share || self.subscribers.contains_key(&stream_id) {
+        let upstream_is_active = self.subscribers.contains_key(&stream_id);
+        let wait_for_upstream_bootstrap = !own_share && !upstream_is_active;
+        let handle = self.video_fanout.add_native(
+            client_id.0 as u64,
+            stream_id,
+            stream,
+            wait_for_upstream_bootstrap,
+        )?;
+        if own_share || upstream_is_active {
             return Ok(handle);
         }
         let Some(tcp_addr) = tcp_addr else {
@@ -173,9 +178,7 @@ impl App {
     }
 
     pub(crate) fn stop_rpc_live_share(&mut self, stream_id: rpc::ids::StreamId) {
-        if self.video_fanout.has_native(stream_id)
-            || self.web_viewing_shares.contains(&stream_id)
-        {
+        if self.video_fanout.has_native(stream_id) || self.web_viewing_shares.contains(&stream_id) {
             return;
         }
         if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {

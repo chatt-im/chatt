@@ -11,10 +11,12 @@
 //! - Outer: a u32 length prefix per record ([`write_record`]/[`parse_record`]),
 //!   capped at [`MAX_VIDEO_FRAME_LEN`].
 //! - Inner (a frame record's sealed plaintext): the [`write_video_frame`] bytes,
-//!   a 17-byte header (`[u32 size_incl_header][i64 ts_ms][u8 is_key][u32
-//!   stream_id]`) followed by the length-prefixed video bitstream. This is
-//!   byte-identical to what the browser decoder expects, so the client forwards
-//!   a decrypted frame body to the browser without re-framing. The `stream_id`
+//!   a 17-byte header (`[u32 size_incl_header][i64 ts_ms][u8 flags][u32
+//!   stream_id]`) followed by the length-prefixed video bitstream. Normal frame
+//!   records are byte-identical to what the browser decoder expects, so the
+//!   client forwards a decrypted frame body without re-framing. Subscriber
+//!   streams additionally use a body-less bootstrap-end record after their
+//!   cached GOP. The `stream_id`
 //!   lets a browser route each frame to its per-stream decoder so it can watch
 //!   several shares at once.
 //!
@@ -37,8 +39,11 @@ use crate::ids::{SessionId, StreamId};
 pub const VIDEO_MAGIC: [u8; 8] = *b"CHTVID01";
 
 /// Length of the per-frame header:
-/// `[u32 size_incl_header][i64 ts_ms][u8 is_key][u32 stream_id]`.
+/// `[u32 size_incl_header][i64 ts_ms][u8 flags][u32 stream_id]`.
 pub const VIDEO_FRAME_HEADER_LEN: usize = 17;
+
+const VIDEO_FRAME_FLAG_KEY: u8 = 1;
+const VIDEO_FRAME_FLAG_BOOTSTRAP_END: u8 = 2;
 
 /// Length prefix on each outer wire record.
 pub const VIDEO_LENGTH_PREFIX_LEN: usize = 4;
@@ -404,6 +409,9 @@ pub struct VideoFrameHeader {
     pub size: usize,
     pub ts_ms: i64,
     pub is_key: bool,
+    /// Marks the ordered boundary between a native subscriber's cached GOP
+    /// and subsequent live frames. It has no bitstream body.
+    pub bootstrap_end: bool,
     pub stream_id: u32,
 }
 
@@ -413,6 +421,7 @@ pub struct VideoFrameHeader {
 pub struct VideoFrame<'a> {
     pub ts_ms: i64,
     pub is_key: bool,
+    pub bootstrap_end: bool,
     pub stream_id: u32,
     pub data: &'a [u8],
 }
@@ -475,9 +484,25 @@ pub fn write_video_frame(out: &mut Vec<u8>, ts_ms: i64, is_key: bool, stream_id:
     let size = (body.len() + VIDEO_FRAME_HEADER_LEN) as u32;
     out.extend_from_slice(&size.to_le_bytes());
     out.extend_from_slice(&ts_ms.to_le_bytes());
-    out.push(u8::from(is_key));
+    out.push(if is_key { VIDEO_FRAME_FLAG_KEY } else { 0 });
     out.extend_from_slice(&stream_id.to_le_bytes());
     out.extend_from_slice(body);
+}
+
+/// Writes the ordered boundary between the cached GOP seeded to a native
+/// subscriber and the live frames that follow it.
+pub fn write_video_bootstrap_end(out: &mut Vec<u8>, stream_id: u32) {
+    out.extend_from_slice(&(VIDEO_FRAME_HEADER_LEN as u32).to_le_bytes());
+    out.extend_from_slice(&0i64.to_le_bytes());
+    out.push(VIDEO_FRAME_FLAG_BOOTSTRAP_END);
+    out.extend_from_slice(&stream_id.to_le_bytes());
+}
+
+/// Encodes a native subscriber bootstrap boundary into a fresh buffer.
+pub fn encode_video_bootstrap_end(stream_id: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(VIDEO_FRAME_HEADER_LEN);
+    write_video_bootstrap_end(&mut out, stream_id);
+    out
 }
 
 /// Encodes one inner frame into a fresh buffer.
@@ -502,15 +527,17 @@ pub fn parse_video_frame_header(
     if size > MAX_VIDEO_FRAME_LEN {
         return Err(VideoFrameError::TooLarge);
     }
-    let is_key = match buffer[12] {
-        0 => false,
-        1 => true,
+    let (is_key, bootstrap_end) = match buffer[12] {
+        0 => (false, false),
+        VIDEO_FRAME_FLAG_KEY => (true, false),
+        VIDEO_FRAME_FLAG_BOOTSTRAP_END if size == VIDEO_FRAME_HEADER_LEN => (false, true),
         _ => return Err(VideoFrameError::BadHeader),
     };
     Ok(Some(VideoFrameHeader {
         size,
         ts_ms: i64::from_le_bytes(buffer[4..12].try_into().unwrap()),
         is_key,
+        bootstrap_end,
         stream_id: u32::from_le_bytes(buffer[13..17].try_into().unwrap()),
     }))
 }
@@ -530,6 +557,7 @@ pub fn parse_video_frame(
         VideoFrame {
             ts_ms: header.ts_ms,
             is_key: header.is_key,
+            bootstrap_end: header.bootstrap_end,
             stream_id: header.stream_id,
             data: &buffer[VIDEO_FRAME_HEADER_LEN..header.size],
         },
@@ -627,8 +655,21 @@ mod tests {
         let (frame, consumed) = parse_video_frame(&buffer).unwrap().unwrap();
         assert_eq!(frame.ts_ms, 33);
         assert!(frame.is_key);
+        assert!(!frame.bootstrap_end);
         assert_eq!(frame.stream_id, 7);
         assert_eq!(frame.data, [1, 2, 3, 4]);
+        assert_eq!(consumed, buffer.len());
+    }
+
+    #[test]
+    fn video_bootstrap_boundary_round_trips() {
+        let buffer = encode_video_bootstrap_end(7);
+        let (frame, consumed) = parse_video_frame(&buffer).unwrap().unwrap();
+        assert_eq!(frame.ts_ms, 0);
+        assert!(!frame.is_key);
+        assert!(frame.bootstrap_end);
+        assert_eq!(frame.stream_id, 7);
+        assert!(frame.data.is_empty());
         assert_eq!(consumed, buffer.len());
     }
 
@@ -673,10 +714,7 @@ mod tests {
         let size = (MAX_VIDEO_FRAME_LEN + 1) as u32;
         buffer.extend_from_slice(&size.to_le_bytes());
         buffer.extend_from_slice(&[0u8; VIDEO_FRAME_HEADER_LEN]);
-        assert_eq!(
-            parse_video_frame(&buffer),
-            Err(VideoFrameError::TooLarge)
-        );
+        assert_eq!(parse_video_frame(&buffer), Err(VideoFrameError::TooLarge));
     }
 
     #[test]

@@ -90,6 +90,10 @@ pub fn start(
     video_transport: VideoTransport,
     fanout: VideoFrameFanout,
 ) -> SubscriberHandle {
+    // Publish the state transition before the worker can connect so a native
+    // viewer joining in the same interval also waits for the server's ordered
+    // cached-GOP boundary.
+    fanout.begin_upstream_bootstrap(stream_id);
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let join = thread::Builder::new()
@@ -159,6 +163,7 @@ fn run_once(
         secret,
         video_transport,
     )?;
+    fanout.begin_upstream_bootstrap(stream_id);
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|error| error.to_string())?;

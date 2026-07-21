@@ -2178,7 +2178,13 @@ impl App {
             self.room.screencast_status.clear_active();
         }
         self.screencast_stream_id = None;
-        for stream_id in self.room.available_shares.keys().copied().collect::<Vec<_>>() {
+        for stream_id in self
+            .room
+            .available_shares
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
             self.video_fanout.close_stream(stream_id);
         }
         self.room.available_shares.clear();

@@ -587,9 +587,7 @@ mod tests {
         let path = directory.path().join("staged.mp4");
         std::fs::write(&path, b"video bytes").unwrap();
         let store = DownloadStore::new(1024);
-        let reservation = store
-            .reserve_disk_name("staged.mp4".to_string())
-            .unwrap();
+        let reservation = store.reserve_disk_name("staged.mp4".to_string()).unwrap();
 
         let name = reservation.commit_owned(path.clone());
         assert!(matches!(store.resolve(&name), Some(Source::Disk(_))));

@@ -2341,16 +2341,22 @@ impl Server {
                 None => Vec::new(),
             }
         };
+        let bootstrap_end =
+            SharedVideoFrame::from_vec(video::encode_video_bootstrap_end(stream_id.0));
         let burst_len = burst.len();
-        let burst_bytes = burst.iter().fold(0usize, |total, data| {
-            total.saturating_add(video_fanout_charge(data, 1))
-        });
+        let burst_bytes = burst
+            .iter()
+            .chain(std::iter::once(&bootstrap_end))
+            .fold(0usize, |total, data| {
+                total.saturating_add(video_fanout_charge(data, 1))
+            });
         if self.video_fanout_bytes.saturating_add(burst_bytes) > VIDEO_FANOUT_QUEUE_MAX_BYTES {
             return Err("video fast-start queue is full; reconnect shortly".to_string());
         }
         for data in burst {
             self.enqueue_video_fanout(stream_id, data, vec![token])?;
         }
+        self.enqueue_video_fanout(stream_id, bootstrap_end, vec![token])?;
         kvlog::info!(
             "video subscriber attached",
             token = token.0,
@@ -10203,10 +10209,9 @@ mod tests {
             expires_at: Instant::now() + DEVICE_LINK_TTL,
             redemption,
         };
-        server.device_links.insert(
-            vec![1; 32],
-            link(alice, DeviceLinkRedemption::Active),
-        );
+        server
+            .device_links
+            .insert(vec![1; 32], link(alice, DeviceLinkRedemption::Active));
         server.device_links.insert(
             vec![2; 32],
             link(
@@ -10218,10 +10223,9 @@ mod tests {
                 },
             ),
         );
-        server.device_links.insert(
-            vec![3; 32],
-            link(bob, DeviceLinkRedemption::Active),
-        );
+        server
+            .device_links
+            .insert(vec![3; 32], link(bob, DeviceLinkRedemption::Active));
 
         server.invalidate_device_links_for_roster_change(alice);
 
@@ -10926,6 +10930,34 @@ mod tests {
         ring.push_back(ring_frame(false));
         ring.push_back(ring_frame(false));
         assert_eq!(fast_start_index(&ring), None);
+    }
+
+    #[test]
+    fn subscriber_fast_start_ends_with_an_ordered_boundary() {
+        let mut server = test_server();
+        let stream_id = StreamId(1);
+        let mut stream = test_stream(RoomId(1), SessionId(1));
+        stream.ring.push_back(ring_frame(true));
+        stream.ring.push_back(ring_frame(false));
+        server.streams.insert(stream_id, stream);
+
+        server.attach_subscriber(Token(9), stream_id).unwrap();
+
+        assert_eq!(server.video_fanouts.len(), 3);
+        assert!(
+            !rpc::video::parse_video_frame(server.video_fanouts.front().unwrap().data.as_slice())
+                .unwrap()
+                .unwrap()
+                .0
+                .bootstrap_end
+        );
+        let boundary =
+            rpc::video::parse_video_frame(server.video_fanouts.back().unwrap().data.as_slice())
+                .unwrap()
+                .unwrap()
+                .0;
+        assert!(boundary.bootstrap_end);
+        assert_eq!(boundary.stream_id, stream_id.0);
     }
 
     #[test]

@@ -26,9 +26,9 @@ use rpc::{
     video::{self, VideoAck, VideoHello, VideoRole},
 };
 
+pub use fanout::{NativeViewerHandle, VideoFrameFanout};
 pub use publisher::{ScreencastHandle, start as start_screencast};
 pub use subscriber::{SubscriberHandle, start as start_subscriber};
-pub use fanout::{NativeViewerHandle, VideoFrameFanout};
 
 /// Fixed plaintext for the auth record. Its contents are irrelevant, opening it
 /// is what proves the peer derived the per-stream key.

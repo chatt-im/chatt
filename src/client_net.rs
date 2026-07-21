@@ -1931,11 +1931,7 @@ fn schedule_reconnect(
     wait_for_reconnect(commands, delay)
 }
 
-fn report_reconnect_scheduled(
-    events: &NetworkEventSender,
-    delay: Duration,
-    reason: &str,
-) {
+fn report_reconnect_scheduled(events: &NetworkEventSender, delay: Duration, reason: &str) {
     kvlog::info!(
         "network reconnect scheduled",
         delay_ms = delay.as_millis() as u64,
@@ -2606,10 +2602,9 @@ struct PendingUploadSource {
 
 impl PendingUploadSource {
     fn commit(mut self) -> Result<String, String> {
-        let reservation = crate::receive_store::allocate_name(
-            &self.requested_name,
-            |candidate| self.store.reserve_disk_name(candidate.to_string()),
-        )
+        let reservation = crate::receive_store::allocate_name(&self.requested_name, |candidate| {
+            self.store.reserve_disk_name(candidate.to_string())
+        })
         .ok_or_else(|| {
             format!(
                 "could not reserve a local served name for {}",
@@ -4105,8 +4100,7 @@ impl WorkerState<'_> {
                         // Buffer into the ring like a received file. If it does not
                         // fit, the upload still proceeds; only the local copy is
                         // skipped.
-                        if let Some(reservation) = self.config.download_store.reserve(upload.size)
-                        {
+                        if let Some(reservation) = self.config.download_store.reserve(upload.size) {
                             upload.local_copy = Some(UploadLocalCopy::Memory {
                                 reservation,
                                 bytes: Vec::with_capacity(upload.size as usize),

@@ -23,9 +23,9 @@ use rpc::{
     video::{self, SharedVideoFrame, VideoRole},
 };
 
+use super::VideoFrameFanout;
 use crate::app::{AppEvent, EventSender, ScreencastProgress};
 use crate::client_net::{CommandSender, NetworkCommand};
-use super::VideoFrameFanout;
 
 use super::VideoTransport;
 use super::capture::{self, Capture, CapturedFrame};

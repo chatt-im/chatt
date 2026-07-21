@@ -239,9 +239,7 @@ impl FrameReader {
         self.recv_decoded(super::frame::decode_daemon)
     }
 
-    pub fn recv_daemon_with_fds(
-        &mut self,
-    ) -> io::Result<ReceivedFrame<super::frame::DaemonFrame>> {
+    pub fn recv_daemon_with_fds(&mut self) -> io::Result<ReceivedFrame<super::frame::DaemonFrame>> {
         self.recv_decoded_with_fds(super::frame::decode_daemon)
     }
 

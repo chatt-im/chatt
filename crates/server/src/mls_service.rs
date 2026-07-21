@@ -2031,12 +2031,7 @@ mod tests {
         std::fs::create_dir(&state_dir).unwrap();
         let mut service = MlsService::open(Some(state_dir.clone()), server_id.to_vec()).unwrap();
         let original_checkpoint = service
-            .put_roster(
-                user_id,
-                None,
-                original.bootstrap.own_roster.clone(),
-                None,
-            )
+            .put_roster(user_id, None, original.bootstrap.own_roster.clone(), None)
             .unwrap();
         let paired_checkpoint = service
             .redeem_pair(
