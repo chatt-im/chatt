@@ -259,6 +259,35 @@ impl Runtime {
         Ok(())
     }
 
+    /// Queues a durable UI acknowledgement even when ordinary actor work has
+    /// filled the bounded request mailbox. The app has already received the
+    /// corresponding event, so dropping this acknowledgement can replay that
+    /// event after a process restart.
+    pub(super) fn queue_ui_dispatch_ack(
+        &self,
+        room_id: RoomId,
+        sequence: u64,
+    ) -> Result<(), String> {
+        if self.outputs.stopped.load(Ordering::Acquire) {
+            return Err("client MLS worker stopped before acknowledging UI dispatch".to_string());
+        }
+        let mut inputs = self.inputs.inputs.lock().unwrap();
+        let notify = inputs.is_empty();
+        inputs.push(Input::Command(Command::AcknowledgeUiDispatch {
+            room_id,
+            sequence,
+        }));
+        drop(inputs);
+        if notify {
+            self.thread
+                .as_ref()
+                .expect("MLS runtime thread is present while sending")
+                .thread()
+                .unpark();
+        }
+        Ok(())
+    }
+
     pub(super) fn drain_outputs(&self, drain: &mut Vec<Output>) -> bool {
         debug_assert!(drain.is_empty());
         let mut outputs = self.outputs.outputs.lock().unwrap();

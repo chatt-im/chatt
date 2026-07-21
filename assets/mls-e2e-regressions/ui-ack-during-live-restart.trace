@@ -1,0 +1,21 @@
+chatt-mls-scenario-v1
+seed 0x4daf115e9a2017c8
+
+# A UI acknowledgement racing a live server restart must be persisted while
+# disconnected so a later process restart does not emit the message again.
+open-dm bob.0 carol dm-bob-carol
+stop carol.0
+stop bob.0
+start carol.0
+edit carol.0 dm-bob-carol __open-dm-bob-carol e0
+start bob.0
+server-restart live
+stop bob.0
+open-dm alice.0 bob dm-alice-bob
+view alice.0 group-ab
+server-restart live
+server-restart cold carol.0,alice.0
+server-restart live
+checkpoint
+batch group-all alice.0 e1 carol.0 e2
+start bob.0

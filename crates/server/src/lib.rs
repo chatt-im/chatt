@@ -10069,7 +10069,7 @@ mod tests {
         let device_id = package_source.bootstrap.device_id;
         let package = package_source
             .client
-            .generate_key_packages(package_source.bootstrap.device_id, 1)
+            .generate_initial_key_packages(package_source.bootstrap.device_id, 1)
             .unwrap()
             .remove(0);
         let packages = vec![package];

@@ -1475,8 +1475,19 @@ fn run_worker(
                     "network connection attempt failed",
                     reason = reason.as_str()
                 );
-                if schedule_reconnect(&events, &commands, &mut reconnect, &reason).is_shutdown() {
-                    break;
+                match schedule_reconnect(
+                    &events,
+                    &commands,
+                    &mut reconnect,
+                    &mls_runtime,
+                    &reason,
+                ) {
+                    RetryWait::Retry => {}
+                    RetryWait::Shutdown => break,
+                    RetryWait::Fatal(reason) => {
+                        let _ = events.send(NetworkEvent::WorkerStopped { reason });
+                        break;
+                    }
                 }
             }
             SessionEnd::Disconnected(reason) => {
@@ -1912,23 +1923,21 @@ impl ReconnectSchedule {
 enum RetryWait {
     Retry,
     Shutdown,
-}
-
-impl RetryWait {
-    fn is_shutdown(&self) -> bool {
-        matches!(self, Self::Shutdown)
-    }
+    Fatal(String),
 }
 
 fn schedule_reconnect(
     events: &NetworkEventSender,
     commands: &Receiver<NetworkCommand>,
     reconnect: &mut ReconnectSchedule,
+    mls_runtime: &mls_actor::Runtime,
     reason: &str,
 ) -> RetryWait {
     let delay = reconnect.next_delay();
     report_reconnect_scheduled(events, delay, reason);
-    wait_for_reconnect(commands, delay)
+    wait_for_reconnect(commands, delay, |room_id, sequence| {
+        mls_runtime.queue_ui_dispatch_ack(room_id, sequence)
+    })
 }
 
 fn report_reconnect_scheduled(events: &NetworkEventSender, delay: Duration, reason: &str) {
@@ -1943,7 +1952,11 @@ fn report_reconnect_scheduled(events: &NetworkEventSender, delay: Duration, reas
     });
 }
 
-fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> RetryWait {
+fn wait_for_reconnect(
+    commands: &Receiver<NetworkCommand>,
+    delay: Duration,
+    mut acknowledge_mls_ui_dispatch: impl FnMut(RoomId, u64) -> Result<(), String>,
+) -> RetryWait {
     let deadline = Instant::now() + delay;
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -1958,6 +1971,16 @@ fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> R
             Ok(NetworkCommand::Shutdown) => {
                 kvlog::info!("shutdown command handling while disconnected");
                 return RetryWait::Shutdown;
+            }
+            Ok(NetworkCommand::AcknowledgeMlsUiDispatch { room_id, sequence }) => {
+                if let Err(error) = acknowledge_mls_ui_dispatch(room_id, sequence) {
+                    return RetryWait::Fatal(error);
+                }
+                kvlog::info!(
+                    "MLS UI dispatch acknowledged while disconnected",
+                    room_id = room_id.0,
+                    sequence
+                );
             }
             Ok(command) => {
                 if !matches!(
@@ -7311,9 +7334,30 @@ mod tests {
         tx.send(NetworkCommand::RetryConnection).unwrap();
 
         assert!(matches!(
-            wait_for_reconnect(&rx, Duration::from_secs(60)),
+            wait_for_reconnect(&rx, Duration::from_secs(60), |_, _| Ok(())),
             RetryWait::Retry
         ));
+    }
+
+    #[test]
+    fn ui_dispatch_ack_is_queued_before_disconnected_shutdown() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(NetworkCommand::AcknowledgeMlsUiDispatch {
+            room_id: RoomId(7),
+            sequence: 11,
+        })
+        .unwrap();
+        tx.send(NetworkCommand::Shutdown).unwrap();
+        let mut acknowledged = Vec::new();
+
+        assert!(matches!(
+            wait_for_reconnect(&rx, Duration::from_secs(60), |room_id, sequence| {
+                acknowledged.push((room_id, sequence));
+                Ok(())
+            }),
+            RetryWait::Shutdown
+        ));
+        assert_eq!(acknowledged, [(RoomId(7), 11)]);
     }
 
     #[test]

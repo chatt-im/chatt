@@ -172,9 +172,13 @@ impl Client {
             "client emitted MLS room {} out of order: sequence {sequence} after {previous:?}",
             room_id.0,
         );
-        self.handle
-            .try_send(NetworkCommand::AcknowledgeMlsUiDispatch { room_id, sequence })
-            .unwrap();
+        // The worker can stop between emitting the chat and the test draining it,
+        // notably when a connected device is revoked with UI events still queued.
+        // The observation above remains valid, but there is no live session left
+        // to persist the synthetic UI acknowledgement.
+        let _ = self
+            .handle
+            .try_send(NetworkCommand::AcknowledgeMlsUiDispatch { room_id, sequence });
     }
 
     fn pending_statuses(&self) -> Vec<String> {
