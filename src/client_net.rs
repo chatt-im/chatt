@@ -1475,13 +1475,8 @@ fn run_worker(
                     "network connection attempt failed",
                     reason = reason.as_str()
                 );
-                match schedule_reconnect(
-                    &events,
-                    &commands,
-                    &mut reconnect,
-                    &mls_runtime,
-                    &reason,
-                ) {
+                match schedule_reconnect(&events, &commands, &mut reconnect, &mls_runtime, &reason)
+                {
                     RetryWait::Retry => {}
                     RetryWait::Shutdown => break,
                     RetryWait::Fatal(reason) => {
@@ -8338,8 +8333,8 @@ mod tests {
         assert_eq!(metadata.byte_len, path.metadata().unwrap().len());
         assert!(metadata.content_type.starts_with("video/"));
         let attachment_id = local_rpc::model::AttachmentId {
-            room_id: RoomId(7),
-            message_id: MessageId(16),
+            timestamp_ms: 16,
+            transfer_id: FileTransferId(7),
         };
         assert!(store.bind_attachment(attachment_id, &served_name));
         assert!(matches!(

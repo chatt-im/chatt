@@ -269,7 +269,17 @@ impl App {
                 transfer_id,
             };
             let detail = self.room.resident_file_detail(message.room_id, &key)?;
-            self.rpc_attachment_descriptor(message.room_id, message.message_id, detail)
+            let descriptor = self.rpc_attachment_descriptor(key, detail)?;
+            kvlog::info!(
+                "daemon attachment descriptor projected",
+                room_id = message.room_id.0,
+                message_id = message.message_id.0,
+                attachment_timestamp_ms = descriptor.id.timestamp_ms,
+                attachment_transfer_id = descriptor.id.transfer_id.0,
+                file_name = descriptor.file_name.as_str(),
+                byte_len = descriptor.byte_len
+            );
+            Some(descriptor)
         });
         Message {
             room_id: message.room_id,
@@ -618,20 +628,13 @@ impl App {
 
     fn rpc_attachment_descriptor(
         &self,
-        room_id: RoomId,
-        message_id: rpc::ids::MessageId,
+        key: crate::room_history::FileHistoryKey,
         detail: &crate::room_history::FileDetail,
     ) -> Option<AttachmentDescriptor> {
         let attachment_id = AttachmentId {
-            room_id,
-            message_id,
+            timestamp_ms: key.timestamp_ms,
+            transfer_id: key.transfer_id,
         };
-        if !self
-            .download_store
-            .bind_attachment(attachment_id, &detail.file_name)
-        {
-            return None;
-        }
         let metadata = self
             .download_store
             .attachment_metadata_by_id(attachment_id)?;
@@ -664,31 +667,45 @@ impl App {
         room_id: RoomId,
         attachment_id: local_rpc::model::AttachmentId,
     ) -> Option<(AttachmentDescriptor, crate::receive_store::Source)> {
-        if attachment_id.room_id != room_id {
-            return None;
-        }
         let history = self.room.history_for(room_id);
+        let key = crate::room_history::FileHistoryKey {
+            timestamp_ms: attachment_id.timestamp_ms,
+            transfer_id: attachment_id.transfer_id,
+        };
         for message in history.messages {
-            if message.message_id != attachment_id.message_id {
+            if message.timestamp_ms != key.timestamp_ms
+                || message.file_transfer_id != Some(key.transfer_id)
+            {
                 continue;
             }
-            let Some(transfer_id) = message.file_transfer_id else {
-                continue;
-            };
-            let key = crate::room_history::FileHistoryKey {
-                timestamp_ms: message.timestamp_ms,
-                transfer_id,
-            };
             let Some(detail) = history.files.get(&key) else {
                 continue;
             };
-            let Some(descriptor) =
-                self.rpc_attachment_descriptor(room_id, message.message_id, detail)
-            else {
+            let Some(descriptor) = self.rpc_attachment_descriptor(key, detail) else {
                 continue;
             };
             if descriptor.id == attachment_id {
                 let source = self.download_store.resolve_attachment(attachment_id)?;
+                let (source_kind, source_bytes) = match &source {
+                    crate::receive_store::Source::Memory { bytes, .. } => {
+                        ("memory", bytes.len() as u64)
+                    }
+                    crate::receive_store::Source::Disk(path) => (
+                        "disk",
+                        std::fs::metadata(path).map_or(0, |metadata| metadata.len()),
+                    ),
+                };
+                kvlog::info!(
+                    "daemon attachment source resolved",
+                    room_id = room_id.0,
+                    message_id = message.message_id.0,
+                    attachment_timestamp_ms = attachment_id.timestamp_ms,
+                    attachment_transfer_id = attachment_id.transfer_id.0,
+                    served_name = detail.file_name.as_str(),
+                    descriptor_bytes = descriptor.byte_len,
+                    source_kind = source_kind,
+                    source_bytes = source_bytes
+                );
                 return Some((descriptor, source));
             }
         }
@@ -849,22 +866,22 @@ mod tests {
     }
 
     #[test]
-    fn attachment_identity_uses_room_and_message() {
+    fn attachment_identity_uses_timestamp_and_server_transfer_id() {
         let first = AttachmentId {
-            room_id: RoomId(1),
-            message_id: rpc::ids::MessageId(7),
+            timestamp_ms: 1_000,
+            transfer_id: rpc::ids::FileTransferId(7),
         };
-        let next_message = AttachmentId {
-            room_id: RoomId(1),
-            message_id: rpc::ids::MessageId(8),
+        let next_transfer = AttachmentId {
+            timestamp_ms: 1_000,
+            transfer_id: rpc::ids::FileTransferId(8),
         };
-        let other_room = AttachmentId {
-            room_id: RoomId(2),
-            message_id: rpc::ids::MessageId(7),
+        let reused_transfer = AttachmentId {
+            timestamp_ms: 2_000,
+            transfer_id: rpc::ids::FileTransferId(7),
         };
 
-        assert_ne!(first, next_message);
-        assert_ne!(first, other_room);
+        assert_ne!(first, next_transfer);
+        assert_ne!(first, reused_transfer);
     }
 
     #[test]
@@ -879,15 +896,75 @@ mod tests {
             length: 16,
             packed_dims: 0,
         };
+        let first_id = AttachmentId {
+            timestamp_ms: 1_000,
+            transfer_id: rpc::ids::FileTransferId(7),
+        };
+        let second_id = AttachmentId {
+            timestamp_ms: 2_000,
+            transfer_id: rpc::ids::FileTransferId(8),
+        };
+        assert!(
+            app.download_store
+                .bind_attachment(first_id, &detail.file_name)
+        );
+        assert!(
+            app.download_store
+                .bind_attachment(second_id, &detail.file_name)
+        );
         let first = app
-            .rpc_attachment_descriptor(RoomId(1), rpc::ids::MessageId(7), &detail)
+            .rpc_attachment_descriptor(
+                crate::room_history::FileHistoryKey {
+                    timestamp_ms: 1_000,
+                    transfer_id: rpc::ids::FileTransferId(7),
+                },
+                &detail,
+            )
             .expect("first descriptor");
         let second = app
-            .rpc_attachment_descriptor(RoomId(1), rpc::ids::MessageId(8), &detail)
+            .rpc_attachment_descriptor(
+                crate::room_history::FileHistoryKey {
+                    timestamp_ms: 2_000,
+                    transfer_id: rpc::ids::FileTransferId(8),
+                },
+                &detail,
+            )
             .expect("second descriptor");
 
         assert_ne!(first.id, second.id);
         assert!(app.download_store.resolve_attachment(first.id).is_some());
         assert!(app.download_store.resolve_attachment(second.id).is_some());
+    }
+
+    #[test]
+    fn historical_filename_does_not_rebind_to_current_memory_source() {
+        let app = App::new(crate::config::Config::default(), None).unwrap();
+        let served_name = app
+            .download_store
+            .insert("clipboard.png", b"current image".to_vec())
+            .unwrap();
+        let detail = crate::room_history::FileDetail {
+            file_name: served_name.clone(),
+            length: 13,
+            packed_dims: 0,
+        };
+        let current = crate::room_history::FileHistoryKey {
+            timestamp_ms: 2_000,
+            transfer_id: rpc::ids::FileTransferId(8),
+        };
+        let historical = crate::room_history::FileHistoryKey {
+            timestamp_ms: 1_000,
+            transfer_id: rpc::ids::FileTransferId(7),
+        };
+        assert!(app.download_store.bind_attachment(
+            AttachmentId {
+                timestamp_ms: current.timestamp_ms,
+                transfer_id: current.transfer_id,
+            },
+            &served_name,
+        ));
+
+        assert!(app.rpc_attachment_descriptor(current, &detail).is_some());
+        assert!(app.rpc_attachment_descriptor(historical, &detail).is_none());
     }
 }

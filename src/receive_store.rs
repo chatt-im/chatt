@@ -485,12 +485,12 @@ mod tests {
         let store = DownloadStore::new(1024);
         let name = store.insert("clip.mp4", vec![1, 2, 3, 4]).unwrap();
         let first = AttachmentId {
-            room_id: rpc::ids::RoomId(1),
-            message_id: rpc::ids::MessageId(1),
+            timestamp_ms: 1,
+            transfer_id: rpc::ids::FileTransferId(1),
         };
         let second = AttachmentId {
-            room_id: rpc::ids::RoomId(1),
-            message_id: rpc::ids::MessageId(2),
+            timestamp_ms: 2,
+            transfer_id: rpc::ids::FileTransferId(2),
         };
 
         assert!(store.bind_attachment(first, &name));
@@ -507,6 +507,41 @@ mod tests {
             store.resolve_attachment(second),
             Some(Source::Memory { .. })
         ));
+    }
+
+    #[test]
+    fn same_filename_upload_ids_resolve_independent_bytes() {
+        let store = DownloadStore::new(1024);
+        let first_name = store.insert("clipboard.png", b"first".to_vec()).unwrap();
+        let second_name = store.insert("clipboard.png", b"second".to_vec()).unwrap();
+        let first = AttachmentId {
+            timestamp_ms: 1_000,
+            transfer_id: rpc::ids::FileTransferId(7),
+        };
+        let second = AttachmentId {
+            timestamp_ms: 2_000,
+            transfer_id: rpc::ids::FileTransferId(8),
+        };
+
+        assert!(store.bind_attachment(first, &first_name));
+        assert!(store.bind_attachment(second, &second_name));
+        let Source::Memory {
+            bytes: first_bytes, ..
+        } = store.resolve_attachment(first).unwrap()
+        else {
+            panic!("first upload should remain memory-backed");
+        };
+        let Source::Memory {
+            bytes: second_bytes,
+            ..
+        } = store.resolve_attachment(second).unwrap()
+        else {
+            panic!("second upload should remain memory-backed");
+        };
+
+        assert_ne!(first_name, second_name);
+        assert_eq!(first_bytes.as_slice(), b"first");
+        assert_eq!(second_bytes.as_slice(), b"second");
     }
 
     #[test]

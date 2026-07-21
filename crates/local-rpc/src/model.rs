@@ -9,8 +9,8 @@ pub struct RequestId(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
 pub struct AttachmentId {
-    pub room_id: RoomId,
-    pub message_id: MessageId,
+    pub timestamp_ms: u64,
+    pub transfer_id: FileTransferId,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]

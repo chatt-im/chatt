@@ -3913,6 +3913,22 @@ impl App {
                 served_name,
                 dimensions,
             } => {
+                let attachment_id = local_rpc::model::AttachmentId {
+                    timestamp_ms: metadata.timestamp_ms,
+                    transfer_id: metadata.transfer_id,
+                };
+                if !self
+                    .download_store
+                    .bind_attachment(attachment_id, &served_name)
+                {
+                    kvlog::warn!(
+                        "received file could not bind durable attachment identity",
+                        room_id = metadata.room_id.0,
+                        attachment_timestamp_ms = attachment_id.timestamp_ms,
+                        attachment_transfer_id = attachment_id.transfer_id.0,
+                        served_name = served_name.as_str()
+                    );
+                }
                 if self.room.viewed_room == Some(metadata.room_id)
                     && let Some(feed) = &self.web_feed
                 {
@@ -9962,13 +9978,26 @@ mod tests {
             encoding: rpc::control::FileContentEncoding::Identity,
             timestamp_ms: 44,
         };
+        let attachment_id = local_rpc::model::AttachmentId {
+            timestamp_ms: metadata.timestamp_ms,
+            transfer_id: metadata.transfer_id,
+        };
+        let served_name = app
+            .download_store
+            .insert("room-two.bin", vec![7; 12])
+            .unwrap();
 
         app.handle_network_event(NetworkEvent::FileReceived {
             metadata,
-            served_name: "room-two.bin".to_string(),
+            served_name,
             dimensions: None,
         });
 
+        assert!(
+            app.download_store
+                .resolve_attachment(attachment_id)
+                .is_some()
+        );
         assert!(app.room.viewed_history().files.is_empty());
         assert!(app.set_viewed_room(RoomId(2)));
         assert_eq!(app.room.viewed_history().files.len(), 1);
