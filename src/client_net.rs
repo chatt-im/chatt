@@ -8273,8 +8273,10 @@ mod tests {
             .expect("registered attachment metadata");
         assert_eq!(metadata.byte_len, path.metadata().unwrap().len());
         assert!(metadata.content_type.starts_with("video/"));
+        let attachment_id = rpc::daemon::model::AttachmentId([7; 16]);
+        assert!(store.bind_attachment(attachment_id, &served_name));
         assert!(matches!(
-            store.resolve_attachment(metadata.id),
+            store.resolve_attachment(attachment_id),
             Some(crate::receive_store::Source::Disk(source)) if source == path
         ));
     }

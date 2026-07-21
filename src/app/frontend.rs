@@ -6,8 +6,8 @@ use rpc::{
         bulk::BeginUpload,
         frame::{ClientFrame, Operation, RequestOutcome, RequestResult},
         model::{
-            AttachmentDescriptor, ConnectionState, MediaKind, Message, RequestId, RoomKind,
-            RoomSnapshot, RoomSummary, StateSnapshot, TrustState, VoiceState,
+            AttachmentDescriptor, AttachmentId, ConnectionState, MediaKind, Message, RequestId,
+            RoomKind, RoomSnapshot, RoomSummary, StateSnapshot, TrustState, VoiceState,
         },
     },
     ids::RoomId,
@@ -271,7 +271,7 @@ impl App {
                 transfer_id,
             };
             let detail = self.room.resident_file_detail(message.room_id, &key)?;
-            self.rpc_attachment_descriptor(detail)
+            self.rpc_attachment_descriptor(key, detail)
         });
         Message {
             room_id: message.room_id,
@@ -620,9 +620,19 @@ impl App {
 
     fn rpc_attachment_descriptor(
         &self,
+        key: crate::room_history::FileHistoryKey,
         detail: &crate::room_history::FileDetail,
     ) -> Option<AttachmentDescriptor> {
-        let metadata = self.download_store.attachment_metadata(&detail.file_name)?;
+        let attachment_id = rpc_attachment_id(key);
+        if !self
+            .download_store
+            .bind_attachment(attachment_id, &detail.file_name)
+        {
+            return None;
+        }
+        let metadata = self
+            .download_store
+            .attachment_metadata_by_id(attachment_id)?;
         let (width, height) = detail
             .dimensions()
             .map_or((None, None), |(w, h)| (Some(w), Some(h)));
@@ -637,7 +647,7 @@ impl App {
             MediaKind::File
         };
         Some(AttachmentDescriptor {
-            id: metadata.id,
+            id: attachment_id,
             file_name: detail.file_name.clone(),
             media_kind,
             content_type,
@@ -665,7 +675,7 @@ impl App {
             let Some(detail) = history.files.get(&key) else {
                 continue;
             };
-            let Some(descriptor) = self.rpc_attachment_descriptor(detail) else {
+            let Some(descriptor) = self.rpc_attachment_descriptor(key, detail) else {
                 continue;
             };
             if descriptor.id == attachment_id {
@@ -704,6 +714,13 @@ impl App {
             Err("not connected".into())
         }
     }
+}
+
+fn rpc_attachment_id(key: crate::room_history::FileHistoryKey) -> AttachmentId {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&key.timestamp_ms.to_le_bytes());
+    bytes[8..].copy_from_slice(&key.transfer_id.0.to_le_bytes());
+    AttachmentId(bytes)
 }
 
 fn rpc_message_size_estimate(message: &rpc::control::ChatMessage) -> usize {
@@ -827,5 +844,64 @@ mod tests {
         assert_eq!(share.sender_name, "alice");
         assert_eq!((share.coded_width, share.coded_height), (320, 240));
         assert_eq!(share.extradata, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn attachment_identity_uses_timestamp_and_server_transfer_id() {
+        use rpc::ids::FileTransferId;
+
+        let first = rpc_attachment_id(crate::room_history::FileHistoryKey {
+            timestamp_ms: 1_000,
+            transfer_id: FileTransferId(7),
+        });
+        let next_transfer = rpc_attachment_id(crate::room_history::FileHistoryKey {
+            timestamp_ms: 1_000,
+            transfer_id: FileTransferId(8),
+        });
+        let reused_transfer = rpc_attachment_id(crate::room_history::FileHistoryKey {
+            timestamp_ms: 2_000,
+            transfer_id: FileTransferId(7),
+        });
+
+        assert_ne!(first, next_transfer);
+        assert_ne!(first, reused_transfer);
+        assert_eq!(&first.0[..8], &1_000u64.to_le_bytes());
+        assert_eq!(&first.0[8..], &7u64.to_le_bytes());
+    }
+
+    #[test]
+    fn repeated_same_name_and_bytes_get_independent_rpc_attachment_ids() {
+        use rpc::ids::FileTransferId;
+
+        let app = App::new(crate::config::Config::default(), None).unwrap();
+        let served_name = app
+            .download_store
+            .insert("clip.mp4", b"same video bytes".to_vec())
+            .unwrap();
+        let detail = crate::room_history::FileDetail {
+            file_name: served_name,
+            length: 16,
+            packed_dims: 0,
+        };
+        let first_key = crate::room_history::FileHistoryKey {
+            timestamp_ms: 1_000,
+            transfer_id: FileTransferId(7),
+        };
+        let second_key = crate::room_history::FileHistoryKey {
+            timestamp_ms: 2_000,
+            transfer_id: FileTransferId(8),
+        };
+
+        let first = app
+            .rpc_attachment_descriptor(first_key, &detail)
+            .expect("first descriptor");
+        let second = app
+            .rpc_attachment_descriptor(second_key, &detail)
+            .expect("second descriptor");
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.digest, second.digest);
+        assert!(app.download_store.resolve_attachment(first.id).is_some());
+        assert!(app.download_store.resolve_attachment(second.id).is_some());
     }
 }

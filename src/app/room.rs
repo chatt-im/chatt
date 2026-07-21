@@ -1274,7 +1274,12 @@ fn collect_web_attachments(
         let Some(detail) = files.get(&key) else {
             continue;
         };
-        let attachment = WebAttachment::from_served_file(&detail.file_name, detail.dimensions());
+        let attachment = WebAttachment::from_served_file(
+            transfer_id.0,
+            message.timestamp_ms,
+            &detail.file_name,
+            detail.dimensions(),
+        );
         web_file_attachments.insert(key, attachment.clone());
         web_attachments.insert(message.message_id.0, attachment);
     }
@@ -1316,7 +1321,8 @@ fn record_room_file(
             packed_dims,
         },
     );
-    let attachment = WebAttachment::from_served_file(file_name, dimensions);
+    let attachment =
+        WebAttachment::from_served_file(transfer_id.0, timestamp_ms, file_name, dimensions);
     room.web_file_attachments.insert(key, attachment.clone());
     if let Some(message_id) = file_message_id(&room.messages, timestamp_ms, transfer_id) {
         room.web_attachments.insert(message_id, attachment);
@@ -5053,24 +5059,30 @@ mod tests {
             length: 1,
             packed_dims: 0,
         };
-        let attachment = WebAttachment {
-            name: "file.bin".to_string(),
-            kind: "file".to_string(),
-            width: None,
-            height: None,
-        };
+        let old_attachment = WebAttachment::from_served_file(
+            old_key.transfer_id.0,
+            old_key.timestamp_ms,
+            "file.bin",
+            None,
+        );
+        let kept_attachment = WebAttachment::from_served_file(
+            kept_key.transfer_id.0,
+            kept_key.timestamp_ms,
+            "file.bin",
+            None,
+        );
         room.shared_mut(1).files.insert(old_key, detail.clone());
         room.shared_mut(1).files.insert(kept_key, detail);
         room.shared_mut(1)
             .web_file_attachments
-            .insert(old_key, attachment.clone());
+            .insert(old_key, old_attachment.clone());
         room.shared_mut(1)
             .web_file_attachments
-            .insert(kept_key, attachment.clone());
+            .insert(kept_key, kept_attachment.clone());
+        room.shared_mut(1).web_attachments.insert(1, old_attachment);
         room.shared_mut(1)
             .web_attachments
-            .insert(1, attachment.clone());
-        room.shared_mut(1).web_attachments.insert(2, attachment);
+            .insert(2, kept_attachment);
 
         room.set_max_messages(2);
 

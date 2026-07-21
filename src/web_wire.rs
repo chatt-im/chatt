@@ -241,6 +241,11 @@ fn render_ref(code: &str, resolver: RefResolver, html: &mut String) {
         .as_ref()
         .and_then(|resolved| resolved.attachment.as_ref())
     {
+        let _ = write!(
+            html,
+            " data-media-file-id=\"{}\" data-media-timestamp-ms=\"{}\"",
+            attachment.file_id, attachment.timestamp_ms,
+        );
         html.push_str(" data-media-name=\"");
         escape_html(&attachment.name, html);
         html.push_str("\" data-media-kind=\"");
@@ -358,6 +363,8 @@ fn encode_message(buf: &mut Vec<u8>, message: &WebMessage) {
             buf.push(1);
             put_str(buf, &attachment.name);
             buf.push(attachment_kind_code(&attachment.kind));
+            put_u64(buf, attachment.file_id);
+            put_u64(buf, attachment.timestamp_ms);
             match (attachment.width, attachment.height) {
                 (Some(width), Some(height)) => {
                     buf.push(1);
@@ -440,6 +447,8 @@ pub(crate) struct DecodedMessage {
     pub edited: bool,
     pub unverified: bool,
     pub attachment_name: Option<String>,
+    pub attachment_file_id: Option<u64>,
+    pub attachment_timestamp_ms: Option<u64>,
     pub fragments: Vec<Fragment>,
 }
 
@@ -519,16 +528,18 @@ impl Reader<'_> {
         let local = self.u8() == 1;
         let edited = self.u8() == 1;
         let unverified = self.u8() == 1;
-        let attachment_name = if self.u8() == 1 {
+        let (attachment_name, attachment_file_id, attachment_timestamp_ms) = if self.u8() == 1 {
             let name = self.string();
             let _kind = self.u8();
+            let file_id = self.u64();
+            let timestamp_ms = self.u64();
             if self.u8() == 1 {
                 let _ = self.u32();
                 let _ = self.u32();
             }
-            Some(name)
+            (Some(name), Some(file_id), Some(timestamp_ms))
         } else {
-            None
+            (None, None, None)
         };
         let _file_id = (self.u8() == 1).then(|| self.u64());
         let fragment_count = self.u32();
@@ -557,6 +568,8 @@ impl Reader<'_> {
             edited,
             unverified,
             attachment_name,
+            attachment_file_id,
+            attachment_timestamp_ms,
             fragments,
         }
     }
@@ -685,6 +698,8 @@ mod tests {
             Some(ResolvedRef {
                 label: "@@ alice: sent file".to_string(),
                 attachment: Some(WebAttachment {
+                    file_id: 11,
+                    timestamp_ms: 1_700_000_000_000,
                     name: "wide \"one\".png".to_string(),
                     kind: "image".to_string(),
                     width: Some(640),
@@ -696,6 +711,11 @@ mod tests {
             panic!("expected text fragment");
         };
         assert!(html.contains("data-media-kind=\"image\""), "html: {html}");
+        assert!(html.contains("data-media-file-id=\"11\""), "html: {html}");
+        assert!(
+            html.contains("data-media-timestamp-ms=\"1700000000000\""),
+            "html: {html}"
+        );
         assert!(
             html.contains("data-media-name=\"wide &quot;one&quot;.png\""),
             "html: {html}"

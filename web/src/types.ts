@@ -10,6 +10,10 @@ export type ViewerMode = "panel" | "tab";
 export type TransferDirection = "incoming" | "outgoing";
 
 export interface WebAttachment {
+  // Durable upload identity. Transfer ids are reused after server restarts, so
+  // every identity comparison must include the announcement timestamp.
+  file_id: number;
+  timestamp_ms: number;
   // Served file name. The URL is `/files/${name}`.
   name: string;
   kind: MediaKind;

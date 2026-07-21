@@ -1085,6 +1085,7 @@ fn web_room_messages(
             }) {
                 Some(detail) => crate::web_server::WebMessage::from_history_file(
                     message,
+                    transfer_id,
                     &detail.file_name,
                     detail.length,
                     detail.dimensions(),

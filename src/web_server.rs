@@ -187,6 +187,11 @@ pub struct WebMessage {
 /// An inline media file attached to a [`WebMessage`], served from `/files`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebAttachment {
+    /// Server file-transfer id for this upload. Paired with [`timestamp_ms`]
+    /// because transfer ids are reused after a server restart.
+    pub file_id: u64,
+    /// Announcement timestamp completing this upload's durable identity.
+    pub timestamp_ms: u64,
     /// The served file name. The frontend builds the URL as `/files/<name>`.
     pub name: String,
     /// One of `image`, `video`, `audio`, or `file`.
@@ -201,13 +206,20 @@ pub struct WebAttachment {
 }
 
 impl WebAttachment {
-    pub fn from_served_file(served_name: &str, dimensions: Option<(u32, u32)>) -> Self {
+    pub fn from_served_file(
+        file_id: u64,
+        timestamp_ms: u64,
+        served_name: &str,
+        dimensions: Option<(u32, u32)>,
+    ) -> Self {
         let kind = classify(served_name);
         let (width, height) = match (kind, dimensions) {
             ("image", Some((w, h))) => (Some(w), Some(h)),
             _ => (None, None),
         };
         Self {
+            file_id,
+            timestamp_ms,
             kind: kind.to_string(),
             name: served_name.to_string(),
             width,
@@ -283,7 +295,12 @@ impl WebMessage {
             edited: false,
             fragments: split_fragments(&body, &|_| None),
             timestamp_ms: metadata.timestamp_ms,
-            attachment: Some(WebAttachment::from_served_file(served_name, dimensions)),
+            attachment: Some(WebAttachment::from_served_file(
+                metadata.transfer_id.0,
+                metadata.timestamp_ms,
+                served_name,
+                dimensions,
+            )),
             file_id: Some(metadata.transfer_id.0),
             // The announcement message carries the identity; merge_from keeps it.
             message_id: 0,
@@ -298,13 +315,14 @@ impl WebMessage {
     /// backlog with a room's file messages when the room is entered.
     pub fn from_history_file(
         message: &ChatMessage,
+        transfer_id: rpc::ids::FileTransferId,
         served_name: &str,
         size: u64,
         dimensions: Option<(u32, u32)>,
         local_user: Option<UserId>,
         unverified: bool,
     ) -> Self {
-        let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
+        let file_id = Some(transfer_id.0);
         // Rebuild the body from the served name rather than reusing the stored
         // announcement, which carries the sender's original name; the live view
         // does the same in `from_file` so a reload reads identically.
@@ -318,7 +336,12 @@ impl WebMessage {
             edited: message.flags.edited(),
             fragments: split_fragments(&body, &|_| None),
             timestamp_ms: message.timestamp_ms,
-            attachment: Some(WebAttachment::from_served_file(served_name, dimensions)),
+            attachment: Some(WebAttachment::from_served_file(
+                transfer_id.0,
+                message.timestamp_ms,
+                served_name,
+                dimensions,
+            )),
             file_id,
             message_id: message.message_id.0,
             ref_code: chat_ref_code(message),
@@ -2317,6 +2340,8 @@ mod tests {
     fn text_edit_resend_merges_replacing_fragments() {
         let mut held = text_message(7, "original");
         held.attachment = Some(WebAttachment {
+            file_id: 17,
+            timestamp_ms: 23,
             name: "pic.png".to_string(),
             kind: "image".to_string(),
             width: None,
@@ -2449,6 +2474,8 @@ mod tests {
         let message = WebMessage::from_file(&metadata, "wide-1.png", Some((640, 480)), None);
         let attachment = message.attachment.as_ref().expect("attachment present");
         assert_eq!(attachment.name, "wide-1.png");
+        assert_eq!(attachment.file_id, 3);
+        assert_eq!(attachment.timestamp_ms, 5);
         assert_eq!(attachment.kind, "image");
         assert_eq!(attachment.width, Some(640));
         assert_eq!(attachment.height, Some(480));
@@ -2462,6 +2489,8 @@ mod tests {
             decoded.messages[0].attachment_name.as_deref(),
             Some("wide-1.png")
         );
+        assert_eq!(decoded.messages[0].attachment_file_id, Some(3));
+        assert_eq!(decoded.messages[0].attachment_timestamp_ms, Some(5));
         assert!(!frame.is_empty());
 
         // The file id carries the transfer id and the body names the served file
@@ -2472,6 +2501,31 @@ mod tests {
             panic!("expected a text fragment");
         };
         assert_eq!(body, "<p>sent file <code>wide-1.png</code> (10 B)</p>");
+    }
+
+    #[test]
+    fn history_attachment_preserves_durable_upload_identity() {
+        use rpc::control::{ChatMessage, MessageFlags};
+        use rpc::ids::MessageId;
+
+        let transfer_id = FileTransferId(37);
+        let message = ChatMessage {
+            message_id: MessageId(91),
+            room_id: RoomId(1),
+            sender: UserId(2),
+            sender_name: "Alice".to_string(),
+            timestamp_ms: 8_000,
+            body: "sent file `clip.mp4` (10 B)".to_string(),
+            file_transfer_id: Some(transfer_id),
+            flags: MessageFlags::default(),
+            target: None,
+        };
+
+        let projected =
+            WebMessage::from_history_file(&message, transfer_id, "clip.mp4", 10, None, None, false);
+        let attachment = projected.attachment.expect("attachment present");
+        assert_eq!(attachment.file_id, 37);
+        assert_eq!(attachment.timestamp_ms, 8_000);
     }
 
     fn file_metadata(transfer_id: u64) -> FileMetadata {
