@@ -261,13 +261,7 @@ mod conversion_tests {
         let avcc = h264::build_avcc_extra_data(&sps, &pps);
         assert_eq!(
             configuration_to_annex_b(Codec::H264, &avcc).unwrap(),
-            [
-                &[0, 0, 0, 1],
-                sps.as_slice(),
-                &[0, 0, 0, 1],
-                pps.as_slice(),
-            ]
-            .concat()
+            [&[0, 0, 0, 1], sps.as_slice(), &[0, 0, 0, 1], pps.as_slice(),].concat()
         );
     }
 }

@@ -30,12 +30,18 @@ struct FanoutInner {
 struct FanoutState {
     native: HashMap<(u64, StreamId), Arc<NativeQueue>>,
     fast_start: HashMap<StreamId, NativeFastStart>,
+    upstream_bootstrap: HashMap<StreamId, UpstreamBootstrap>,
 }
 
 #[derive(Default)]
 struct NativeFastStart {
     frames: VecDeque<SharedVideoFrame>,
     bytes: usize,
+}
+
+struct UpstreamBootstrap {
+    replay_through_ts_ms: Option<i64>,
+    skipped_frames: u64,
 }
 
 struct NativeQueue {
@@ -52,6 +58,8 @@ struct QueueState {
     seen_keyframe: bool,
     awaiting_keyframe: bool,
     bootstrapping: bool,
+    bootstrap_complete: bool,
+    bootstrap_boundary_pending: bool,
     closed: bool,
     received_frames: u64,
     written_frames: u64,
@@ -84,17 +92,79 @@ impl VideoFrameFanout {
             return;
         }
         let stream_id = StreamId(parsed.stream_id);
+        if parsed.bootstrap_end {
+            self.finish_upstream_bootstrap(stream_id);
+            return;
+        }
         let is_key = parsed.is_key;
+        let (queues, replayed) = {
+            let mut state = self.inner.state.lock().unwrap();
+            let replayed = if let Some(bootstrap) = state.upstream_bootstrap.get_mut(&stream_id)
+                && bootstrap
+                    .replay_through_ts_ms
+                    .is_some_and(|timestamp| parsed.ts_ms <= timestamp)
+            {
+                bootstrap.skipped_frames += 1;
+                true
+            } else {
+                false
+            };
+            if replayed {
+                (Vec::new(), true)
+            } else {
+                state.fast_start.entry(stream_id).or_default().push(
+                    stream_id,
+                    frame.clone(),
+                    is_key,
+                );
+                let queues = state
+                    .native
+                    .iter()
+                    .filter(|((_, id), _)| *id == stream_id)
+                    .map(|(_, queue)| queue.clone())
+                    .collect::<Vec<_>>();
+                (queues, false)
+            }
+        };
         if let Some(web) = &self.inner.web {
             web.send_video_frame(frame.clone());
         }
+        if replayed {
+            return;
+        }
+        for queue in queues {
+            queue.push(frame.clone(), is_key);
+        }
+    }
+
+    /// Marks a new server subscription so an overlapping server-side cached
+    /// GOP is not replayed after the daemon's own cached GOP.
+    pub fn begin_upstream_bootstrap(&self, stream_id: StreamId) {
+        let mut state = self.inner.state.lock().unwrap();
+        let replay_through_ts_ms = state
+            .fast_start
+            .get(&stream_id)
+            .and_then(NativeFastStart::latest_timestamp);
+        state.upstream_bootstrap.insert(
+            stream_id,
+            UpstreamBootstrap {
+                replay_through_ts_ms,
+                skipped_frames: 0,
+            },
+        );
+    }
+
+    fn finish_upstream_bootstrap(&self, stream_id: StreamId) {
         let queues = {
             let mut state = self.inner.state.lock().unwrap();
-            state
-                .fast_start
-                .entry(stream_id)
-                .or_default()
-                .push(stream_id, frame.clone(), is_key);
+            let Some(bootstrap) = state.upstream_bootstrap.remove(&stream_id) else {
+                return;
+            };
+            kvlog::info!(
+                "video subscriber fast-start complete",
+                stream_id = stream_id.0,
+                skipped_replayed_frames = bootstrap.skipped_frames
+            );
             state
                 .native
                 .iter()
@@ -103,7 +173,7 @@ impl VideoFrameFanout {
                 .collect::<Vec<_>>()
         };
         for queue in queues {
-            queue.push(frame.clone(), is_key);
+            queue.finish_bootstrap();
         }
     }
 
@@ -112,6 +182,7 @@ impl VideoFrameFanout {
         viewer_id: u64,
         stream_id: StreamId,
         stream: UnixStream,
+        wait_for_upstream_bootstrap: bool,
     ) -> Result<NativeViewerHandle, String> {
         let key = (viewer_id, stream_id);
         let control = Arc::new(
@@ -133,15 +204,19 @@ impl VideoFrameFanout {
             let cached = state.fast_start.get(&stream_id);
             let cached_frames = cached.map_or(0, |cache| cache.frames.len());
             let cached_bytes = cached.map_or(0, |cache| cache.bytes);
-            if let Some(cached) = cached {
-                queue.seed(&cached.frames);
-            }
+            let wait_for_upstream_bootstrap =
+                wait_for_upstream_bootstrap || state.upstream_bootstrap.contains_key(&stream_id);
+            queue.seed(
+                cached.map(|cache| &cache.frames),
+                !wait_for_upstream_bootstrap,
+            );
             kvlog::info!(
                 "native video viewer registered",
                 viewer_id,
                 stream_id = stream_id.0,
                 cached_frames,
-                cached_bytes
+                cached_bytes,
+                wait_for_upstream_bootstrap
             );
             state.native.insert(key, queue.clone());
         }
@@ -177,6 +252,7 @@ impl VideoFrameFanout {
         let queues = {
             let mut state = self.inner.state.lock().unwrap();
             state.fast_start.remove(&stream_id);
+            state.upstream_bootstrap.remove(&stream_id);
             let keys = state
                 .native
                 .keys()
@@ -194,6 +270,15 @@ impl VideoFrameFanout {
 }
 
 impl NativeFastStart {
+    fn latest_timestamp(&self) -> Option<i64> {
+        self.frames.back().and_then(|frame| {
+            rpc::video::parse_video_frame_header(frame.as_slice())
+                .ok()
+                .flatten()
+                .map(|header| header.ts_ms)
+        })
+    }
+
     fn push(&mut self, stream_id: StreamId, frame: SharedVideoFrame, is_key: bool) {
         if is_key {
             self.frames.clear();
@@ -221,16 +306,32 @@ impl NativeFastStart {
 }
 
 impl NativeQueue {
-    fn seed(&self, frames: &VecDeque<SharedVideoFrame>) {
+    fn seed(&self, frames: Option<&VecDeque<SharedVideoFrame>>, bootstrap_complete: bool) {
         let mut state = self.state.lock().unwrap();
-        state.frames.extend(frames.iter().cloned());
+        if let Some(frames) = frames {
+            state.frames.extend(frames.iter().cloned());
+        }
+        if bootstrap_complete {
+            state.push_bootstrap_boundary(self.stream_id);
+        }
         state.pending_bytes = state
             .frames
             .iter()
             .map(SharedVideoFrame::retained_bytes)
             .sum();
-        state.seen_keyframe = !state.frames.is_empty();
-        state.bootstrapping = !state.frames.is_empty();
+        state.seen_keyframe = frames.is_some_and(|frames| !frames.is_empty());
+        state.bootstrapping = true;
+        state.bootstrap_complete = bootstrap_complete;
+        self.ready.notify_one();
+    }
+
+    fn finish_bootstrap(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.bootstrap_complete {
+            return;
+        }
+        state.bootstrap_complete = true;
+        state.push_bootstrap_boundary(self.stream_id);
         self.ready.notify_one();
     }
 
@@ -268,8 +369,7 @@ impl NativeQueue {
                 MAX_PENDING_FRAMES
             };
             let over_limit = state.frames.len() >= frame_limit
-                || state.pending_bytes.saturating_add(frame.retained_bytes())
-                    > MAX_PENDING_BYTES;
+                || state.pending_bytes.saturating_add(frame.retained_bytes()) > MAX_PENDING_BYTES;
             if over_limit {
                 if is_key {
                     state.clear_frames();
@@ -296,7 +396,11 @@ impl NativeQueue {
             if let Some(frame) = state.frames.pop_front() {
                 state.pending_bytes -= frame.retained_bytes();
                 state.written_frames += 1;
-                if state.frames.is_empty() {
+                let bootstrap_end = is_bootstrap_boundary(&frame);
+                if bootstrap_end {
+                    state.bootstrap_boundary_pending = false;
+                }
+                if state.frames.is_empty() && state.bootstrap_complete {
                     state.bootstrapping = false;
                 }
                 return Some(frame);
@@ -311,16 +415,46 @@ impl NativeQueue {
     fn close(&self) {
         let mut state = self.state.lock().unwrap();
         state.closed = true;
-        state.clear_frames();
+        state.frames.clear();
+        state.pending_bytes = 0;
+        state.bootstrap_boundary_pending = false;
         self.ready.notify_all();
     }
 }
 
 impl QueueState {
     fn clear_frames(&mut self) {
+        let boundary = self
+            .bootstrap_boundary_pending
+            .then(|| {
+                self.frames
+                    .iter()
+                    .find(|frame| is_bootstrap_boundary(frame))
+                    .cloned()
+            })
+            .flatten();
         self.frames.clear();
         self.pending_bytes = 0;
+        if let Some(boundary) = boundary {
+            self.pending_bytes = boundary.retained_bytes();
+            self.frames.push_back(boundary);
+        }
     }
+
+    fn push_bootstrap_boundary(&mut self, stream_id: StreamId) {
+        let boundary =
+            SharedVideoFrame::from_vec(rpc::video::encode_video_bootstrap_end(stream_id.0));
+        self.pending_bytes += boundary.retained_bytes();
+        self.frames.push_back(boundary);
+        self.bootstrap_boundary_pending = true;
+    }
+}
+
+fn is_bootstrap_boundary(frame: &SharedVideoFrame) -> bool {
+    rpc::video::parse_video_frame_header(frame.as_slice())
+        .ok()
+        .flatten()
+        .is_some_and(|header| header.bootstrap_end)
 }
 
 fn native_writer_loop(mut stream: UnixStream, queue: Arc<NativeQueue>) {
@@ -328,8 +462,21 @@ fn native_writer_loop(mut stream: UnixStream, queue: Arc<NativeQueue>) {
     while let Some(frame) = queue.pop() {
         match stream.write_all(frame.as_slice()) {
             Ok(()) => {
-                written += 1;
-                if written == 1 {
+                let bootstrap_end = rpc::video::parse_video_frame_header(frame.as_slice())
+                    .ok()
+                    .flatten()
+                    .is_some_and(|header| header.bootstrap_end);
+                if bootstrap_end {
+                    kvlog::debug!(
+                        "native video bootstrap boundary written",
+                        viewer_id = queue.viewer_id,
+                        stream_id = queue.stream_id.0,
+                        cached_frames = written
+                    );
+                } else {
+                    written += 1;
+                }
+                if written == 1 && !bootstrap_end {
                     kvlog::info!(
                         "native video first frame written",
                         viewer_id = queue.viewer_id,
@@ -429,16 +576,119 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();
         let _viewer = fanout
-            .add_native(11, StreamId(7), daemon_stream)
+            .add_native(11, StreamId(7), daemon_stream, false)
             .unwrap();
         let mut first = vec![0; rpc::video::VIDEO_FRAME_HEADER_LEN + 1];
         frontend_stream.read_exact(&mut first).unwrap();
         let mut second = vec![0; rpc::video::VIDEO_FRAME_HEADER_LEN + 1];
         frontend_stream.read_exact(&mut second).unwrap();
+        let mut boundary = vec![0; rpc::video::VIDEO_FRAME_HEADER_LEN];
+        frontend_stream.read_exact(&mut boundary).unwrap();
         assert_eq!(first[4], 3);
         assert_eq!(first[12], 1);
         assert_eq!(second[4], 4);
         assert_eq!(second[12], 0);
+        let (boundary, consumed) = rpc::video::parse_video_frame(&boundary).unwrap().unwrap();
+        assert!(boundary.bootstrap_end);
+        assert_eq!(consumed, rpc::video::VIDEO_FRAME_HEADER_LEN);
+    }
+
+    #[test]
+    fn native_viewer_without_a_cached_gop_starts_with_a_bootstrap_boundary() {
+        let fanout = VideoFrameFanout::new(None);
+        let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
+        frontend_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let _viewer = fanout
+            .add_native(11, StreamId(7), daemon_stream, false)
+            .unwrap();
+        let mut bytes = vec![0; rpc::video::VIDEO_FRAME_HEADER_LEN];
+        frontend_stream.read_exact(&mut bytes).unwrap();
+        let (boundary, _) = rpc::video::parse_video_frame(&bytes).unwrap().unwrap();
+        assert!(boundary.bootstrap_end);
+        assert_eq!(boundary.stream_id, 7);
+    }
+
+    #[test]
+    fn cold_native_viewer_waits_for_the_upstream_cached_gop_boundary() {
+        let fanout = VideoFrameFanout::new(None);
+        let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
+        frontend_stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let _viewer = fanout
+            .add_native(11, StreamId(7), daemon_stream, true)
+            .unwrap();
+
+        let mut header = [0; rpc::video::VIDEO_FRAME_HEADER_LEN];
+        let error = frontend_stream.read_exact(&mut header).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+
+        fanout.begin_upstream_bootstrap(StreamId(7));
+        fanout.send(frame(7, true, 1));
+        fanout.send(frame(7, false, 2));
+        fanout.send(SharedVideoFrame::from_vec(
+            rpc::video::encode_video_bootstrap_end(7),
+        ));
+
+        frontend_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut key = vec![0; rpc::video::VIDEO_FRAME_HEADER_LEN + 1];
+        frontend_stream.read_exact(&mut key).unwrap();
+        let mut delta = vec![0; rpc::video::VIDEO_FRAME_HEADER_LEN + 1];
+        frontend_stream.read_exact(&mut delta).unwrap();
+        frontend_stream.read_exact(&mut header).unwrap();
+        assert_eq!(key[4], 1);
+        assert_eq!(delta[4], 2);
+        assert!(
+            rpc::video::parse_video_frame(&header)
+                .unwrap()
+                .unwrap()
+                .0
+                .bootstrap_end
+        );
+    }
+
+    #[test]
+    fn upstream_fast_start_skips_frames_already_in_the_daemon_cache() {
+        let fanout = VideoFrameFanout::new(None);
+        fanout.send(frame(7, true, 1));
+        fanout.send(frame(7, false, 2));
+
+        let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
+        frontend_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let _viewer = fanout
+            .add_native(11, StreamId(7), daemon_stream, true)
+            .unwrap();
+        fanout.begin_upstream_bootstrap(StreamId(7));
+        fanout.send(frame(7, true, 1));
+        fanout.send(frame(7, false, 2));
+        fanout.send(frame(7, false, 3));
+        fanout.send(SharedVideoFrame::from_vec(
+            rpc::video::encode_video_bootstrap_end(7),
+        ));
+
+        for marker in [1, 2, 3] {
+            let mut bytes = vec![0; rpc::video::VIDEO_FRAME_HEADER_LEN + 1];
+            frontend_stream.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes[4], marker);
+        }
+        let mut boundary = [0; rpc::video::VIDEO_FRAME_HEADER_LEN];
+        frontend_stream.read_exact(&mut boundary).unwrap();
+        assert!(
+            rpc::video::parse_video_frame(&boundary)
+                .unwrap()
+                .unwrap()
+                .0
+                .bootstrap_end
+        );
     }
 
     #[test]

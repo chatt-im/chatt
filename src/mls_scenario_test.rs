@@ -552,8 +552,7 @@ impl ScenarioServerBindCoordinator {
     }
 }
 
-static SCENARIO_SERVER_BINDS: ScenarioServerBindCoordinator =
-    ScenarioServerBindCoordinator::new();
+static SCENARIO_SERVER_BINDS: ScenarioServerBindCoordinator = ScenarioServerBindCoordinator::new();
 static NEXT_SCENARIO_SERVER_PORT: AtomicU64 = AtomicU64::new(0);
 
 impl ScenarioServer {
@@ -813,10 +812,7 @@ fn invalidate_server_device_links(tickets: &mut BTreeMap<String, PendingTicket>)
     }
 }
 
-fn invalidate_account_device_links(
-    tickets: &mut BTreeMap<String, PendingTicket>,
-    user: User,
-) {
+fn invalidate_account_device_links(tickets: &mut BTreeMap<String, PendingTicket>, user: User) {
     for ticket in tickets.values_mut() {
         if ticket.state == TicketState::Active
             && device_user(&ticket.sponsor).is_ok_and(|sponsor| sponsor == user)
@@ -3064,8 +3060,7 @@ mod tests {
             let competing_events = event_tx.clone();
             scope.spawn(move || {
                 competing_events.send("attempting").unwrap();
-                competing_coordinator
-                    .bind(|| competing_events.send("competing-bind").unwrap());
+                competing_coordinator.bind(|| competing_events.send("competing-bind").unwrap());
             });
 
             assert_eq!(event_rx.recv().unwrap(), "attempting");
@@ -3280,10 +3275,7 @@ mod tests {
                 "alice-redeemed".into(),
                 ticket("alice.0", TicketState::Redeemed),
             ),
-            (
-                "bob-active".into(),
-                ticket("bob.0", TicketState::Active),
-            ),
+            ("bob-active".into(), ticket("bob.0", TicketState::Active)),
         ]);
 
         invalidate_account_device_links(&mut tickets, User::Alice);
