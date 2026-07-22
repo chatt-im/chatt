@@ -19,10 +19,7 @@ mod e2e;
 mod e2e_identity;
 mod file_compression;
 mod fuzzy;
-mod highlight;
-mod link;
 mod local_control;
-mod markdown;
 pub mod mdns;
 #[cfg(test)]
 mod mls_e2e_test;

@@ -6,7 +6,7 @@ use crate::config::{
     CustomTheme, SyntaxSlot, ThemeChoice, ThemeColorPair, ThemeSelection, ThemeSlot, ThemesConfig,
     UiConfig,
 };
-use crate::highlight::{HlClass, classify_span};
+use chatt_message_format::highlight::{HlClass, PaletteRole, classify_span};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiMode {
@@ -488,41 +488,16 @@ impl SyntaxTheme {
     /// The web view retains finer semantic roles, while this mapping reproduces
     /// exgit's Tomorrow Night token groups exactly.
     pub fn style_for(&self, class: HlClass) -> Style {
-        match class {
-            HlClass::Plain
-            | HlClass::Variable
-            | HlClass::PropertyAccess
-            | HlClass::MetaVariable
-            | HlClass::Argument
-            | HlClass::Operator
-            | HlClass::Punctuation
-            | HlClass::Delimiter
-            | HlClass::Delimiter1
-            | HlClass::Delimiter2
-            | HlClass::Delimiter3
-            | HlClass::Delimiter4
-            | HlClass::Delimiter5
-            | HlClass::Error => self.fg,
-            HlClass::Type => self.type_,
-            HlClass::Function
-            | HlClass::Method
-            | HlClass::Macro
-            | HlClass::Tag
-            | HlClass::AttrName
-            | HlClass::Heading => self.function,
-            HlClass::Parameter | HlClass::VariableDef | HlClass::Property | HlClass::Lifetime => {
-                self.binding
-            }
-            HlClass::Namespace
-            | HlClass::EntityRef
-            | HlClass::HashToken
-            | HlClass::Link
-            | HlClass::LinkUrl => self.namespace,
-            HlClass::Keyword | HlClass::Attribute => self.keyword,
-            HlClass::String | HlClass::Char | HlClass::Regex => self.string,
-            HlClass::Number => self.number,
-            HlClass::Comment | HlClass::DocComment => self.comment,
-            HlClass::Blockquote | HlClass::ListMarker | HlClass::Emphasis => self.fg,
+        match class.palette_role() {
+            PaletteRole::Foreground => self.fg,
+            PaletteRole::Type => self.type_,
+            PaletteRole::Function => self.function,
+            PaletteRole::Binding => self.binding,
+            PaletteRole::Namespace => self.namespace,
+            PaletteRole::Keyword => self.keyword,
+            PaletteRole::String => self.string,
+            PaletteRole::Number => self.number,
+            PaletteRole::Comment => self.comment,
         }
     }
 

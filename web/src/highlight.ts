@@ -2,7 +2,7 @@
 //
 // The backend runs the syntax highlighter and sends compact span buffers; the
 // browser never highlights. A span buffer is a run list of (u32 byte length, u8
-// class); the class byte indexes the `HlClass` enum in `src/highlight.rs` and
+// class); the class byte indexes `chatt-message-format`'s `HlClass` enum and
 // maps to a `hl-<n>` CSS color. Class 0 is plain text and gets no span.
 //
 // Runs and line splits fall on UTF-8 character boundaries, so slicing the

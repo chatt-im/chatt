@@ -324,6 +324,7 @@ dependencies = [
  "aws-lc-rs",
  "bwrap",
  "chatt-local-rpc",
+ "chatt-message-format",
  "chatt-mls",
  "chatt-p2p",
  "cpal",
@@ -378,6 +379,13 @@ dependencies = [
  "chatt-video",
  "jsony",
  "libc",
+]
+
+[[package]]
+name = "chatt-message-format"
+version = "0.1.0"
+dependencies = [
+ "tinyhl",
 ]
 
 [[package]]
@@ -1783,6 +1791,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "chatt-ids",
+ "chatt-message-format",
  "chatt-video",
  "jsony",
  "libc",

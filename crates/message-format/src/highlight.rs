@@ -1,10 +1,9 @@
-//! Syntax highlighting shared by the TUI theme and the web view.
+//! Syntax highlighting shared by Chatt renderers.
 //!
 //! [`classify_span`] reduces a [`tinyhl::RenderSpan`] to an [`HlClass`] color
-//! role. The TUI folds a class onto its nine palette slots in
-//! [`crate::theme::SyntaxTheme`]. The web view encodes runs of classes into the
-//! compact binary buffers below, which the browser decodes into colored spans
-//! without running a highlighter itself.
+//! role. Renderers fold that class onto the nine [`PaletteRole`] slots. The web
+//! view encodes runs of classes into compact binary buffers, which the browser
+//! decodes without running a highlighter itself.
 
 use std::path::Path;
 
@@ -20,9 +19,9 @@ const VERSION: u8 = 1;
 /// The set is deliberately fine grained: it keeps every distinction `tinyhl`
 /// draws (operators apart from punctuation, a method call apart from a free
 /// function, a doc comment apart from a comment, markdown structure apart from
-/// prose) so the web view can color them independently. The TUI folds these
-/// back onto its nine palette slots in [`SyntaxTheme::style_for`], so the terminal
-/// output is unchanged while the wire keeps full detail.
+/// prose) so the web view can color them independently. Renderers fold these
+/// back onto the shared nine palette slots, so the terminal output is unchanged
+/// while the wire keeps full detail.
 ///
 /// The `u8` discriminants are the wire encoding shared with the frontend, so
 /// their values are stable. Keep `web/src/highlight.ts` in sync.
@@ -72,9 +71,65 @@ pub enum HlClass {
     Delimiter5 = 40,
 }
 
+/// The nine shared Tomorrow Night palette slots used by every Chatt renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteRole {
+    Foreground,
+    Type,
+    Function,
+    Binding,
+    Namespace,
+    Keyword,
+    String,
+    Number,
+    Comment,
+}
+
 impl HlClass {
     pub const fn as_u8(self) -> u8 {
         self as u8
+    }
+
+    /// Folds the fine-grained class onto Chatt's shared nine-color palette.
+    pub const fn palette_role(self) -> PaletteRole {
+        match self {
+            Self::Plain
+            | Self::Variable
+            | Self::PropertyAccess
+            | Self::MetaVariable
+            | Self::Argument
+            | Self::Operator
+            | Self::Punctuation
+            | Self::Delimiter
+            | Self::Emphasis
+            | Self::Blockquote
+            | Self::ListMarker
+            | Self::Error
+            | Self::Delimiter1
+            | Self::Delimiter2
+            | Self::Delimiter3
+            | Self::Delimiter4
+            | Self::Delimiter5 => PaletteRole::Foreground,
+            Self::Type => PaletteRole::Type,
+            Self::Function
+            | Self::Method
+            | Self::Macro
+            | Self::Tag
+            | Self::AttrName
+            | Self::Heading => PaletteRole::Function,
+            Self::Parameter | Self::VariableDef | Self::Property | Self::Lifetime => {
+                PaletteRole::Binding
+            }
+            Self::Namespace
+            | Self::EntityRef
+            | Self::HashToken
+            | Self::Link
+            | Self::LinkUrl => PaletteRole::Namespace,
+            Self::Keyword | Self::Attribute => PaletteRole::Keyword,
+            Self::String | Self::Char | Self::Regex => PaletteRole::String,
+            Self::Number => PaletteRole::Number,
+            Self::Comment | Self::DocComment => PaletteRole::Comment,
+        }
     }
 }
 
@@ -644,6 +699,19 @@ mod tests {
         assert_eq!(HlClass::Operator.as_u8(), 20);
         assert_eq!(HlClass::Delimiter.as_u8(), 22);
         assert_eq!(HlClass::Error.as_u8(), 34);
+    }
+
+    #[test]
+    fn palette_roles_match_the_web_theme_groups() {
+        assert_eq!(HlClass::Plain.palette_role(), PaletteRole::Foreground);
+        assert_eq!(HlClass::Type.palette_role(), PaletteRole::Type);
+        assert_eq!(HlClass::Method.palette_role(), PaletteRole::Function);
+        assert_eq!(HlClass::Parameter.palette_role(), PaletteRole::Binding);
+        assert_eq!(HlClass::LinkUrl.palette_role(), PaletteRole::Namespace);
+        assert_eq!(HlClass::Attribute.palette_role(), PaletteRole::Keyword);
+        assert_eq!(HlClass::Regex.palette_role(), PaletteRole::String);
+        assert_eq!(HlClass::Number.palette_role(), PaletteRole::Number);
+        assert_eq!(HlClass::DocComment.palette_role(), PaletteRole::Comment);
     }
 
     #[test]
