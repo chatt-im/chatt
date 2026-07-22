@@ -1733,13 +1733,27 @@ impl Actor {
                 .client
                 .acknowledge_ui_dispatch(room_id, sequence),
             Command::RevokeDevice(device_id) => {
-                if !self.mls_bound {
-                    return Err("the local MLS device is not bound yet; retry shortly".to_string());
-                }
                 let installation = self
                     .installation
                     .as_ref()
                     .ok_or_else(|| "the MLS installation is unavailable".to_string())?;
+                if !installation
+                    .bootstrap
+                    .own_roster
+                    .body
+                    .active_devices
+                    .iter()
+                    .any(|certificate| certificate.body.device_id == device_id)
+                {
+                    // Another linked device can win the roster update before
+                    // this queued command runs. Revocation is already complete
+                    // in that case, so do not turn the harmless race into a
+                    // fatal MLS actor failure and reconnect.
+                    return Ok(());
+                }
+                if !self.mls_bound {
+                    return Err("the local MLS device is not bound yet; retry shortly".to_string());
+                }
                 let roster = installation.roster_without(device_id)?;
                 let expected = Some(installation.roster_checkpoint());
                 self.pending_mls_roster = Some(roster.clone());
@@ -3135,6 +3149,52 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn duplicate_revocation_after_linked_roster_update_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [14; 32];
+        let (mut alice, _) = LocalInstallation::open_or_create(
+            &temp.path().join("alice"),
+            server_id,
+            UserId(1),
+            "Alice",
+        )
+        .unwrap();
+        let linked = LocalInstallation::create_pending_pair(
+            &temp.path().join("alice-linked"),
+            server_id,
+            UserId(1),
+            "Alice linked",
+            alice.bootstrap.authority_seed,
+            &alice.bootstrap.own_roster,
+            rpc::ids::PairAttemptId([1; 16]),
+            "secret",
+            "bearer",
+        )
+        .unwrap();
+        alice
+            .replace_own_roster(linked.bootstrap.own_roster.clone())
+            .unwrap();
+        let linked_device = linked.bootstrap.device_id;
+        let already_revoked = alice.roster_without(linked_device).unwrap();
+        alice.replace_own_roster(already_revoked).unwrap();
+
+        let (mut actor, outputs, _poll) = test_actor(test_config(None));
+        actor.generation = 1;
+        actor.session_id = Some(SessionId(1));
+        actor.user_id = Some(UserId(1));
+        actor.mls_bound = true;
+        actor.installation = Some(alice);
+
+        actor
+            .handle_command(Command::RevokeDevice(linked_device))
+            .unwrap();
+
+        assert!(actor.mls_bound);
+        assert!(actor.pending_mls_roster.is_none());
+        assert!(outputs.outputs.lock().unwrap().is_empty());
     }
 
     #[test]
