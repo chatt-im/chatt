@@ -16,14 +16,9 @@ use crate::{
     ids::{MessageId, RoomId},
 };
 
-/// Prefix that introduces a message reference in message bodies.
-pub const REF_PREFIX: &str = "@@";
-
-/// Shortest code [`MessageRef::decode`] can accept.
-pub const MIN_CODE_LEN: usize = 5;
-
-/// Longest code [`MessageRef::decode`] can accept.
-pub const MAX_CODE_LEN: usize = 25;
+pub use chatt_message_format::reference::{
+    MAX_CODE_LEN, MIN_CODE_LEN, REF_PREFIX, is_ref_char,
+};
 
 /// The durable identity of a chat message, as carried by an `@@` reference.
 ///
@@ -108,14 +103,6 @@ impl MessageRef {
         }
         Some(decoded)
     }
-}
-
-/// Returns whether `byte` can appear in a reference code.
-///
-/// This is the accept set for tokenizers scanning `@@` codes: the Crockford
-/// base32 alphabet in either case plus the decode aliases `i`, `l`, and `o`.
-pub fn is_ref_char(byte: u8) -> bool {
-    base32::decode_value(byte).is_some()
 }
 
 fn checksum(payload: &[u8]) -> u8 {

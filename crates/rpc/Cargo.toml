@@ -10,6 +10,7 @@ toml = ["chatt-ids/toml"]
 [dependencies]
 chatt-ids = { path = "../ids" }
 chatt-video = { path = "../video" }
+chatt-message-format = { path = "../message-format", default-features = false }
 jsony = "0.1.10"
 libc = "0.2"
 mio = { version = "1.2.1", features = ["os-poll"] }

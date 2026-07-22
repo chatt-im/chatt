@@ -5,8 +5,10 @@ use rpc::control::ChatMessage;
 use rpc::ids::FileTransferId;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::highlight::{self, HlClass};
-use crate::markdown::{Token, TokenKind};
+use chatt_message_format::{
+    Token, TokenKind,
+    highlight::{self, HlClass},
+};
 use crate::theme::SyntaxTheme;
 
 /// Wrapped body lines beyond this collapse a lone message behind an expander.
@@ -345,7 +347,7 @@ impl VirtualChatBuffer {
     }
 
     fn build_entry(&self, message: ChatMessage, local: bool, unverified: bool) -> ChatEntry {
-        let inline = crate::markdown::inline_ranges(&message.body);
+        let inline = chatt_message_format::inline_ranges(&message.body);
         let refs = self.build_ref_spans(&message.body, inline.refs);
         ChatEntry {
             id: message.message_id.0,
@@ -549,7 +551,7 @@ impl VirtualChatBuffer {
         kind: NoticeKind,
     ) -> NoticeId {
         let body = body.into();
-        let inline = crate::markdown::inline_ranges(&body);
+        let inline = chatt_message_format::inline_ranges(&body);
         let refs = self.build_ref_spans(&body, inline.refs);
         let notice_id = NoticeId(self.next_notice_id);
         self.next_notice_id = self.next_notice_id.wrapping_add(1).max(1);
@@ -1880,7 +1882,7 @@ impl MessageLayout {
     fn reset_layout(&mut self, width: u16, text: &str) {
         self.wrap_width = width;
         self.cursor = 0;
-        crate::markdown::tokenize(text, &mut self.tokens);
+        chatt_message_format::tokenize(text, &mut self.tokens);
         self.line_starts.clear();
         self.line_sources.clear();
         self.segments.clear();
@@ -2785,7 +2787,7 @@ mod tests {
     impl VirtualChatBuffer {
         fn push_test(&mut self, sender: &str, body: &str, timestamp_ms: u64, local: bool) {
             let id = self.messages.len() as u64 + 1;
-            let inline = crate::markdown::inline_ranges(body);
+            let inline = chatt_message_format::inline_ranges(body);
             let refs = self.build_ref_spans(body, inline.refs);
             let old_len = self.messages.len();
             self.messages.push(ChatEntry {

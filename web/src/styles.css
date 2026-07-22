@@ -905,7 +905,7 @@ body {
  * Syntax highlighting.
  *
  * The backend streams span buffers whose class byte indexes `HlClass` in
- * `src/highlight.rs`; the frontend paints each run as `hl-<n>`. The semantic
+ * `chatt-message-format`; the frontend paints each run as `hl-<n>`. The semantic
  * classes stay fine-grained, while their default colors use exgit's exact
  * Tomorrow Night syntax palette. Class 0 (plain) inherits `--hl-fg`.
  * ------------------------------------------------------------------------- */

@@ -854,7 +854,7 @@ mod tests {
     fn message_ref_insertion_separates_reference_from_adjacent_text() {
         for (source, cursor) in [("before", 6), ("after", 0), ("beforeafter", 6)] {
             let (result, reference) = insert_reference(source, cursor);
-            let ranges = crate::markdown::inline_ranges(&result).refs;
+            let ranges = chatt_message_format::inline_ranges(&result).refs;
             assert_eq!(ranges.len(), 1, "reference not tokenized in {result:?}");
             let range = &ranges[0];
             assert_eq!(&result[range.start as usize..range.end as usize], reference);

@@ -1,0 +1,11 @@
+[package]
+name = "chatt-message-format"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["syntax-highlighting"]
+syntax-highlighting = ["dep:tinyhl"]
+
+[dependencies]
+tinyhl = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui", optional = true }

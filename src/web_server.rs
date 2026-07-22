@@ -856,7 +856,7 @@ fn files_route(store: DownloadStore) -> darkhttp::GeneratedHandler {
 }
 
 /// Builds the `/highlight/<name>` handler serving a file's line-indexed
-/// highlight buffer (see [`crate::highlight::encode_file`]).
+/// highlight buffer (see [`chatt_message_format::highlight::encode_file`]).
 ///
 /// The name resolves through the download index — the same flat namespace
 /// `/files` serves, covering both in-memory and persistent downloads. A missing
@@ -902,8 +902,8 @@ fn highlight_route(store: DownloadStore) -> darkhttp::GeneratedHandler {
         let Ok(text) = String::from_utf8(bytes) else {
             return darkhttp::GeneratedResponse::error(415);
         };
-        let language = crate::highlight::language_for_path(name);
-        let buffer = crate::highlight::encode_file(&text, language);
+        let language = chatt_message_format::highlight::language_for_path(name);
+        let buffer = chatt_message_format::highlight::encode_file(&text, language);
         darkhttp::GeneratedResponse::ok("application/octet-stream", buffer)
     })
 }
@@ -2764,7 +2764,9 @@ mod tests {
         stream.read_to_end(&mut body).unwrap();
         // The first byte is the format version; a Rust body highlights a keyword.
         assert_eq!(body[0], 1);
-        assert!(body.contains(&crate::highlight::HlClass::Keyword.as_u8()));
+        assert!(body.contains(
+            &chatt_message_format::highlight::HlClass::Keyword.as_u8()
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

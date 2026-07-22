@@ -1,4 +1,4 @@
-//! Chatt's small Markdown subset tokenizer.
+//! Chatt's small message-format subset tokenizer.
 //!
 //! The tokenizer is intentionally shallow: it emits balanced block and inline
 //! delimiter events plus source byte ranges. Renderers keep using the original
@@ -499,12 +499,13 @@ fn emit_text_with_refs(source: &str, range: Range<usize>, out: &mut Vec<Token>) 
         }
         let code_start = pos + 2;
         let mut code_end = code_start;
-        while code_end < range.end && rpc::msgref::is_ref_char(bytes[code_end]) {
+        while code_end < range.end && crate::reference::is_ref_char(bytes[code_end]) {
             code_end += 1;
         }
         let len = code_end - code_start;
         let terminated = code_end >= range.end || !bytes[code_end].is_ascii_alphanumeric();
-        let gated = (rpc::msgref::MIN_CODE_LEN..=rpc::msgref::MAX_CODE_LEN).contains(&len);
+        let gated =
+            (crate::reference::MIN_CODE_LEN..=crate::reference::MAX_CODE_LEN).contains(&len);
         if gated && terminated {
             if cursor < pos {
                 push(out, TokenKind::Text, cursor..pos);
@@ -1110,7 +1111,7 @@ mod tests {
     fn maximum_message_quote_depth_is_iterative() {
         let source = format!(
             "{}x",
-            ">".repeat(rpc::control::MAX_CHAT_BODY_BYTES.saturating_sub(1))
+            ">".repeat((8 * 1024usize).saturating_sub(1))
         );
         let tokens = pairs(&source);
         assert_eq!(
@@ -1118,14 +1119,14 @@ mod tests {
                 .iter()
                 .filter(|(kind, _)| matches!(kind, TokenKind::BlockQuoteStart))
                 .count(),
-            rpc::control::MAX_CHAT_BODY_BYTES - 1
+            8 * 1024 - 1
         );
         assert_eq!(
             tokens
                 .iter()
                 .filter(|(kind, _)| matches!(kind, TokenKind::BlockQuoteEnd))
                 .count(),
-            rpc::control::MAX_CHAT_BODY_BYTES - 1
+            8 * 1024 - 1
         );
     }
 }

@@ -3,7 +3,7 @@
 //! A message is split server-side into an ordered list of [`Fragment`]s: quote
 //! boundaries, prose rendered from Chatt's canonical Markdown-subset token
 //! stream as safe HTML, and fenced code blocks carrying their text alongside a
-//! precomputed highlight-span buffer (see [`crate::highlight`]). The frontend
+//! precomputed highlight-span buffer (see [`chatt_message_format::highlight`]). The frontend
 //! composes a message straight from its fragments, so it does not parse Markdown
 //! or reproject highlights onto rendered HTML.
 //!
@@ -13,8 +13,10 @@
 //! 17-byte header), so the frontend tells the two apart by that word. All
 //! integers are little-endian. Keep `web/src/feed.ts` in sync.
 
-use crate::highlight;
-use crate::markdown::{Token, TokenKind};
+use chatt_message_format::{
+    Token, TokenKind,
+    highlight,
+};
 use crate::web_server::{WebAttachment, WebMessage};
 
 /// Marks a feed frame, distinguishing it from a raw video frame.
@@ -82,7 +84,7 @@ pub type RefResolver<'a> = &'a dyn Fn(rpc::msgref::MessageRef) -> Option<Resolve
 /// matches the fence content and whose spans are keyed to the block's language.
 pub fn split_fragments(body: &str, resolver: RefResolver) -> Vec<Fragment> {
     let mut tokens = Vec::new();
-    crate::markdown::tokenize(body, &mut tokens);
+    chatt_message_format::tokenize(body, &mut tokens);
     let mut fragments = Vec::new();
     let mut prose_start = 0usize;
 
