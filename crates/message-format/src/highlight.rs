@@ -120,11 +120,9 @@ impl HlClass {
             Self::Parameter | Self::VariableDef | Self::Property | Self::Lifetime => {
                 PaletteRole::Binding
             }
-            Self::Namespace
-            | Self::EntityRef
-            | Self::HashToken
-            | Self::Link
-            | Self::LinkUrl => PaletteRole::Namespace,
+            Self::Namespace | Self::EntityRef | Self::HashToken | Self::Link | Self::LinkUrl => {
+                PaletteRole::Namespace
+            }
             Self::Keyword | Self::Attribute => PaletteRole::Keyword,
             Self::String | Self::Char | Self::Regex => PaletteRole::String,
             Self::Number => PaletteRole::Number,

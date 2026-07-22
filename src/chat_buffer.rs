@@ -5,11 +5,11 @@ use rpc::control::ChatMessage;
 use rpc::ids::FileTransferId;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::theme::SyntaxTheme;
 use chatt_message_format::{
     Token, TokenKind,
     highlight::{self, HlClass},
 };
-use crate::theme::SyntaxTheme;
 
 /// Wrapped body lines beyond this collapse a lone message behind an expander.
 const COLLAPSE_LIMIT: usize = 12;

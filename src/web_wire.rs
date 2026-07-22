@@ -13,11 +13,8 @@
 //! 17-byte header), so the frontend tells the two apart by that word. All
 //! integers are little-endian. Keep `web/src/feed.ts` in sync.
 
-use chatt_message_format::{
-    Token, TokenKind,
-    highlight,
-};
 use crate::web_server::{WebAttachment, WebMessage};
+use chatt_message_format::{Token, TokenKind, highlight};
 
 /// Marks a feed frame, distinguishing it from a raw video frame.
 const SENTINEL: [u8; 4] = [0, 0, 0, 0];
