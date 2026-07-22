@@ -6,8 +6,6 @@ use std::{
 };
 
 use local_rpc::{
-    bulk::BulkChunk,
-    frame::DaemonFrame,
     model::BulkTransferId,
     unix::{FrameReader, FrameWriter},
 };
@@ -24,13 +22,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             let mut reader = FrameReader::new(reader_stream);
             loop {
-                match reader.recv_daemon() {
-                    Ok(DaemonFrame::BulkChunk(chunk)) => {
-                        if delivered_tx.send(Ok(chunk.bytes.len())).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(frame) => {
+                match reader.recv_daemon_with_bulk(|_, bytes| {
+                    delivered_tx
+                        .send(Ok(bytes.len()))
+                        .map_err(|_| std::io::ErrorKind::BrokenPipe.into())
+                }) {
+                    Ok(None) => {}
+                    Ok(Some(frame)) => {
                         let _ =
                             delivered_tx.send(Err(format!("unexpected daemon frame: {frame:?}")));
                         break;
@@ -45,22 +43,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = FrameWriter::new(writer_stream);
 
     println!(
-        "persistent local Unix RPC delivery (serialize + socket + decode), {} measured samples",
+        "persistent local Unix RPC delivery (frame + socket + borrowed decode), {} measured samples",
         MEASURED_SAMPLES
     );
     println!("payload       p50       p95       min      mean   p95 frames@120Hz");
     for (index, &payload_bytes) in PAYLOAD_SIZES.iter().enumerate() {
-        let frame = DaemonFrame::BulkChunk(BulkChunk {
-            transfer_id: BulkTransferId((index + 1) as u64),
-            bytes: vec![0x5a; payload_bytes],
-        });
+        let transfer_id = BulkTransferId((index + 1) as u64);
+        let payload = vec![0x5a; payload_bytes];
         for _ in 0..WARMUP_SAMPLES {
-            deliver(&mut writer, &delivered_rx, &frame, payload_bytes)?;
+            deliver(&mut writer, &delivered_rx, transfer_id, &payload)?;
         }
         let mut samples = Vec::with_capacity(MEASURED_SAMPLES);
         for _ in 0..MEASURED_SAMPLES {
             let started = Instant::now();
-            deliver(&mut writer, &delivered_rx, &frame, payload_bytes)?;
+            deliver(&mut writer, &delivered_rx, transfer_id, &payload)?;
             samples.push(started.elapsed());
         }
         report(payload_bytes, &mut samples);
@@ -76,13 +72,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn deliver(
     writer: &mut FrameWriter,
     delivered: &mpsc::Receiver<Result<usize, String>>,
-    frame: &DaemonFrame,
-    expected: usize,
+    transfer_id: BulkTransferId,
+    payload: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    writer.send_daemon(frame)?;
+    writer.send_daemon_bulk_chunk(transfer_id, payload)?;
     let actual = delivered.recv().map_err(|error| error.to_string())??;
-    if actual != expected {
-        return Err(format!("decoded {actual} payload bytes; expected {expected}").into());
+    if actual != payload.len() {
+        return Err(format!("decoded {actual} payload bytes; expected {}", payload.len()).into());
     }
     Ok(())
 }
