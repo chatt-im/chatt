@@ -1,17 +1,12 @@
 //! Socket receive buffer built for the framed transports: bytes land directly
 //! in a reusable `Vec` and frames are consumed in place.
 //!
-//! [`RecvBuffer::fill`] reads with `libc::read` straight into the `Vec`'s
-//! spare capacity, so there is no zero-initialized scratch buffer and no copy
-//! from scratch into the buffer. The caller supplies the maximum bytes for one
-//! syscall; retained capacity is reuse only, not an implicit larger read.
-//! Frames are parsed from [`RecvBuffer::pending`]
-//! and consumed by advancing a cursor, so popping a frame never memmoves the
-//! bytes behind it, and sealed frames decrypt in place through
-//! [`RecvBuffer::pending_mut`]. A read usually delivers exactly one whole
-//! frame; [`RecvBuffer::ship`] hands that buffer onward without copying it.
-//! Only bytes that straddle a read boundary are ever copied, to the front of
-//! the buffer before the next read.
+//! Bytes land straight in a reusable `Vec`'s spare capacity, so there is no
+//! zero-initialized scratch buffer or copy from scratch into the buffer. Frames
+//! are parsed from [`RecvBuffer::pending`] and consumed by advancing a cursor;
+//! multiple complete frames from one batched receive remain in place. Only an
+//! incomplete tail behind an advanced cursor is compacted before another
+//! receive.
 
 use std::io;
 #[cfg(test)]

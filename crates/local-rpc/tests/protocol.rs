@@ -3,7 +3,7 @@ use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
 use local_rpc::{
     DEFAULT_UPLOAD_LIMIT_BYTES, MAX_HISTORY_REQUEST_MESSAGES, MAX_MESSAGE_BODY_BYTES,
     PROTOCOL_MAX_VERSION, PROTOCOL_MIN_VERSION,
-    bulk::{BulkChunk, BulkFinished},
+    bulk::BulkFinished,
     frame::{ClientFrame, ClientHello, DaemonFrame, NegotiatedLimits, Welcome},
     ids::StreamId,
     model::{
@@ -13,15 +13,15 @@ use local_rpc::{
 };
 
 #[test]
-fn renderer_and_daemon_exchange_protocol_v4_frames_and_live_share_fd() {
-    assert_eq!(PROTOCOL_MIN_VERSION, 4);
-    assert_eq!(PROTOCOL_MAX_VERSION, 4);
+fn renderer_and_daemon_exchange_protocol_v5_frames_and_live_share_fd() {
+    assert_eq!(PROTOCOL_MIN_VERSION, 5);
+    assert_eq!(PROTOCOL_MAX_VERSION, 5);
     assert_eq!(MAX_MESSAGE_BODY_BYTES, 8 * 1024);
     assert_eq!(DEFAULT_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
     assert_eq!(MAX_HISTORY_REQUEST_MESSAGES, 500);
 
     let hello = ClientHello::current("test-renderer");
-    assert_eq!(hello.negotiated_version(), Some(4));
+    assert_eq!(hello.negotiated_version(), Some(5));
 
     let (daemon_socket, renderer_socket) = UnixStream::pair().unwrap();
     let mut daemon_reader = FrameReader::new(daemon_socket.try_clone().unwrap());
@@ -71,12 +71,22 @@ fn renderer_and_daemon_exchange_protocol_v4_frames_and_live_share_fd() {
     assert_eq!(renderer_reader.recv_daemon().unwrap(), snapshot);
 
     let transfer_id = BulkTransferId(4);
-    let chunk = DaemonFrame::BulkChunk(BulkChunk {
-        transfer_id,
-        bytes: vec![1, 2, 3, 4],
-    });
-    daemon_writer.send_daemon(&chunk).unwrap();
-    assert_eq!(renderer_reader.recv_daemon().unwrap(), chunk);
+    daemon_writer
+        .send_daemon_bulk_chunk(transfer_id, &[1, 2, 3, 4])
+        .unwrap();
+    let mut received_chunk = false;
+    assert!(
+        renderer_reader
+            .recv_daemon_with_bulk(|received_id, bytes| {
+                assert_eq!(received_id, transfer_id);
+                assert_eq!(bytes, [1, 2, 3, 4]);
+                received_chunk = true;
+                Ok(())
+            })
+            .unwrap()
+            .is_none()
+    );
+    assert!(received_chunk);
 
     let finished = DaemonFrame::BulkFinished(BulkFinished { transfer_id });
     daemon_writer.send_daemon(&finished).unwrap();

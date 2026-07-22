@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, Read, Write},
+    io::{self, IoSlice, Read, Write},
     mem,
     os::{
         fd::{AsRawFd, OwnedFd, RawFd},
@@ -24,11 +24,44 @@ pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERROR: u8 = 1;
 pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const RECEIVE_BATCH_BYTES: usize = 64 * 1024;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const RECVMSG_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const RECVMSG_FLAGS: libc::c_int = 0;
+
+struct ControlBuffer {
+    storage: Vec<libc::cmsghdr>,
+    len: usize,
+}
+
+impl ControlBuffer {
+    fn new(fd_capacity: usize) -> Self {
+        assert!(
+            fd_capacity > 0,
+            "ancillary buffer must hold at least one fd"
+        );
+        // SAFETY: CMSG_SPACE only computes the storage required for this
+        // small, bounded SCM_RIGHTS payload.
+        let len =
+            unsafe { libc::CMSG_SPACE((fd_capacity * mem::size_of::<RawFd>()) as u32) } as usize;
+        let elements = len.div_ceil(mem::size_of::<libc::cmsghdr>());
+        let mut storage = Vec::with_capacity(elements);
+        // SAFETY: every field of cmsghdr is an integer, so its all-zero value
+        // is valid. Using cmsghdr elements also guarantees ancillary alignment.
+        storage.resize_with(elements, || unsafe { mem::zeroed() });
+        Self { storage, len }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut libc::c_void {
+        self.storage.as_mut_ptr().cast()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
 
 #[derive(Debug)]
 pub enum ConnectError {
@@ -195,9 +228,44 @@ pub fn peer_credentials(stream: &UnixStream) -> io::Result<(u32, u32)> {
         if result == -1 {
             return Err(io::Error::last_os_error());
         }
-        return Ok((cred.uid, cred.pid as u32));
+        if len as usize != mem::size_of::<libc::ucred>() || cred.pid <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Unix peer credentials",
+            ));
+        }
+        Ok((cred.uid, cred.pid as u32))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut uid: libc::uid_t = 0;
+        let mut _gid: libc::gid_t = 0;
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut _gid) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut pid: libc::pid_t = 0;
+        let mut len = mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if len as usize != mem::size_of::<libc::pid_t>() || pid <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Unix peer process id",
+            ));
+        }
+        Ok((uid, pid as u32))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         let _ = stream;
         Err(io::Error::new(
@@ -210,10 +278,11 @@ pub fn peer_credentials(stream: &UnixStream) -> io::Result<(u32, u32)> {
 pub struct FrameReader {
     stream: UnixStream,
     buffer: crate::recv_buffer::RecvBuffer,
-    control: Vec<u8>,
+    control: ControlBuffer,
     current_fds: Vec<OwnedFd>,
 }
 
+#[derive(Debug)]
 pub struct ReceivedFrame<T> {
     pub frame: T,
     pub fds: Vec<OwnedFd>,
@@ -221,46 +290,142 @@ pub struct ReceivedFrame<T> {
 
 impl FrameReader {
     pub fn new(stream: UnixStream) -> Self {
-        let control_len = unsafe {
-            libc::CMSG_SPACE((super::MAX_FDS_PER_FRAME * mem::size_of::<RawFd>()) as u32)
-        } as usize;
         Self {
             stream,
             buffer: crate::recv_buffer::RecvBuffer::new(),
-            control: vec![0; control_len],
+            control: ControlBuffer::new(super::MAX_FDS_PER_FRAME),
             current_fds: Vec::new(),
         }
     }
 
     pub fn recv_payload(&mut self) -> io::Result<Vec<u8>> {
-        self.recv_decoded(|payload| Ok::<_, std::convert::Infallible>(payload.to_vec()))
+        self.recv_decoded(|payload| Ok(payload.to_vec()))
     }
 
     pub fn recv_client(&mut self) -> io::Result<super::frame::ClientFrame> {
-        self.recv_decoded(super::frame::decode_client)
+        self.recv_decoded(|payload| match decode_client_wire(payload)? {
+            super::frame::DecodedWire::Frame(frame) => Ok(frame),
+            super::frame::DecodedWire::BulkChunk { transfer_id, bytes } => Ok(
+                super::frame::ClientFrame::UploadChunk(super::bulk::BulkChunk {
+                    transfer_id,
+                    bytes: bytes.to_vec(),
+                }),
+            ),
+        })
+    }
+
+    /// Receives one client frame, exposing upload bytes directly from the
+    /// reusable socket buffer. A handled bulk chunk returns `Ok(None)`.
+    pub fn recv_client_with_bulk(
+        &mut self,
+        mut receive_bulk: impl FnMut(super::model::BulkTransferId, &[u8]) -> io::Result<()>,
+    ) -> io::Result<Option<super::frame::ClientFrame>> {
+        self.recv_decoded(|payload| match decode_client_wire(payload)? {
+            super::frame::DecodedWire::Frame(frame) => Ok(Some(frame)),
+            super::frame::DecodedWire::BulkChunk { transfer_id, bytes } => {
+                receive_bulk(transfer_id, bytes)?;
+                Ok(None)
+            }
+        })
     }
 
     pub fn recv_daemon(&mut self) -> io::Result<super::frame::DaemonFrame> {
-        self.recv_decoded(super::frame::decode_daemon)
+        self.recv_decoded(|payload| match decode_daemon_wire(payload)? {
+            super::frame::DecodedWire::Frame(frame) => Ok(frame),
+            super::frame::DecodedWire::BulkChunk { transfer_id, bytes } => Ok(
+                super::frame::DaemonFrame::BulkChunk(super::bulk::BulkChunk {
+                    transfer_id,
+                    bytes: bytes.to_vec(),
+                }),
+            ),
+        })
+    }
+
+    /// Receives one daemon frame, exposing attachment bytes directly from the
+    /// reusable socket buffer. A handled bulk chunk returns `Ok(None)`.
+    /// This variant rejects descriptors and can batch descriptor-free frames.
+    pub fn recv_daemon_with_bulk(
+        &mut self,
+        mut receive_bulk: impl FnMut(super::model::BulkTransferId, &[u8]) -> io::Result<()>,
+    ) -> io::Result<Option<super::frame::DaemonFrame>> {
+        self.recv_decoded(|payload| match decode_daemon_wire(payload)? {
+            super::frame::DecodedWire::Frame(frame) => Ok(Some(frame)),
+            super::frame::DecodedWire::BulkChunk { transfer_id, bytes } => {
+                receive_bulk(transfer_id, bytes)?;
+                Ok(None)
+            }
+        })
     }
 
     pub fn recv_daemon_with_fds(&mut self) -> io::Result<ReceivedFrame<super::frame::DaemonFrame>> {
-        self.recv_decoded_with_fds(super::frame::decode_daemon)
+        let mut bulk = None;
+        if let Some(received) = self.recv_daemon_with_fds_and_bulk(|transfer_id, bytes| {
+            bulk = Some(super::frame::DaemonFrame::BulkChunk(
+                super::bulk::BulkChunk {
+                    transfer_id,
+                    bytes: bytes.to_vec(),
+                },
+            ));
+            Ok(())
+        })? {
+            return Ok(received);
+        }
+        Ok(ReceivedFrame {
+            frame: bulk.expect("bulk callback handled the received frame"),
+            fds: Vec::new(),
+        })
     }
 
-    fn recv_decoded<T, E>(&mut self, decode: impl Fn(&[u8]) -> Result<T, E>) -> io::Result<T>
-    where
-        E: std::fmt::Display,
-    {
+    /// Descriptor-aware receive path with a borrowed bulk payload. Descriptor
+    /// association requires exact frame-boundary reads, so this path does not
+    /// batch across frames.
+    pub fn recv_daemon_with_fds_and_bulk(
+        &mut self,
+        mut receive_bulk: impl FnMut(super::model::BulkTransferId, &[u8]) -> io::Result<()>,
+    ) -> io::Result<Option<ReceivedFrame<super::frame::DaemonFrame>>> {
         loop {
             match crate::framing::parse_frame_with_limit(
                 self.buffer.pending(),
                 super::MAX_FRAME_BYTES,
             ) {
                 Ok(Some((payload, consumed))) => {
-                    let decoded = decode(payload).map_err(|error| {
-                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-                    })?;
+                    let frame = match super::frame::decode_daemon_wire(payload)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    {
+                        super::frame::DecodedWire::Frame(frame) => Some(ReceivedFrame {
+                            frame,
+                            fds: mem::take(&mut self.current_fds),
+                        }),
+                        super::frame::DecodedWire::BulkChunk { transfer_id, bytes } => {
+                            if !self.current_fds.is_empty() {
+                                self.current_fds.clear();
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "bulk chunk unexpectedly carried file descriptors",
+                                ));
+                            }
+                            receive_bulk(transfer_id, bytes)?;
+                            None
+                        }
+                    };
+                    self.buffer.consume(consumed);
+                    return Ok(frame);
+                }
+                Ok(None) => {}
+                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+            self.recv_more_exact()?;
+        }
+    }
+
+    fn recv_decoded<T>(&mut self, mut decode: impl FnMut(&[u8]) -> io::Result<T>) -> io::Result<T> {
+        loop {
+            match crate::framing::parse_frame_with_limit(
+                self.buffer.pending(),
+                super::MAX_FRAME_BYTES,
+            ) {
+                Ok(Some((payload, consumed))) => {
+                    let decoded = decode(payload)?;
                     self.buffer.consume(consumed);
                     if !self.current_fds.is_empty() {
                         self.current_fds.clear();
@@ -274,43 +439,50 @@ impl FrameReader {
                 Ok(None) => {}
                 Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
-            self.recv_more()?;
+            self.recv_more_batched()?;
         }
     }
 
-    fn recv_decoded_with_fds<T, E>(
-        &mut self,
-        decode: impl Fn(&[u8]) -> Result<T, E>,
-    ) -> io::Result<ReceivedFrame<T>>
-    where
-        E: std::fmt::Display,
-    {
-        loop {
-            match crate::framing::parse_frame_with_limit(
-                self.buffer.pending(),
-                super::MAX_FRAME_BYTES,
-            ) {
-                Ok(Some((payload, consumed))) => {
-                    let frame = decode(payload).map_err(|error| {
-                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-                    })?;
-                    self.buffer.consume(consumed);
-                    return Ok(ReceivedFrame {
-                        frame,
-                        fds: mem::take(&mut self.current_fds),
-                    });
-                }
-                Ok(None) => {}
-                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+    fn recv_more_batched(&mut self) -> io::Result<()> {
+        let pending = self.buffer.pending();
+        let wanted = if pending.len() < crate::framing::LENGTH_PREFIX_LEN {
+            RECEIVE_BATCH_BYTES
+        } else {
+            let payload_len = u32::from_le_bytes(
+                pending[..crate::framing::LENGTH_PREFIX_LEN]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            if payload_len > super::MAX_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "daemon frame exceeds maximum length",
+                ));
             }
-            self.recv_more()?;
+            let frame_len = crate::framing::LENGTH_PREFIX_LEN + payload_len;
+            let remaining = frame_len.saturating_sub(pending.len());
+            remaining.saturating_add(RECEIVE_BATCH_BYTES)
+        };
+        let (read, fds, flags) = self.recv_into(wanted)?;
+        if read == 0 {
+            return Err(self.eof_error());
         }
+        if flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated daemon frame or ancillary data",
+            ));
+        }
+        if !fds.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected file descriptors in daemon frame",
+            ));
+        }
+        Ok(())
     }
 
-    fn recv_more(&mut self) -> io::Result<()> {
-        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
-        let fd = self.stream.as_raw_fd();
-        let control = &mut self.control;
+    fn recv_more_exact(&mut self) -> io::Result<()> {
         // Never read across a frame boundary. SCM_RIGHTS on a Unix stream is
         // attached to a byte position, not to a message, so bounding recvmsg
         // this way lets us associate every descriptor with exactly one frame.
@@ -331,20 +503,56 @@ impl FrameReader {
             }
             crate::framing::LENGTH_PREFIX_LEN + payload_len - pending.len()
         };
+        let (read, fds, flags) = self.recv_into(wanted)?;
+        if read == 0 {
+            return Err(self.eof_error());
+        }
+        if flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+            // `fds` owns and closes every descriptor that fit in the truncated
+            // control buffer before this error is returned.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated daemon frame or ancillary data",
+            ));
+        }
+        if self.current_fds.len() + fds.len() > super::MAX_FDS_PER_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many file descriptors in daemon frame",
+            ));
+        }
+        self.current_fds.extend(fds);
+        Ok(())
+    }
+
+    fn recv_into(&mut self, wanted: usize) -> io::Result<(usize, Vec<OwnedFd>, libc::c_int)> {
+        let fd = self.stream.as_raw_fd();
+        let control = &mut self.control;
+        let mut received_fds = Vec::new();
+        let mut received_flags = 0;
         let read = self.buffer.fill_with(wanted, |destination, len| {
-            let mut iov = libc::iovec {
-                iov_base: destination.cast(),
-                iov_len: len,
-            };
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = control.as_mut_ptr().cast();
-            msg.msg_controllen = control.len().try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "ancillary buffer is too large")
-            })?;
             loop {
+                let mut iov = libc::iovec {
+                    iov_base: destination.cast(),
+                    iov_len: len,
+                };
+                let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr();
+                msg.msg_controllen = control.len() as _;
+                // SAFETY: both iovec and the aligned control buffer remain alive
+                // for the call and advertise exactly their writable capacities.
                 let read = unsafe { libc::recvmsg(fd, &mut msg, RECVMSG_FLAGS) };
                 if read >= 0 {
+                    if read as usize > len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "recvmsg reported an invalid byte count",
+                        ));
+                    }
+                    received_fds = take_rights(&msg)?;
+                    received_flags = msg.msg_flags;
                     return Ok(read as usize);
                 }
                 let error = io::Error::last_os_error();
@@ -353,38 +561,86 @@ impl FrameReader {
                 }
             }
         })?;
-        if read == 0 {
-            let kind = if self.buffer.is_empty() {
-                io::ErrorKind::UnexpectedEof
-            } else {
-                io::ErrorKind::InvalidData
-            };
-            return Err(io::Error::new(kind, "EOF in daemon frame"));
-        }
-        let fds = take_rights(&msg)?;
-        if msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
-            // `fds` owns and closes every descriptor that fit in the truncated
-            // control buffer before this error is returned.
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated daemon frame or ancillary data",
-            ));
-        }
-        self.current_fds.extend(fds);
-        Ok(())
+        Ok((read, received_fds, received_flags))
     }
+
+    fn eof_error(&self) -> io::Error {
+        let kind = if self.buffer.is_empty() {
+            io::ErrorKind::UnexpectedEof
+        } else {
+            io::ErrorKind::InvalidData
+        };
+        io::Error::new(kind, "EOF in daemon frame")
+    }
+}
+
+fn decode_client_wire(
+    payload: &[u8],
+) -> io::Result<super::frame::DecodedWire<'_, super::frame::ClientFrame>> {
+    super::frame::decode_client_wire(payload)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn decode_daemon_wire(
+    payload: &[u8],
+) -> io::Result<super::frame::DecodedWire<'_, super::frame::DaemonFrame>> {
+    super::frame::decode_daemon_wire(payload)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn take_rights(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
     use std::os::fd::FromRawFd;
     let mut out = Vec::new();
+    // SAFETY: callers pass the msghdr just populated by recvmsg. Every header
+    // and payload range is checked against msg_controllen before dereferencing
+    // it, and every accepted descriptor is immediately placed in OwnedFd.
     unsafe {
+        let control_start = msg.msg_control as usize;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let control_len = msg.msg_controllen;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let control_len = msg.msg_controllen as usize;
+        let control_end = control_start.checked_add(control_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ancillary buffer range overflow",
+            )
+        })?;
         let mut cmsg = libc::CMSG_FIRSTHDR(msg);
         while !cmsg.is_null() {
+            let cmsg_start = cmsg as usize;
+            cmsg_start
+                .checked_add(mem::size_of::<libc::cmsghdr>())
+                .filter(|end| cmsg_start >= control_start && *end <= control_end)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ancillary message header is outside its buffer",
+                    )
+                })?;
+            let cmsg_len = (*cmsg).cmsg_len as usize;
+            let header_len = libc::CMSG_LEN(0) as usize;
+            if cmsg_len < header_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid ancillary message header length",
+                ));
+            }
+            let cmsg_end = cmsg_start.checked_add(cmsg_len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ancillary message range overflow",
+                )
+            })?;
+            if cmsg_end > control_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ancillary message exceeds its buffer",
+                ));
+            }
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let data_len =
-                    ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
-                if data_len % mem::size_of::<RawFd>() != 0 {
+                let data_len = cmsg_len - header_len;
+                if !data_len.is_multiple_of(mem::size_of::<RawFd>()) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid SCM_RIGHTS payload",
@@ -393,7 +649,14 @@ fn take_rights(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
                 let count = data_len / mem::size_of::<RawFd>();
                 let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
                 for index in 0..count {
-                    out.push(OwnedFd::from_raw_fd(*data.add(index)));
+                    let raw_fd = std::ptr::read_unaligned(data.add(index));
+                    if raw_fd < 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "SCM_RIGHTS contained an invalid file descriptor",
+                        ));
+                    }
+                    out.push(OwnedFd::from_raw_fd(raw_fd));
                 }
             }
             cmsg = libc::CMSG_NXTHDR(msg, cmsg);
@@ -435,15 +698,41 @@ impl FrameWriter {
     }
 
     pub fn send_client(&mut self, frame: &super::frame::ClientFrame) -> io::Result<()> {
+        if let super::frame::ClientFrame::UploadChunk(chunk) = frame {
+            return self.send_client_bulk_chunk(chunk.transfer_id, &chunk.bytes);
+        }
         super::frame::encode_client_framed_into(frame, &mut self.buffer)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         send_frame_bytes(&mut self.stream, &self.buffer, &[])
     }
 
+    /// Sends upload bytes directly from caller-owned storage using vectored
+    /// I/O; the bytes are not copied into the writer's serialization buffer.
+    pub fn send_client_bulk_chunk(
+        &mut self,
+        transfer_id: super::model::BulkTransferId,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        send_bulk_frame(&mut self.stream, transfer_id, bytes)
+    }
+
     pub fn send_daemon(&mut self, frame: &super::frame::DaemonFrame) -> io::Result<()> {
+        if let super::frame::DaemonFrame::BulkChunk(chunk) = frame {
+            return self.send_daemon_bulk_chunk(chunk.transfer_id, &chunk.bytes);
+        }
         super::frame::encode_daemon_framed_into(frame, &mut self.buffer)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         send_frame_bytes(&mut self.stream, &self.buffer, &[])
+    }
+
+    /// Sends attachment bytes directly from caller-owned storage using
+    /// vectored I/O.
+    pub fn send_daemon_bulk_chunk(
+        &mut self,
+        transfer_id: super::model::BulkTransferId,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        send_bulk_frame(&mut self.stream, transfer_id, bytes)
     }
 
     pub fn send_daemon_with_fds(
@@ -451,6 +740,15 @@ impl FrameWriter {
         frame: &super::frame::DaemonFrame,
         fds: &[RawFd],
     ) -> io::Result<()> {
+        if let super::frame::DaemonFrame::BulkChunk(chunk) = frame {
+            if !fds.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bulk chunks cannot carry file descriptors",
+                ));
+            }
+            return self.send_daemon_bulk_chunk(chunk.transfer_id, &chunk.bytes);
+        }
         super::frame::encode_daemon_framed_into(frame, &mut self.buffer)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         send_frame_bytes(&mut self.stream, &self.buffer, fds)
@@ -473,12 +771,62 @@ impl FrameWriter {
                 "multiple daemon frames supplied",
             ));
         }
+        let payload = &frame[crate::framing::LENGTH_PREFIX_LEN..];
+        if !fds.is_empty() && payload.first() == Some(&super::frame::WIRE_BULK_CHUNK) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bulk chunks cannot carry file descriptors",
+            ));
+        }
         send_frame_bytes(&mut self.stream, frame, fds)
     }
 
     pub fn shutdown(&self) -> io::Result<()> {
         self.stream.shutdown(std::net::Shutdown::Both)
     }
+}
+
+fn send_bulk_frame(
+    stream: &mut UnixStream,
+    transfer_id: super::model::BulkTransferId,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let header = super::frame::bulk_framed_header(transfer_id, bytes.len())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    write_two(stream, &header, bytes)
+}
+
+fn write_two(stream: &mut UnixStream, first: &[u8], second: &[u8]) -> io::Result<()> {
+    let mut first_offset = 0;
+    let mut second_offset = 0;
+    while first_offset < first.len() || second_offset < second.len() {
+        let written = if first_offset < first.len() {
+            let slices = [
+                IoSlice::new(&first[first_offset..]),
+                IoSlice::new(&second[second_offset..]),
+            ];
+            stream.write_vectored(&slices)
+        } else {
+            stream.write(&second[second_offset..])
+        };
+        let written = match written {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "zero-byte Unix socket write",
+                ));
+            }
+            Ok(written) => written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let first_remaining = first.len() - first_offset;
+        let from_first = written.min(first_remaining);
+        first_offset += from_first;
+        second_offset += written - from_first;
+        debug_assert!(second_offset <= second.len());
+    }
+    Ok(())
 }
 
 fn send_frame_bytes(stream: &mut UnixStream, frame: &[u8], fds: &[RawFd]) -> io::Result<()> {
@@ -493,6 +841,12 @@ fn send_frame_bytes(stream: &mut UnixStream, frame: &[u8], fds: &[RawFd]) -> io:
     } else {
         send_first_with_fds(stream, frame, fds)?
     };
+    if sent > frame.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sendmsg reported an invalid byte count",
+        ));
+    }
     stream.write_all(&frame[sent..])
 }
 
@@ -501,41 +855,47 @@ fn send_first_with_fds(stream: &UnixStream, frame: &[u8], fds: &[RawFd]) -> io::
         iov_base: frame.as_ptr().cast_mut().cast(),
         iov_len: frame.len(),
     };
-    let control_len =
-        unsafe { libc::CMSG_SPACE((fds.len() * mem::size_of::<RawFd>()) as u32) } as usize;
-    let mut control = vec![0u8; control_len];
+    let mut control = ControlBuffer::new(fds.len());
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len().try_into().map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "ancillary buffer is too large")
-    })?;
+    msg.msg_control = control.as_mut_ptr();
+    msg.msg_controllen = control.len() as _;
+    // SAFETY: ControlBuffer is CMSG-aligned and sized with CMSG_SPACE; msg and
+    // its iovec remain alive until sendmsg returns.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ancillary buffer cannot hold SCM_RIGHTS header",
+            ));
+        }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = (libc::CMSG_LEN((fds.len() * mem::size_of::<RawFd>()) as u32) as usize)
-            .try_into()
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "ancillary message is too large",
-                )
-            })?;
-        std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast(), fds.len());
-        msg.msg_controllen = (*cmsg).cmsg_len;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of_val(fds) as u32) as _;
+        let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+        for (index, fd) in fds.iter().copied().enumerate() {
+            std::ptr::write_unaligned(data.add(index), fd);
+        }
     }
-    let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
-    if sent == -1 {
-        Err(io::Error::last_os_error())
-    } else if sent == 0 {
-        Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "zero-byte sendmsg",
-        ))
-    } else {
-        Ok(sent as usize)
+    loop {
+        // SAFETY: msg only borrows frame and control, both of which remain
+        // alive and unchanged across interrupted retries.
+        let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        if sent > 0 {
+            return Ok(sent as usize);
+        }
+        if sent == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "zero-byte sendmsg",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -589,11 +949,59 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_aware_reader_rejects_descriptors_on_bulk_chunks() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let file = fs::File::open("/dev/null").unwrap();
+        let transfer_id = super::super::model::BulkTransferId(12);
+        let header = super::super::frame::bulk_framed_header(transfer_id, 3).unwrap();
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(b"abc");
+        send_first_with_fds(&left, &frame, &[file.as_raw_fd()]).unwrap();
+
+        let error = FrameReader::new(right).recv_daemon_with_fds().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("bulk chunk"));
+    }
+
+    #[test]
     fn writer_and_reader_exchange_payload() {
         let (left, right) = UnixStream::pair().unwrap();
         let mut writer = FrameWriter::new(left);
         writer.send_payload(b"hello", &[]).unwrap();
         assert_eq!(FrameReader::new(right).recv_payload().unwrap(), b"hello");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn peer_credentials_identify_local_process() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        let (uid, pid) = peer_credentials(&left).unwrap();
+        assert_eq!(uid, unsafe { libc::geteuid() });
+        assert_eq!(pid, std::process::id());
+    }
+
+    #[test]
+    fn bulk_callback_borrows_receive_storage() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut writer = FrameWriter::new(left);
+        let transfer_id = super::super::model::BulkTransferId(11);
+        let payload = vec![0x5a; 32 * 1024];
+        writer
+            .send_client_bulk_chunk(transfer_id, &payload)
+            .unwrap();
+
+        let mut reader = FrameReader::new(right);
+        let mut handled = false;
+        let frame = reader
+            .recv_client_with_bulk(|received_id, received| {
+                assert_eq!(received_id, transfer_id);
+                assert_eq!(received, payload);
+                handled = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(frame.is_none());
+        assert!(handled);
     }
 
     #[test]

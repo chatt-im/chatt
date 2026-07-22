@@ -21,9 +21,9 @@ cargo run --release -p benchmark -- bench live/ingest_contention --progress
 cargo run --release -p benchmark -- bench crypto --progress
 ```
 
-Measure persistent local Unix-socket RPC delivery latency, including protocol
-serialization and decoding, for 64 KiB, the former 192 KiB chunk size, and the
-current 1 MiB chunk size:
+Measure persistent local Unix-socket bulk RPC delivery latency, including raw
+wire framing and borrowed decoding, for 64 KiB, the former 192 KiB chunk size,
+and the current 1 MiB chunk size:
 
 ```sh
 cargo run --release -p benchmark --bin local_rpc

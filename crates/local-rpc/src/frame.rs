@@ -11,6 +11,18 @@ use super::{
     },
 };
 
+pub(crate) const WIRE_JSON: u8 = 0;
+pub(crate) const WIRE_BULK_CHUNK: u8 = 1;
+const WIRE_BULK_HEADER_LEN: usize = 1 + std::mem::size_of::<u64>();
+
+pub(crate) enum DecodedWire<'a, T> {
+    Frame(T),
+    BulkChunk {
+        transfer_id: BulkTransferId,
+        bytes: &'a [u8],
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub struct ClientHello {
@@ -379,7 +391,13 @@ pub enum DaemonFrame {
 
 pub fn encode_client(frame: &ClientFrame) -> Result<Vec<u8>, String> {
     validate_client(frame)?;
-    bounded_encode(frame)
+    let mut output = Vec::new();
+    if let ClientFrame::UploadChunk(chunk) = frame {
+        encode_bulk_wire_into(chunk, &mut output)?;
+    } else {
+        bounded_encode_wire_into(frame, &mut output)?;
+    }
+    Ok(output)
 }
 
 /// Serializes a complete length-prefixed client frame into reusable storage.
@@ -387,48 +405,76 @@ pub fn encode_client(frame: &ClientFrame) -> Result<Vec<u8>, String> {
 /// The prefix is reserved before `jsony` writes the payload, so framing does
 /// not require a second allocation or a payload copy.
 pub fn encode_client_framed_into(frame: &ClientFrame, output: &mut Vec<u8>) -> Result<(), String> {
+    output.clear();
     validate_client(frame)?;
+    if let ClientFrame::UploadChunk(chunk) = frame {
+        return encode_bulk_framed_into(chunk, output);
+    }
     bounded_encode_framed_into(frame, output)
 }
 
 pub fn decode_client(bytes: &[u8]) -> Result<ClientFrame, String> {
-    let frame = bounded_decode(bytes)?;
-    validate_client(&frame)?;
-    Ok(frame)
+    match decode_client_wire(bytes)? {
+        DecodedWire::Frame(frame) => Ok(frame),
+        DecodedWire::BulkChunk { transfer_id, bytes } => Ok(ClientFrame::UploadChunk(BulkChunk {
+            transfer_id,
+            bytes: bytes.to_vec(),
+        })),
+    }
 }
 
 pub fn encode_daemon(frame: &DaemonFrame) -> Result<Vec<u8>, String> {
     validate_daemon(frame)?;
-    bounded_encode(frame)
+    let mut output = Vec::new();
+    if let DaemonFrame::BulkChunk(chunk) = frame {
+        encode_bulk_wire_into(chunk, &mut output)?;
+    } else {
+        bounded_encode_wire_into(frame, &mut output)?;
+    }
+    Ok(output)
 }
 
 /// Serializes a complete length-prefixed daemon frame into reusable storage.
 pub fn encode_daemon_framed_into(frame: &DaemonFrame, output: &mut Vec<u8>) -> Result<(), String> {
+    output.clear();
     validate_daemon(frame)?;
+    if let DaemonFrame::BulkChunk(chunk) = frame {
+        return encode_bulk_framed_into(chunk, output);
+    }
     bounded_encode_framed_into(frame, output)
 }
 
 pub fn decode_daemon(bytes: &[u8]) -> Result<DaemonFrame, String> {
-    let frame = bounded_decode(bytes)?;
-    validate_daemon(&frame)?;
-    Ok(frame)
+    match decode_daemon_wire(bytes)? {
+        DecodedWire::Frame(frame) => Ok(frame),
+        DecodedWire::BulkChunk { transfer_id, bytes } => Ok(DaemonFrame::BulkChunk(BulkChunk {
+            transfer_id,
+            bytes: bytes.to_vec(),
+        })),
+    }
 }
 
-fn bounded_encode<T: jsony::ToBinary>(value: &T) -> Result<Vec<u8>, String> {
-    let bytes = jsony::to_binary(value);
-    if bytes.len() > super::MAX_FRAME_BYTES {
+fn bounded_encode_wire_into<T: jsony::ToBinary>(
+    value: &T,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    output.push(WIRE_JSON);
+    jsony::to_binary_into(value, &mut *output);
+    if output.len() > super::MAX_FRAME_BYTES {
+        output.clear();
         return Err("daemon frame exceeds maximum length".into());
     }
-    Ok(bytes)
+    Ok(())
 }
 
 fn bounded_encode_framed_into<T: jsony::ToBinary>(
     value: &T,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
-    output.clear();
     output.extend_from_slice(&[0; crate::framing::LENGTH_PREFIX_LEN]);
-    let payload_len = jsony::to_binary_into(value, &mut *output).len();
+    output.push(WIRE_JSON);
+    let encoded_len = jsony::to_binary_into(value, &mut *output).len();
+    let payload_len = encoded_len + 1;
     if payload_len > super::MAX_FRAME_BYTES {
         output.clear();
         return Err("daemon frame exceeds maximum length".into());
@@ -437,6 +483,117 @@ fn bounded_encode_framed_into<T: jsony::ToBinary>(
         u32::try_from(payload_len).map_err(|_| "daemon frame length does not fit in u32")?;
     output[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(&payload_len.to_le_bytes());
     Ok(())
+}
+
+fn encode_bulk_framed_into(chunk: &BulkChunk, output: &mut Vec<u8>) -> Result<(), String> {
+    let payload_len = WIRE_BULK_HEADER_LEN
+        .checked_add(chunk.bytes.len())
+        .ok_or_else(|| "daemon frame length overflow".to_string())?;
+    if payload_len > super::MAX_FRAME_BYTES {
+        return Err("daemon frame exceeds maximum length".into());
+    }
+    let payload_len =
+        u32::try_from(payload_len).map_err(|_| "daemon frame length does not fit in u32")?;
+    output.extend_from_slice(&payload_len.to_le_bytes());
+    output.push(WIRE_BULK_CHUNK);
+    output.extend_from_slice(&chunk.transfer_id.0.to_le_bytes());
+    output.extend_from_slice(&chunk.bytes);
+    Ok(())
+}
+
+fn encode_bulk_wire_into(chunk: &BulkChunk, output: &mut Vec<u8>) -> Result<(), String> {
+    let payload_len = WIRE_BULK_HEADER_LEN
+        .checked_add(chunk.bytes.len())
+        .ok_or_else(|| "daemon frame length overflow".to_string())?;
+    if payload_len > super::MAX_FRAME_BYTES {
+        return Err("daemon frame exceeds maximum length".into());
+    }
+    output.push(WIRE_BULK_CHUNK);
+    output.extend_from_slice(&chunk.transfer_id.0.to_le_bytes());
+    output.extend_from_slice(&chunk.bytes);
+    Ok(())
+}
+
+pub(crate) fn bulk_framed_header(
+    transfer_id: BulkTransferId,
+    bytes_len: usize,
+) -> Result<[u8; crate::framing::LENGTH_PREFIX_LEN + WIRE_BULK_HEADER_LEN], String> {
+    if transfer_id.0 == 0 {
+        return Err("transfer id must be nonzero".into());
+    }
+    if bytes_len == 0 {
+        return Err("bulk chunk must not be empty".into());
+    }
+    if bytes_len > super::MAX_CHUNK_BYTES {
+        return Err("bulk chunk exceeds limit".into());
+    }
+    let payload_len = WIRE_BULK_HEADER_LEN
+        .checked_add(bytes_len)
+        .ok_or_else(|| "daemon frame length overflow".to_string())?;
+    if payload_len > super::MAX_FRAME_BYTES {
+        return Err("daemon frame exceeds maximum length".into());
+    }
+    let payload_len =
+        u32::try_from(payload_len).map_err(|_| "daemon frame length does not fit in u32")?;
+    let mut header = [0; crate::framing::LENGTH_PREFIX_LEN + WIRE_BULK_HEADER_LEN];
+    header[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(&payload_len.to_le_bytes());
+    header[crate::framing::LENGTH_PREFIX_LEN] = WIRE_BULK_CHUNK;
+    header[crate::framing::LENGTH_PREFIX_LEN + 1..].copy_from_slice(&transfer_id.0.to_le_bytes());
+    Ok(header)
+}
+
+pub(crate) fn decode_client_wire(bytes: &[u8]) -> Result<DecodedWire<'_, ClientFrame>, String> {
+    decode_wire(bytes, decode_client_body)
+}
+
+pub(crate) fn decode_daemon_wire(bytes: &[u8]) -> Result<DecodedWire<'_, DaemonFrame>, String> {
+    decode_wire(bytes, decode_daemon_body)
+}
+
+fn decode_client_body(bytes: &[u8]) -> Result<ClientFrame, String> {
+    let frame = bounded_decode(bytes)?;
+    validate_client(&frame)?;
+    Ok(frame)
+}
+
+fn decode_daemon_body(bytes: &[u8]) -> Result<DaemonFrame, String> {
+    let frame = bounded_decode(bytes)?;
+    validate_daemon(&frame)?;
+    Ok(frame)
+}
+
+fn decode_wire<'a, T>(
+    bytes: &'a [u8],
+    decode: impl FnOnce(&[u8]) -> Result<T, String>,
+) -> Result<DecodedWire<'a, T>, String> {
+    let Some((&kind, body)) = bytes.split_first() else {
+        return Err("daemon wire frame is empty".into());
+    };
+    match kind {
+        WIRE_JSON => decode(body).map(DecodedWire::Frame),
+        WIRE_BULK_CHUNK => {
+            let Some((transfer_id, bytes)) = body.split_at_checked(std::mem::size_of::<u64>())
+            else {
+                return Err("bulk chunk wire header is incomplete".into());
+            };
+            let transfer_id = BulkTransferId(u64::from_le_bytes(
+                transfer_id
+                    .try_into()
+                    .expect("checked bulk transfer id length"),
+            ));
+            if transfer_id.0 == 0 {
+                return Err("transfer id must be nonzero".into());
+            }
+            if bytes.is_empty() {
+                return Err("bulk chunk must not be empty".into());
+            }
+            if bytes.len() > super::MAX_CHUNK_BYTES {
+                return Err("bulk chunk exceeds limit".into());
+            }
+            Ok(DecodedWire::BulkChunk { transfer_id, bytes })
+        }
+        _ => Err("unknown daemon wire frame kind".into()),
+    }
 }
 
 fn bounded_decode<T: for<'a> jsony::FromBinary<'a>>(bytes: &[u8]) -> Result<T, String> {
@@ -661,6 +818,9 @@ mod tests {
             request_id: RequestId(0),
         };
         assert!(encode_client(&frame).is_err());
+        let mut reusable = vec![1, 2, 3];
+        assert!(encode_client_framed_into(&frame, &mut reusable).is_err());
+        assert!(reusable.is_empty());
         let frame = ClientFrame::UploadChunk(BulkChunk {
             transfer_id: BulkTransferId(1),
             bytes: vec![0; super::super::MAX_CHUNK_BYTES + 1],
@@ -683,7 +843,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(consumed, buffer.len());
-        assert_eq!(decode_client(payload).unwrap(), first);
+        let DecodedWire::Frame(decoded) = decode_client_wire(payload).unwrap() else {
+            panic!("ordinary client frame decoded as bulk data")
+        };
+        assert_eq!(decoded, first);
 
         let second = ClientFrame::Ping {
             request_id: RequestId(2),
@@ -695,7 +858,35 @@ mod tests {
             crate::framing::parse_frame_with_limit(&buffer, super::super::MAX_FRAME_BYTES)
                 .unwrap()
                 .unwrap();
-        assert_eq!(decode_client(payload).unwrap(), second);
+        let DecodedWire::Frame(decoded) = decode_client_wire(payload).unwrap() else {
+            panic!("ordinary client frame decoded as bulk data")
+        };
+        assert_eq!(decoded, second);
+    }
+
+    #[test]
+    fn bulk_wire_payload_is_raw_and_borrowed() {
+        let bytes = vec![7; 4096];
+        let chunk = ClientFrame::UploadChunk(BulkChunk {
+            transfer_id: BulkTransferId(9),
+            bytes: bytes.clone(),
+        });
+        let mut framed = Vec::new();
+        encode_client_framed_into(&chunk, &mut framed).unwrap();
+        let (payload, _) =
+            crate::framing::parse_frame_with_limit(&framed, super::super::MAX_FRAME_BYTES)
+                .unwrap()
+                .unwrap();
+        let DecodedWire::BulkChunk {
+            transfer_id,
+            bytes: decoded,
+        } = decode_client_wire(payload).unwrap()
+        else {
+            panic!("bulk client frame decoded as an ordinary frame")
+        };
+        assert_eq!(transfer_id, BulkTransferId(9));
+        assert_eq!(decoded, bytes);
+        assert_eq!(decoded.as_ptr(), payload[WIRE_BULK_HEADER_LEN..].as_ptr());
     }
 
     #[test]
