@@ -2764,9 +2764,7 @@ mod tests {
         stream.read_to_end(&mut body).unwrap();
         // The first byte is the format version; a Rust body highlights a keyword.
         assert_eq!(body[0], 1);
-        assert!(body.contains(
-            &chatt_message_format::highlight::HlClass::Keyword.as_u8()
-        ));
+        assert!(body.contains(&chatt_message_format::highlight::HlClass::Keyword.as_u8()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

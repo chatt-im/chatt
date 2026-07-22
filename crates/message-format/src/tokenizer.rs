@@ -1109,10 +1109,7 @@ mod tests {
 
     #[test]
     fn maximum_message_quote_depth_is_iterative() {
-        let source = format!(
-            "{}x",
-            ">".repeat((8 * 1024usize).saturating_sub(1))
-        );
+        let source = format!("{}x", ">".repeat((8 * 1024usize).saturating_sub(1)));
         let tokens = pairs(&source);
         assert_eq!(
             tokens

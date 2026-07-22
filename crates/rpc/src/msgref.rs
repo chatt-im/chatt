@@ -16,9 +16,7 @@ use crate::{
     ids::{MessageId, RoomId},
 };
 
-pub use chatt_message_format::reference::{
-    MAX_CODE_LEN, MIN_CODE_LEN, REF_PREFIX, is_ref_char,
-};
+pub use chatt_message_format::reference::{MAX_CODE_LEN, MIN_CODE_LEN, REF_PREFIX, is_ref_char};
 
 /// The durable identity of a chat message, as carried by an `@@` reference.
 ///

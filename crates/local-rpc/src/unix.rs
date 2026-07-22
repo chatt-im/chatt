@@ -25,6 +25,11 @@ pub const STATUS_ERROR: u8 = 1;
 pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const RECVMSG_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const RECVMSG_FLAGS: libc::c_int = 0;
+
 #[derive(Debug)]
 pub enum ConnectError {
     Unavailable(String),
@@ -334,9 +339,11 @@ impl FrameReader {
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
             msg.msg_control = control.as_mut_ptr().cast();
-            msg.msg_controllen = control.len();
+            msg.msg_controllen = control.len().try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "ancillary buffer is too large")
+            })?;
             loop {
-                let read = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+                let read = unsafe { libc::recvmsg(fd, &mut msg, RECVMSG_FLAGS) };
                 if read >= 0 {
                     return Ok(read as usize);
                 }
@@ -390,6 +397,18 @@ fn take_rights(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
                 }
             }
             cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    for fd in &out {
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::FD_CLOEXEC == 0
+            && unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+        {
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(out)
@@ -489,12 +508,21 @@ fn send_first_with_fds(stream: &UnixStream, frame: &[u8], fds: &[RawFd]) -> io::
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len().try_into().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "ancillary buffer is too large")
+    })?;
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN((fds.len() * mem::size_of::<RawFd>()) as u32) as usize;
+        (*cmsg).cmsg_len = (libc::CMSG_LEN((fds.len() * mem::size_of::<RawFd>()) as u32) as usize)
+            .try_into()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ancillary message is too large",
+                )
+            })?;
         std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast(), fds.len());
         msg.msg_controllen = (*cmsg).cmsg_len;
     }
@@ -555,6 +583,9 @@ mod tests {
         let received = reader.recv_daemon_with_fds().unwrap();
         assert_eq!(received.frame, opened);
         assert_eq!(received.fds.len(), 1);
+        let flags = unsafe { libc::fcntl(received.fds[0].as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]
