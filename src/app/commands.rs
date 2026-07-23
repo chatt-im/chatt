@@ -33,6 +33,18 @@ impl SlashArg {
             _ => None,
         }
     }
+
+    pub(crate) fn rpc_kind(self) -> local_rpc::model::CommandArgKind {
+        use local_rpc::model::CommandArgKind;
+
+        match self {
+            SlashArg::None => CommandArgKind::None,
+            SlashArg::User | SlashArg::OptionalUser => CommandArgKind::User,
+            SlashArg::Room => CommandArgKind::Room,
+            SlashArg::Sound => CommandArgKind::Sound,
+            SlashArg::FreeText(_) => CommandArgKind::Free,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,13 +288,32 @@ pub(crate) fn web_commands() -> impl Iterator<Item = &'static SlashCommand> {
     SLASH_COMMANDS.iter().filter(|command| command.web)
 }
 
-/// Checks that `first_token` names a web-capable command.
-pub(crate) fn web_command_gate(first_token: &str) -> Result<(), String> {
+/// The commands safe to expose to non-terminal frontends.
+pub(crate) fn frontend_commands() -> impl Iterator<Item = &'static SlashCommand> {
+    web_commands()
+}
+
+pub(crate) fn frontend_command_catalog() -> Vec<local_rpc::model::CommandInfo> {
+    let mut commands = frontend_commands()
+        .map(|command| local_rpc::model::CommandInfo {
+            name: command.name.to_string(),
+            usage: command.usage.to_string(),
+            description: command.description.to_string(),
+            arg: command.arg.rpc_kind(),
+            placeholder: command.arg.placeholder().map(str::to_string),
+        })
+        .collect::<Vec<_>>();
+    commands.sort_by(|left, right| left.name.cmp(&right.name));
+    commands
+}
+
+/// Checks that `first_token` names a command safe for a graphical frontend.
+pub(crate) fn frontend_command_gate(first_token: &str) -> Result<(), String> {
     let Some(command) = find_command(first_token) else {
         return Err(format!("unknown command: {first_token}"));
     };
     if !command.web {
-        return Err(format!("{first_token} is not available from the web view"));
+        return Err(format!("{first_token} is not available from this frontend"));
     }
     Ok(())
 }
@@ -651,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn web_gate_allows_curated_commands() {
+    fn frontend_gate_allows_curated_commands() {
         let curated = [
             "/mute",
             "/unmute",
@@ -671,23 +702,27 @@ mod tests {
             "/video",
         ];
         for name in curated {
-            assert_eq!(web_command_gate(name), Ok(()), "{name} must pass the gate");
+            assert_eq!(
+                frontend_command_gate(name),
+                Ok(()),
+                "{name} must pass the gate"
+            );
         }
         assert_eq!(web_commands().count(), curated.len());
     }
 
     #[test]
-    fn web_gate_rejects_tui_only_and_unknown_commands() {
+    fn frontend_gate_rejects_tui_only_and_unknown_commands() {
         assert_eq!(
-            web_command_gate("/clear"),
-            Err("/clear is not available from the web view".to_string())
+            frontend_command_gate("/clear"),
+            Err("/clear is not available from this frontend".to_string())
         );
         assert_eq!(
-            web_command_gate("/settings"),
-            Err("/settings is not available from the web view".to_string())
+            frontend_command_gate("/settings"),
+            Err("/settings is not available from this frontend".to_string())
         );
         assert_eq!(
-            web_command_gate("/nope"),
+            frontend_command_gate("/nope"),
             Err("unknown command: /nope".to_string())
         );
     }
@@ -698,6 +733,28 @@ mod tests {
             assert!(command.usage.starts_with(command.name), "{}", command.name);
             assert!(!command.description.is_empty(), "{}", command.name);
         }
+    }
+
+    #[test]
+    fn frontend_catalog_is_sorted_and_preserves_argument_metadata() {
+        let catalog = frontend_command_catalog();
+        assert!(catalog.windows(2).all(|pair| pair[0].name < pair[1].name));
+        assert_eq!(catalog.len(), web_commands().count());
+        assert!(catalog.iter().all(|command| command.validate().is_ok()));
+
+        let room = catalog
+            .iter()
+            .find(|command| command.name == "/room")
+            .unwrap();
+        assert_eq!(room.arg, local_rpc::model::CommandArgKind::Room);
+        assert_eq!(room.placeholder, None);
+
+        let report = catalog
+            .iter()
+            .find(|command| command.name == "/report-bug")
+            .unwrap();
+        assert_eq!(report.arg, local_rpc::model::CommandArgKind::Free);
+        assert_eq!(report.placeholder.as_deref(), Some("what went wrong"));
     }
 
     #[test]
