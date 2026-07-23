@@ -5,9 +5,9 @@ use crate::ids::{FileTransferId, MessageId, RoomId, StreamId};
 use super::{
     bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished},
     model::{
-        BulkTransferId, ConnectionState, DaemonInstanceId, LiveShare, Message, Participant,
-        RequestId, RoomSnapshot, RoomSummary, StateSnapshot, TransferSummary, TrustState,
-        VoiceState,
+        BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo, CommandOutputLine,
+        ConnectionState, DaemonInstanceId, LiveShare, Message, Participant, RequestId,
+        RoomSnapshot, RoomSummary, StateSnapshot, TransferSummary, TrustState, VoiceState,
     },
 };
 
@@ -117,6 +117,7 @@ pub struct Welcome {
     pub active_server: Option<String>,
     pub first_event_seq: u64,
     pub limits: NegotiatedLimits,
+    pub commands: Vec<CommandInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -140,6 +141,7 @@ pub enum Operation {
     SetOutputVolume,
     StartLiveShare,
     StopLiveShare,
+    RunCommand,
     Ping,
     RequestSnapshot,
     Disconnect,
@@ -321,6 +323,14 @@ pub enum ClientFrame {
         request_id: RequestId,
         stream_id: StreamId,
     },
+    RunCommand {
+        request_id: RequestId,
+        body: String,
+    },
+    RequestCommandCandidates {
+        request_id: RequestId,
+        kind: CommandCandidateKind,
+    },
     Ping {
         request_id: RequestId,
         nonce: u64,
@@ -354,6 +364,8 @@ impl ClientFrame {
             | Self::SetOutputVolume { request_id, .. }
             | Self::StartLiveShare { request_id, .. }
             | Self::StopLiveShare { request_id, .. }
+            | Self::RunCommand { request_id, .. }
+            | Self::RequestCommandCandidates { request_id, .. }
             | Self::Ping { request_id, .. }
             | Self::RequestSnapshot { request_id }
             | Self::Disconnect { request_id } => Some(*request_id),
@@ -373,6 +385,15 @@ pub enum DaemonFrame {
     },
     Event(StateEvent),
     RequestResult(RequestResult),
+    CommandResult {
+        result: RequestResult,
+        lines: Vec<CommandOutputLine>,
+    },
+    CommandCandidates {
+        request_id: RequestId,
+        kind: CommandCandidateKind,
+        items: Vec<CommandCandidate>,
+    },
     LiveShareOpened {
         request_id: RequestId,
         stream_id: StreamId,
@@ -617,6 +638,17 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
                 return Err("message body exceeds limit".into());
             }
         }
+        ClientFrame::RunCommand { body, .. } => {
+            if body.len() > super::MAX_MESSAGE_BODY_BYTES {
+                return Err("command body exceeds limit".into());
+            }
+            if !body.starts_with('/') {
+                return Err("command body must start with a slash".into());
+            }
+            if body.contains(['\r', '\n']) {
+                return Err("command body must be a single line".into());
+            }
+        }
         ClientFrame::SetOutputVolume { volume, .. } if !volume.is_finite() => {
             return Err("output volume must be finite".into());
         }
@@ -679,6 +711,19 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
             super::model::check_nonempty_string(&welcome.daemon_build)?;
             super::model::check_opt_string(&welcome.active_server)?;
             welcome.limits.validate()?;
+            if welcome.commands.len() > super::MAX_COMMANDS {
+                return Err("command catalog exceeds limit".into());
+            }
+            for command in &welcome.commands {
+                command.validate()?;
+            }
+            if welcome
+                .commands
+                .windows(2)
+                .any(|commands| commands[0].name >= commands[1].name)
+            {
+                return Err("command catalog must be strictly ordered by name".into());
+            }
             Ok(())
         }
         DaemonFrame::Event(event) => {
@@ -686,6 +731,33 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
             validate_delta(&event.delta)
         }
         DaemonFrame::RequestResult(result) => validate_result(result),
+        DaemonFrame::CommandResult { result, lines } => {
+            validate_result(result)?;
+            if result.operation != Operation::RunCommand {
+                return Err("command result carries the wrong operation".into());
+            }
+            if lines.len() > super::MAX_COMMAND_OUTPUT_LINES {
+                return Err("command output exceeds limit".into());
+            }
+            for line in lines {
+                line.validate()?;
+            }
+            Ok(())
+        }
+        DaemonFrame::CommandCandidates {
+            request_id, items, ..
+        } => {
+            if request_id.0 == 0 {
+                return Err("request id must be nonzero".into());
+            }
+            if items.len() > super::MAX_COMMAND_CANDIDATES {
+                return Err("command candidate collection exceeds limit".into());
+            }
+            for item in items {
+                item.validate()?;
+            }
+            Ok(())
+        }
         DaemonFrame::LiveShareOpened { request_id, .. } if request_id.0 == 0 => {
             Err("request id must be nonzero".into())
         }
@@ -1004,6 +1076,14 @@ mod tests {
                 request_id,
                 stream_id: StreamId(5),
             },
+            ClientFrame::RunCommand {
+                request_id,
+                body: "/whoami".into(),
+            },
+            ClientFrame::RequestCommandCandidates {
+                request_id,
+                kind: CommandCandidateKind::Room,
+            },
             ClientFrame::Ping {
                 request_id,
                 nonce: 9,
@@ -1045,6 +1125,13 @@ mod tests {
                 active_server: Some("local".into()),
                 first_event_seq: 1,
                 limits: NegotiatedLimits::default(),
+                commands: vec![CommandInfo {
+                    name: "/whoami".into(),
+                    usage: "/whoami".into(),
+                    description: "show the current authenticated user".into(),
+                    arg: super::super::model::CommandArgKind::None,
+                    placeholder: None,
+                }],
             }),
             DaemonFrame::Snapshot {
                 instance_id,
@@ -1076,6 +1163,25 @@ mod tests {
                 operation: Operation::Ping,
                 outcome: RequestOutcome::Accepted,
             }),
+            DaemonFrame::CommandResult {
+                result: RequestResult {
+                    request_id,
+                    operation: Operation::RunCommand,
+                    outcome: RequestOutcome::Accepted,
+                },
+                lines: vec![CommandOutputLine {
+                    error: false,
+                    text: "alice".into(),
+                }],
+            },
+            DaemonFrame::CommandCandidates {
+                request_id,
+                kind: CommandCandidateKind::Room,
+                items: vec![CommandCandidate {
+                    value: "general".into(),
+                    detail: None,
+                }],
+            },
             DaemonFrame::LiveShareOpened {
                 request_id,
                 stream_id: StreamId(5),

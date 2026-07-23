@@ -382,6 +382,8 @@ impl RpcClientSender {
     fn complete_request(&self, frame: &DaemonFrame) {
         let request_id = match frame {
             DaemonFrame::RequestResult(result) => Some(result.request_id),
+            DaemonFrame::CommandResult { result, .. } => Some(result.request_id),
+            DaemonFrame::CommandCandidates { request_id, .. } => Some(*request_id),
             DaemonFrame::Pong { request_id, .. } => Some(*request_id),
             DaemonFrame::LiveShareOpened { request_id, .. } => Some(*request_id),
             _ => None,
@@ -398,6 +400,8 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::Snapshot { .. } => "snapshot",
         DaemonFrame::Event(_) => "event",
         DaemonFrame::RequestResult(_) => "request_result",
+        DaemonFrame::CommandResult { .. } => "command_result",
+        DaemonFrame::CommandCandidates { .. } => "command_candidates",
         DaemonFrame::LiveShareOpened { .. } => "live_share_opened",
         DaemonFrame::Pong { .. } => "pong",
         DaemonFrame::BulkChunk(_) => "bulk_chunk",
@@ -837,6 +841,7 @@ fn spawn_rpc_client(
         active_server: snapshot.active_server.clone(),
         first_event_seq: 1,
         limits,
+        commands: crate::app::commands::frontend_command_catalog(),
     };
     if let Err(error) = sender.send(&DaemonFrame::Welcome(welcome)) {
         sender.shutdown();
@@ -1747,6 +1752,22 @@ fn handle_rpc_effect(
             client
                 .sender
                 .send_or_abort(&DaemonFrame::RequestResult(result));
+        }
+        RpcCommandEffect::CommandResult { result, lines } => {
+            client
+                .sender
+                .send_or_abort(&DaemonFrame::CommandResult { result, lines });
+        }
+        RpcCommandEffect::CommandCandidates {
+            request_id,
+            kind,
+            items,
+        } => {
+            client.sender.send_or_abort(&DaemonFrame::CommandCandidates {
+                request_id,
+                kind,
+                items,
+            });
         }
         RpcCommandEffect::None => {}
     }

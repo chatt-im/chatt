@@ -29,6 +29,48 @@ pub enum ConnectionState {
     Online,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Jsony)]
+#[jsony(Binary, version)]
+pub enum CommandArgKind {
+    None,
+    User,
+    Room,
+    Sound,
+    Free,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Jsony)]
+#[jsony(Binary, version)]
+pub enum CommandCandidateKind {
+    User,
+    Room,
+    Sound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct CommandInfo {
+    pub name: String,
+    pub usage: String,
+    pub description: String,
+    pub arg: CommandArgKind,
+    pub placeholder: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct CommandCandidate {
+    pub value: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct CommandOutputLine {
+    pub error: bool,
+    pub text: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub enum RoomKind {
@@ -265,6 +307,41 @@ impl LiveShare {
             return Err("live share codec data exceeds limit".into());
         }
         Ok(())
+    }
+}
+
+impl CommandInfo {
+    pub fn validate(&self) -> Result<(), String> {
+        check_nonempty_string(&self.name)?;
+        check_nonempty_string(&self.usage)?;
+        check_nonempty_string(&self.description)?;
+        check_opt_string(&self.placeholder)?;
+        if !self.name.starts_with('/')
+            || self.name.len() == 1
+            || self.name.chars().any(char::is_whitespace)
+        {
+            return Err("command name is invalid".into());
+        }
+        if self.arg == CommandArgKind::Free && self.placeholder.is_none() {
+            return Err("free-text command is missing its placeholder".into());
+        }
+        if self.arg != CommandArgKind::Free && self.placeholder.is_some() {
+            return Err("non-free command must not carry a placeholder".into());
+        }
+        Ok(())
+    }
+}
+
+impl CommandCandidate {
+    pub fn validate(&self) -> Result<(), String> {
+        check_nonempty_string(&self.value)?;
+        check_opt_string(&self.detail)
+    }
+}
+
+impl CommandOutputLine {
+    pub fn validate(&self) -> Result<(), String> {
+        check_nonempty_string(&self.text)
     }
 }
 

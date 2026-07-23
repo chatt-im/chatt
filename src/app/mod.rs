@@ -457,9 +457,9 @@ pub(crate) struct App {
     /// Web-originated deletes awaiting either a mutation echo or an explicit
     /// server rejection, keyed by room because ids are room-local.
     pending_web_deletes: HashSet<(RoomId, MessageId)>,
-    /// While a web-originated slash command runs, status and notice output is
-    /// teed here (the TUI still shows it) and returned to the issuing browser.
-    web_command_capture: Option<Vec<WebCommandLine>>,
+    /// While a frontend-originated slash command runs, status and notice output
+    /// is teed here and returned only to the issuing frontend.
+    frontend_command_capture: Option<Vec<local_rpc::model::CommandOutputLine>>,
     /// The in-memory download ring buffer, shared with the network worker and
     /// the web server. Held app-wide so it survives web-server respawns.
     download_store: crate::receive_store::DownloadStore,
@@ -921,22 +921,8 @@ fn share_ended_envelope(stream_id: StreamId) -> String {
     jsony::object! { type: "share_ended", stream_id: stream_id.0 }
 }
 
-/// One captured line of slash-command output, shown as a system row in the web
-/// feed.
-#[derive(Debug, PartialEq, Eq)]
-struct WebCommandLine {
-    error: bool,
-    text: String,
-}
-
-/// An argument-completion candidate offered to the web autocomplete popup.
-struct CandidateItem {
-    value: String,
-    detail: Option<String>,
-}
-
 /// The `command_output` envelope carrying a web command's captured output.
-fn command_output_envelope(lines: &[WebCommandLine]) -> String {
+fn command_output_envelope(lines: &[local_rpc::model::CommandOutputLine]) -> String {
     jsony::object! {
         type: "command_output",
         lines: [
@@ -951,7 +937,11 @@ fn command_output_envelope(lines: &[WebCommandLine]) -> String {
 
 /// The `command_candidates` envelope answering an autocomplete candidates
 /// request.
-fn command_candidates_envelope(request_id: u64, kind: &str, items: &[CandidateItem]) -> String {
+fn command_candidates_envelope(
+    request_id: u64,
+    kind: &str,
+    items: &[local_rpc::model::CommandCandidate],
+) -> String {
     jsony::object! {
         type: "command_candidates",
         request_id: request_id,
@@ -1397,7 +1387,7 @@ impl App {
             web_feed,
             video_fanout,
             pending_web_deletes: HashSet::new(),
-            web_command_capture: None,
+            frontend_command_capture: None,
             download_store,
             screencast: None,
             cached_screencast_start: None,
@@ -2469,13 +2459,33 @@ impl App {
 
     /// Gates and dispatches a web slash command, teeing its output. `Err` is a
     /// gating failure (unknown or TUI-only command); the command did not run.
-    fn run_web_command_captured(&mut self, body: String) -> Result<Vec<WebCommandLine>, String> {
+    fn run_web_command_captured(
+        &mut self,
+        body: String,
+    ) -> Result<Vec<local_rpc::model::CommandOutputLine>, String> {
+        self.run_frontend_command_captured(self.command_client, self.room.viewed_room, body)
+            .map_err(|error| error.replace("this frontend", "the web view"))
+    }
+
+    pub(crate) fn run_frontend_command_captured(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+        room_id: Option<RoomId>,
+        body: String,
+    ) -> Result<Vec<local_rpc::model::CommandOutputLine>, String> {
         let body = body.trim().to_string();
+        if body.contains('\r') || body.contains('\n') {
+            return Err("slash commands must be a single line".into());
+        }
         let first_token = body.split_whitespace().next().unwrap_or("");
-        commands::web_command_gate(first_token)?;
-        self.web_command_capture = Some(Vec::new());
-        self.run_slash_command(self.room.viewed_room, body);
-        Ok(self.web_command_capture.take().unwrap_or_default())
+        commands::frontend_command_gate(first_token)?;
+        debug_assert!(self.frontend_command_capture.is_none());
+        let previous_client = std::mem::replace(&mut self.command_client, client_id);
+        self.frontend_command_capture = Some(Vec::new());
+        self.run_slash_command(room_id, body);
+        let output = self.frontend_command_capture.take().unwrap_or_default();
+        self.command_client = previous_client;
+        Ok(output)
     }
 
     /// Answers the web autocomplete's request for argument candidates.
@@ -2485,43 +2495,72 @@ impl App {
         request_id: u64,
         kind: crate::web_server::CandidateKind,
     ) {
-        let items: Vec<CandidateItem> = match kind {
-            crate::web_server::CandidateKind::User => self
-                .room
-                .username_candidates()
-                .into_iter()
-                .map(|value| CandidateItem {
-                    value,
-                    detail: None,
-                })
-                .collect(),
-            crate::web_server::CandidateKind::Room => self
-                .room
-                .room_name_candidates()
-                .into_iter()
-                .map(|value| CandidateItem {
-                    value,
-                    detail: None,
-                })
-                .collect(),
-            crate::web_server::CandidateKind::Sound => self
-                .config
-                .soundboard
-                .clips
-                .iter()
-                .enumerate()
-                .map(|(index, clip)| CandidateItem {
-                    value: clip.name.clone(),
-                    detail: Some(format!("slot {}", index + 1)),
-                })
-                .collect(),
+        let rpc_kind = match kind {
+            crate::web_server::CandidateKind::User => {
+                local_rpc::model::CommandCandidateKind::User
+            }
+            crate::web_server::CandidateKind::Room => {
+                local_rpc::model::CommandCandidateKind::Room
+            }
+            crate::web_server::CandidateKind::Sound => {
+                local_rpc::model::CommandCandidateKind::Sound
+            }
         };
+        let items = self.frontend_command_candidates(rpc_kind);
         if let Some(feed) = &self.web_feed {
             feed.send_command_reply(
                 client,
                 command_candidates_envelope(request_id, kind.wire_name(), &items),
             );
         }
+    }
+
+    pub(crate) fn frontend_command_candidates(
+        &self,
+        kind: local_rpc::model::CommandCandidateKind,
+    ) -> Vec<local_rpc::model::CommandCandidate> {
+        let mut items = match kind {
+            local_rpc::model::CommandCandidateKind::User => self
+                .room
+                .username_candidates()
+                .into_iter()
+                .map(|value| local_rpc::model::CommandCandidate {
+                    value,
+                    detail: None,
+                })
+                .collect::<Vec<_>>(),
+            local_rpc::model::CommandCandidateKind::Room => self
+                .room
+                .room_name_candidates()
+                .into_iter()
+                .map(|value| local_rpc::model::CommandCandidate {
+                    value,
+                    detail: None,
+                })
+                .collect::<Vec<_>>(),
+            local_rpc::model::CommandCandidateKind::Sound => self
+                .config
+                .soundboard
+                .clips
+                .iter()
+                .enumerate()
+                .map(|(index, clip)| local_rpc::model::CommandCandidate {
+                    value: clip.name.clone(),
+                    detail: Some(format!("slot {}", index + 1)),
+                })
+                .collect::<Vec<_>>(),
+        };
+        items.retain(|item| item.validate().is_ok());
+        items.sort_by(|left, right| {
+            left.value
+                .to_lowercase()
+                .cmp(&right.value.to_lowercase())
+                .then_with(|| left.value.cmp(&right.value))
+                .then_with(|| left.detail.cmp(&right.detail))
+        });
+        items.dedup();
+        items.truncate(local_rpc::MAX_COMMAND_CANDIDATES);
+        items
     }
 
     fn report_web_delete_error(&self, target: MessageId, message: &str) {
@@ -4659,7 +4698,7 @@ impl App {
     pub(crate) fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
         let sender = sender.into();
         let body = body.into();
-        self.capture_web_command_line(false, &body);
+        self.capture_frontend_command_line(false, &body);
         if !self.room.push_notice(sender.clone(), body.clone()) {
             self.send_terminal_event(
                 Audience::Client(self.command_client),
@@ -4675,7 +4714,7 @@ impl App {
     pub(crate) fn push_error_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
         let sender = sender.into();
         let body = body.into();
-        self.capture_web_command_line(true, &body);
+        self.capture_frontend_command_line(true, &body);
         if !self.room.push_error_notice(sender.clone(), body.clone()) {
             self.send_terminal_event(
                 Audience::Client(self.command_client),
@@ -8133,7 +8172,7 @@ impl App {
 
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
         let status = status.into();
-        self.capture_web_command_line(false, &status);
+        self.capture_frontend_command_line(false, &status);
         self.send_terminal_event(
             Audience::Client(self.command_client),
             TerminalEvent::Status(status),
@@ -8150,16 +8189,19 @@ impl App {
 
     pub(crate) fn set_error(&mut self, status: impl Into<String>) {
         let status = status.into();
-        self.capture_web_command_line(true, &status);
+        self.capture_frontend_command_line(true, &status);
         self.send_terminal_event(
             Audience::Client(self.command_client),
             TerminalEvent::Error(status),
         );
     }
 
-    fn capture_web_command_line(&mut self, error: bool, text: &str) {
-        if let Some(capture) = &mut self.web_command_capture {
-            capture.push(WebCommandLine {
+    fn capture_frontend_command_line(&mut self, error: bool, text: &str) {
+        if let Some(capture) = &mut self.frontend_command_capture
+            && !text.is_empty()
+            && capture.len() < local_rpc::MAX_COMMAND_OUTPUT_LINES
+        {
+            capture.push(local_rpc::model::CommandOutputLine {
                 error,
                 text: text.to_string(),
             });
@@ -10924,7 +10966,7 @@ mod tests {
             app.run_web_command_captured("/nope".to_string()),
             Err("unknown command: /nope".to_string())
         );
-        assert!(app.web_command_capture.is_none());
+        assert!(app.frontend_command_capture.is_none());
     }
 
     #[test]
@@ -10941,7 +10983,7 @@ mod tests {
             lines[0].text
         );
         assert!(
-            app.web_command_capture.is_none(),
+            app.frontend_command_capture.is_none(),
             "capture must not outlive the command"
         );
     }

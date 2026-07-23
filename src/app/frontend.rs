@@ -6,8 +6,9 @@ use local_rpc::{
     frame::{ClientFrame, Operation, RequestOutcome, RequestResult},
     ids::RoomId,
     model::{
-        AttachmentDescriptor, AttachmentId, ConnectionState, MediaKind, Message, RequestId,
-        RoomKind, RoomSnapshot, RoomSummary, StateSnapshot, TrustState, VoiceState,
+        AttachmentDescriptor, AttachmentId, CommandCandidate, CommandCandidateKind,
+        CommandOutputLine, ConnectionState, MediaKind, Message, RequestId, RoomKind, RoomSnapshot,
+        RoomSummary, StateSnapshot, TrustState, VoiceState,
     },
 };
 
@@ -29,6 +30,15 @@ pub(crate) enum RpcCommandEffect {
     BeginUpload {
         request_id: RequestId,
         upload: BeginUpload,
+    },
+    CommandResult {
+        result: RequestResult,
+        lines: Vec<CommandOutputLine>,
+    },
+    CommandCandidates {
+        request_id: RequestId,
+        kind: CommandCandidateKind,
+        items: Vec<CommandCandidate>,
     },
     None,
 }
@@ -311,6 +321,26 @@ impl App {
             ClientFrame::RequestSnapshot { request_id } => RpcCommandEffect::Snapshot(request_id),
             ClientFrame::Disconnect { request_id } => {
                 RpcCommandEffect::Disconnect(accepted(request_id, Operation::Disconnect))
+            }
+            ClientFrame::RunCommand { request_id, body } => {
+                let room_id = self.room.selected_room_for(client_id);
+                match self.run_frontend_command_captured(client_id, room_id, body) {
+                    Ok(lines) => RpcCommandEffect::CommandResult {
+                        result: accepted(request_id, Operation::RunCommand),
+                        lines,
+                    },
+                    Err(message) => RpcCommandEffect::CommandResult {
+                        result: rejected(request_id, Operation::RunCommand, 422, &message),
+                        lines: Vec::new(),
+                    },
+                }
+            }
+            ClientFrame::RequestCommandCandidates { request_id, kind } => {
+                RpcCommandEffect::CommandCandidates {
+                    request_id,
+                    kind,
+                    items: self.frontend_command_candidates(kind),
+                }
             }
             ClientFrame::StartLiveShare { .. } | ClientFrame::StopLiveShare { .. } => {
                 RpcCommandEffect::None
@@ -838,6 +868,46 @@ mod tests {
         assert_eq!(app.rpc_snapshot(first).selected_room, Some(RoomId(2)));
         assert_eq!(app.rpc_snapshot(second).selected_room, Some(RoomId(1)));
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+    }
+
+    #[test]
+    fn rpc_runs_frontend_safe_commands_and_captures_output() {
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
+        let effect = app.handle_rpc_frame(
+            ClientId(7),
+            ClientFrame::RunCommand {
+                request_id: RequestId(3),
+                body: "/whoami".into(),
+            },
+        );
+
+        let RpcCommandEffect::CommandResult { result, lines } = effect else {
+            panic!("expected command result");
+        };
+        assert_eq!(result.operation, Operation::RunCommand);
+        assert_eq!(result.outcome, RequestOutcome::Accepted);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn rpc_rejects_terminal_only_commands_without_running_them() {
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
+        let effect = app.handle_rpc_frame(
+            ClientId(7),
+            ClientFrame::RunCommand {
+                request_id: RequestId(4),
+                body: "/clear".into(),
+            },
+        );
+
+        let RpcCommandEffect::CommandResult { result, lines } = effect else {
+            panic!("expected command result");
+        };
+        assert!(matches!(
+            result.outcome,
+            RequestOutcome::Rejected { code: 422, .. }
+        ));
+        assert!(lines.is_empty());
     }
 
     #[test]
