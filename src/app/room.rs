@@ -315,9 +315,21 @@ impl RoomShared {
         let Some(message) = self.message_by_key(key) else {
             return false;
         };
+        self.message_is_unverified(message, local_user)
+    }
+
+    /// Classifies a message from its already-resolved record. All provenance
+    /// and verification lookups are hash based, keeping bulk relabeling O(1)
+    /// per message and O(n) for the room.
+    fn message_is_unverified(
+        &self,
+        message: &ChatMessage,
+        local_user: Option<UserId>,
+    ) -> bool {
         if !self.e2e_room || Some(message.sender) == local_user {
             return false;
         }
+        let key = MessageLog::key(message);
         let original_unverified = self
             .message_provenance
             .get(&key)
@@ -543,6 +555,24 @@ impl RoomShared {
         let mut fresh = normals;
         fresh.sort_by_key(|record| MessageLog::key(&record.message));
         fresh.dedup_by_key(|record| MessageLog::key(&record.message));
+        let mut provenance_enriched = false;
+        for record in &fresh {
+            let key = MessageLog::key(&record.message);
+            if self.messages.contains(key)
+                && !self.message_provenance.contains_key(&key)
+                && let Some(provenance) = record.provenance
+            {
+                self.message_provenance.insert(key, provenance);
+                if let Some(store) = &mut self.history {
+                    store.append_authenticated_message(&record.message, Some(provenance));
+                }
+                provenance_enriched = true;
+            }
+        }
+        if provenance_enriched {
+            self.invalidate();
+            changed = true;
+        }
         fresh.retain(|record| !self.messages.contains(MessageLog::key(&record.message)));
         if fresh.is_empty() {
             return changed;
@@ -692,7 +722,7 @@ impl RoomView {
                 self.chat.push_authenticated_chat(
                     message.clone(),
                     Some(message.sender) == local_user,
-                    shared.message_unverified(*key, local_user),
+                    shared.message_is_unverified(message, local_user),
                 );
                 if stick {
                     self.chat.bottom();
@@ -705,7 +735,7 @@ impl RoomView {
                 self.chat.insert_authenticated_chat(
                     message.clone(),
                     Some(message.sender) == local_user,
-                    shared.message_unverified(*key, local_user),
+                    shared.message_is_unverified(message, local_user),
                 );
             }
             RoomDelta::Prepend(keys) => {
@@ -716,7 +746,7 @@ impl RoomView {
                         (
                             message.clone(),
                             Some(message.sender) == local_user,
-                            shared.message_unverified(message.message_id.0, local_user),
+                            shared.message_is_unverified(message, local_user),
                         )
                     })
                     .collect();
@@ -729,7 +759,7 @@ impl RoomView {
                 self.chat.edit_authenticated_message(
                     *key,
                     message.clone(),
-                    shared.message_unverified(*key, local_user),
+                    shared.message_is_unverified(message, local_user),
                 );
             }
             RoomDelta::Delete(key) => {
@@ -785,7 +815,7 @@ impl RoomView {
             self.chat.push_authenticated_chat(
                 message.clone(),
                 Some(message.sender) == local_user,
-                shared.message_unverified(message.message_id.0, local_user),
+                shared.message_is_unverified(message, local_user),
             );
         }
         // Journal-resident notices survive the rebuild (appended after the
@@ -3722,6 +3752,41 @@ mod tests {
         assert!(!chat.message(0).unverified);
         assert!(!chat.message(1).unverified);
         assert!(chat.message(2).unverified);
+    }
+
+    #[test]
+    fn duplicate_history_enriches_missing_message_provenance() {
+        let mut client = test_room();
+        let room_id = RoomId(9);
+        let verified_key = [0x31; rpc::identity::ACCOUNT_ID_LEN];
+        client.session.authenticated(
+            &[dm_room_info(9, UserId(1), UserId(2))],
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            room_id,
+            None,
+            Some(UserId(1)),
+        );
+        client.session.chat_received(
+            authenticated_message(room_id, 1, UserId(2), "cached", None),
+            Some(UserId(1)),
+        );
+        client
+            .session
+            .set_e2e_verified_keys(room_id, [verified_key]);
+        assert!(client.chat().message(0).unverified);
+
+        assert!(client.session.merge_history(
+            room_id,
+            vec![authenticated_message(
+                room_id,
+                1,
+                UserId(2),
+                "cached",
+                Some(verified_key),
+            )],
+        ));
+
+        assert!(!client.chat().message(0).unverified);
     }
 
     #[test]
