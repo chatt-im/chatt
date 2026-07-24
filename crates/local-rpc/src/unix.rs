@@ -986,22 +986,26 @@ mod tests {
         let mut writer = FrameWriter::new(left);
         let transfer_id = super::super::model::BulkTransferId(11);
         let payload = vec![0x5a; 32 * 1024];
+        let expected = payload.clone();
+        let receiver = std::thread::spawn(move || {
+            let mut reader = FrameReader::new(right);
+            let mut handled = false;
+            let frame = reader
+                .recv_client_with_bulk(|received_id, received| {
+                    assert_eq!(received_id, transfer_id);
+                    assert_eq!(received, expected);
+                    handled = true;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(frame.is_none());
+            assert!(handled);
+        });
+
         writer
             .send_client_bulk_chunk(transfer_id, &payload)
             .unwrap();
-
-        let mut reader = FrameReader::new(right);
-        let mut handled = false;
-        let frame = reader
-            .recv_client_with_bulk(|received_id, received| {
-                assert_eq!(received_id, transfer_id);
-                assert_eq!(received, payload);
-                handled = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(frame.is_none());
-        assert!(handled);
+        receiver.join().unwrap();
     }
 
     #[test]
