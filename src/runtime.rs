@@ -53,6 +53,9 @@ struct RemoteRpcClient {
     pending_history: Option<RpcHistoryRequest>,
     last_snapshot: local_rpc::model::StateSnapshot,
     live_viewers: HashMap<rpc::ids::StreamId, crate::video::NativeViewerHandle>,
+    settings_device_generation: u64,
+    next_settings_audio_event_at: Instant,
+    last_settings_audio_runtime: Option<local_rpc::settings::AudioRuntimeState>,
 }
 
 #[derive(Clone, Copy)]
@@ -386,6 +389,7 @@ impl RpcClientSender {
             DaemonFrame::CommandCandidates { request_id, .. } => Some(*request_id),
             DaemonFrame::Pong { request_id, .. } => Some(*request_id),
             DaemonFrame::LiveShareOpened { request_id, .. } => Some(*request_id),
+            DaemonFrame::SettingsResult(result) => Some(result.result.request_id),
             _ => None,
         };
         if let Some(request_id) = request_id {
@@ -407,6 +411,8 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::BulkChunk(_) => "bulk_chunk",
         DaemonFrame::BulkFinished(_) => "bulk_finished",
         DaemonFrame::BulkCanceled { .. } => "bulk_canceled",
+        DaemonFrame::SettingsResult(_) => "settings_result",
+        DaemonFrame::SettingsEvent(_) => "settings_event",
     }
 }
 
@@ -561,6 +567,7 @@ fn run_app_inner(
             );
         }
         dirty |= app.tick();
+        broadcast_rpc_settings_events(&app, &mut rpc_clients, Instant::now());
 
         let quit = (!headless && app.take_quit_requested()) || polling::termination_requested();
         wait_timeout = app.next_tick_timeout(Instant::now());
@@ -872,6 +879,9 @@ fn spawn_rpc_client(
         pending_history: None,
         last_snapshot: snapshot,
         live_viewers: HashMap::new(),
+        settings_device_generation: 0,
+        next_settings_audio_event_at: Instant::now(),
+        last_settings_audio_runtime: None,
     })
 }
 
@@ -1329,6 +1339,27 @@ fn handle_rpc_command(
     instance_id: DaemonInstanceId,
 ) {
     match frame {
+        local_rpc::frame::ClientFrame::Settings {
+            request_id,
+            command,
+        } => {
+            let result = app.handle_rpc_settings(id, request_id, command);
+            if let Some(client) = clients.get_mut(&id) {
+                match &result.payload {
+                    local_rpc::settings::SettingsResultPayload::Document(document) => {
+                        client.settings_device_generation =
+                            app.rpc_settings_device_generation();
+                        client.last_settings_audio_runtime =
+                            Some(document.audio_runtime.clone());
+                    }
+                    _ => {}
+                }
+                client
+                    .sender
+                    .send_or_abort(&DaemonFrame::SettingsResult(result));
+            }
+            return;
+        }
         local_rpc::frame::ClientFrame::StartLiveShare {
             request_id,
             stream_id,
@@ -1591,6 +1622,50 @@ fn handle_rpc_command(
             };
             handle_rpc_effect(app, client, id, effect, instance_id);
             return;
+        }
+    }
+}
+
+fn broadcast_rpc_settings_events(
+    app: &App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    now: Instant,
+) {
+    const AUDIO_EVENT_INTERVAL: Duration = Duration::from_millis(50);
+    for (id, client) in clients.iter_mut() {
+        if let Some((generation, event)) =
+            app.rpc_settings_document_event(*id, client.settings_device_generation)
+        {
+            client.settings_device_generation = generation;
+            if !client
+                .sender
+                .send_or_abort(&DaemonFrame::SettingsEvent(event))
+            {
+                continue;
+            }
+        }
+        if now < client.next_settings_audio_event_at {
+            continue;
+        }
+        let Some((meter, runtime_event)) = app.rpc_settings_audio_events(*id) else {
+            continue;
+        };
+        client.next_settings_audio_event_at = now + AUDIO_EVENT_INTERVAL;
+        if !client
+            .sender
+            .send_or_abort(&DaemonFrame::SettingsEvent(meter))
+        {
+            continue;
+        }
+        let local_rpc::settings::SettingsEvent::AudioRuntime { runtime, .. } = &runtime_event
+        else {
+            unreachable!("settings audio runtime helper returned the wrong event")
+        };
+        if client.last_settings_audio_runtime.as_ref() != Some(runtime) {
+            client.last_settings_audio_runtime = Some(runtime.clone());
+            client
+                .sender
+                .send_or_abort(&DaemonFrame::SettingsEvent(runtime_event));
         }
     }
 }

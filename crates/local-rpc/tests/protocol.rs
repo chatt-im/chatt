@@ -13,15 +13,15 @@ use local_rpc::{
 };
 
 #[test]
-fn renderer_and_daemon_exchange_protocol_v6_frames_and_live_share_fd() {
-    assert_eq!(PROTOCOL_MIN_VERSION, 6);
-    assert_eq!(PROTOCOL_MAX_VERSION, 6);
+fn renderer_and_daemon_exchange_protocol_v7_frames_and_live_share_fd() {
+    assert_eq!(PROTOCOL_MIN_VERSION, 7);
+    assert_eq!(PROTOCOL_MAX_VERSION, 7);
     assert_eq!(MAX_MESSAGE_BODY_BYTES, 8 * 1024);
     assert_eq!(DEFAULT_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
     assert_eq!(MAX_HISTORY_REQUEST_MESSAGES, 500);
 
     let hello = ClientHello::current("test-renderer");
-    assert_eq!(hello.negotiated_version(), Some(6));
+    assert_eq!(hello.negotiated_version(), Some(7));
 
     let (daemon_socket, renderer_socket) = UnixStream::pair().unwrap();
     let mut daemon_reader = FrameReader::new(daemon_socket.try_clone().unwrap());

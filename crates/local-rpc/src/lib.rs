@@ -12,6 +12,7 @@ pub mod ids {
     pub use chatt_ids::{FileTransferId, MessageId, RoomId, StreamId, UserId};
 }
 pub mod model;
+pub mod settings;
 #[cfg(unix)]
 pub mod unix;
 
@@ -20,8 +21,8 @@ pub use chatt_video::{bitstream, video};
 mod framing;
 mod recv_buffer;
 
-pub const PROTOCOL_MIN_VERSION: u16 = 6;
-pub const PROTOCOL_MAX_VERSION: u16 = 6;
+pub const PROTOCOL_MIN_VERSION: u16 = 7;
+pub const PROTOCOL_MAX_VERSION: u16 = 7;
 pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ROOM_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
@@ -44,3 +45,9 @@ pub const MAX_OUTSTANDING_REQUESTS: usize = 128;
 pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CONCURRENT_TRANSFERS: usize = 4;
 pub const MAX_OUTPUT_VOLUME_PERCENT: f32 = 130.0;
+pub const MAX_SETTINGS_DIAGNOSTICS: usize = 64;
+pub const MAX_SETTINGS_SECTIONS: usize = 32;
+pub const MAX_SETTINGS_FIELDS: usize = 256;
+pub const MAX_SETTINGS_CHOICES: usize = 64;
+pub const MAX_SETTINGS_LIST_ITEMS: usize = 64;
+pub const MAX_SETTINGS_CHANGES: usize = 256;

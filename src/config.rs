@@ -1547,6 +1547,18 @@ pub(crate) enum AppConfigLoad {
     Missing(Config),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeSaveError {
+    Conflict { actual_revision: u64 },
+    Other(String),
+}
+
+pub(crate) struct RuntimeDocument {
+    pub(crate) config: Config,
+    pub(crate) revision: u64,
+    pub(crate) source_exists: bool,
+}
+
 impl Config {
     /// Loads and validates the config file, rendering diagnostics to stderr.
     ///
@@ -2077,27 +2089,83 @@ impl Config {
     }
 
     pub fn save_runtime(&self) -> Result<PathBuf, String> {
-        let path = self
-            .config_path
-            .clone()
-            .or_else(paths::client_config_path)
-            .ok_or_else(|| "HOME is not set; cannot determine config path".to_string())?;
+        let (_, revision) = self.runtime_source()?;
+        self.save_runtime_at_revision(revision, true)
+            .map(|(path, _)| path)
+            .map_err(|error| match error {
+                RuntimeSaveError::Conflict { .. } => {
+                    "configuration changed while it was being saved".to_string()
+                }
+                RuntimeSaveError::Other(error) => error,
+            })
+    }
+
+    /// Loads the editable configuration and its optimistic-concurrency token
+    /// from one source read. The token therefore always describes the values
+    /// presented to a renderer.
+    pub(crate) fn load_runtime_document(&self) -> Result<RuntimeDocument, String> {
+        let path = self.runtime_path()?;
+        let (content, revision, source_exists) = runtime_source_at(&path)?;
+        let outcome = Self::collect_content(
+            content,
+            path.display().to_string(),
+            Some(path.clone()),
+        )?;
+        let errors = outcome.diagnostics.iter().filter(|diag| diag.error).count();
+        match outcome.config {
+            Some(mut config) if errors == 0 => {
+                config.config_path = Some(path);
+                Ok(RuntimeDocument {
+                    config,
+                    revision,
+                    source_exists,
+                })
+            }
+            _ => Err(config_diagnostics::render_to_string(
+                &outcome.source,
+                &outcome.content,
+                &outcome.diagnostics,
+                false,
+            )),
+        }
+    }
+
+    /// Comment-preserving, private, atomic save guarded by the revision
+    /// observed when a renderer opened its settings session.
+    pub(crate) fn save_runtime_at_revision(
+        &self,
+        expected_revision: u64,
+        force: bool,
+    ) -> Result<(PathBuf, u64), RuntimeSaveError> {
+        let path = self.runtime_path().map_err(RuntimeSaveError::Other)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|err| {
+                RuntimeSaveError::Other(format!("failed to create {}: {err}", parent.display()))
+            })?;
+        }
+        let (content, actual_revision, _) =
+            runtime_source_at(&path).map_err(RuntimeSaveError::Other)?;
+        if !force && actual_revision != expected_revision {
+            return Err(RuntimeSaveError::Conflict { actual_revision });
         }
 
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.to_string(),
-            Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
-        };
+        let output = self.runtime_toml(&content).map_err(|err| {
+            RuntimeSaveError::Other(format!("failed to serialize {}: {err}", path.display()))
+        })?;
+        atomic_write_private(&path, output.as_bytes()).map_err(RuntimeSaveError::Other)?;
+        Ok((path, runtime_revision(output.as_bytes(), true)))
+    }
 
-        let output = self
-            .runtime_toml(&content)
-            .map_err(|err| format!("failed to serialize {}: {err}", path.display()))?;
-        atomic_write_private(&path, output.as_bytes())?;
-        Ok(path)
+    fn runtime_path(&self) -> Result<PathBuf, String> {
+        self.config_path
+            .clone()
+            .or_else(paths::client_config_path)
+            .ok_or_else(|| "HOME is not set; cannot determine config path".to_string())
+    }
+
+    fn runtime_source(&self) -> Result<(String, u64), String> {
+        runtime_source_at(&self.runtime_path()?)
+            .map(|(content, revision, _)| (content, revision))
     }
 
     /// Serializes the runtime config, reusing the comments, key order, and
@@ -2115,6 +2183,35 @@ impl Config {
             .format(self)
             .map_err(|err| err.to_string())
     }
+}
+
+fn runtime_source_at(path: &Path) -> Result<(String, u64, bool), String> {
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            let revision = runtime_revision(content.as_bytes(), true);
+            Ok((content, revision, true))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((
+            DEFAULT_CONFIG.to_string(),
+            runtime_revision(DEFAULT_CONFIG.as_bytes(), false),
+            false,
+        )),
+        Err(error) => Err(format!("failed to read {}: {error}", path.display())),
+    }
+}
+
+fn runtime_revision(bytes: &[u8], source_exists: bool) -> u64 {
+    // FNV-1a is sufficient here: this is an opaque change detector, not trust
+    // material. Include source existence so first-save conflicts cannot alias
+    // the embedded defaults even when their text is identical.
+    let mut hash = 0xcbf29ce484222325u64;
+    hash ^= u64::from(source_exists);
+    hash = hash.wrapping_mul(0x100000001b3);
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash.max(1)
 }
 
 /// Replaces a sensitive config without ever truncating the live file. The
@@ -3800,6 +3897,33 @@ server-public-key = ""
         );
         assert!(!dir.join(".client.toml.tmp").exists());
         Config::collect(Some(path.to_str().unwrap())).unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_save_revision_detects_external_changes_without_overwriting() {
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-config-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.toml");
+        fs::write(&path, DEFAULT_CONFIG).unwrap();
+        let mut config = Config::default();
+        config.config_path = Some(path.clone());
+        let revision = config.load_runtime_document().unwrap().revision;
+        let external = format!("{DEFAULT_CONFIG}\n# edited elsewhere\n");
+        fs::write(&path, &external).unwrap();
+
+        assert!(matches!(
+            config.save_runtime_at_revision(revision, false),
+            Err(RuntimeSaveError::Conflict { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
         let _ = fs::remove_dir_all(dir);
     }
 }
