@@ -1,0 +1,52 @@
+# Maintainer: Chatt contributors
+
+pkgname=chatt-server-git
+pkgver=r527.4e86efb
+pkgrel=1
+pkgdesc='Self-hosted server for low-latency voice, video, text, and file communication'
+arch=('x86_64' 'aarch64')
+url='https://github.com/chatt-im/chatt'
+license=('MIT OR Apache-2.0')
+depends=('glibc' 'libgcc')
+makedepends=('cargo' 'git')
+provides=("chatt-server=${pkgver}")
+conflicts=('chatt-server')
+source=("chatt::git+file://$(git rev-parse --show-toplevel)")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd chatt
+    printf 'r%s.%s' \
+        "$(git rev-list --count HEAD)" \
+        "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+    cd chatt
+    export RUSTUP_TOOLCHAIN=stable
+
+    cargo fetch --locked --target host-tuple
+}
+
+build() {
+    cd chatt
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR="$srcdir/target"
+
+    cargo build --frozen --release --package server --bin chatt-server
+}
+
+check() {
+    cd chatt
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR="$srcdir/target"
+
+    cargo test --frozen --package server
+}
+
+package() {
+    install -Dm0755 "$srcdir/target/release/chatt-server" \
+        "$pkgdir/usr/bin/chatt-server"
+    install -Dm0644 chatt/README.md chatt/BUILDING.md \
+        -t "$pkgdir/usr/share/doc/$pkgname"
+}

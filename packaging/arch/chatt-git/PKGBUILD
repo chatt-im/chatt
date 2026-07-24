@@ -1,0 +1,64 @@
+# Maintainer: Chatt contributors
+
+pkgname=chatt-git
+pkgver=r527.4e86efb
+pkgrel=1
+pkgdesc='Terminal client for low-latency voice, video, text, and file communication'
+arch=('x86_64' 'aarch64')
+url='https://github.com/chatt-im/chatt'
+license=('MIT OR Apache-2.0')
+depends=('alsa-lib' 'glibc' 'libgcc' 'zstd')
+makedepends=('cargo' 'clang' 'git' 'libpipewire')
+checkdepends=('ffmpeg')
+optdepends=(
+    'ffmpeg: screen capture'
+    'pipewire: PipeWire audio backend'
+    'wl-clipboard: clipboard integration on Wayland'
+    'xclip: clipboard integration on X11'
+    'xsel: alternative text clipboard integration on X11'
+    'xdg-utils: open links with the default application'
+)
+provides=("chatt=${pkgver}")
+conflicts=('chatt')
+source=("chatt::git+file://$(git rev-parse --show-toplevel)")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd chatt
+    printf 'r%s.%s' \
+        "$(git rev-list --count HEAD)" \
+        "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+    cd chatt
+    export RUSTUP_TOOLCHAIN=stable
+
+    cargo fetch --locked --target host-tuple
+}
+
+build() {
+    cd chatt
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR="$srcdir/target"
+    export ZSTD_SYS_USE_PKG_CONFIG=1
+
+    cargo build --frozen --release --package chatt --bin chatt \
+        --features pipewire
+}
+
+check() {
+    cd chatt
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR="$srcdir/target"
+    export ZSTD_SYS_USE_PKG_CONFIG=1
+
+    cargo test --frozen --package chatt --features pipewire
+}
+
+package() {
+    install -Dm0755 "$srcdir/target/release/chatt" \
+        "$pkgdir/usr/bin/chatt"
+    install -Dm0644 chatt/README.md chatt/BUILDING.md \
+        -t "$pkgdir/usr/share/doc/$pkgname"
+}
