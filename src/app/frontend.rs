@@ -322,6 +322,15 @@ impl App {
             ClientFrame::Disconnect { request_id } => {
                 RpcCommandEffect::Disconnect(accepted(request_id, Operation::Disconnect))
             }
+            ClientFrame::Settings {
+                request_id,
+                command,
+            } => RpcCommandEffect::Reply(rejected(
+                request_id,
+                command.operation(),
+                500,
+                "settings command bypassed runtime dispatch",
+            )),
             ClientFrame::RunCommand { request_id, body } => {
                 let room_id = self.room.selected_room_for(client_id);
                 match self.run_frontend_command_captured(client_id, room_id, body) {

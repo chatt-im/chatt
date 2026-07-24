@@ -9,6 +9,7 @@ mod pairing;
 pub(crate) mod participants;
 pub(crate) mod room;
 pub(crate) mod room_settings;
+mod rpc_settings;
 pub(crate) mod server;
 mod shared;
 #[cfg(test)]
@@ -377,6 +378,8 @@ pub(crate) struct App {
     connection_attempt: Option<ConnectionAttempt>,
     next_connection_generation: u64,
     active_network_generation: Option<u64>,
+    rpc_settings: Option<rpc_settings::RpcSettingsSession>,
+    next_rpc_settings_session_id: u64,
     pub room: CoreRw<RoomSession>,
     pub network: Option<NetworkClient>,
     pub control_socket: Option<local_control::ControlSocket>,
@@ -1340,6 +1343,8 @@ impl App {
             connection_attempt: None,
             next_connection_generation: 0,
             active_network_generation: None,
+            rpc_settings: None,
+            next_rpc_settings_session_id: 1,
             room: CoreRw::new(room),
             network: None,
             control_socket,
@@ -5017,7 +5022,7 @@ impl App {
     }
 
     pub(crate) fn open_settings(&mut self) {
-        if self.room.settings.is_some() {
+        if self.room.settings_owner.is_some() {
             self.set_error("settings are already open in another client");
             return;
         }
@@ -5047,6 +5052,14 @@ impl App {
         }
         self.room.remove_client_view(client_id);
         self.apply_pairing_input(PairingInput::OwnerRetired { owner: client_id });
+        if self
+            .rpc_settings
+            .as_ref()
+            .is_some_and(|session| session.owner == client_id)
+        {
+            self.finish_rpc_settings_session();
+            return;
+        }
         if self.room.settings_owner != Some(client_id) {
             return;
         }

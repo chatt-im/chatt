@@ -9,6 +9,7 @@ use super::{
         ConnectionState, DaemonInstanceId, LiveShare, Message, Participant, RequestId,
         RoomSnapshot, RoomSummary, StateSnapshot, TransferSummary, TrustState, VoiceState,
     },
+    settings::{SettingsCommand, SettingsEvent, SettingsResult},
 };
 
 pub(crate) const WIRE_JSON: u8 = 0;
@@ -120,7 +121,7 @@ pub struct Welcome {
     pub commands: Vec<CommandInfo>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub enum Operation {
     SelectRoom,
@@ -145,6 +146,13 @@ pub enum Operation {
     Ping,
     RequestSnapshot,
     Disconnect,
+    OpenSettings,
+    SetAudioPreviewActive,
+    PreviewAudioSettings,
+    RefreshSettingsChoices,
+    ReloadSettings,
+    SaveSettings,
+    CloseSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -341,6 +349,10 @@ pub enum ClientFrame {
     Disconnect {
         request_id: RequestId,
     },
+    Settings {
+        request_id: RequestId,
+        command: SettingsCommand,
+    },
 }
 
 impl ClientFrame {
@@ -368,7 +380,8 @@ impl ClientFrame {
             | Self::RequestCommandCandidates { request_id, .. }
             | Self::Ping { request_id, .. }
             | Self::RequestSnapshot { request_id }
-            | Self::Disconnect { request_id } => Some(*request_id),
+            | Self::Disconnect { request_id }
+            | Self::Settings { request_id, .. } => Some(*request_id),
             Self::UploadChunk(_) => None,
         }
     }
@@ -408,6 +421,8 @@ pub enum DaemonFrame {
         transfer_id: BulkTransferId,
         reason: String,
     },
+    SettingsResult(SettingsResult),
+    SettingsEvent(SettingsEvent),
 }
 
 pub fn encode_client(frame: &ClientFrame) -> Result<Vec<u8>, String> {
@@ -680,6 +695,7 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         ClientFrame::BeginAttachmentRead { read, .. } => {
             read.validate()?;
         }
+        ClientFrame::Settings { command, .. } => command.validate()?,
         _ => {}
     }
     Ok(())
@@ -774,6 +790,8 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
             }
             super::model::check_nonempty_string(reason)
         }
+        DaemonFrame::SettingsResult(result) => result.validate(),
+        DaemonFrame::SettingsEvent(event) => event.validate(),
         DaemonFrame::Pong { .. } | DaemonFrame::LiveShareOpened { .. } => Ok(()),
     }
 }
