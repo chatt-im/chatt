@@ -83,6 +83,10 @@ struct CertifiedDevice {
 
 #[derive(Debug, Default)]
 struct PolicyState {
+    /// Stable account-to-user resolution for authenticated application
+    /// events. Event conversion is a hot path, so it must not scan every
+    /// active device to rediscover the roster owner.
+    account_users: HashMap<AccountId, UserId>,
     /// Certificates in the current authority-signed roster, used for all new
     /// MLS membership decisions.
     devices: HashMap<Vec<u8>, CertifiedDevice>,
@@ -166,6 +170,7 @@ impl ChattIdentityProvider {
                 ));
             }
         }
+        index_account_user(&mut state, roster.body.account_id, roster.body.user_id)?;
         state
             .devices
             .retain(|_, device| device.account_id != roster.body.account_id);
@@ -215,6 +220,7 @@ impl ChattIdentityProvider {
         if historical_roster_cache_hit(&state, roster)? {
             return Ok(());
         }
+        index_account_user(&mut state, roster.body.account_id, roster.body.user_id)?;
         for certificate in &roster.body.active_devices {
             let client_id = certificate.body.mls_client_id.clone();
             let device = certified_device(certificate);
@@ -362,10 +368,9 @@ impl ChattIdentityProvider {
     pub fn user_for_account(&self, account_id: AccountId) -> Result<UserId, PolicyError> {
         let state = self.state.read().map_err(|_| PolicyError::LockPoisoned)?;
         state
-            .devices
-            .values()
-            .find(|device| device.account_id == account_id)
-            .map(|device| device.user_id)
+            .account_users
+            .get(&account_id)
+            .copied()
             .ok_or(PolicyError::UnknownDevice)
     }
 }
@@ -594,6 +599,23 @@ fn historical_roster_cache_hit(
             "historical device roster revision equivocates".to_string(),
         )),
         None => Ok(false),
+    }
+}
+
+fn index_account_user(
+    state: &mut PolicyState,
+    account_id: AccountId,
+    user_id: UserId,
+) -> Result<(), PolicyError> {
+    match state.account_users.get(&account_id) {
+        Some(existing) if *existing != user_id => Err(PolicyError::InvalidRoster(
+            "account id is already certified for another user".to_string(),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            state.account_users.insert(account_id, user_id);
+            Ok(())
+        }
     }
 }
 

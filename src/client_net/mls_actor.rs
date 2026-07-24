@@ -2174,7 +2174,12 @@ impl Actor {
             flags,
             target,
         };
-        Ok(message.into())
+        Ok(AuthenticatedChat {
+            message,
+            provenance: Some(crate::e2e::MessageProvenance {
+                peer_public_key: event.sender_account.0,
+            }),
+        })
     }
 
     fn resume_pending_mls_group_infos(&mut self, user_id: UserId) -> Result<(), String> {
@@ -2953,6 +2958,53 @@ mod tests {
     fn leaves_small_lightly_fragmented_database_alone() {
         assert!(!should_compact(stats(40 * 1024 * 1024, 9 * 1024 * 1024)));
         assert!(!should_compact(stats(0, 0)));
+    }
+
+    #[test]
+    fn converted_mls_chat_retains_the_authenticated_sender_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [9; 32];
+        let (alice, _) = LocalInstallation::open_or_create(
+            &temp.path().join("alice"),
+            server_id,
+            UserId(1),
+            "Alice",
+        )
+        .unwrap();
+        let (bob, _) = LocalInstallation::open_or_create(
+            &temp.path().join("bob"),
+            server_id,
+            UserId(2),
+            "Bob",
+        )
+        .unwrap();
+        alice.install_roster(&bob.bootstrap.own_roster).unwrap();
+        let bob_account = bob.bootstrap.account_id;
+
+        let (mut actor, _outputs, _poll) = test_actor(test_config(None));
+        actor.installation = Some(alice);
+        actor.user_names.insert(UserId(2), "Bob".to_string());
+        let chat = actor
+            .mls_chatt_event_to_chat(
+                rpc::mls::MlsChattEvent {
+                    version: rpc::mls::MLS_PROTOCOL_VERSION,
+                    room_id: RoomId(9),
+                    event_id: EventId([7; 16]),
+                    sender_account: bob_account,
+                    timestamp_ms: 123,
+                    content: rpc::mls::ChattEventContent::Text {
+                        body: "authenticated".to_string(),
+                    },
+                },
+                4,
+            )
+            .unwrap();
+
+        assert_eq!(chat.message.sender, UserId(2));
+        assert_eq!(
+            chat.provenance.map(|provenance| provenance.peer_public_key),
+            Some(bob_account.0)
+        );
     }
 
     #[test]
