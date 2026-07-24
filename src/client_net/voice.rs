@@ -3650,7 +3650,7 @@ mod tests {
 
     #[test]
     fn wrong_server_source_does_not_consume_replay_or_dispatch_packet() {
-        let actor_poll = Poll::new().unwrap();
+        let mut actor_poll = Poll::new().unwrap();
         let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
         let wrong = StdUdpSocket::bind("127.0.0.1:0").unwrap();
         let udp = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -3686,12 +3686,21 @@ mod tests {
             payload: media::VoicePayload::Opus(vec![1, 2, 3]),
         };
         let packet = media::seal_media(&protection(55), 1, &voice).unwrap();
+        let mut events = Events::with_capacity(1);
         wrong.send_to(&packet, actor_addr).unwrap();
+        actor_poll
+            .poll(&mut events, Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(events.iter().any(|event| event.token() == UDP));
         assert!(!session.read_udp());
         assert!(session.pending_playback_packets.is_empty());
 
         let before = Instant::now();
         server.send_to(&packet, actor_addr).unwrap();
+        actor_poll
+            .poll(&mut events, Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(events.iter().any(|event| event.token() == UDP));
         assert!(!session.read_udp());
         let after = Instant::now();
         let received = session.pending_playback_packets.front().unwrap();

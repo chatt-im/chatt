@@ -1431,7 +1431,6 @@ mod tests {
         };
         let packet = media::seal_media(&alice_codec, 2, &voice).unwrap();
         alice.send_to(&packet, server_addr).unwrap();
-        thread::sleep(Duration::from_millis(25));
 
         let mut datagram = [0; 2048];
         let (len, _) = bob.recv_from(&mut datagram).unwrap();
