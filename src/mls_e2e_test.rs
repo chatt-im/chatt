@@ -447,13 +447,22 @@ fn pair_device(
     (pair_config, client, device_id)
 }
 
-fn relay_one_frame(source: &mut TcpStream, destination: &mut TcpStream) {
+fn read_one_frame(source: &mut TcpStream) -> ([u8; 4], Vec<u8>) {
     let mut length = [0u8; 4];
     source.read_exact(&mut length).unwrap();
     let mut payload = vec![0u8; u32::from_le_bytes(length) as usize];
     source.read_exact(&mut payload).unwrap();
+    (length, payload)
+}
+
+fn relay_one_frame(source: &mut TcpStream, destination: &mut TcpStream) {
+    let (length, payload) = read_one_frame(source);
     destination.write_all(&length).unwrap();
     destination.write_all(&payload).unwrap();
+}
+
+fn discard_one_frame(source: &mut TcpStream) {
+    let _ = read_one_frame(source);
 }
 
 fn spawn_pair_response_loss_proxy(server_addr: &str) -> (String, thread::JoinHandle<()>) {
@@ -465,6 +474,9 @@ fn spawn_pair_response_loss_proxy(server_addr: &str) -> (String, thread::JoinHan
         .spawn(move || {
             let (mut client, _) = listener.accept().unwrap();
             let mut server = TcpStream::connect(server_addr).unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             // Hello, enrollment fetch, then redemption. The server receives
             // the atomic redemption, but its success response is discarded.
             relay_one_frame(&mut client, &mut server);
@@ -472,7 +484,9 @@ fn spawn_pair_response_loss_proxy(server_addr: &str) -> (String, thread::JoinHan
             relay_one_frame(&mut client, &mut server);
             relay_one_frame(&mut server, &mut client);
             relay_one_frame(&mut client, &mut server);
-            thread::sleep(Duration::from_millis(200));
+            // Wait until redemption has completed, then discard its success
+            // response so the client must reconcile the exact device on retry.
+            discard_one_frame(&mut server);
             let _ = client.shutdown(Shutdown::Both);
             let _ = server.shutdown(Shutdown::Both);
         })
@@ -1270,7 +1284,7 @@ fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
                         body: body.clone(),
                     })
                     .unwrap();
-                thread::sleep(Duration::from_millis(150));
+                wait_chat(alice.as_ref().unwrap(), &body);
                 bob = Some(spawn(bob_config.clone()));
                 wait_authenticated(bob.as_ref().unwrap(), "bob offline restart");
                 wait_event(
@@ -1289,7 +1303,7 @@ fn mls_live_restart_offline_direction_matrix_and_file_round_trip() {
                         body: body.clone(),
                     })
                     .unwrap();
-                thread::sleep(Duration::from_millis(150));
+                wait_chat(bob.as_ref().unwrap(), &body);
                 alice = Some(spawn(alice_config.clone()));
                 wait_authenticated(alice.as_ref().unwrap(), "alice offline restart");
                 wait_event(
