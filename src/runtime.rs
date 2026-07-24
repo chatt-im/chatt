@@ -2372,29 +2372,31 @@ mod tests {
         .unwrap();
         let (writer_stream, reader_stream) = UnixStream::pair().unwrap();
         let mut writer = local_rpc::unix::FrameWriter::new(writer_stream);
+        let receiver = thread::spawn(move || {
+            let mut reader = local_rpc::unix::FrameReader::new(reader_stream);
+            assert!(
+                reader
+                    .recv_daemon_with_bulk(|received_id, received| {
+                        assert_eq!(received_id, transfer_id);
+                        assert_eq!(received, bytes);
+                        Ok(())
+                    })
+                    .unwrap()
+                    .is_none()
+            );
+            let finished = reader.recv_daemon().unwrap();
+            assert_eq!(
+                finished,
+                local_rpc::frame::DaemonFrame::BulkFinished(local_rpc::bulk::BulkFinished {
+                    transfer_id
+                })
+            );
+        });
 
         assert!(!transfer.pump(&mut writer).unwrap());
         assert_eq!(transfer.buffer.len(), local_rpc::MAX_CHUNK_BYTES);
         assert!(transfer.pump(&mut writer).unwrap());
-
-        let mut reader = local_rpc::unix::FrameReader::new(reader_stream);
-        assert!(
-            reader
-                .recv_daemon_with_bulk(|received_id, received| {
-                    assert_eq!(received_id, transfer_id);
-                    assert_eq!(received, bytes);
-                    Ok(())
-                })
-                .unwrap()
-                .is_none()
-        );
-        let finished = reader.recv_daemon().unwrap();
-        assert_eq!(
-            finished,
-            local_rpc::frame::DaemonFrame::BulkFinished(local_rpc::bulk::BulkFinished {
-                transfer_id
-            })
-        );
+        receiver.join().unwrap();
     }
 
     #[test]
