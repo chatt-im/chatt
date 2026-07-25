@@ -1,3 +1,4 @@
+mod appearance;
 pub(crate) mod audio_diagnostics;
 pub(crate) mod audio_supervisor;
 pub(crate) mod command;
@@ -396,6 +397,7 @@ pub(crate) struct App {
     active_network_generation: Option<u64>,
     rpc_settings: Option<rpc_settings::RpcSettingsSession>,
     next_rpc_settings_session_id: u64,
+    appearance: appearance::AppearanceHub,
     pub room: CoreRw<RoomSession>,
     pub network: Option<NetworkClient>,
     pub control_socket: Option<local_control::ControlSocket>,
@@ -1363,6 +1365,7 @@ impl App {
             active_network_generation: None,
             rpc_settings: None,
             next_rpc_settings_session_id: 1,
+            appearance: appearance::AppearanceHub::default(),
             room: CoreRw::new(room),
             network: None,
             control_socket,
@@ -5155,6 +5158,7 @@ impl App {
     pub(crate) fn retire_client(&mut self, client_id: crate::client_channel::ClientId) {
         self.clients.remove(&client_id);
         self.rpc_clients.remove(&client_id);
+        self.appearance.retire(client_id);
         if self
             .rpc_server_selection_issue
             .as_ref()

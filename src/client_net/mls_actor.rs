@@ -3040,7 +3040,7 @@ mod tests {
         assert!(
             observed
                 .iter()
-            .all(|output| !matches!(output, Output::SessionReady { .. }))
+                .all(|output| !matches!(output, Output::SessionReady { .. }))
         );
     }
 

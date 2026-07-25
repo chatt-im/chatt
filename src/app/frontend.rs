@@ -417,6 +417,15 @@ impl App {
                 500,
                 "settings command bypassed runtime dispatch",
             )),
+            ClientFrame::Appearance {
+                request_id,
+                command,
+            } => RpcCommandEffect::Reply(rejected(
+                request_id,
+                command.operation(),
+                500,
+                "appearance command bypassed runtime dispatch",
+            )),
             ClientFrame::RunCommand { request_id, body } => {
                 let room_id = self.room.selected_room_for(client_id);
                 match self.run_frontend_command_captured(client_id, room_id, body) {
