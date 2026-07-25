@@ -101,6 +101,7 @@ members = [
     "crates/opus-codec",
     "crates/nnnoiseless",
     "crates/darkhttp",
+    "crates/libspa-sys",
     "crates/pipewire-sys",
 ]
 exclude = [
@@ -144,4 +145,5 @@ inherits = "release"
 debug = "full"
 
 [patch.crates-io]
+libspa-sys.path = "crates/libspa-sys"
 pipewire-sys.path = "crates/pipewire-sys"
