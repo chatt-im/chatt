@@ -56,6 +56,7 @@ struct RemoteRpcClient {
     settings_device_generation: u64,
     next_settings_audio_event_at: Instant,
     last_settings_audio_runtime: Option<local_rpc::settings::AudioRuntimeState>,
+    appearance_generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -415,6 +416,7 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::BulkCanceled { .. } => "bulk_canceled",
         DaemonFrame::SettingsResult(_) => "settings_result",
         DaemonFrame::SettingsEvent(_) => "settings_event",
+        DaemonFrame::Appearance(_) => "appearance",
     }
 }
 
@@ -570,6 +572,7 @@ fn run_app_inner(
         }
         dirty |= app.tick();
         broadcast_rpc_settings_events(&app, &mut rpc_clients, Instant::now());
+        broadcast_rpc_appearance_events(&app, &mut rpc_clients);
 
         let quit = (!headless && app.take_quit_requested()) || polling::termination_requested();
         wait_timeout = app.next_tick_timeout(Instant::now());
@@ -905,6 +908,7 @@ fn spawn_rpc_client(
         settings_device_generation: 0,
         next_settings_audio_event_at: Instant::now(),
         last_settings_audio_runtime: None,
+        appearance_generation: 0,
     })
 }
 
@@ -1372,6 +1376,18 @@ fn handle_rpc_command(
     instance_id: DaemonInstanceId,
 ) {
     match frame {
+        local_rpc::frame::ClientFrame::Appearance {
+            request_id,
+            command,
+        } => {
+            let result = app.handle_rpc_appearance(id, request_id, command);
+            if let Some(client) = clients.get_mut(&id) {
+                client
+                    .sender
+                    .send_or_abort(&DaemonFrame::RequestResult(result));
+            }
+            return;
+        }
         local_rpc::frame::ClientFrame::Settings {
             request_id,
             command,
@@ -1653,6 +1669,19 @@ fn handle_rpc_command(
             };
             handle_rpc_effect(app, client, id, effect, instance_id);
             return;
+        }
+    }
+}
+
+fn broadcast_rpc_appearance_events(app: &App, clients: &mut HashMap<ClientId, RemoteRpcClient>) {
+    let generation = app.rpc_appearance_generation();
+    for client in clients.values_mut() {
+        if client.appearance_generation == generation {
+            continue;
+        }
+        let event = app.rpc_appearance_event();
+        if client.sender.send_or_abort(&DaemonFrame::Appearance(event)) {
+            client.appearance_generation = generation;
         }
     }
 }

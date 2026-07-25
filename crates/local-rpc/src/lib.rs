@@ -4,6 +4,7 @@
 //! protocol. It contains presentation-safe projections, never application
 //! implementation state or daemon filesystem paths.
 
+pub mod appearance;
 pub mod bulk;
 pub mod frame;
 pub mod ids {
@@ -21,8 +22,8 @@ pub use chatt_video::{bitstream, video};
 mod framing;
 mod recv_buffer;
 
-pub const PROTOCOL_MIN_VERSION: u16 = 9;
-pub const PROTOCOL_MAX_VERSION: u16 = 9;
+pub const PROTOCOL_MIN_VERSION: u16 = 10;
+pub const PROTOCOL_MAX_VERSION: u16 = 10;
 pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ROOM_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
@@ -52,3 +53,4 @@ pub const MAX_SETTINGS_FIELDS: usize = 256;
 pub const MAX_SETTINGS_CHOICES: usize = 64;
 pub const MAX_SETTINGS_LIST_ITEMS: usize = 64;
 pub const MAX_SETTINGS_CHANGES: usize = 256;
+pub const MAX_APPEARANCE_BYTES: usize = 64 * 1024;

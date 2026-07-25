@@ -3,6 +3,7 @@ use jsony::Jsony;
 use crate::ids::{FileTransferId, MessageId, RoomId, StreamId};
 
 use super::{
+    appearance::{AppearanceCommand, AppearanceEvent},
     bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished},
     model::{
         BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo, CommandOutputLine,
@@ -156,6 +157,9 @@ pub enum Operation {
     ReloadSettings,
     SaveSettings,
     CloseSettings,
+    PreviewAppearance,
+    CommitAppearance,
+    EndAppearancePreview,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -376,6 +380,10 @@ pub enum ClientFrame {
         request_id: RequestId,
         command: SettingsCommand,
     },
+    Appearance {
+        request_id: RequestId,
+        command: AppearanceCommand,
+    },
 }
 
 impl ClientFrame {
@@ -407,7 +415,8 @@ impl ClientFrame {
             | Self::Ping { request_id, .. }
             | Self::RequestSnapshot { request_id }
             | Self::Disconnect { request_id }
-            | Self::Settings { request_id, .. } => Some(*request_id),
+            | Self::Settings { request_id, .. }
+            | Self::Appearance { request_id, .. } => Some(*request_id),
             Self::UploadChunk(_) => None,
         }
     }
@@ -455,6 +464,7 @@ pub enum DaemonFrame {
     },
     SettingsResult(SettingsResult),
     SettingsEvent(SettingsEvent),
+    Appearance(AppearanceEvent),
 }
 
 pub fn encode_client(frame: &ClientFrame) -> Result<Vec<u8>, String> {
@@ -737,6 +747,7 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
             read.validate()?;
         }
         ClientFrame::Settings { command, .. } => command.validate()?,
+        ClientFrame::Appearance { command, .. } => command.validate()?,
         _ => {}
     }
     Ok(())
@@ -853,6 +864,7 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         }
         DaemonFrame::SettingsResult(result) => result.validate(),
         DaemonFrame::SettingsEvent(event) => event.validate(),
+        DaemonFrame::Appearance(event) => event.validate(),
         DaemonFrame::Pong { .. } | DaemonFrame::LiveShareOpened { .. } => Ok(()),
     }
 }
