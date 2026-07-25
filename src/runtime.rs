@@ -387,6 +387,7 @@ impl RpcClientSender {
             DaemonFrame::RequestResult(result) => Some(result.request_id),
             DaemonFrame::CommandResult { result, .. } => Some(result.request_id),
             DaemonFrame::CommandCandidates { request_id, .. } => Some(*request_id),
+            DaemonFrame::MessageReferenceResolved { request_id, .. } => Some(*request_id),
             DaemonFrame::Pong { request_id, .. } => Some(*request_id),
             DaemonFrame::LiveShareOpened { request_id, .. } => Some(*request_id),
             DaemonFrame::SettingsResult(result) => Some(result.result.request_id),
@@ -406,6 +407,7 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::RequestResult(_) => "request_result",
         DaemonFrame::CommandResult { .. } => "command_result",
         DaemonFrame::CommandCandidates { .. } => "command_candidates",
+        DaemonFrame::MessageReferenceResolved { .. } => "message_reference_resolved",
         DaemonFrame::LiveShareOpened { .. } => "live_share_opened",
         DaemonFrame::Pong { .. } => "pong",
         DaemonFrame::BulkChunk(_) => "bulk_chunk",
@@ -1896,6 +1898,21 @@ fn handle_rpc_effect(
                     request_id,
                     kind,
                     items,
+                });
+        }
+        RpcCommandEffect::MessageReferenceResolved {
+            request_id,
+            room_id,
+            message_id,
+            message,
+        } => {
+            client
+                .sender
+                .send_or_abort(&DaemonFrame::MessageReferenceResolved {
+                    request_id,
+                    room_id,
+                    message_id,
+                    message,
                 });
         }
         RpcCommandEffect::None => {}

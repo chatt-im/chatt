@@ -41,6 +41,12 @@ pub(crate) enum RpcCommandEffect {
         kind: CommandCandidateKind,
         items: Vec<CommandCandidate>,
     },
+    MessageReferenceResolved {
+        request_id: RequestId,
+        room_id: RoomId,
+        message_id: rpc::ids::MessageId,
+        message: Option<Message>,
+    },
     None,
 }
 
@@ -325,13 +331,30 @@ impl App {
     }
 
     fn rpc_message(&self, message: rpc::control::ChatMessage) -> Message {
+        let detail = message.file_transfer_id.and_then(|transfer_id| {
+            self.room.resident_file_detail(
+                message.room_id,
+                &crate::room_history::FileHistoryKey {
+                    timestamp_ms: message.timestamp_ms,
+                    transfer_id,
+                },
+            )
+        });
+        self.rpc_message_with_file_detail(message, detail)
+    }
+
+    fn rpc_message_with_file_detail(
+        &self,
+        message: rpc::control::ChatMessage,
+        file_detail: Option<&crate::room_history::FileDetail>,
+    ) -> Message {
         let local_user = self.user_id;
         let attachment = message.file_transfer_id.and_then(|transfer_id| {
             let key = crate::room_history::FileHistoryKey {
                 timestamp_ms: message.timestamp_ms,
                 transfer_id,
             };
-            let detail = self.room.resident_file_detail(message.room_id, &key)?;
+            let detail = file_detail?;
             let descriptor = self.rpc_attachment_descriptor(key, detail)?;
             kvlog::info!(
                 "daemon attachment descriptor projected",
@@ -412,6 +435,24 @@ impl App {
                     request_id,
                     kind,
                     items: self.frontend_command_candidates(kind),
+                }
+            }
+            ClientFrame::ResolveMessageReference {
+                request_id,
+                room_id,
+                message_id,
+            } => {
+                let message =
+                    self.room
+                        .reference_message(room_id, message_id)
+                        .map(|(message, detail)| {
+                            self.rpc_message_with_file_detail(message, detail.as_ref())
+                        });
+                RpcCommandEffect::MessageReferenceResolved {
+                    request_id,
+                    room_id,
+                    message_id,
+                    message,
                 }
             }
             ClientFrame::StartLiveShare { .. } | ClientFrame::StopLiveShare { .. } => {
@@ -880,49 +921,32 @@ impl App {
         room_id: RoomId,
         attachment_id: local_rpc::model::AttachmentId,
     ) -> Option<(AttachmentDescriptor, crate::receive_store::Source)> {
-        let history = self.room.history_for(room_id);
         let key = crate::room_history::FileHistoryKey {
             timestamp_ms: attachment_id.timestamp_ms,
             transfer_id: attachment_id.transfer_id,
         };
-        for message in history.messages {
-            if message.timestamp_ms != key.timestamp_ms
-                || message.file_transfer_id != Some(key.transfer_id)
-            {
-                continue;
-            }
-            let Some(detail) = history.files.get(&key) else {
-                continue;
-            };
-            let Some(descriptor) = self.rpc_attachment_descriptor(key, detail) else {
-                continue;
-            };
-            if descriptor.id == attachment_id {
-                let source = self.download_store.resolve_attachment(attachment_id)?;
-                let (source_kind, source_bytes) = match &source {
-                    crate::receive_store::Source::Memory { bytes, .. } => {
-                        ("memory", bytes.len() as u64)
-                    }
-                    crate::receive_store::Source::Disk(path) => (
-                        "disk",
-                        std::fs::metadata(path).map_or(0, |metadata| metadata.len()),
-                    ),
-                };
-                kvlog::info!(
-                    "daemon attachment source resolved",
-                    room_id = room_id.0,
-                    message_id = message.message_id.0,
-                    attachment_timestamp_ms = attachment_id.timestamp_ms,
-                    attachment_transfer_id = attachment_id.transfer_id.0,
-                    served_name = detail.file_name.as_str(),
-                    descriptor_bytes = descriptor.byte_len,
-                    source_kind = source_kind,
-                    source_bytes = source_bytes
-                );
-                return Some((descriptor, source));
-            }
-        }
-        None
+        let (message, detail) = self.room.reference_attachment(room_id, &key)?;
+        let descriptor = self.rpc_attachment_descriptor(key, &detail)?;
+        let source = self.download_store.resolve_attachment(attachment_id)?;
+        let (source_kind, source_bytes) = match &source {
+            crate::receive_store::Source::Memory { bytes, .. } => ("memory", bytes.len() as u64),
+            crate::receive_store::Source::Disk(path) => (
+                "disk",
+                std::fs::metadata(path).map_or(0, |metadata| metadata.len()),
+            ),
+        };
+        kvlog::info!(
+            "daemon attachment source resolved",
+            room_id = room_id.0,
+            message_id = message.message_id.0,
+            attachment_timestamp_ms = attachment_id.timestamp_ms,
+            attachment_transfer_id = attachment_id.transfer_id.0,
+            served_name = detail.file_name.as_str(),
+            descriptor_bytes = descriptor.byte_len,
+            source_kind = source_kind,
+            source_bytes = source_bytes
+        );
+        Some((descriptor, source))
     }
 
     pub(crate) fn queue_rpc_upload(
