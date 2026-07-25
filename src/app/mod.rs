@@ -96,6 +96,8 @@ pub(crate) enum StatusKind {
 }
 
 const STATUS_LIFETIME: Duration = Duration::from_secs(3);
+pub(crate) const SERVER_SWITCH_TRANSFER_BLOCKED: &str =
+    "wait for or cancel active file transfers before switching servers";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScreencastPhase {
@@ -364,10 +366,23 @@ struct ConnectionAttempt {
     server_label: String,
 }
 
+#[derive(Clone, Debug)]
+enum RpcServerSelectionIssue {
+    Error(local_rpc::model::ServerSelectionError),
+    Prompt(local_rpc::model::ServerSelectionPrompt),
+}
+
+#[derive(Clone, Debug)]
+struct OwnedRpcServerSelectionIssue {
+    owner: crate::client_channel::ClientId,
+    issue: RpcServerSelectionIssue,
+}
+
 pub(crate) struct App {
     pub config: CoreRw<Config>,
     events: AppEvents,
     clients: HashMap<crate::client_channel::ClientId, ClientHandle>,
+    rpc_clients: HashSet<crate::client_channel::ClientId>,
     command_client: crate::client_channel::ClientId,
     quit_requested: bool,
     /// Advances when configuration mirrored into attached terminal views changes.
@@ -376,6 +391,7 @@ pub(crate) struct App {
     synced_daemon_config_generation: u64,
     pairing: PairingCoordinator,
     connection_attempt: Option<ConnectionAttempt>,
+    rpc_server_selection_issue: Option<OwnedRpcServerSelectionIssue>,
     next_connection_generation: u64,
     active_network_generation: Option<u64>,
     rpc_settings: Option<rpc_settings::RpcSettingsSession>,
@@ -1335,12 +1351,14 @@ impl App {
         let app = Self {
             events,
             clients: HashMap::new(),
+            rpc_clients: HashSet::new(),
             command_client: crate::client_channel::ClientId::PRIMARY,
             quit_requested: false,
             daemon_config_generation: 0,
             synced_daemon_config_generation: 0,
             pairing: PairingCoordinator::default(),
             connection_attempt: None,
+            rpc_server_selection_issue: None,
             next_connection_generation: 0,
             active_network_generation: None,
             rpc_settings: None,
@@ -2501,12 +2519,8 @@ impl App {
         kind: crate::web_server::CandidateKind,
     ) {
         let rpc_kind = match kind {
-            crate::web_server::CandidateKind::User => {
-                local_rpc::model::CommandCandidateKind::User
-            }
-            crate::web_server::CandidateKind::Room => {
-                local_rpc::model::CommandCandidateKind::Room
-            }
+            crate::web_server::CandidateKind::User => local_rpc::model::CommandCandidateKind::User,
+            crate::web_server::CandidateKind::Room => local_rpc::model::CommandCandidateKind::Room,
             crate::web_server::CandidateKind::Sound => {
                 local_rpc::model::CommandCandidateKind::Sound
             }
@@ -2831,6 +2845,11 @@ impl App {
     }
 
     fn start_connection(&mut self, alias: &str, owner: crate::client_channel::ClientId) -> bool {
+        if self.room.has_active_transfers() {
+            self.set_error(SERVER_SWITCH_TRANSFER_BLOCKED);
+            return false;
+        }
+        self.rpc_server_selection_issue = None;
         if let Ok(server) = self.config.server(alias).cloned()
             && server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX)
         {
@@ -2851,6 +2870,44 @@ impl App {
             self.connection_attempt = None;
             false
         }
+    }
+
+    fn rpc_connection_attempt(&self) -> Option<&ConnectionAttempt> {
+        self.connection_attempt
+            .as_ref()
+            .filter(|attempt| self.rpc_clients.contains(&attempt.owner))
+    }
+
+    fn set_rpc_server_selection_error(
+        &mut self,
+        attempt: &ConnectionAttempt,
+        message: impl Into<String>,
+    ) {
+        if !self.rpc_clients.contains(&attempt.owner) {
+            return;
+        }
+        self.rpc_server_selection_issue = Some(OwnedRpcServerSelectionIssue {
+            owner: attempt.owner,
+            issue: RpcServerSelectionIssue::Error(local_rpc::model::ServerSelectionError {
+                label: Some(attempt.server_label.clone()),
+                message: message.into(),
+            }),
+        });
+    }
+
+    fn set_rpc_native_encryption_prompt(&mut self, attempt: &ConnectionAttempt) {
+        if !self.rpc_clients.contains(&attempt.owner) {
+            return;
+        }
+        self.rpc_server_selection_issue = Some(OwnedRpcServerSelectionIssue {
+            owner: attempt.owner,
+            issue: RpcServerSelectionIssue::Prompt(
+                local_rpc::model::ServerSelectionPrompt::AllowExternalSecureLink {
+                    label: attempt.server_label.clone(),
+                    attempt_id: attempt.generation,
+                },
+            ),
+        });
     }
 
     fn disconnect_network(&mut self) {
@@ -3700,6 +3757,7 @@ impl App {
                 video_transport_mode,
                 video_auth_key,
             } => {
+                self.rpc_server_selection_issue = None;
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
                 self.video_transport = Some(crate::video::VideoTransport::new(
@@ -3718,6 +3776,7 @@ impl App {
                     catalog.last_viewed_room,
                     Some(user_id),
                 );
+                self.reconcile_rpc_client_views();
                 self.sync_viewed_room_to_feeds();
                 for room_id in known {
                     if self.room.begin_history_fetch(room_id) {
@@ -4415,7 +4474,11 @@ impl App {
             }
             NetworkEvent::AuthFailed { code, message } => {
                 kvlog::warn!("app auth failed", code, error = message.as_str());
-                if code == ERROR_TOKEN_STALE_EPOCH && self.start_stale_token_repair(&message) {
+                let rpc_attempt = self.rpc_connection_attempt().cloned();
+                if code == ERROR_TOKEN_STALE_EPOCH
+                    && rpc_attempt.is_none()
+                    && self.start_stale_token_repair(&message)
+                {
                     return;
                 }
                 if code == ERROR_USERNAME_TAKEN {
@@ -4427,10 +4490,21 @@ impl App {
                     self.disconnect_network();
                     self.navigate_all(BaseScreen::Servers { query: None });
                     if let Some(attempt) = attempt {
-                        let previous = std::mem::replace(&mut self.command_client, attempt.owner);
-                        self.replace_with_server_edit_focused(&attempt.server_label, "Username");
-                        self.set_error("username already in use; choose another");
-                        self.command_client = previous;
+                        if self.rpc_clients.contains(&attempt.owner) {
+                            self.set_rpc_server_selection_error(
+                                &attempt,
+                                "username already in use; edit this saved server in the terminal client",
+                            );
+                        } else {
+                            let previous =
+                                std::mem::replace(&mut self.command_client, attempt.owner);
+                            self.replace_with_server_edit_focused(
+                                &attempt.server_label,
+                                "Username",
+                            );
+                            self.set_error("username already in use; choose another");
+                            self.command_client = previous;
+                        }
                     } else {
                         self.set_error("username already in use; choose another");
                     }
@@ -4443,7 +4517,16 @@ impl App {
                 self.disconnect_network();
                 self.navigate_all(BaseScreen::Servers { query: None });
                 self.push_network_notice("auth", &message);
-                self.set_error(message);
+                self.set_error(message.clone());
+                if let Some(attempt) = rpc_attempt {
+                    let guidance = if code == ERROR_TOKEN_STALE_EPOCH {
+                        "saved credentials need repair; finish pairing in the terminal client"
+                            .to_string()
+                    } else {
+                        format!("authentication failed: {message}")
+                    };
+                    self.set_rpc_server_selection_error(&attempt, guidance);
+                }
             }
             NetworkEvent::NativeEncryptionRequired => {
                 let Some(attempt) = self.connection_attempt.clone() else {
@@ -4454,6 +4537,7 @@ impl App {
                 };
                 self.disconnect_network();
                 self.navigate_all(BaseScreen::Servers { query: None });
+                self.set_rpc_native_encryption_prompt(&attempt);
                 self.send_terminal_event(
                     Audience::Client(attempt.owner),
                     TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
@@ -4784,26 +4868,35 @@ impl App {
     }
 
     pub(crate) fn accept_native_encryption_warning(&mut self, label: &str, generation: u64) {
-        let Some(attempt) = self.connection_attempt.as_ref() else {
-            return;
-        };
-        if attempt.generation != generation
-            || attempt.owner != self.command_client
-            || attempt.server_label != label
+        if !self
+            .connection_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.server_label == label)
         {
             return;
         }
+        let _ = self.accept_native_encryption_warning_for(generation);
+    }
+
+    fn accept_native_encryption_warning_for(&mut self, generation: u64) -> bool {
+        let Some(attempt) = self.connection_attempt.clone() else {
+            return false;
+        };
+        if attempt.generation != generation || attempt.owner != self.command_client {
+            return false;
+        }
+        let label = attempt.server_label.clone();
         let Some(server) = self
             .config
             .servers
             .iter_mut()
-            .find(|server| server.label == label)
+            .find(|server| server.label == label.as_str())
         else {
             self.set_error(format!("server {label} is not configured"));
             self.room.reset_for_server_list();
             self.broadcast_reset_rooms();
             self.navigate_all(BaseScreen::Servers { query: None });
-            return;
+            return false;
         };
         server.require_native_encryption = false;
 
@@ -4811,28 +4904,43 @@ impl App {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 self.rebuild_server_items();
-                if self.start_network(label) {
+                if self.start_network(&label) {
+                    self.rpc_server_selection_issue = None;
                     self.navigate_all(BaseScreen::Room);
                     self.set_status(format!(
                         "native encryption disabled for {label}; config saved to {}",
                         path.display()
                     ));
+                    true
                 } else {
+                    self.set_rpc_server_selection_error(
+                        &attempt,
+                        "failed to restart the server connection",
+                    );
                     self.room.reset_for_server_list();
                     self.broadcast_reset_rooms();
                     self.navigate_all(BaseScreen::Servers { query: None });
+                    false
                 }
             }
-            Err(error) => self.set_error(error),
+            Err(error) => {
+                self.set_error(error);
+                false
+            }
         }
     }
 
     pub(crate) fn cancel_native_encryption_warning(&mut self, generation: u64) {
+        self.cancel_native_encryption_warning_for(generation);
+    }
+
+    fn cancel_native_encryption_warning_for(&mut self, generation: u64) {
         if !self.connection_attempt.as_ref().is_some_and(|attempt| {
             attempt.generation == generation && attempt.owner == self.command_client
         }) {
             return;
         }
+        self.rpc_server_selection_issue = None;
         self.connection_attempt = None;
         self.disconnect_network();
         self.room.reset_for_server_list();
@@ -5046,6 +5154,14 @@ impl App {
     /// teardown is best-effort; preview resources cannot depend on it.
     pub(crate) fn retire_client(&mut self, client_id: crate::client_channel::ClientId) {
         self.clients.remove(&client_id);
+        self.rpc_clients.remove(&client_id);
+        if self
+            .rpc_server_selection_issue
+            .as_ref()
+            .is_some_and(|issue| issue.owner == client_id)
+        {
+            self.rpc_server_selection_issue = None;
+        }
         self.open_e2e_reviews.remove(&client_id);
         for clients in self.pending_identity_review.values_mut() {
             clients.retain(|pending| *pending != client_id);
@@ -5071,6 +5187,15 @@ impl App {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.finish_settings_session(&mut session);
+    }
+
+    pub(crate) fn reject_server_switch_for_client(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+    ) {
+        let previous = std::mem::replace(&mut self.command_client, client_id);
+        self.set_error(SERVER_SWITCH_TRANSFER_BLOCKED);
+        self.command_client = previous;
     }
 
     pub(crate) fn close_settings(&mut self, session: &mut SettingsSession) {
@@ -8574,6 +8699,28 @@ mod tests {
     }
 
     #[test]
+    fn native_encryption_rejection_projects_prompt_to_rpc_owner() {
+        let mut app = test_app();
+        let owner = crate::client_channel::ClientId(7);
+        app.register_rpc_client(owner);
+        app.connection_attempt = Some(ConnectionAttempt {
+            generation: 9,
+            owner,
+            server_label: "legacy".to_string(),
+        });
+
+        app.handle_network_event(NetworkEvent::NativeEncryptionRequired);
+
+        assert!(matches!(
+            app.rpc_snapshot(owner).server_selection.prompt,
+            Some(local_rpc::model::ServerSelectionPrompt::AllowExternalSecureLink {
+                label,
+                attempt_id: 9,
+            }) if label == "legacy"
+        ));
+    }
+
+    #[test]
     fn stale_connection_generation_cannot_publish_navigation() {
         let mut app = test_app();
         let channel = app.terminal_channel();
@@ -9153,6 +9300,27 @@ mod tests {
         assert!(flushed);
         assert!(app.pending_network_commands.is_empty());
         assert!(!app.room.network_disconnected);
+    }
+
+    #[test]
+    fn authentication_assigns_an_initial_room_to_preconnected_rpc_frontend() {
+        let mut app = test_app();
+        let client_id = crate::client_channel::ClientId(7);
+        app.register_rpc_client(client_id);
+        app.voice_left = true;
+
+        app.handle_network_event(NetworkEvent::Authenticated {
+            session_id: SessionId(1),
+            user_id: UserId(1),
+            rooms: vec![test_room_info(1), test_room_info(2)],
+            users: vec![user_summary(UserId(1), "alice")],
+            default_room: RoomId(2),
+            video_transport_mode: rpc::crypto::TransportMode::NativeEncrypted,
+            video_auth_key: [0; rpc::crypto::KEY_LEN],
+        });
+
+        let snapshot = app.rpc_snapshot(client_id);
+        assert_eq!(snapshot.selected_room, Some(RoomId(2)));
     }
 
     #[test]

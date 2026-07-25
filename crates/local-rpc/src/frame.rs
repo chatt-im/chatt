@@ -7,7 +7,8 @@ use super::{
     model::{
         BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo, CommandOutputLine,
         ConnectionState, DaemonInstanceId, LiveShare, Message, Participant, RequestId,
-        RoomSnapshot, RoomSummary, StateSnapshot, TransferSummary, TrustState, VoiceState,
+        RoomSnapshot, RoomSummary, ServerSelectionState, StateSnapshot, TransferSummary,
+        TrustState, VoiceState,
     },
     settings::{SettingsCommand, SettingsEvent, SettingsResult},
 };
@@ -124,6 +125,8 @@ pub struct Welcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub enum Operation {
+    SelectServer,
+    ResolveServerPrompt,
     SelectRoom,
     LoadOlder,
     SendMessage,
@@ -176,6 +179,12 @@ pub enum StateDelta {
     ConnectionChanged {
         connection: ConnectionState,
         active_server: Option<String>,
+    },
+    LocalIdentityChanged {
+        local_identity: Option<String>,
+    },
+    ServerSelectionChanged {
+        selection: ServerSelectionState,
     },
     RoomCatalogReset {
         rooms: Vec<RoomSummary>,
@@ -253,6 +262,15 @@ pub struct StateEvent {
 #[derive(Clone, Debug, PartialEq, Jsony)]
 #[jsony(Binary, version)]
 pub enum ClientFrame {
+    SelectServer {
+        request_id: RequestId,
+        label: String,
+    },
+    ResolveServerPrompt {
+        request_id: RequestId,
+        attempt_id: u64,
+        accept: bool,
+    },
     SelectRoom {
         request_id: RequestId,
         room_id: RoomId,
@@ -358,7 +376,9 @@ pub enum ClientFrame {
 impl ClientFrame {
     pub fn request_id(&self) -> Option<RequestId> {
         match self {
-            Self::SelectRoom { request_id, .. }
+            Self::SelectServer { request_id, .. }
+            | Self::ResolveServerPrompt { request_id, .. }
+            | Self::SelectRoom { request_id, .. }
             | Self::LoadOlder { request_id, .. }
             | Self::SendMessage { request_id, .. }
             | Self::EditMessage { request_id, .. }
@@ -648,6 +668,12 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         return Err("request id must be nonzero".into());
     }
     match frame {
+        ClientFrame::SelectServer { label, .. } => {
+            super::model::check_nonempty_string(label)?;
+        }
+        ClientFrame::ResolveServerPrompt { attempt_id, .. } if *attempt_id == 0 => {
+            return Err("server selection prompt attempt id must be nonzero".into());
+        }
         ClientFrame::SendMessage { body, .. } | ClientFrame::EditMessage { body, .. } => {
             if body.len() > super::MAX_MESSAGE_BODY_BYTES {
                 return Err("message body exceeds limit".into());
@@ -801,6 +827,10 @@ fn validate_delta(delta: &StateDelta) -> Result<(), String> {
         StateDelta::ConnectionChanged { active_server, .. } => {
             super::model::check_opt_string(active_server)
         }
+        StateDelta::LocalIdentityChanged { local_identity } => {
+            super::model::check_opt_string(local_identity)
+        }
+        StateDelta::ServerSelectionChanged { selection } => selection.validate(),
         StateDelta::RoomCatalogReset { rooms } => {
             if rooms.len() > super::MAX_ROOMS {
                 return Err("room collection exceeds limit".into());
@@ -1003,6 +1033,15 @@ mod tests {
         let room_id = RoomId(2);
         let transfer_id = BulkTransferId(3);
         let frames = vec![
+            ClientFrame::SelectServer {
+                request_id,
+                label: "work".into(),
+            },
+            ClientFrame::ResolveServerPrompt {
+                request_id,
+                attempt_id: 7,
+                accept: true,
+            },
             ClientFrame::SelectRoom {
                 request_id,
                 room_id,
@@ -1118,6 +1157,56 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_server_selection_requests() {
+        assert!(
+            encode_client(&ClientFrame::SelectServer {
+                request_id: RequestId(1),
+                label: String::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            encode_client(&ClientFrame::ResolveServerPrompt {
+                request_id: RequestId(1),
+                attempt_id: 0,
+                accept: false,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_duplicate_server_selection_state() {
+        let server = super::super::model::ServerSummary {
+            label: "work".into(),
+            username: "alice".into(),
+            tcp_addr: "127.0.0.1:4000".into(),
+            require_native_encryption: true,
+            availability: super::super::model::ServerAvailability::Ready,
+        };
+        let selection = ServerSelectionState {
+            servers: vec![server.clone(), server],
+            error: Some(super::super::model::ServerSelectionError {
+                label: Some("work".into()),
+                message: "failed".into(),
+            }),
+            prompt: Some(
+                super::super::model::ServerSelectionPrompt::AllowExternalSecureLink {
+                    label: "work".into(),
+                    attempt_id: 1,
+                },
+            ),
+        };
+        let frame = DaemonFrame::Event(StateEvent {
+            instance_id: DaemonInstanceId([1; 16]),
+            event_seq: 1,
+            delta: StateDelta::ServerSelectionChanged { selection },
+        });
+
+        assert!(encode_daemon(&frame).is_err());
+    }
+
+    #[test]
     fn every_phase_one_daemon_frame_round_trips() {
         let request_id = RequestId(1);
         let transfer_id = BulkTransferId(3);
@@ -1157,6 +1246,7 @@ mod tests {
                 snapshot: StateSnapshot {
                     connection: ConnectionState::Online,
                     active_server: Some("local".into()),
+                    server_selection: Default::default(),
                     local_identity: Some("alice".into()),
                     rooms: Vec::new(),
                     selected_room: None,
@@ -1174,6 +1264,13 @@ mod tests {
             DaemonFrame::Event(StateEvent {
                 instance_id,
                 event_seq: 2,
+                delta: StateDelta::LocalIdentityChanged {
+                    local_identity: Some("bob".into()),
+                },
+            }),
+            DaemonFrame::Event(StateEvent {
+                instance_id,
+                event_seq: 3,
                 delta: StateDelta::DaemonStopping,
             }),
             DaemonFrame::RequestResult(RequestResult {
@@ -1210,7 +1307,7 @@ mod tests {
             },
             DaemonFrame::Event(StateEvent {
                 instance_id,
-                event_seq: 3,
+                event_seq: 4,
                 delta: StateDelta::MessageUpserted {
                     message: Message {
                         room_id: RoomId(2),

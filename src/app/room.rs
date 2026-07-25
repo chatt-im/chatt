@@ -321,11 +321,7 @@ impl RoomShared {
     /// Classifies a message from its already-resolved record. All provenance
     /// and verification lookups are hash based, keeping bulk relabeling O(1)
     /// per message and O(n) for the room.
-    fn message_is_unverified(
-        &self,
-        message: &ChatMessage,
-        local_user: Option<UserId>,
-    ) -> bool {
+    fn message_is_unverified(&self, message: &ChatMessage, local_user: Option<UserId>) -> bool {
         if !self.e2e_room || Some(message.sender) == local_user {
             return false;
         }
@@ -2436,6 +2432,14 @@ impl RoomSession {
             .collect()
     }
 
+    pub(crate) fn has_active_transfers(&self) -> bool {
+        self.rooms.values().any(|room| {
+            room.transfers
+                .values()
+                .any(|transfer| matches!(transfer, TransferStatus::Active(_)))
+        })
+    }
+
     /// Every known room in id order: `(room_id, meta)`.
     pub(crate) fn room_metas(&self) -> impl Iterator<Item = (RoomId, &RoomMeta)> {
         self.metas.iter().map(|(room_id, meta)| (*room_id, meta))
@@ -4067,7 +4071,9 @@ mod tests {
         let id = FileTransferId(7);
         room.upsert_room(&room_info(1), None);
         assert!(room.set_viewed_room(RoomId(1)));
+        assert!(!room.has_active_transfers());
         room.transfer_progress(RoomId(1), id, 0, 100, TransferDirection::Incoming);
+        assert!(room.has_active_transfers());
         assert_eq!(active_progress(&room, id).transferred, 0);
         assert_eq!(active_progress(&room, id).total, 100);
         room.transfer_progress(RoomId(1), id, 40, 100, TransferDirection::Incoming);
@@ -4077,6 +4083,7 @@ mod tests {
         room.transfer_progress(RoomId(1), id, 100, 100, TransferDirection::Incoming);
         assert_eq!(active_progress(&room, id).transferred, 100);
         room.clear_transfer(RoomId(1), id);
+        assert!(!room.has_active_transfers());
         assert!(room.transfer(id).is_none());
     }
 
@@ -4100,6 +4107,7 @@ mod tests {
                 reason: Some("Sender aborted transfer".to_string()),
             })
         );
+        assert!(!room.has_active_transfers());
     }
 
     #[test]

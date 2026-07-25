@@ -8,7 +8,8 @@ use local_rpc::{
     model::{
         AttachmentDescriptor, AttachmentId, CommandCandidate, CommandCandidateKind,
         CommandOutputLine, ConnectionState, MediaKind, Message, RequestId, RoomKind, RoomSnapshot,
-        RoomSummary, StateSnapshot, TrustState, VoiceState,
+        RoomSummary, ServerAvailability, ServerSelectionState, ServerSummary, StateSnapshot,
+        TrustState, VoiceState,
     },
 };
 
@@ -51,12 +52,63 @@ pub(crate) struct RpcHistoryPage {
 
 impl App {
     pub(crate) fn register_rpc_client(&mut self, client_id: ClientId) {
+        self.rpc_clients.insert(client_id);
         if let Some(room_id) = self.room.viewed_room {
             self.room.prepare_client_view(client_id, room_id);
         }
     }
 
+    pub(crate) fn reconcile_rpc_client_views(&mut self) {
+        let Some(fallback_room) = self.room.viewed_room else {
+            return;
+        };
+        let clients = self.rpc_clients.iter().copied().collect::<Vec<_>>();
+        for client_id in clients {
+            let selection_is_accessible = self
+                .room
+                .selected_room_for(client_id)
+                .is_some_and(|room_id| self.room.room_meta(room_id).is_some());
+            if !selection_is_accessible {
+                self.room.prepare_client_view(client_id, fallback_room);
+            }
+        }
+    }
+
     pub(crate) fn rpc_snapshot(&self, client_id: ClientId) -> StateSnapshot {
+        let issue = self
+            .rpc_server_selection_issue
+            .as_ref()
+            .filter(|issue| issue.owner == client_id)
+            .map(|issue| issue.issue.clone());
+        let server_selection = ServerSelectionState {
+            servers: self
+                .config
+                .servers
+                .iter()
+                .map(|server| ServerSummary {
+                    label: server.label.clone(),
+                    username: server.username.clone(),
+                    tcp_addr: server.tcp_addr.clone(),
+                    require_native_encryption: server.require_native_encryption,
+                    availability: if server
+                        .token
+                        .starts_with(rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX)
+                    {
+                        ServerAvailability::PairingIncomplete
+                    } else {
+                        ServerAvailability::Ready
+                    },
+                })
+                .collect(),
+            error: issue.as_ref().and_then(|issue| match issue {
+                super::RpcServerSelectionIssue::Error(error) => Some(error.clone()),
+                super::RpcServerSelectionIssue::Prompt(_) => None,
+            }),
+            prompt: issue.and_then(|issue| match issue {
+                super::RpcServerSelectionIssue::Error(_) => None,
+                super::RpcServerSelectionIssue::Prompt(prompt) => Some(prompt),
+            }),
+        };
         let selected_room = self.room.selected_room_for(client_id);
         let rooms = self
             .room
@@ -116,6 +168,7 @@ impl App {
             active_server: self.room.active_server_label.clone().or_else(|| {
                 (!self.room.server_alias.is_empty()).then(|| self.room.server_alias.clone())
             }),
+            server_selection,
             local_identity: (!self.room.local_username.is_empty())
                 .then(|| self.room.local_username.clone()),
             rooms,
@@ -317,6 +370,16 @@ impl App {
         frame: ClientFrame,
     ) -> RpcCommandEffect {
         match frame {
+            ClientFrame::SelectServer { request_id, label } => {
+                RpcCommandEffect::Reply(self.rpc_select_server(client_id, request_id, label))
+            }
+            ClientFrame::ResolveServerPrompt {
+                request_id,
+                attempt_id,
+                accept,
+            } => RpcCommandEffect::Reply(
+                self.rpc_resolve_server_prompt(client_id, request_id, attempt_id, accept),
+            ),
             ClientFrame::Ping { request_id, nonce } => RpcCommandEffect::Pong(request_id, nonce),
             ClientFrame::RequestSnapshot { request_id } => RpcCommandEffect::Snapshot(request_id),
             ClientFrame::Disconnect { request_id } => {
@@ -659,6 +722,117 @@ impl App {
         }
     }
 
+    fn rpc_select_server(
+        &mut self,
+        client_id: ClientId,
+        request_id: RequestId,
+        label: String,
+    ) -> RequestResult {
+        if self
+            .rpc_server_selection_issue
+            .as_ref()
+            .is_some_and(|issue| issue.owner == client_id)
+        {
+            self.rpc_server_selection_issue = None;
+        }
+        let Some(server) = self
+            .config
+            .servers
+            .iter()
+            .find(|server| server.label == label)
+        else {
+            return rejected(
+                request_id,
+                Operation::SelectServer,
+                404,
+                "server is not configured",
+            );
+        };
+        if server
+            .token
+            .starts_with(rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX)
+        {
+            return rejected(
+                request_id,
+                Operation::SelectServer,
+                409,
+                "server pairing is incomplete; finish pairing in the terminal client",
+            );
+        }
+        if self.room.active_server_label.as_deref() == Some(label.as_str())
+            && self.network.is_some()
+        {
+            return accepted(request_id, Operation::SelectServer);
+        }
+        if self.room.has_active_transfers() {
+            return rejected(
+                request_id,
+                Operation::SelectServer,
+                409,
+                super::SERVER_SWITCH_TRANSFER_BLOCKED,
+            );
+        }
+        if self.start_connection(&label, client_id) {
+            accepted(request_id, Operation::SelectServer)
+        } else {
+            rejected(
+                request_id,
+                Operation::SelectServer,
+                503,
+                "failed to start the server connection",
+            )
+        }
+    }
+
+    fn rpc_resolve_server_prompt(
+        &mut self,
+        client_id: ClientId,
+        request_id: RequestId,
+        attempt_id: u64,
+        accept_prompt: bool,
+    ) -> RequestResult {
+        let current = self
+            .rpc_server_selection_issue
+            .as_ref()
+            .filter(|issue| issue.owner == client_id)
+            .and_then(|issue| match &issue.issue {
+                super::RpcServerSelectionIssue::Prompt(
+                    local_rpc::model::ServerSelectionPrompt::AllowExternalSecureLink {
+                        attempt_id,
+                        ..
+                    },
+                ) => Some(*attempt_id),
+                super::RpcServerSelectionIssue::Error(_) => None,
+            });
+        if current != Some(attempt_id) {
+            return rejected(
+                request_id,
+                Operation::ResolveServerPrompt,
+                409,
+                "server selection prompt is stale",
+            );
+        }
+
+        let previous = std::mem::replace(&mut self.command_client, client_id);
+        let resolved = if accept_prompt {
+            self.accept_native_encryption_warning_for(attempt_id)
+        } else {
+            self.cancel_native_encryption_warning_for(attempt_id);
+            true
+        };
+        self.command_client = previous;
+        if resolved {
+            accepted(request_id, Operation::ResolveServerPrompt)
+        } else {
+            rejected(
+                request_id,
+                Operation::ResolveServerPrompt,
+                500,
+                "could not apply the server security preference",
+            )
+        }
+    }
+
     fn rpc_owns_message(&self, room_id: RoomId, target: rpc::ids::MessageId) -> bool {
         self.room
             .resident_message(room_id, target)
@@ -828,6 +1002,127 @@ mod tests {
         ids::UserId,
     };
 
+    fn app_with_server(label: &str, token: &str, require_native_encryption: bool) -> App {
+        let mut config = crate::config::Config::default();
+        config.servers.push(crate::config::ServerEntry {
+            label: label.into(),
+            username: "alice".into(),
+            tcp_addr: "127.0.0.1:4000".into(),
+            udp_addr: "127.0.0.1:4000".into(),
+            token: token.into(),
+            require_native_encryption,
+            ..Default::default()
+        });
+        App::new(config, None).unwrap()
+    }
+
+    #[test]
+    fn rpc_snapshot_projects_safe_server_catalog_and_pairing_state() {
+        let app = app_with_server(
+            "work",
+            &format!("{}pending", rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX),
+            false,
+        );
+
+        let snapshot = app.rpc_snapshot(ClientId(7));
+
+        assert_eq!(snapshot.server_selection.servers.len(), 1);
+        let server = &snapshot.server_selection.servers[0];
+        assert_eq!(server.label, "work");
+        assert_eq!(server.username, "alice");
+        assert_eq!(server.tcp_addr, "127.0.0.1:4000");
+        assert!(!server.require_native_encryption);
+        assert_eq!(server.availability, ServerAvailability::PairingIncomplete);
+    }
+
+    #[test]
+    fn rpc_rejects_unknown_and_incomplete_server_selection() {
+        let mut app = app_with_server(
+            "work",
+            &format!("{}pending", rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX),
+            true,
+        );
+
+        for (request_id, label, expected_code) in [(1, "missing", 404), (2, "work", 409)] {
+            let RpcCommandEffect::Reply(result) = app.handle_rpc_frame(
+                ClientId(7),
+                ClientFrame::SelectServer {
+                    request_id: RequestId(request_id),
+                    label: label.into(),
+                },
+            ) else {
+                panic!("expected request result");
+            };
+            assert_eq!(result.operation, Operation::SelectServer);
+            assert!(matches!(
+                result.outcome,
+                RequestOutcome::Rejected { code, .. } if code == expected_code
+            ));
+        }
+        assert!(app.network.is_none());
+    }
+
+    #[test]
+    fn rpc_selects_ready_server_and_projects_connecting_state() {
+        let mut app = app_with_server("work", "token", true);
+        let client_id = ClientId(7);
+        app.register_rpc_client(client_id);
+
+        let RpcCommandEffect::Reply(result) = app.handle_rpc_frame(
+            client_id,
+            ClientFrame::SelectServer {
+                request_id: RequestId(1),
+                label: "work".into(),
+            },
+        ) else {
+            panic!("expected request result");
+        };
+
+        assert_eq!(result.outcome, RequestOutcome::Accepted);
+        let snapshot = app.rpc_snapshot(client_id);
+        assert_eq!(snapshot.active_server.as_deref(), Some("work"));
+        assert_eq!(snapshot.connection, ConnectionState::Connecting);
+        assert!(app.network.is_some());
+    }
+
+    #[test]
+    fn rpc_server_prompt_is_owner_scoped_and_cancel_is_stale_safe() {
+        let mut app = app_with_server("legacy", "token", true);
+        let owner = ClientId(7);
+        let observer = ClientId(8);
+        app.register_rpc_client(owner);
+        app.register_rpc_client(observer);
+        app.connection_attempt = Some(super::super::ConnectionAttempt {
+            generation: 11,
+            owner,
+            server_label: "legacy".into(),
+        });
+        app.rpc_server_selection_issue = Some(super::super::OwnedRpcServerSelectionIssue {
+            owner,
+            issue: super::super::RpcServerSelectionIssue::Prompt(
+                local_rpc::model::ServerSelectionPrompt::AllowExternalSecureLink {
+                    label: "legacy".into(),
+                    attempt_id: 11,
+                },
+            ),
+        });
+
+        assert!(app.rpc_snapshot(owner).server_selection.prompt.is_some());
+        assert!(app.rpc_snapshot(observer).server_selection.prompt.is_none());
+
+        let stale = app.rpc_resolve_server_prompt(owner, RequestId(1), 10, false);
+        assert!(matches!(
+            stale.outcome,
+            RequestOutcome::Rejected { code: 409, .. }
+        ));
+        assert!(app.connection_attempt.is_some());
+
+        let canceled = app.rpc_resolve_server_prompt(owner, RequestId(2), 11, false);
+        assert_eq!(canceled.outcome, RequestOutcome::Accepted);
+        assert!(app.connection_attempt.is_none());
+        assert!(app.rpc_snapshot(owner).server_selection.prompt.is_none());
+    }
+
     #[test]
     fn rpc_frontends_keep_independent_selected_rooms() {
         let mut app = App::new(crate::config::Config::default(), None).unwrap();
@@ -877,6 +1172,109 @@ mod tests {
         assert_eq!(app.rpc_snapshot(first).selected_room, Some(RoomId(2)));
         assert_eq!(app.rpc_snapshot(second).selected_room, Some(RoomId(1)));
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+    }
+
+    #[test]
+    fn rpc_frontends_inherit_authenticated_room_and_preserve_valid_independent_views() {
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
+        let first = ClientId(1);
+        let second = ClientId(2);
+        app.register_rpc_client(first);
+        app.register_rpc_client(second);
+        let rooms = vec![
+            RoomInfo {
+                room_id: RoomId(1),
+                name: "one".into(),
+                kind: WireRoomKind::Public,
+                head: None,
+                voice_users: Vec::new(),
+            },
+            RoomInfo {
+                room_id: RoomId(2),
+                name: "two".into(),
+                kind: WireRoomKind::Public,
+                head: None,
+                voice_users: Vec::new(),
+            },
+        ];
+        let users = || {
+            vec![UserSummary {
+                user_id: UserId(1),
+                username: "alice".into(),
+                online: true,
+                connected_at_ms: 1,
+                voice_status: ParticipantVoiceStatus::default(),
+            }]
+        };
+
+        app.room
+            .authenticated(&rooms, users(), RoomId(1), Some(RoomId(2)), Some(UserId(1)));
+        app.reconcile_rpc_client_views();
+
+        assert_eq!(app.rpc_snapshot(first).selected_room, Some(RoomId(2)));
+        assert_eq!(app.rpc_snapshot(second).selected_room, Some(RoomId(2)));
+
+        assert!(app.room.prepare_client_view(first, RoomId(1)));
+        app.room
+            .authenticated(&rooms, users(), RoomId(1), Some(RoomId(2)), Some(UserId(1)));
+        app.reconcile_rpc_client_views();
+
+        assert_eq!(app.rpc_snapshot(first).selected_room, Some(RoomId(1)));
+        assert_eq!(app.rpc_snapshot(second).selected_room, Some(RoomId(2)));
+
+        app.room.authenticated(
+            &rooms[1..],
+            users(),
+            RoomId(2),
+            Some(RoomId(2)),
+            Some(UserId(1)),
+        );
+        app.reconcile_rpc_client_views();
+
+        assert_eq!(app.rpc_snapshot(first).selected_room, Some(RoomId(2)));
+        assert_eq!(app.rpc_snapshot(second).selected_room, Some(RoomId(2)));
+    }
+
+    #[test]
+    fn rpc_server_switch_rejects_active_transfer_without_disconnecting() {
+        let mut app = app_with_server("work", "token", true);
+        app.room.authenticated(
+            &[RoomInfo {
+                room_id: RoomId(1),
+                name: "one".into(),
+                kind: WireRoomKind::Public,
+                head: None,
+                voice_users: Vec::new(),
+            }],
+            Vec::new(),
+            RoomId(1),
+            None,
+            None,
+        );
+        app.room.transfer_progress(
+            RoomId(1),
+            rpc::ids::FileTransferId(9),
+            10,
+            100,
+            crate::client_net::TransferDirection::Outgoing,
+        );
+
+        let RpcCommandEffect::Reply(result) = app.handle_rpc_frame(
+            ClientId(7),
+            ClientFrame::SelectServer {
+                request_id: RequestId(1),
+                label: "work".into(),
+            },
+        ) else {
+            panic!("expected request result");
+        };
+
+        assert!(matches!(
+            result.outcome,
+            RequestOutcome::Rejected { code: 409, ref message }
+                if message == super::super::SERVER_SWITCH_TRANSFER_BLOCKED
+        ));
+        assert!(app.network.is_none());
     }
 
     #[test]
