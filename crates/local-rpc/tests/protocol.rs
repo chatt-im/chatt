@@ -7,21 +7,22 @@ use local_rpc::{
     frame::{ClientFrame, ClientHello, DaemonFrame, NegotiatedLimits, Welcome},
     ids::StreamId,
     model::{
-        BulkTransferId, ConnectionState, DaemonInstanceId, RequestId, StateSnapshot, VoiceState,
+        BulkTransferId, ConnectionState, DaemonInstanceId, RequestId, ServerAvailability,
+        ServerSelectionState, ServerSummary, StateSnapshot, VoiceState,
     },
     unix::{FrameReader, FrameWriter},
 };
 
 #[test]
-fn renderer_and_daemon_exchange_protocol_v7_frames_and_live_share_fd() {
-    assert_eq!(PROTOCOL_MIN_VERSION, 7);
-    assert_eq!(PROTOCOL_MAX_VERSION, 7);
+fn renderer_and_daemon_exchange_protocol_v8_frames_and_live_share_fd() {
+    assert_eq!(PROTOCOL_MIN_VERSION, 8);
+    assert_eq!(PROTOCOL_MAX_VERSION, 8);
     assert_eq!(MAX_MESSAGE_BODY_BYTES, 8 * 1024);
     assert_eq!(DEFAULT_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
     assert_eq!(MAX_HISTORY_REQUEST_MESSAGES, 500);
 
     let hello = ClientHello::current("test-renderer");
-    assert_eq!(hello.negotiated_version(), Some(7));
+    assert_eq!(hello.negotiated_version(), Some(8));
 
     let (daemon_socket, renderer_socket) = UnixStream::pair().unwrap();
     let mut daemon_reader = FrameReader::new(daemon_socket.try_clone().unwrap());
@@ -48,12 +49,30 @@ fn renderer_and_daemon_exchange_protocol_v7_frames_and_live_share_fd() {
     renderer_writer.send_client(&request).unwrap();
     assert_eq!(daemon_reader.recv_client().unwrap(), request);
 
+    let select = ClientFrame::SelectServer {
+        request_id: RequestId(2),
+        label: "test-server".into(),
+    };
+    renderer_writer.send_client(&select).unwrap();
+    assert_eq!(daemon_reader.recv_client().unwrap(), select);
+
     let snapshot = DaemonFrame::Snapshot {
         instance_id: DaemonInstanceId([1; 16]),
         event_seq: 1,
         snapshot: StateSnapshot {
             connection: ConnectionState::Online,
             active_server: Some("test-server".into()),
+            server_selection: ServerSelectionState {
+                servers: vec![ServerSummary {
+                    label: "test-server".into(),
+                    username: "alice".into(),
+                    tcp_addr: "127.0.0.1:4000".into(),
+                    require_native_encryption: true,
+                    availability: ServerAvailability::Ready,
+                }],
+                error: None,
+                prompt: None,
+            },
             local_identity: Some("alice".into()),
             rooms: Vec::new(),
             selected_room: None,

@@ -2106,11 +2106,8 @@ impl Config {
     pub(crate) fn load_runtime_document(&self) -> Result<RuntimeDocument, String> {
         let path = self.runtime_path()?;
         let (content, revision, source_exists) = runtime_source_at(&path)?;
-        let outcome = Self::collect_content(
-            content,
-            path.display().to_string(),
-            Some(path.clone()),
-        )?;
+        let outcome =
+            Self::collect_content(content, path.display().to_string(), Some(path.clone()))?;
         let errors = outcome.diagnostics.iter().filter(|diag| diag.error).count();
         match outcome.config {
             Some(mut config) if errors == 0 => {
@@ -2164,8 +2161,7 @@ impl Config {
     }
 
     fn runtime_source(&self) -> Result<(String, u64), String> {
-        runtime_source_at(&self.runtime_path()?)
-            .map(|(content, revision, _)| (content, revision))
+        runtime_source_at(&self.runtime_path()?).map(|(content, revision, _)| (content, revision))
     }
 
     /// Serializes the runtime config, reusing the comments, key order, and

@@ -57,8 +57,7 @@ struct ControlSpec {
 enum FieldAccess {
     Audio {
         read: fn(&config::AudioConfig) -> wire::SettingsValue,
-        write:
-            fn(&mut config::AudioConfig, &wire::SettingsValue) -> Result<(), String>,
+        write: fn(&mut config::AudioConfig, &wire::SettingsValue) -> Result<(), String>,
     },
     Config {
         read: fn(&config::Config) -> wire::SettingsValue,
@@ -86,11 +85,7 @@ impl FieldSpec {
         }
     }
 
-    fn write(
-        self,
-        config: &mut config::Config,
-        value: &wire::SettingsValue,
-    ) -> Result<(), String> {
+    fn write(self, config: &mut config::Config, value: &wire::SettingsValue) -> Result<(), String> {
         match self.access {
             FieldAccess::Audio { write, .. } => write(&mut config.audio, value),
             FieldAccess::Config { write, .. } => write(config, value),
@@ -723,7 +718,6 @@ impl App {
             diagnostics,
         }
     }
-
 }
 
 fn device_choices(
@@ -737,8 +731,7 @@ fn device_choices(
             let selection = current
                 .as_ref()
                 .filter(|current| {
-                    device.selection.as_ref() == Some(*current)
-                        || device.aliases.contains(*current)
+                    device.selection.as_ref() == Some(*current) || device.aliases.contains(*current)
                 })
                 .cloned()
                 .or_else(|| device.selection.clone());
@@ -887,9 +880,7 @@ const fn dynamic_choice_control(
     }
 }
 
-const fn choice_control(
-    choices: &'static [(&'static str, &'static str)],
-) -> ControlSpec {
+const fn choice_control(choices: &'static [(&'static str, &'static str)]) -> ControlSpec {
     ControlSpec {
         kind: wire::CONTROL_CHOICE,
         choices: ChoiceSpec::Static(choices),
@@ -1056,35 +1047,59 @@ const DATA_SECTIONS: &[SectionSpec] = &[
 
 const DATA_FIELDS: &[FieldSpec] = &[
     audio_spec!(
-        1, "audio.input-device-id", "Microphone",
-        "System default follows operating-system device changes.", 0,
+        1,
+        "audio.input-device-id",
+        "Microphone",
+        "System default follows operating-system device changes.",
+        0,
         dynamic_choice_control(
             input_device_choices,
             refresh_audio_device_choices,
             "Search microphones"
         ),
         |audio| wire::SettingsValue::Text(audio.input_device_id.clone().unwrap_or_default()),
-        |audio, value| { audio.input_device_id = optional_text(value)?; Ok(()) }
+        |audio, value| {
+            audio.input_device_id = optional_text(value)?;
+            Ok(())
+        }
     ),
     audio_spec!(
-        2, "audio.output-device-id", "Speakers",
-        "System default follows operating-system device changes.", 0,
+        2,
+        "audio.output-device-id",
+        "Speakers",
+        "System default follows operating-system device changes.",
+        0,
         dynamic_choice_control(
             output_device_choices,
             refresh_audio_device_choices,
             "Search output devices"
         ),
         |audio| wire::SettingsValue::Text(audio.output_device_id.clone().unwrap_or_default()),
-        |audio, value| { audio.output_device_id = optional_text(value)?; Ok(()) }
+        |audio, value| {
+            audio.output_device_id = optional_text(value)?;
+            Ok(())
+        }
     ),
     audio_float!(
-        3, "audio.output-volume", "Output volume",
-        "Playback gain, from 0 through 130 percent.", 0,
-        number_control(Some(0.0), Some(config::MAX_OUTPUT_VOLUME_PERCENT), Some(1.0), "%"),
+        3,
+        "audio.output-volume",
+        "Output volume",
+        "Playback gain, from 0 through 130 percent.",
+        0,
+        number_control(
+            Some(0.0),
+            Some(config::MAX_OUTPUT_VOLUME_PERCENT),
+            Some(1.0),
+            "%"
+        ),
         output_volume
     ),
     audio_spec!(
-        4, "audio.bitrate-bps", "Voice bitrate", "Opus voice bitrate in bits per second.", 0,
+        4,
+        "audio.bitrate-bps",
+        "Voice bitrate",
+        "Opus voice bitrate in bits per second.",
+        0,
         number_control(Some(8_000.0), Some(96_000.0), Some(1_000.0), "bps"),
         |audio| wire::SettingsValue::Signed(i64::from(audio.bitrate_bps)),
         |audio, value| {
@@ -1094,9 +1109,16 @@ const DATA_FIELDS: &[FieldSpec] = &[
         }
     ),
     audio_spec!(
-        5, "audio.denoise", "Noise suppression",
-        "RNNoise is the default high-quality microphone denoiser.", 0,
-        choice_control(&[("none", "off"), ("spectral", "spectral"), ("rnnoise", "RNNoise")]),
+        5,
+        "audio.denoise",
+        "Noise suppression",
+        "RNNoise is the default high-quality microphone denoiser.",
+        0,
+        choice_control(&[
+            ("none", "off"),
+            ("spectral", "spectral"),
+            ("rnnoise", "RNNoise")
+        ]),
         |audio| wire::SettingsValue::Text(denoise_name(audio.denoise).into()),
         |audio, value| {
             audio.denoise = match text(value)? {
@@ -1109,8 +1131,11 @@ const DATA_FIELDS: &[FieldSpec] = &[
         }
     ),
     audio_spec!(
-        6, "audio.dred", "Packet-loss recovery",
-        "Adds in-band redundancy that peers can use after packet loss.", wire::FIELD_ADVANCED,
+        6,
+        "audio.dred",
+        "Packet-loss recovery",
+        "Adds in-band redundancy that peers can use after packet loss.",
+        wire::FIELD_ADVANCED,
         choice_control(&[("off", "off"), ("auto", "auto"), ("on", "on")]),
         |audio| wire::SettingsValue::Text(dred_name(audio.dred).into()),
         |audio, value| {
@@ -1124,77 +1149,175 @@ const DATA_FIELDS: &[FieldSpec] = &[
         }
     ),
     audio_bool!(
-        7, "audio.echo-cancellation", "Echo cancellation",
-        "Useful when speakers can feed back into the microphone.", 0, echo_cancellation
+        7,
+        "audio.echo-cancellation",
+        "Echo cancellation",
+        "Useful when speakers can feed back into the microphone.",
+        0,
+        echo_cancellation
     ),
     audio_float!(
-        8, "audio.max-amplification", "Automatic gain ceiling",
-        "Maximum adaptive microphone gain in decibels.", 0,
+        8,
+        "audio.max-amplification",
+        "Automatic gain ceiling",
+        "Maximum adaptive microphone gain in decibels.",
+        0,
         number_control(
             Some(settings::MAX_AMPLIFICATION_DB_RANGE.0),
             Some(settings::MAX_AMPLIFICATION_DB_RANGE.1),
-            Some(1.0), "dB"
+            Some(1.0),
+            "dB"
         ),
         max_amplification
     ),
     audio_float!(
-        9, "audio.denoise-suppression", "RNNoise suppression",
-        "Advanced RNNoise shaping.", wire::FIELD_ADVANCED,
-        number_control(None, None, Some(0.05), ""), denoise_suppression
+        9,
+        "audio.denoise-suppression",
+        "RNNoise suppression",
+        "Advanced RNNoise shaping.",
+        wire::FIELD_ADVANCED,
+        number_control(None, None, Some(0.05), ""),
+        denoise_suppression
     ),
     audio_float!(
-        10, "audio.denoise-release", "RNNoise release",
-        "Advanced RNNoise shaping.", wire::FIELD_ADVANCED,
-        number_control(None, None, Some(0.05), ""), denoise_release
+        10,
+        "audio.denoise-release",
+        "RNNoise release",
+        "Advanced RNNoise shaping.",
+        wire::FIELD_ADVANCED,
+        number_control(None, None, Some(0.05), ""),
+        denoise_release
     ),
     audio_bool!(
-        11, "audio.denoise-typing-suppression", "Typing suppression",
-        "Advanced keyboard-noise gate.", wire::FIELD_ADVANCED, denoise_typing_suppression
+        11,
+        "audio.denoise-typing-suppression",
+        "Typing suppression",
+        "Advanced keyboard-noise gate.",
+        wire::FIELD_ADVANCED,
+        denoise_typing_suppression
     ),
     audio_float!(
-        12, "audio.denoise-typing-vad-enter", "Typing VAD enter",
-        "Advanced keyboard-noise gate.", wire::FIELD_ADVANCED,
-        number_control(Some(0.0), Some(1.0), Some(0.01), ""), denoise_typing_vad_enter
+        12,
+        "audio.denoise-typing-vad-enter",
+        "Typing VAD enter",
+        "Advanced keyboard-noise gate.",
+        wire::FIELD_ADVANCED,
+        number_control(Some(0.0), Some(1.0), Some(0.01), ""),
+        denoise_typing_vad_enter
     ),
     audio_float!(
-        13, "audio.denoise-typing-vad-release", "Typing VAD release",
-        "Advanced keyboard-noise gate.", wire::FIELD_ADVANCED,
-        number_control(Some(0.0), Some(1.0), Some(0.01), ""), denoise_typing_vad_release
+        13,
+        "audio.denoise-typing-vad-release",
+        "Typing VAD release",
+        "Advanced keyboard-noise gate.",
+        wire::FIELD_ADVANCED,
+        number_control(Some(0.0), Some(1.0), Some(0.01), ""),
+        denoise_typing_vad_release
     ),
     audio_spec!(
-        14, "audio.input-buffer.samples", "Input buffer",
-        "Use default unless diagnosing a device-period problem.", wire::FIELD_ADVANCED,
+        14,
+        "audio.input-buffer.samples",
+        "Input buffer",
+        "Use default unless diagnosing a device-period problem.",
+        wire::FIELD_ADVANCED,
         text_control(wire::CONTROL_TEXT, "default or 32-8192"),
         |audio| wire::SettingsValue::Text(buffer_text(audio.input_buffer)),
-        |audio, value| { audio.input_buffer = parse_buffer(text(value)?)?; Ok(()) }
+        |audio, value| {
+            audio.input_buffer = parse_buffer(text(value)?)?;
+            Ok(())
+        }
     ),
     audio_spec!(
-        15, "audio.output-buffer.samples", "Output buffer",
-        "Use default unless diagnosing a device-period problem.", wire::FIELD_ADVANCED,
+        15,
+        "audio.output-buffer.samples",
+        "Output buffer",
+        "Use default unless diagnosing a device-period problem.",
+        wire::FIELD_ADVANCED,
         text_control(wire::CONTROL_TEXT, "default or 32-8192"),
         |audio| wire::SettingsValue::Text(buffer_text(audio.output_buffer)),
-        |audio, value| { audio.output_buffer = parse_buffer(text(value)?)?; Ok(()) }
+        |audio, value| {
+            audio.output_buffer = parse_buffer(text(value)?)?;
+            Ok(())
+        }
     ),
     audio_bool!(
-        16, "audio.latency.capture-silence-gate", "Capture silence gate",
-        "Advanced live-audio latency tuning.", wire::FIELD_ADVANCED,
+        16,
+        "audio.latency.capture-silence-gate",
+        "Capture silence gate",
+        "Advanced live-audio latency tuning.",
+        wire::FIELD_ADVANCED,
         latency.capture_silence_gate
     ),
     audio_bool!(
-        17, "audio.latency.render-assist", "Render assist",
-        "Advanced live-audio latency tuning.", wire::FIELD_ADVANCED, latency.render_assist
+        17,
+        "audio.latency.render-assist",
+        "Render assist",
+        "Advanced live-audio latency tuning.",
+        wire::FIELD_ADVANCED,
+        latency.render_assist
     ),
-    audio_u64!(18, "audio.latency.neteq-start-delay-ms", "NetEq start delay", "ms", latency.neteq_start_delay_ms),
-    audio_u64!(19, "audio.latency.neteq-min-delay-ms", "NetEq minimum delay", "ms", latency.neteq_min_delay_ms),
-    audio_u64!(20, "audio.latency.neteq-base-minimum-delay-ms", "NetEq base minimum", "ms", latency.neteq_base_minimum_delay_ms),
-    audio_u64!(21, "audio.latency.neteq-max-delay-ms", "NetEq maximum delay", "ms", latency.neteq_max_delay_ms),
-    audio_u64!(22, "audio.latency.hard-queue-bound-ms", "Hard queue bound", "ms", latency.hard_queue_bound_ms),
-    audio_u64!(23, "audio.latency.initial-buffer-ms", "Initial buffer", "ms", latency.initial_buffer_ms),
-    audio_u64!(24, "audio.latency.max-reorder-delay-ms", "Maximum reorder delay", "ms", latency.max_reorder_delay_ms),
-    audio_u64!(25, "audio.latency.device-period-margin-ms", "Device period margin", "ms", latency.device_period_margin_ms),
+    audio_u64!(
+        18,
+        "audio.latency.neteq-start-delay-ms",
+        "NetEq start delay",
+        "ms",
+        latency.neteq_start_delay_ms
+    ),
+    audio_u64!(
+        19,
+        "audio.latency.neteq-min-delay-ms",
+        "NetEq minimum delay",
+        "ms",
+        latency.neteq_min_delay_ms
+    ),
+    audio_u64!(
+        20,
+        "audio.latency.neteq-base-minimum-delay-ms",
+        "NetEq base minimum",
+        "ms",
+        latency.neteq_base_minimum_delay_ms
+    ),
+    audio_u64!(
+        21,
+        "audio.latency.neteq-max-delay-ms",
+        "NetEq maximum delay",
+        "ms",
+        latency.neteq_max_delay_ms
+    ),
+    audio_u64!(
+        22,
+        "audio.latency.hard-queue-bound-ms",
+        "Hard queue bound",
+        "ms",
+        latency.hard_queue_bound_ms
+    ),
+    audio_u64!(
+        23,
+        "audio.latency.initial-buffer-ms",
+        "Initial buffer",
+        "ms",
+        latency.initial_buffer_ms
+    ),
+    audio_u64!(
+        24,
+        "audio.latency.max-reorder-delay-ms",
+        "Maximum reorder delay",
+        "ms",
+        latency.max_reorder_delay_ms
+    ),
+    audio_u64!(
+        25,
+        "audio.latency.device-period-margin-ms",
+        "Device period margin",
+        "ms",
+        latency.device_period_margin_ms
+    ),
     audio_spec!(
-        26, "audio.latency.silence-vad-max", "Silence VAD maximum",
-        "Advanced live-audio latency tuning.", wire::FIELD_ADVANCED,
+        26,
+        "audio.latency.silence-vad-max",
+        "Silence VAD maximum",
+        "Advanced live-audio latency tuning.",
+        wire::FIELD_ADVANCED,
         number_control(Some(0.0), Some(255.0), Some(1.0), ""),
         |audio| wire::SettingsValue::Unsigned(u64::from(audio.latency.silence_vad_max)),
         |audio, value| {
@@ -1203,13 +1326,38 @@ const DATA_FIELDS: &[FieldSpec] = &[
             Ok(())
         }
     ),
-    audio_u64!(27, "audio.latency.capture-long-silence-stop-ms", "Long-silence stop", "ms", latency.capture_long_silence_stop_ms),
-    audio_u64!(28, "audio.latency.capture-silence-preroll-ms", "Silence preroll", "ms", latency.capture_silence_preroll_ms),
-    audio_u64!(29, "audio.latency.capture-silence-ramp-ms", "Silence ramp", "ms", latency.capture_silence_ramp_ms),
+    audio_u64!(
+        27,
+        "audio.latency.capture-long-silence-stop-ms",
+        "Long-silence stop",
+        "ms",
+        latency.capture_long_silence_stop_ms
+    ),
+    audio_u64!(
+        28,
+        "audio.latency.capture-silence-preroll-ms",
+        "Silence preroll",
+        "ms",
+        latency.capture_silence_preroll_ms
+    ),
+    audio_u64!(
+        29,
+        "audio.latency.capture-silence-ramp-ms",
+        "Silence ramp",
+        "ms",
+        latency.capture_silence_ramp_ms
+    ),
     config_spec!(
-        30, 1, "notifications.sounds", "Play sounds",
+        30,
+        1,
+        "notifications.sounds",
+        "Play sounds",
         "Deafen always suppresses notification sounds.",
-        choice_control(&[("never", "never"), ("in-calls", "in calls"), ("always", "always")]),
+        choice_control(&[
+            ("never", "never"),
+            ("in-calls", "in calls"),
+            ("always", "always")
+        ]),
         |config| wire::SettingsValue::Text(notification_name(config.notifications.sounds).into()),
         |config, value| {
             config.notifications.sounds = match text(value)? {
@@ -1222,27 +1370,58 @@ const DATA_FIELDS: &[FieldSpec] = &[
         }
     ),
     config_float!(
-        31, 1, "notifications.message-volume-db", "Message volume",
+        31,
+        1,
+        "notifications.message-volume-db",
+        "Message volume",
         "Relative level in decibels.",
-        number_control(Some(config::MIN_NOTIFICATION_VOLUME_DB), Some(config::MAX_NOTIFICATION_VOLUME_DB), Some(1.0), "dB"),
+        number_control(
+            Some(config::MIN_NOTIFICATION_VOLUME_DB),
+            Some(config::MAX_NOTIFICATION_VOLUME_DB),
+            Some(1.0),
+            "dB"
+        ),
         notifications.message_volume_db
     ),
     config_float!(
-        32, 1, "notifications.peer-join-volume-db", "Peer joined volume",
+        32,
+        1,
+        "notifications.peer-join-volume-db",
+        "Peer joined volume",
         "Relative level in decibels.",
-        number_control(Some(config::MIN_NOTIFICATION_VOLUME_DB), Some(config::MAX_NOTIFICATION_VOLUME_DB), Some(1.0), "dB"),
+        number_control(
+            Some(config::MIN_NOTIFICATION_VOLUME_DB),
+            Some(config::MAX_NOTIFICATION_VOLUME_DB),
+            Some(1.0),
+            "dB"
+        ),
         notifications.peer_join_volume_db
     ),
     config_float!(
-        33, 1, "notifications.peer-leave-volume-db", "Peer left volume",
+        33,
+        1,
+        "notifications.peer-leave-volume-db",
+        "Peer left volume",
         "Relative level in decibels.",
-        number_control(Some(config::MIN_NOTIFICATION_VOLUME_DB), Some(config::MAX_NOTIFICATION_VOLUME_DB), Some(1.0), "dB"),
+        number_control(
+            Some(config::MIN_NOTIFICATION_VOLUME_DB),
+            Some(config::MAX_NOTIFICATION_VOLUME_DB),
+            Some(1.0),
+            "dB"
+        ),
         notifications.peer_leave_volume_db
     ),
     config_spec!(
-        34, 2, "files.download", "Incoming files",
+        34,
+        2,
+        "files.download",
+        "Incoming files",
         "Reject, keep in memory, or persist incoming files.",
-        choice_control(&[("off", "off"), ("memory", "memory"), ("persistent", "persistent")]),
+        choice_control(&[
+            ("off", "off"),
+            ("memory", "memory"),
+            ("persistent", "persistent")
+        ]),
         |config| wire::SettingsValue::Text(download_name(config.files.download).into()),
         |config, value| {
             config.files.download = match text(value)? {
@@ -1255,29 +1434,98 @@ const DATA_FIELDS: &[FieldSpec] = &[
         }
     ),
     config_spec!(
-        35, 2, "files.download-dir", "Download directory",
+        35,
+        2,
+        "files.download-dir",
+        "Download directory",
         "Empty uses the platform downloads directory.",
         text_control(wire::CONTROL_TEXT, "platform default"),
         |config| wire::SettingsValue::Text(config.files.download_dir.clone()),
-        |config, value| { config.files.download_dir = text(value)?.trim().into(); Ok(()) }
+        |config, value| {
+            config.files.download_dir = text(value)?.trim().into();
+            Ok(())
+        }
     ),
-    config_u64!(36, 2, "files.download-memory-mb", "Memory cache", "Shared in-memory ring size in MiB.", 1.0, "MiB", files.download_memory_mb),
-    config_u64!(37, 2, "files.max-download-mb", "Maximum download", "Transfer limit in MiB.", 1.0, "MiB", files.max_download_mb),
-    config_u64!(38, 2, "files.max-upload-mb", "Maximum upload", "Transfer limit in MiB.", 1.0, "MiB", files.max_upload_mb),
-    config_u64!(39, 2, "files.upload-rate-bytes", "Upload rate limit", "Bytes per second; 0 means unlimited.", 0.0, "B/s", files.upload_rate_bytes),
-    config_bool!(40, 2, "history.enabled", "Persist chat history", "Applies to future connections.", history.enabled),
+    config_u64!(
+        36,
+        2,
+        "files.download-memory-mb",
+        "Memory cache",
+        "Shared in-memory ring size in MiB.",
+        1.0,
+        "MiB",
+        files.download_memory_mb
+    ),
+    config_u64!(
+        37,
+        2,
+        "files.max-download-mb",
+        "Maximum download",
+        "Transfer limit in MiB.",
+        1.0,
+        "MiB",
+        files.max_download_mb
+    ),
+    config_u64!(
+        38,
+        2,
+        "files.max-upload-mb",
+        "Maximum upload",
+        "Transfer limit in MiB.",
+        1.0,
+        "MiB",
+        files.max_upload_mb
+    ),
+    config_u64!(
+        39,
+        2,
+        "files.upload-rate-bytes",
+        "Upload rate limit",
+        "Bytes per second; 0 means unlimited.",
+        0.0,
+        "B/s",
+        files.upload_rate_bytes
+    ),
+    config_bool!(
+        40,
+        2,
+        "history.enabled",
+        "Persist chat history",
+        "Applies to future connections.",
+        history.enabled
+    ),
     config_spec!(
-        41, 2, "history.location", "History location",
+        41,
+        2,
+        "history.location",
+        "History location",
         "Empty uses Chatt's platform data directory.",
         text_control(wire::CONTROL_TEXT, "platform default"),
         |config| wire::SettingsValue::Text(config.history.location.clone().unwrap_or_default()),
-        |config, value| { config.history.location = optional_text(value)?; Ok(()) }
+        |config, value| {
+            config.history.location = optional_text(value)?;
+            Ok(())
+        }
     ),
-    config_bool!(42, 3, "p2p.enabled", "Enable P2P", "Attempts direct media paths before falling back to relay.", p2p.enabled),
+    config_bool!(
+        42,
+        3,
+        "p2p.enabled",
+        "Enable P2P",
+        "Attempts direct media paths before falling back to relay.",
+        p2p.enabled
+    ),
     config_spec!(
-        43, 3, "p2p.candidate-privacy", "Local-address privacy",
+        43,
+        3,
+        "p2p.candidate-privacy",
+        "Local-address privacy",
         "mDNS hides literal local IPs from remote peers.",
-        choice_control(&[("mdns", "mDNS"), ("ip-address", "IP address"), ("no-host", "no host candidates")]),
+        choice_control(&[
+            ("mdns", "mDNS"),
+            ("ip-address", "IP address"),
+            ("no-host", "no host candidates")
+        ]),
         |config| wire::SettingsValue::Text(privacy_name(config.p2p.candidate_privacy).into()),
         |config, value| {
             config.p2p.candidate_privacy = match text(value)? {
@@ -1289,30 +1537,71 @@ const DATA_FIELDS: &[FieldSpec] = &[
             Ok(())
         }
     ),
-    config_bool!(44, 3, "p2p.prefer-ipv6", "Prefer IPv6", "Prefer native IPv6 when candidate quality is otherwise equal.", p2p.prefer_ipv6),
-    config_bool!(45, 4, "web.enabled", "Enable browser view", "Starts the optional local browser chat-log server.", web.enabled),
-    config_spec!(
-        46, 4, "web.bind", "Listen address", "IP address and port, such as 127.0.0.1:8080.",
-        text_control(wire::CONTROL_TEXT, "127.0.0.1:8080"),
-        |config| wire::SettingsValue::Text(config.web.bind.clone()),
-        |config, value| { config.web.bind = text(value)?.trim().into(); Ok(()) }
+    config_bool!(
+        44,
+        3,
+        "p2p.prefer-ipv6",
+        "Prefer IPv6",
+        "Prefer native IPv6 when candidate quality is otherwise equal.",
+        p2p.prefer_ipv6
+    ),
+    config_bool!(
+        45,
+        4,
+        "web.enabled",
+        "Enable browser view",
+        "Starts the optional local browser chat-log server.",
+        web.enabled
     ),
     config_spec!(
-        47, 4, "web.allowed-origins", "Allowed origins",
+        46,
+        4,
+        "web.bind",
+        "Listen address",
+        "IP address and port, such as 127.0.0.1:8080.",
+        text_control(wire::CONTROL_TEXT, "127.0.0.1:8080"),
+        |config| wire::SettingsValue::Text(config.web.bind.clone()),
+        |config, value| {
+            config.web.bind = text(value)?.trim().into();
+            Ok(())
+        }
+    ),
+    config_spec!(
+        47,
+        4,
+        "web.allowed-origins",
+        "Allowed origins",
         "HTTP(S) origins without paths; empty derives from the bind address.",
         text_control(wire::CONTROL_TEXT_LIST, "https://example.com"),
         |config| wire::SettingsValue::TextList(config.web.allowed_origins.clone()),
         |config, value| {
             config.web.allowed_origins = text_list(value)?
-                .iter().map(|origin| origin.trim().to_string())
-                .filter(|origin| !origin.is_empty()).collect();
+                .iter()
+                .map(|origin| origin.trim().to_string())
+                .filter(|origin| !origin.is_empty())
+                .collect();
             Ok(())
         }
     ),
-    config_bool!(48, 4, "web.readonly", "Read only", "Prevents browser clients from sending messages or files.", web.readonly),
+    config_bool!(
+        48,
+        4,
+        "web.readonly",
+        "Read only",
+        "Prevents browser clients from sending messages or files.",
+        web.readonly
+    ),
     config_spec!(
-        49, 4, "web.autoplay", "Video autoplay", "Browsers may still block autoplay with audio.",
-        choice_control(&[("disabled", "off"), ("muted", "muted"), ("with-audio", "with audio")]),
+        49,
+        4,
+        "web.autoplay",
+        "Video autoplay",
+        "Browsers may still block autoplay with audio.",
+        choice_control(&[
+            ("disabled", "off"),
+            ("muted", "muted"),
+            ("with-audio", "with audio")
+        ]),
         |config| wire::SettingsValue::Text(autoplay_name(config.web.autoplay).into()),
         |config, value| {
             config.web.autoplay = match text(value)? {
@@ -1325,7 +1614,10 @@ const DATA_FIELDS: &[FieldSpec] = &[
         }
     ),
     config_spec!(
-        50, 4, "web.viewer", "File viewer",
+        50,
+        4,
+        "web.viewer",
+        "File viewer",
         "Open file previews in the side panel or a new browser tab.",
         choice_control(&[("panel", "side panel"), ("tab", "browser tab")]),
         |config| wire::SettingsValue::Text(viewer_name(config.web.viewer).into()),
@@ -1752,12 +2044,14 @@ mod tests {
             .flat_map(|section| &section.fields)
             .find(|field| field.id == wire::SettingsFieldId(1))
             .unwrap();
-        assert_eq!(
-            microphone.control.kind,
-            wire::CONTROL_SEARCHABLE_CHOICE
-        );
+        assert_eq!(microphone.control.kind, wire::CONTROL_SEARCHABLE_CHOICE);
         assert_eq!(microphone.control.choices[0].label, "System default");
-        assert!(data_field(microphone.id).unwrap().refresh_choices().is_some());
+        assert!(
+            data_field(microphone.id)
+                .unwrap()
+                .refresh_choices()
+                .is_some()
+        );
     }
 
     #[test]

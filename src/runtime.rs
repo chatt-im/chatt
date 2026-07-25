@@ -652,6 +652,12 @@ fn handle_runtime_event(
 ) {
     match event {
         AppEvent::ClientCommand { client_id, command } => {
+            if matches!(&command, CoreCommand::Connect { .. })
+                && rpc_upload_staging_active(rpc_clients)
+            {
+                app.reject_server_switch_for_client(client_id);
+                return;
+            }
             handle_runtime_command(app, clients, client_id, command);
         }
         AppEvent::ClientAttach {
@@ -730,6 +736,21 @@ fn handle_runtime_event(
             }
         }
         AppEvent::RpcClientFrame { client_id, frame } => {
+            if let local_rpc::frame::ClientFrame::SelectServer { request_id, label } = &frame
+                && !(app.room.active_server_label.as_deref() == Some(label.as_str())
+                    && app.network.is_some())
+                && rpc_upload_staging_active(rpc_clients)
+            {
+                send_rpc_rejection(
+                    rpc_clients,
+                    client_id,
+                    *request_id,
+                    local_rpc::frame::Operation::SelectServer,
+                    409,
+                    crate::app::SERVER_SWITCH_TRANSFER_BLOCKED,
+                );
+                return;
+            }
             let disconnect = matches!(frame, local_rpc::frame::ClientFrame::Disconnect { .. });
             handle_rpc_command(app, rpc_clients, client_id, frame, daemon_instance);
             if !disconnect {
@@ -1192,6 +1213,16 @@ fn projection_deltas(
             active_server: next.active_server.clone(),
         });
     }
+    if old.local_identity != next.local_identity {
+        deltas.push(StateDelta::LocalIdentityChanged {
+            local_identity: next.local_identity.clone(),
+        });
+    }
+    if old.server_selection != next.server_selection {
+        deltas.push(StateDelta::ServerSelectionChanged {
+            selection: next.server_selection.clone(),
+        });
+    }
     if old.rooms != next.rooms {
         deltas.push(StateDelta::RoomCatalogReset {
             rooms: next.rooms.clone(),
@@ -1347,10 +1378,8 @@ fn handle_rpc_command(
             if let Some(client) = clients.get_mut(&id) {
                 match &result.payload {
                     local_rpc::settings::SettingsResultPayload::Document(document) => {
-                        client.settings_device_generation =
-                            app.rpc_settings_device_generation();
-                        client.last_settings_audio_runtime =
-                            Some(document.audio_runtime.clone());
+                        client.settings_device_generation = app.rpc_settings_device_generation();
+                        client.last_settings_audio_runtime = Some(document.audio_runtime.clone());
                     }
                     _ => {}
                 }
@@ -1678,6 +1707,17 @@ fn send_live_share_rejection(
     code: u16,
     message: &str,
 ) {
+    send_rpc_rejection(clients, id, request_id, operation, code, message);
+}
+
+fn send_rpc_rejection(
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    operation: local_rpc::frame::Operation,
+    code: u16,
+    message: &str,
+) {
     let Some(client) = clients.get_mut(&id) else {
         return;
     };
@@ -1691,6 +1731,18 @@ fn send_live_share_rejection(
             },
         },
     ));
+}
+
+fn rpc_upload_staging_active(clients: &HashMap<ClientId, RemoteRpcClient>) -> bool {
+    upload_staging_active(clients.values().map(|client| client.uploads.as_ref()))
+}
+
+fn upload_staging_active<'a, T: 'a>(
+    uploads: impl IntoIterator<Item = &'a Mutex<HashMap<local_rpc::model::BulkTransferId, T>>>,
+) -> bool {
+    uploads
+        .into_iter()
+        .any(|uploads| !uploads.lock().is_empty())
 }
 
 fn handle_rpc_effect(
@@ -1838,11 +1890,13 @@ fn handle_rpc_effect(
             kind,
             items,
         } => {
-            client.sender.send_or_abort(&DaemonFrame::CommandCandidates {
-                request_id,
-                kind,
-                items,
-            });
+            client
+                .sender
+                .send_or_abort(&DaemonFrame::CommandCandidates {
+                    request_id,
+                    kind,
+                    items,
+                });
         }
         RpcCommandEffect::None => {}
     }
@@ -2148,7 +2202,7 @@ mod tests {
 
     use super::{
         RemoteClient, RemoteShutdown, daemon_instance_id, handle_runtime_event,
-        panic_payload_message, shutdown_remote,
+        panic_payload_message, shutdown_remote, upload_staging_active,
     };
     use crate::{attach, client_channel::ClientChannel};
     use parking_lot::Mutex;
@@ -2190,6 +2244,67 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rpc_projection_emits_server_selection_catalog_changes() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None).unwrap();
+        let client_id = crate::client_channel::ClientId(7);
+        let old = app.rpc_snapshot(client_id);
+        app.config.servers.push(crate::config::ServerEntry {
+            label: "work".into(),
+            username: "alice".into(),
+            tcp_addr: "127.0.0.1:4000".into(),
+            udp_addr: "127.0.0.1:4000".into(),
+            token: "token".into(),
+            ..Default::default()
+        });
+        let next = app.rpc_snapshot(client_id);
+
+        let deltas = super::projection_deltas(&old, &next);
+
+        assert!(matches!(
+            deltas.as_slice(),
+            [local_rpc::frame::StateDelta::ServerSelectionChanged { selection }]
+                if selection.servers.len() == 1 && selection.servers[0].label == "work"
+        ));
+    }
+
+    #[test]
+    fn rpc_projection_emits_local_identity_changes_without_a_room_change() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None).unwrap();
+        let client_id = crate::client_channel::ClientId(7);
+        let old = app.rpc_snapshot(client_id);
+        app.room.local_username = "alice".into();
+        let next = app.rpc_snapshot(client_id);
+
+        let deltas = super::projection_deltas(&old, &next);
+
+        assert!(matches!(
+            deltas.as_slice(),
+            [local_rpc::frame::StateDelta::LocalIdentityChanged {
+                local_identity: Some(identity)
+            }] if identity == "alice"
+        ));
+    }
+
+    #[test]
+    fn upload_staging_guard_is_global_across_rpc_clients() {
+        let first = Mutex::new(std::collections::HashMap::<
+            local_rpc::model::BulkTransferId,
+            (),
+        >::new());
+        let second = Mutex::new(std::collections::HashMap::<
+            local_rpc::model::BulkTransferId,
+            (),
+        >::new());
+        assert!(!upload_staging_active([&first, &second]));
+
+        second
+            .lock()
+            .insert(local_rpc::model::BulkTransferId(7), ());
+
+        assert!(upload_staging_active([&first, &second]));
     }
 
     #[test]

@@ -29,6 +29,44 @@ pub enum ConnectionState {
     Online,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum ServerAvailability {
+    Ready,
+    PairingIncomplete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct ServerSummary {
+    pub label: String,
+    pub username: String,
+    pub tcp_addr: String,
+    pub require_native_encryption: bool,
+    pub availability: ServerAvailability,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct ServerSelectionError {
+    pub label: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum ServerSelectionPrompt {
+    AllowExternalSecureLink { label: String, attempt_id: u64 },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct ServerSelectionState {
+    pub servers: Vec<ServerSummary>,
+    pub error: Option<ServerSelectionError>,
+    pub prompt: Option<ServerSelectionPrompt>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Jsony)]
 #[jsony(Binary, version)]
 pub enum CommandArgKind {
@@ -223,6 +261,7 @@ pub struct RoomSnapshot {
 pub struct StateSnapshot {
     pub connection: ConnectionState,
     pub active_server: Option<String>,
+    pub server_selection: ServerSelectionState,
     pub local_identity: Option<String>,
     pub rooms: Vec<RoomSummary>,
     pub selected_room: Option<RoomId>,
@@ -244,6 +283,7 @@ impl StateSnapshot {
             return Err("live share collection exceeds limit".into());
         }
         check_opt_string(&self.active_server)?;
+        self.server_selection.validate()?;
         check_opt_string(&self.local_identity)?;
         for room in &self.rooms {
             room.validate()?;
@@ -293,6 +333,64 @@ impl StateSnapshot {
             return Err("live shares must be strictly ordered by stream id".into());
         }
         Ok(())
+    }
+}
+
+impl ServerSelectionState {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.servers.len() > super::MAX_SERVERS {
+            return Err("server collection exceeds limit".into());
+        }
+        for server in &self.servers {
+            server.validate()?;
+        }
+        for (index, server) in self.servers.iter().enumerate() {
+            if self.servers[..index]
+                .iter()
+                .any(|other| other.label == server.label)
+            {
+                return Err("server labels must be unique".into());
+            }
+        }
+        if let Some(error) = &self.error {
+            error.validate()?;
+        }
+        if let Some(prompt) = &self.prompt {
+            prompt.validate()?;
+        }
+        if self.error.is_some() && self.prompt.is_some() {
+            return Err("server selection cannot contain an error and prompt".into());
+        }
+        Ok(())
+    }
+}
+
+impl ServerSummary {
+    pub fn validate(&self) -> Result<(), String> {
+        check_nonempty_string(&self.label)?;
+        check_string(&self.username)?;
+        check_nonempty_string(&self.tcp_addr)
+    }
+}
+
+impl ServerSelectionError {
+    pub fn validate(&self) -> Result<(), String> {
+        check_opt_string(&self.label)?;
+        check_nonempty_string(&self.message)
+    }
+}
+
+impl ServerSelectionPrompt {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::AllowExternalSecureLink { label, attempt_id } => {
+                check_nonempty_string(label)?;
+                if *attempt_id == 0 {
+                    return Err("server selection prompt attempt id must be nonzero".into());
+                }
+                Ok(())
+            }
+        }
     }
 }
 
