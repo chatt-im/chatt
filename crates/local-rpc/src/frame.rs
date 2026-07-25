@@ -6,9 +6,9 @@ use super::{
     appearance::{AppearanceCommand, AppearanceEvent},
     bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished},
     model::{
-        BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo, CommandOutputLine,
-        ConnectionState, DaemonInstanceId, LiveShare, Message, Participant, RequestId,
-        RoomSnapshot, RoomSummary, ServerSelectionState, StateSnapshot, TransferSummary,
+        AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo,
+        CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, Message, Participant,
+        RequestId, RoomSnapshot, RoomSummary, ServerSelectionState, StateSnapshot, TransferSummary,
         TrustState, VoiceState,
     },
     settings::{SettingsCommand, SettingsEvent, SettingsResult},
@@ -66,6 +66,8 @@ pub struct NegotiatedLimits {
     pub message_bytes: u32,
     pub upload_bytes: u64,
     pub concurrent_transfers: u16,
+    pub concurrent_attachment_streams: u16,
+    pub attachment_read_bytes: u32,
     pub outstanding_requests: u16,
 }
 
@@ -77,6 +79,8 @@ impl Default for NegotiatedLimits {
             message_bytes: super::MAX_MESSAGE_BODY_BYTES as u32,
             upload_bytes: super::DEFAULT_UPLOAD_LIMIT_BYTES,
             concurrent_transfers: super::MAX_CONCURRENT_TRANSFERS as u16,
+            concurrent_attachment_streams: super::MAX_CONCURRENT_ATTACHMENT_STREAMS as u16,
+            attachment_read_bytes: super::MAX_ATTACHMENT_READ_BYTES as u32,
             outstanding_requests: super::MAX_OUTSTANDING_REQUESTS as u16,
         }
     }
@@ -100,6 +104,17 @@ impl NegotiatedLimits {
             || self.concurrent_transfers as usize > super::MAX_CONCURRENT_TRANSFERS
         {
             return Err("negotiated transfer limit is invalid".into());
+        }
+        if self.concurrent_attachment_streams == 0
+            || self.concurrent_attachment_streams as usize
+                > super::MAX_CONCURRENT_ATTACHMENT_STREAMS
+        {
+            return Err("negotiated attachment stream limit is invalid".into());
+        }
+        if self.attachment_read_bytes == 0
+            || self.attachment_read_bytes as usize > super::MAX_ATTACHMENT_READ_BYTES
+        {
+            return Err("negotiated attachment read limit is invalid".into());
         }
         if self.outstanding_requests == 0
             || self.outstanding_requests as usize > super::MAX_OUTSTANDING_REQUESTS
@@ -137,6 +152,7 @@ pub enum Operation {
     FinishUpload,
     CancelUpload,
     BeginAttachmentRead,
+    OpenAttachmentSource,
     CancelBulkTransfer,
     CancelFileTransfer,
     SetMuted,
@@ -323,6 +339,11 @@ pub enum ClientFrame {
         request_id: RequestId,
         read: BeginAttachmentRead,
     },
+    OpenAttachmentSource {
+        request_id: RequestId,
+        room_id: RoomId,
+        attachment_id: AttachmentId,
+    },
     CancelBulkTransfer {
         request_id: RequestId,
         transfer_id: BulkTransferId,
@@ -401,6 +422,7 @@ impl ClientFrame {
             | Self::FinishUpload { request_id, .. }
             | Self::CancelUpload { request_id, .. }
             | Self::BeginAttachmentRead { request_id, .. }
+            | Self::OpenAttachmentSource { request_id, .. }
             | Self::CancelBulkTransfer { request_id, .. }
             | Self::CancelFileTransfer { request_id, .. }
             | Self::SetMuted { request_id, .. }
@@ -452,6 +474,13 @@ pub enum DaemonFrame {
         request_id: RequestId,
         stream_id: StreamId,
     },
+    AttachmentSourceOpened {
+        request_id: RequestId,
+        room_id: RoomId,
+        attachment_id: AttachmentId,
+        byte_len: u64,
+        transport: AttachmentSourceTransport,
+    },
     Pong {
         request_id: RequestId,
         nonce: u64,
@@ -465,6 +494,13 @@ pub enum DaemonFrame {
     SettingsResult(SettingsResult),
     SettingsEvent(SettingsEvent),
     Appearance(AppearanceEvent),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum AttachmentSourceTransport {
+    DirectFile,
+    ReadAtSocket,
 }
 
 pub fn encode_client(frame: &ClientFrame) -> Result<Vec<u8>, String> {
@@ -746,6 +782,11 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         ClientFrame::BeginAttachmentRead { read, .. } => {
             read.validate()?;
         }
+        ClientFrame::OpenAttachmentSource { attachment_id, .. }
+            if attachment_id.transfer_id.0 == 0 =>
+        {
+            return Err("attachment transfer id must be nonzero".into());
+        }
         ClientFrame::Settings { command, .. } => command.validate()?,
         ClientFrame::Appearance { command, .. } => command.validate()?,
         _ => {}
@@ -849,6 +890,14 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::LiveShareOpened { request_id, .. } if request_id.0 == 0 => {
             Err("request id must be nonzero".into())
         }
+        DaemonFrame::AttachmentSourceOpened {
+            request_id,
+            attachment_id,
+            byte_len,
+            ..
+        } if request_id.0 == 0 || attachment_id.transfer_id.0 == 0 || *byte_len == 0 => {
+            Err("attachment source identity or length is invalid".into())
+        }
         DaemonFrame::Pong { request_id, .. } if request_id.0 == 0 => {
             Err("request id must be nonzero".into())
         }
@@ -865,7 +914,9 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::SettingsResult(result) => result.validate(),
         DaemonFrame::SettingsEvent(event) => event.validate(),
         DaemonFrame::Appearance(event) => event.validate(),
-        DaemonFrame::Pong { .. } | DaemonFrame::LiveShareOpened { .. } => Ok(()),
+        DaemonFrame::Pong { .. }
+        | DaemonFrame::LiveShareOpened { .. }
+        | DaemonFrame::AttachmentSourceOpened { .. } => Ok(()),
     }
 }
 
@@ -1152,6 +1203,14 @@ mod tests {
                     },
                 },
             },
+            ClientFrame::OpenAttachmentSource {
+                request_id,
+                room_id,
+                attachment_id: super::super::model::AttachmentId {
+                    timestamp_ms: 2,
+                    transfer_id: FileTransferId(2),
+                },
+            },
             ClientFrame::CancelBulkTransfer {
                 request_id,
                 transfer_id,
@@ -1225,6 +1284,22 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn negotiated_attachment_limits_reject_zero_and_values_above_compiled_maxima() {
+        let mut limits = NegotiatedLimits::default();
+        limits.concurrent_attachment_streams = 0;
+        assert!(limits.validate().is_err());
+        limits.concurrent_attachment_streams =
+            super::super::MAX_CONCURRENT_ATTACHMENT_STREAMS as u16 + 1;
+        assert!(limits.validate().is_err());
+
+        let mut limits = NegotiatedLimits::default();
+        limits.attachment_read_bytes = 0;
+        assert!(limits.validate().is_err());
+        limits.attachment_read_bytes = super::super::MAX_ATTACHMENT_READ_BYTES as u32 + 1;
+        assert!(limits.validate().is_err());
     }
 
     #[test]
@@ -1358,6 +1433,13 @@ mod tests {
             DaemonFrame::LiveShareOpened {
                 request_id,
                 stream_id: StreamId(5),
+            },
+            DaemonFrame::AttachmentSourceOpened {
+                request_id,
+                room_id: RoomId(2),
+                attachment_id: descriptor.id,
+                byte_len: descriptor.byte_len,
+                transport: AttachmentSourceTransport::ReadAtSocket,
             },
             DaemonFrame::Pong {
                 request_id,

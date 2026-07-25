@@ -392,10 +392,11 @@ impl FrameReader {
                     let frame = match super::frame::decode_daemon_wire(payload)
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
                     {
-                        super::frame::DecodedWire::Frame(frame) => Some(ReceivedFrame {
-                            frame,
-                            fds: mem::take(&mut self.current_fds),
-                        }),
+                        super::frame::DecodedWire::Frame(frame) => {
+                            let fds = mem::take(&mut self.current_fds);
+                            validate_daemon_frame_fds(&frame, &fds)?;
+                            Some(ReceivedFrame { frame, fds })
+                        }
                         super::frame::DecodedWire::BulkChunk { transfer_id, bytes } => {
                             if !self.current_fds.is_empty() {
                                 self.current_fds.clear();
@@ -720,6 +721,7 @@ impl FrameWriter {
         if let super::frame::DaemonFrame::BulkChunk(chunk) = frame {
             return self.send_daemon_bulk_chunk(chunk.transfer_id, &chunk.bytes);
         }
+        validate_daemon_frame_fd_count(frame, 0)?;
         super::frame::encode_daemon_framed_into(frame, &mut self.buffer)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         send_frame_bytes(&mut self.stream, &self.buffer, &[])
@@ -749,6 +751,7 @@ impl FrameWriter {
             }
             return self.send_daemon_bulk_chunk(chunk.transfer_id, &chunk.bytes);
         }
+        validate_daemon_frame_fd_count(frame, fds.len())?;
         super::frame::encode_daemon_framed_into(frame, &mut self.buffer)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         send_frame_bytes(&mut self.stream, &self.buffer, fds)
@@ -784,6 +787,30 @@ impl FrameWriter {
     pub fn shutdown(&self) -> io::Result<()> {
         self.stream.shutdown(std::net::Shutdown::Both)
     }
+}
+
+fn validate_daemon_frame_fds(frame: &super::frame::DaemonFrame, fds: &[OwnedFd]) -> io::Result<()> {
+    validate_daemon_frame_fd_count(frame, fds.len())
+}
+
+fn validate_daemon_frame_fd_count(
+    frame: &super::frame::DaemonFrame,
+    fd_count: usize,
+) -> io::Result<()> {
+    let expected = match frame {
+        super::frame::DaemonFrame::LiveShareOpened { .. }
+        | super::frame::DaemonFrame::AttachmentSourceOpened { .. } => 1,
+        _ => 0,
+    };
+    if fd_count != expected {
+        let message = if expected == 1 {
+            "descriptor-bearing daemon frame must carry exactly one file descriptor"
+        } else {
+            "daemon frame unexpectedly carried file descriptors"
+        };
+        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+    }
+    Ok(())
 }
 
 fn send_bulk_frame(
@@ -946,6 +973,46 @@ mod tests {
         let flags = unsafe { libc::fcntl(received.fds[0].as_raw_fd(), libc::F_GETFD) };
         assert_ne!(flags, -1);
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn attachment_source_open_requires_exactly_one_descriptor() {
+        use super::super::{
+            frame::{AttachmentSourceTransport, DaemonFrame},
+            model::{AttachmentId, RequestId},
+        };
+
+        let opened = DaemonFrame::AttachmentSourceOpened {
+            request_id: RequestId(2),
+            room_id: crate::ids::RoomId(3),
+            attachment_id: AttachmentId {
+                timestamp_ms: 4,
+                transfer_id: crate::ids::FileTransferId(5),
+            },
+            byte_len: 6,
+            transport: AttachmentSourceTransport::ReadAtSocket,
+        };
+
+        let (left, right) = UnixStream::pair().unwrap();
+        let payload = super::super::frame::encode_daemon(&opened).unwrap();
+        FrameWriter::new(left).send_payload(&payload, &[]).unwrap();
+        let error = FrameReader::new(right).recv_daemon_with_fds().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exactly one"));
+
+        let (left, right) = UnixStream::pair().unwrap();
+        let file = fs::File::open("/dev/null").unwrap();
+        let payload = super::super::frame::encode_daemon(&DaemonFrame::Pong {
+            request_id: RequestId(7),
+            nonce: 8,
+        })
+        .unwrap();
+        FrameWriter::new(left)
+            .send_payload(&payload, &[file.as_raw_fd()])
+            .unwrap();
+        let error = FrameReader::new(right).recv_daemon_with_fds().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unexpectedly"));
     }
 
     #[test]

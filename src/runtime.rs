@@ -46,6 +46,7 @@ struct RemoteClient {
 struct RemoteRpcClient {
     sender: RpcClientSender,
     control: Arc<UnixStream>,
+    events: EventSender,
     reader_thread: Option<JoinHandle<()>>,
     writer_thread: Option<JoinHandle<()>>,
     next_event_seq: u64,
@@ -53,10 +54,16 @@ struct RemoteRpcClient {
     pending_history: Option<RpcHistoryRequest>,
     last_snapshot: local_rpc::model::StateSnapshot,
     live_viewers: HashMap<rpc::ids::StreamId, crate::video::NativeViewerHandle>,
+    attachment_streams: HashMap<local_rpc::model::RequestId, AttachmentStreamControl>,
     settings_device_generation: u64,
     next_settings_audio_event_at: Instant,
     last_settings_audio_runtime: Option<local_rpc::settings::AudioRuntimeState>,
     appearance_generation: u64,
+}
+
+struct AttachmentStreamControl {
+    shutdown: UnixStream,
+    worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -276,6 +283,13 @@ impl RpcClientSender {
     }
 
     fn queue_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), String> {
+        let expected_fds = match frame {
+            DaemonFrame::LiveShareOpened { .. } | DaemonFrame::AttachmentSourceOpened { .. } => 1,
+            _ => 0,
+        };
+        if fds.len() != expected_fds {
+            return Err("daemon frame carries an invalid descriptor count".into());
+        }
         let mut framed = self.buffers.lock().pop().unwrap_or_default();
         if let Err(error) = local_rpc::frame::encode_daemon_framed_into(frame, &mut framed) {
             recycle_rpc_buffer(&self.buffers, framed);
@@ -391,6 +405,7 @@ impl RpcClientSender {
             DaemonFrame::MessageReferenceResolved { request_id, .. } => Some(*request_id),
             DaemonFrame::Pong { request_id, .. } => Some(*request_id),
             DaemonFrame::LiveShareOpened { request_id, .. } => Some(*request_id),
+            DaemonFrame::AttachmentSourceOpened { request_id, .. } => Some(*request_id),
             DaemonFrame::SettingsResult(result) => Some(result.result.request_id),
             _ => None,
         };
@@ -410,6 +425,7 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::CommandCandidates { .. } => "command_candidates",
         DaemonFrame::MessageReferenceResolved { .. } => "message_reference_resolved",
         DaemonFrame::LiveShareOpened { .. } => "live_share_opened",
+        DaemonFrame::AttachmentSourceOpened { .. } => "attachment_source_opened",
         DaemonFrame::Pong { .. } => "pong",
         DaemonFrame::BulkChunk(_) => "bulk_chunk",
         DaemonFrame::BulkFinished(_) => "bulk_finished",
@@ -774,6 +790,22 @@ fn handle_runtime_event(
                 kvlog::info!("daemon RPC client detached", client_id = id.0);
             }
         }
+        AppEvent::AttachmentStreamWorkerExited {
+            client_id,
+            request_id,
+            request_count,
+            bytes_served,
+            highest_requested_offset,
+        } => {
+            let _ = (request_count, bytes_served, highest_requested_offset);
+            if let Some(client) = rpc_clients.get_mut(&client_id) {
+                if let Some(mut stream) = client.attachment_streams.remove(&request_id)
+                    && let Some(worker) = stream.worker.take()
+                {
+                    let _ = worker.join();
+                }
+            }
+        }
         AppEvent::ClientDetached(id) => {
             app.retire_client(id);
             if let Some(client) = clients.get(&id) {
@@ -898,6 +930,7 @@ fn spawn_rpc_client(
     Ok(RemoteRpcClient {
         sender,
         control,
+        events,
         reader_thread: Some(reader_thread),
         writer_thread: Some(writer_thread),
         next_event_seq: 2,
@@ -905,6 +938,7 @@ fn spawn_rpc_client(
         pending_history: None,
         last_snapshot: snapshot,
         live_viewers: HashMap::new(),
+        attachment_streams: HashMap::new(),
         settings_device_generation: 0,
         next_settings_audio_event_at: Instant::now(),
         last_settings_audio_runtime: None,
@@ -1477,6 +1511,25 @@ fn handle_rpc_command(
             }
             return;
         }
+        local_rpc::frame::ClientFrame::OpenAttachmentSource {
+            request_id,
+            room_id,
+            attachment_id,
+        } => {
+            let effect = app.handle_rpc_frame(
+                id,
+                local_rpc::frame::ClientFrame::OpenAttachmentSource {
+                    request_id,
+                    room_id,
+                    attachment_id,
+                },
+            );
+            let Some(client) = clients.get_mut(&id) else {
+                return;
+            };
+            handle_rpc_effect(app, client, id, effect, instance_id);
+            return;
+        }
         local_rpc::frame::ClientFrame::StopLiveShare {
             request_id,
             stream_id,
@@ -1776,6 +1829,287 @@ fn upload_staging_active<'a, T: 'a>(
         .any(|uploads| !uploads.lock().is_empty())
 }
 
+fn open_rpc_attachment_source(
+    client: &mut RemoteRpcClient,
+    client_id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    room_id: local_rpc::ids::RoomId,
+    attachment_id: local_rpc::model::AttachmentId,
+    byte_len: u64,
+    source: crate::receive_store::Source,
+) {
+    use local_rpc::frame::{AttachmentSourceTransport, Operation, RequestOutcome, RequestResult};
+
+    let reject = |client: &RemoteRpcClient, code, message: String| {
+        client
+            .sender
+            .send_or_abort(&DaemonFrame::RequestResult(RequestResult {
+                request_id,
+                operation: Operation::OpenAttachmentSource,
+                outcome: RequestOutcome::Rejected { code, message },
+            }));
+    };
+
+    match source {
+        crate::receive_store::Source::Disk(path) => {
+            let fd = match open_direct_attachment_source(&path, byte_len) {
+                Ok(fd) => fd,
+                Err((code, message)) => {
+                    reject(client, code, message);
+                    return;
+                }
+            };
+            let opened = DaemonFrame::AttachmentSourceOpened {
+                request_id,
+                room_id,
+                attachment_id,
+                byte_len,
+                transport: AttachmentSourceTransport::DirectFile,
+            };
+            if let Err(error) = client.sender.send_with_fds(&opened, vec![fd]) {
+                kvlog::error!(
+                    "could not send attachment file descriptor to RPC client",
+                    client_id = client_id.0,
+                    attachment_timestamp_ms = attachment_id.timestamp_ms,
+                    attachment_transfer_id = attachment_id.transfer_id.0,
+                    error = %error
+                );
+                client.sender.abort();
+            }
+        }
+        crate::receive_store::Source::Memory { bytes, .. } => {
+            if client.attachment_streams.len() >= local_rpc::MAX_CONCURRENT_ATTACHMENT_STREAMS {
+                reject(
+                    client,
+                    429,
+                    "too many active attachment source streams".into(),
+                );
+                return;
+            }
+            if client.attachment_streams.contains_key(&request_id) {
+                reject(
+                    client,
+                    409,
+                    "attachment source request is already active".into(),
+                );
+                return;
+            }
+            if bytes.len() as u64 != byte_len {
+                reject(
+                    client,
+                    409,
+                    "attachment source changed before it could be opened".into(),
+                );
+                return;
+            }
+            let (daemon_stream, frontend_stream) = match UnixStream::pair() {
+                Ok(pair) => pair,
+                Err(error) => {
+                    reject(
+                        client,
+                        500,
+                        format!("attachment source transport cannot be created: {error}"),
+                    );
+                    return;
+                }
+            };
+            let shutdown = match daemon_stream.try_clone() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    reject(
+                        client,
+                        500,
+                        format!("attachment source transport cannot be tracked: {error}"),
+                    );
+                    return;
+                }
+            };
+            let events = client.events.clone();
+            let worker_name = format!("chatt-attachment-{}-{}", client_id.0, request_id.0);
+            let worker = thread::Builder::new().name(worker_name).spawn(move || {
+                run_attachment_stream_worker(
+                    daemon_stream,
+                    bytes,
+                    events,
+                    client_id,
+                    request_id,
+                    attachment_id,
+                )
+            });
+            let worker = match worker {
+                Ok(worker) => worker,
+                Err(error) => {
+                    reject(
+                        client,
+                        500,
+                        format!("attachment source worker cannot start: {error}"),
+                    );
+                    return;
+                }
+            };
+            client.attachment_streams.insert(
+                request_id,
+                AttachmentStreamControl {
+                    shutdown,
+                    worker: Some(worker),
+                },
+            );
+            let opened = DaemonFrame::AttachmentSourceOpened {
+                request_id,
+                room_id,
+                attachment_id,
+                byte_len,
+                transport: AttachmentSourceTransport::ReadAtSocket,
+            };
+            let fd: OwnedFd = frontend_stream.into();
+            if let Err(error) = client.sender.send_with_fds(&opened, vec![fd]) {
+                if let Some(mut stream) = client.attachment_streams.remove(&request_id) {
+                    let _ = stream.shutdown.shutdown(std::net::Shutdown::Both);
+                    if let Some(worker) = stream.worker.take() {
+                        let _ = worker.join();
+                    }
+                }
+                kvlog::error!(
+                    "could not send attachment range socket to RPC client",
+                    client_id = client_id.0,
+                    attachment_timestamp_ms = attachment_id.timestamp_ms,
+                    attachment_transfer_id = attachment_id.transfer_id.0,
+                    error = %error
+                );
+                client.sender.abort();
+            }
+        }
+    }
+}
+
+fn open_direct_attachment_source(
+    path: &std::path::Path,
+    byte_len: u64,
+) -> Result<OwnedFd, (u16, String)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| (404, format!("attachment source cannot be opened: {error}")))?;
+    let metadata = file.metadata().map_err(|error| {
+        (
+            500,
+            format!("attachment source metadata cannot be read: {error}"),
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() != byte_len {
+        return Err((
+            409,
+            "attachment source changed before it could be opened".into(),
+        ));
+    }
+    Ok(file.into())
+}
+
+struct AttachmentStreamWorkerGuard {
+    events: EventSender,
+    client_id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    attachment_id: local_rpc::model::AttachmentId,
+    request_count: u64,
+    bytes_served: u64,
+    highest_requested_offset: u64,
+    reason: String,
+}
+
+impl Drop for AttachmentStreamWorkerGuard {
+    fn drop(&mut self) {
+        kvlog::info!(
+            "daemon attachment range worker exited",
+            client_id = self.client_id.0,
+            attachment_timestamp_ms = self.attachment_id.timestamp_ms,
+            attachment_transfer_id = self.attachment_id.transfer_id.0,
+            request_count = self.request_count,
+            bytes_served = self.bytes_served,
+            highest_requested_offset = self.highest_requested_offset,
+            reason = self.reason.as_str()
+        );
+        let _ = self.events.send(AppEvent::AttachmentStreamWorkerExited {
+            client_id: self.client_id,
+            request_id: self.request_id,
+            request_count: self.request_count,
+            bytes_served: self.bytes_served,
+            highest_requested_offset: self.highest_requested_offset,
+        });
+    }
+}
+
+fn run_attachment_stream_worker(
+    mut stream: UnixStream,
+    bytes: Arc<Vec<u8>>,
+    events: EventSender,
+    client_id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    attachment_id: local_rpc::model::AttachmentId,
+) {
+    use local_rpc::attachment_stream::{ResponseStatus, read_request, write_response};
+
+    let mut guard = AttachmentStreamWorkerGuard {
+        events,
+        client_id,
+        request_id,
+        attachment_id,
+        request_count: 0,
+        bytes_served: 0,
+        highest_requested_offset: 0,
+        reason: "worker panicked".into(),
+    };
+    loop {
+        let request = match read_request(&mut stream) {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                guard.reason = "frontend closed source".into();
+                break;
+            }
+            Err(error) => {
+                let diagnostic = error.to_string();
+                let _ = write_response(
+                    &mut stream,
+                    ResponseStatus::InvalidRequest,
+                    diagnostic.as_bytes(),
+                );
+                guard.reason = format!("invalid request: {error}");
+                break;
+            }
+        };
+        guard.request_count = guard.request_count.saturating_add(1);
+        guard.highest_requested_offset = guard.highest_requested_offset.max(request.offset);
+
+        let payload = if request.offset >= bytes.len() as u64 {
+            &[][..]
+        } else {
+            let start = match usize::try_from(request.offset) {
+                Ok(start) => start,
+                Err(_) => {
+                    guard.reason = "request offset does not fit source address space".into();
+                    let _ = write_response(
+                        &mut stream,
+                        ResponseStatus::InvalidRequest,
+                        guard.reason.as_bytes(),
+                    );
+                    break;
+                }
+            };
+            let end = start
+                .saturating_add(request.length as usize)
+                .min(bytes.len());
+            &bytes[start..end]
+        };
+        if let Err(error) = write_response(&mut stream, ResponseStatus::Data, payload) {
+            guard.reason = format!("response failed: {error}");
+            break;
+        }
+        guard.bytes_served = guard.bytes_served.saturating_add(payload.len() as u64);
+    }
+}
+
 fn handle_rpc_effect(
     app: &mut App,
     client: &mut RemoteRpcClient,
@@ -1866,6 +2200,23 @@ fn handle_rpc_effect(
                 );
                 client.sender.abort();
             }
+        }
+        RpcCommandEffect::OpenAttachmentSource {
+            request_id,
+            room_id,
+            attachment_id,
+            descriptor,
+            source,
+        } => {
+            open_rpc_attachment_source(
+                client,
+                id,
+                request_id,
+                room_id,
+                attachment_id,
+                descriptor.byte_len,
+                source,
+            );
         }
         RpcCommandEffect::BeginUpload { request_id, upload } => {
             let mut uploads = client.uploads.lock();
@@ -2035,6 +2386,14 @@ fn finish_rpc_upload(
 
 fn shutdown_rpc(client: &mut RemoteRpcClient) {
     client.live_viewers.clear();
+    for stream in client.attachment_streams.values() {
+        let _ = stream.shutdown.shutdown(std::net::Shutdown::Both);
+    }
+    for (_, mut stream) in client.attachment_streams.drain() {
+        if let Some(worker) = stream.worker.take() {
+            let _ = worker.join();
+        }
+    }
     client.sender.shutdown();
     let _ = client.control.shutdown(std::net::Shutdown::Both);
     if let Some(thread) = client.reader_thread.take() {
@@ -2427,6 +2786,102 @@ mod tests {
         assert_eq!(reader.join().unwrap(), byte_len as u64);
         sender.shutdown();
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn memory_attachment_serves_tail_then_head_without_full_copy() {
+        use local_rpc::attachment_stream::{
+            ReadRequest, ResponseStatus, read_response, write_request,
+        };
+
+        let bytes = (0..(1024 * 1024 + 73))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let expected = bytes.clone();
+        let tail_offset = bytes.len() as u64 - 31;
+        let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let client_id = crate::client_channel::ClientId(44);
+        let request_id = local_rpc::model::RequestId(45);
+        let attachment_id = local_rpc::model::AttachmentId {
+            timestamp_ms: 46,
+            transfer_id: rpc::ids::FileTransferId(47),
+        };
+        let worker = thread::spawn(move || {
+            super::run_attachment_stream_worker(
+                daemon_stream,
+                Arc::new(bytes),
+                crate::app::EventSender(event_tx),
+                client_id,
+                request_id,
+                attachment_id,
+            )
+        });
+
+        for request in [
+            ReadRequest {
+                offset: tail_offset,
+                length: 31,
+            },
+            ReadRequest {
+                offset: 0,
+                length: 19,
+            },
+        ] {
+            write_request(&mut frontend_stream, request).unwrap();
+            let response = read_response(&mut frontend_stream, request.length)
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status, ResponseStatus::Data);
+            let start = request.offset as usize;
+            assert_eq!(
+                response.payload,
+                expected[start..start + request.length as usize]
+            );
+        }
+        drop(frontend_stream);
+        worker.join().unwrap();
+        match event_rx.recv().unwrap() {
+            crate::app::AppEvent::AttachmentStreamWorkerExited {
+                client_id: exited_client,
+                request_id: exited_request,
+                request_count,
+                bytes_served,
+                highest_requested_offset,
+            } => {
+                assert_eq!(exited_client, client_id);
+                assert_eq!(exited_request, request_id);
+                assert_eq!(request_count, 2);
+                assert_eq!(bytes_served, 50);
+                assert_eq!(highest_requested_offset, tail_offset);
+            }
+            _ => panic!("unexpected attachment worker event"),
+        }
+    }
+
+    #[test]
+    fn opens_disk_attachment_as_read_only_seekable_descriptor() {
+        use std::{
+            io::Write,
+            os::{fd::AsRawFd, unix::fs::FileExt},
+        };
+
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        source.write_all(b"seekable-video").unwrap();
+        let fd = super::open_direct_attachment_source(source.path(), 14).unwrap();
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+        let file = std::fs::File::from(fd);
+        let mut tail = [0; 5];
+        assert_eq!(file.read_at(&mut tail, 9).unwrap(), 5);
+        assert_eq!(&tail, b"video");
+        assert_eq!(
+            super::open_direct_attachment_source(source.path(), 13)
+                .unwrap_err()
+                .0,
+            409
+        );
     }
 
     #[test]
