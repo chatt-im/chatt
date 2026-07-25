@@ -343,4 +343,5 @@ features = [
 default-features = false
 
 [patch.crates-io]
+libspa-sys = { path = "../libspa-sys" }
 pipewire-sys = { path = "../pipewire-sys" }
