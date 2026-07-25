@@ -281,6 +281,11 @@ pub enum ClientFrame {
         before: Option<MessageId>,
         limit: u16,
     },
+    ResolveMessageReference {
+        request_id: RequestId,
+        room_id: RoomId,
+        message_id: MessageId,
+    },
     SendMessage {
         request_id: RequestId,
         room_id: RoomId,
@@ -380,6 +385,7 @@ impl ClientFrame {
             | Self::ResolveServerPrompt { request_id, .. }
             | Self::SelectRoom { request_id, .. }
             | Self::LoadOlder { request_id, .. }
+            | Self::ResolveMessageReference { request_id, .. }
             | Self::SendMessage { request_id, .. }
             | Self::EditMessage { request_id, .. }
             | Self::DeleteMessage { request_id, .. }
@@ -426,6 +432,12 @@ pub enum DaemonFrame {
         request_id: RequestId,
         kind: CommandCandidateKind,
         items: Vec<CommandCandidate>,
+    },
+    MessageReferenceResolved {
+        request_id: RequestId,
+        room_id: RoomId,
+        message_id: MessageId,
+        message: Option<Message>,
     },
     LiveShareOpened {
         request_id: RequestId,
@@ -703,6 +715,9 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         {
             return Err("history request limit is invalid".into());
         }
+        ClientFrame::ResolveMessageReference { message_id, .. } if message_id.0 == 0 => {
+            return Err("message reference target must be nonzero".into());
+        }
         ClientFrame::BeginUpload { upload, .. } => {
             upload.validate()?;
         }
@@ -797,6 +812,26 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
             }
             for item in items {
                 item.validate()?;
+            }
+            Ok(())
+        }
+        DaemonFrame::MessageReferenceResolved {
+            request_id,
+            room_id,
+            message_id,
+            message,
+        } => {
+            if request_id.0 == 0 {
+                return Err("request id must be nonzero".into());
+            }
+            if message_id.0 == 0 {
+                return Err("message reference target must be nonzero".into());
+            }
+            if let Some(message) = message {
+                message.validate()?;
+                if message.room_id != *room_id || message.message_id != *message_id {
+                    return Err("resolved message reference identity does not match target".into());
+                }
             }
             Ok(())
         }
@@ -1052,6 +1087,11 @@ mod tests {
                 before: Some(MessageId(4)),
                 limit: 20,
             },
+            ClientFrame::ResolveMessageReference {
+                request_id,
+                room_id,
+                message_id: MessageId(4),
+            },
             ClientFrame::SendMessage {
                 request_id,
                 room_id,
@@ -1296,6 +1336,12 @@ mod tests {
                     value: "general".into(),
                     detail: None,
                 }],
+            },
+            DaemonFrame::MessageReferenceResolved {
+                request_id,
+                room_id: RoomId(2),
+                message_id: MessageId(4),
+                message: None,
             },
             DaemonFrame::LiveShareOpened {
                 request_id,

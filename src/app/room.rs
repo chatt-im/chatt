@@ -2284,23 +2284,6 @@ impl RoomSession {
         }
     }
 
-    /// A side-effect-free history projection for any materialized room.
-    pub(crate) fn history_for(&self, room_id: RoomId) -> room_history::LoadedHistory {
-        let Some(room) = self.rooms.get(&room_id) else {
-            return room_history::LoadedHistory::default();
-        };
-        room_history::LoadedHistory {
-            messages: room.visible_messages().cloned().collect(),
-            files: room.files.clone(),
-            mutations: Vec::new(),
-            provenance: room
-                .message_provenance
-                .iter()
-                .map(|(id, provenance)| (*id, *provenance))
-                .collect(),
-        }
-    }
-
     pub(crate) fn resident_message_page(
         &self,
         room_id: RoomId,
@@ -2358,6 +2341,81 @@ impl RoomSession {
     ) -> Option<&ChatMessage> {
         let message = self.rooms.get(&room_id)?.message_by_key(message_id.0)?;
         (!message.flags.deleted()).then_some(message)
+    }
+
+    /// Resolves a durable message identity without changing any client's room
+    /// selection or history cursor. Only rooms in the current catalog are
+    /// eligible; retained on-disk history is consulted when the message is not
+    /// resident in memory.
+    pub(crate) fn reference_message(
+        &self,
+        room_id: RoomId,
+        message_id: MessageId,
+    ) -> Option<(ChatMessage, Option<room_history::FileDetail>)> {
+        if !self.metas.contains_key(&room_id) {
+            return None;
+        }
+        if let Some(message) = self.resident_message(room_id, message_id).cloned() {
+            let detail = message.file_transfer_id.and_then(|transfer_id| {
+                self.resident_file_detail(
+                    room_id,
+                    &FileHistoryKey {
+                        timestamp_ms: message.timestamp_ms,
+                        transfer_id,
+                    },
+                )
+                .cloned()
+            });
+            return Some((message, detail));
+        }
+
+        let dir = self.history.room_dir(room_id)?;
+        let loaded = room_history::open_in(Some(dir), room_id).loaded;
+        let message = loaded
+            .messages
+            .into_iter()
+            .find(|message| message.message_id == message_id && !message.flags.deleted())?;
+        let detail = message
+            .file_transfer_id
+            .and_then(|transfer_id| {
+                loaded.files.get(&FileHistoryKey {
+                    timestamp_ms: message.timestamp_ms,
+                    transfer_id,
+                })
+            })
+            .cloned();
+        Some((message, detail))
+    }
+
+    /// Resolves an attachment announcement and its retained metadata without
+    /// requiring the room to be selected or resident.
+    pub(crate) fn reference_attachment(
+        &self,
+        room_id: RoomId,
+        key: &FileHistoryKey,
+    ) -> Option<(ChatMessage, room_history::FileDetail)> {
+        if !self.metas.contains_key(&room_id) {
+            return None;
+        }
+        if let Some(room) = self.rooms.get(&room_id)
+            && let Some(detail) = room.files.get(key)
+            && let Some(message) = room.visible_messages().find(|message| {
+                message.timestamp_ms == key.timestamp_ms
+                    && message.file_transfer_id == Some(key.transfer_id)
+            })
+        {
+            return Some((message.clone(), detail.clone()));
+        }
+
+        let dir = self.history.room_dir(room_id)?;
+        let loaded = room_history::open_in(Some(dir), room_id).loaded;
+        let detail = loaded.files.get(key)?.clone();
+        let message = loaded.messages.into_iter().find(|message| {
+            !message.flags.deleted()
+                && message.timestamp_ms == key.timestamp_ms
+                && message.file_transfer_id == Some(key.transfer_id)
+        })?;
+        Some((message, detail))
     }
 
     pub(crate) fn history_cursor(&self, room_id: RoomId) -> (Option<MessageId>, bool) {
@@ -3616,6 +3674,49 @@ mod tests {
         );
         room.session.merge_history(RoomId(1), history);
         room.sync();
+    }
+
+    #[test]
+    fn reference_resolution_does_not_change_the_viewed_room() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "one")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        let mut target = message(42, UserId(1), "from room two");
+        target.room_id = RoomId(2);
+        let transfer_id = FileTransferId(7);
+        let mut image = file_message(43, UserId(1), "image", transfer_id);
+        image.room_id = RoomId(2);
+        assert!(room.set_viewed_room(RoomId(2)));
+        room.session.merge_history(RoomId(2), vec![target, image]);
+        let attachment_key = FileHistoryKey {
+            timestamp_ms: 43_000,
+            transfer_id,
+        };
+        room.shared_mut(2).files.insert(
+            attachment_key,
+            room_history::FileDetail {
+                file_name: "preview.png".into(),
+                length: 128,
+                packed_dims: 0,
+            },
+        );
+        assert!(room.set_viewed_room(RoomId(1)));
+
+        let (resolved, _) = room
+            .reference_message(RoomId(2), MessageId(42))
+            .expect("accessible retained message resolves");
+        assert_eq!(resolved.body, "from room two");
+        let (announcement, detail) = room
+            .reference_attachment(RoomId(2), &attachment_key)
+            .expect("cross-room attachment resolves");
+        assert_eq!(announcement.message_id, MessageId(43));
+        assert_eq!(detail.file_name, "preview.png");
+        assert_eq!(room.viewed_room, Some(RoomId(1)));
+        assert!(room.reference_message(RoomId(99), MessageId(42)).is_none());
     }
 
     fn message(id: u64, sender: UserId, body: &str) -> ChatMessage {
