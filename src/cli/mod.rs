@@ -1247,10 +1247,13 @@ mod tests {
             command::parse(&ROOT, &argv(&["chatt", "-h"])),
             Ok(Parsed::Help(_))
         ));
-        assert!(matches!(
-            command::parse(&ROOT, &argv(&["chatt", "daemon", "--help"])),
-            Ok(Parsed::Help(text)) if text.contains("without opening a terminal UI")
-        ));
+        let Ok(Parsed::Help(daemon_help)) =
+            command::parse(&ROOT, &argv(&["chatt", "daemon", "--help"]))
+        else {
+            panic!("daemon --help should return help text");
+        };
+        let normalized_help = daemon_help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_help.contains("without opening a terminal UI"));
         assert!(matches!(
             command::parse(&ROOT, &argv(&["chatt", "help", "upload"])),
             Ok(Parsed::Help(_))
