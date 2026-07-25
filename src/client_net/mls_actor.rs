@@ -1698,10 +1698,20 @@ impl Actor {
                 before,
                 limit,
             } => {
-                let installation = self
-                    .installation
-                    .as_ref()
-                    .ok_or_else(|| "local MLS installation is unavailable".to_string())?;
+                let Some(installation) = self.installation.as_ref() else {
+                    // The app can still view public rooms and remain in a
+                    // voice call when this installation cannot open its MLS
+                    // state. Finish the room-local history request without
+                    // failing the otherwise healthy network session.
+                    let _ = self.events.send(NetworkEvent::HistoryChunk {
+                        room_id,
+                        before,
+                        messages: Vec::new(),
+                        at_start: true,
+                        complete: true,
+                    });
+                    return Ok(());
+                };
                 let Some(_) = installation.client.descriptor(room_id)? else {
                     self.queue_control(ClientControl::FetchHistory {
                         room_id,
@@ -3030,8 +3040,55 @@ mod tests {
         assert!(
             observed
                 .iter()
-                .all(|output| !matches!(output, Output::SessionReady { .. }))
+            .all(|output| !matches!(output, Output::SessionReady { .. }))
         );
+    }
+
+    #[test]
+    fn unavailable_installation_finishes_history_without_failing_the_session() {
+        let poll = Poll::new().unwrap();
+        let outputs = Arc::new(OutputQueue {
+            outputs: Mutex::new(Vec::new()),
+            waker: Arc::new(Waker::new(poll.registry(), WAKE).unwrap()),
+            stopped: AtomicBool::new(false),
+        });
+        let (events, receiver) = mpsc::channel();
+        let actor = Actor::new(
+            test_config(None),
+            NetworkEventSender::for_test(events),
+            OutputSender(Arc::clone(&outputs)),
+        );
+
+        let observed = run_inputs(
+            actor,
+            vec![
+                Input::Command(Command::FetchHistory {
+                    room_id: RoomId(9),
+                    before: None,
+                    limit: 50,
+                }),
+                Input::Shutdown,
+            ],
+            &outputs,
+        );
+
+        assert!(
+            observed
+                .iter()
+                .all(|output| !matches!(output, Output::Fatal { .. }))
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(crate::app::AppEvent::Network(
+                NetworkEvent::HistoryChunk {
+                    room_id: RoomId(9),
+                    before: None,
+                    messages,
+                    at_start: true,
+                    complete: true,
+                }
+            )) if messages.is_empty()
+        ));
     }
 
     #[test]
