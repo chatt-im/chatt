@@ -28,6 +28,13 @@ pub(crate) enum RpcCommandEffect {
         descriptor: AttachmentDescriptor,
         source: crate::receive_store::Source,
     },
+    OpenAttachmentSource {
+        request_id: RequestId,
+        room_id: RoomId,
+        attachment_id: AttachmentId,
+        descriptor: AttachmentDescriptor,
+        source: crate::receive_store::Source,
+    },
     BeginUpload {
         request_id: RequestId,
         upload: BeginUpload,
@@ -740,6 +747,44 @@ impl App {
                     source,
                 }
             }
+            ClientFrame::OpenAttachmentSource {
+                request_id,
+                room_id,
+                attachment_id,
+            } => {
+                if self.room.selected_room_for(client_id) != Some(room_id) {
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::OpenAttachmentSource,
+                        403,
+                        "attachment room is not selected by this client",
+                    ));
+                }
+                let Some((descriptor, source)) = self.rpc_attachment_source(room_id, attachment_id)
+                else {
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::OpenAttachmentSource,
+                        404,
+                        "attachment source is unavailable",
+                    ));
+                };
+                if descriptor.byte_len == 0 {
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::OpenAttachmentSource,
+                        422,
+                        "attachment source is empty",
+                    ));
+                }
+                RpcCommandEffect::OpenAttachmentSource {
+                    request_id,
+                    room_id,
+                    attachment_id,
+                    descriptor,
+                    source,
+                }
+            }
             ClientFrame::CancelBulkTransfer {
                 request_id,
                 transfer_id,
@@ -944,6 +989,19 @@ impl App {
                 std::fs::metadata(path).map_or(0, |metadata| metadata.len()),
             ),
         };
+        if source_bytes != descriptor.byte_len {
+            kvlog::warn!(
+                "daemon attachment source length changed",
+                room_id = room_id.0,
+                message_id = message.message_id.0,
+                attachment_timestamp_ms = attachment_id.timestamp_ms,
+                attachment_transfer_id = attachment_id.transfer_id.0,
+                descriptor_bytes = descriptor.byte_len,
+                source_kind = source_kind,
+                source_bytes = source_bytes
+            );
+            return None;
+        }
         kvlog::info!(
             "daemon attachment source resolved",
             room_id = room_id.0,
@@ -1392,6 +1450,30 @@ mod tests {
 
         assert_ne!(first, next_transfer);
         assert_ne!(first, reused_transfer);
+    }
+
+    #[test]
+    fn rejects_attachment_source_outside_selected_room() {
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
+        let effect = app.handle_rpc_frame(
+            ClientId(7),
+            ClientFrame::OpenAttachmentSource {
+                request_id: RequestId(8),
+                room_id: RoomId(9),
+                attachment_id: AttachmentId {
+                    timestamp_ms: 10,
+                    transfer_id: rpc::ids::FileTransferId(11),
+                },
+            },
+        );
+        let RpcCommandEffect::Reply(result) = effect else {
+            panic!("expected attachment source rejection");
+        };
+        assert_eq!(result.operation, Operation::OpenAttachmentSource);
+        assert!(matches!(
+            result.outcome,
+            RequestOutcome::Rejected { code: 403, .. }
+        ));
     }
 
     #[test]

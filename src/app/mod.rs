@@ -832,6 +832,14 @@ pub(crate) enum AppEvent {
     },
     #[cfg(unix)]
     RpcClientExited(crate::client_channel::ClientId),
+    #[cfg(unix)]
+    AttachmentStreamWorkerExited {
+        client_id: crate::client_channel::ClientId,
+        request_id: local_rpc::model::RequestId,
+        request_count: u64,
+        bytes_served: u64,
+        highest_requested_offset: u64,
+    },
     ClientDetached(crate::client_channel::ClientId),
     ClientExited(crate::client_channel::ClientId),
     OutputVolume {
@@ -1916,7 +1924,8 @@ impl App {
             #[cfg(unix)]
             AppEvent::RpcClientAttach { .. }
             | AppEvent::RpcClientFrame { .. }
-            | AppEvent::RpcClientExited(_) => {
+            | AppEvent::RpcClientExited(_)
+            | AppEvent::AttachmentStreamWorkerExited { .. } => {
                 unreachable!("RPC client events are owned by the daemon runtime")
             }
             AppEvent::ClientDetached(_) | AppEvent::ClientExited(_) => {
