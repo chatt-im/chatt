@@ -5063,19 +5063,30 @@ impl App {
     }
 
     pub(crate) fn cancel_open_audio_picker(&mut self, session: &mut SettingsSession) -> bool {
+        let mut canceled = false;
         if session.input_picker.open {
             self.cancel_audio_input_picker(session);
-            true
-        } else if session.output_picker.open {
-            self.cancel_audio_output_picker(session);
-            true
-        } else {
-            false
+            canceled = true;
         }
+        if session.output_picker.open {
+            self.cancel_audio_output_picker(session);
+            canceled = true;
+        }
+        canceled
     }
 
     fn audio_picker_open(session: &SettingsSession) -> bool {
-        session.input_picker.open || session.output_picker.open
+        session.active_audio_picker_open()
+    }
+
+    fn cancel_unfocused_audio_pickers(&mut self, session: &mut SettingsSession) {
+        let focus = session.form.focus();
+        if session.input_picker.open && focus != capture_device_id() {
+            self.cancel_audio_input_picker(session);
+        }
+        if session.output_picker.open && focus != playback_device_id() {
+            self.cancel_audio_output_picker(session);
+        }
     }
 
     pub(crate) fn handle_open_settings_picker_mouse(
@@ -5255,6 +5266,7 @@ impl App {
         if session.tab == tab {
             return;
         }
+        self.cancel_open_audio_picker(session);
         let commit = session.form.clear_text();
         session.tab = tab;
         self.drive_settings(session, FieldIntent::None, commit, None);
@@ -5271,6 +5283,10 @@ impl App {
         commit: Option<(FieldId, String)>,
         focus_column: Option<u16>,
     ) {
+        // A picker is owned by its device row. Mouse focus changes happen in
+        // the renderer before this core logic pass, so dismiss a picker that
+        // no longer owns focus before applying the clicked field's intent.
+        self.cancel_unfocused_audio_pickers(session);
         let output = crate::ui::settings::settings_logic(
             &mut session.form,
             &mut session.draft,
@@ -8555,6 +8571,32 @@ mod tests {
         TestApp::new(Config::default(), None).expect("test app")
     }
 
+    fn open_test_input_picker(session: &mut SettingsSession) {
+        session.input_items = ["System default", "USB Mic", "Line In"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| settings::AudioDeviceItem {
+                selection: Some(format!("device-{index}")),
+                aliases: Vec::new(),
+                backend_id: None,
+                device_index: Some(index as u32),
+                name: name.to_string(),
+                search_text: name.to_string(),
+                rank: 0,
+                supported: true,
+                preview: None,
+                issue: None,
+                variants: Vec::new(),
+                default_source: "test",
+            })
+            .collect();
+        let input_selection = session.draft.input_selection().map(ToOwned::to_owned);
+        let input_items = session.input_items.clone();
+        session
+            .input_picker
+            .open(&input_items, input_selection.as_deref());
+    }
+
     fn user_summary(user_id: UserId, username: &str) -> rpc::control::UserSummary {
         rpc::control::UserSummary {
             user_id,
@@ -10421,29 +10463,7 @@ mod tests {
         let settings_session = app.room.settings.clone().expect("settings session");
         {
             let mut session = settings_session.lock().unwrap();
-            session.input_items = ["System default", "USB Mic", "Line In"]
-                .into_iter()
-                .enumerate()
-                .map(|(index, name)| settings::AudioDeviceItem {
-                    selection: Some(format!("device-{index}")),
-                    aliases: Vec::new(),
-                    backend_id: None,
-                    device_index: Some(index as u32),
-                    name: name.to_string(),
-                    search_text: name.to_string(),
-                    rank: 0,
-                    supported: true,
-                    preview: None,
-                    issue: None,
-                    variants: Vec::new(),
-                    default_source: "test",
-                })
-                .collect();
-            let input_selection = session.draft.input_selection().map(ToOwned::to_owned);
-            let input_items = session.input_items.clone();
-            session
-                .input_picker
-                .open(&input_items, input_selection.as_deref());
+            open_test_input_picker(&mut session);
         }
 
         assert_eq!(
@@ -10475,6 +10495,73 @@ mod tests {
                 .current_item_index(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn switching_settings_tabs_closes_open_audio_picker_and_releases_input() {
+        use crate::config::FormBindings;
+        use crate::ui::settings::SettingsTab;
+
+        let mut app = test_app();
+        let form = FormState::new(
+            crate::ui::settings::capture_device_id(),
+            app.config.ui.default_bindings,
+        );
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings_session = app.room.settings.clone().expect("settings session");
+        open_test_input_picker(&mut settings_session.lock().unwrap());
+
+        mode.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+
+        {
+            let session = settings_session.lock().unwrap();
+            assert_eq!(session.tab, SettingsTab::Interface);
+            assert!(!session.input_picker.open);
+        }
+
+        mode.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::empty()),
+        );
+
+        let session = settings_session.lock().unwrap();
+        assert_eq!(session.draft.form_bindings(), FormBindings::Vim);
+        assert!(session.dirty);
+    }
+
+    #[test]
+    fn clicking_another_settings_field_closes_open_audio_picker() {
+        let mut app = test_app();
+        let form = FormState::new(
+            crate::ui::settings::capture_device_id(),
+            app.config.ui.default_bindings,
+        );
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings_session = app.room.settings.clone().expect("settings session");
+        open_test_input_picker(&mut settings_session.lock().unwrap());
+        mode.render(&mut app, &mut Buffer::new(100, 40), 0);
+
+        let bitrate = crate::ui::settings::field_id_for("Capture Settings", "Bitrate");
+        let rect = settings_session
+            .lock()
+            .unwrap()
+            .form
+            .field_rect_for_test(bitrate)
+            .expect("bitrate hit target");
+        mode.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        let session = settings_session.lock().unwrap();
+        assert_eq!(session.form.focus(), bitrate);
+        assert!(!session.input_picker.open);
+        assert!(session.dirty);
     }
 
     #[test]

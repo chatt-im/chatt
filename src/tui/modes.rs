@@ -911,6 +911,12 @@ impl SettingsSession {
                 .reset(&self.output_items, self.draft.output_selection());
         }
     }
+
+    pub(crate) fn active_audio_picker_open(&self) -> bool {
+        let focus = self.form.focus();
+        (focus == crate::ui::settings::capture_device_id() && self.input_picker.open)
+            || (focus == crate::ui::settings::playback_device_id() && self.output_picker.open)
+    }
 }
 
 pub(crate) struct SettingsMode;
@@ -986,16 +992,6 @@ impl SettingsMode {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         session.sync_catalog(&cx.session.audio_devices);
-        if session.input_picker.open || session.output_picker.open {
-            drop(session);
-            cx.send(CoreCommand::Settings(SettingsOp::PickerKey(key)));
-            return Action::Continue;
-        }
-        if is_control_save_chord_cx(cx, &key) {
-            drop(session);
-            cx.send(CoreCommand::Settings(SettingsOp::Save));
-            return Action::Continue;
-        }
         let tab_delta = match key.code {
             KeyCode::Tab => Some(1),
             KeyCode::BackTab => Some(-1),
@@ -1009,6 +1005,16 @@ impl SettingsMode {
         if let Some(delta) = settings_tab_chord_cx(cx, &key) {
             drop(session);
             cx.send(CoreCommand::Settings(SettingsOp::CycleTab(delta)));
+            return Action::Continue;
+        }
+        if session.active_audio_picker_open() {
+            drop(session);
+            cx.send(CoreCommand::Settings(SettingsOp::PickerKey(key)));
+            return Action::Continue;
+        }
+        if is_control_save_chord_cx(cx, &key) {
+            drop(session);
+            cx.send(CoreCommand::Settings(SettingsOp::Save));
             return Action::Continue;
         }
 
@@ -1101,7 +1107,7 @@ impl SettingsMode {
             cx.send(CoreCommand::Settings(SettingsOp::SetTab(tab)));
             return Action::Continue;
         }
-        if (session.input_picker.open || session.output_picker.open)
+        if session.active_audio_picker_open()
             && matches!(
                 mouse.kind,
                 extui::event::MouseEventKind::ScrollDown | extui::event::MouseEventKind::ScrollUp

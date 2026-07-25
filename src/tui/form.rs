@@ -531,6 +531,14 @@ impl<F: Copy + Eq> FormState<F> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn field_rect_for_test(&self, field: F) -> Option<Rect> {
+        self.hits
+            .iter()
+            .find(|hit| hit.field == field && !matches!(hit.kind, HitKind::PickerItem(_)))
+            .map(|hit| hit.rect)
+    }
+
     fn handle_standard_key(&mut self, key: KeyEvent, focused_kind: FormFieldKind) -> FormEvent<F> {
         match key.code {
             KeyCode::Esc => {
