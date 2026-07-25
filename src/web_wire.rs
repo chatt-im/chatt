@@ -195,7 +195,9 @@ fn render_html(source: &str, tokens: &[Token], resolver: RefResolver) -> String 
                 let url = slice(source, &token.range);
                 html.push_str("<a href=\"");
                 escape_html(url, &mut html);
-                html.push_str("\">");
+                // Peer-authored destinations must not navigate the chat client
+                // away or gain access to its window through `window.opener`.
+                html.push_str("\" target=\"_blank\" rel=\"noopener noreferrer\">");
                 escape_html(url, &mut html);
                 html.push_str("</a>");
             }
@@ -593,6 +595,19 @@ mod tests {
         assert_eq!(
             fragments,
             vec![Fragment::text("<p>hello <strong>world</strong></p>")]
+        );
+    }
+
+    #[test]
+    fn user_links_open_safely_in_a_new_tab() {
+        let fragments = split_fragments("see https://example.com/a?x=1&y=2", &|_| None);
+        assert_eq!(
+            fragments,
+            vec![Fragment::text(
+                "<p>see <a href=\"https://example.com/a?x=1&amp;y=2\" \
+                 target=\"_blank\" rel=\"noopener noreferrer\">\
+                 https://example.com/a?x=1&amp;y=2</a></p>"
+            )]
         );
     }
 
