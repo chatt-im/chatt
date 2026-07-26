@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicU32, Ordering},
         mpsc::TrySendError,
         mpsc::{Receiver, Sender, SyncSender, sync_channel},
     },
@@ -68,14 +68,9 @@ pub struct LiveCaptureConfig {
     pub buffer_request: BufferRequest,
     pub tuning: LiveAudioTuning,
     pub echo_control: Option<Arc<EchoCancellationControl>>,
-    /// Microphone mute flag, shared with the app. The encoder worker reads it
-    /// each chunk so muting drives a fade-out and silence markers through the
-    /// pipeline instead of the audio just stopping (which the receiver would
-    /// mistake for packet loss).
-    pub mic_muted: Arc<AtomicBool>,
-    /// Deafen flag. Deafen force-mutes the microphone, so the encoder treats it
-    /// exactly like [`Self::mic_muted`] for the outgoing fade/silence transition.
-    pub deafened: Arc<AtomicBool>,
+    /// Shared three-state voice mode. Muted and deafened states both drive the
+    /// outgoing fade/silence transition.
+    pub voice_state: Arc<crate::audio::AtomicVoiceState>,
 }
 
 /// Resolved device parameters captured when a capture or playback stream
@@ -657,8 +652,7 @@ where
     let worker_stats = stats.clone();
     let worker_max_amplification = Arc::clone(&max_amplification_bits);
     let worker_encoder_loss_percent = Arc::clone(&encoder_loss_percent);
-    let worker_mic_muted = Arc::clone(&config.mic_muted);
-    let worker_deafened = Arc::clone(&config.deafened);
+    let worker_voice_state = Arc::clone(&config.voice_state);
     let echo_source = config
         .echo_control
         .clone()
@@ -677,8 +671,7 @@ where
                 config.denoise,
                 worker_max_amplification,
                 worker_encoder_loss_percent,
-                worker_mic_muted,
-                worker_deafened,
+                worker_voice_state,
                 config.tuning,
                 config.suppression,
                 config.typing_suppression,

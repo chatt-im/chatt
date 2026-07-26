@@ -145,8 +145,8 @@ pub enum ClientControl {
         room_id: RoomId,
         body: String,
     },
-    SetVoiceStatus {
-        status: ParticipantVoiceStatus,
+    SetVoiceState {
+        state: VoiceState,
     },
     PublishP2p {
         room_id: RoomId,
@@ -364,10 +364,10 @@ pub enum ServerControl {
         user_id: UserId,
         stream_id: StreamId,
     },
-    VoiceStatus {
+    VoiceStateChanged {
         room_id: RoomId,
         user_id: UserId,
-        status: ParticipantVoiceStatus,
+        state: VoiceState,
     },
     /// Reply to a [`ClientControl::JoinVoice`] the server could not satisfy,
     /// attributable to the room so the client can roll back its pending join.
@@ -621,7 +621,7 @@ pub struct UserSummary {
     /// Server wall-clock (UNIX ms) the user's current session connected; 0
     /// when offline.
     pub connected_at_ms: u64,
-    pub voice_status: ParticipantVoiceStatus,
+    pub voice_state: VoiceState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -633,17 +633,40 @@ pub struct ParticipantServerRtt {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
-pub struct ParticipantVoiceStatus {
-    pub muted: bool,
-    pub deafened: bool,
+pub enum VoiceState {
+    #[default]
+    Live,
+    Muted,
+    Deafened,
 }
 
-impl ParticipantVoiceStatus {
-    pub fn normalized(mut self) -> Self {
-        if self.deafened {
-            self.muted = true;
+impl VoiceState {
+    pub fn is_muted(self) -> bool {
+        !matches!(self, Self::Live)
+    }
+
+    pub fn is_deafened(self) -> bool {
+        matches!(self, Self::Deafened)
+    }
+
+    /// Target state for a mute/unmute toggle.
+    ///
+    /// Deafened is also muted, so "unmute" always returns fully to Live.
+    pub fn toggle_mute(self) -> Self {
+        match self {
+            Self::Live => Self::Muted,
+            Self::Muted | Self::Deafened => Self::Live,
         }
-        self
+    }
+
+    /// Target state for a deafen/undeafen toggle.
+    ///
+    /// Undeafening returns fully to Live instead of retaining hidden mute state.
+    pub fn toggle_deafen(self) -> Self {
+        match self {
+            Self::Deafened => Self::Live,
+            Self::Live | Self::Muted => Self::Deafened,
+        }
     }
 }
 
@@ -1485,10 +1508,7 @@ mod tests {
                 username: "Alice".to_string(),
                 online: true,
                 connected_at_ms: 1_700_000_000_000,
-                voice_status: ParticipantVoiceStatus {
-                    muted: true,
-                    deafened: false,
-                },
+                voice_state: VoiceState::Muted,
             },
             online: true,
         };
@@ -1550,22 +1570,37 @@ mod tests {
     }
 
     #[test]
-    fn voice_status_controls_round_trip() {
-        let status = ParticipantVoiceStatus {
-            muted: true,
-            deafened: false,
-        };
-        let client = ClientControl::SetVoiceStatus { status };
-        let encoded = encode_client_control(&client).unwrap();
-        assert_eq!(decode_client_control(&encoded).unwrap(), client);
+    fn voice_state_controls_round_trip() {
+        for state in [VoiceState::Live, VoiceState::Muted, VoiceState::Deafened] {
+            let client = ClientControl::SetVoiceState { state };
+            let encoded = encode_client_control(&client).unwrap();
+            assert_eq!(decode_client_control(&encoded).unwrap(), client);
 
-        let server = ServerControl::VoiceStatus {
-            room_id: RoomId(1),
-            user_id: UserId(2),
-            status,
-        };
-        let encoded = encode_server_control(&server);
-        assert_eq!(decode_server_control(&encoded).unwrap(), server);
+            let server = ServerControl::VoiceStateChanged {
+                room_id: RoomId(1),
+                user_id: UserId(2),
+                state,
+            };
+            let encoded = encode_server_control(&server);
+            assert_eq!(decode_server_control(&encoded).unwrap(), server);
+        }
+    }
+
+    #[test]
+    fn voice_state_toggle_transitions_are_exhaustive() {
+        let cases = [
+            (VoiceState::Live, VoiceState::Muted, VoiceState::Deafened),
+            (VoiceState::Muted, VoiceState::Live, VoiceState::Deafened),
+            (VoiceState::Deafened, VoiceState::Live, VoiceState::Live),
+        ];
+        for (state, mute_target, deafen_target) in cases {
+            assert_eq!(state.toggle_mute(), mute_target, "mute from {state:?}");
+            assert_eq!(
+                state.toggle_deafen(),
+                deafen_target,
+                "deafen from {state:?}"
+            );
+        }
     }
 
     #[test]
@@ -1729,7 +1764,7 @@ mod tests {
                 username: "Zoe".to_string(),
                 online: true,
                 connected_at_ms: 1_700_000_000_000,
-                voice_status: ParticipantVoiceStatus::default(),
+                voice_state: VoiceState::default(),
             }],
             default_room: RoomId(1),
         };

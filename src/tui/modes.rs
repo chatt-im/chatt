@@ -334,29 +334,29 @@ fn process_top_bar_mouse_cx(cx: &mut ViewCx<'_>, mouse: MouseEvent) -> bool {
     }
     let requested =
         if crate::tui::form::rect_contains(cx.view.chrome.top_bar.live, mouse.column, mouse.row) {
-            Some(crate::app::LocalVoiceMode::Live)
+            Some(rpc::control::VoiceState::Live)
         } else if crate::tui::form::rect_contains(
             cx.view.chrome.top_bar.mute,
             mouse.column,
             mouse.row,
         ) {
-            Some(crate::app::LocalVoiceMode::Muted)
+            Some(rpc::control::VoiceState::Muted)
         } else if crate::tui::form::rect_contains(
             cx.view.chrome.top_bar.deafen,
             mouse.column,
             mouse.row,
         ) {
-            Some(crate::app::LocalVoiceMode::Deafened)
+            Some(rpc::control::VoiceState::Deafened)
         } else {
             None
         };
     if let Some(requested) = requested {
-        let mode = if cx.view.local_voice_mode() == requested {
-            crate::app::LocalVoiceMode::Live
+        let mode = if cx.view.local_voice_state() == requested {
+            rpc::control::VoiceState::Live
         } else {
             requested
         };
-        cx.send(CoreCommand::SetVoiceMode(mode));
+        cx.send(CoreCommand::SetVoiceState(mode));
         return true;
     }
     if crate::tui::form::rect_contains(cx.view.chrome.top_bar.video, mouse.column, mouse.row) {
@@ -2763,7 +2763,7 @@ mod tests {
     };
     use extui_editor::Mode as EditorMode;
     use rpc::{
-        control::{ChatMessage, ParticipantVoiceStatus},
+        control::{ChatMessage, VoiceState},
         ids::{FileTransferId, MessageId, RoomId, UserId},
     };
     use toml_spanner::Arena;
@@ -3566,7 +3566,7 @@ mod tests {
             username: username.to_string(),
             online: true,
             connected_at_ms: 0,
-            voice_status: ParticipantVoiceStatus::default(),
+            voice_state: VoiceState::default(),
         }
     }
 
@@ -5234,10 +5234,10 @@ mod tests {
 
         room.process_input(&mut app, key('h'));
         assert_eq!(room.lobby_list_focus(), LobbyListFocus::Rooms);
-        assert!(!app.deafened.load(Ordering::Relaxed));
+        assert!(!app.voice_state.load(Ordering::Relaxed).is_deafened());
 
         room.process_input(&mut app, ctrl('h'));
-        assert!(app.deafened.load(Ordering::Relaxed));
+        assert!(app.voice_state.load(Ordering::Relaxed).is_deafened());
     }
 
     #[test]
@@ -5258,13 +5258,14 @@ mod tests {
         assert!(!live_row.contains(" HEAR "));
 
         app.voice_tx_enabled.store(false, Ordering::Relaxed);
-        app.mic_muted.store(true, Ordering::Relaxed);
+        app.voice_state.store(VoiceState::Muted, Ordering::Relaxed);
         render_room(&mut app, &mut room, &mut buffer);
         let muted_row = row_text(&mut buffer, 0);
         assert!(muted_row.contains(" LIVE  MUTE  DEAF "));
         assert!(!muted_row.contains(" MUTED "));
 
-        app.deafened.store(true, Ordering::Relaxed);
+        app.voice_state
+            .store(VoiceState::Deafened, Ordering::Relaxed);
         render_room(&mut app, &mut room, &mut buffer);
         let deaf_row = row_text(&mut buffer, 0);
         assert!(deaf_row.contains(" LIVE  MUTE  DEAF "));

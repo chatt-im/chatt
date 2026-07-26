@@ -10,9 +10,48 @@ use std::{
 };
 
 use nnnoiseless::DenoiseState;
+use rpc::control::VoiceState;
 use toml_spanner::Toml;
 
 use crate::audio::errors::AudioErrorKind;
+
+/// Atomically shared local voice state. The private byte representation keeps
+/// capture, playback, and every frontend on one coherent three-state value.
+#[derive(Debug)]
+pub struct AtomicVoiceState(AtomicU8);
+
+impl AtomicVoiceState {
+    pub fn new(state: VoiceState) -> Self {
+        Self(AtomicU8::new(Self::encode(state)))
+    }
+
+    pub fn load(&self, ordering: Ordering) -> VoiceState {
+        match self.0.load(ordering) {
+            0 => VoiceState::Live,
+            1 => VoiceState::Muted,
+            2 => VoiceState::Deafened,
+            value => panic!("invalid atomic voice state {value}"),
+        }
+    }
+
+    pub fn store(&self, state: VoiceState, ordering: Ordering) {
+        self.0.store(Self::encode(state), ordering);
+    }
+
+    const fn encode(state: VoiceState) -> u8 {
+        match state {
+            VoiceState::Live => 0,
+            VoiceState::Muted => 1,
+            VoiceState::Deafened => 2,
+        }
+    }
+}
+
+impl Default for AtomicVoiceState {
+    fn default() -> Self {
+        Self::new(VoiceState::Live)
+    }
+}
 
 /// Capture noise-suppression engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
@@ -1265,6 +1304,21 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+
+    #[test]
+    fn atomic_voice_state_round_trips_every_state() {
+        let state = AtomicVoiceState::default();
+        assert_eq!(state.load(Ordering::Relaxed), VoiceState::Live);
+        assert_eq!(
+            std::mem::size_of::<AtomicVoiceState>(),
+            std::mem::size_of::<AtomicU8>()
+        );
+
+        for expected in [VoiceState::Live, VoiceState::Muted, VoiceState::Deafened] {
+            state.store(expected, Ordering::Relaxed);
+            assert_eq!(state.load(Ordering::Relaxed), expected);
+        }
+    }
 
     #[test]
     fn latency_range_consts_agree_with_validate() {

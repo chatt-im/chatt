@@ -191,15 +191,74 @@ pub struct Participant {
     pub name: String,
     pub online: bool,
     pub speaking: bool,
-    pub muted: bool,
-    pub deafened: bool,
+    pub voice_state: VoiceState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum VoiceState {
+    #[default]
+    Live,
+    Muted,
+    Deafened,
+}
+
+impl VoiceState {
+    pub fn is_muted(self) -> bool {
+        !matches!(self, Self::Live)
+    }
+
+    pub fn is_deafened(self) -> bool {
+        matches!(self, Self::Deafened)
+    }
+
+    /// Target state for a mute/unmute toggle.
+    ///
+    /// Deafened is also muted, so "unmute" always returns fully to Live.
+    pub fn toggle_mute(self) -> Self {
+        match self {
+            Self::Live => Self::Muted,
+            Self::Muted | Self::Deafened => Self::Live,
+        }
+    }
+
+    /// Target state for a deafen/undeafen toggle.
+    ///
+    /// Undeafening returns fully to Live instead of retaining hidden mute state.
+    pub fn toggle_deafen(self) -> Self {
+        match self {
+            Self::Deafened => Self::Live,
+            Self::Live | Self::Muted => Self::Deafened,
+        }
+    }
+}
+
+#[cfg(test)]
+mod voice_state_tests {
+    use super::VoiceState;
+
+    #[test]
+    fn toggle_transitions_are_exhaustive() {
+        let cases = [
+            (VoiceState::Live, VoiceState::Muted, VoiceState::Deafened),
+            (VoiceState::Muted, VoiceState::Live, VoiceState::Deafened),
+            (VoiceState::Deafened, VoiceState::Live, VoiceState::Live),
+        ];
+        for (state, mute_target, deafen_target) in cases {
+            assert_eq!(state.toggle_mute(), mute_target, "mute from {state:?}");
+            assert_eq!(
+                state.toggle_deafen(),
+                deafen_target,
+                "deafen from {state:?}"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Jsony)]
 #[jsony(Binary, version)]
-pub struct VoiceState {
-    pub muted: bool,
-    pub deafened: bool,
+pub struct VoiceSessionState {
+    pub state: VoiceState,
     pub output_volume: f32,
     pub joined_room: Option<RoomId>,
 }
@@ -266,7 +325,7 @@ pub struct StateSnapshot {
     pub rooms: Vec<RoomSummary>,
     pub selected_room: Option<RoomId>,
     pub room: Option<RoomSnapshot>,
-    pub voice: VoiceState,
+    pub voice: VoiceSessionState,
     pub transfers: Vec<TransferSummary>,
     pub live_shares: Vec<LiveShare>,
 }
@@ -484,7 +543,7 @@ impl Participant {
     }
 }
 
-impl VoiceState {
+impl VoiceSessionState {
     pub fn validate(&self) -> Result<(), String> {
         if !self.output_volume.is_finite()
             || !(0.0..=super::MAX_OUTPUT_VOLUME_PERCENT).contains(&self.output_volume)

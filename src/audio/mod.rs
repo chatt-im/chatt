@@ -25,7 +25,7 @@ pub use lifecycle::{
 };
 pub use notifications::{NotificationSound, sound_samples};
 pub use shared::{
-    AudioStats, BufferRequest, CAPTURE_LONG_SILENCE_STOP_MS_RANGE,
+    AtomicVoiceState, AudioStats, BufferRequest, CAPTURE_LONG_SILENCE_STOP_MS_RANGE,
     CAPTURE_SILENCE_PREROLL_MS_RANGE, CAPTURE_SILENCE_RAMP_MS_RANGE, CHANNELS,
     DEFAULT_DENOISE_RELEASE, DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_RELEASE_MS,
     DEFAULT_DENOISE_TYPING_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
@@ -45,8 +45,8 @@ pub use sim::{
     LiveAudioContentionBenchReport, LiveAudioContentionBenchTarget, LiveAudioContentionBenchmark,
     LiveAudioDirectSampleSimulationConfig, LiveAudioFilePlaybackTestConfig,
     LiveAudioFilePlaybackTestReport, LiveAudioFileSourceConfig, LiveAudioFileSourceReport,
-    LiveAudioMuteState, LiveAudioPacketLossProfile, LiveAudioSimulationConfig,
-    LiveAudioSimulationOutput, LiveAudioSimulationReport, LiveAudioSimulationScenario,
+    LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationOutput,
+    LiveAudioSimulationReport, LiveAudioSimulationScenario, LiveAudioSourceState,
     load_live_audio_simulation_sample_pcm, load_live_audio_simulation_speech_frames,
     render_live_audio_simulation_input, run_live_audio_direct_sample_simulation_output,
     run_live_audio_direct_sample_simulation_output_with_trace, run_live_audio_file_playback_test,

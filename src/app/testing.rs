@@ -207,9 +207,7 @@ impl TestApp {
             OpenSettings => self.app.open_settings(),
             Quit => return Action::Quit,
             ToggleMute => self.app.toggle_mute(),
-            ToggleDeafen => self
-                .app
-                .set_deafen(!self.app.deafened.load(std::sync::atomic::Ordering::Relaxed)),
+            ToggleDeafen => self.app.toggle_deafen(),
             PlaySoundboard1 => self.app.trigger_soundboard_slot(0),
             PlaySoundboard2 => self.app.trigger_soundboard_slot(1),
             PlaySoundboard3 => self.app.trigger_soundboard_slot(2),

@@ -8,21 +8,21 @@ use local_rpc::{
     ids::StreamId,
     model::{
         BulkTransferId, ConnectionState, DaemonInstanceId, RequestId, ServerAvailability,
-        ServerSelectionState, ServerSummary, StateSnapshot, VoiceState,
+        ServerSelectionState, ServerSummary, StateSnapshot, VoiceSessionState, VoiceState,
     },
     unix::{FrameReader, FrameWriter},
 };
 
 #[test]
-fn renderer_and_daemon_exchange_protocol_v11_frames_and_live_share_fd() {
-    assert_eq!(PROTOCOL_MIN_VERSION, 11);
-    assert_eq!(PROTOCOL_MAX_VERSION, 11);
+fn renderer_and_daemon_exchange_protocol_v12_frames_and_live_share_fd() {
+    assert_eq!(PROTOCOL_MIN_VERSION, 12);
+    assert_eq!(PROTOCOL_MAX_VERSION, 12);
     assert_eq!(MAX_MESSAGE_BODY_BYTES, 8 * 1024);
     assert_eq!(DEFAULT_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
     assert_eq!(MAX_HISTORY_REQUEST_MESSAGES, 500);
 
     let hello = ClientHello::current("test-renderer");
-    assert_eq!(hello.negotiated_version(), Some(11));
+    assert_eq!(hello.negotiated_version(), Some(12));
 
     let (daemon_socket, renderer_socket) = UnixStream::pair().unwrap();
     let mut daemon_reader = FrameReader::new(daemon_socket.try_clone().unwrap());
@@ -77,9 +77,8 @@ fn renderer_and_daemon_exchange_protocol_v11_frames_and_live_share_fd() {
             rooms: Vec::new(),
             selected_room: None,
             room: None,
-            voice: VoiceState {
-                muted: false,
-                deafened: false,
+            voice: VoiceSessionState {
+                state: VoiceState::Live,
                 output_volume: 100.0,
                 joined_room: None,
             },

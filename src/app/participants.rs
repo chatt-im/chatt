@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rpc::{
-    control::{ParticipantVoiceStatus, UserSummary},
+    control::{UserSummary, VoiceState},
     ids::{StreamId, UserId},
 };
 
@@ -25,7 +25,7 @@ pub(crate) struct ParticipantState {
     pub(crate) username: Option<String>,
     pub(crate) online: bool,
     pub(crate) voice_active: bool,
-    pub(crate) voice_status: ParticipantVoiceStatus,
+    pub(crate) voice_state: VoiceState,
     pub(crate) talking_display: bool,
     last_talking_at: Option<Instant>,
     pub(crate) p2p_direct: bool,
@@ -69,7 +69,7 @@ impl ParticipantState {
             username: None,
             online: true,
             voice_active: true,
-            voice_status: ParticipantVoiceStatus::default(),
+            voice_state: VoiceState::default(),
             talking_display: false,
             last_talking_at: None,
             p2p_direct: false,
@@ -205,7 +205,7 @@ impl Participants {
             existing.username = Some(user.username);
             existing.online = online;
             existing.voice_active = in_call;
-            existing.voice_status = user.voice_status.normalized();
+            existing.voice_state = user.voice_state;
             if online {
                 existing.presence_since = Some(instant_from_server_ms(user.connected_at_ms));
             } else if let Some(away_since) = away_since {
@@ -213,7 +213,7 @@ impl Participants {
             } else if was_online {
                 existing.presence_since = Some(Instant::now());
             }
-            if !online || !in_call || existing.voice_status.muted {
+            if !online || !in_call || existing.voice_state.is_muted() {
                 existing.p2p_direct = false;
                 existing.voice_feedback = None;
                 existing.outbound_feedback = None;
@@ -227,7 +227,7 @@ impl Participants {
             if !online && away_since.is_none() {
                 return;
             }
-            let voice_status = user.voice_status.normalized();
+            let voice_state = user.voice_state;
             let presence_since = if online {
                 instant_from_server_ms(user.connected_at_ms)
             } else {
@@ -238,7 +238,7 @@ impl Participants {
                 username: Some(user.username),
                 online,
                 voice_active: in_call,
-                voice_status,
+                voice_state,
                 talking_display: false,
                 last_talking_at: None,
                 p2p_direct: false,
@@ -282,23 +282,23 @@ impl Participants {
         }
     }
 
-    pub(crate) fn set_voice_status(&mut self, user_id: UserId, status: ParticipantVoiceStatus) {
+    pub(crate) fn set_voice_state(&mut self, user_id: UserId, state: VoiceState) {
         let entry = self.ensure_user(user_id);
-        entry.voice_status = status.normalized();
-        if entry.voice_status.muted {
+        entry.voice_state = state;
+        if entry.voice_state.is_muted() {
             entry.talking_display = false;
             entry.last_talking_at = None;
         }
     }
 
     /// Whether the given user is currently muted (or deafened), per the last
-    /// control-stream voice status. Used to seed a newly started stream's
+    /// control-stream voice state. Used to seed a newly started stream's
     /// sender-mute state.
     pub(crate) fn voice_muted(&self, user_id: UserId) -> bool {
         self.entries
             .iter()
             .find(|entry| entry.user_id == user_id)
-            .is_some_and(|entry| entry.voice_status.muted)
+            .is_some_and(|entry| entry.voice_state.is_muted())
     }
 
     pub(crate) fn update_talking_display(
@@ -316,7 +316,7 @@ impl Participants {
             return false;
         };
         let was_talking = entry.talking_display;
-        if !entry.online || !entry.voice_active || entry.voice_status.muted {
+        if !entry.online || !entry.voice_active || entry.voice_state.is_muted() {
             entry.talking_display = false;
             entry.last_talking_at = None;
             return was_talking;
@@ -411,7 +411,7 @@ impl Participants {
             username: None,
             online: true,
             voice_active: false,
-            voice_status: ParticipantVoiceStatus::default(),
+            voice_state: VoiceState::default(),
             talking_display: false,
             last_talking_at: None,
             p2p_direct: false,
@@ -495,7 +495,7 @@ mod tests {
                 username: format!("user-{}", user_id.0),
                 online: true,
                 connected_at_ms: 0,
-                voice_status: ParticipantVoiceStatus::default(),
+                voice_state: VoiceState::default(),
             },
             in_call: true,
             away_since: None,
@@ -790,13 +790,7 @@ mod tests {
         let now = Instant::now();
         participants.update_talking_display(UserId(1), true, now, Duration::from_millis(200));
 
-        participants.set_voice_status(
-            UserId(1),
-            ParticipantVoiceStatus {
-                muted: true,
-                deafened: false,
-            },
-        );
+        participants.set_voice_state(UserId(1), VoiceState::Muted);
 
         assert!(!participants.entries[0].talking_display);
     }

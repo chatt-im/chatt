@@ -5,7 +5,7 @@ mod scenario;
 
 pub use file_source::{
     LiveAudioFilePlaybackTestConfig, LiveAudioFilePlaybackTestReport, LiveAudioFileSourceConfig,
-    LiveAudioFileSourceReport, LiveAudioMuteState, run_live_audio_file_playback_test,
+    LiveAudioFileSourceReport, LiveAudioSourceState, run_live_audio_file_playback_test,
     run_live_audio_file_source,
 };
 pub use harness::{

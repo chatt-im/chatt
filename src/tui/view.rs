@@ -5,7 +5,10 @@
 use extui::Style;
 use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use hashbrown::HashMap;
-use rpc::ids::{MessageId, RoomId, UserId};
+use rpc::{
+    control::VoiceState,
+    ids::{MessageId, RoomId, UserId},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
@@ -33,10 +36,9 @@ pub(crate) struct ClientView {
     pub chrome: ChromeState,
     /// Rows for the server picker, rebuilt from config whenever it changes.
     pub server_catalog: crate::app::ServerCatalog,
-    /// Shared mute/deafen switches, cloned from the core's handles so the
-    /// top bar reads them without core access.
-    pub mic_muted: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub deafened: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared three-state voice mode, cloned from the core so the top bar reads
+    /// one coherent value without core access.
+    pub voice_state: std::sync::Arc<crate::audio::AtomicVoiceState>,
     /// Fast-attack/slow-release smoothing for the mic VU meter and dB readout,
     /// so noise-reduction gating faint background noise reads as a steady level
     /// instead of flicker. Applied in `prepare_screen`; display-only.
@@ -119,8 +121,7 @@ impl ClientView {
                 catalog.rebuild(config);
                 catalog
             },
-            mic_muted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            deafened: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            voice_state: std::sync::Arc::new(crate::audio::AtomicVoiceState::default()),
             mic_level_ballistics: MicLevelBallistics::default(),
             lobby_details: false,
             rooms_offset: 0,
@@ -272,16 +273,10 @@ impl ClientView {
         self.active.chat.bottom();
     }
 
-    /// The local mute/deafen display mode, read from the shared switches.
-    pub(crate) fn local_voice_mode(&self) -> crate::app::LocalVoiceMode {
+    /// The local voice mode read from the shared atomic state.
+    pub(crate) fn local_voice_state(&self) -> VoiceState {
         use std::sync::atomic::Ordering;
-        if self.deafened.load(Ordering::Relaxed) {
-            crate::app::LocalVoiceMode::Deafened
-        } else if self.mic_muted.load(Ordering::Relaxed) {
-            crate::app::LocalVoiceMode::Muted
-        } else {
-            crate::app::LocalVoiceMode::Live
-        }
+        self.voice_state.load(Ordering::Relaxed)
     }
 
     pub(crate) fn take_pending_clipboard(&mut self) -> Option<String> {

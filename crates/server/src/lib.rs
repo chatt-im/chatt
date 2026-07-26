@@ -3024,9 +3024,9 @@ impl Server {
                 self.open_dm(session_id, user_id);
                 Ok(())
             }
-            (ConnState::Ready, ClientControl::SetVoiceStatus { status }) => {
+            (ConnState::Ready, ClientControl::SetVoiceState { state }) => {
                 let session_id = self.session_for_token(token)?;
-                self.set_voice_status(session_id, status);
+                self.set_voice_state(session_id, state);
                 Ok(())
             }
             (
@@ -4850,7 +4850,7 @@ impl Server {
                 voice_room: None,
                 transport,
                 active_stream: None,
-                voice_status: control::ParticipantVoiceStatus::default(),
+                voice_state: control::VoiceState::default(),
                 reported_server_rtt_ms: None,
                 server_rtt_reported_at: None,
                 p2p: None,
@@ -4992,7 +4992,7 @@ impl Server {
                     username: user.username.clone(),
                     online: session.is_some(),
                     connected_at_ms: session.map(|s| s.connected_at_ms).unwrap_or(0),
-                    voice_status: session.map(|s| s.voice_status).unwrap_or_default(),
+                    voice_state: session.map(|s| s.voice_state).unwrap_or_default(),
                 }
             })
             .collect();
@@ -5012,10 +5012,10 @@ impl Server {
             username: session.username.clone(),
             online,
             connected_at_ms: if online { session.connected_at_ms } else { 0 },
-            voice_status: if online {
-                session.voice_status
+            voice_state: if online {
+                session.voice_state
             } else {
-                control::ParticipantVoiceStatus::default()
+                control::VoiceState::default()
             },
         }
     }
@@ -5115,21 +5115,21 @@ impl Server {
                 self.send_existing_voice_streams_to_token(room_id, session_id, token);
             }
             self.replay_voice_room_shares(room_id, session_id);
-            // Peers cache the last VoiceStatus broadcast per user, and status
+            // Peers cache the last VoiceStateChanged broadcast per user, and state
             // changes made while out of a call are stored without broadcast,
-            // so an effective join must republish the joiner's current status
+            // so an effective join must republish the joiner's current state
             // unconditionally to overwrite any stale belief.
-            let status = self
+            let state = self
                 .sessions
                 .get(&session_id)
-                .map(|session| session.voice_status)
+                .map(|session| session.voice_state)
                 .unwrap_or_default();
             self.broadcast_control(
                 room_id,
-                &ServerControl::VoiceStatus {
+                &ServerControl::VoiceStateChanged {
                     room_id,
                     user_id,
-                    status,
+                    state,
                 },
             );
         }
@@ -6872,43 +6872,40 @@ impl Server {
         );
     }
 
-    fn set_voice_status(&mut self, session_id: SessionId, status: control::ParticipantVoiceStatus) {
-        let status = status.normalized();
+    fn set_voice_state(&mut self, session_id: SessionId, state: control::VoiceState) {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
-        if session.voice_status == status {
+        if session.voice_state == state {
             return;
         }
-        session.voice_status = status;
+        session.voice_state = state;
         let Some(room_id) = session.voice_room else {
             return;
         };
         let user_id = session.user_id;
         kvlog::info!(
-            "voice status changed",
+            "voice state changed",
             session_id = session_id.0,
             room_id = room_id.0,
             user_id = user_id.0,
-            muted = status.muted,
-            deafened = status.deafened
+            state = ?state
         );
         if audio_pop_logging_enabled() {
             kvlog::info!(
-                "audio pop control voice status relay",
+                "audio pop control voice state relay",
                 session_id = session_id.0,
                 room_id = room_id.0,
                 user_id = user_id.0,
-                muted = status.muted,
-                deafened = status.deafened
+                state = ?state
             );
         }
         self.broadcast_control(
             room_id,
-            &ServerControl::VoiceStatus {
+            &ServerControl::VoiceStateChanged {
                 room_id,
                 user_id,
-                status,
+                state,
             },
         );
     }
@@ -8287,7 +8284,7 @@ struct Session {
     /// own codec and exclusively owns the mutable media counters/replay state.
     transport: SessionTransport,
     active_stream: Option<StreamId>,
-    voice_status: control::ParticipantVoiceStatus,
+    voice_state: control::VoiceState,
     reported_server_rtt_ms: Option<u16>,
     server_rtt_reported_at: Option<Instant>,
     p2p: Option<P2pSessionState>,
@@ -8768,7 +8765,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::Pair { .. } => "pair",
         ClientControl::OpenPair { .. } => "open_pair",
         ClientControl::SendChat { .. } => "send_chat",
-        ClientControl::SetVoiceStatus { .. } => "set_voice_status",
+        ClientControl::SetVoiceState { .. } => "set_voice_state",
         ClientControl::PublishP2p { .. } => "publish_p2p",
         ClientControl::UploadFileStart { .. } => "upload_file_start",
         ClientControl::UploadFileChunk { .. } => "upload_file_chunk",
@@ -8823,7 +8820,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::Presence { .. } => "presence",
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
-        ServerControl::VoiceStatus { .. } => "voice_status",
+        ServerControl::VoiceStateChanged { .. } => "voice_state",
         ServerControl::VoiceJoinFailed { .. } => "voice_join_failed",
         ServerControl::RoomRttSnapshot { .. } => "room_rtt_snapshot",
         ServerControl::UdpBound => "udp_bound",
@@ -8973,7 +8970,7 @@ mod tests {
             voice_room,
             transport: test_transport(1),
             active_stream: None,
-            voice_status: control::ParticipantVoiceStatus::default(),
+            voice_state: control::VoiceState::default(),
             reported_server_rtt_ms: None,
             server_rtt_reported_at: None,
             p2p: None,
@@ -9275,7 +9272,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_status_normalizes_deafened_to_muted() {
+    fn voice_state_stores_deafened_exactly() {
         let mut server = test_server();
         let room_id = RoomId(1);
         let session_id = SessionId(1);
@@ -9287,22 +9284,10 @@ mod tests {
             test_session(UserId(9), Token(11), Some(room_id)),
         );
 
-        server.set_voice_status(
-            session_id,
-            control::ParticipantVoiceStatus {
-                muted: false,
-                deafened: true,
-            },
-        );
+        server.set_voice_state(session_id, control::VoiceState::Deafened);
 
         let session = server.sessions.get(&session_id).expect("session exists");
-        assert_eq!(
-            session.voice_status,
-            control::ParticipantVoiceStatus {
-                muted: true,
-                deafened: true,
-            }
-        );
+        assert_eq!(session.voice_state, control::VoiceState::Deafened);
     }
 
     #[test]
@@ -10491,21 +10476,18 @@ mod tests {
     }
 
     #[test]
-    fn join_voice_broadcasts_joiner_stored_status() {
-        fn read_voice_status(
+    fn join_voice_broadcasts_joiner_stored_state() {
+        fn read_voice_state(
             server: &mut Server,
             peer: &mut std::net::TcpStream,
-        ) -> (UserId, control::ParticipantVoiceStatus) {
+        ) -> (UserId, control::VoiceState) {
             let control = read_until(server, peer, |control| {
-                matches!(control, ServerControl::VoiceStatus { .. })
+                matches!(control, ServerControl::VoiceStateChanged { .. })
             });
-            let ServerControl::VoiceStatus {
-                user_id, status, ..
-            } = control
-            else {
+            let ServerControl::VoiceStateChanged { user_id, state, .. } = control else {
                 unreachable!();
             };
-            (user_id, status)
+            (user_id, state)
         }
 
         let mut server = test_server();
@@ -10514,29 +10496,26 @@ mod tests {
         let observer = SessionId(2);
         let _joiner_peer = live_user(&mut server, Token(11), joiner, UserId(1));
         let mut observer_peer = live_user(&mut server, Token(22), observer, UserId(2));
-        let muted = control::ParticipantVoiceStatus {
-            muted: true,
-            deafened: false,
-        };
+        let muted = control::VoiceState::Muted;
 
         server.join_voice(joiner, room_id);
         server.leave_voice(joiner, None);
-        server.set_voice_status(joiner, muted);
+        server.set_voice_state(joiner, muted);
         server.join_voice(joiner, room_id);
         server.leave_voice(joiner, None);
-        server.set_voice_status(joiner, control::ParticipantVoiceStatus::default());
+        server.set_voice_state(joiner, control::VoiceState::default());
         server.join_voice(joiner, room_id);
 
         let mut statuses = Vec::new();
         for _ in 0..3 {
-            statuses.push(read_voice_status(&mut server, &mut observer_peer));
+            statuses.push(read_voice_state(&mut server, &mut observer_peer));
         }
         assert_eq!(
             statuses,
             vec![
-                (UserId(1), control::ParticipantVoiceStatus::default()),
+                (UserId(1), control::VoiceState::default()),
                 (UserId(1), muted),
-                (UserId(1), control::ParticipantVoiceStatus::default()),
+                (UserId(1), control::VoiceState::default()),
             ]
         );
     }
@@ -10644,7 +10623,7 @@ mod tests {
 
         server.join_voice(joiner, room_id);
         read_until(&mut server, &mut joiner_peer, |control| {
-            matches!(control, ServerControl::VoiceStatus { .. })
+            matches!(control, ServerControl::VoiceStateChanged { .. })
         });
 
         server.join_voice(joiner, room_id);
@@ -11260,13 +11239,12 @@ mod tests {
             .insert(session_id, test_session(UserId(9), token, None));
 
         let mut pipelined = Vec::new();
-        for muted in [true, false, true] {
-            let control = ClientControl::SetVoiceStatus {
-                status: control::ParticipantVoiceStatus {
-                    muted,
-                    deafened: false,
-                },
-            };
+        for state in [
+            control::VoiceState::Muted,
+            control::VoiceState::Live,
+            control::VoiceState::Muted,
+        ] {
+            let control = ClientControl::SetVoiceState { state };
             let payload =
                 rpc::control::encode_client_control(&control).expect("encode client control");
             frame::encode_frame(&payload, &mut pipelined).expect("encode frame");
@@ -11288,15 +11266,15 @@ mod tests {
                 .sessions
                 .get(&session_id)
                 .expect("session exists")
-                .voice_status
-                .muted;
+                .voice_state
+                .is_muted();
             if muted || Instant::now() > deadline {
                 break;
             }
         }
 
         let session = server.sessions.get(&session_id).expect("session exists");
-        assert!(session.voice_status.muted);
+        assert!(session.voice_state.is_muted());
         let client = server.clients.get(&token).expect("client still connected");
         assert!(client.read_buf.is_empty());
     }

@@ -29,6 +29,7 @@ mod imp {
 
     use local_rpc::unix::{CONTROL_MAGIC as MAGIC, OP_DAEMON_RPC};
     pub use local_rpc::unix::{RUN_DIR_ENV, SOCKET_ENV};
+    use rpc::control::VoiceState;
     const OP_UPLOAD: u8 = 1;
     const OP_VOICE: u8 = 2;
     const OP_SCREENCAST: u8 = 3;
@@ -49,11 +50,9 @@ mod imp {
     const FOLLOW_POLL: Duration = Duration::from_millis(150);
     const LIVE_SOCKET_ERROR: &str = "another chatt instance is already listening on ";
 
-    const VOICE_TARGET_MUTE: u8 = 0;
-    const VOICE_TARGET_DEAFEN: u8 = 1;
-    const VOICE_ACTION_TOGGLE: u8 = 0;
-    const VOICE_ACTION_SET_FALSE: u8 = 1;
-    const VOICE_ACTION_SET_TRUE: u8 = 2;
+    const VOICE_TOGGLE_MUTE: u8 = 0;
+    const VOICE_TOGGLE_DEAFEN: u8 = 1;
+    const VOICE_SET_STATE: u8 = 2;
     const OUTPUT_VOLUME_QUERY: u8 = 0;
     const OUTPUT_VOLUME_SET: u8 = 1;
     const OUTPUT_VOLUME_ADJUST: u8 = 2;
@@ -78,48 +77,44 @@ mod imp {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum VoiceCommand {
         ToggleMute,
-        SetMute(bool),
         ToggleDeafen,
-        SetDeafen(bool),
+        SetVoiceState(VoiceState),
     }
 
     impl VoiceCommand {
-        fn encode(self) -> [u8; 2] {
-            let (target, action) = match self {
-                VoiceCommand::ToggleMute => (VOICE_TARGET_MUTE, VOICE_ACTION_TOGGLE),
-                VoiceCommand::SetMute(false) => (VOICE_TARGET_MUTE, VOICE_ACTION_SET_FALSE),
-                VoiceCommand::SetMute(true) => (VOICE_TARGET_MUTE, VOICE_ACTION_SET_TRUE),
-                VoiceCommand::ToggleDeafen => (VOICE_TARGET_DEAFEN, VOICE_ACTION_TOGGLE),
-                VoiceCommand::SetDeafen(false) => (VOICE_TARGET_DEAFEN, VOICE_ACTION_SET_FALSE),
-                VoiceCommand::SetDeafen(true) => (VOICE_TARGET_DEAFEN, VOICE_ACTION_SET_TRUE),
-            };
-            [target, action]
+        fn encode(self) -> Vec<u8> {
+            match self {
+                VoiceCommand::ToggleMute => vec![VOICE_TOGGLE_MUTE],
+                VoiceCommand::ToggleDeafen => vec![VOICE_TOGGLE_DEAFEN],
+                VoiceCommand::SetVoiceState(state) => vec![
+                    VOICE_SET_STATE,
+                    match state {
+                        VoiceState::Live => 0,
+                        VoiceState::Muted => 1,
+                        VoiceState::Deafened => 2,
+                    },
+                ],
+            }
         }
 
         fn decode(payload: &[u8]) -> Result<Self, String> {
-            let [target, action] = match payload {
-                [target, action] => [*target, *action],
-                _ => return Err("voice control payload must be 2 bytes".to_string()),
-            };
-            match (target, action) {
-                (VOICE_TARGET_MUTE, VOICE_ACTION_TOGGLE) => Ok(VoiceCommand::ToggleMute),
-                (VOICE_TARGET_MUTE, VOICE_ACTION_SET_FALSE) => Ok(VoiceCommand::SetMute(false)),
-                (VOICE_TARGET_MUTE, VOICE_ACTION_SET_TRUE) => Ok(VoiceCommand::SetMute(true)),
-                (VOICE_TARGET_DEAFEN, VOICE_ACTION_TOGGLE) => Ok(VoiceCommand::ToggleDeafen),
-                (VOICE_TARGET_DEAFEN, VOICE_ACTION_SET_FALSE) => Ok(VoiceCommand::SetDeafen(false)),
-                (VOICE_TARGET_DEAFEN, VOICE_ACTION_SET_TRUE) => Ok(VoiceCommand::SetDeafen(true)),
-                _ => Err(format!(
-                    "unknown voice control target {target} action {action}"
-                )),
+            match payload {
+                [VOICE_TOGGLE_MUTE] => Ok(VoiceCommand::ToggleMute),
+                [VOICE_TOGGLE_DEAFEN] => Ok(VoiceCommand::ToggleDeafen),
+                [VOICE_SET_STATE, 0] => Ok(VoiceCommand::SetVoiceState(VoiceState::Live)),
+                [VOICE_SET_STATE, 1] => Ok(VoiceCommand::SetVoiceState(VoiceState::Muted)),
+                [VOICE_SET_STATE, 2] => Ok(VoiceCommand::SetVoiceState(VoiceState::Deafened)),
+                _ => Err("invalid voice control payload".to_string()),
             }
         }
 
         fn ack_message(self) -> String {
             match self {
                 VoiceCommand::ToggleMute => "mute toggle requested".to_string(),
-                VoiceCommand::SetMute(state) => format!("mute set {state} requested"),
                 VoiceCommand::ToggleDeafen => "deafen toggle requested".to_string(),
-                VoiceCommand::SetDeafen(state) => format!("deafen set {state} requested"),
+                VoiceCommand::SetVoiceState(state) => {
+                    format!("voice state set to {state:?} requested")
+                }
             }
         }
     }
@@ -1710,11 +1705,10 @@ mod imp {
         fn voice_request_round_trips_each_command() {
             let commands = [
                 VoiceCommand::ToggleMute,
-                VoiceCommand::SetMute(true),
-                VoiceCommand::SetMute(false),
                 VoiceCommand::ToggleDeafen,
-                VoiceCommand::SetDeafen(true),
-                VoiceCommand::SetDeafen(false),
+                VoiceCommand::SetVoiceState(VoiceState::Live),
+                VoiceCommand::SetVoiceState(VoiceState::Muted),
+                VoiceCommand::SetVoiceState(VoiceState::Deafened),
             ];
             for command in commands {
                 let (mut writer, mut reader) = UnixStream::pair().unwrap();
@@ -1896,13 +1890,17 @@ mod imp {
             let socket =
                 ControlSocket::spawn_at_path(socket_path.clone(), EventSender(voice_tx)).unwrap();
 
-            let response = send_voice_to_path(&socket_path, VoiceCommand::SetDeafen(true)).unwrap();
+            let response = send_voice_to_path(
+                &socket_path,
+                VoiceCommand::SetVoiceState(VoiceState::Deafened),
+            )
+            .unwrap();
             let event = voice_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-            assert_eq!(response, "deafen set true requested");
+            assert_eq!(response, "voice state set to Deafened requested");
             assert!(matches!(
                 event,
-                crate::app::AppEvent::Voice(VoiceCommand::SetDeafen(true))
+                crate::app::AppEvent::Voice(VoiceCommand::SetVoiceState(VoiceState::Deafened))
             ));
 
             drop(socket);
@@ -2090,6 +2088,7 @@ mod imp {
     use std::path::Path;
 
     use crate::app::EventSender;
+    use rpc::control::VoiceState;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct ClientHello {
@@ -2101,9 +2100,8 @@ mod imp {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum VoiceCommand {
         ToggleMute,
-        SetMute(bool),
         ToggleDeafen,
-        SetDeafen(bool),
+        SetVoiceState(VoiceState),
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]

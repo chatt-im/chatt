@@ -12,8 +12,7 @@ use rpc::{
 };
 
 use super::{
-    LocalVoiceMode, PendingJoin, RoomSettingsDraft, ServerEditDraft, UserVolumeDialog,
-    UserVolumeEvent,
+    PendingJoin, RoomSettingsDraft, ServerEditDraft, UserVolumeDialog, UserVolumeEvent, VoiceState,
 };
 use crate::clipboard_paste::ImagePasteSource;
 use crate::ui::settings::{FieldId, FieldIntent};
@@ -79,7 +78,7 @@ pub(crate) enum CoreCommand {
     LeaveVoice,
     ToggleMute,
     ToggleDeafen,
-    SetVoiceMode(LocalVoiceMode),
+    SetVoiceState(VoiceState),
     ToggleUserMute(UserId),
     BeginVolumePreview {
         user_id: UserId,
