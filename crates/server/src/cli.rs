@@ -191,7 +191,7 @@ mod tests {
             "serve",
             "--dir",
             "./instance",
-            "--network.tcp-addr=127.0.0.1:42000",
+            "--network.bind=127.0.0.1:42000",
             "--network.p2p",
             "false",
         ]))
@@ -206,7 +206,7 @@ mod tests {
                 .iter()
                 .map(ConfigOverride::name)
                 .collect::<Vec<_>>(),
-            ["network.tcp-addr", "network.p2p"]
+            ["network.bind", "network.p2p"]
         );
     }
 

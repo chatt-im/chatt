@@ -2,7 +2,7 @@
 # Not for production: the identity seed and tokens are public dev fixtures.
 
 [network]
-tcp-addr = "127.0.0.1:41000"
+bind = "127.0.0.1:41000"
 p2p = false
 
 [security]

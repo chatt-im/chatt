@@ -619,21 +619,19 @@ fn scenario_server_config(
     addresses: Option<(&str, &str)>,
 ) -> Result<ServerConfig, String> {
     let mut config = ServerConfig::default();
-    config.network.tcp_addr = addresses
+    config.network.bind.tcp = addresses
         .map(|(tcp, _)| tcp.parse())
         .transpose()
         .map_err(|error| format!("parsing scenario TCP address: {error}"))?
         .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
-    config.network.udp_addr = Some(
-        addresses
-            .map(|(_, udp)| udp.parse())
-            .transpose()
-            .map_err(|error| format!("parsing scenario UDP address: {error}"))?
-            .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
-    );
+    config.network.bind.udp = addresses
+        .map(|(_, udp)| udp.parse())
+        .transpose()
+        .map_err(|error| format!("parsing scenario UDP address: {error}"))?
+        .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
     config.network.udp_probe_addr = None;
-    config.network.public_tcp_addr.clear();
-    config.network.public_udp_addr.clear();
+    config.network.public_addr.tcp.clear();
+    config.network.public_addr.udp.clear();
     config.network.public_udp_probe_addr = None;
     config.network.p2p = false;
     config.security.server_identity_seed = dev_server_seed_hex();
@@ -644,8 +642,8 @@ fn scenario_server_config(
 }
 
 fn bind_scenario_server(config: ServerConfig) -> Result<Server, String> {
-    let tcp = config.network.tcp_addr;
-    let udp = config.network.udp_addr();
+    let tcp = config.network.bind.tcp;
+    let udp = config.network.bind.udp;
     Server::bind(config)
         .map_err(|error| format!("binding scenario server at TCP {tcp} and UDP {udp}: {error}"))
 }
