@@ -1211,10 +1211,10 @@ fn draw_server_select_item(
             .with(base.patch(theme.subtle))
             .with(Ellipsis(true))
             .text(buf, &format!("  {}", item.tcp_addr));
-        if !item.require_native_encryption {
+        if !item.require_transport_encryption {
             addr.with(base.patch(theme.warn))
                 .with(Ellipsis(true))
-                .text(buf, "  (encryption not enforced)");
+                .text(buf, "  (transport encryption not required)");
         }
     }
 }

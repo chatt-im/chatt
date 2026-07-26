@@ -60,7 +60,7 @@ pub(crate) enum ScreenSpec {
 
 pub(crate) enum OverlaySpec {
     UserVolume(UserVolumeDialog),
-    NativeEncryptionWarning { label: String, generation: u64 },
+    TransportEncryptionWarning { label: String, generation: u64 },
     E2eIdentity(E2eIdentityOverlay),
     PairingPassword { retry: bool },
     DevicePair(DevicePairDialog),

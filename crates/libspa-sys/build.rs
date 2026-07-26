@@ -83,6 +83,10 @@ fn main() {
     cc.files(cc_files);
     cc.include(env!("CARGO_MANIFEST_DIR"));
     cc.includes(libs.all_include_paths());
+    // Some SPA headers contain static inline functions with intentionally unused
+    // parameters. Those functions are compiled into bindgen's generated wrappers,
+    // where cc's default -Wextra would otherwise report the system-header code.
+    cc.flag_if_supported("-Wno-unused-parameter");
 
     #[cfg(feature = "v0_3_65")]
     cc.define("FEATURE_0_3_65", "1");

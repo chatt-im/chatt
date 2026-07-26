@@ -49,14 +49,14 @@ impl VideoTransport {
 
     fn record_protection(self, secret: &[u8]) -> Result<RecordProtection, String> {
         match self.mode {
-            TransportMode::NativeEncrypted => {
+            TransportMode::Encrypted => {
                 let secret: &[u8; KEY_LEN] = secret
                     .try_into()
                     .map_err(|_| "video secret must be 32 bytes".to_string())?;
                 let (send, recv) = derive_video_keys(secret, VideoKeyRole::Client);
                 Ok(RecordProtection::aead(send, recv))
             }
-            TransportMode::ExternalSecureLink => Ok(RecordProtection::clear()),
+            TransportMode::Plaintext => Ok(RecordProtection::clear()),
         }
     }
 
@@ -68,10 +68,10 @@ impl VideoTransport {
         role: VideoRole,
     ) -> Result<Vec<u8>, String> {
         match self.mode {
-            TransportMode::NativeEncrypted => record
+            TransportMode::Encrypted => record
                 .seal_next(CHANNEL_VIDEO, AUTH_PAYLOAD)
                 .map_err(|error| error.to_string()),
-            TransportMode::ExternalSecureLink => {
+            TransportMode::Plaintext => {
                 Ok(
                     video::video_auth_proof(&self.auth_key, session_id, stream_id, role, self.mode)
                         .to_vec(),

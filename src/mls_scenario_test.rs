@@ -25,10 +25,7 @@ use rpc::{
 };
 use server::{
     Server,
-    config::{
-        Config as ServerConfig, RoomConfig, RoomPersistenceConfig, TransportModeConfig, UserConfig,
-        hash_secret,
-    },
+    config::{Config as ServerConfig, RoomConfig, RoomPersistenceConfig, UserConfig, hash_secret},
     local_admin::{AdminCommand, AdminSender},
 };
 
@@ -640,7 +637,7 @@ fn scenario_server_config(
     config.network.public_udp_probe_addr = None;
     config.network.p2p_enabled = false;
     config.security.server_identity_seed = dev_server_seed_hex();
-    config.security.transport_mode = TransportModeConfig::NativeEncrypted;
+    config.security.transport_encryption = true;
     config.storage.data_dir = Some(root.join("server").display().to_string());
     config.rooms = scenario_rooms();
     Ok(config)
@@ -733,7 +730,7 @@ fn scenario_client_config(
         server_public_key: None,
         data_dir: Some(root.join(format!("{safe}-state"))),
         e2e_peer_pins: Vec::new(),
-        require_native_encryption: true,
+        require_transport_encryption: true,
         file_policy: FilePolicy {
             default: EffectiveFiles {
                 target: DownloadTarget::Persistent(downloads),
@@ -1039,8 +1036,10 @@ impl ScenarioRunner {
             NetworkEvent::WorkerStopped { reason } => {
                 return Err(format!("{device} network worker stopped: {reason}"));
             }
-            NetworkEvent::NativeEncryptionRequired => {
-                return Err(format!("{device} unexpectedly required native encryption"));
+            NetworkEvent::TransportEncryptionRequired => {
+                return Err(format!(
+                    "{device} unexpectedly required transport encryption"
+                ));
             }
             NetworkEvent::Chat(chat) if chat.message.message_id.0 & (1 << 63) != 0 => {
                 self.observe_mls_chat(device, chat)?;

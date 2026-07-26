@@ -2020,9 +2020,9 @@ impl VoiceSession {
     }
 
     fn set_p2p_enabled(&mut self, enabled: bool) {
-        if enabled && self.transport_mode != TransportMode::NativeEncrypted {
+        if enabled && self.transport_mode != TransportMode::Encrypted {
             let _ = self.events.send(NetworkEvent::Status(
-                "P2P unavailable in external-secure-link mode".to_string(),
+                "P2P unavailable without transport encryption".to_string(),
             ));
             return;
         }
@@ -3364,7 +3364,7 @@ mod tests {
             udp,
             media: protection(100 + generation as u32),
             initial_bind_attempted: false,
-            transport_mode: TransportMode::NativeEncrypted,
+            transport_mode: TransportMode::Encrypted,
             server_udp_addr: "127.0.0.1:9".parse().unwrap(),
             server_udp_probe_addr: None,
             p2p_enabled,
@@ -3664,7 +3664,7 @@ mod tests {
             udp,
             protection(55),
             false,
-            TransportMode::NativeEncrypted,
+            TransportMode::Encrypted,
             server.local_addr().unwrap(),
             None,
             false,
@@ -3728,7 +3728,7 @@ mod tests {
             udp,
             protection(55),
             false,
-            TransportMode::NativeEncrypted,
+            TransportMode::Encrypted,
             server.local_addr().unwrap(),
             None,
             false,
@@ -3820,7 +3820,7 @@ mod tests {
             udp,
             protection(55),
             false,
-            TransportMode::NativeEncrypted,
+            TransportMode::Encrypted,
             server.local_addr().unwrap(),
             None,
             false,
@@ -3975,7 +3975,7 @@ mod tests {
                     udp,
                     media: protection(77),
                     initial_bind_attempted: false,
-                    transport_mode: TransportMode::NativeEncrypted,
+                    transport_mode: TransportMode::Encrypted,
                     server_udp_addr: server.local_addr().unwrap(),
                     server_udp_probe_addr: None,
                     p2p_enabled: true,

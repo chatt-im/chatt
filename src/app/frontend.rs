@@ -102,7 +102,7 @@ impl App {
                     label: server.label.clone(),
                     username: server.username.clone(),
                     tcp_addr: server.tcp_addr.clone(),
-                    require_native_encryption: server.require_native_encryption,
+                    require_transport_encryption: server.require_transport_encryption,
                     availability: if server
                         .token
                         .starts_with(rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX)
@@ -892,7 +892,7 @@ impl App {
             .filter(|issue| issue.owner == client_id)
             .and_then(|issue| match &issue.issue {
                 super::RpcServerSelectionIssue::Prompt(
-                    local_rpc::model::ServerSelectionPrompt::AllowExternalSecureLink {
+                    local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
                         attempt_id,
                         ..
                     },
@@ -910,9 +910,9 @@ impl App {
 
         let previous = std::mem::replace(&mut self.command_client, client_id);
         let resolved = if accept_prompt {
-            self.accept_native_encryption_warning_for(attempt_id)
+            self.accept_transport_encryption_warning_for(attempt_id)
         } else {
-            self.cancel_native_encryption_warning_for(attempt_id);
+            self.cancel_transport_encryption_warning_for(attempt_id);
             true
         };
         self.command_client = previous;
@@ -1093,7 +1093,7 @@ mod tests {
         ids::UserId,
     };
 
-    fn app_with_server(label: &str, token: &str, require_native_encryption: bool) -> App {
+    fn app_with_server(label: &str, token: &str, require_transport_encryption: bool) -> App {
         let mut config = crate::config::Config::default();
         config.servers.push(crate::config::ServerEntry {
             label: label.into(),
@@ -1101,7 +1101,7 @@ mod tests {
             tcp_addr: "127.0.0.1:4000".into(),
             udp_addr: "127.0.0.1:4000".into(),
             token: token.into(),
-            require_native_encryption,
+            require_transport_encryption,
             ..Default::default()
         });
         App::new(config, None).unwrap()
@@ -1122,7 +1122,7 @@ mod tests {
         assert_eq!(server.label, "work");
         assert_eq!(server.username, "alice");
         assert_eq!(server.tcp_addr, "127.0.0.1:4000");
-        assert!(!server.require_native_encryption);
+        assert!(!server.require_transport_encryption);
         assert_eq!(server.availability, ServerAvailability::PairingIncomplete);
     }
 
@@ -1191,7 +1191,7 @@ mod tests {
         app.rpc_server_selection_issue = Some(super::super::OwnedRpcServerSelectionIssue {
             owner,
             issue: super::super::RpcServerSelectionIssue::Prompt(
-                local_rpc::model::ServerSelectionPrompt::AllowExternalSecureLink {
+                local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
                     label: "legacy".into(),
                     attempt_id: 11,
                 },

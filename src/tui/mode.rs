@@ -445,13 +445,13 @@ impl ScreenSpec {
 impl OverlaySpec {
     pub(crate) fn into_mode(self, theme: &crate::theme::Theme) -> Box<dyn AppMode> {
         use crate::tui::overlay::{
-            DeviceLinkMode, DevicePairMode, DialogMode, E2eIdentityMode,
-            NativeEncryptionWarningMode, PasswordPromptMode, PasteImageUploadMode,
+            DeviceLinkMode, DevicePairMode, DialogMode, E2eIdentityMode, PasswordPromptMode,
+            PasteImageUploadMode, TransportEncryptionWarningMode,
         };
         match self {
             Self::UserVolume(dialog) => Box::new(DialogMode::new(dialog)),
-            Self::NativeEncryptionWarning { label, generation } => {
-                Box::new(NativeEncryptionWarningMode::new(label, generation))
+            Self::TransportEncryptionWarning { label, generation } => {
+                Box::new(TransportEncryptionWarningMode::new(label, generation))
             }
             Self::E2eIdentity(dialog) => Box::new(E2eIdentityMode::new(dialog, theme)),
             Self::PairingPassword { retry } => Box::new(PasswordPromptMode::new(retry)),
@@ -616,7 +616,7 @@ mod tests {
             stack.process_terminal_event(
                 &mut cx,
                 TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
-                    OverlaySpec::NativeEncryptionWarning {
+                    OverlaySpec::TransportEncryptionWarning {
                         label: "legacy".to_string(),
                         generation: 17,
                     },
@@ -636,7 +636,7 @@ mod tests {
         }
         assert!(matches!(
             app.take_queued_core_command(),
-            Some(CoreCommand::CancelNativeEncryption { generation: 17 })
+            Some(CoreCommand::CancelTransportEncryption { generation: 17 })
         ));
     }
 

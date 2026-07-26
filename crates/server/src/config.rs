@@ -74,37 +74,13 @@ impl Default for NetworkConfig {
     }
 }
 
-/// The transport trust boundary the server runs under. Selected once and applied
-/// to every client; clients that do not support it are rejected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
-#[toml(FromToml, rename_all = "kebab-case")]
-pub enum TransportModeConfig {
-    /// Chatt secures the wire with session AEAD keys (default).
-    #[default]
-    NativeEncrypted,
-    /// An outer tunnel secures the wire; payloads travel clear after the signed
-    /// handshake and P2P is disabled.
-    ExternalSecureLink,
-}
-
-impl TransportModeConfig {
-    pub fn to_transport_mode(self) -> rpc::crypto::TransportMode {
-        match self {
-            TransportModeConfig::NativeEncrypted => rpc::crypto::TransportMode::NativeEncrypted,
-            TransportModeConfig::ExternalSecureLink => {
-                rpc::crypto::TransportMode::ExternalSecureLink
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
 pub struct SecurityConfig {
     pub server_identity_seed: String,
-    /// The transport trust boundary applied to every client.
-    #[toml(default)]
-    pub transport_mode: TransportModeConfig,
+    /// Whether Chatt encrypts control, media, video, and file transport payloads.
+    #[toml(default = true)]
+    pub transport_encryption: bool,
     #[toml(default = DEFAULT_FILE_SIZE_LIMIT_MB)]
     pub max_file_size_mb: u64,
     /// Directory where `/report-bug` bundles are saved. Bug reports are rejected
@@ -129,7 +105,7 @@ impl Default for SecurityConfig {
         Self {
             server_identity_seed: generate_identity_seed_hex()
                 .expect("system random is available for default test config"),
-            transport_mode: TransportModeConfig::NativeEncrypted,
+            transport_encryption: true,
             max_file_size_mb: DEFAULT_FILE_SIZE_LIMIT_MB,
             bug_report_dir: None,
             public: false,
@@ -355,11 +331,10 @@ p2p-enabled = true
 
 [security]
 server-identity-seed = "{seed}"
-# Transport trust boundary. "native-encrypted" (default) has chatt secure the
-# wire with session keys. "external-secure-link" defers wire security to an outer
-# tunnel: control, media, video, and file payloads travel clear after the signed
-# handshake, and P2P is disabled.
-transport-mode = "native-encrypted"
+# Whether Chatt encrypts control, media, video, and file transport payloads.
+# Disabling this sends those payloads in plaintext after the signed handshake
+# and disables P2P.
+transport-encryption = true
 # Maximum relayed file size, in MiB.
 max-file-size-mb = {max_file_size_mb}
 # Directory where `/report-bug` bundles are saved. Bug reports are rejected when
@@ -493,15 +468,18 @@ impl Config {
         Some(path.with_file_name(format!("{stem}-data")))
     }
 
-    /// Whether chatt secures the wire itself, versus deferring to an outer link.
+    /// The wire mode selected by `security.transport-encryption`.
     pub fn transport_mode(&self) -> rpc::crypto::TransportMode {
-        self.security.transport_mode.to_transport_mode()
+        if self.security.transport_encryption {
+            rpc::crypto::TransportMode::Encrypted
+        } else {
+            rpc::crypto::TransportMode::Plaintext
+        }
     }
 
     pub(crate) fn normalize(&mut self) {
-        // Relying on an outer secure link means P2P would bypass that link, so it
-        // is hard-disabled regardless of the `[network] p2p-enabled` value.
-        if self.security.transport_mode == TransportModeConfig::ExternalSecureLink {
+        // P2P transport is never available when transport encryption is off.
+        if !self.security.transport_encryption {
             self.network.p2p_enabled = false;
         }
         self.network.public_tcp_addr = self.network.public_tcp_addr.trim().to_string();
@@ -957,10 +935,7 @@ mod tests {
         assert_eq!(config.network.public_udp_addr, "127.0.0.1:41000");
         assert_eq!(config.network.public_udp_probe_addr, None);
         assert!(config.network.p2p_enabled);
-        assert_eq!(
-            config.security.transport_mode,
-            TransportModeConfig::NativeEncrypted
-        );
+        assert!(config.security.transport_encryption);
         assert_ne!(config.security.server_identity_seed, dev_server_seed_hex());
         assert_eq!(config.rooms[0].room_id(), RoomId(1));
         assert!(config.rooms[0].is_public());
@@ -1039,21 +1014,15 @@ mod tests {
     }
 
     #[test]
-    fn external_secure_link_forces_p2p_off() {
-        // Even with p2p-enabled = true, external-secure-link disables P2P.
+    fn disabled_transport_encryption_forces_p2p_off() {
+        // Even with p2p-enabled = true, plaintext transport disables P2P.
         let content = config_content("")
             .replace("[network]", "[network]\np2p-enabled = true")
-            .replace(
-                "[security]",
-                "[security]\ntransport-mode = \"external-secure-link\"",
-            );
+            .replace("[security]", "[security]\ntransport-encryption = false");
 
         let config = parse(&content).unwrap();
 
-        assert_eq!(
-            config.security.transport_mode,
-            TransportModeConfig::ExternalSecureLink
-        );
+        assert!(!config.security.transport_encryption);
         assert!(!config.network.p2p_enabled);
     }
 

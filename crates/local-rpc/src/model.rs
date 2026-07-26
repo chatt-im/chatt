@@ -42,7 +42,7 @@ pub struct ServerSummary {
     pub label: String,
     pub username: String,
     pub tcp_addr: String,
-    pub require_native_encryption: bool,
+    pub require_transport_encryption: bool,
     pub availability: ServerAvailability,
 }
 
@@ -56,7 +56,7 @@ pub struct ServerSelectionError {
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub enum ServerSelectionPrompt {
-    AllowExternalSecureLink { label: String, attempt_id: u64 },
+    AllowUnencryptedTransport { label: String, attempt_id: u64 },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Jsony)]
@@ -383,7 +383,7 @@ impl ServerSelectionError {
 impl ServerSelectionPrompt {
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::AllowExternalSecureLink { label, attempt_id } => {
+            Self::AllowUnencryptedTransport { label, attempt_id } => {
                 check_nonempty_string(label)?;
                 if *attempt_id == 0 {
                     return Err("server selection prompt attempt id must be nonzero".into());

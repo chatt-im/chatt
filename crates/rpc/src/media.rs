@@ -24,8 +24,8 @@ pub struct UdpHeader {
     pub kind: u8,
     /// Per-session UDP demux tag. For server-session datagrams this is the
     /// session's derived media route id; for direct P2P peer datagrams it is the
-    /// peer key id. Authenticated as AAD (native) or covered by the bind proof
-    /// (external-link `Bind`).
+    /// peer key id. Authenticated as AAD (encrypted) or covered by the bind proof
+    /// (plaintext `Bind`).
     pub route_id: u32,
     pub counter: u64,
 }
@@ -34,7 +34,7 @@ pub struct UdpHeader {
 pub enum MediaPayload {
     /// Claims (or refreshes) the session's UDP address. The session is
     /// identified by the datagram's route id; the media codec adds the address
-    /// proof on the wire in external-link mode.
+    /// proof on the wire in plaintext mode.
     Bind,
     NatProbe {
         probe_id: u8,
@@ -226,9 +226,9 @@ impl From<CryptoError> for MediaError {
 /// session [`TransportMode`].
 ///
 /// `Aead` seals every datagram with the directional session keys and demuxes by
-/// `route_id`. `Clear` sends payloads in the clear (the outer secure link
-/// protects them) but authenticates `Bind` address claims with a truncated HMAC
-/// under `bind_key`, so a spoofed datagram cannot rebind the session.
+/// `route_id`. `Clear` sends payloads in plaintext but authenticates `Bind`
+/// address claims with a truncated HMAC under `bind_key`, so a spoofed datagram
+/// cannot rebind the session.
 #[derive(Clone)]
 pub enum MediaProtection {
     Aead {
@@ -246,12 +246,12 @@ impl MediaProtection {
     /// Builds the media codec selected by the session's negotiated mode.
     pub fn from_transport(transport: &SessionTransport) -> Self {
         match transport.mode {
-            TransportMode::NativeEncrypted => MediaProtection::Aead {
+            TransportMode::Encrypted => MediaProtection::Aead {
                 route_id: transport.route_id,
                 send: transport.secrets.media_send.clone(),
                 recv: transport.secrets.media_recv.clone(),
             },
-            TransportMode::ExternalSecureLink => MediaProtection::Clear {
+            TransportMode::Plaintext => MediaProtection::Clear {
                 route_id: transport.route_id,
                 bind_key: transport.bind_key,
             },
@@ -270,11 +270,11 @@ impl MediaProtection {
 /// Proof that an opened datagram may act on the session's UDP address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressProof {
-    /// Native-encrypted: the whole datagram is AEAD-authenticated.
+    /// Encrypted transport: the whole datagram is AEAD-authenticated.
     AuthenticatedDatagram,
-    /// External-link `Bind`: the address claim carries a valid bind proof.
+    /// Plaintext `Bind`: the address claim carries a valid bind proof.
     AuthenticatedAddressClaim,
-    /// External-link data: unauthenticated by chatt, accepted only from the
+    /// Plaintext data: unauthenticated by Chatt, accepted only from the
     /// already-bound address.
     None,
 }
@@ -294,7 +294,7 @@ pub struct OpenedMediaRef<'a> {
     pub address_proof: AddressProof,
 }
 
-/// Domain-separated message covered by the external-link `Bind` proof. Binds the
+/// Domain-separated message covered by the plaintext `Bind` proof. Binds the
 /// route id, UDP kind, counter, and selected mode so a proof cannot be replayed
 /// under a different session, kind, counter, or transport mode.
 fn bind_proof_message(route_id: u32, kind: u8, counter: u64) -> [u8; 39] {
@@ -303,10 +303,10 @@ fn bind_proof_message(route_id: u32, kind: u8, counter: u64) -> [u8; 39] {
     msg[25..29].copy_from_slice(&route_id.to_le_bytes());
     msg[29] = kind;
     msg[30..38].copy_from_slice(&counter.to_le_bytes());
-    // Clear-mode media exists only under external-secure-link, so the mode id is
-    // a constant here; bind it into the proof for domain separation without
-    // threading a value that can only ever be one thing.
-    msg[38] = TransportMode::ExternalSecureLink.wire_id();
+    // Clear media exists only in plaintext mode, so the mode id is a constant
+    // here; bind it into the proof for domain separation without threading a
+    // value that can only ever be one thing.
+    msg[38] = TransportMode::Plaintext.wire_id();
     msg
 }
 
@@ -386,7 +386,7 @@ pub fn seal_media_ref_into(
 /// decoded payload, and how far the datagram is authenticated. Anti-replay is
 /// enforced for authenticated datagrams only: every `Aead` datagram, and every
 /// `Clear` `Bind` after its proof verifies. Clear data kinds are unauthenticated
-/// by chatt (the outer link protects them) and carry no replay state.
+/// by Chatt and carry no replay state.
 pub fn open_media(
     protection: &MediaProtection,
     replay: &mut AntiReplay,
@@ -514,7 +514,7 @@ pub fn open_media_in_place<'a>(
 }
 
 /// Seals a direct P2P peer datagram under a raw AEAD `key`, using the key id as
-/// the header route tag. P2P runs only in native-encrypted mode, so peer media
+/// the header route tag. P2P runs only with transport encryption, so peer media
 /// is always AEAD; this is the raw-key counterpart to [`seal_media_into`].
 pub fn seal_peer_media_into(
     key: &KeyMaterial,

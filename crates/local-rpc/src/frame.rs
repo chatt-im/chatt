@@ -1308,7 +1308,7 @@ mod tests {
             label: "work".into(),
             username: "alice".into(),
             tcp_addr: "127.0.0.1:4000".into(),
-            require_native_encryption: true,
+            require_transport_encryption: true,
             availability: super::super::model::ServerAvailability::Ready,
         };
         let selection = ServerSelectionState {
@@ -1318,7 +1318,7 @@ mod tests {
                 message: "failed".into(),
             }),
             prompt: Some(
-                super::super::model::ServerSelectionPrompt::AllowExternalSecureLink {
+                super::super::model::ServerSelectionPrompt::AllowUnencryptedTransport {
                     label: "work".into(),
                     attempt_id: 1,
                 },
