@@ -36,7 +36,7 @@ jobs:
           - os: macos-latest
             nextest-platform: mac
             # These workspace packages depend on Linux-only PipeWire/perf-event APIs.
-            nextest-args: --workspace --exclude benchmark --exclude pipewire-sys --profile ci
+            nextest-args: --workspace --exclude benchmark --exclude libspa-sys --exclude pipewire-sys --profile ci
 
     steps:
       - uses: actions/checkout@v6
