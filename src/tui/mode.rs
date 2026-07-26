@@ -248,7 +248,7 @@ impl ModeStack {
                 height,
             } => {
                 cx.view.switch_room(target.room_id, cx.session);
-                let _ = cx.view.jump_to_ref(target, width, height);
+                let _ = cx.view.jump_to_ref(cx.session, target, width, height);
             }
             TerminalEvent::ClearVisualSelection => {
                 cx.view.active.chat.clear_visual_anchor();

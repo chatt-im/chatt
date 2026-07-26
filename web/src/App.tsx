@@ -1416,6 +1416,7 @@ export default function App() {
   const [deleteError, setDeleteError] = createSignal<string | null>(null);
   const [refHover, setRefHover] = createSignal<RefHoverState | null>(null);
   const [connected, setConnected] = createSignal(false);
+  const [historyReady, setHistoryReady] = createSignal(false);
   const [connectionErrorVisible, setConnectionErrorVisible] =
     createSignal(false);
   // Drives virtua's `shift`: while true a data change is treated as a prepend so
@@ -1610,7 +1611,7 @@ export default function App() {
     // Emoji is plain local text, so it stays available while editing or offline;
     // slash commands need a live, non-editing session to dispatch.
     if (ctx.mode === "emoji") return ctx;
-    return editing() || interactionBlocked() || !connected() ? null : ctx;
+    return editing() || interactionBlocked() || !connected() || !historyReady() ? null : ctx;
   });
   const completionView = createMemo<{
     context: NonNullable<ReturnType<typeof completionContext>>;
@@ -2450,7 +2451,7 @@ export default function App() {
   // log container, mirroring onLogClick, because the anchors live inside
   // Rust-rendered fragment HTML. The card is pointer-inert, so only the pill
   // itself keeps the hover alive. A target outside the loaded window is fetched
-  // from the web server's retained history with a `ref_preview` request; the
+  // from canonical client-core history with a `ref_preview` request; the
   // responses are cached (hits and misses) until the next room sync.
   let refHoverTimer: number | undefined;
   let refHoverAnchor: HTMLElement | undefined;
@@ -2944,7 +2945,7 @@ export default function App() {
 
   async function submitCompose() {
     setAssist(CLOSED_ASSIST);
-    if (!connected() || submitting()) return;
+    if (!connected() || !historyReady() || submitting()) return;
     if (e2eBlocked()) {
       setComposeError("The peer encryption key is unavailable; try again after key discovery.");
       return;
@@ -3439,6 +3440,13 @@ export default function App() {
       if (socket !== ws) return;
       debugSocket("open", { url });
       setConnected(true);
+      setHistoryReady(false);
+      setMessages([]);
+      currentRoomId = 0;
+      currentRoomGeneration = 0;
+      olderCursor = null;
+      hasMore = false;
+      loadingOlder = false;
       hideConnectionError();
     };
     ws.onmessage = (ev) => {
@@ -3469,6 +3477,7 @@ export default function App() {
           currentRoomGeneration = feed.room_generation;
           olderCursor = feed.older_cursor;
           hasMore = !feed.at_start;
+          setHistoryReady(true);
           loadingOlder = false;
           prependSettling = false;
           clearPrependSettleFrame();
@@ -3575,7 +3584,7 @@ export default function App() {
                 return next;
               }
               // An edit of a target outside this tab's loaded window updates
-              // the server-side backlog but must not appear as a new tail row.
+              // canonical history but must not appear as a new tail row.
               if (msg.edited) return prev;
             }
             appended = true;
@@ -3778,6 +3787,7 @@ export default function App() {
         was_clean: event.wasClean,
       });
       setConnected(false);
+      setHistoryReady(false);
       setAssist(CLOSED_ASSIST);
       candidateRequests.invalidate();
       setCandidateCache({});
@@ -4119,6 +4129,9 @@ export default function App() {
               <Show when={!connected()}>
                 <div class="composer-offline" role="status">Offline — your draft is retained; sending is disabled.</div>
               </Show>
+              <Show when={connected() && !historyReady()}>
+                <div class="composer-offline" role="status">Loading current room history…</div>
+              </Show>
               <Show when={completionOpen() ? completionView() : null}>
                 {(view) => (
                   <CommandPopup
@@ -4168,7 +4181,7 @@ export default function App() {
                     aria-label="Attach files"
                     title="Attach files"
                     onClick={openComposeFileDialog}
-                    disabled={submitting() || e2eBlocked() !== null}
+                    disabled={submitting() || !historyReady() || e2eBlocked() !== null}
                   >
                     <Icon name="plus" />
                   </button>
@@ -4217,7 +4230,7 @@ export default function App() {
                     if (assist().kind === "completion") setAssist(CLOSED_ASSIST);
                   }}
                   onPaste={onComposePaste}
-                  disabled={e2eBlocked() !== null}
+                  disabled={!historyReady() || e2eBlocked() !== null}
                 />
                 <input
                   class="composer-file-input"
@@ -4235,7 +4248,7 @@ export default function App() {
                   aria-haspopup="dialog"
                   aria-expanded={pickerOpen()}
                   title="Emoji"
-                  disabled={submitting() || e2eBlocked() !== null}
+                  disabled={submitting() || !historyReady() || e2eBlocked() !== null}
                   onPointerEnter={() => setEmojiLoadRequested(true)}
                   onClick={() => {
                     setEmojiLoadRequested(true);

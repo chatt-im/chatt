@@ -49,6 +49,7 @@ pub(crate) enum RpcCommandEffect {
     MessageReferenceResolved {
         request_id: RequestId,
         room_id: RoomId,
+        room_generation: u64,
         message_id: rpc::ids::MessageId,
         message: Option<Message>,
     },
@@ -57,6 +58,7 @@ pub(crate) enum RpcCommandEffect {
 
 pub(crate) struct RpcHistoryPage {
     pub messages: Vec<Message>,
+    pub room_generation: u64,
     pub older_cursor: Option<rpc::ids::MessageId>,
     pub at_start: bool,
 }
@@ -86,6 +88,14 @@ impl App {
     }
 
     pub(crate) fn rpc_snapshot(&self, client_id: ClientId) -> StateSnapshot {
+        self.rpc_snapshot_inner(client_id, true)
+    }
+
+    pub(crate) fn rpc_projection_state(&self, client_id: ClientId) -> StateSnapshot {
+        self.rpc_snapshot_inner(client_id, false)
+    }
+
+    fn rpc_snapshot_inner(&self, client_id: ClientId, include_history: bool) -> StateSnapshot {
         let issue = self
             .rpc_server_selection_issue
             .as_ref()
@@ -152,7 +162,13 @@ impl App {
                 },
             })
             .collect();
-        let room = selected_room.map(|room_id| self.rpc_room_snapshot(room_id));
+        let room = selected_room.map(|room_id| {
+            if include_history {
+                self.rpc_room_snapshot(room_id)
+            } else {
+                self.rpc_room_projection(room_id)
+            }
+        });
         let mut live_shares = self
             .room
             .available_shares
@@ -257,7 +273,7 @@ impl App {
         }
     }
 
-    fn rpc_room_snapshot(&self, room_id: RoomId) -> RoomSnapshot {
+    pub(crate) fn rpc_room_snapshot(&self, room_id: RoomId) -> RoomSnapshot {
         let page = self
             .room
             .resident_message_page(
@@ -277,15 +293,22 @@ impl App {
             .into_iter()
             .map(|message| self.rpc_message(message))
             .collect();
-        let (room_cursor, room_at_start) = self.room.history_cursor(room_id);
-        let (older_cursor, at_start) = if has_older {
-            (messages.first().map(|message| message.message_id), false)
-        } else {
-            (room_cursor, room_at_start)
-        };
+        let mut snapshot = self.rpc_room_projection(room_id);
+        if has_older {
+            snapshot.older_cursor = messages.first().map(|message| message.message_id);
+            snapshot.at_start = false;
+        }
+        snapshot.messages = messages;
+        snapshot
+    }
+
+    fn rpc_room_projection(&self, room_id: RoomId) -> RoomSnapshot {
+        let (older_cursor, at_start) = self.room.history_cursor(room_id);
         RoomSnapshot {
             room_id,
-            messages,
+            room_generation: self.room.room_generation(room_id).unwrap_or_default(),
+            history_revision: self.room.room_history_revision(room_id).unwrap_or_default(),
+            messages: Vec::new(),
             older_cursor,
             at_start,
             participants: self
@@ -327,10 +350,22 @@ impl App {
             .collect::<Vec<_>>();
         let (_, room_at_start) = self.room.history_cursor(room_id);
         Some(RpcHistoryPage {
+            room_generation: self.room.room_generation(room_id)?,
             older_cursor: messages.first().map(|message| message.message_id),
             at_start: !has_older && room_at_start,
             messages,
         })
+    }
+
+    pub(crate) fn rpc_canonical_message(
+        &self,
+        room_id: RoomId,
+        message_id: rpc::ids::MessageId,
+    ) -> Option<Message> {
+        self.room
+            .resident_message(room_id, message_id)
+            .cloned()
+            .map(|message| self.rpc_message(message))
     }
 
     fn rpc_message(&self, message: rpc::control::ChatMessage) -> Message {
@@ -452,17 +487,22 @@ impl App {
             ClientFrame::ResolveMessageReference {
                 request_id,
                 room_id,
+                room_generation,
                 message_id,
             } => {
-                let message =
-                    self.room
-                        .reference_message(room_id, message_id)
-                        .map(|(message, detail)| {
-                            self.rpc_message_with_file_detail(message, detail.as_ref())
-                        });
+                let message = (self.room.room_generation(room_id) == Some(room_generation))
+                    .then(|| {
+                        self.room
+                            .reference_message(room_id, message_id)
+                            .map(|(message, detail)| {
+                                self.rpc_message_with_file_detail(message, detail.as_ref())
+                            })
+                    })
+                    .flatten();
                 RpcCommandEffect::MessageReferenceResolved {
                     request_id,
                     room_id,
+                    room_generation,
                     message_id,
                     message,
                 }
@@ -491,9 +531,18 @@ impl App {
             ClientFrame::LoadOlder {
                 request_id,
                 room_id,
+                room_generation,
                 before,
                 limit,
             } => {
+                if self.room.room_generation(room_id) != Some(room_generation) {
+                    return RpcCommandEffect::Reply(rejected(
+                        request_id,
+                        Operation::LoadOlder,
+                        409,
+                        "room generation is stale",
+                    ));
+                }
                 if self.room.selected_room_for(client_id) != Some(room_id) {
                     return RpcCommandEffect::Reply(rejected(
                         request_id,
@@ -1268,6 +1317,63 @@ mod tests {
         assert_eq!(app.rpc_snapshot(first).selected_room, Some(RoomId(2)));
         assert_eq!(app.rpc_snapshot(second).selected_room, Some(RoomId(1)));
         assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+    }
+
+    #[test]
+    fn rpc_history_requests_reject_stale_room_generation() {
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
+        app.room.authenticated(
+            &[RoomInfo {
+                room_id: RoomId(1),
+                name: "one".into(),
+                kind: WireRoomKind::Public,
+                head: None,
+                voice_users: Vec::new(),
+            }],
+            Vec::new(),
+            RoomId(1),
+            Some(RoomId(1)),
+            Some(UserId(1)),
+        );
+        let client = ClientId(7);
+        app.register_rpc_client(client);
+        let stale = app.room.room_generation(RoomId(1)).unwrap().wrapping_add(1);
+
+        let RpcCommandEffect::Reply(result) = app.handle_rpc_frame(
+            client,
+            ClientFrame::LoadOlder {
+                request_id: RequestId(1),
+                room_id: RoomId(1),
+                room_generation: stale,
+                before: None,
+                limit: 10,
+            },
+        ) else {
+            panic!("expected request result");
+        };
+        assert!(matches!(
+            result.outcome,
+            RequestOutcome::Rejected { code: 409, .. }
+        ));
+
+        let RpcCommandEffect::MessageReferenceResolved {
+            room_generation,
+            message,
+            ..
+        } = app.handle_rpc_frame(
+            client,
+            ClientFrame::ResolveMessageReference {
+                request_id: RequestId(2),
+                room_id: RoomId(1),
+                room_generation: stale,
+                message_id: rpc::ids::MessageId(1),
+            },
+        )
+        else {
+            panic!("expected reference response");
+        };
+        assert_eq!(room_generation, stale);
+        assert!(message.is_none());
     }
 
     #[test]

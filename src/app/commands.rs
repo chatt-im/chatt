@@ -1,7 +1,7 @@
 use extui::Style;
 use extui_editor::{Editor, InlineCompletion, Mode as EditorMode, Span};
 
-use crate::chat_buffer::VirtualChatBuffer;
+use crate::chat_buffer::ChatViewport;
 
 /// The argument a slash command accepts, driving web autocomplete.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,7 +497,8 @@ impl RefCompletionState {
     pub(crate) fn inline_completion(
         &mut self,
         editor: &Editor,
-        chat: &VirtualChatBuffer,
+        chat: &ChatViewport,
+        history: &crate::app::room::RoomHistoryRef<'_>,
         style: Style,
     ) -> Option<InlineCompletion> {
         if editor.mode() != EditorMode::Insert {
@@ -512,17 +513,22 @@ impl RefCompletionState {
             return Some(InlineCompletion::new(context.span, hint, style));
         }
         if let Some(target) = decode_ref_token(&context.token) {
-            let label = chat.ref_label_for(target)?;
+            let label = chat.ref_label_for(history, target)?;
             let hint = format!("{} {label}", context.token);
             return Some(InlineCompletion::new(context.span, hint, style));
         }
-        let candidates = ref_candidates(chat, &context.token);
+        let candidates = ref_candidates(chat, history, &context.token);
         let first = candidates.first()?;
         let hint = format!("{} {}", context.token, first.label);
         Some(InlineCompletion::new(context.span, hint, style))
     }
 
-    pub(crate) fn complete(&mut self, editor: &mut Editor, chat: &VirtualChatBuffer) -> bool {
+    pub(crate) fn complete(
+        &mut self,
+        editor: &mut Editor,
+        chat: &ChatViewport,
+        history: &crate::app::room::RoomHistoryRef<'_>,
+    ) -> bool {
         let Some(context) = ref_context(editor) else {
             self.cycle = None;
             return false;
@@ -536,7 +542,7 @@ impl RefCompletionState {
             });
             return true;
         }
-        let candidates = ref_candidates(chat, &context.token);
+        let candidates = ref_candidates(chat, history, &context.token);
         let Some(first) = candidates.first() else {
             self.cycle = None;
             return false;
@@ -603,29 +609,16 @@ fn ref_context(editor: &Editor) -> Option<CommandContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpc::control::ChatMessage;
-    use rpc::ids::{MessageId, RoomId, UserId};
+    use crate::app::room::RoomHistoryFixture;
 
-    fn chat_with(messages: &[(&str, &str)]) -> VirtualChatBuffer {
-        let mut chat = VirtualChatBuffer::new(100, crate::theme::SyntaxTheme::default());
-        chat.set_room_id(RoomId(1));
-        for (i, (sender, body)) in messages.iter().enumerate() {
-            chat.push_chat(
-                ChatMessage {
-                    message_id: MessageId(i as u64 + 1),
-                    room_id: RoomId(1),
-                    sender: UserId(1),
-                    sender_name: sender.to_string(),
-                    timestamp_ms: 1_000_000 + i as u64,
-                    body: body.to_string(),
-                    file_transfer_id: None,
-                    flags: rpc::control::MessageFlags::default(),
-                    target: None,
-                },
-                false,
-            );
+    fn chat_with(messages: &[(&str, &str)]) -> (ChatViewport, RoomHistoryFixture) {
+        let mut chat = ChatViewport::new(crate::theme::SyntaxTheme::default());
+        let mut history = RoomHistoryFixture::new();
+        for (index, (sender, body)) in messages.iter().enumerate() {
+            history.push(index as u64 + 1, sender, body);
         }
-        chat
+        chat.reconcile(&history.history());
+        (chat, history)
     }
 
     fn insert_editor(text: &str) -> Editor {
@@ -638,7 +631,7 @@ mod tests {
 
     #[test]
     fn ref_picker_completes_a_fuzzy_pattern_to_a_code() {
-        let chat = chat_with(&[
+        let (chat, history) = chat_with(&[
             ("alice", "the delay manager change is in"),
             ("bob", "unrelated chatter"),
         ]);
@@ -646,7 +639,7 @@ mod tests {
         let mut state = RefCompletionState::default();
 
         let hint = state
-            .inline_completion(&editor, &chat, Style::DEFAULT)
+            .inline_completion(&editor, &chat, &history.history(), Style::DEFAULT)
             .expect("ghost hint for a fuzzy match");
         assert!(
             hint.replacement.starts_with("@@delay @@ alice:"),
@@ -654,7 +647,7 @@ mod tests {
             hint.replacement
         );
 
-        assert!(state.complete(&mut editor, &chat));
+        assert!(state.complete(&mut editor, &chat, &history.history()));
         let text = editor.text();
         let code = text
             .strip_prefix("see @@")
@@ -666,13 +659,13 @@ mod tests {
 
     #[test]
     fn ref_picker_cycles_matches_on_repeat_tab() {
-        let chat = chat_with(&[("alice", "first note"), ("alice", "second note")]);
+        let (chat, history) = chat_with(&[("alice", "first note"), ("alice", "second note")]);
         let mut editor = insert_editor("@@note");
         let mut state = RefCompletionState::default();
 
-        assert!(state.complete(&mut editor, &chat));
+        assert!(state.complete(&mut editor, &chat, &history.history()));
         let first = editor.text();
-        assert!(state.complete(&mut editor, &chat));
+        assert!(state.complete(&mut editor, &chat, &history.history()));
         let second = editor.text();
         assert_ne!(first, second, "second Tab must cycle to the other match");
         for text in [first, second] {
@@ -759,28 +752,34 @@ mod tests {
 
     #[test]
     fn ref_picker_ignores_plain_text_and_bare_prefix() {
-        let chat = chat_with(&[("alice", "hello")]);
+        let (chat, history) = chat_with(&[("alice", "hello")]);
         let mut state = RefCompletionState::default();
         for text in ["hello there", "@@", "email@@"] {
             let mut editor = insert_editor(text);
             assert!(
                 state
-                    .inline_completion(&editor, &chat, Style::DEFAULT)
+                    .inline_completion(&editor, &chat, &history.history(), Style::DEFAULT)
                     .is_none(),
                 "no completion expected for {text:?}"
             );
-            assert!(!state.complete(&mut editor, &chat));
+            assert!(!state.complete(&mut editor, &chat, &history.history()));
             assert_eq!(editor.text(), text);
         }
     }
 }
 
-fn ref_candidates(chat: &VirtualChatBuffer, token: &str) -> Vec<RefCandidate> {
+fn ref_candidates(
+    chat: &ChatViewport,
+    history: &crate::app::room::RoomHistoryRef<'_>,
+    token: &str,
+) -> Vec<RefCandidate> {
     let pattern = &token[rpc::msgref::REF_PREFIX.len()..];
     let mut scored: Vec<(i32, usize)> = Vec::new();
     let len = chat.len();
     for index in (len.saturating_sub(REF_PICKER_SCAN)..len).rev() {
-        let entry = chat.message(index);
+        let Some(entry) = chat.record(history, index) else {
+            continue;
+        };
         if entry.timestamp_ms == 0 {
             continue;
         }
@@ -797,7 +796,7 @@ fn ref_candidates(chat: &VirtualChatBuffer, token: &str) -> Vec<RefCandidate> {
     scored.truncate(REF_PICKER_MATCHES);
     let mut candidates = Vec::with_capacity(scored.len());
     for (_, index) in scored {
-        let Some((target, label)) = chat.ref_for_index(index) else {
+        let Some((target, label)) = chat.ref_for_index(history, index) else {
             continue;
         };
         candidates.push(RefCandidate {

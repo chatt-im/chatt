@@ -104,12 +104,18 @@ mod log_encoding_tests {
             .map(Result::unwrap)
             .map(|(key, value)| (key.as_str().unwrap().to_owned(), value))
             .collect::<Vec<_>>();
-        assert!(values.iter().any(
-            |(key, value)| key == "attachment_timestamp_ms" && matches!(value, Value::U64(1_234))
-        ));
-        assert!(values.iter().any(
-            |(key, value)| key == "attachment_transfer_id" && matches!(value, Value::U64(56))
-        ));
+        assert!(
+            values
+                .iter()
+                .any(|(key, value)| key == "attachment_timestamp_ms"
+                    && matches!(value, Value::U64(1_234)))
+        );
+        assert!(
+            values
+                .iter()
+                .any(|(key, value)| key == "attachment_transfer_id"
+                    && matches!(value, Value::U64(56)))
+        );
     }
 }
 
@@ -413,6 +419,10 @@ pub struct LiveShare {
 #[jsony(Binary, version)]
 pub struct RoomSnapshot {
     pub room_id: RoomId,
+    /// Server-continuity generation for rejecting stale room projections.
+    pub room_generation: u64,
+    /// Canonical resident-history revision represented by this snapshot.
+    pub history_revision: u64,
     pub messages: Vec<Message>,
     pub older_cursor: Option<MessageId>,
     pub at_start: bool,

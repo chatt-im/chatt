@@ -1,5 +1,5 @@
 //! Per-client view state: everything one attached terminal owns exclusively —
-//! the composer, its scrollback buffers, pending edit, clipboard queue — as
+//! the composer, its borrowed-history viewport, pending edit, clipboard queue — as
 //! opposed to the session state all clients share.
 
 use extui::Style;
@@ -7,7 +7,7 @@ use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use hashbrown::HashMap;
 use rpc::{
     control::VoiceState,
-    ids::{MessageId, RoomId, UserId},
+    ids::{RoomId, UserId},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -77,7 +77,6 @@ pub(crate) struct ClientView {
     parked: HashMap<RoomId, RoomView>,
     pending_clipboard: Option<String>,
     pending_url_open: Option<String>,
-    max_messages: usize,
     syntax: crate::theme::SyntaxTheme,
 }
 
@@ -109,7 +108,6 @@ impl ClientView {
         composer.set_theme(theme.editor_theme());
         composer.enter_insert_mode();
         let composer_hl = EditorHighlighter::new(&mut composer);
-        let max_messages = config.ui.max_messages as usize;
         let syntax = theme.syntax;
 
         Self {
@@ -136,11 +134,10 @@ impl ClientView {
             pending_edit: None,
             viewed_room: None,
             session_epoch: None,
-            active: RoomView::detached(max_messages, syntax),
+            active: RoomView::detached(syntax),
             parked: HashMap::new(),
             pending_clipboard: None,
             pending_url_open: None,
-            max_messages,
             syntax,
         }
     }
@@ -191,10 +188,10 @@ impl ClientView {
         let Some(room_id) = self.viewed_room else {
             return;
         };
-        let Some(shared) = session.room(room_id) else {
+        let Some(history) = session.history_ref(room_id) else {
             return;
         };
-        self.active.sync(shared, session.local_user);
+        self.active.sync(history);
     }
 
     /// Switches the chat panel to `room_id`, parking the current buffer and
@@ -209,10 +206,7 @@ impl ClientView {
         // the edit text.
         self.cancel_pending_edit();
         if let Some(previous) = self.viewed_room.take() {
-            let mut parked = std::mem::replace(
-                &mut self.active,
-                RoomView::detached(self.max_messages, self.syntax),
-            );
+            let mut parked = std::mem::replace(&mut self.active, RoomView::detached(self.syntax));
             parked.draft = self.composer.text();
             if self.parked.len() >= MAX_PARKED_ROOM_VIEWS
                 && let Some(evicted) = self.parked.keys().next().copied()
@@ -224,7 +218,7 @@ impl ClientView {
         self.active = self
             .parked
             .remove(&room_id)
-            .unwrap_or_else(|| RoomView::new(room_id, self.max_messages, self.syntax));
+            .unwrap_or_else(|| RoomView::new(room_id, self.syntax));
         self.composer.clear();
         let draft = std::mem::take(&mut self.active.draft);
         if !draft.is_empty() {
@@ -242,7 +236,7 @@ impl ClientView {
         self.viewed_room = None;
         self.rooms_offset = 0;
         self.parked.clear();
-        self.active = RoomView::detached(self.max_messages, self.syntax);
+        self.active = RoomView::detached(self.syntax);
         self.composer.clear();
         self.composer.enter_insert_mode();
     }
@@ -262,7 +256,7 @@ impl ClientView {
     }
 
     /// Lands a notice in this view's buffer directly, for notices raised
-    /// before any room is viewed (the session journals the rest).
+    /// before any room is viewed (the session owns room notices).
     pub(crate) fn push_local_notice(
         &mut self,
         sender: impl Into<String>,
@@ -330,7 +324,12 @@ impl ClientView {
             .set_cursor_offset(insertion.saturating_add(final_grapheme));
     }
 
-    pub(crate) fn refresh_command_completion(&mut self, enabled: bool, style: Style) {
+    pub(crate) fn refresh_command_completion(
+        &mut self,
+        session: &RoomSession,
+        enabled: bool,
+        style: Style,
+    ) {
         if !enabled {
             self.command_completion.clear();
             self.ref_completion.clear();
@@ -341,30 +340,41 @@ impl ClientView {
             .command_completion
             .inline_completion(&self.composer, style)
             .or_else(|| {
-                self.ref_completion
-                    .inline_completion(&self.composer, &self.active.chat, style)
+                let history = session.history_ref(self.viewed_room?)?;
+                self.ref_completion.inline_completion(
+                    &self.composer,
+                    &self.active.chat,
+                    &history,
+                    style,
+                )
             });
         self.composer.set_inline_completion(completion);
     }
 
-    pub(crate) fn complete_command(&mut self) -> bool {
+    pub(crate) fn complete_command(&mut self, session: &RoomSession) -> bool {
         self.composer.clear_inline_completion();
         if self.command_completion.complete(&mut self.composer) {
             return true;
         }
+        let Some(history) = self.viewed_room.and_then(|id| session.history_ref(id)) else {
+            return false;
+        };
         self.ref_completion
-            .complete(&mut self.composer, &self.active.chat)
+            .complete(&mut self.composer, &self.active.chat, &history)
     }
 
-    pub(crate) fn submit_composer(&mut self) -> Option<ComposerSubmission> {
+    pub(crate) fn submit_composer(&mut self, session: &RoomSession) -> Option<ComposerSubmission> {
         let text = self.composer.text();
         let mut input = strip_blank_edge_lines(&text);
         if input.is_empty() {
             return None;
         }
         if let Some(edit) = self.pending_edit.take() {
+            let unchanged = session
+                .resident_message(edit.room_id, edit.target)
+                .is_some_and(|message| message.body == input);
             self.reset_composer(&edit.parked_draft);
-            if input == edit.original {
+            if unchanged {
                 return None;
             }
             return Some(ComposerSubmission::Edit {
@@ -415,13 +425,20 @@ impl ClientView {
         let Some(room_id) = self.viewed_room else {
             return Err(EditDenied::NoMessage);
         };
-        let Some(cursor) = self.active.chat.ensure_cursor(width) else {
+        let history = session.history_ref(room_id).ok_or(EditDenied::NoMessage)?;
+        let Some(cursor) = self.active.chat.ensure_cursor(&history, width) else {
             return Err(EditDenied::NoMessage);
         };
-        let entry = self.active.chat.message(cursor.message);
+        let entry = self
+            .active
+            .chat
+            .record_entry(&history, cursor.entry)
+            .ok_or(EditDenied::NoMessage)?;
         Self::validate_edit_entry(session, room_id, entry)?;
-        let target = MessageId(entry.id);
-        let original = entry.body.clone();
+        let crate::chat_buffer::HistoryEntryId::Message(target) = entry.entry_id else {
+            return Err(EditDenied::Notice);
+        };
+        let original = entry.body.to_string();
         let parked_draft = self.composer.text();
         self.composer.set_lines(&original);
         if self.bindings == DefaultBindings::Standard {
@@ -430,7 +447,6 @@ impl ClientView {
         self.pending_edit = Some(PendingEdit {
             room_id,
             target,
-            original,
             parked_draft,
         });
         Ok(())
@@ -439,73 +455,37 @@ impl ClientView {
     fn validate_edit_entry(
         session: &RoomSession,
         room_id: RoomId,
-        entry: &crate::chat_buffer::ChatEntry,
+        entry: crate::chat_buffer::ChatRecord<'_>,
     ) -> Result<(), EditDenied> {
-        if entry.id == 0 {
+        let crate::chat_buffer::HistoryEntryId::Message(message_id) = entry.entry_id else {
             return Err(EditDenied::Notice);
-        }
+        };
         if !entry.local {
             return Err(EditDenied::NotYours);
         }
         if entry.file_transfer_id.is_some() {
             return Err(EditDenied::FileMessage);
         }
-        if !session.edit_window_ok(room_id, entry.id) {
+        if !session.edit_window_ok(room_id, message_id.0) {
             return Err(EditDenied::TooOld);
         }
         Ok(())
     }
 
-    /// Validates an id-addressed edit requested by a writable browser view and
-    /// returns the room it belongs to. The browser never controls room routing.
-    pub(crate) fn validate_web_edit(
-        &self,
-        session: &RoomSession,
-        target: MessageId,
-    ) -> Result<RoomId, EditDenied> {
-        let room_id = self.viewed_room.ok_or(EditDenied::NoMessage)?;
-        let index = self
-            .active
-            .chat
-            .find_message(target.0)
-            .ok_or(EditDenied::NoMessage)?;
-        Self::validate_edit_entry(session, room_id, self.active.chat.message(index))?;
-        Ok(room_id)
-    }
-
     fn delete_denied(
         session: &RoomSession,
         room_id: RoomId,
-        entry: &crate::chat_buffer::ChatEntry,
+        entry: crate::chat_buffer::ChatRecord<'_>,
     ) -> Option<DeleteDenied> {
-        if entry.id == 0 {
+        let crate::chat_buffer::HistoryEntryId::Message(message_id) = entry.entry_id else {
             return Some(DeleteDenied::Notice);
-        }
+        };
         if !entry.local {
             return Some(DeleteDenied::NotYours);
         }
         session
-            .delete_window_denied(room_id, entry.id)
+            .delete_window_denied(room_id, message_id.0)
             .then_some(DeleteDenied::TooOld)
-    }
-
-    /// Validates an id-addressed delete requested by a writable browser view.
-    pub(crate) fn validate_web_delete(
-        &self,
-        session: &RoomSession,
-        target: MessageId,
-    ) -> Result<RoomId, DeleteDenied> {
-        let room_id = self.viewed_room.ok_or(DeleteDenied::NoMessage)?;
-        let index = self
-            .active
-            .chat
-            .find_message(target.0)
-            .ok_or(DeleteDenied::NoMessage)?;
-        if let Some(denied) = Self::delete_denied(session, room_id, self.active.chat.message(index))
-        {
-            return Err(denied);
-        }
-        Ok(room_id)
     }
 
     /// Collects deletable messages under the cursor or visual-line selection.
@@ -520,20 +500,29 @@ impl ClientView {
         let Some(room_id) = self.viewed_room else {
             return Err(DeleteDenied::NoMessage);
         };
-        let indexes = self.active.chat.selected_message_indices(width);
-        if indexes.is_empty() {
+        let history = session
+            .history_ref(room_id)
+            .ok_or(DeleteDenied::NoMessage)?;
+        let entries = self.active.chat.selected_entries(&history, width);
+        if entries.is_empty() {
             return Err(DeleteDenied::NoMessage);
         }
-        let single = indexes.len() == 1;
+        let single = entries.len() == 1;
+        let selected_count = entries.len();
         let mut first_denied = None;
         let mut targets = Vec::new();
-        for index in indexes.iter().copied() {
-            let entry = self.active.chat.message(index);
+        for entry_id in entries {
+            let Some(entry) = self.active.chat.record_entry(&history, entry_id) else {
+                continue;
+            };
             let denied = Self::delete_denied(session, room_id, entry);
             if let Some(denied) = denied {
                 first_denied.get_or_insert(denied);
             } else {
-                targets.push(MessageId(entry.id));
+                let crate::chat_buffer::HistoryEntryId::Message(id) = entry.entry_id else {
+                    continue;
+                };
+                targets.push(id);
             }
         }
         if targets.is_empty() {
@@ -546,7 +535,7 @@ impl ClientView {
         targets.sort_unstable_by_key(|target| target.0);
         Ok(DeleteSelection {
             room_id,
-            skipped: indexes.len() - targets.len(),
+            skipped: selected_count - targets.len(),
             targets,
         })
     }
@@ -573,47 +562,63 @@ impl ClientView {
 
     /// Copies the visual selection's text, clearing the selection on success
     /// so a yank exits visual mode.
-    pub(crate) fn copy_chat_selection(&mut self, width: u16) -> Option<String> {
-        let text = self.active.chat.visual_text(width)?;
+    pub(crate) fn copy_chat_selection(
+        &mut self,
+        session: &RoomSession,
+        width: u16,
+    ) -> Option<String> {
+        let history = session.history_ref(self.viewed_room?)?;
+        let text = self.active.chat.visual_text(&history, width)?;
         self.active.chat.clear_visual_anchor();
         self.pending_clipboard = Some(text.clone());
         Some(text)
     }
 
     /// Copies the original body text of the cursor's wrapped row.
-    pub(crate) fn copy_cursor_line(&mut self, width: u16) -> Option<String> {
-        self.active.chat.ensure_cursor(width)?;
-        let text = self.active.chat.cursor_line_text()?;
+    pub(crate) fn copy_cursor_line(&mut self, session: &RoomSession, width: u16) -> Option<String> {
+        let history = session.history_ref(self.viewed_room?)?;
+        self.active.chat.ensure_cursor(&history, width)?;
+        let text = self.active.chat.cursor_line_text(&history, width)?;
         self.pending_clipboard = Some(text.clone());
         Some(text)
     }
 
     /// Copies the full body of the message under the cursor.
-    pub(crate) fn copy_cursor_message(&mut self, width: u16) -> Option<String> {
-        self.active.chat.ensure_cursor(width)?;
-        let text = self.active.chat.cursor_message_body()?.to_string();
+    pub(crate) fn copy_cursor_message(
+        &mut self,
+        session: &RoomSession,
+        width: u16,
+    ) -> Option<String> {
+        let history = session.history_ref(self.viewed_room?)?;
+        self.active.chat.ensure_cursor(&history, width)?;
+        let text = self.active.chat.cursor_message_body(&history)?.to_string();
         self.pending_clipboard = Some(text.clone());
         Some(text)
     }
 
     /// The reference identifying the message under the cursor, when it is
     /// referenceable (notices have no durable key).
-    fn cursor_message_ref(&mut self, width: u16) -> Option<rpc::msgref::MessageRef> {
-        let room_id = self.active.chat.room_id()?;
-        let cursor = self.active.chat.ensure_cursor(width)?;
-        let entry = self.active.chat.message(cursor.message);
-        if entry.id == 0 {
+    fn cursor_message_ref(
+        &mut self,
+        session: &RoomSession,
+        width: u16,
+    ) -> Option<rpc::msgref::MessageRef> {
+        let room_id = self.viewed_room?;
+        let history = session.history_ref(room_id)?;
+        let cursor = self.active.chat.ensure_cursor(&history, width)?;
+        let entry = self.active.chat.record_entry(&history, cursor.entry)?;
+        let crate::chat_buffer::HistoryEntryId::Message(message_id) = entry.entry_id else {
             return None;
-        }
+        };
         Some(rpc::msgref::MessageRef {
             room_id,
-            message_id: rpc::ids::MessageId(entry.id),
+            message_id,
         })
     }
 
     /// Copies the cursor message's `@@code` to the clipboard, returning it.
-    pub(crate) fn copy_message_ref(&mut self, width: u16) -> Option<String> {
-        let code = self.cursor_message_ref(width)?.encode();
+    pub(crate) fn copy_message_ref(&mut self, session: &RoomSession, width: u16) -> Option<String> {
+        let code = self.cursor_message_ref(session, width)?.encode();
         let code = format!("{}{code}", rpc::msgref::REF_PREFIX);
         self.pending_clipboard = Some(code.clone());
         Some(code)
@@ -625,8 +630,12 @@ impl ClientView {
     /// Markdown tokenizer from recognizing the reference. The trailing space
     /// both terminates the reference and leaves the composer ready for more
     /// text.
-    pub(crate) fn insert_message_ref(&mut self, width: u16) -> Option<String> {
-        let code = self.cursor_message_ref(width)?.encode();
+    pub(crate) fn insert_message_ref(
+        &mut self,
+        session: &RoomSession,
+        width: u16,
+    ) -> Option<String> {
+        let code = self.cursor_message_ref(session, width)?.encode();
         let reference = format!("{}{code}", rpc::msgref::REF_PREFIX);
         let source = self.composer.text();
         let cursor = self.composer.cursor_offset() as usize;
@@ -635,22 +644,11 @@ impl ClientView {
         Some(code)
     }
 
-    /// Resolves a reference label from this view's buffer plus the shared
-    /// attachment record, for the web feed.
-    pub(crate) fn web_ref_for(
-        &self,
-        session: &RoomSession,
-        target: rpc::msgref::MessageRef,
-    ) -> Option<crate::web_wire::ResolvedRef> {
-        let label = self.active.chat.ref_label_for(target)?;
-        let attachment = session.web_attachment_for(target);
-        Some(crate::web_wire::ResolvedRef { label, attachment })
-    }
-
     /// Moves the cursor onto and scrolls to the message a reference targets.
     /// Never touches the view unless the target is present in the buffer.
     pub(crate) fn jump_to_ref(
         &mut self,
+        session: &RoomSession,
         target: rpc::msgref::MessageRef,
         width: u16,
         height: u16,
@@ -658,32 +656,57 @@ impl ClientView {
         if self.active.chat.room_id() != Some(target.room_id) {
             return RefJump::OtherRoom;
         }
-        let Some(index) = self.active.chat.find_message(target.message_id.0) else {
+        let Some(entry) = self.active.chat.find_message(target.message_id.0) else {
             return RefJump::NotFound;
         };
-        self.active.chat.set_cursor_to_message(index);
+        let Some(history) = session.history_ref(target.room_id) else {
+            return RefJump::NotFound;
+        };
+        self.active.chat.set_cursor(entry);
         self.active
             .chat
-            .scroll_message_into_view(index, width, height);
+            .scroll_entry_into_view(&history, entry, width, height);
         RefJump::Jumped
     }
 
-    pub(crate) fn toggle_cursor_message_expand(&mut self, width: u16) -> ToggleExpandResult {
-        let Some(cursor) = self.active.chat.ensure_cursor(width) else {
+    pub(crate) fn toggle_cursor_message_expand(
+        &mut self,
+        session: &RoomSession,
+        width: u16,
+    ) -> ToggleExpandResult {
+        let Some(history) = self.viewed_room.and_then(|id| session.history_ref(id)) else {
             return ToggleExpandResult::NoMessages;
         };
-        if self.active.chat.toggle_expand(cursor.message, width) {
+        let Some(cursor) = self.active.chat.ensure_cursor(&history, width) else {
+            return ToggleExpandResult::NoMessages;
+        };
+        if self
+            .active
+            .chat
+            .toggle_expand_entry(&history, cursor.entry, width)
+        {
             ToggleExpandResult::Toggled
         } else {
             ToggleExpandResult::NotCollapsible
         }
     }
 
-    pub(crate) fn move_chat_cursor(&mut self, delta: isize, width: u16) -> bool {
-        self.active.chat.move_cursor_line(delta, width).is_some()
+    pub(crate) fn move_chat_cursor(
+        &mut self,
+        session: &RoomSession,
+        delta: isize,
+        width: u16,
+    ) -> bool {
+        let Some(history) = self.viewed_room.and_then(|id| session.history_ref(id)) else {
+            return false;
+        };
+        self.active
+            .chat
+            .move_cursor_line(&history, delta, width)
+            .is_some()
     }
 
-    /// Adopts `theme` for this view: the buffers' syntax palette and the
+    /// Adopts `theme` for this view: the viewports' syntax palette and the
     /// composer's editor theme.
     pub(crate) fn apply_theme(&mut self, theme: Theme) {
         self.syntax = theme.syntax;
@@ -695,26 +718,10 @@ impl ClientView {
         self.theme = theme;
     }
 
-    pub(crate) fn set_max_messages(&mut self, max_messages: u32) -> bool {
-        let max_messages = max_messages as usize;
-        if self.max_messages == max_messages {
-            return false;
-        }
-        self.max_messages = max_messages;
-        self.active.chat.set_max_messages(max_messages);
-        for room in self.parked.values_mut() {
-            room.chat.set_max_messages(max_messages);
-        }
-        true
-    }
-
     pub(crate) fn sync_daemon_config(&mut self, config: &Config) {
         let theme = config.ui.resolve_theme();
         if self.theme != theme {
             self.apply_theme(theme);
-        }
-        if self.max_messages != config.ui.max_messages as usize {
-            self.set_max_messages(config.ui.max_messages);
         }
         if self.bindings != config.ui.default_bindings {
             self.apply_bindings(config.ui.default_bindings);

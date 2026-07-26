@@ -81,7 +81,7 @@ use shared::CoreRw;
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
 pub(crate) use room::{
-    ComposerSubmission, DeleteSelection, MutationOutcome, RoomSession, ToggleExpandResult,
+    ComposerSubmission, DeleteSelection, HistoryChange, RoomSession, ToggleExpandResult,
 };
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
@@ -1074,50 +1074,53 @@ fn web_action_error_envelope(operation: &str, message: &str) -> String {
     }
 }
 
-/// Starts the web server and a relay thread that forwards browser requests into
-/// the app event channel, returning the feed handle. The relay bridges the
-/// otherwise one-directional web feed so a browser play click reaches the app.
-/// Builds the web view's backlog for a room from its loaded history, attaching
-/// stored image dimensions and served names to file messages.
+/// Projects borrowed canonical records into a bounded wire window.
 fn web_messages_from_canonical<'a>(
     messages: impl IntoIterator<Item = &'a rpc::control::ChatMessage>,
     room: &RoomSession,
-    client_view: &ClientView,
     local_user: Option<UserId>,
 ) -> Vec<crate::web_server::WebMessage> {
-    let resolver = |target| client_view.web_ref_for(room, target);
+    let resolver = |target| room.resolve_web_ref(target);
     let messages = messages.into_iter();
     let mut projected = Vec::with_capacity(messages.size_hint().0);
     for message in messages {
-        let unverified = room.message_unverified(message.room_id, message.message_id, local_user);
-        let web_message = match message.file_transfer_id {
-            Some(transfer_id) => match room.resident_file_detail(
-                message.room_id,
-                &crate::room_history::FileHistoryKey {
-                    timestamp_ms: message.timestamp_ms,
-                    transfer_id,
-                },
-            ) {
-                Some(detail) => crate::web_server::WebMessage::from_history_file(
-                    message,
-                    transfer_id,
-                    &detail.file_name,
-                    detail.length,
-                    detail.dimensions(),
-                    local_user,
-                    unverified,
-                ),
-                None => crate::web_server::WebMessage::from_chat(
-                    message, &resolver, local_user, unverified,
-                ),
-            },
-            None => {
-                crate::web_server::WebMessage::from_chat(message, &resolver, local_user, unverified)
-            }
-        };
-        projected.push(web_message);
+        projected.push(web_message_from_canonical(
+            message, room, &resolver, local_user,
+        ));
     }
     projected
+}
+
+fn web_message_from_canonical(
+    message: &rpc::control::ChatMessage,
+    room: &RoomSession,
+    resolver: &impl Fn(rpc::msgref::MessageRef) -> Option<crate::web_wire::ResolvedRef>,
+    local_user: Option<UserId>,
+) -> crate::web_server::WebMessage {
+    let unverified = room.message_unverified(message.room_id, message.message_id, local_user);
+    match message.file_transfer_id {
+        Some(transfer_id) => match room.resident_file_detail(
+            message.room_id,
+            &crate::room_history::FileHistoryKey {
+                timestamp_ms: message.timestamp_ms,
+                transfer_id,
+            },
+        ) {
+            Some(detail) => crate::web_server::WebMessage::from_history_file(
+                message,
+                transfer_id,
+                &detail.file_name,
+                detail.length,
+                detail.dimensions(),
+                local_user,
+                unverified,
+            ),
+            None => {
+                crate::web_server::WebMessage::from_chat(message, resolver, local_user, unverified)
+            }
+        },
+        None => crate::web_server::WebMessage::from_chat(message, resolver, local_user, unverified),
+    }
 }
 
 /// Registers persistent downloads already on disk so the web view can serve them
@@ -1525,14 +1528,6 @@ impl App {
         }
     }
 
-    fn web_client_view(&self) -> ClientView {
-        let mut view = ClientView::new(&self.config, self.config.ui.resolve_theme());
-        if let Some(room_id) = self.room.viewed_room {
-            view.switch_room(room_id, &self.room);
-        }
-        view
-    }
-
     fn navigate_all(&mut self, base: BaseScreen) {
         self.send_terminal_event(
             Audience::All,
@@ -1886,15 +1881,18 @@ impl App {
         false
     }
 
-    pub(crate) fn handle_app_event(&mut self, event: AppEvent) {
+    pub(crate) fn handle_app_event(&mut self, event: AppEvent) -> Option<HistoryChange> {
+        let mut history_change = None;
         match event {
-            AppEvent::Network(event) => self.handle_network_event(event),
+            AppEvent::Network(event) => {
+                history_change = self.handle_network_event_change(event);
+            }
             AppEvent::ClientCommand { .. } => {
                 unreachable!("client commands are handled by the runtime")
             }
             AppEvent::NetworkFor { generation, event } => {
                 if self.active_network_generation == Some(generation) {
-                    self.handle_network_event(event);
+                    history_change = self.handle_network_event_change(event);
                 } else {
                     kvlog::debug!("ignored stale network event", generation);
                 }
@@ -1934,6 +1932,37 @@ impl App {
             AppEvent::ReportBug(description) => self.start_bug_report(description),
             AppEvent::ScreencastFailed(reason) => self.handle_screencast_failed(reason),
             AppEvent::ScreencastProgress(progress) => self.handle_screencast_progress(progress),
+        }
+        history_change
+    }
+
+    fn project_history_change_to_web(&self, change: &HistoryChange) {
+        if self.room.viewed_room != Some(change.room_id) {
+            return;
+        }
+        let Some(feed) = &self.web_feed else {
+            return;
+        };
+        if change.refresh_window {
+            self.send_web_history_snapshot(crate::web_server::WebAudience::All);
+            return;
+        }
+        for message_id in &change.removed {
+            feed.send_delete(change.room_id, change.room_generation, message_id.0);
+        }
+        if let Some(message_id) = change.upserted
+            && let Some(message) = self.room.resident_message(change.room_id, message_id)
+        {
+            feed.send(
+                change.room_id,
+                change.room_generation,
+                web_message_from_canonical(
+                    message,
+                    &self.room,
+                    &|target| self.room.resolve_web_ref(target),
+                    self.user_id,
+                ),
+            );
         }
     }
 
@@ -2264,12 +2293,7 @@ impl App {
                 room_generation,
                 message_id,
             } => {
-                self.send_web_ref_preview(
-                    client,
-                    room_id,
-                    room_generation,
-                    message_id,
-                );
+                self.send_web_ref_preview(client, room_id, room_generation, message_id);
             }
             crate::web_server::WebRequest::PlayShare { client, stream_id } => {
                 self.start_view(client, StreamId(stream_id))
@@ -2326,8 +2350,7 @@ impl App {
                 body,
             } => {
                 let target = MessageId(target);
-                let client_view = self.web_client_view();
-                match client_view.validate_web_edit(&self.room, target) {
+                match self.room.validate_web_edit(target) {
                     Ok(room_id) if !body.trim().is_empty() => {
                         if self.network.is_none() && !self.room.network_disconnected {
                             let message = "select a server before editing messages";
@@ -2386,8 +2409,7 @@ impl App {
                 target,
             } => {
                 let target = MessageId(target);
-                let client_view = self.web_client_view();
-                match client_view.validate_web_delete(&self.room, target) {
+                match self.room.validate_web_delete(target) {
                     Ok(room_id) => {
                         if self.network.is_none() {
                             let message = "select a server before deleting messages";
@@ -2506,12 +2528,8 @@ impl App {
             return;
         };
         let page = history.latest_page(crate::web_server::SYNC_WINDOW);
-        let projected = web_messages_from_canonical(
-            page.messages.iter().copied(),
-            &self.room,
-            &self.web_client_view(),
-            self.user_id,
-        );
+        let projected =
+            web_messages_from_canonical(page.messages.iter().copied(), &self.room, self.user_id);
         feed.send_history_window(
             audience,
             crate::web_server::HistoryWindowKind::Sync,
@@ -2554,12 +2572,8 @@ impl App {
             feed.send_stale_history(client, room_id, requested_generation);
             return;
         };
-        let projected = web_messages_from_canonical(
-            page.messages.iter().copied(),
-            &self.room,
-            &self.web_client_view(),
-            self.user_id,
-        );
+        let projected =
+            web_messages_from_canonical(page.messages.iter().copied(), &self.room, self.user_id);
         feed.send_history_window(
             crate::web_server::WebAudience::One(client),
             crate::web_server::HistoryWindowKind::Older,
@@ -2589,40 +2603,33 @@ impl App {
             );
             return;
         }
-        let projected = self
-            .room
-            .reference_message(room_id, message_id)
-            .map(|(message, detail)| match (message.file_transfer_id, detail) {
-                (Some(transfer_id), Some(detail)) => {
-                    crate::web_server::WebMessage::from_history_file(
-                        &message,
-                        transfer_id,
-                        &detail.file_name,
-                        detail.length,
-                        detail.dimensions(),
-                        self.user_id,
-                        self.room.message_unverified(
-                            room_id,
-                            message_id,
+        let projected =
+            self.room
+                .reference_message(room_id, message_id)
+                .map(
+                    |(message, detail)| match (message.file_transfer_id, detail) {
+                        (Some(transfer_id), Some(detail)) => {
+                            crate::web_server::WebMessage::from_history_file(
+                                &message,
+                                transfer_id,
+                                &detail.file_name,
+                                detail.length,
+                                detail.dimensions(),
+                                self.user_id,
+                                self.room
+                                    .message_unverified(room_id, message_id, self.user_id),
+                            )
+                        }
+                        _ => crate::web_server::WebMessage::from_chat(
+                            &message,
+                            &|target| self.room.resolve_web_ref(target),
                             self.user_id,
+                            self.room
+                                .message_unverified(room_id, message_id, self.user_id),
                         ),
-                    )
-                }
-                _ => crate::web_server::WebMessage::from_chat(
-                    &message,
-                    &|target| self.web_client_view().web_ref_for(&self.room, target),
-                    self.user_id,
-                    self.room
-                        .message_unverified(room_id, message_id, self.user_id),
-                ),
-            });
-        feed.send_ref_preview(
-            client,
-            room_id,
-            requested_generation,
-            message_id,
-            projected,
-        );
+                    },
+                );
+        feed.send_ref_preview(client, room_id, requested_generation, message_id, projected);
     }
 
     /// Runs a browser-composed slash command through the shared dispatch,
@@ -3903,7 +3910,22 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn handle_network_event(&mut self, event: NetworkEvent) {
+        let _ = self.handle_network_event_change(event);
+    }
+
+    fn handle_network_event_change(&mut self, event: NetworkEvent) -> Option<HistoryChange> {
+        let mut history_change = None;
+        self.handle_network_event_inner(event, &mut history_change);
+        history_change
+    }
+
+    fn handle_network_event_inner(
+        &mut self,
+        event: NetworkEvent,
+        history_change: &mut Option<HistoryChange>,
+    ) {
         kvlog::info!("app network event", kind = network_event_kind(&event));
         match event {
             NetworkEvent::Connected => {
@@ -4016,12 +4038,12 @@ impl App {
                     complete,
                     self.user_id,
                 );
-                let changed = update.changed;
                 if update.read_advanced {
                     self.mark_room_catalog_dirty();
                 }
-                if changed && self.room.viewed_room == Some(room_id) && self.web_feed.is_some() {
-                    self.sync_viewed_room_to_feeds();
+                if let Some(change) = update.change {
+                    self.project_history_change_to_web(&change);
+                    *history_change = Some(change);
                 }
                 if let Some((room_id, before, limit)) = update.next_backfill
                     && !self.send_network_command(
@@ -4086,7 +4108,6 @@ impl App {
                     (raw_message_id & (1 << 63) != 0).then_some(raw_message_id & !(1 << 63));
                 (|| {
                     let message = &record.message;
-                    let viewed = self.room.viewed_room == Some(message.room_id);
                     if message.target.is_some() {
                         let update = self
                             .room
@@ -4101,53 +4122,22 @@ impl App {
                         if update.read_advanced {
                             self.mark_room_catalog_dirty();
                         }
-                        if matches!(&update.outcome, MutationOutcome::AppliedDelete) {
-                            let target = message.target.expect("mutation record");
+                        let target = message.target.expect("mutation record");
+                        if update
+                            .change
+                            .as_ref()
+                            .is_some_and(|change| change.removed.contains(&target))
+                        {
                             self.pending_web_deletes.remove(&(message.room_id, target));
                         }
-                        let target = message.target.expect("mutation record");
                         let delete = message.flags.deleted();
                         self.pop_mutation_owner(message.room_id, target, delete);
-                        if viewed && let Some(feed) = &self.web_feed {
-                            let generation = self
-                                .room
-                                .room_generation(message.room_id)
-                                .unwrap_or_else(|| self.room.epoch().wire());
-                            match update.outcome {
-                                MutationOutcome::AppliedEdit(_) => {
-                                    let Some(folded) =
-                                        self.room.resident_message(message.room_id, target)
-                                    else {
-                                        return;
-                                    };
-                                    let client_view = self.web_client_view();
-                                    feed.send(
-                                        message.room_id,
-                                        generation,
-                                        crate::web_server::WebMessage::from_chat(
-                                            folded,
-                                            &|target| {
-                                                client_view.web_ref_for(&self.room, target)
-                                            },
-                                            self.user_id,
-                                            self.room.message_unverified(
-                                                folded.room_id,
-                                                folded.message_id,
-                                                self.user_id,
-                                            ),
-                                        ),
-                                    );
-                                }
-                                MutationOutcome::AppliedDelete => {
-                                    let target = message.target.expect("mutation record");
-                                    feed.send_delete(message.room_id, generation, target.0);
-                                }
-                                MutationOutcome::Ignored | MutationOutcome::Pending => {}
-                            }
+                        if let Some(change) = update.change {
+                            self.project_history_change_to_web(&change);
+                            *history_change = Some(change);
                         }
                         return;
                     }
-                    let feed_message = (viewed && self.web_feed.is_some()).then(|| message.clone());
                     let update = RoomSession::chat_received(&mut self.room, record, self.user_id);
                     let Some(update) = update else {
                         return;
@@ -4156,35 +4146,14 @@ impl App {
                         self.report_message_id_regression(regression);
                         return;
                     }
-                    if !update.fresh {
+                    let Some(change) = update.change else {
                         return;
-                    }
+                    };
                     if update.read_advanced {
                         self.mark_room_catalog_dirty();
                     }
-                    if let Some(message) = feed_message
-                        && let Some(feed) = &self.web_feed
-                    {
-                        let client_view = self.web_client_view();
-                        let generation = self
-                            .room
-                            .room_generation(message.room_id)
-                            .unwrap_or_else(|| self.room.epoch().wire());
-                        feed.send(
-                            message.room_id,
-                            generation,
-                            crate::web_server::WebMessage::from_chat(
-                                &message,
-                                &|target| client_view.web_ref_for(&self.room, target),
-                                self.user_id,
-                                self.room.message_unverified(
-                                    message.room_id,
-                                    message.message_id,
-                                    self.user_id,
-                                ),
-                            ),
-                        );
-                    }
+                    self.project_history_change_to_web(&change);
+                    *history_change = Some(change);
                     if !update.local {
                         self.play_notification(NotificationSound::MessageReceived);
                     }
@@ -4219,43 +4188,16 @@ impl App {
                 }
                 self.room
                     .clear_transfer(metadata.room_id, metadata.transfer_id);
-                self.room.file_received(
+                if let Some(change) = self.room.file_received(
                     metadata.room_id,
                     metadata.transfer_id,
                     metadata.timestamp_ms,
                     &served_name,
                     metadata.size,
                     dimensions,
-                );
-                if self.room.viewed_room == Some(metadata.room_id)
-                    && let Some(feed) = &self.web_feed
-                    && let Some(message) = self.room.resident_file_message(
-                        metadata.room_id,
-                        metadata.timestamp_ms,
-                        metadata.transfer_id,
-                    )
-                {
-                    let generation = self
-                        .room
-                        .room_generation(metadata.room_id)
-                        .unwrap_or_else(|| self.room.epoch().wire());
-                    feed.send(
-                        metadata.room_id,
-                        generation,
-                        crate::web_server::WebMessage::from_history_file(
-                            message,
-                            metadata.transfer_id,
-                            &served_name,
-                            metadata.size,
-                            dimensions,
-                            self.user_id,
-                            self.room.message_unverified(
-                                metadata.room_id,
-                                message.message_id,
-                                self.user_id,
-                            ),
-                        ),
-                    );
+                ) {
+                    self.project_history_change_to_web(&change);
+                    *history_change = Some(change);
                 }
             }
             NetworkEvent::TransferProgress {
@@ -5846,6 +5788,7 @@ impl App {
 
     fn apply_max_messages(&mut self) {
         self.room.set_max_messages(self.config.ui.max_messages);
+        self.send_web_history_snapshot(crate::web_server::WebAudience::All);
     }
 
     /// Projects audio display facts into the shared session so every view
@@ -10445,19 +10388,25 @@ mod tests {
         );
         assert!(
             app.room
-                .resident_file_detail(RoomId(1), &crate::room_history::FileHistoryKey {
-                    timestamp_ms: attachment_id.timestamp_ms,
-                    transfer_id: attachment_id.transfer_id,
-                })
+                .resident_file_detail(
+                    RoomId(1),
+                    &crate::room_history::FileHistoryKey {
+                        timestamp_ms: attachment_id.timestamp_ms,
+                        transfer_id: attachment_id.transfer_id,
+                    }
+                )
                 .is_none()
         );
         assert!(app.set_viewed_room(RoomId(2)));
         assert!(
             app.room
-                .resident_file_detail(RoomId(2), &crate::room_history::FileHistoryKey {
-                    timestamp_ms: attachment_id.timestamp_ms,
-                    transfer_id: attachment_id.transfer_id,
-                })
+                .resident_file_detail(
+                    RoomId(2),
+                    &crate::room_history::FileHistoryKey {
+                        timestamp_ms: attachment_id.timestamp_ms,
+                        transfer_id: attachment_id.transfer_id,
+                    }
+                )
                 .is_some()
         );
     }
@@ -10484,7 +10433,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         app.room
-            .complete_history_fetch(RoomId(1), None, &messages, false);
+            .complete_history_fetch(RoomId(1), None, Some(MessageId(6)), false);
         app.room.merge_history(RoomId(1), messages);
         let (core, view) = app.parts_mut();
         view.sync_independent(&core.room);
@@ -10492,7 +10441,9 @@ mod tests {
         app.request_older_history_if_at_top(40, 5);
         assert!(rx.try_recv().is_err());
 
-        app.view.active.chat.top(40, 5);
+        let (core, view) = app.parts_mut();
+        let history = core.room.history_ref(RoomId(1)).unwrap();
+        view.active.chat.top(&history, 40, 5);
         app.request_older_history_if_at_top(40, 5);
         match rx.try_recv().unwrap() {
             NetworkCommand::FetchHistory {
@@ -10969,7 +10920,7 @@ mod tests {
         app.submit_input();
 
         assert_eq!(app.view.active.chat.len(), 1);
-        let notice = app.view.active.chat.message(0);
+        let notice = app.view.active.chat.local_record(0).unwrap();
         assert_eq!(notice.sender, "help");
         assert!(notice.body.contains("/report-bug what went wrong"));
         assert!(notice.body.contains("Press Tab again to cycle matches"));
@@ -11019,7 +10970,8 @@ mod tests {
         view.switch_room(RoomId(2), &core.room);
         view.sync_independent(&core.room);
         assert_eq!(app.view.active.chat.len(), 1);
-        let notice = app.view.active.chat.message(0);
+        let history = app.room.history_ref(RoomId(2)).unwrap();
+        let notice = app.view.active.chat.record(&history, 0).unwrap();
         assert_eq!(notice.sender, "network");
         assert!(notice.body.contains("out-of-order chat record 9"));
         assert!(notice.body.contains("message ID is 10"));
@@ -11074,7 +11026,7 @@ mod tests {
         app.submit_input();
 
         assert_eq!(app.view.active.chat.len(), 1);
-        let notice = app.view.active.chat.message(0);
+        let notice = app.view.active.chat.local_record(0).unwrap();
         assert_eq!(notice.sender, "video");
         assert!(notice.body.contains("state: failed"));
         assert!(notice.body.contains("last issue:"));
@@ -11314,9 +11266,14 @@ mod tests {
         view.sync_independent(&core.room);
         let mut mode = RoomMode::with_focus(ChatPanelFocus::ChatLog);
         mode.render(&mut app, &mut Buffer::new(80, 24), 0);
-        app.view.active.chat.set_cursor_to_message(0);
-        assert!(app.view.active.chat.toggle_visual_anchor(80));
-        app.view.active.chat.move_cursor_line(2, 80);
+        app.view
+            .active
+            .chat
+            .set_cursor(crate::chat_buffer::HistoryEntryId::Message(MessageId(1)));
+        let (core, view) = app.parts_mut();
+        let history = core.room.history_ref(RoomId(1)).unwrap();
+        assert!(view.active.chat.toggle_visual_anchor(&history, 80));
+        view.active.chat.move_cursor_line(&history, 2, 80);
         let stack = crate::tui::mode_stack::ModeStack::new(Box::new(mode), &mut app);
         let mut h = Harness { app, stack };
 
@@ -11836,7 +11793,7 @@ mod tests {
         );
 
         assert_eq!(app.view.active.chat.len(), 1);
-        let notice = app.view.active.chat.message(0);
+        let notice = app.view.active.chat.local_record(0).unwrap();
         assert_eq!(notice.sender, "video");
         assert!(notice.body.contains("connection reset"));
     }

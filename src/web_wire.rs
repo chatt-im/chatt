@@ -353,11 +353,7 @@ pub fn encode_stale(room_id: rpc::ids::RoomId, room_generation: u64) -> Vec<u8> 
 
 /// Encodes a `delete` frame: room identity plus the chat message id the
 /// browser should drop.
-pub fn encode_delete(
-    room_id: rpc::ids::RoomId,
-    room_generation: u64,
-    message_id: u64,
-) -> Vec<u8> {
+pub fn encode_delete(room_id: rpc::ids::RoomId, room_generation: u64, message_id: u64) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&SENTINEL);
     buf.push(KIND_DELETE);
@@ -631,7 +627,10 @@ mod tests {
         assert_eq!(frame[4], KIND_DELETE);
         assert_eq!(u64::from_le_bytes(frame[5..13].try_into().unwrap()), 7);
         assert_eq!(u64::from_le_bytes(frame[13..21].try_into().unwrap()), 9);
-        assert_eq!(u64::from_le_bytes(frame[21..29].try_into().unwrap()), 0xABCD);
+        assert_eq!(
+            u64::from_le_bytes(frame[21..29].try_into().unwrap()),
+            0xABCD
+        );
         assert_eq!(frame.len(), 29);
     }
 
@@ -825,9 +824,9 @@ mod tests {
         message.local = true;
         message.edited = true;
         message.unverified = true;
-        let decoded =
-            decode_single(&encode_single(rpc::ids::RoomId(7), 11, &message));
+        let decoded = decode_single(&encode_single(rpc::ids::RoomId(7), 11, &message));
 
+        assert_eq!(decoded.sender, "Alice");
         assert_eq!(decoded.body, "revised");
         assert!(decoded.local);
         assert!(decoded.edited);
@@ -964,8 +963,7 @@ mod tests {
     #[test]
     fn quote_boundaries_round_trip_on_the_wire() {
         let message = WebMessage::text_for_test(1, "> ```rust\n> fn f() {}\n> ```");
-        let decoded =
-            decode_single(&encode_single(rpc::ids::RoomId(7), 11, &message));
+        let decoded = decode_single(&encode_single(rpc::ids::RoomId(7), 11, &message));
         assert_eq!(decoded.fragments, message.fragments);
     }
 }

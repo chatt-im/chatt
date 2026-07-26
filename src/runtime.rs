@@ -69,6 +69,7 @@ struct AttachmentStreamControl {
 #[derive(Clone, Copy)]
 struct RpcHistoryRequest {
     room_id: rpc::ids::RoomId,
+    room_generation: u64,
     before: rpc::ids::MessageId,
     limit: u16,
 }
@@ -820,7 +821,11 @@ fn handle_runtime_event(
             }
         }
         event => {
-            app.handle_app_event(event);
+            if let Some(change) = app.handle_app_event(event)
+                && !rpc_clients.is_empty()
+            {
+                project_rpc_history_change(app, rpc_clients, daemon_instance, &change);
+            }
             broadcast_rpc_snapshots(app, rpc_clients, daemon_instance);
         }
     }
@@ -916,7 +921,7 @@ fn spawn_rpc_client(
         app.retire_client(id);
         return Err(error);
     }
-    let snapshot = match sender.send_snapshot(instance_id, 1, snapshot) {
+    let mut retained_snapshot = match sender.send_snapshot(instance_id, 1, snapshot) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             sender.shutdown();
@@ -927,6 +932,9 @@ fn spawn_rpc_client(
             return Err(error);
         }
     };
+    if let Some(room) = retained_snapshot.room.as_mut() {
+        room.messages.clear();
+    }
     Ok(RemoteRpcClient {
         sender,
         control,
@@ -936,7 +944,7 @@ fn spawn_rpc_client(
         next_event_seq: 2,
         uploads,
         pending_history: None,
-        last_snapshot: snapshot,
+        last_snapshot: retained_snapshot,
         live_viewers: HashMap::new(),
         attachment_streams: HashMap::new(),
         settings_device_generation: 0,
@@ -1094,7 +1102,11 @@ fn send_rpc_snapshot(
 ) -> Result<(), String> {
     let seq = client.next_event_seq;
     let snapshot = app.rpc_snapshot(id);
-    client.last_snapshot = client.sender.send_snapshot(instance_id, seq, snapshot)?;
+    let mut snapshot = client.sender.send_snapshot(instance_id, seq, snapshot)?;
+    if let Some(room) = snapshot.room.as_mut() {
+        room.messages.clear();
+    }
+    client.last_snapshot = snapshot;
     client.pending_history = None;
     client.next_event_seq = seq.wrapping_add(1);
     Ok(())
@@ -1107,7 +1119,7 @@ fn broadcast_rpc_snapshots(
 ) {
     let mut failed = Vec::new();
     for (id, client) in clients.iter_mut() {
-        if let Err(error) = sync_rpc_projection(app, *id, client, instance_id) {
+        if let Err(error) = sync_rpc_state(app, *id, client, instance_id) {
             kvlog::error!(
                 "could not send daemon RPC state update",
                 client_id = id.0,
@@ -1138,16 +1150,83 @@ fn send_rpc_event(
     Ok(())
 }
 
-fn sync_rpc_projection(
+fn project_rpc_history_change(
+    app: &App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    instance_id: DaemonInstanceId,
+    change: &crate::app::HistoryChange,
+) {
+    let (deltas, cursor) = if change.refresh_window {
+        let snapshot = app.rpc_room_snapshot(change.room_id);
+        let cursor = Some((snapshot.older_cursor, snapshot.at_start));
+        (vec![StateDelta::RoomSnapshot(snapshot)], cursor)
+    } else {
+        let mut deltas = change
+            .removed
+            .iter()
+            .map(|message_id| StateDelta::MessageDeleted {
+                room_id: change.room_id,
+                message_id: *message_id,
+            })
+            .collect::<Vec<_>>();
+        if let Some(message) = change
+            .upserted
+            .and_then(|id| app.rpc_canonical_message(change.room_id, id))
+        {
+            deltas.push(StateDelta::MessageUpserted { message });
+        }
+        (deltas, None)
+    };
+    let mut failed = Vec::new();
+    for (id, client) in clients.iter_mut() {
+        let selected = client.last_snapshot.selected_room == Some(change.room_id)
+            && client.last_snapshot.room.as_ref().is_some_and(|room| {
+                room.room_id == change.room_id && room.room_generation == change.room_generation
+            });
+        if !selected {
+            continue;
+        }
+        if deltas
+            .iter()
+            .try_for_each(|delta| send_rpc_event(client, instance_id, delta.clone()))
+            .is_err()
+        {
+            failed.push(*id);
+            continue;
+        }
+        if let Some(room) = client.last_snapshot.room.as_mut() {
+            room.history_revision = app
+                .room
+                .room_history_revision(change.room_id)
+                .unwrap_or(room.history_revision);
+            if let Some((older_cursor, at_start)) = cursor {
+                room.older_cursor = older_cursor;
+                room.at_start = at_start;
+            }
+        }
+    }
+    failed.sort_unstable_by_key(|id| id.0);
+    failed.dedup();
+    for id in failed {
+        if let Some(client) = clients.get(&id) {
+            let _ = client.control.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+fn sync_rpc_state(
     app: &App,
     id: ClientId,
     client: &mut RemoteRpcClient,
     instance_id: DaemonInstanceId,
 ) -> Result<(), String> {
     complete_pending_rpc_history(app, id, client, instance_id)?;
-    let mut next = app.rpc_snapshot(id);
-    if let (Some(previous), Some(next_room)) = (&client.last_snapshot.room, &mut next.room)
-        && previous.room_id == next_room.room_id
+    let mut next = app.rpc_projection_state(id);
+    let same_room = client.last_snapshot.selected_room == next.selected_room
+        && client.last_snapshot.room.as_ref().map(|room| room.room_id)
+            == next.room.as_ref().map(|room| room.room_id);
+    if same_room
+        && let (Some(previous), Some(next_room)) = (&client.last_snapshot.room, &mut next.room)
     {
         next_room.older_cursor = previous.older_cursor;
         next_room.at_start = previous.at_start;
@@ -1157,14 +1236,16 @@ fn sync_rpc_projection(
             .iter()
             .any(|share| share.stream_id == *stream_id)
     });
-    if client.last_snapshot.selected_room != next.selected_room
-        || client.last_snapshot.room.as_ref().map(|room| room.room_id)
-            != next.room.as_ref().map(|room| room.room_id)
-    {
+    if !same_room {
         let seq = client.next_event_seq;
-        next = client.sender.send_snapshot(instance_id, seq, next)?;
+        let mut snapshot = client
+            .sender
+            .send_snapshot(instance_id, seq, app.rpc_snapshot(id))?;
+        if let Some(room) = snapshot.room.as_mut() {
+            room.messages.clear();
+        }
         client.next_event_seq = seq.wrapping_add(1);
-        client.last_snapshot = next;
+        client.last_snapshot = snapshot;
         return Ok(());
     }
 
@@ -1189,6 +1270,10 @@ fn complete_pending_rpc_history(
         client.pending_history = None;
         return Ok(());
     }
+    if app.room.room_generation(request.room_id) != Some(request.room_generation) {
+        client.pending_history = None;
+        return Ok(());
+    }
     if let Some(page) =
         app.rpc_resident_history_page(request.room_id, request.before, request.limit)
     {
@@ -1201,6 +1286,7 @@ fn complete_pending_rpc_history(
             instance_id,
             StateDelta::HistoryStateChanged {
                 room_id: request.room_id,
+                room_generation: request.room_generation,
                 older_cursor: Some(request.before),
                 at_start,
             },
@@ -1223,11 +1309,13 @@ fn send_rpc_history_page(
 ) -> Result<(), String> {
     let older_cursor = page.older_cursor;
     let at_start = page.at_start;
+    let room_generation = page.room_generation;
     send_rpc_event(
         client,
         instance_id,
         StateDelta::MessagesPrepended {
             room_id,
+            room_generation,
             messages: page.messages,
             older_cursor,
             at_start,
@@ -1321,7 +1409,6 @@ fn projection_deltas(
     }
 
     if let (Some(old_room), Some(next_room)) = (&old.room, &next.room) {
-        append_message_deltas(old_room, next_room, &mut deltas);
         if old_room.participants != next_room.participants {
             deltas.push(StateDelta::ParticipantsChanged {
                 room_id: next_room.room_id,
@@ -1333,73 +1420,13 @@ fn projection_deltas(
         {
             deltas.push(StateDelta::HistoryStateChanged {
                 room_id: next_room.room_id,
+                room_generation: next_room.room_generation,
                 older_cursor: next_room.older_cursor,
                 at_start: next_room.at_start,
             });
         }
     }
     deltas
-}
-
-fn append_message_deltas(
-    old: &local_rpc::model::RoomSnapshot,
-    next: &local_rpc::model::RoomSnapshot,
-    deltas: &mut Vec<StateDelta>,
-) {
-    let old_first = old.messages.first().map(|message| message.message_id);
-    let mut prepended = Vec::new();
-    let mut old_index = 0;
-    let mut next_index = 0;
-    while old_index < old.messages.len() || next_index < next.messages.len() {
-        match (old.messages.get(old_index), next.messages.get(next_index)) {
-            (Some(old_message), Some(next_message))
-                if old_message.message_id == next_message.message_id =>
-            {
-                if old_message != next_message {
-                    deltas.push(StateDelta::MessageUpserted {
-                        message: next_message.clone(),
-                    });
-                }
-                old_index += 1;
-                next_index += 1;
-            }
-            (Some(old_message), Some(next_message))
-                if old_message.message_id < next_message.message_id =>
-            {
-                deltas.push(StateDelta::MessageDeleted {
-                    room_id: next.room_id,
-                    message_id: old_message.message_id,
-                });
-                old_index += 1;
-            }
-            (_, Some(next_message)) => {
-                if old_first.is_some_and(|first| next_message.message_id < first) {
-                    prepended.push(next_message.clone());
-                } else {
-                    deltas.push(StateDelta::MessageUpserted {
-                        message: next_message.clone(),
-                    });
-                }
-                next_index += 1;
-            }
-            (Some(old_message), None) => {
-                deltas.push(StateDelta::MessageDeleted {
-                    room_id: next.room_id,
-                    message_id: old_message.message_id,
-                });
-                old_index += 1;
-            }
-            (None, None) => break,
-        }
-    }
-    if !prepended.is_empty() {
-        deltas.push(StateDelta::MessagesPrepended {
-            room_id: next.room_id,
-            messages: prepended,
-            older_cursor: next.older_cursor,
-            at_start: next.at_start,
-        });
-    }
 }
 
 fn handle_rpc_command(
@@ -1551,6 +1578,7 @@ fn handle_rpc_command(
         local_rpc::frame::ClientFrame::LoadOlder {
             request_id,
             room_id,
+            room_generation,
             before,
             limit,
         } => {
@@ -1560,6 +1588,8 @@ fn handle_rpc_command(
             let current_room = client.last_snapshot.room.as_ref();
             let rejection = if current_room.map(|room| room.room_id) != Some(room_id) {
                 Some("room is not selected by this client")
+            } else if current_room.map(|room| room.room_generation) != Some(room_generation) {
+                Some("room generation is stale")
             } else if client.pending_history.is_some() {
                 Some("an older-history fetch is already active")
             } else if current_room.is_some_and(|room| room.at_start) {
@@ -1614,6 +1644,7 @@ fn handle_rpc_command(
                 local_rpc::frame::ClientFrame::LoadOlder {
                     request_id,
                     room_id,
+                    room_generation,
                     before: network_before,
                     limit,
                 },
@@ -1629,6 +1660,7 @@ fn handle_rpc_command(
             if network_started {
                 client.pending_history = Some(RpcHistoryRequest {
                     room_id,
+                    room_generation,
                     before,
                     limit,
                 });
@@ -2283,6 +2315,7 @@ fn handle_rpc_effect(
         RpcCommandEffect::MessageReferenceResolved {
             request_id,
             room_id,
+            room_generation,
             message_id,
             message,
         } => {
@@ -2291,6 +2324,7 @@ fn handle_rpc_effect(
                 .send_or_abort(&DaemonFrame::MessageReferenceResolved {
                     request_id,
                     room_id,
+                    room_generation,
                     message_id,
                     message,
                 });

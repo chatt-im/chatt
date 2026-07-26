@@ -5,7 +5,7 @@
 //! provably incomplete tail is truncated; other corruption is archived and
 //! only structurally validated records are copied into a clean active file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -874,18 +874,9 @@ fn fold_records(records: &[ValidatedRecord]) -> LoadedHistory {
         apply_mutation(message, mutation);
     }
 
-    let mut message_keys: HashSet<(FileTransferId, u64)> = HashSet::new();
-    for message in messages.values() {
-        if let Some(transfer_id) = message.file_transfer_id {
-            message_keys.insert((transfer_id, message.timestamp_ms));
-        }
-    }
-
     let mut files = HashMap::new();
     for (key, detail) in details {
-        if message_keys.contains(&(key.transfer_id, key.timestamp_ms)) {
-            files.insert(key, detail);
-        }
+        files.insert(key, detail);
     }
 
     let mut messages: Vec<ChatMessage> = messages.into_values().collect();
@@ -1265,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_is_kept_only_when_a_message_shares_its_transfer_id_and_timestamp() {
+    fn unmatched_detail_remains_available_for_later_announcement() {
         let mut records = Vec::new();
         let mut matched = text_message(1, 1_000, "matched");
         matched.file_transfer_id = Some(FileTransferId(5));
@@ -1290,8 +1281,8 @@ mod tests {
                 },
             },
         });
-        // A detail whose timestamp does not match any message of its transfer id
-        // is dropped.
+        // A completed transfer may reach disk before its durable chat
+        // announcement. The canonical owner adopts this detail as pending.
         let mut other = text_message(2, 2_000, "other");
         other.file_transfer_id = Some(FileTransferId(6));
         records.push(ValidatedRecord {
@@ -1321,12 +1312,10 @@ mod tests {
             timestamp_ms: 1_000,
             transfer_id: FileTransferId(5)
         }));
-        assert!(
-            !loaded
-                .files
-                .keys()
-                .any(|key| key.transfer_id == FileTransferId(6))
-        );
+        assert!(loaded.files.contains_key(&FileHistoryKey {
+            timestamp_ms: 9_000,
+            transfer_id: FileTransferId(6)
+        }));
     }
 
     #[test]
