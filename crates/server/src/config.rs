@@ -12,7 +12,7 @@ use rpc::{
     crypto::{encode_hex, server_key_pair_from_seed_hex},
     ids::{RoomId, UserId},
 };
-use toml_spanner::{Item, Toml};
+use toml_spanner::{Context, Failed, FromToml, Item, Toml};
 
 use crate::config_diagnostics::{self, Diag};
 
@@ -32,24 +32,73 @@ pub const FIRST_DYNAMIC_ROOM_ID: u32 = 0x8000_0000;
 /// `memory-limit`.
 pub const DEFAULT_MEMORY_HISTORY_LIMIT: usize = 512;
 
+#[derive(Clone, Copy, Debug)]
+pub struct Binds {
+    pub tcp: SocketAddr,
+    pub udp: SocketAddr,
+}
+
+impl Default for Binds {
+    fn default() -> Self {
+        let addr = default_listen_addr();
+        Self {
+            tcp: addr,
+            udp: addr,
+        }
+    }
+}
+
+impl<'de> FromToml<'de> for Binds {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        if item.as_str().is_some() {
+            let addr = toml_spanner::helper::parse_string::from_toml(ctx, item)?;
+            return Ok(Self {
+                tcp: addr,
+                udp: addr,
+            });
+        }
+
+        let mut table = item.table_helper(ctx)?;
+        let tcp = table.required_mapped("tcp", Item::parse::<SocketAddr>)?;
+        let udp = table.required_mapped("udp", Item::parse::<SocketAddr>)?;
+        table.require_empty()?;
+        Ok(Self { tcp, udp })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PublicAddrs {
+    pub tcp: String,
+    pub udp: String,
+}
+
+impl<'de> FromToml<'de> for PublicAddrs {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        if let Some(addr) = item.as_str() {
+            let addr = addr.to_string();
+            return Ok(Self {
+                tcp: addr.clone(),
+                udp: addr,
+            });
+        }
+
+        let mut table = item.table_helper(ctx)?;
+        let tcp = table.required("tcp")?;
+        let udp = table.required("udp")?;
+        table.require_empty()?;
+        Ok(Self { tcp, udp })
+    }
+}
+
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
 pub struct NetworkConfig {
-    #[toml(
-        default = default_listen_addr(),
-        FromToml with = toml_spanner::helper::parse_string
-    )]
-    pub tcp_addr: SocketAddr,
-    /// UDP media bind address. `None` inherits `tcp-addr`; read through
-    /// [`NetworkConfig::udp_addr`].
-    #[toml(FromToml with = toml_spanner::helper::parse_string)]
-    pub udp_addr: Option<SocketAddr>,
+    #[toml(default)]
+    pub bind: Binds,
     #[toml(FromToml with = toml_spanner::helper::parse_string)]
     pub udp_probe_addr: Option<SocketAddr>,
     #[toml(default)]
-    pub public_tcp_addr: String,
-    #[toml(default)]
-    pub public_udp_addr: String,
+    pub public_addr: PublicAddrs,
     #[toml(default)]
     pub public_udp_probe_addr: Option<String>,
     #[toml(skip)]
@@ -58,22 +107,12 @@ pub struct NetworkConfig {
     pub p2p: bool,
 }
 
-impl NetworkConfig {
-    /// The UDP media bind address: `udp-addr` when configured, otherwise
-    /// `tcp-addr`.
-    pub fn udp_addr(&self) -> SocketAddr {
-        self.udp_addr.unwrap_or(self.tcp_addr)
-    }
-}
-
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            tcp_addr: default_listen_addr(),
-            udp_addr: None,
+            bind: Binds::default(),
             udp_probe_addr: None,
-            public_tcp_addr: String::new(),
-            public_udp_addr: String::new(),
+            public_addr: PublicAddrs::default(),
             public_udp_probe_addr: None,
             public_udp_probe_addr_overridden: false,
             p2p: true,
@@ -334,15 +373,6 @@ macro_rules! optional_parse_setter {
     };
 }
 
-macro_rules! scalar_string_setter {
-    ($function:ident, $section:ident.$field:ident) => {
-        fn $function(config: &mut Config, value: &str) -> Result<(), String> {
-            config.$section.$field = value.to_string();
-            Ok(())
-        }
-    };
-}
-
 macro_rules! optional_string_setter {
     ($function:ident, $section:ident.$field:ident) => {
         fn $function(config: &mut Config, value: &str) -> Result<(), String> {
@@ -352,26 +382,49 @@ macro_rules! optional_string_setter {
     };
 }
 
-scalar_parse_setter!(
-    set_network_tcp_addr,
-    network.tcp_addr,
-    SocketAddr,
-    "network.tcp-addr"
-);
-optional_parse_setter!(
-    set_network_udp_addr,
-    network.udp_addr,
-    SocketAddr,
-    "network.udp-addr"
-);
+fn set_network_bind(config: &mut Config, value: &str) -> Result<(), String> {
+    let addr = value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid value for --network.bind: {error}"))?;
+    config.network.bind = Binds {
+        tcp: addr,
+        udp: addr,
+    };
+    Ok(())
+}
+fn set_network_bind_tcp(config: &mut Config, value: &str) -> Result<(), String> {
+    config.network.bind.tcp = value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid value for --network.bind.tcp: {error}"))?;
+    Ok(())
+}
+fn set_network_bind_udp(config: &mut Config, value: &str) -> Result<(), String> {
+    config.network.bind.udp = value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid value for --network.bind.udp: {error}"))?;
+    Ok(())
+}
 optional_parse_setter!(
     set_network_udp_probe_addr,
     network.udp_probe_addr,
     SocketAddr,
     "network.udp-probe-addr"
 );
-scalar_string_setter!(set_network_public_tcp_addr, network.public_tcp_addr);
-scalar_string_setter!(set_network_public_udp_addr, network.public_udp_addr);
+fn set_network_public_addr(config: &mut Config, value: &str) -> Result<(), String> {
+    config.network.public_addr = PublicAddrs {
+        tcp: value.to_string(),
+        udp: value.to_string(),
+    };
+    Ok(())
+}
+fn set_network_public_addr_tcp(config: &mut Config, value: &str) -> Result<(), String> {
+    config.network.public_addr.tcp = value.to_string();
+    Ok(())
+}
+fn set_network_public_addr_udp(config: &mut Config, value: &str) -> Result<(), String> {
+    config.network.public_addr.udp = value.to_string();
+    Ok(())
+}
 fn set_network_public_udp_probe_addr(config: &mut Config, value: &str) -> Result<(), String> {
     config.network.public_udp_probe_addr = (!value.is_empty()).then(|| value.to_string());
     config.network.public_udp_probe_addr_overridden = true;
@@ -446,16 +499,22 @@ scalar_parse_setter!(
 
 pub(crate) const CONFIG_OPTION_SPECS: &[ConfigOptionSpec] = &[
     ConfigOptionSpec {
-        name: "network.tcp-addr",
+        name: "network.bind",
         value_name: "ADDR",
-        description: "TCP bind address",
-        apply: set_network_tcp_addr,
+        description: "TCP and UDP bind address",
+        apply: set_network_bind,
     },
     ConfigOptionSpec {
-        name: "network.udp-addr",
+        name: "network.bind.tcp",
         value_name: "ADDR",
-        description: "UDP media bind address; empty inherits TCP",
-        apply: set_network_udp_addr,
+        description: "TCP bind address",
+        apply: set_network_bind_tcp,
+    },
+    ConfigOptionSpec {
+        name: "network.bind.udp",
+        value_name: "ADDR",
+        description: "UDP media bind address",
+        apply: set_network_bind_udp,
     },
     ConfigOptionSpec {
         name: "network.udp-probe-addr",
@@ -464,16 +523,22 @@ pub(crate) const CONFIG_OPTION_SPECS: &[ConfigOptionSpec] = &[
         apply: set_network_udp_probe_addr,
     },
     ConfigOptionSpec {
-        name: "network.public-tcp-addr",
+        name: "network.public-addr",
         value_name: "ENDPOINT",
-        description: "TCP endpoint advertised to clients",
-        apply: set_network_public_tcp_addr,
+        description: "TCP and UDP endpoints advertised to clients",
+        apply: set_network_public_addr,
     },
     ConfigOptionSpec {
-        name: "network.public-udp-addr",
+        name: "network.public-addr.tcp",
+        value_name: "ENDPOINT",
+        description: "TCP endpoint advertised to clients",
+        apply: set_network_public_addr_tcp,
+    },
+    ConfigOptionSpec {
+        name: "network.public-addr.udp",
         value_name: "ENDPOINT",
         description: "UDP endpoint advertised to clients",
-        apply: set_network_public_udp_addr,
+        apply: set_network_public_addr_udp,
     },
     ConfigOptionSpec {
         name: "network.public-udp-probe-addr",
@@ -683,16 +748,19 @@ pub fn generated_template_config() -> Result<String, String> {
 
 [network]
 # Bind addresses on this host.
-tcp-addr = "{listen_addr}"
-# udp-addr defaults to tcp-addr when omitted.
-# udp-addr = "{listen_addr}"
+bind = "{listen_addr}"
+# To use different transport addresses, replace `bind` above with:
+# bind.tcp = "127.0.0.1:41000"
+# bind.udp = "127.0.0.1:41000"
 # Optional UDP socket used for P2P path probes.
 # udp-probe-addr = "127.0.0.1:41001"
 
 # Public endpoints embedded in invites and returned during open pairing. Set
 # these when clients need a DNS name, reverse proxy port, or forwarded NAT port.
-# public-tcp-addr = "chat.example.com:41000"
-# public-udp-addr = "chat.example.com:41000"
+# public-addr = "chat.example.com:41000"
+# To advertise different transport endpoints, use:
+# public-addr.tcp = "chat.example.com:41000"
+# public-addr.udp = "media.example.com:41000"
 # public-udp-probe-addr = "chat.example.com:41001"
 p2p = true
 
@@ -861,16 +929,14 @@ impl Config {
         if !self.security.transport_encryption {
             self.network.p2p = false;
         }
-        self.network.public_tcp_addr = self.network.public_tcp_addr.trim().to_string();
-        if self.network.public_tcp_addr.is_empty() {
-            self.network.public_tcp_addr = self.network.tcp_addr.to_string();
+        self.network.public_addr.tcp = self.network.public_addr.tcp.trim().to_string();
+        if self.network.public_addr.tcp.is_empty() {
+            self.network.public_addr.tcp = self.network.bind.tcp.to_string();
         }
-        self.network.public_udp_addr = self.network.public_udp_addr.trim().to_string();
-        if self.network.public_udp_addr.is_empty() {
-            self.network.public_udp_addr = public_endpoint_for_bind_addr(
-                self.network.udp_addr(),
-                &self.network.public_tcp_addr,
-            );
+        self.network.public_addr.udp = self.network.public_addr.udp.trim().to_string();
+        if self.network.public_addr.udp.is_empty() {
+            self.network.public_addr.udp =
+                public_endpoint_for_bind_addr(self.network.bind.udp, &self.network.public_addr.tcp);
         }
         let public_udp_probe_addr = self
             .network
@@ -885,7 +951,7 @@ impl Config {
             public_udp_probe_addr.or_else(|| {
                 self.network
                     .udp_probe_addr
-                    .map(|addr| public_endpoint_for_bind_addr(addr, &self.network.public_tcp_addr))
+                    .map(|addr| public_endpoint_for_bind_addr(addr, &self.network.public_addr.tcp))
             })
         };
         for room in &mut self.rooms {
@@ -909,13 +975,13 @@ impl Config {
         }
         validate_public_endpoint(
             source,
-            "network.public-tcp-addr",
-            &self.network.public_tcp_addr,
+            "network.public-addr.tcp",
+            &self.network.public_addr.tcp,
         )?;
         validate_public_endpoint(
             source,
-            "network.public-udp-addr",
-            &self.network.public_udp_addr,
+            "network.public-addr.udp",
+            &self.network.public_addr.udp,
         )?;
         if let Some(addr) = &self.network.public_udp_probe_addr {
             validate_public_endpoint(source, "network.public-udp-probe-addr", addr)?;
@@ -1313,7 +1379,7 @@ mod tests {
     /// sections; rooms default to the lobby when `extra` declares none.
     fn config_content(extra: &str) -> String {
         format!(
-            "[network]\ntcp-addr = \"127.0.0.1:41000\"\n\n[security]\nserver-identity-seed = \"{}\"\n\n{extra}",
+            "[network]\nbind = \"127.0.0.1:41000\"\n\n[security]\nserver-identity-seed = \"{}\"\n\n{extra}",
             dev_server_seed_hex()
         )
     }
@@ -1326,11 +1392,11 @@ mod tests {
     fn default_config_parses_and_validates() {
         let config = Config::default();
         config.validate("<test>").unwrap();
-        assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:41000");
-        assert_eq!(config.network.udp_addr(), config.network.tcp_addr);
+        assert_eq!(config.network.bind.tcp.to_string(), "127.0.0.1:41000");
+        assert_eq!(config.network.bind.udp, config.network.bind.tcp);
         assert_eq!(config.network.udp_probe_addr, None);
-        assert_eq!(config.network.public_tcp_addr, "127.0.0.1:41000");
-        assert_eq!(config.network.public_udp_addr, "127.0.0.1:41000");
+        assert_eq!(config.network.public_addr.tcp, "127.0.0.1:41000");
+        assert_eq!(config.network.public_addr.udp, "127.0.0.1:41000");
         assert_eq!(config.network.public_udp_probe_addr, None);
         assert!(config.network.p2p);
         assert!(config.security.transport_encryption);
@@ -1348,7 +1414,7 @@ mod tests {
         let config = parse(&content).unwrap();
 
         assert_ne!(config.security.server_identity_seed, dev_server_seed_hex());
-        assert_eq!(config.network.udp_addr(), config.network.tcp_addr);
+        assert_eq!(config.network.bind.udp, config.network.bind.tcp);
     }
 
     #[test]
@@ -1359,11 +1425,13 @@ mod tests {
                 .map(|spec| spec.name)
                 .collect::<Vec<_>>(),
             [
-                "network.tcp-addr",
-                "network.udp-addr",
+                "network.bind",
+                "network.bind.tcp",
+                "network.bind.udp",
                 "network.udp-probe-addr",
-                "network.public-tcp-addr",
-                "network.public-udp-addr",
+                "network.public-addr",
+                "network.public-addr.tcp",
+                "network.public-addr.udp",
                 "network.public-udp-probe-addr",
                 "network.p2p",
                 "security.transport-encryption",
@@ -1387,11 +1455,13 @@ mod tests {
     fn scalar_overrides_apply_to_every_registered_field() {
         let password_hash = hash_secret("override-password");
         let overrides = vec![
-            config_override("network.tcp-addr", "127.0.0.1:42000"),
-            config_override("network.udp-addr", "127.0.0.1:42001"),
+            config_override("network.bind", "127.0.0.1:41999"),
+            config_override("network.bind.tcp", "127.0.0.1:42000"),
+            config_override("network.bind.udp", "127.0.0.1:42001"),
             config_override("network.udp-probe-addr", "127.0.0.1:42002"),
-            config_override("network.public-tcp-addr", "chat.example.com:443"),
-            config_override("network.public-udp-addr", "chat.example.com:444"),
+            config_override("network.public-addr", "chat.example.com:442"),
+            config_override("network.public-addr.tcp", "chat.example.com:443"),
+            config_override("network.public-addr.udp", "chat.example.com:444"),
             config_override("network.public-udp-probe-addr", "chat.example.com:445"),
             config_override("network.p2p", "false"),
             config_override("security.transport-encryption", "true"),
@@ -1429,17 +1499,14 @@ mod tests {
         );
         let config = outcome.config.unwrap();
 
-        assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:42000");
-        assert_eq!(
-            config.network.udp_addr.map(|addr| addr.to_string()),
-            Some("127.0.0.1:42001".to_string())
-        );
+        assert_eq!(config.network.bind.tcp.to_string(), "127.0.0.1:42000");
+        assert_eq!(config.network.bind.udp.to_string(), "127.0.0.1:42001");
         assert_eq!(
             config.network.udp_probe_addr.map(|addr| addr.to_string()),
             Some("127.0.0.1:42002".to_string())
         );
-        assert_eq!(config.network.public_tcp_addr, "chat.example.com:443");
-        assert_eq!(config.network.public_udp_addr, "chat.example.com:444");
+        assert_eq!(config.network.public_addr.tcp, "chat.example.com:443");
+        assert_eq!(config.network.public_addr.udp, "chat.example.com:444");
         assert_eq!(
             config.network.public_udp_probe_addr.as_deref(),
             Some("chat.example.com:445")
@@ -1470,8 +1537,8 @@ mod tests {
     #[test]
     fn overrides_precede_normalization_and_last_value_wins() {
         let overrides = vec![
-            config_override("network.tcp-addr", "127.0.0.1:41999"),
-            config_override("network.tcp-addr", "127.0.0.1:42000"),
+            config_override("network.bind", "127.0.0.1:41999"),
+            config_override("network.bind", "127.0.0.1:42000"),
         ];
 
         let outcome = collect_config_content_with_overrides(
@@ -1482,18 +1549,19 @@ mod tests {
         );
         let config = outcome.config.unwrap();
 
-        assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:42000");
-        assert_eq!(config.network.public_tcp_addr, "127.0.0.1:42000");
-        assert_eq!(config.network.public_udp_addr, "127.0.0.1:42000");
+        assert_eq!(config.network.bind.tcp.to_string(), "127.0.0.1:42000");
+        assert_eq!(config.network.bind.udp.to_string(), "127.0.0.1:42000");
+        assert_eq!(config.network.public_addr.tcp, "127.0.0.1:42000");
+        assert_eq!(config.network.public_addr.udp, "127.0.0.1:42000");
     }
 
     #[test]
-    fn override_supplies_tcp_addr_omitted_from_partial_network_section() {
+    fn override_supplies_bind_omitted_from_partial_network_section() {
         let content = format!(
             "[network]\np2p = false\n\n[security]\nserver-identity-seed = \"{}\"\n",
             dev_server_seed_hex()
         );
-        let overrides = [config_override("network.tcp-addr", "127.0.0.1:42000")];
+        let overrides = [config_override("network.bind", "127.0.0.1:42000")];
 
         let outcome = collect_config_content_with_overrides(
             &content,
@@ -1515,26 +1583,25 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let config = outcome.config.unwrap();
-        assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:42000");
+        assert_eq!(config.network.bind.tcp.to_string(), "127.0.0.1:42000");
+        assert_eq!(config.network.bind.udp.to_string(), "127.0.0.1:42000");
         assert!(!config.network.p2p);
     }
 
     #[test]
-    fn empty_optional_override_clears_file_value() {
-        let content =
-            config_content("").replace("[network]", "[network]\nudp-addr = \"127.0.0.1:42001\"");
-        let overrides = [config_override("network.udp-addr", "")];
+    fn transport_specific_override_changes_only_that_bind() {
+        let overrides = [config_override("network.bind.udp", "127.0.0.1:42001")];
 
         let outcome = collect_config_content_with_overrides(
-            &content,
+            &config_content(""),
             "<test>",
             Some(PathBuf::from("server.toml")),
             &overrides,
         );
         let config = outcome.config.unwrap();
 
-        assert_eq!(config.network.udp_addr, None);
-        assert_eq!(config.network.udp_addr(), config.network.tcp_addr);
+        assert_eq!(config.network.bind.tcp.to_string(), "127.0.0.1:41000");
+        assert_eq!(config.network.bind.udp.to_string(), "127.0.0.1:42001");
     }
 
     #[test]
@@ -1571,12 +1638,13 @@ mod tests {
         assert_eq!(first.config_path.as_deref(), Some(config_path.as_path()));
         assert_eq!(first.data_dir(), Some(dir.join("chatt-server-data")));
 
-        let overrides = [config_override("network.tcp-addr", "127.0.0.1:42000")];
+        let overrides = [config_override("network.bind", "127.0.0.1:42000")];
         let (second, initialized) = load_or_initialize_directory(&dir, &overrides).unwrap();
 
         assert!(!initialized);
         assert_eq!(second.security.server_identity_seed, seed);
-        assert_eq!(second.network.tcp_addr.to_string(), "127.0.0.1:42000");
+        assert_eq!(second.network.bind.tcp.to_string(), "127.0.0.1:42000");
+        assert_eq!(second.network.bind.udp.to_string(), "127.0.0.1:42000");
         assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
     }
 
@@ -1633,7 +1701,7 @@ mod tests {
 
     #[test]
     fn config_rejects_missing_identity_seed() {
-        let content = "[network]\ntcp-addr = \"127.0.0.1:41000\"\n";
+        let content = "[network]\nbind = \"127.0.0.1:41000\"\n";
 
         let error = parse(content).unwrap_err();
 
@@ -1688,24 +1756,25 @@ mod tests {
     }
 
     #[test]
-    fn udp_addr_inherits_tcp_addr_when_omitted() {
+    fn scalar_bind_populates_both_transports() {
         let config = parse(&config_content("")).unwrap();
 
-        assert_eq!(config.network.udp_addr, None);
-        assert_eq!(config.network.udp_addr(), config.network.tcp_addr);
+        assert_eq!(config.network.bind.tcp.to_string(), "127.0.0.1:41000");
+        assert_eq!(config.network.bind.udp, config.network.bind.tcp);
         assert_eq!(config.network.udp_probe_addr, None);
     }
 
     #[test]
-    fn parses_explicit_udp_and_probe_addrs() {
+    fn parses_transport_specific_binds_and_probe_addr() {
         let content = config_content("").replace(
-            "tcp-addr = \"127.0.0.1:41000\"",
-            "tcp-addr = \"127.0.0.1:42000\"\nudp-addr = \"127.0.0.1:42001\"\nudp-probe-addr = \"127.0.0.1:42002\"",
+            "bind = \"127.0.0.1:41000\"",
+            "bind.tcp = \"127.0.0.1:42000\"\nbind.udp = \"127.0.0.1:42001\"\nudp-probe-addr = \"127.0.0.1:42002\"",
         );
 
         let config = parse(&content).unwrap();
 
-        assert_eq!(config.network.udp_addr().to_string(), "127.0.0.1:42001");
+        assert_eq!(config.network.bind.tcp.to_string(), "127.0.0.1:42000");
+        assert_eq!(config.network.bind.udp.to_string(), "127.0.0.1:42001");
         assert_eq!(
             config.network.udp_probe_addr.map(|addr| addr.to_string()),
             Some("127.0.0.1:42002".to_string())
@@ -1715,56 +1784,54 @@ mod tests {
     #[test]
     fn public_endpoints_can_differ_from_bind_addresses() {
         let content = config_content("").replace(
-            "tcp-addr = \"127.0.0.1:41000\"",
-            "tcp-addr = \"0.0.0.0:41000\"\npublic-tcp-addr = \"chat.example.com:443\"\npublic-udp-addr = \"198.51.100.20:54100\"",
+            "bind = \"127.0.0.1:41000\"",
+            "bind = \"0.0.0.0:41000\"\npublic-addr.tcp = \"chat.example.com:443\"\npublic-addr.udp = \"198.51.100.20:54100\"",
         );
 
         let config = parse(&content).unwrap();
 
-        assert_eq!(config.network.tcp_addr.to_string(), "0.0.0.0:41000");
-        assert_eq!(config.network.udp_addr().to_string(), "0.0.0.0:41000");
-        assert_eq!(config.network.public_tcp_addr, "chat.example.com:443");
-        assert_eq!(config.network.public_udp_addr, "198.51.100.20:54100");
+        assert_eq!(config.network.bind.tcp.to_string(), "0.0.0.0:41000");
+        assert_eq!(config.network.bind.udp.to_string(), "0.0.0.0:41000");
+        assert_eq!(config.network.public_addr.tcp, "chat.example.com:443");
+        assert_eq!(config.network.public_addr.udp, "198.51.100.20:54100");
     }
 
     #[test]
-    fn public_udp_addr_inherits_public_tcp_host_when_bind_is_unspecified() {
+    fn scalar_public_addr_populates_both_transports() {
         let content = config_content("").replace(
-            "tcp-addr = \"127.0.0.1:41000\"",
-            "tcp-addr = \"0.0.0.0:41000\"\npublic-tcp-addr = \"104.247.224.7:41000\"",
+            "bind = \"127.0.0.1:41000\"",
+            "bind = \"0.0.0.0:41000\"\npublic-addr = \"104.247.224.7:41000\"",
         );
 
         let config = parse(&content).unwrap();
 
-        assert_eq!(config.network.tcp_addr.to_string(), "0.0.0.0:41000");
-        assert_eq!(config.network.udp_addr().to_string(), "0.0.0.0:41000");
-        assert_eq!(config.network.public_tcp_addr, "104.247.224.7:41000");
-        assert_eq!(config.network.public_udp_addr, "104.247.224.7:41000");
+        assert_eq!(config.network.bind.tcp.to_string(), "0.0.0.0:41000");
+        assert_eq!(config.network.bind.udp.to_string(), "0.0.0.0:41000");
+        assert_eq!(config.network.public_addr.tcp, "104.247.224.7:41000");
+        assert_eq!(config.network.public_addr.udp, "104.247.224.7:41000");
     }
 
     #[test]
     fn public_endpoints_reject_unspecified_addresses() {
-        let content = config_content("").replace(
-            "tcp-addr = \"127.0.0.1:41000\"",
-            "tcp-addr = \"0.0.0.0:41000\"",
-        );
+        let content =
+            config_content("").replace("bind = \"127.0.0.1:41000\"", "bind = \"0.0.0.0:41000\"");
 
         let error = parse(&content).unwrap_err();
 
-        assert!(error.contains("network.public-tcp-addr"));
+        assert!(error.contains("network.public-addr.tcp"));
         assert!(error.contains("unspecified address"));
     }
 
     #[test]
     fn explicit_public_udp_addr_rejects_unspecified_address() {
         let content = config_content("").replace(
-            "tcp-addr = \"127.0.0.1:41000\"",
-            "tcp-addr = \"0.0.0.0:41000\"\npublic-tcp-addr = \"104.247.224.7:41000\"\npublic-udp-addr = \"0.0.0.0:41000\"",
+            "bind = \"127.0.0.1:41000\"",
+            "bind = \"0.0.0.0:41000\"\npublic-addr.tcp = \"104.247.224.7:41000\"\npublic-addr.udp = \"0.0.0.0:41000\"",
         );
 
         let error = parse(&content).unwrap_err();
 
-        assert!(error.contains("network.public-udp-addr"));
+        assert!(error.contains("network.public-addr.udp"));
         assert!(error.contains("unspecified address"));
     }
 
@@ -1800,13 +1867,13 @@ mod tests {
 
     #[test]
     fn parse_errors_are_rendered_as_annotated_snippets() {
-        let content = "[network]\ntcp-addr = 42\n";
+        let content = "[network]\nbind = 42\n";
         let outcome = collect_config_content(content, "server.toml", None);
         let rendered =
             config_diagnostics::render_to_string("server.toml", content, &outcome.diagnostics);
 
         assert!(rendered.contains("server.toml:2"), "{rendered}");
-        assert!(rendered.contains("tcp-addr = 42"), "{rendered}");
+        assert!(rendered.contains("bind = 42"), "{rendered}");
         assert!(rendered.contains("error:"), "{rendered}");
     }
 

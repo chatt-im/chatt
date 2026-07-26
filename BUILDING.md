@@ -75,7 +75,7 @@ file:
 ```sh
 chatt-server serve \
   --dir ./chatt-server \
-  --network.tcp-addr=127.0.0.1:42000 \
+  --network.bind=127.0.0.1:42000 \
   --network.p2p=false
 ```
 

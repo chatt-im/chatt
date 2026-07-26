@@ -268,11 +268,11 @@ fn start_server(root: &Path) -> Addrs {
 
 fn start_server_with(root: &Path, rooms: Vec<RoomConfig>, users: Vec<UserConfig>) -> Addrs {
     let mut config = ServerConfig::default();
-    config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-    config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
+    config.network.bind.tcp = "127.0.0.1:0".parse().unwrap();
+    config.network.bind.udp = "127.0.0.1:0".parse().unwrap();
     config.network.udp_probe_addr = None;
-    config.network.public_tcp_addr.clear();
-    config.network.public_udp_addr.clear();
+    config.network.public_addr.tcp.clear();
+    config.network.public_addr.udp.clear();
     config.network.public_udp_probe_addr = None;
     config.network.p2p = false;
     config.security.server_identity_seed = dev_server_seed_hex();

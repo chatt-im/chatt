@@ -473,17 +473,17 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "disabled".to_string());
     kvlog::info!(
         "server starting",
-        tcp_addr = %config.network.tcp_addr,
-        udp_addr = %config.network.udp_addr(),
+        tcp_addr = %config.network.bind.tcp,
+        udp_addr = %config.network.bind.udp,
         udp_probe_addr = udp_probe_label.as_str(),
         server_public_key = server_public_key.as_str(),
         transport_mode = config.transport_mode().as_str(),
         p2p_enabled = config.network.p2p
     );
-    let tcp_addr = config.network.tcp_addr;
-    let udp_addr = config.network.udp_addr();
-    let public_tcp_addr = config.network.public_tcp_addr.clone();
-    let public_udp_addr = config.network.public_udp_addr.clone();
+    let tcp_addr = config.network.bind.tcp;
+    let udp_addr = config.network.bind.udp;
+    let public_tcp_addr = config.network.public_addr.tcp.clone();
+    let public_udp_addr = config.network.public_addr.udp.clone();
     let public_udp_probe_addr = config
         .network
         .public_udp_probe_addr
@@ -1281,24 +1281,26 @@ impl Server {
     }
 
     pub fn bind(mut config: ServerConfig) -> io::Result<Self> {
-        let infer_public_tcp = config.network.public_tcp_addr.trim().is_empty()
-            || (config.network.tcp_addr.port() == 0
+        let infer_public_tcp = config.network.public_addr.tcp.trim().is_empty()
+            || (config.network.bind.tcp.port() == 0
                 && config
                     .network
-                    .public_tcp_addr
+                    .public_addr
+                    .tcp
                     .parse::<SocketAddr>()
                     .is_ok_and(|endpoint| endpoint.port() == 0));
-        let infer_public_udp = config.network.public_udp_addr.trim().is_empty()
-            || (config.network.udp_addr().port() == 0
+        let infer_public_udp = config.network.public_addr.udp.trim().is_empty()
+            || (config.network.bind.udp.port() == 0
                 && config
                     .network
-                    .public_udp_addr
+                    .public_addr
+                    .udp
                     .parse::<SocketAddr>()
                     .is_ok_and(|endpoint| endpoint.port() == 0));
         let infer_public_udp_probe = config.network.public_udp_probe_addr.is_none();
         config.normalize();
-        let tcp_addr = config.network.tcp_addr;
-        let udp_addr = config.network.udp_addr();
+        let tcp_addr = config.network.bind.tcp;
+        let udp_addr = config.network.bind.udp;
         let udp_probe_addr = config.network.udp_probe_addr;
         let p2p_enabled = config.network.p2p;
         let poll = Poll::new()?;
@@ -1312,20 +1314,22 @@ impl Server {
         if infer_public_tcp {
             let mut public = config
                 .network
-                .public_tcp_addr
+                .public_addr
+                .tcp
                 .parse::<SocketAddr>()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             public.set_port(listener.local_addr()?.port());
-            config.network.public_tcp_addr = public.to_string();
+            config.network.public_addr.tcp = public.to_string();
         }
         if infer_public_udp {
             let mut public = config
                 .network
-                .public_udp_addr
+                .public_addr
+                .udp
                 .parse::<SocketAddr>()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             public.set_port(udp.local_addr()?.port());
-            config.network.public_udp_addr = public.to_string();
+            config.network.public_addr.udp = public.to_string();
         }
         if infer_public_udp_probe
             && let (Some(public), Some(socket)) = (
@@ -1779,8 +1783,8 @@ impl Server {
         let ticket = InviteTicket {
             version: rpc::PROTOCOL_VERSION,
             pairing_code: pairing_code.clone(),
-            tcp_addr: self.config.network.public_tcp_addr.clone(),
-            udp_addr: self.config.network.public_udp_addr.clone(),
+            tcp_addr: self.config.network.public_addr.tcp.clone(),
+            udp_addr: self.config.network.public_addr.udp.clone(),
             udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
             server_public_key: encode_hex(self.server_key_pair.public_key().as_ref()),
         };
@@ -4879,7 +4883,7 @@ impl Server {
         let response = match issued_token {
             Some(IssuedSessionToken::OpenPair(token)) => ServerControl::OpenPaired {
                 token,
-                udp_addr: self.config.network.public_udp_addr.clone(),
+                udp_addr: self.config.network.public_addr.udp.clone(),
                 udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
                 session_id,
                 user_id,
@@ -4890,7 +4894,7 @@ impl Server {
             Some(IssuedSessionToken::DeviceLink(token)) => ServerControl::DeviceLinked {
                 token,
                 username: username.clone(),
-                udp_addr: self.config.network.public_udp_addr.clone(),
+                udp_addr: self.config.network.public_addr.udp.clone(),
                 udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
                 session_id,
                 user_id,
@@ -8991,8 +8995,8 @@ mod tests {
 
     fn test_server_config() -> ServerConfig {
         let mut config = ServerConfig::default();
-        config.network.tcp_addr = "127.0.0.1:0".parse().expect("valid tcp addr");
-        config.network.udp_addr = Some("127.0.0.1:0".parse().expect("valid udp addr"));
+        config.network.bind.tcp = "127.0.0.1:0".parse().expect("valid tcp addr");
+        config.network.bind.udp = "127.0.0.1:0".parse().expect("valid udp addr");
         config.network.udp_probe_addr = None;
         config.network.p2p = false;
         config
@@ -9082,8 +9086,8 @@ mod tests {
     #[test]
     fn invite_ticket_uses_advertised_public_udp_endpoint() {
         let mut server = test_server();
-        server.config.network.public_tcp_addr = "104.247.224.7:41000".to_string();
-        server.config.network.public_udp_addr = "104.247.224.7:41000".to_string();
+        server.config.network.public_addr.tcp = "104.247.224.7:41000".to_string();
+        server.config.network.public_addr.udp = "104.247.224.7:41000".to_string();
 
         let join_string = server.create_invite("alice").unwrap();
         let ticket = control::decode_invite_ticket(&join_string).unwrap();
@@ -9773,8 +9777,8 @@ mod tests {
             .dm_room_for(UserId(1), UserId(2))
             .expect("dm registered");
         let mut config = server.config.clone();
-        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.network.bind.tcp = "127.0.0.1:0".parse().unwrap();
+        config.network.bind.udp = "127.0.0.1:0".parse().unwrap();
         drop(server);
 
         let restarted = Server::bind(config).expect("restarted server");
@@ -10222,8 +10226,8 @@ mod tests {
     #[test]
     fn history_fetch_paginates_backwards() {
         let mut config = ServerConfig::default();
-        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.network.bind.tcp = "127.0.0.1:0".parse().unwrap();
+        config.network.bind.udp = "127.0.0.1:0".parse().unwrap();
         config.network.p2p = false;
         config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
         config.rooms[0].memory_limit = Some(100);
@@ -10261,8 +10265,8 @@ mod tests {
     #[test]
     fn history_fetch_streams_page_over_bounded_chunks() {
         let mut config = ServerConfig::default();
-        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.network.bind.tcp = "127.0.0.1:0".parse().unwrap();
+        config.network.bind.udp = "127.0.0.1:0".parse().unwrap();
         config.network.p2p = false;
         config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
         config.rooms[0].memory_limit = Some(256);
@@ -10354,8 +10358,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = ServerConfig::default();
-        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.network.bind.tcp = "127.0.0.1:0".parse().unwrap();
+        config.network.bind.udp = "127.0.0.1:0".parse().unwrap();
         config.network.p2p = false;
         config.rooms[0].persistence = config::RoomPersistenceConfig::Durable;
         config.storage.data_dir = Some(dir.display().to_string());
@@ -12401,7 +12405,7 @@ mod tests {
         let mut server = open_pair_test_server();
         server.config.security.password_hash = Some(hash_secret("hunter2"));
         server.config.security.password_epoch = 7;
-        server.config.network.public_udp_addr = "198.51.100.20:54100".to_string();
+        server.config.network.public_addr.udp = "198.51.100.20:54100".to_string();
         server.config.network.public_udp_probe_addr = Some("198.51.100.20:54101".to_string());
         let seed = server.config.security.server_identity_seed.clone();
         let user_id = UserId(config::FIRST_DYNAMIC_USER_ID + 5);
@@ -13027,7 +13031,7 @@ mod tests {
         let config_path = dir.join("chatt-server.toml");
         let content = format!(
             "# operator comment that must survive pairing\n\
-             [network]\ntcp-addr = \"127.0.0.1:0\"\np2p = false\n\n\
+             [network]\nbind = \"127.0.0.1:0\"\np2p = false\n\n\
              [security]\nserver-identity-seed = \"{}\"\n",
             rpc::crypto::dev_server_seed_hex()
         );

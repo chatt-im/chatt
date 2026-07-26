@@ -51,8 +51,8 @@ struct Client {
 
 fn server_config() -> ServerConfig {
     let mut config = ServerConfig::default();
-    config.network.tcp_addr = "127.0.0.1:0".parse().expect("valid loopback tcp addr");
-    config.network.udp_addr = Some("127.0.0.1:0".parse().expect("valid loopback udp addr"));
+    config.network.bind.tcp = "127.0.0.1:0".parse().expect("valid loopback tcp addr");
+    config.network.bind.udp = "127.0.0.1:0".parse().expect("valid loopback udp addr");
     config.network.udp_probe_addr = None;
     config.network.p2p = false;
     // Use the well-known dev identity so clients with `server_public_key = None`

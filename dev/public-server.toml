@@ -1,7 +1,7 @@
 # chatt server configuration
 
 [network]
-tcp-addr = "127.0.0.1:42000"
+bind = "127.0.0.1:42000"
 p2p = false
 
 [security]

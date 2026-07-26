@@ -163,14 +163,14 @@ or from `--config` / `CHATT_SERVER_CONFIG`.
 
 Important fields:
 
-- `network.tcp-addr`: TCP control listener. UDP media shares this address by
-  default.
-- `network.udp-addr`: optional UDP media listener override.
+- `network.bind`: shared TCP control and UDP media bind address. Use
+  `network.bind.tcp` and `network.bind.udp` instead when they differ.
 - `network.udp-probe-addr`: optional second UDP endpoint for P2P NAT
   classification.
-- `network.public-tcp-addr`: TCP endpoint embedded in invites. This may be a
-  DNS name or NAT/reverse-proxy address and port.
-- `network.public-udp-addr`: UDP media endpoint embedded in invites.
+- `network.public-addr`: shared TCP and UDP endpoint embedded in invites. This
+  may be a DNS name or NAT/reverse-proxy address and port. Use
+  `network.public-addr.tcp` and `network.public-addr.udp` instead when the
+  transport endpoints differ.
 - `network.public-udp-probe-addr`: optional public P2P NAT probe endpoint
   embedded in invites.
 - `security.server-identity-seed`: 32-byte Ed25519 seed encoded as hex. Replace
