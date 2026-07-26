@@ -1,11 +1,10 @@
 use std::ops::Range;
 
 use extui::{Style, vt::Modifier};
-use rpc::control::ChatMessage;
-use rpc::ids::FileTransferId;
+use rpc::ids::{FileTransferId, MessageId, RoomId};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::theme::SyntaxTheme;
+use crate::{app::room::RoomHistoryRef, theme::SyntaxTheme};
 use chatt_message_format::{
     Token, TokenKind,
     highlight::{self, HlClass},
@@ -17,9 +16,201 @@ const COLLAPSE_LIMIT: usize = 12;
 const COLLAPSE_SHOW: usize = 10;
 /// Maximum gap between adjacent same-sender messages that still groups them.
 const GROUP_GAP_MS: u64 = 90_000;
+/// Detached pre-room output is view-local and deliberately small.
+const MAX_LOCAL_NOTICES: usize = 128;
+/// Layout retention is the visible terminal window plus at most this many
+/// disposable rows on either side. Since terminal height is `u16`, this also
+/// gives the cache a hard upper bound independent of history length.
+const MAX_LAYOUT_OVERSCAN_ROWS: usize = 256;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoticeId(u64);
+
+/// Stable identity of one canonical room-history entry. Viewports retain these
+/// ids and derived layout state, never the sender or body they identify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HistoryEntryId {
+    Message(MessageId),
+    Notice(u64),
+    LocalNotice(NoticeId),
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::*;
+    use crate::app::room::RoomHistoryFixture as TestHistory;
+
+    #[test]
+    fn viewport_retains_only_ids_and_reads_current_body() {
+        let mut history = TestHistory::new();
+        history.push(1, "alice", "first");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        assert_eq!(
+            viewport.record(&history.history(), 0).unwrap().body,
+            "first"
+        );
+
+        history.edit(1, "edited");
+        viewport.reconcile(&history.history());
+        assert_eq!(
+            viewport.record(&history.history(), 0).unwrap().body,
+            "edited"
+        );
+    }
+
+    #[test]
+    fn stable_cursor_survives_prepend() {
+        let mut history = TestHistory::new();
+        history.push(10, "alice", "ten");
+        history.push(11, "alice", "eleven");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.set_cursor(HistoryEntryId::Message(MessageId(11)));
+        history.push(1, "alice", "one");
+        viewport.reconcile(&history.history());
+        assert_eq!(
+            viewport.cursor().unwrap().entry,
+            HistoryEntryId::Message(MessageId(11))
+        );
+        assert_eq!(
+            viewport.record(&history.history(), 2).unwrap().entry_id,
+            HistoryEntryId::Message(MessageId(11))
+        );
+    }
+
+    #[test]
+    fn deleted_cursor_chooses_newer_survivor_across_prepend() {
+        let mut history = TestHistory::new();
+        history.push(10, "alice", "ten");
+        history.push(11, "alice", "eleven");
+        history.push(12, "alice", "twelve");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.set_cursor(HistoryEntryId::Message(MessageId(11)));
+        history.remove(11);
+        history.push(1, "alice", "one");
+        viewport.reconcile(&history.history());
+
+        let cursor = viewport.cursor().unwrap();
+        assert_eq!(cursor.entry, HistoryEntryId::Message(MessageId(12)));
+    }
+
+    #[test]
+    fn clear_boundary_hides_old_history_but_keeps_new_messages() {
+        let mut history = TestHistory::new();
+        history.push(1, "alice", "old");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.clear_scrollback();
+        assert!(viewport.is_empty());
+        history.push(2, "alice", "new");
+        viewport.reconcile(&history.history());
+        assert_eq!(viewport.len(), 1);
+        assert_eq!(viewport.record(&history.history(), 0).unwrap().body, "new");
+    }
+
+    #[test]
+    fn clear_boundary_survives_deletion_of_its_last_message() {
+        let mut history = TestHistory::new();
+        history.push(1, "alice", "older");
+        history.push(2, "alice", "boundary");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.clear_scrollback();
+
+        history.remove(2);
+        viewport.reconcile(&history.history());
+        assert!(viewport.is_empty());
+
+        history.push(3, "alice", "new");
+        viewport.reconcile(&history.history());
+        assert_eq!(viewport.len(), 1);
+        assert_eq!(viewport.record(&history.history(), 0).unwrap().body, "new");
+    }
+
+    #[test]
+    fn generation_reset_discards_clear_boundary() {
+        let mut history = TestHistory::new();
+        history.push(1, "alice", "old");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.clear_scrollback();
+        assert!(viewport.is_empty());
+
+        history.advance_generation();
+        viewport.reconcile(&history.history());
+        assert_eq!(viewport.record(&history.history(), 0).unwrap().body, "old");
+    }
+
+    #[test]
+    fn wrapping_and_selection_read_borrowed_content() {
+        let mut history = TestHistory::new();
+        history.push(1, "alice", "alpha beta gamma");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.ensure_cursor(&history.history(), 6);
+        viewport.toggle_visual_anchor(&history.history(), 6);
+        assert_eq!(
+            viewport.visual_text(&history.history(), 6).as_deref(),
+            Some("gamma")
+        );
+    }
+
+    #[test]
+    fn grouping_and_collapse_layout_remain_view_local() {
+        let mut history = TestHistory::new();
+        history.push(1, "alice", &"line\n".repeat(14));
+        let mut first = ChatViewport::new(SyntaxTheme::default());
+        let mut second = ChatViewport::new(SyntaxTheme::default());
+        first.reconcile(&history.history());
+        second.reconcile(&history.history());
+        assert!(first.toggle_expand(&history.history(), 0, 40));
+        first.visible_lines(&history.history(), 40, 40, 0);
+        second.visible_lines(&history.history(), 40, 40, 0);
+        assert!(first.is_expanded(0));
+        assert!(second.is_collapsed(0));
+    }
+
+    #[test]
+    fn layout_cache_retains_only_the_visible_window() {
+        let mut history = TestHistory::new();
+        for id in 1..=200 {
+            history.push(id, &format!("user-{id}"), &format!("message body {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        let visible = viewport.visible_lines(&history.history(), 40, 6, 2);
+
+        let resident = viewport
+            .entries
+            .iter()
+            .filter(|entry| entry.layout.is_some())
+            .count();
+        assert!(!visible.is_empty());
+        assert!(resident <= 10, "{resident} layouts remained resident");
+    }
+
+    #[test]
+    fn append_while_scrolled_preserves_the_visible_entry_anchor() {
+        let mut history = TestHistory::new();
+        for id in 1..=30 {
+            history.push(id, &format!("user-{id}"), &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.scroll_up(&history.history(), 8, 40, 6);
+        let before = viewport.visible_lines(&history.history(), 40, 6, 1);
+        let before = viewport.entries[before[0].message].id;
+
+        history.push(31, "new-user", "new tail");
+        viewport.reconcile(&history.history());
+        let after = viewport.visible_lines(&history.history(), 40, 6, 1);
+        let after = viewport.entries[after[0].message].id;
+
+        assert_eq!(after, before);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeKind {
@@ -63,6 +254,7 @@ pub enum LineKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisibleLine {
+    pub entry: HistoryEntryId,
     /// For `Body`/`Ellipsis` the owning message; for `Heading` the block's first
     /// (oldest) message.
     pub message: usize,
@@ -82,10 +274,12 @@ impl VisibleLine {
     }
 }
 
-pub struct ChatEntry {
-    pub id: u64,
-    pub sender: String,
-    pub body: String,
+/// A borrowed canonical record presented to the viewport for one operation.
+#[derive(Clone, Copy)]
+pub struct ChatRecord<'a> {
+    pub entry_id: HistoryEntryId,
+    pub sender: &'a str,
+    pub body: &'a str,
     pub timestamp_ms: u64,
     pub local: bool,
     /// The remote DM content is authenticated by a key that has not been
@@ -97,15 +291,63 @@ pub struct ChatEntry {
     /// The server file transfer this message announces, when it is a file. Keys
     /// the render-time progress overlay in [`crate::app::room::RoomSession`].
     pub file_transfer_id: Option<FileTransferId>,
-    /// Byte ranges of `http`/`https` URLs in `body`, computed once at push time.
-    pub links: Vec<Range<u32>>,
-    /// Message references in `body`, decoded and resolved once at push time.
-    pub refs: Vec<MsgRefSpan>,
+    pub notice_kind: Option<NoticeKind>,
+    /// Changes whenever this record's display content changes.
+    pub content_revision: u64,
+}
+
+struct ViewEntry {
+    id: HistoryEntryId,
+    content_revision: u64,
     /// Whether a collapsible (over [`COLLAPSE_LIMIT`] lines) message is expanded.
     expanded: bool,
-    notice_id: Option<NoticeId>,
-    pub notice_kind: Option<NoticeKind>,
-    layout: MessageLayout,
+    /// Present only inside the bounded visible/overscan cache window.
+    layout: Option<Box<MessageLayout>>,
+}
+
+impl ViewEntry {
+    fn layout(&self) -> &MessageLayout {
+        self.layout
+            .as_deref()
+            .expect("message layout must be ensured before use")
+    }
+
+    fn layout_mut(&mut self) -> &mut MessageLayout {
+        self.layout
+            .get_or_insert_with(|| Box::new(MessageLayout::new()))
+    }
+
+    fn invalidate_layout(&mut self) {
+        if let Some(layout) = self.layout.as_deref_mut() {
+            layout.invalidate();
+        }
+    }
+}
+
+fn remap_missing_entry(
+    entries: &[ViewEntry],
+    previous: &[HistoryEntryId],
+    old_position: usize,
+) -> Option<HistoryEntryId> {
+    let survives = |id| entries.iter().any(|entry| entry.id == id);
+    previous
+        .get(old_position.saturating_add(1)..)
+        .and_then(|newer| newer.iter().copied().find(|id| survives(*id)))
+        .or_else(|| {
+            previous[..old_position.min(previous.len())]
+                .iter()
+                .rev()
+                .copied()
+                .find(|id| survives(*id))
+        })
+}
+
+struct LocalNotice {
+    id: NoticeId,
+    sender: String,
+    body: String,
+    kind: NoticeKind,
+    after: Option<MessageId>,
 }
 
 /// A run of one or more consecutive messages rendered under a single heading.
@@ -172,10 +414,6 @@ impl FenwickRows {
         self.total = 0;
     }
 
-    fn len(&self) -> usize {
-        self.tree.len()
-    }
-
     fn total(&self) -> usize {
         self.total
     }
@@ -190,11 +428,6 @@ impl FenwickRows {
             .saturating_sub(self.prefix_sum(start));
         self.tree.push(previous.saturating_add(value));
         self.total = self.total.saturating_add(value);
-    }
-
-    fn truncate(&mut self, len: usize) {
-        self.tree.truncate(len);
-        self.total = self.prefix_sum(len);
     }
 
     fn set(&mut self, index: usize, value: usize) {
@@ -261,33 +494,78 @@ impl FenwickRows {
 /// A body-line position: wrapped visible `line` within `message`. `Ord` is
 /// `(message, line)` lexicographic, used to normalize visual ranges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Cursor {
-    pub message: usize,
+struct LayoutCursor {
+    message: usize,
+    line: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewCursor {
+    pub entry: HistoryEntryId,
     pub line: usize,
 }
 
-pub struct VirtualChatBuffer {
-    messages: Vec<ChatEntry>,
-    /// Advances whenever searchable message text or ordering changes.
-    revision: u64,
-    /// Advances only when existing index offsets may have changed. Search can
-    /// append incrementally while this remains stable.
-    reindex_revision: u64,
-    max_messages: usize,
+#[derive(Clone, Copy)]
+struct ViewScrollAnchor {
+    entry: HistoryEntryId,
+    line: usize,
+    kind: LineKind,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ClearBoundary {
+    message: Option<MessageId>,
+    notice: Option<u64>,
+    local_notice: Option<NoticeId>,
+}
+
+impl ClearBoundary {
+    fn observe(&mut self, id: HistoryEntryId) {
+        match id {
+            HistoryEntryId::Message(id) => {
+                self.message = Some(self.message.map_or(id, |current| current.max(id)));
+            }
+            HistoryEntryId::Notice(id) => {
+                self.notice = Some(self.notice.map_or(id, |current| current.max(id)));
+            }
+            HistoryEntryId::LocalNotice(id) => {
+                self.local_notice = Some(self.local_notice.map_or(id, |current| current.max(id)));
+            }
+        }
+    }
+
+    fn hides(self, id: HistoryEntryId) -> bool {
+        match id {
+            HistoryEntryId::Message(id) => self.message.is_some_and(|boundary| id <= boundary),
+            HistoryEntryId::Notice(id) => self.notice.is_some_and(|boundary| id <= boundary),
+            HistoryEntryId::LocalNotice(id) => {
+                self.local_notice.is_some_and(|boundary| id <= boundary)
+            }
+        }
+    }
+}
+
+pub struct ChatViewport {
+    entries: Vec<ViewEntry>,
+    observed_generation: Option<u64>,
+    observed_revision: u64,
     scroll_offset: usize,
+    scroll_anchor: Option<ViewScrollAnchor>,
     /// Navigation cursor; `None` only while the buffer is empty. A stale
     /// `line` (after reflow or collapse) is clamped lazily by
     /// [`Self::ensure_cursor`].
-    cursor: Option<Cursor>,
+    cursor: Option<ViewCursor>,
     /// `Some` means a line-wise visual selection spans `anchor..=cursor`,
     /// order-normalized. Keyboard visual mode and mouse drags share this.
-    anchor: Option<Cursor>,
+    anchor: Option<ViewCursor>,
     /// A mouse drag is in progress; releasing with `anchor == cursor` (a
     /// click) clears the anchor, leaving a plain cursor move.
     dragging: bool,
     syntax: SyntaxTheme,
-    room_id: Option<rpc::ids::RoomId>,
+    room_id: Option<RoomId>,
+    local_notices: Vec<LocalNotice>,
     next_notice_id: u64,
+    clear_boundary: Option<ClearBoundary>,
     layout_index: LayoutIndex,
     /// Advances on any mutation that can move existing rendered rows: edits,
     /// removals, prepends, eviction, collapse toggles, reflow. Pure tail
@@ -297,20 +575,22 @@ pub struct VirtualChatBuffer {
     layout_epoch: u64,
 }
 
-impl VirtualChatBuffer {
-    pub fn new(max_messages: usize, syntax: SyntaxTheme) -> Self {
+impl ChatViewport {
+    pub fn new(syntax: SyntaxTheme) -> Self {
         Self {
-            messages: Vec::new(),
-            revision: 0,
-            reindex_revision: 0,
-            max_messages: max_messages.max(1),
+            entries: Vec::new(),
+            observed_generation: None,
+            observed_revision: 0,
             scroll_offset: 0,
+            scroll_anchor: None,
             cursor: None,
             anchor: None,
             dragging: false,
             syntax,
             room_id: None,
+            local_notices: Vec::new(),
             next_notice_id: 1,
+            clear_boundary: None,
             layout_index: LayoutIndex::default(),
             layout_epoch: 0,
         }
@@ -318,17 +598,12 @@ impl VirtualChatBuffer {
 
     /// Sets the room this buffer displays, the scope against which message
     /// references resolve.
-    pub fn set_room_id(&mut self, room_id: rpc::ids::RoomId) {
+    pub fn set_room_id(&mut self, room_id: RoomId) {
         self.room_id = Some(room_id);
     }
 
-    pub fn room_id(&self) -> Option<rpc::ids::RoomId> {
+    pub fn room_id(&self) -> Option<RoomId> {
         self.room_id
-    }
-
-    pub fn set_max_messages(&mut self, max_messages: usize) {
-        self.max_messages = max_messages.max(1);
-        self.trim_front();
     }
 
     /// Restyles syntax highlighting when the active theme changes. Cached
@@ -339,295 +614,205 @@ impl VirtualChatBuffer {
             return;
         }
         self.syntax = syntax;
-        for entry in &mut self.messages {
-            entry.layout.invalidate();
+        for entry in &mut self.entries {
+            entry.invalidate_layout();
         }
         self.layout_index.invalidate();
         self.bump_layout_epoch();
     }
 
-    fn build_entry(&self, message: ChatMessage, local: bool, unverified: bool) -> ChatEntry {
-        let inline = chatt_message_format::inline_ranges(&message.body);
-        let refs = self.build_ref_spans(&message.body, inline.refs);
-        ChatEntry {
-            id: message.message_id.0,
-            sender: message.sender_name,
-            body: message.body,
-            timestamp_ms: message.timestamp_ms,
-            local,
-            unverified: unverified && !local,
-            edited: message.flags.edited(),
-            file_transfer_id: message.file_transfer_id,
-            links: inline.urls,
-            refs,
-            expanded: false,
-            notice_id: None,
-            notice_kind: None,
-            layout: MessageLayout::new(),
-        }
-    }
-
-    /// Replaces the message with `message_id` by the folded `message`,
-    /// recomputing links, references, and layout while keeping the entry's
-    /// local flag and expansion. Returns whether the message was resident.
-    #[cfg(test)]
-    pub fn edit_message(&mut self, message_id: u64, message: ChatMessage) -> bool {
-        let unverified = self
-            .find_message(message_id)
-            .map(|index| self.messages[index].unverified)
-            .unwrap_or(false);
-        self.edit_authenticated_message(message_id, message, unverified)
-    }
-
-    pub fn edit_authenticated_message(
-        &mut self,
-        message_id: u64,
-        message: ChatMessage,
-        unverified: bool,
-    ) -> bool {
-        let Some(index) = self.find_message(message_id) else {
-            return false;
-        };
-        let expanded = self.messages[index].expanded;
-        let local = self.messages[index].local;
-        let mut entry = self.build_entry(message, local, unverified);
-        entry.expanded = expanded;
-        self.messages[index] = entry;
-        self.bump_reindex_revision();
-        self.layout_index.invalidate();
-        self.bump_layout_epoch();
-        true
-    }
-
-    /// Removes the message with `message_id`, fixing up the cursor and anchor
-    /// like a notice removal. Returns whether the message was resident.
-    pub fn remove_message(&mut self, message_id: u64) -> bool {
-        let Some(index) = self.find_message(message_id) else {
-            return false;
-        };
-        self.remove_at(index);
-        true
-    }
-
-    #[cfg(test)]
-    pub fn push_chat(&mut self, message: ChatMessage, local: bool) {
-        self.push_authenticated_chat(message, local, false);
-    }
-
-    pub fn push_authenticated_chat(&mut self, message: ChatMessage, local: bool, unverified: bool) {
-        let old_len = self.messages.len();
-        let entry = self.build_entry(message, local, unverified);
-        self.messages.push(entry);
-        self.bump_revision();
-        self.repair_layout_index_after_append(old_len);
-        self.follow_bottom_after_push(old_len);
-        self.trim_front();
-    }
-
-    /// Advances the cursor onto a just-pushed newest message when the view is
-    /// following the bottom: only with `scroll_offset == 0`, no visual anchor,
-    /// and the cursor already on the previously-newest message. Scrolled-up or
-    /// mid-selection, the cursor sticks to its message through index shifts.
-    fn follow_bottom_after_push(&mut self, old_len: usize) {
-        if self.scroll_offset != 0 || self.anchor.is_some() {
+    /// Reconciles stable view ids and disposable layout state with canonical
+    /// history. Payload is always re-read through `history`.
+    pub fn reconcile(&mut self, history: &RoomHistoryRef<'_>) {
+        let generation_changed = self.observed_generation != Some(history.generation());
+        let generation_reset = self.observed_generation.is_some() && generation_changed;
+        let revision_changed = self.observed_revision != history.order_revision();
+        if !generation_changed && !revision_changed {
             return;
         }
-        let Some(cursor) = &mut self.cursor else {
-            return;
-        };
-        if old_len > 0 && cursor.message == old_len - 1 {
-            // The line is clamped to the message's last visible line lazily.
-            *cursor = Cursor {
-                message: old_len,
-                line: usize::MAX,
-            };
-        }
-    }
 
-    /// Inserts a batch of older messages before the first entry. `messages`
-    /// must be sorted by `message_id` and older than every resident message.
-    /// The bottom-relative scroll is untouched, so the view does not jump;
-    /// cursor and anchor shift with the entries they name.
-    #[cfg(test)]
-    pub fn prepend_chat(&mut self, messages: Vec<(ChatMessage, bool)>) {
-        self.prepend_authenticated_chat(
-            messages
-                .into_iter()
-                .map(|(message, local)| (message, local, false))
-                .collect(),
-        );
-    }
-
-    pub fn prepend_authenticated_chat(&mut self, messages: Vec<(ChatMessage, bool, bool)>) {
-        if messages.is_empty() {
-            return;
-        }
-        let count = messages.len();
-        let entries: Vec<ChatEntry> = messages
-            .into_iter()
-            .map(|(message, local, unverified)| self.build_entry(message, local, unverified))
-            .collect();
-        self.messages.splice(0..0, entries);
-        self.bump_reindex_revision();
-        if let Some(cursor) = &mut self.cursor {
-            cursor.message += count;
-        }
-        if let Some(anchor) = &mut self.anchor {
-            anchor.message += count;
-        }
-        self.layout_index.invalidate();
-        self.bump_layout_epoch();
-        self.trim_front();
-    }
-
-    /// Inserts one message at its sorted position among real messages,
-    /// leaving notices pinned where they were pushed. For the rare history
-    /// straggler that lands between resident messages.
-    #[cfg(test)]
-    pub fn insert_chat(&mut self, message: ChatMessage, local: bool) {
-        self.insert_authenticated_chat(message, local, false);
-    }
-
-    pub fn insert_authenticated_chat(
-        &mut self,
-        message: ChatMessage,
-        local: bool,
-        unverified: bool,
-    ) {
-        let key = message.message_id.0;
-        let index = self
-            .messages
+        let cursor_position = self.cursor.and_then(|cursor| {
+            self.entries
+                .iter()
+                .position(|entry| entry.id == cursor.entry)
+        });
+        let anchor_position = self.anchor.and_then(|anchor| {
+            self.entries
+                .iter()
+                .position(|entry| entry.id == anchor.entry)
+        });
+        let scroll_anchor_position = self.scroll_anchor.and_then(|anchor| {
+            self.entries
+                .iter()
+                .position(|entry| entry.id == anchor.entry)
+        });
+        let was_following = self.scroll_offset == 0;
+        let cursor_was_tail = self.entries.is_empty()
+            || cursor_position.is_some_and(|message| message + 1 == self.entries.len());
+        let previous_ids = self
+            .entries
             .iter()
-            .rposition(|entry| entry.id != 0 && entry.id < key)
-            .map_or(0, |newest_older| newest_older + 1);
-        let entry = self.build_entry(message, local, unverified);
-        self.messages.insert(index, entry);
-        self.bump_reindex_revision();
-        if let Some(cursor) = &mut self.cursor
-            && cursor.message >= index
-        {
-            cursor.message += 1;
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        let previous_len = previous_ids.len();
+
+        let mut previous = self
+            .entries
+            .drain(..)
+            .map(|entry| (entry.id, entry))
+            .collect::<hashbrown::HashMap<_, _>>();
+        if generation_reset {
+            previous.clear();
+            self.local_notices.clear();
         }
-        if let Some(anchor) = &mut self.anchor
-            && anchor.message >= index
-        {
-            anchor.message += 1;
+        if generation_changed {
+            self.clear_boundary = None;
+        }
+        let mut ids = history.entry_ids();
+        for notice in &self.local_notices {
+            let insert_at = notice.after.map_or(0, |after| {
+                ids.partition_point(|id| match id {
+                    HistoryEntryId::Message(id) => *id <= after,
+                    HistoryEntryId::Notice(_) | HistoryEntryId::LocalNotice(_) => true,
+                })
+            });
+            ids.insert(insert_at, HistoryEntryId::LocalNotice(notice.id));
+        }
+        if let Some(boundary) = self.clear_boundary {
+            ids.retain(|id| !boundary.hides(*id));
+        }
+        let mut messages = Vec::with_capacity(ids.len());
+        let mut content_changed = false;
+        for id in ids {
+            let Some(record) = self.resolve_record(history, id) else {
+                continue;
+            };
+            let mut entry = previous.remove(&record.entry_id).unwrap_or(ViewEntry {
+                id: record.entry_id,
+                content_revision: record.content_revision,
+                expanded: false,
+                layout: None,
+            });
+            if entry.content_revision != record.content_revision {
+                entry.content_revision = record.content_revision;
+                entry.invalidate_layout();
+                content_changed = true;
+            } else if revision_changed {
+                // Reference pill labels resolve through other canonical
+                // records. A room revision can therefore change this layout
+                // even when this record's own body did not.
+                entry.invalidate_layout();
+            }
+            messages.push(entry);
+        }
+        let pure_tail_append = !generation_changed
+            && !content_changed
+            && messages.len() > previous_len
+            && messages[..previous_len]
+                .iter()
+                .map(|entry| entry.id)
+                .eq(previous_ids.iter().copied());
+        self.entries = messages;
+        self.room_id = history.room_id();
+        self.observed_generation = Some(history.generation());
+        self.observed_revision = history.order_revision();
+
+        if generation_changed {
+            self.scroll_offset = 0;
+            self.cursor = None;
+            self.anchor = None;
+            self.scroll_anchor = None;
+            self.dragging = false;
+        } else {
+            self.cursor = self.cursor.and_then(|cursor| {
+                if self.entries.iter().any(|entry| entry.id == cursor.entry) {
+                    Some(cursor)
+                } else {
+                    Some(ViewCursor {
+                        entry: remap_missing_entry(&self.entries, &previous_ids, cursor_position?)?,
+                        line: cursor.line,
+                    })
+                }
+            });
+            self.anchor = self.anchor.and_then(|anchor| {
+                if self.entries.iter().any(|entry| entry.id == anchor.entry) {
+                    Some(anchor)
+                } else {
+                    Some(ViewCursor {
+                        entry: remap_missing_entry(&self.entries, &previous_ids, anchor_position?)?,
+                        line: anchor.line,
+                    })
+                }
+            });
+            self.scroll_anchor = self.scroll_anchor.and_then(|anchor| {
+                if self.entries.iter().any(|entry| entry.id == anchor.entry) {
+                    Some(anchor)
+                } else {
+                    Some(ViewScrollAnchor {
+                        entry: remap_missing_entry(
+                            &self.entries,
+                            &previous_ids,
+                            scroll_anchor_position?,
+                        )?,
+                        line: anchor.line,
+                        kind: anchor.kind,
+                    })
+                }
+            });
+            if self.cursor.is_none() && !self.entries.is_empty() {
+                self.cursor = Some(ViewCursor {
+                    entry: self.entries.last().expect("nonempty").id,
+                    line: 0,
+                });
+                self.anchor = None;
+            }
+            if was_following && cursor_was_tail && self.anchor.is_none() {
+                self.cursor = self.entries.last().map(|entry| ViewCursor {
+                    entry: entry.id,
+                    line: usize::MAX,
+                });
+            }
         }
         self.layout_index.invalidate();
-        self.bump_layout_epoch();
-        self.trim_front();
-    }
-
-    /// Re-marks which messages are locally sent, keyed by message id. Heading
-    /// grouping reads `local`, so the row index is invalidated only when an
-    /// entry actually changes.
-    /// Notices and keys the callback does not know keep their flag.
-    pub fn set_local_flags(&mut self, local_for: impl Fn(u64) -> Option<bool>) {
-        let mut changed = false;
-        for entry in &mut self.messages {
-            if entry.id == 0 {
-                continue;
-            }
-            if let Some(local) = local_for(entry.id) {
-                changed |= entry.local != local;
-                entry.local = local;
-            }
-        }
-        if changed {
-            self.layout_index.invalidate();
+        if !pure_tail_append {
             self.bump_layout_epoch();
         }
     }
 
-    #[cfg(test)]
-    pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) -> NoticeId {
-        self.push_notice_with_kind(sender, body, NoticeKind::Info)
-    }
-
-    pub fn push_notice_with_kind(
-        &mut self,
-        sender: impl Into<String>,
-        body: impl Into<String>,
-        kind: NoticeKind,
-    ) -> NoticeId {
-        let body = body.into();
-        let inline = chatt_message_format::inline_ranges(&body);
-        let refs = self.build_ref_spans(&body, inline.refs);
-        let notice_id = NoticeId(self.next_notice_id);
-        self.next_notice_id = self.next_notice_id.wrapping_add(1).max(1);
-        let old_len = self.messages.len();
-        self.messages.push(ChatEntry {
-            id: 0,
-            sender: sender.into(),
-            body,
-            timestamp_ms: 0,
-            local: false,
-            unverified: false,
-            edited: false,
-            file_transfer_id: None,
-            links: inline.urls,
-            refs,
-            expanded: false,
-            notice_id: Some(notice_id),
-            notice_kind: Some(kind),
-            layout: MessageLayout::new(),
-        });
-        self.bump_revision();
-        self.repair_layout_index_after_append(old_len);
-        self.follow_bottom_after_push(old_len);
-        self.trim_front();
-        notice_id
-    }
-
-    pub fn remove_notice(&mut self, notice_id: NoticeId) -> bool {
-        let Some(index) = self
-            .messages
-            .iter()
-            .position(|entry| entry.notice_id == Some(notice_id))
-        else {
-            return false;
-        };
-        self.remove_at(index);
-        true
-    }
-
-    fn remove_at(&mut self, index: usize) {
-        self.messages.remove(index);
-        self.bump_reindex_revision();
-        let anchor_removed = self.anchor.is_some_and(|anchor| anchor.message == index);
-        let cursor_removed = self.cursor.is_some_and(|cursor| cursor.message == index);
-        if anchor_removed || cursor_removed {
-            self.anchor = None;
-        } else if let Some(anchor) = &mut self.anchor
-            && anchor.message > index
-        {
-            anchor.message -= 1;
+    fn resolve_record<'a>(
+        &'a self,
+        history: &'a RoomHistoryRef<'a>,
+        id: HistoryEntryId,
+    ) -> Option<ChatRecord<'a>> {
+        if let HistoryEntryId::LocalNotice(id) = id {
+            let notice = self.local_notices.iter().find(|notice| notice.id == id)?;
+            return Some(ChatRecord {
+                entry_id: HistoryEntryId::LocalNotice(id),
+                sender: &notice.sender,
+                body: &notice.body,
+                timestamp_ms: 0,
+                local: false,
+                unverified: false,
+                edited: false,
+                file_transfer_id: None,
+                notice_kind: Some(notice.kind),
+                content_revision: id.0,
+            });
         }
-        if cursor_removed {
-            // Land on the nearest surviving message's first line.
-            if self.messages.is_empty() {
-                self.cursor = None;
-            } else {
-                self.cursor = Some(Cursor {
-                    message: index.min(self.messages.len() - 1),
-                    line: 0,
-                });
-            }
-        } else if let Some(cursor) = &mut self.cursor
-            && cursor.message > index
-        {
-            cursor.message -= 1;
-        }
-        self.layout_index.invalidate();
-        self.bump_layout_epoch();
+        history.record(id)
     }
 
-    fn build_ref_spans(&self, body: &str, ranges: Vec<Range<u32>>) -> Vec<MsgRefSpan> {
+    fn build_ref_spans(
+        &self,
+        history: &RoomHistoryRef<'_>,
+        body: &str,
+        ranges: Vec<Range<u32>>,
+    ) -> Vec<MsgRefSpan> {
         let mut spans = Vec::with_capacity(ranges.len());
         for range in ranges {
             let code_start = range.start as usize + rpc::msgref::REF_PREFIX.len();
             let target = rpc::msgref::MessageRef::decode(&body[code_start..range.end as usize]);
-            let label = target.and_then(|target| self.resolve_label(target));
+            let label = target.and_then(|target| self.resolve_label(history, target));
             spans.push(MsgRefSpan {
                 range,
                 target,
@@ -640,87 +825,176 @@ impl VirtualChatBuffer {
     /// Resolves a reference target to its pill label when the message is in
     /// this buffer and this room, the same lookup pushes use. The web feed
     /// resolves through this so both views label references identically.
-    pub fn ref_label_for(&self, target: rpc::msgref::MessageRef) -> Option<String> {
-        self.resolve_label(target)
+    pub fn ref_label_for(
+        &self,
+        history: &RoomHistoryRef<'_>,
+        target: rpc::msgref::MessageRef,
+    ) -> Option<String> {
+        self.resolve_label(history, target)
     }
 
     /// The reference and pill label of the message at `index`, for the composer
     /// reference picker. `None` for notices, which have no durable key.
-    pub fn ref_for_index(&self, index: usize) -> Option<(rpc::msgref::MessageRef, String)> {
-        let room_id = self.room_id?;
-        let entry = self.messages.get(index)?;
-        if entry.id == 0 {
+    pub fn ref_for_index(
+        &self,
+        history: &RoomHistoryRef<'_>,
+        index: usize,
+    ) -> Option<(rpc::msgref::MessageRef, String)> {
+        let room_id = history.room_id()?;
+        let entry = self.resolve_record(history, self.entries.get(index)?.id)?;
+        let HistoryEntryId::Message(message_id) = entry.entry_id else {
             return None;
-        }
+        };
         let target = rpc::msgref::MessageRef {
             room_id,
-            message_id: rpc::ids::MessageId(entry.id),
+            message_id,
         };
-        Some((target, ref_label(&entry.sender, &entry.body)))
+        Some((target, message_ref_label(entry.sender, entry.body)))
     }
 
-    fn resolve_label(&self, target: rpc::msgref::MessageRef) -> Option<String> {
-        if self.room_id != Some(target.room_id) {
+    fn resolve_label(
+        &self,
+        history: &RoomHistoryRef<'_>,
+        target: rpc::msgref::MessageRef,
+    ) -> Option<String> {
+        if history.room_id() != Some(target.room_id) {
             return None;
         }
-        let index = self.find_message(target.message_id.0)?;
-        let entry = &self.messages[index];
-        Some(ref_label(&entry.sender, &entry.body))
+        let entry = history.record(HistoryEntryId::Message(target.message_id))?;
+        Some(message_ref_label(entry.sender, entry.body))
     }
 
-    /// Returns the index of the message with the given durable key, preferring
-    /// the newest on the (never expected) chance of a duplicate.
-    pub fn find_message(&self, message_id: u64) -> Option<usize> {
-        for (index, entry) in self.messages.iter().enumerate().rev() {
-            if entry.id == message_id && entry.notice_id.is_none() {
-                return Some(index);
-            }
-        }
-        None
+    pub fn find_message(&self, message_id: u64) -> Option<HistoryEntryId> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == HistoryEntryId::Message(MessageId(message_id)))
+            .map(|entry| entry.id)
     }
 
-    pub fn clear(&mut self) {
-        if !self.messages.is_empty() {
-            self.bump_reindex_revision();
+    pub fn push_notice_with_kind(
+        &mut self,
+        sender: impl Into<String>,
+        body: impl Into<String>,
+        kind: NoticeKind,
+    ) -> NoticeId {
+        let id = NoticeId(self.next_notice_id);
+        self.next_notice_id = self.next_notice_id.wrapping_add(1).max(1);
+        let after = self.entries.iter().rev().find_map(|entry| match entry.id {
+            HistoryEntryId::Message(id) => Some(id),
+            HistoryEntryId::Notice(_) | HistoryEntryId::LocalNotice(_) => None,
+        });
+        self.local_notices.push(LocalNotice {
+            id,
+            sender: sender.into(),
+            body: body.into(),
+            kind,
+            after,
+        });
+        if self.local_notices.len() > MAX_LOCAL_NOTICES {
+            let removed = self.local_notices.remove(0).id;
+            self.entries
+                .retain(|entry| entry.id != HistoryEntryId::LocalNotice(removed));
         }
-        self.messages.clear();
+        self.entries.push(ViewEntry {
+            id: HistoryEntryId::LocalNotice(id),
+            content_revision: id.0,
+            expanded: false,
+            layout: None,
+        });
+        self.layout_index.invalidate();
+        self.bump_layout_epoch();
+        id
+    }
+
+    pub fn clear_scrollback(&mut self) {
+        let mut boundary = ClearBoundary::default();
+        for entry in &self.entries {
+            boundary.observe(entry.id);
+        }
+        self.clear_boundary = (!self.entries.is_empty()).then_some(boundary);
+        self.local_notices.clear();
+        self.entries.clear();
         self.scroll_offset = 0;
+        self.scroll_anchor = None;
         self.cursor = None;
         self.anchor = None;
         self.dragging = false;
-        self.room_id = None;
-        self.next_notice_id = 1;
         self.layout_index.clear();
         self.bump_layout_epoch();
     }
 
     pub fn len(&self) -> usize {
-        self.messages.len()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
+        self.entries.is_empty()
     }
 
-    pub fn message(&self, index: usize) -> &ChatEntry {
-        &self.messages[index]
+    pub fn record<'a>(
+        &'a self,
+        history: &'a RoomHistoryRef<'a>,
+        index: usize,
+    ) -> Option<ChatRecord<'a>> {
+        let id = self.entries.get(index)?.id;
+        self.resolve_record(history, id)
     }
 
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
+    pub fn record_entry<'a>(
+        &'a self,
+        history: &'a RoomHistoryRef<'a>,
+        id: HistoryEntryId,
+    ) -> Option<ChatRecord<'a>> {
+        self.resolve_record(history, id)
     }
 
-    pub(crate) fn reindex_revision(&self) -> u64 {
-        self.reindex_revision
+    pub(crate) fn entry_index(&self, id: HistoryEntryId) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.id == id)
     }
 
-    fn bump_revision(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+    pub fn toggle_expand_entry(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        id: HistoryEntryId,
+        width: u16,
+    ) -> bool {
+        let Some(index) = self.entry_index(id) else {
+            return false;
+        };
+        self.toggle_expand(history, index, width)
     }
 
-    fn bump_reindex_revision(&mut self) {
-        self.bump_revision();
-        self.reindex_revision = self.reindex_revision.wrapping_add(1);
+    pub fn scroll_entry_into_view(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        id: HistoryEntryId,
+        width: u16,
+        height: u16,
+    ) {
+        if let Some(index) = self.entry_index(id) {
+            self.scroll_message_into_view(history, index, width, height);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_record(&self, index: usize) -> Option<ChatRecord<'_>> {
+        let id = self.entries.get(index)?.id;
+        let HistoryEntryId::LocalNotice(id) = id else {
+            return None;
+        };
+        let notice = self.local_notices.iter().find(|notice| notice.id == id)?;
+        Some(ChatRecord {
+            entry_id: HistoryEntryId::LocalNotice(id),
+            sender: &notice.sender,
+            body: &notice.body,
+            timestamp_ms: 0,
+            local: false,
+            unverified: false,
+            edited: false,
+            file_transfer_id: None,
+            notice_kind: Some(notice.kind),
+            content_revision: id.0,
+        })
     }
 
     pub(crate) fn layout_epoch(&self) -> u64 {
@@ -732,23 +1006,30 @@ impl VirtualChatBuffer {
     }
 
     pub fn line(&self, message: usize, line: usize) -> &[Segment] {
-        self.messages[message].layout.line(line)
+        self.entries[message].layout().line(line)
     }
 
     /// Returns the URL at `col_in_line` on wrapped `line` of `message`, when a
     /// link segment covers that column. `col_in_line` is measured from the start
     /// of the message content, the same origin as [`Segment::col`].
-    pub fn link_at(&self, message: usize, line: usize, col_in_line: u16) -> Option<&str> {
-        let entry = self.messages.get(message)?;
-        if entry.links.is_empty() {
+    pub fn link_at<'a>(
+        &'a self,
+        history: &'a RoomHistoryRef<'a>,
+        message: usize,
+        line: usize,
+        col_in_line: u16,
+    ) -> Option<&'a str> {
+        let view = self.entries.get(message)?;
+        let entry = self.resolve_record(history, self.entries.get(message)?.id)?;
+        let links = chatt_message_format::inline_ranges(entry.body).urls;
+        if links.is_empty() {
             return None;
         }
-        let seg = entry.layout.segment_at(&entry.body, line, col_in_line)?;
+        let seg = view.layout().segment_at(entry.body, line, col_in_line)?;
         if seg.synth {
             return None;
         }
-        let range = entry
-            .links
+        let range = links
             .iter()
             .find(|r| r.start < seg.end && seg.start < r.end)?;
         Some(&entry.body[range.start as usize..range.end as usize])
@@ -758,21 +1039,24 @@ impl VirtualChatBuffer {
     /// of `message`, whether rendered as a pill or as a literal code.
     pub fn ref_at(
         &self,
+        history: &RoomHistoryRef<'_>,
         message: usize,
         line: usize,
         col_in_line: u16,
     ) -> Option<rpc::msgref::MessageRef> {
-        let entry = self.messages.get(message)?;
-        if entry.refs.is_empty() {
+        let view = self.entries.get(message)?;
+        let entry = self.resolve_record(history, self.entries.get(message)?.id)?;
+        let inline = chatt_message_format::inline_ranges(entry.body);
+        if inline.refs.is_empty() {
             return None;
         }
-        let seg = entry.layout.segment_at(&entry.body, line, col_in_line)?;
+        let refs = self.build_ref_spans(history, entry.body, inline.refs);
+        let seg = view.layout().segment_at(entry.body, line, col_in_line)?;
         if seg.synth {
-            let index = entry.layout.pill_ref_at(seg)?;
-            return entry.refs.get(index)?.target;
+            let index = view.layout().pill_ref_at(seg)?;
+            return refs.get(index)?.target;
         }
-        let span = entry
-            .refs
+        let span = refs
             .iter()
             .find(|span| span.range.start < seg.end && seg.start < span.range.end)?;
         span.target
@@ -780,53 +1064,84 @@ impl VirtualChatBuffer {
 
     /// Returns the text a segment displays: a body slice, or a slice of the
     /// layout's synthetic pill text.
-    pub fn segment_text(&self, message: usize, seg: &Segment) -> &str {
-        let entry = &self.messages[message];
-        entry.layout.segment_str(&entry.body, seg)
+    pub fn segment_text<'a>(
+        &'a self,
+        history: &'a RoomHistoryRef<'a>,
+        message: usize,
+        seg: &Segment,
+    ) -> Option<&'a str> {
+        let view = self.entries.get(message)?;
+        let entry = self.resolve_record(history, self.entries.get(message)?.id)?;
+        Some(view.layout().segment_str(entry.body, seg))
     }
 
+    #[cfg(test)]
     pub fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
 
-    pub fn scroll_up(&mut self, rows: usize, width: u16, height: u16) {
-        let max = self.max_scroll(width, height);
+    pub fn scroll_up(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        rows: usize,
+        width: u16,
+        height: u16,
+    ) {
+        let max = self.max_scroll(history, width, height);
         self.scroll_offset = self.scroll_offset.saturating_add(rows.max(1)).min(max);
+        self.scroll_anchor = None;
     }
 
     pub fn scroll_down(&mut self, rows: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(rows.max(1));
+        self.scroll_anchor = None;
     }
 
     pub fn bottom(&mut self) {
         self.scroll_offset = 0;
+        self.scroll_anchor = None;
     }
 
-    pub fn is_at_top(&mut self, width: u16, height: u16) -> bool {
-        self.scroll_offset == self.max_scroll(width, height)
+    pub fn is_at_top(&mut self, history: &RoomHistoryRef<'_>, width: u16, height: u16) -> bool {
+        self.scroll_offset == self.max_scroll(history, width, height)
     }
 
-    pub fn top(&mut self, width: u16, height: u16) {
-        self.scroll_offset = self.max_scroll(width, height);
+    pub fn top(&mut self, history: &RoomHistoryRef<'_>, width: u16, height: u16) {
+        self.scroll_offset = self.max_scroll(history, width, height);
+        self.scroll_anchor = None;
     }
 
     /// Largest valid `scroll_offset`: the offset that places the oldest line at
     /// the top of the view. Zero when all content fits within `height`.
-    fn max_scroll(&mut self, width: u16, height: u16) -> usize {
-        self.total_lines_exact(width)
+    fn max_scroll(&mut self, history: &RoomHistoryRef<'_>, width: u16, height: u16) -> usize {
+        self.total_lines_exact(history, width)
             .saturating_sub(height as usize)
     }
 
+    fn layout_cursor(&self, cursor: ViewCursor) -> Option<LayoutCursor> {
+        Some(LayoutCursor {
+            message: self
+                .entries
+                .iter()
+                .position(|entry| entry.id == cursor.entry)?,
+            line: cursor.line,
+        })
+    }
+
     /// Places the cursor and anchor at `pos` and starts a mouse drag.
-    pub fn begin_drag(&mut self, pos: Cursor) {
-        self.cursor = Some(pos);
-        self.anchor = Some(pos);
+    pub fn begin_drag(&mut self, pos: ViewCursor) {
+        self.cursor = self
+            .entries
+            .iter()
+            .any(|entry| entry.id == pos.entry)
+            .then_some(pos);
+        self.anchor = self.cursor;
         self.dragging = true;
     }
 
     /// Moves the cursor of an in-progress drag to `pos`; the anchor stays.
-    pub fn drag_to(&mut self, pos: Cursor) {
-        if self.dragging {
+    pub fn drag_to(&mut self, pos: ViewCursor) {
+        if self.dragging && self.entries.iter().any(|entry| entry.id == pos.entry) {
             self.cursor = Some(pos);
         }
     }
@@ -851,102 +1166,133 @@ impl VirtualChatBuffer {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn cursor(&self) -> Option<Cursor> {
+    pub fn cursor(&self) -> Option<ViewCursor> {
         self.cursor
     }
 
     /// Returns a valid cursor, defaulting to the last body line of the newest
     /// message and clamping stale coordinates. `None` only when empty.
-    pub fn ensure_cursor(&mut self, width: u16) -> Option<Cursor> {
-        if self.messages.is_empty() {
+    pub fn ensure_cursor(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+    ) -> Option<ViewCursor> {
+        self.ensure_layout_cursor(history, width)?;
+        self.cursor
+    }
+
+    fn ensure_layout_cursor(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+    ) -> Option<LayoutCursor> {
+        if self.entries.is_empty() {
             self.cursor = None;
             self.anchor = None;
             return None;
         }
         if self.cursor.is_none() {
-            self.cursor = Some(Cursor {
-                message: self.messages.len() - 1,
+            self.cursor = Some(ViewCursor {
+                entry: self.entries.last()?.id,
                 line: usize::MAX,
             });
         }
-        self.clamp_positions(width);
-        self.cursor
+        self.clamp_positions(history, width);
+        self.layout_cursor(self.cursor?)
     }
 
-    /// Moves the cursor to the first body line of `message`, clearing any
-    /// visual anchor. Used by reference jumps.
-    pub fn set_cursor_to_message(&mut self, message: usize) -> Option<Cursor> {
-        if message >= self.messages.len() {
+    /// Moves the cursor to a stable history entry, clearing any visual anchor.
+    pub fn set_cursor(&mut self, entry: HistoryEntryId) -> Option<ViewCursor> {
+        if !self.entries.iter().any(|candidate| candidate.id == entry) {
             return None;
         }
-        self.cursor = Some(Cursor { message, line: 0 });
+        self.cursor = Some(ViewCursor { entry, line: 0 });
         self.anchor = None;
-        self.cursor
+        self.cursor()
     }
 
     /// Moves the cursor `delta` visible body lines, walking across messages,
     /// clamping at the buffer edges. Lines hidden by collapse are never
     /// visited.
-    pub fn move_cursor_line(&mut self, delta: isize, width: u16) -> Option<Cursor> {
-        let mut cursor = self.ensure_cursor(width)?;
+    pub fn move_cursor_line(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        delta: isize,
+        width: u16,
+    ) -> Option<ViewCursor> {
+        let mut cursor = self.ensure_layout_cursor(history, width)?;
         for _ in 0..delta.unsigned_abs() {
             let next = if delta > 0 {
-                self.next_body_pos(cursor, width)
+                self.next_body_pos(history, cursor, width)
             } else {
-                self.prev_body_pos(cursor, width)
+                self.prev_body_pos(history, cursor, width)
             };
             let Some(next) = next else { break };
             cursor = next;
         }
-        self.cursor = Some(cursor);
-        self.cursor
+        self.cursor = Some(ViewCursor {
+            entry: self.entries[cursor.message].id,
+            line: cursor.line,
+        });
+        self.cursor()
     }
 
     /// Moves the cursor to the first body line of the block `delta` blocks
     /// away (a sender-group heading boundary), clamping at the ends.
-    pub fn move_cursor_paragraph(&mut self, delta: isize, width: u16) -> Option<Cursor> {
-        let cursor = self.ensure_cursor(width)?;
-        self.ensure_layout_index(width);
+    pub fn move_cursor_paragraph(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        delta: isize,
+        width: u16,
+    ) -> Option<ViewCursor> {
+        let cursor = self.ensure_layout_cursor(history, width)?;
+        self.ensure_layout_index(history, width);
         let current = self.layout_index.block_containing_message(cursor.message)?;
         let block_count = self.layout_index.blocks.len();
         let next = (current as isize + delta).clamp(0, block_count as isize - 1) as usize;
-        self.cursor = Some(Cursor {
-            message: self.layout_index.blocks[next].first,
+        let message = self.layout_index.blocks[next].first;
+        self.cursor = Some(ViewCursor {
+            entry: self.entries[message].id,
             line: 0,
         });
-        self.cursor
+        self.cursor()
     }
 
-    pub fn cursor_to_first(&mut self) -> Option<Cursor> {
-        if self.messages.is_empty() {
+    pub fn cursor_to_first(&mut self) -> Option<ViewCursor> {
+        if self.entries.is_empty() {
             return None;
         }
-        self.cursor = Some(Cursor {
-            message: 0,
+        self.cursor = Some(ViewCursor {
+            entry: self.entries[0].id,
             line: 0,
         });
-        self.cursor
+        self.cursor()
     }
 
-    pub fn cursor_to_last(&mut self, width: u16) -> Option<Cursor> {
-        if self.messages.is_empty() {
+    pub fn cursor_to_last(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+    ) -> Option<ViewCursor> {
+        if self.entries.is_empty() {
             return None;
         }
-        let last = self.messages.len() - 1;
-        self.cursor = Some(Cursor {
-            message: last,
-            line: self.visible_body_lines(last, width) - 1,
+        let last = self.entries.len() - 1;
+        self.cursor = Some(ViewCursor {
+            entry: self.entries[last].id,
+            line: self.visible_body_lines(history, last, width) - 1,
         });
-        self.cursor
+        self.cursor()
     }
 
     /// Toggles visual-line mode: anchors a selection at the cursor, or clears
     /// an existing one. Returns whether a selection is now active.
-    pub fn toggle_visual_anchor(&mut self, width: u16) -> bool {
+    pub fn toggle_visual_anchor(&mut self, history: &RoomHistoryRef<'_>, width: u16) -> bool {
         if self.anchor.take().is_some() {
             return false;
         }
-        self.anchor = self.ensure_cursor(width);
+        self.ensure_cursor(history, width);
+        self.anchor = self.cursor;
         self.anchor.is_some()
     }
 
@@ -960,7 +1306,13 @@ impl VirtualChatBuffer {
     }
 
     pub fn is_cursor_line(&self, message: usize, line: usize) -> bool {
-        self.cursor == Some(Cursor { message, line })
+        self.entries.get(message).is_some_and(|entry| {
+            self.cursor
+                == Some(ViewCursor {
+                    entry: entry.id,
+                    line,
+                })
+        })
     }
 
     /// Returns whether the given `(message, line)` falls within the visual
@@ -969,14 +1321,14 @@ impl VirtualChatBuffer {
         let Some((lo, hi)) = self.visual_bounds() else {
             return false;
         };
-        let pos = Cursor { message, line };
+        let pos = LayoutCursor { message, line };
         lo <= pos && pos <= hi
     }
 
     /// The visual range's ordered `(oldest, newest)` endpoints, when active.
-    fn visual_bounds(&self) -> Option<(Cursor, Cursor)> {
-        let anchor = self.anchor?;
-        let cursor = self.cursor?;
+    fn visual_bounds(&self) -> Option<(LayoutCursor, LayoutCursor)> {
+        let anchor = self.layout_cursor(self.anchor?)?;
+        let cursor = self.layout_cursor(self.cursor?)?;
         if anchor <= cursor {
             Some((anchor, cursor))
         } else {
@@ -984,30 +1336,38 @@ impl VirtualChatBuffer {
         }
     }
 
-    /// Message indexes targeted by an action on the current chat selection.
+    /// Stable entries targeted by an action on the current chat selection.
     /// A plain cursor targets its whole message; a visual-line range targets
     /// each message touched by either endpoint or any line between them.
-    pub fn selected_message_indices(&mut self, width: u16) -> Vec<usize> {
-        let Some(cursor) = self.ensure_cursor(width) else {
+    pub fn selected_entries(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+    ) -> Vec<HistoryEntryId> {
+        let Some(cursor) = self.ensure_layout_cursor(history, width) else {
             return Vec::new();
         };
         let Some((lo, hi)) = self.visual_bounds() else {
-            return vec![cursor.message];
+            return vec![self.entries[cursor.message].id];
         };
-        (lo.message..=hi.message).collect()
+        self.entries[lo.message..=hi.message]
+            .iter()
+            .map(|entry| entry.id)
+            .collect()
     }
 
     /// Copies original body text covered by the visually selected rendered
     /// rows, content only (no sender column). Wrapped rows from the same
     /// message are sliced as one source range so clipboard text keeps the
     /// message's whitespace instead of the display wrapper's trimmed fragments.
-    pub fn visual_text(&mut self, width: u16) -> Option<String> {
+    pub fn visual_text(&mut self, history: &RoomHistoryRef<'_>, width: u16) -> Option<String> {
         let width = width.max(1);
         let (lo, hi) = self.visual_bounds()?;
         let mut out = String::new();
         let mut first = true;
-        for message in lo.message..=hi.message.min(self.messages.len().saturating_sub(1)) {
-            let lines = self.visible_body_lines(message, width);
+        for message in lo.message..=hi.message.min(self.entries.len().saturating_sub(1)) {
+            let lines = self.visible_body_lines(history, message, width);
+            self.ensure_lines(history, message, width);
             let start = if message == lo.message { lo.line } else { 0 };
             if start >= lines {
                 continue;
@@ -1022,16 +1382,17 @@ impl VirtualChatBuffer {
                 out.push('\n');
             }
             first = false;
-            let entry = &self.messages[message];
+            let view = &self.entries[message];
+            let entry = self.resolve_record(history, self.entries.get(message)?.id)?;
             if start == 0 && end == lines - 1 {
-                if lines == entry.layout.lines().max(1) {
-                    out.push_str(&entry.body);
+                if lines == view.layout().lines().max(1) {
+                    out.push_str(entry.body);
                 } else {
-                    let range = entry.layout.source_range(start, end, entry.body.len());
+                    let range = view.layout().source_range(start, end, entry.body.len());
                     out.push_str(&entry.body[range]);
                 }
             } else {
-                let range = entry.layout.source_range(start, end, entry.body.len());
+                let range = view.layout().source_range(start, end, entry.body.len());
                 out.push_str(&entry.body[range]);
             }
         }
@@ -1039,33 +1400,39 @@ impl VirtualChatBuffer {
     }
 
     /// The original body text the cursor's wrapped row displays.
-    pub fn cursor_line_text(&self) -> Option<String> {
-        let cursor = self.cursor?;
-        let entry = self.messages.get(cursor.message)?;
-        let lines = entry.layout.lines().max(1);
+    pub fn cursor_line_text(&mut self, history: &RoomHistoryRef<'_>, width: u16) -> Option<String> {
+        let cursor = self.layout_cursor(self.cursor?)?;
+        self.ensure_lines(history, cursor.message, width);
+        let view = self.entries.get(cursor.message)?;
+        let entry = self.resolve_record(history, self.entries.get(cursor.message)?.id)?;
+        let lines = view.layout().lines().max(1);
         if cursor.line >= lines {
             return None;
         }
         if lines == 1 {
-            return Some(entry.body.clone());
+            return Some(entry.body.to_string());
         }
-        let range = entry
-            .layout
+        let range = view
+            .layout()
             .source_range(cursor.line, cursor.line, entry.body.len());
         Some(entry.body[range].to_string())
     }
 
-    pub fn cursor_message_body(&self) -> Option<&str> {
-        let cursor = self.cursor?;
-        Some(self.messages.get(cursor.message)?.body.as_str())
+    pub fn cursor_message_body<'a>(&'a self, history: &'a RoomHistoryRef<'a>) -> Option<&'a str> {
+        let cursor = self.layout_cursor(self.cursor?)?;
+        Some(
+            self.resolve_record(history, self.entries.get(cursor.message)?.id)?
+                .body,
+        )
     }
 
     /// The first decodable reference contained in the cursor's message, for
     /// keyboard-driven "open the reference in this message".
-    pub fn cursor_ref(&self) -> Option<rpc::msgref::MessageRef> {
-        let cursor = self.cursor?;
-        let entry = self.messages.get(cursor.message)?;
-        for span in &entry.refs {
+    pub fn cursor_ref(&self, history: &RoomHistoryRef<'_>) -> Option<rpc::msgref::MessageRef> {
+        let cursor = self.layout_cursor(self.cursor?)?;
+        let entry = self.resolve_record(history, self.entries.get(cursor.message)?.id)?;
+        let inline = chatt_message_format::inline_ranges(entry.body);
+        for span in self.build_ref_spans(history, entry.body, inline.refs) {
             if let Some(target) = span.target {
                 return Some(target);
             }
@@ -1074,13 +1441,18 @@ impl VirtualChatBuffer {
     }
 
     /// Scrolls the minimum amount that brings the cursor's row into view.
-    pub fn keep_cursor_visible(&mut self, width: u16, height: u16) -> Option<()> {
+    pub fn keep_cursor_visible(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+        height: u16,
+    ) -> Option<()> {
         let height = height as usize;
         if height == 0 {
             return None;
         }
-        let cursor = self.ensure_cursor(width)?;
-        let (row, total) = self.pos_row_and_total(cursor, width)?;
+        let cursor = self.ensure_layout_cursor(history, width)?;
+        let (row, total) = self.pos_row_and_total(history, cursor, width)?;
         let max_scroll = total.saturating_sub(height);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
         let top = total.saturating_sub(self.scroll_offset.saturating_add(height));
@@ -1098,41 +1470,52 @@ impl VirtualChatBuffer {
     /// Reflow at a new width invalidates wrapped-line coordinates: the anchor
     /// is dropped (a line-wise range is ambiguous across rewrap) and the
     /// cursor's line is clamped, never lost.
-    pub fn on_reflow(&mut self, width: u16) {
+    pub fn on_reflow(&mut self, history: &RoomHistoryRef<'_>, width: u16) {
         self.anchor = None;
         self.dragging = false;
         self.layout_index.invalidate();
         self.bump_layout_epoch();
-        self.clamp_positions(width);
+        self.clamp_positions(history, width);
     }
 
     /// Clamps the cursor and anchor into the collapse-aware visible line range
     /// at `width`.
-    fn clamp_positions(&mut self, width: u16) {
-        if self.messages.is_empty() {
+    fn clamp_positions(&mut self, history: &RoomHistoryRef<'_>, width: u16) {
+        if self.entries.is_empty() {
             self.cursor = None;
             self.anchor = None;
             return;
         }
-        if let Some(cursor) = self.cursor {
-            let message = cursor.message.min(self.messages.len() - 1);
-            let line = cursor.line.min(self.visible_body_lines(message, width) - 1);
-            self.cursor = Some(Cursor { message, line });
+        if let Some(cursor) = self.cursor.and_then(|cursor| self.layout_cursor(cursor)) {
+            let message = cursor.message;
+            let line = cursor
+                .line
+                .min(self.visible_body_lines(history, message, width) - 1);
+            self.cursor = Some(ViewCursor {
+                entry: self.entries[message].id,
+                line,
+            });
         }
-        if let Some(anchor) = self.anchor {
-            let message = anchor.message.min(self.messages.len() - 1);
-            let line = anchor.line.min(self.visible_body_lines(message, width) - 1);
-            self.anchor = Some(Cursor { message, line });
+        if let Some(anchor) = self.anchor.and_then(|anchor| self.layout_cursor(anchor)) {
+            let message = anchor.message;
+            let line = anchor
+                .line
+                .min(self.visible_body_lines(history, message, width) - 1);
+            self.anchor = Some(ViewCursor {
+                entry: self.entries[message].id,
+                line,
+            });
         }
     }
 
-    pub fn clamp_scroll(&mut self, width: u16, height: u16) {
-        let max = self.max_scroll(width, height);
+    pub fn clamp_scroll(&mut self, history: &RoomHistoryRef<'_>, width: u16, height: u16) {
+        let max = self.max_scroll(history, width, height);
         self.scroll_offset = self.scroll_offset.min(max);
     }
 
     pub fn scroll_message_into_view(
         &mut self,
+        history: &RoomHistoryRef<'_>,
         message: usize,
         width: u16,
         height: u16,
@@ -1141,7 +1524,7 @@ impl VirtualChatBuffer {
         if height == 0 {
             return None;
         }
-        let (message_row, total_rows) = self.message_row_and_total(message, width)?;
+        let (message_row, total_rows) = self.message_row_and_total(history, message, width)?;
         let max_scroll = total_rows.saturating_sub(height);
         let max_top = total_rows.saturating_sub(height);
         let desired_top = message_row.saturating_sub(height / 2);
@@ -1162,24 +1545,31 @@ impl VirtualChatBuffer {
     /// Toggles the expand/collapse state of `message` when it is collapsible
     /// (over [`COLLAPSE_LIMIT`] wrapped lines at `width`). Returns whether the
     /// state changed.
-    pub fn toggle_expand(&mut self, message: usize, width: u16) -> bool {
-        if message >= self.messages.len() || self.ensure_lines(message, width) <= COLLAPSE_LIMIT {
+    pub fn toggle_expand(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        width: u16,
+    ) -> bool {
+        if message >= self.entries.len()
+            || self.ensure_lines(history, message, width) <= COLLAPSE_LIMIT
+        {
             return false;
         }
-        self.messages[message].expanded = !self.messages[message].expanded;
+        self.entries[message].expanded = !self.entries[message].expanded;
         if self.layout_index.valid
             && self.layout_index.width == width.max(1)
-            && self.layout_index.line_counts.len() == self.messages.len()
+            && self.layout_index.line_counts.len() == self.entries.len()
         {
             if let Some(block_index) = self.layout_index.block_containing_message(message) {
                 let rows = {
                     let block = &mut self.layout_index.blocks[block_index];
-                    block.body_lines = if self.messages[message].expanded {
+                    block.body_lines = if self.entries[message].expanded {
                         self.layout_index.line_counts[message]
                     } else {
                         COLLAPSE_SHOW
                     };
-                    block.collapsed = !self.messages[message].expanded;
+                    block.collapsed = !self.entries[message].expanded;
                     Self::block_rows(block)
                 };
                 self.layout_index.rows.set(block_index, rows);
@@ -1190,42 +1580,36 @@ impl VirtualChatBuffer {
             self.layout_index.invalidate();
         }
         // Collapsing under the cursor or anchor pulls them into the preview.
-        self.clamp_positions(width);
+        self.clamp_positions(history, width);
         self.bump_layout_epoch();
         true
-    }
-
-    /// Whether `message`'s wrapped body exceeds [`COLLAPSE_LIMIT`] at `width`.
-    #[cfg(test)]
-    pub fn is_collapsible(&mut self, message: usize, width: u16) -> bool {
-        message < self.messages.len() && self.ensure_lines(message, width) > COLLAPSE_LIMIT
     }
 
     /// Whether `message` is collapsible (over [`COLLAPSE_LIMIT`] lines) and
     /// currently collapsed. Assumes its layout was already laid out this frame
     /// (true for any message in a visible block).
     pub fn is_collapsed(&self, message: usize) -> bool {
-        let entry = &self.messages[message];
-        entry.layout.lines() > COLLAPSE_LIMIT && !entry.expanded
+        let entry = &self.entries[message];
+        entry.layout().lines() > COLLAPSE_LIMIT && !entry.expanded
     }
 
     /// Whether `message` is collapsible and currently expanded. Counterpart to
     /// [`Self::is_collapsed`]; both are false for short messages.
     pub fn is_expanded(&self, message: usize) -> bool {
-        let entry = &self.messages[message];
-        entry.layout.lines() > COLLAPSE_LIMIT && entry.expanded
+        let entry = &self.entries[message];
+        entry.layout().lines() > COLLAPSE_LIMIT && entry.expanded
     }
 
     /// Returns the absolute row index of the viewport's top line at the given
     /// dimensions, applying the same scroll clamp as
     /// [`Self::visible_lines_into`] so a subsequent call computes the
     /// identical window.
-    pub fn viewport_top(&mut self, width: u16, height: u16) -> usize {
+    pub fn viewport_top(&mut self, history: &RoomHistoryRef<'_>, width: u16, height: u16) -> usize {
         let target = height as usize;
-        if self.messages.is_empty() || target == 0 {
+        if self.entries.is_empty() || target == 0 {
             return 0;
         }
-        self.ensure_layout_index(width.max(1));
+        self.ensure_layout_index(history, width.max(1));
         let total = self.layout_index.total_rows();
         self.scroll_offset = self.scroll_offset.min(total.saturating_sub(target));
         total.saturating_sub(self.scroll_offset.saturating_add(target))
@@ -1233,79 +1617,158 @@ impl VirtualChatBuffer {
 
     pub fn visible_lines_into(
         &mut self,
+        history: &RoomHistoryRef<'_>,
         width: u16,
         height: u16,
-        _overscan: usize,
+        overscan: usize,
         out: &mut Vec<VisibleLine>,
     ) {
         let width = width.max(1);
         let target = height as usize;
         out.clear();
-        if self.messages.is_empty() || target == 0 {
+        if self.entries.is_empty() || target == 0 {
             return;
         }
-        self.ensure_layout_index(width);
+        self.ensure_layout_index(history, width);
         let total = self.layout_index.total_rows();
+        if self.scroll_offset > 0
+            && let Some(anchor) = self.scroll_anchor.take()
+            && let Some(message) = self
+                .entries
+                .iter()
+                .position(|entry| entry.id == anchor.entry)
+            && let Some(top) = self.visible_line_row(message, anchor.line, anchor.kind)
+        {
+            self.scroll_offset = total
+                .saturating_sub(top.saturating_add(target))
+                .min(total.saturating_sub(target));
+        }
         let max_scroll = total.saturating_sub(target);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
         let top = total.saturating_sub(self.scroll_offset.saturating_add(target));
         let bottom = top.saturating_add(target).min(total);
+        let overscan = overscan.min(MAX_LAYOUT_OVERSCAN_ROWS);
+        let cache_top = top.saturating_sub(overscan);
+        let cache_bottom = bottom.saturating_add(overscan).min(total);
+        let cache_range = self.message_range_for_rows(cache_top, cache_bottom);
+        if let Some((first, last)) = cache_range {
+            for message in first..=last {
+                self.ensure_lines(history, message, width);
+            }
+        }
+        for (message, entry) in self.entries.iter_mut().enumerate() {
+            if !cache_range.is_some_and(|(first, last)| first <= message && message <= last) {
+                entry.layout = None;
+            }
+        }
         out.reserve(bottom.saturating_sub(top));
         for row in top..bottom {
             if let Some(line) = self.cached_visible_line(row) {
                 out.push(line);
             }
         }
+        self.scroll_anchor = (self.scroll_offset > 0)
+            .then(|| out.first().copied())
+            .flatten()
+            .and_then(|line| {
+                Some(ViewScrollAnchor {
+                    entry: self.entries.get(line.message)?.id,
+                    line: line.line,
+                    kind: line.kind,
+                })
+            });
+    }
+
+    fn message_range_for_rows(&self, top: usize, bottom: usize) -> Option<(usize, usize)> {
+        if top >= bottom {
+            return None;
+        }
+        let first = self.cached_visible_line(top)?;
+        let last = self.cached_visible_line(bottom - 1)?;
+        Some((first.block_first, last.block_last))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn visible_lines(&mut self, width: u16, height: u16, overscan: usize) -> Vec<VisibleLine> {
+    pub fn visible_lines(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+        height: u16,
+        overscan: usize,
+    ) -> Vec<VisibleLine> {
         let mut lines = Vec::new();
-        self.visible_lines_into(width, height, overscan, &mut lines);
+        self.visible_lines_into(history, width, height, overscan, &mut lines);
         lines
     }
 
     /// Lays out `idx` at `width` and returns its wrapped line count (at least 1).
-    fn ensure_lines(&mut self, idx: usize, width: u16) -> usize {
+    fn ensure_lines(&mut self, history: &RoomHistoryRef<'_>, idx: usize, width: u16) -> usize {
         let width = width.max(1);
         if self.layout_index.valid && self.layout_index.width != width {
             self.layout_index.invalidate();
         }
         let syntax = self.syntax;
-        let msg = &mut self.messages[idx];
-        msg.layout.ensure(width, &msg.body, &msg.refs, syntax);
-        msg.layout.lines().max(1)
+        let id = self.entries[idx].id;
+        if let HistoryEntryId::LocalNotice(id) = id {
+            let body = self
+                .local_notices
+                .iter()
+                .find(|notice| notice.id == id)
+                .expect("local notice id must resolve")
+                .body
+                .clone();
+            let inline = chatt_message_format::inline_ranges(&body);
+            let refs = self.build_ref_spans(history, &body, inline.refs);
+            let msg = &mut self.entries[idx];
+            let layout = msg.layout_mut();
+            layout.ensure(width, &body, &refs, syntax);
+            return layout.lines().max(1);
+        }
+        let record = history
+            .record(id)
+            .expect("viewport id must resolve through canonical history");
+        let inline = chatt_message_format::inline_ranges(record.body);
+        let refs = self.build_ref_spans(history, record.body, inline.refs);
+        let msg = &mut self.entries[idx];
+        let layout = msg.layout_mut();
+        layout.ensure(width, record.body, &refs, syntax);
+        layout.lines().max(1)
     }
 
-    fn ensure_layout_index(&mut self, width: u16) {
+    fn ensure_layout_index(&mut self, history: &RoomHistoryRef<'_>, width: u16) {
         let width = width.max(1);
         if self.layout_index.valid
             && self.layout_index.width == width
-            && self.layout_index.line_counts.len() == self.messages.len()
+            && self.layout_index.line_counts.len() == self.entries.len()
         {
             return;
         }
-        self.rebuild_layout_index(width);
+        self.rebuild_layout_index(history, width);
     }
 
-    fn rebuild_layout_index(&mut self, width: u16) {
+    fn rebuild_layout_index(&mut self, history: &RoomHistoryRef<'_>, width: u16) {
         let width = width.max(1);
         self.layout_index.valid = false;
         self.layout_index.width = width;
 
         let mut line_counts = std::mem::take(&mut self.layout_index.line_counts);
         line_counts.clear();
-        line_counts.reserve(self.messages.len());
-        for idx in 0..self.messages.len() {
-            line_counts.push(self.ensure_lines(idx, width));
+        line_counts.reserve(self.entries.len());
+        for idx in 0..self.entries.len() {
+            let lines = self.ensure_lines(history, idx, width);
+            line_counts.push(lines);
+            // A full row-index rebuild measures every record, but those
+            // layouts are not the cache. Release each immediately; the
+            // visible/overscan pass below repopulates only its bounded window.
+            self.entries[idx].layout = None;
         }
 
         let mut blocks = std::mem::take(&mut self.layout_index.blocks);
         blocks.clear();
         let mut cursor = 0usize;
-        while cursor < self.messages.len() {
-            let run_end = self.run_end_cached(cursor, &line_counts);
-            self.pack_run_cached(cursor, run_end, &line_counts, &mut blocks);
+        while cursor < self.entries.len() {
+            let run_end = self.run_end_cached(history, cursor, &line_counts);
+            self.pack_run_cached(history, cursor, run_end, &line_counts, &mut blocks);
             cursor = run_end + 1;
         }
 
@@ -1322,118 +1785,54 @@ impl VirtualChatBuffer {
         }
     }
 
-    fn repair_layout_index_after_append(&mut self, old_len: usize) {
-        if !self.layout_index.valid {
-            return;
-        }
-        if old_len + 1 != self.messages.len()
-            || self.layout_index.line_counts.len() != old_len
-            || self.layout_index.rows.len() != self.layout_index.blocks.len()
-        {
-            self.layout_index.invalidate();
-            return;
-        }
-        let width = self.layout_index.width;
-        let lines = self.ensure_lines(old_len, width);
-        self.layout_index.line_counts.push(lines);
-        let repair_start = if old_len == 0 {
-            0
-        } else if self.boundary_before_cached(old_len - 1, old_len, &self.layout_index.line_counts)
-        {
-            old_len
-        } else if let Some(block_index) = self.layout_index.block_containing_message(old_len - 1) {
-            self.layout_index.blocks[block_index].first
-        } else {
-            self.layout_index.invalidate();
-            return;
-        };
-        self.rebuild_layout_index_tail_from(repair_start);
-    }
-
-    fn rebuild_layout_index_tail_from(&mut self, repair_start: usize) {
-        if !self.layout_index.valid
-            || self.layout_index.line_counts.len() != self.messages.len()
-            || repair_start > self.messages.len()
-        {
-            self.layout_index.invalidate();
-            return;
-        }
-        let keep_blocks = self
-            .layout_index
-            .blocks
-            .partition_point(|block| block.last < repair_start);
-        self.layout_index.blocks.truncate(keep_blocks);
-        self.layout_index.rows.truncate(keep_blocks);
-
-        let mut tail_blocks = Vec::new();
-        let mut cursor = repair_start;
-        while cursor < self.messages.len() {
-            let run_end = self.run_end_cached(cursor, &self.layout_index.line_counts);
-            self.pack_run_cached(
-                cursor,
-                run_end,
-                &self.layout_index.line_counts,
-                &mut tail_blocks,
-            );
-            cursor = run_end + 1;
-        }
-        for block in tail_blocks {
-            self.layout_index.rows.push(Self::block_rows(&block));
-            self.layout_index.blocks.push(block);
-        }
-    }
-
-    fn rebuild_layout_index_blocks_from_counts(&mut self) {
-        if !self.layout_index.valid || self.layout_index.line_counts.len() != self.messages.len() {
-            self.layout_index.invalidate();
-            return;
-        }
-        let mut blocks = std::mem::take(&mut self.layout_index.blocks);
-        blocks.clear();
-        let mut cursor = 0usize;
-        while cursor < self.messages.len() {
-            let run_end = self.run_end_cached(cursor, &self.layout_index.line_counts);
-            self.pack_run_cached(cursor, run_end, &self.layout_index.line_counts, &mut blocks);
-            cursor = run_end + 1;
-        }
-        self.layout_index.rows.clear();
-        for block in &blocks {
-            self.layout_index.rows.push(Self::block_rows(block));
-        }
-        self.layout_index.blocks = blocks;
-    }
-
-    fn run_end_cached(&self, start: usize, line_counts: &[usize]) -> usize {
+    fn run_end_cached(
+        &self,
+        history: &RoomHistoryRef<'_>,
+        start: usize,
+        line_counts: &[usize],
+    ) -> usize {
         if line_counts[start] > COLLAPSE_LIMIT {
             return start;
         }
         let mut end = start;
-        while end + 1 < self.messages.len()
-            && !self.boundary_before_cached(end, end + 1, line_counts)
+        while end + 1 < self.entries.len()
+            && !self.boundary_before_cached(history, end, end + 1, line_counts)
         {
             end += 1;
         }
         end
     }
 
-    fn boundary_before_cached(&self, prev: usize, cur: usize, line_counts: &[usize]) -> bool {
-        if self.messages[prev].timestamp_ms == 0 || self.messages[cur].timestamp_ms == 0 {
+    fn boundary_before_cached(
+        &self,
+        history: &RoomHistoryRef<'_>,
+        prev: usize,
+        cur: usize,
+        line_counts: &[usize],
+    ) -> bool {
+        let prev_record = self
+            .resolve_record(history, self.entries[prev].id)
+            .expect("viewport id must resolve through canonical history");
+        let cur_record = self
+            .resolve_record(history, self.entries[cur].id)
+            .expect("viewport id must resolve through canonical history");
+        if prev_record.timestamp_ms == 0 || cur_record.timestamp_ms == 0 {
             return true;
         }
-        if self.messages[prev].local != self.messages[cur].local
-            || self.messages[prev].sender != self.messages[cur].sender
-            || self.messages[prev].unverified != self.messages[cur].unverified
+        if prev_record.local != cur_record.local
+            || prev_record.sender != cur_record.sender
+            || prev_record.unverified != cur_record.unverified
         {
             return true;
         }
         // An edited message anchors its own heading, where the `(edited)`
         // marker renders; grouped mid-block it would be invisible.
-        if self.messages[prev].edited != self.messages[cur].edited {
+        if prev_record.edited != cur_record.edited {
             return true;
         }
-        let gap = self.messages[cur]
+        let gap = cur_record
             .timestamp_ms
-            .saturating_sub(self.messages[prev].timestamp_ms);
+            .saturating_sub(prev_record.timestamp_ms);
         if gap > GROUP_GAP_MS {
             return true;
         }
@@ -1442,6 +1841,7 @@ impl VirtualChatBuffer {
 
     fn pack_run_cached(
         &self,
+        _history: &RoomHistoryRef<'_>,
         run_start: usize,
         run_end: usize,
         line_counts: &[usize],
@@ -1449,7 +1849,7 @@ impl VirtualChatBuffer {
     ) {
         let first_lines = line_counts[run_start];
         if run_start == run_end && first_lines > COLLAPSE_LIMIT {
-            let expanded = self.messages[run_start].expanded;
+            let expanded = self.entries[run_start].expanded;
             blocks.push(Block {
                 first: run_start,
                 last: run_start,
@@ -1488,6 +1888,7 @@ impl VirtualChatBuffer {
         let row_in_block = row.saturating_sub(self.layout_index.rows.prefix_sum(block_index));
         if row_in_block == 0 {
             return Some(VisibleLine {
+                entry: self.entries[block.first].id,
                 message: block.first,
                 block_first: block.first,
                 block_last: block.last,
@@ -1499,6 +1900,7 @@ impl VirtualChatBuffer {
             let body_row = row_in_block - 1;
             if body_row < block.body_lines {
                 return Some(VisibleLine {
+                    entry: self.entries[block.last].id,
                     message: block.last,
                     block_first: block.first,
                     block_last: block.last,
@@ -1507,6 +1909,7 @@ impl VirtualChatBuffer {
                 });
             }
             return Some(VisibleLine {
+                entry: self.entries[block.last].id,
                 message: block.last,
                 block_first: block.first,
                 block_last: block.last,
@@ -1520,6 +1923,7 @@ impl VirtualChatBuffer {
             let lines = self.layout_index.line_counts[message];
             if body_row < lines {
                 return Some(VisibleLine {
+                    entry: self.entries[message].id,
                     message,
                     block_first: block.first,
                     block_last: block.last,
@@ -1532,32 +1936,59 @@ impl VirtualChatBuffer {
         None
     }
 
+    fn visible_line_row(&self, message: usize, line: usize, kind: LineKind) -> Option<usize> {
+        let block_index = self.layout_index.block_containing_message(message)?;
+        let block = self.layout_index.blocks.get(block_index)?;
+        let block_row = self.layout_index.rows.prefix_sum(block_index);
+        match kind {
+            LineKind::Heading => (message == block.first).then_some(block_row),
+            LineKind::Ellipsis => (block.collapsed && message == block.last)
+                .then_some(block_row + 1 + block.body_lines),
+            LineKind::Body => {
+                let preceding = if block.collapsed {
+                    0
+                } else {
+                    self.layout_index.line_counts[block.first..message]
+                        .iter()
+                        .copied()
+                        .sum()
+                };
+                Some(block_row + 1 + preceding + line.min(block.body_lines.saturating_sub(1)))
+            }
+        }
+    }
+
     /// Total rendered rows for a block: heading + body + optional ellipsis.
     fn block_rows(block: &Block) -> usize {
         1 + block.body_lines + usize::from(block.collapsed)
     }
 
-    fn total_lines_exact(&mut self, width: u16) -> usize {
-        self.ensure_layout_index(width);
+    fn total_lines_exact(&mut self, history: &RoomHistoryRef<'_>, width: u16) -> usize {
+        self.ensure_layout_index(history, width);
         self.layout_index.total_rows()
     }
 
     /// Visible body lines of `message` at `width`: the full wrapped count, or
     /// [`COLLAPSE_SHOW`] when the message is collapsed.
-    fn visible_body_lines(&mut self, message: usize, width: u16) -> usize {
+    fn visible_body_lines(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        width: u16,
+    ) -> usize {
         let width = width.max(1);
         let lines = if self.layout_index.valid
             && self.layout_index.width == width
-            && self.layout_index.line_counts.len() == self.messages.len()
+            && self.layout_index.line_counts.len() == self.entries.len()
         {
             self.layout_index.line_counts[message]
         } else {
-            self.ensure_lines(message, width)
+            self.ensure_lines(history, message, width)
         };
-        Self::visible_body_lines_for(&self.messages[message], lines)
+        Self::visible_body_lines_for(&self.entries[message], lines)
     }
 
-    fn visible_body_lines_for(entry: &ChatEntry, lines: usize) -> usize {
+    fn visible_body_lines_for(entry: &ViewEntry, lines: usize) -> usize {
         if lines > COLLAPSE_LIMIT && !entry.expanded {
             COLLAPSE_SHOW
         } else {
@@ -1565,15 +1996,20 @@ impl VirtualChatBuffer {
         }
     }
 
-    fn next_body_pos(&mut self, pos: Cursor, width: u16) -> Option<Cursor> {
-        if pos.line + 1 < self.visible_body_lines(pos.message, width) {
-            return Some(Cursor {
+    fn next_body_pos(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        pos: LayoutCursor,
+        width: u16,
+    ) -> Option<LayoutCursor> {
+        if pos.line + 1 < self.visible_body_lines(history, pos.message, width) {
+            return Some(LayoutCursor {
                 message: pos.message,
                 line: pos.line + 1,
             });
         }
-        if pos.message + 1 < self.messages.len() {
-            return Some(Cursor {
+        if pos.message + 1 < self.entries.len() {
+            return Some(LayoutCursor {
                 message: pos.message + 1,
                 line: 0,
             });
@@ -1581,27 +2017,37 @@ impl VirtualChatBuffer {
         None
     }
 
-    fn prev_body_pos(&mut self, pos: Cursor, width: u16) -> Option<Cursor> {
+    fn prev_body_pos(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        pos: LayoutCursor,
+        width: u16,
+    ) -> Option<LayoutCursor> {
         if pos.line > 0 {
-            return Some(Cursor {
+            return Some(LayoutCursor {
                 message: pos.message,
                 line: pos.line - 1,
             });
         }
         let message = pos.message.checked_sub(1)?;
-        Some(Cursor {
+        Some(LayoutCursor {
             message,
-            line: self.visible_body_lines(message, width) - 1,
+            line: self.visible_body_lines(history, message, width) - 1,
         })
     }
 
     /// The rendered row of `pos` from the top of the full layout plus the
     /// total row count, counting heading and ellipsis rows.
-    fn pos_row_and_total(&mut self, pos: Cursor, width: u16) -> Option<(usize, usize)> {
-        if pos.message >= self.messages.len() {
+    fn pos_row_and_total(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        pos: LayoutCursor,
+        width: u16,
+    ) -> Option<(usize, usize)> {
+        if pos.message >= self.entries.len() {
             return None;
         }
-        self.ensure_layout_index(width);
+        self.ensure_layout_index(history, width);
         let block_index = self.layout_index.block_containing_message(pos.message)?;
         let block = self.layout_index.blocks[block_index];
         let mut row = self
@@ -1618,18 +2064,23 @@ impl VirtualChatBuffer {
             );
         }
         let visible_lines = Self::visible_body_lines_for(
-            &self.messages[pos.message],
+            &self.entries[pos.message],
             self.layout_index.line_counts[pos.message],
         );
         row = row.saturating_add(pos.line.min(visible_lines.saturating_sub(1)));
         Some((row, self.layout_index.total_rows()))
     }
 
-    fn message_row_and_total(&mut self, message: usize, width: u16) -> Option<(usize, usize)> {
-        if message >= self.messages.len() {
+    fn message_row_and_total(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        width: u16,
+    ) -> Option<(usize, usize)> {
+        if message >= self.entries.len() {
             return None;
         }
-        self.ensure_layout_index(width);
+        self.ensure_layout_index(history, width);
         let block_index = self.layout_index.block_containing_message(message)?;
         let block = self.layout_index.blocks[block_index];
         let mut row = self
@@ -1647,48 +2098,6 @@ impl VirtualChatBuffer {
         }
         Some((row, self.layout_index.total_rows()))
     }
-
-    fn trim_front(&mut self) {
-        let excess = self.messages.len().saturating_sub(self.max_messages);
-        if excess > 0 {
-            let index_repairable = self.layout_index.valid
-                && self.layout_index.line_counts.len() == self.messages.len()
-                && self.layout_index.rows.len() == self.layout_index.blocks.len();
-            self.messages.drain(0..excess);
-            self.bump_reindex_revision();
-            self.bump_layout_epoch();
-            self.scroll_offset = self.scroll_offset.saturating_sub(excess);
-            let anchor_evicted = self.anchor.is_some_and(|anchor| anchor.message < excess);
-            let cursor_evicted = self.cursor.is_some_and(|cursor| cursor.message < excess);
-            if anchor_evicted || cursor_evicted {
-                self.anchor = None;
-            } else {
-                self.anchor = self.anchor.map(|anchor| Cursor {
-                    message: anchor.message - excess,
-                    line: anchor.line,
-                });
-            }
-            self.cursor = self.cursor.map(|cursor| {
-                // Clamp an evicted cursor onto the oldest survivor.
-                match cursor.message.checked_sub(excess) {
-                    Some(message) => Cursor {
-                        message,
-                        line: cursor.line,
-                    },
-                    None => Cursor {
-                        message: 0,
-                        line: 0,
-                    },
-                }
-            });
-            if index_repairable {
-                self.layout_index.line_counts.drain(0..excess);
-                self.rebuild_layout_index_blocks_from_counts();
-            } else {
-                self.layout_index.invalidate();
-            }
-        }
-    }
 }
 
 struct MessageLayout {
@@ -1701,7 +2110,7 @@ struct MessageLayout {
     /// Display-only text with no body counterpart: resolved reference pill
     /// labels. Synthetic segments index into this buffer.
     synthetic: String,
-    /// Synthetic ranges of rendered pills paired with their `ChatEntry::refs`
+    /// Synthetic ranges of rendered pills paired with their decoded-reference
     /// index, for hit-testing clicks on pill segments.
     pill_spans: Vec<(Range<u32>, u32)>,
     /// Current block-quote nesting while laying out; drives the grey `> ` prefix
@@ -1725,7 +2134,7 @@ enum PieceKind {
     /// Real message-body text; contributes to clipboard source mapping.
     Body,
     /// A resolved reference pill label in the synthetic buffer, paired with its
-    /// `ChatEntry::refs` index. Never contributes to clipboard mapping; the
+    /// decoded-reference index. Never contributes to clipboard mapping; the
     /// hidden literal `@@code` range does instead.
     Pill(u32),
     /// Display-only synthetic text such as a block-quote `> ` marker. Never
@@ -2723,7 +3132,7 @@ fn append_synth_prefix(
 
 /// Builds the display label of a resolved reference pill from its target's
 /// sender and body.
-fn ref_label(sender: &str, body: &str) -> String {
+pub(crate) fn message_ref_label(sender: &str, body: &str) -> String {
     const SNIPPET_CHARS: usize = 40;
     let mut label = format!("@@ {sender}: ");
     let snippet = body.lines().next().unwrap_or("");
@@ -2770,1613 +3179,4 @@ pub fn format_age(elapsed_ms: u64) -> String {
         return format!("{}h", elapsed_ms / 3_600_000);
     }
     format!("{}d", elapsed_ms / 86_400_000)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn buffer_with_notices(count: usize) -> VirtualChatBuffer {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for i in 0..count {
-            buf.push_notice("user", format!("message {i}"));
-        }
-        buf
-    }
-
-    impl VirtualChatBuffer {
-        fn push_test(&mut self, sender: &str, body: &str, timestamp_ms: u64, local: bool) {
-            let id = self.messages.len() as u64 + 1;
-            let inline = chatt_message_format::inline_ranges(body);
-            let refs = self.build_ref_spans(body, inline.refs);
-            let old_len = self.messages.len();
-            self.messages.push(ChatEntry {
-                id,
-                sender: sender.to_string(),
-                body: body.to_string(),
-                timestamp_ms,
-                local,
-                edited: false,
-                unverified: false,
-                file_transfer_id: None,
-                links: inline.urls,
-                refs,
-                expanded: false,
-                notice_id: None,
-                notice_kind: None,
-                layout: MessageLayout::new(),
-            });
-            self.repair_layout_index_after_append(old_len);
-            self.trim_front();
-        }
-    }
-
-    fn chat_message(id: u64, timestamp_ms: u64, body: &str) -> ChatMessage {
-        ChatMessage {
-            message_id: rpc::ids::MessageId(id),
-            room_id: rpc::ids::RoomId(1),
-            sender: rpc::ids::UserId(2),
-            sender_name: "alice".to_string(),
-            timestamp_ms,
-            body: body.to_string(),
-            file_transfer_id: None,
-            flags: rpc::control::MessageFlags::default(),
-            target: None,
-        }
-    }
-
-    #[test]
-    fn prepend_shifts_cursor_and_keeps_bottom_relative_scroll() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for id in 10..15 {
-            buf.push_chat(chat_message(id, id * 1_000, "resident"), false);
-        }
-        buf.scroll_up(3, 40, 2);
-        let offset = buf.scroll_offset();
-        buf.set_cursor_to_message(2);
-
-        let older = (1..4)
-            .map(|id| (chat_message(id, id * 1_000, "older"), false))
-            .collect();
-        buf.prepend_chat(older);
-
-        assert_eq!(buf.len(), 8);
-        assert_eq!(buf.message(0).id, 1);
-        assert_eq!(buf.scroll_offset(), offset);
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 5,
-                line: 0
-            })
-        );
-        assert_eq!(buf.message(5).id, 12);
-    }
-
-    #[test]
-    fn prepend_respects_message_cap() {
-        let mut buf = VirtualChatBuffer::new(4, SyntaxTheme::default());
-        for id in 10..13 {
-            buf.push_chat(chat_message(id, id * 1_000, "resident"), false);
-        }
-
-        let older = (1..=3)
-            .map(|id| (chat_message(id, id * 1_000, "older"), false))
-            .collect();
-        buf.prepend_chat(older);
-
-        assert_eq!(buf.len(), 4);
-        assert_eq!(buf.message(0).id, 3);
-        assert_eq!(buf.message(3).id, 12);
-    }
-
-    #[test]
-    fn insert_chat_orders_between_messages_and_skips_notices() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_chat(chat_message(1, 1_000, "first"), false);
-        buf.push_notice("net", "notice");
-        buf.push_chat(chat_message(4, 4_000, "fourth"), false);
-
-        buf.insert_chat(chat_message(2, 2_000, "second"), false);
-        buf.insert_chat(chat_message(0, 500, "oldest"), false);
-
-        let ids: Vec<u64> = (0..buf.len()).map(|index| buf.message(index).id).collect();
-        assert_eq!(ids, vec![0, 1, 2, 0, 4]);
-        assert_eq!(buf.message(3).timestamp_ms, 0, "notice stays pinned");
-        assert_eq!(buf.message(0).body, "oldest");
-    }
-
-    #[test]
-    fn set_local_flags_updates_entries_by_key() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_chat(chat_message(1, 1_000, "mine"), false);
-        buf.push_notice("net", "notice");
-        buf.push_chat(chat_message(2, 2_000, "theirs"), false);
-
-        buf.set_local_flags(|id| (id == 1).then_some(true));
-
-        assert!(buf.message(0).local);
-        assert!(!buf.message(1).local);
-        assert!(!buf.message(2).local);
-    }
-
-    fn heading_ids(buf: &mut VirtualChatBuffer, width: u16) -> Vec<u64> {
-        buf.visible_lines(width, 10_000, 0)
-            .into_iter()
-            .filter(|row| row.kind == LineKind::Heading)
-            .map(|row| buf.message(row.message).id)
-            .collect()
-    }
-
-    /// A fenced code block laying out to exactly `n` rendered content lines.
-    fn fenced(n: usize) -> String {
-        let mut body = String::from("```\n");
-        for i in 0..n {
-            if i > 0 {
-                body.push('\n');
-            }
-            body.push_str(&i.to_string());
-        }
-        body.push_str("\n```");
-        body
-    }
-
-    fn kinds(rows: &[VisibleLine]) -> Vec<LineKind> {
-        rows.iter().map(|row| row.kind).collect()
-    }
-
-    fn headings(rows: &[VisibleLine]) -> usize {
-        rows.iter()
-            .filter(|row| row.kind == LineKind::Heading)
-            .count()
-    }
-
-    #[test]
-    fn format_age_covers_each_unit_boundary() {
-        let cases = [
-            (0u64, "0m"),
-            (59 * 60_000, "59m"),
-            (3_600_000, "1.0h"),
-            (5_400_000, "1.5h"),
-            (35_640_000, "9.9h"),
-            (36_000_000, "10h"),
-            (115_200_000, "32h"),
-            (172_800_000, "48h"),
-            (176_400_000, "2d"),
-            (345_600_000, "4d"),
-        ];
-        for (elapsed, expected) in cases {
-            assert_eq!(format_age(elapsed), expected, "elapsed {elapsed}ms");
-        }
-    }
-
-    #[test]
-    fn same_sender_within_window_shares_one_heading() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "hello", 1_000_000, false);
-        buf.push_test("alice", "world", 1_000_000 + GROUP_GAP_MS, false);
-        let rows = buf.visible_lines(40, 50, 0);
-        assert_eq!(headings(&rows), 1);
-        assert_eq!(rows.len(), 3); // heading + two body lines
-    }
-
-    #[test]
-    fn gap_over_window_breaks_the_block() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "hello", 1_000_000, false);
-        buf.push_test("alice", "world", 1_000_000 + GROUP_GAP_MS + 1, false);
-        let rows = buf.visible_lines(40, 50, 0);
-        assert_eq!(headings(&rows), 2);
-    }
-
-    #[test]
-    fn sender_change_breaks_the_block() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "hello", 1_000_000, false);
-        buf.push_test("bob", "world", 1_000_000 + 1_000, false);
-        assert_eq!(headings(&buf.visible_lines(40, 50, 0)), 2);
-    }
-
-    #[test]
-    fn block_cap_groups_twelve_lines_and_splits_thirteen() {
-        let group = |count: usize| {
-            let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-            for i in 0..count {
-                buf.push_test("alice", "x", 1_000_000 + i as u64 * 1_000, false);
-            }
-            headings(&buf.visible_lines(40, 100, 0))
-        };
-        assert_eq!(group(12), 1); // twelve single-line messages stay together
-        assert_eq!(group(13), 2); // the thirteenth line forces a new heading
-    }
-
-    #[test]
-    fn notices_never_group() {
-        let mut buf = buffer_with_notices(3);
-        assert_eq!(headings(&buf.visible_lines(40, 50, 0)), 3);
-    }
-
-    #[test]
-    fn long_message_collapses_to_preview_plus_ellipsis() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", &fenced(13), 1_000_000, false);
-        let rows = buf.visible_lines(40, 50, 0);
-        assert_eq!(rows.len(), 1 + COLLAPSE_SHOW + 1);
-        assert_eq!(rows.first().map(|r| r.kind), Some(LineKind::Heading));
-        assert_eq!(rows.last().map(|r| r.kind), Some(LineKind::Ellipsis));
-        assert_eq!(
-            kinds(&rows[1..=COLLAPSE_SHOW]),
-            vec![LineKind::Body; COLLAPSE_SHOW]
-        );
-        assert!(buf.is_collapsed(0));
-        assert!(buf.is_collapsible(0, 40));
-    }
-
-    #[test]
-    fn exactly_twelve_lines_renders_in_full() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", &fenced(12), 1_000_000, false);
-        let rows = buf.visible_lines(40, 50, 0);
-        assert_eq!(rows.len(), 1 + 12); // heading + twelve body lines
-        assert!(rows.iter().all(|r| r.kind != LineKind::Ellipsis));
-        assert!(!buf.is_collapsible(0, 40));
-    }
-
-    #[test]
-    fn expanding_a_long_message_shows_every_line() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", &fenced(13), 1_000_000, false);
-        let _ = buf.visible_lines(40, 50, 0);
-        assert!(buf.is_collapsed(0) && !buf.is_expanded(0));
-        assert!(buf.toggle_expand(0, 40));
-        let rows = buf.visible_lines(40, 50, 0);
-        assert_eq!(rows.len(), 1 + 13);
-        assert!(rows.iter().all(|r| r.kind != LineKind::Ellipsis));
-        assert!(buf.is_expanded(0) && !buf.is_collapsed(0));
-    }
-
-    #[test]
-    fn block_first_line_is_a_heading() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "hi", 1_000_000, false);
-        let rows = buf.visible_lines(40, 50, 0);
-        assert_eq!(rows.first().map(|r| r.kind), Some(LineKind::Heading));
-    }
-
-    #[test]
-    fn headings_stay_fixed_as_messages_arrive() {
-        // Five-line messages pack two-to-a-block (10 lines) with a third forcing a
-        // new heading. Forward packing keeps earlier headings anchored to the same
-        // message as the run grows; backward packing would shuffle them.
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        let mut ts = 1_000_000;
-        for _ in 0..3 {
-            buf.push_test("alice", &fenced(5), ts, false);
-            ts += 1_000;
-        }
-        let before = heading_ids(&mut buf, 40);
-        buf.push_test("alice", &fenced(5), ts, false);
-        let after = heading_ids(&mut buf, 40);
-        for id in &before {
-            assert!(
-                after.contains(id),
-                "heading on message {id} moved after a new message"
-            );
-        }
-    }
-
-    #[test]
-    fn reflow_clamps_cursor_and_drops_anchor() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "aa bb cc dd ee ff", 1_000_000, false);
-        // At width 3 the body wraps to six lines; park the cursor on the last.
-        let cursor = buf.cursor_to_last(3).expect("non-empty");
-        assert!(cursor.line >= 5);
-        assert!(buf.toggle_visual_anchor(3));
-
-        // At width 40 the body is a single line: the anchor is gone and the
-        // cursor keeps its message with the line clamped into range.
-        buf.on_reflow(40);
-        assert!(!buf.has_visual());
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            })
-        );
-    }
-
-    #[test]
-    fn reflow_first_render_clamps_stale_scroll_offset() {
-        let mut buf = buffer_with_notices(20);
-        let height = 5;
-        buf.top(3, height);
-        assert!(buf.scroll_offset() > 0);
-
-        buf.on_reflow(80);
-        let rows = buf.visible_lines(80, height, 0);
-
-        assert!(!rows.is_empty(), "the first post-reflow render draws rows");
-        assert_eq!(buf.scroll_offset(), buf.max_scroll(80, height));
-    }
-
-    #[test]
-    fn cursor_message_body_returns_the_full_body() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "first", 1_000_000, false);
-        buf.push_test("alice", "second\nlines", 1_001_000, false);
-        buf.set_cursor_to_message(1);
-
-        assert_eq!(buf.cursor_message_body(), Some("second\nlines"));
-    }
-
-    #[test]
-    fn selected_message_indices_cover_each_visual_message_once() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "first wraps across rows", 1_000_000, false);
-        buf.push_test("bob", "second also wraps across rows", 1_001_000, false);
-        buf.push_test("carol", "third wraps as well", 1_002_000, false);
-        buf.set_cursor_to_message(0);
-        assert!(buf.toggle_visual_anchor(8));
-        buf.move_cursor_line(20, 8);
-
-        assert_eq!(buf.selected_message_indices(8), vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn selected_message_indices_plain_cursor_targets_whole_message() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test(
-            "alice",
-            "many wrapped body lines live here",
-            1_000_000,
-            false,
-        );
-        buf.cursor_to_last(6);
-
-        assert_eq!(buf.selected_message_indices(6), vec![0]);
-    }
-
-    #[test]
-    fn total_lines_exact_matches_emitted_row_count() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "hello", 1_000_000, false);
-        buf.push_test("alice", "world", 1_000_000 + 1_000, false);
-        buf.push_test("bob", &fenced(13), 1_000_000 + 200_000, false);
-        buf.push_notice("system", "joined");
-        let total = buf.total_lines_exact(40);
-        assert_eq!(total, buf.visible_lines(40, 10_000, 0).len());
-    }
-
-    #[test]
-    fn scroll_up_clamps_at_the_top() {
-        let mut buf = buffer_with_notices(20);
-        let (width, height) = (40, 5);
-        let total = buf.total_lines_exact(width);
-        buf.scroll_up(1000, width, height);
-        assert_eq!(buf.scroll_offset(), total - height as usize);
-        // Already clamped; scrolling further changes nothing.
-        buf.scroll_up(10, width, height);
-        assert_eq!(buf.scroll_offset(), total - height as usize);
-    }
-
-    #[test]
-    fn top_then_scroll_down_reveals_one_line() {
-        let mut buf = buffer_with_notices(20);
-        let (width, height) = (40, 5);
-        buf.top(width, height);
-        let top = buf.scroll_offset();
-        assert!(top > 0);
-        buf.scroll_down(1);
-        assert_eq!(buf.scroll_offset(), top - 1);
-    }
-
-    #[test]
-    fn max_scroll_is_zero_when_content_fits() {
-        let mut buf = buffer_with_notices(3);
-        assert_eq!(buf.max_scroll(40, 50), 0);
-        buf.top(40, 50);
-        assert_eq!(buf.scroll_offset(), 0);
-    }
-
-    #[test]
-    fn bottom_resets_to_zero_offset() {
-        let mut buf = buffer_with_notices(20);
-        buf.scroll_up(5, 40, 5);
-        assert!(buf.scroll_offset() > 0);
-        buf.bottom();
-        assert_eq!(buf.scroll_offset(), 0);
-    }
-
-    #[test]
-    fn ref_scroll_detaches_when_target_is_visible_in_tail() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for i in 0..8 {
-            let sender = if i % 2 == 0 { "alice" } else { "bob" };
-            buf.push_test(sender, &format!("message {i}"), 1_000_000 + i as u64, false);
-        }
-
-        let (width, height) = (40, 5);
-        buf.bottom();
-        assert_eq!(buf.scroll_offset(), 0);
-
-        let target = buf.messages.len() - 2;
-        buf.scroll_message_into_view(target, width, height)
-            .expect("target message is present");
-
-        assert_eq!(buf.scroll_offset(), 1);
-        let rows = buf.visible_lines(width, height, 0);
-        assert!(
-            rows.iter()
-                .any(|row| row.kind == LineKind::Body && row.message == target),
-            "target body should remain visible after detaching from bottom"
-        );
-    }
-
-    #[test]
-    fn visual_text_is_body_content_joined_by_newlines() {
-        let mut buf = buffer_with_notices(3);
-        // Lay out every message so line segments exist.
-        let _ = buf.total_lines_exact(40);
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 0,
-        });
-        buf.drag_to(Cursor {
-            message: 2,
-            line: 0,
-        });
-        assert_eq!(
-            buf.visual_text(40).as_deref(),
-            Some("message 0\nmessage 1\nmessage 2")
-        );
-    }
-
-    #[test]
-    fn visual_text_does_not_copy_hidden_collapsed_rows() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "before", 1_000_000, false);
-        buf.push_test("bob", &fenced(13), 1_200_000, false);
-        buf.push_test("carol", "after", 1_400_000, false);
-        let _ = buf.total_lines_exact(40);
-
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 0,
-        });
-        buf.drag_to(Cursor {
-            message: 2,
-            line: 0,
-        });
-
-        let copied = buf.visual_text(40).expect("selection copies");
-        assert!(copied.contains("before\n0\n1"));
-        assert!(copied.contains("\n9\nafter"));
-        assert!(!copied.contains("\n10"));
-        assert!(!copied.contains("\n12"));
-    }
-
-    #[test]
-    fn paragraph_newlines_render_as_separate_body_rows() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "Alpha.\nBeta.", 1_000_000, false);
-        let _ = buf.total_lines_exact(80);
-
-        assert_eq!(buf.messages[0].layout.lines(), 2);
-        assert_eq!(
-            kinds(&buf.visible_lines(80, 10, 0)),
-            vec![LineKind::Heading, LineKind::Body, LineKind::Body]
-        );
-    }
-
-    #[test]
-    fn visual_text_preserves_whitespace_between_wrapped_rows() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "alpha beta", 1_000_000, false);
-        let _ = buf.total_lines_exact(5);
-        assert_eq!(buf.messages[0].layout.lines(), 2);
-
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 0,
-        });
-        buf.drag_to(Cursor {
-            message: 0,
-            line: 1,
-        });
-
-        assert_eq!(buf.visual_text(5).as_deref(), Some("alpha beta"));
-    }
-
-    fn ref_code(message_id: u64) -> String {
-        rpc::msgref::MessageRef {
-            room_id: rpc::ids::RoomId(1),
-            message_id: rpc::ids::MessageId(message_id),
-        }
-        .encode()
-    }
-
-    fn pill_segments(buf: &VirtualChatBuffer, message: usize) -> Vec<(Segment, String)> {
-        let entry = &buf.messages[message];
-        let mut found = Vec::new();
-        for line in 0..entry.layout.lines() {
-            for seg in entry.layout.line(line) {
-                if seg.synth {
-                    found.push((*seg, buf.segment_text(message, seg).to_string()));
-                }
-            }
-        }
-        found
-    }
-
-    #[test]
-    fn resolved_ref_lays_out_a_pill_with_the_target_label() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.set_room_id(rpc::ids::RoomId(1));
-        buf.push_test("alice", "the delay manager change is in", 1_000_000, false);
-        let code = ref_code(1);
-        buf.push_test(
-            "bob",
-            &format!("see @@{code} for context"),
-            1_060_000,
-            false,
-        );
-        let _ = buf.total_lines_exact(95);
-
-        let entry = &buf.messages[1];
-        assert!(entry.refs[0].target.is_some());
-        assert!(entry.refs[0].label.is_some());
-        let pills = pill_segments(&buf, 1);
-        assert!(!pills.is_empty(), "no synthetic pill segment emitted");
-        assert!(
-            pills[0].1.starts_with("@@ alice: the delay manager"),
-            "unexpected pill text {:?}",
-            pills[0].1
-        );
-    }
-
-    #[test]
-    fn ref_at_resolves_a_click_on_the_pill() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.set_room_id(rpc::ids::RoomId(1));
-        buf.push_test("alice", "target", 1_000_000, false);
-        let code = ref_code(1);
-        buf.push_test("bob", &format!("see @@{code}"), 1_060_000, false);
-        let _ = buf.total_lines_exact(95);
-
-        let (pill, _) = pill_segments(&buf, 1)[0];
-        let target = buf.ref_at(1, 0, pill.col).expect("pill click resolves");
-        assert_eq!(target.message_id.0, 1);
-        assert_eq!(buf.find_message(1), Some(0));
-    }
-
-    #[test]
-    fn unresolved_ref_renders_the_literal_code() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.set_room_id(rpc::ids::RoomId(1));
-        let code = ref_code(42);
-        buf.push_test("bob", &format!("see @@{code}"), 1_060_000, false);
-        let _ = buf.total_lines_exact(95);
-
-        let entry = &buf.messages[0];
-        assert!(entry.refs[0].target.is_some());
-        assert!(entry.refs[0].label.is_none());
-        assert!(pill_segments(&buf, 0).is_empty());
-        let target = buf.ref_at(0, 0, 5).expect("literal ref is clickable");
-        assert_eq!(target.message_id.0, 42);
-    }
-
-    #[test]
-    fn undecodable_ref_is_not_clickable() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.set_room_id(rpc::ids::RoomId(1));
-        let mut code = ref_code(42);
-        let flipped = if code.ends_with('0') { '1' } else { '0' };
-        code.pop();
-        code.push(flipped);
-        buf.push_test("bob", &format!("see @@{code}"), 1_060_000, false);
-        let _ = buf.total_lines_exact(95);
-
-        let entry = &buf.messages[0];
-        assert_eq!(entry.refs.len(), 1);
-        assert!(entry.refs[0].target.is_none());
-        assert!(buf.ref_at(0, 0, 5).is_none());
-    }
-
-    #[test]
-    fn selection_over_a_pill_line_copies_the_literal_code() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.set_room_id(rpc::ids::RoomId(1));
-        buf.push_test("alice", "target message", 1_000_000, false);
-        let code = ref_code(1);
-        let body = format!("intro\nsee @@{code} tail");
-        buf.push_test("bob", &body, 1_060_000, false);
-        let _ = buf.total_lines_exact(95);
-        assert_eq!(buf.messages[1].layout.lines(), 2);
-
-        buf.begin_drag(Cursor {
-            message: 1,
-            line: 1,
-        });
-        buf.drag_to(Cursor {
-            message: 1,
-            line: 1,
-        });
-        assert_eq!(
-            buf.visual_text(95).as_deref(),
-            Some(format!("see @@{code} tail").as_str())
-        );
-    }
-
-    #[test]
-    fn visual_text_preserves_original_newlines_when_message_is_selected() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "alpha\nbeta", 1_000_000, false);
-        let _ = buf.total_lines_exact(40);
-
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 0,
-        });
-        buf.drag_to(Cursor {
-            message: 0,
-            line: buf.messages[0].layout.lines() - 1,
-        });
-
-        assert_eq!(buf.visual_text(40).as_deref(), Some("alpha\nbeta"));
-    }
-
-    /// A theme whose `comment` slot is a distinct grey, so quote dimming is
-    /// observable (the derived default leaves every slot blank).
-    fn grey_theme() -> SyntaxTheme {
-        let mut syntax = SyntaxTheme::default();
-        syntax.comment = Style::DEFAULT.with_fg_rgb(0x8a, 0x8c, 0x8a);
-        syntax
-    }
-
-    fn syntax_probe_theme() -> SyntaxTheme {
-        let mut syntax = SyntaxTheme::default();
-        syntax.fg = Style::DEFAULT.with_fg_rgb(0x01, 0x01, 0x01);
-        syntax.keyword = Style::DEFAULT.with_fg_rgb(0x02, 0x02, 0x02);
-        syntax.function = Style::DEFAULT.with_fg_rgb(0x03, 0x03, 0x03);
-        syntax.string = Style::DEFAULT.with_fg_rgb(0x04, 0x04, 0x04);
-        syntax
-    }
-
-    /// Renders `body` into a standalone layout and returns its segments paired
-    /// with their rendered text.
-    fn quote_segments(body: &str) -> Vec<(Segment, String)> {
-        let mut layout = MessageLayout::new();
-        layout.ensure(40, body, &[], grey_theme());
-        (0..layout.lines())
-            .flat_map(|line| layout.line(line).to_vec())
-            .map(|seg| {
-                let text = layout.segment_str(body, &seg).to_string();
-                (seg, text)
-            })
-            .collect()
-    }
-
-    fn styled_segments(body: &str, syntax: SyntaxTheme) -> Vec<(String, Style)> {
-        let mut layout = MessageLayout::new();
-        layout.ensure(80, body, &[], syntax);
-        (0..layout.lines())
-            .flat_map(|line| layout.line(line).to_vec())
-            .filter(|seg| !seg.synth)
-            .map(|seg| (layout.segment_str(body, &seg).to_string(), seg.style))
-            .collect()
-    }
-
-    fn rendered_lines(body: &str, width: u16) -> Vec<String> {
-        let mut layout = MessageLayout::new();
-        layout.ensure(width, body, &[], grey_theme());
-        (0..layout.lines())
-            .map(|line| {
-                layout
-                    .line(line)
-                    .iter()
-                    .map(|segment| layout.segment_str(body, segment))
-                    .collect()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn prose_wraps_at_the_available_terminal_width() {
-        let body = ["word"; 21].join(" ");
-        assert_eq!(rendered_lines(&body, 120), vec![body]);
-    }
-
-    #[test]
-    fn ordinary_lines_preserve_leading_whitespace() {
-        let body = "sh ./script.sh /\n    arg1\n    arg2";
-        assert_eq!(
-            rendered_lines(body, 80),
-            vec!["sh ./script.sh /", "    arg1", "    arg2"]
-        );
-    }
-
-    #[test]
-    fn internal_blank_lines_render_once_and_edge_blanks_are_omitted() {
-        let body = "\n\n> Quote 1\n\n \n\n> Quote 2\n\n";
-        assert_eq!(rendered_lines(body, 80), vec!["> Quote 1", "", "> Quote 2"]);
-    }
-
-    #[test]
-    fn fenced_code_block_uses_declared_language_highlighting() {
-        let syntax = syntax_probe_theme();
-        let segments = styled_segments("```rust\nfn main() {\n    let value = 1;\n}\n```", syntax);
-
-        let fn_style = segments
-            .iter()
-            .find_map(|(text, style)| (text == "fn").then_some(*style))
-            .expect("rust keyword segment");
-        assert_eq!(fn_style, syntax.keyword);
-
-        let main_style = segments
-            .iter()
-            .find_map(|(text, style)| (text == "main").then_some(*style))
-            .expect("rust function segment");
-        assert_eq!(main_style, syntax.function);
-    }
-
-    #[test]
-    fn quoted_fenced_code_block_uses_declared_language_highlighting() {
-        let syntax = syntax_probe_theme();
-        let segments = styled_segments("> ```rust\n> fn main() {}\n> ```", syntax);
-
-        let fn_style = segments
-            .iter()
-            .find_map(|(text, style)| (text == "fn").then_some(*style))
-            .expect("rust keyword segment");
-        assert_eq!(fn_style, syntax.keyword);
-
-        let main_style = segments
-            .iter()
-            .find_map(|(text, style)| (text == "main").then_some(*style))
-            .expect("rust function segment");
-        assert_eq!(main_style, syntax.function);
-    }
-
-    #[test]
-    fn unknown_code_block_language_keeps_code_style() {
-        let syntax = syntax_probe_theme();
-        let segments = styled_segments("```madeup\nfn main\n```", syntax);
-
-        assert!(
-            segments
-                .iter()
-                .any(|(text, style)| text == "fn main" && *style == syntax.string),
-            "unrecognized fences fall back to the code string color"
-        );
-    }
-
-    #[test]
-    fn block_quote_prefixes_grey_marker_and_dims_text() {
-        let grey = grey_theme().comment;
-        let segs = quote_segments("> quoted");
-
-        let (marker, _) = segs
-            .iter()
-            .find(|(seg, text)| seg.synth && text == "> ")
-            .expect("synthetic grey marker preserving the `>`");
-        assert_eq!(marker.style, grey);
-
-        let (body, _) = segs
-            .iter()
-            .find(|(seg, text)| !seg.synth && text == "quoted")
-            .expect("dimmed quote text");
-        assert_eq!(
-            body.style,
-            Style::DEFAULT.patch(grey),
-            "quote text is dimmed"
-        );
-    }
-
-    #[test]
-    fn nested_block_quote_marker_repeats_per_level() {
-        let segs = quote_segments(">> deep");
-        assert!(
-            segs.iter().any(|(seg, text)| seg.synth && text == "> > "),
-            "two nesting levels render two grey markers"
-        );
-    }
-
-    #[test]
-    fn quoted_marker_stays_out_of_line_selection() {
-        let mut buf = VirtualChatBuffer::new(1000, grey_theme());
-        buf.push_test("alice", "> a\n> b", 1_000_000, false);
-        let _ = buf.total_lines_exact(40);
-
-        // Selecting only the first rendered line copies its content, not the
-        // synthetic `> ` marker.
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 0,
-        });
-        buf.drag_to(Cursor {
-            message: 0,
-            line: 0,
-        });
-        assert_eq!(buf.visual_text(40).as_deref(), Some("a"));
-    }
-
-    #[test]
-    fn quoted_code_selection_uses_logical_line_ranges() {
-        let mut buf = VirtualChatBuffer::new(1000, grey_theme());
-        buf.push_test(
-            "alice",
-            "intro\n> ```\n>> literal marker\n> ```\noutro",
-            1_000_000,
-            false,
-        );
-        let _ = buf.total_lines_exact(40);
-        assert_eq!(buf.messages[0].layout.lines(), 3);
-
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 1,
-        });
-        buf.drag_to(Cursor {
-            message: 0,
-            line: 1,
-        });
-        assert_eq!(
-            buf.visual_text(40).as_deref(),
-            Some("> literal marker"),
-            "the container prefix is absent while the deeper literal marker remains"
-        );
-    }
-
-    #[test]
-    fn empty_quoted_code_has_no_synthetic_contiguous_source_range() {
-        let mut buf = VirtualChatBuffer::new(1000, grey_theme());
-        buf.push_test("alice", "intro\n> ```\n> ```\noutro", 1_000_000, false);
-        let _ = buf.total_lines_exact(40);
-        assert_eq!(buf.messages[0].layout.lines(), 3);
-
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 1,
-        });
-        buf.drag_to(Cursor {
-            message: 0,
-            line: 1,
-        });
-        assert_eq!(buf.visual_text(40).as_deref(), Some(""));
-    }
-
-    #[test]
-    fn cursor_defaults_to_last_body_line_of_newest_message() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "one", 1_000_000, false);
-        buf.push_test("alice", "alpha\nbeta", 1_001_000, false);
-
-        assert_eq!(
-            buf.ensure_cursor(40),
-            Some(Cursor {
-                message: 1,
-                line: 1
-            })
-        );
-    }
-
-    #[test]
-    fn ensure_cursor_is_none_on_an_empty_buffer() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        assert_eq!(buf.ensure_cursor(40), None);
-    }
-
-    #[test]
-    fn move_cursor_line_crosses_block_boundaries() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "alpha\nbeta", 1_000_000, false);
-        buf.push_test("bob", "gamma", 1_001_000, false);
-
-        buf.set_cursor_to_message(0);
-        assert_eq!(
-            buf.move_cursor_line(1, 40),
-            Some(Cursor {
-                message: 0,
-                line: 1
-            })
-        );
-        assert_eq!(
-            buf.move_cursor_line(1, 40),
-            Some(Cursor {
-                message: 1,
-                line: 0
-            }),
-            "crossing into bob's block"
-        );
-        assert_eq!(
-            buf.move_cursor_line(-2, 40),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            })
-        );
-        assert_eq!(
-            buf.move_cursor_line(-1, 40),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            }),
-            "clamped at the oldest line"
-        );
-    }
-
-    #[test]
-    fn move_cursor_line_skips_collapsed_hidden_lines() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", &fenced(13), 1_000_000, false);
-        buf.push_test("bob", "after", 1_200_000, false);
-
-        buf.set_cursor_to_message(0);
-        let mut cursor = buf.cursor().expect("cursor set");
-        while cursor.message == 0 {
-            cursor = buf.move_cursor_line(1, 40).expect("non-empty");
-        }
-        // The collapsed preview shows COLLAPSE_SHOW lines; the walk never
-        // visits the hidden tail before crossing to the next message.
-        assert_eq!(
-            cursor,
-            Cursor {
-                message: 1,
-                line: 0
-            }
-        );
-        let steps_taken = COLLAPSE_SHOW; // preview walk plus the crossing step
-        assert_eq!(
-            buf.move_cursor_line(-(steps_taken as isize), 40),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            })
-        );
-    }
-
-    #[test]
-    fn paragraph_motion_lands_on_first_body_line_of_adjacent_block() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "one\ntwo", 1_000_000, false);
-        buf.push_test("alice", "three", 1_001_000, false);
-        buf.push_test("bob", "four", 1_002_000, false);
-
-        // alice's two messages share a block; bob starts the next.
-        buf.cursor_to_last(40);
-        assert_eq!(
-            buf.move_cursor_paragraph(-1, 40),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            })
-        );
-        assert_eq!(
-            buf.move_cursor_paragraph(1, 40),
-            Some(Cursor {
-                message: 2,
-                line: 0
-            })
-        );
-    }
-
-    #[test]
-    fn paragraph_motion_clamps_at_buffer_edges() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "one", 1_000_000, false);
-        buf.push_test("bob", "two", 1_001_000, false);
-
-        buf.set_cursor_to_message(0);
-        assert_eq!(
-            buf.move_cursor_paragraph(-1, 40),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            })
-        );
-        assert_eq!(
-            buf.move_cursor_paragraph(5, 40),
-            Some(Cursor {
-                message: 1,
-                line: 0
-            })
-        );
-    }
-
-    #[test]
-    fn visual_range_normalizes_anchor_after_cursor() {
-        let mut buf = buffer_with_notices(3);
-        let _ = buf.total_lines_exact(40);
-        buf.set_cursor_to_message(2);
-        assert!(buf.toggle_visual_anchor(40));
-        buf.move_cursor_line(-2, 40);
-
-        assert!(buf.is_visual(0, 0));
-        assert!(buf.is_visual(2, 0));
-        assert_eq!(
-            buf.visual_text(40).as_deref(),
-            Some("message 0\nmessage 1\nmessage 2")
-        );
-    }
-
-    #[test]
-    fn toggling_visual_anchor_twice_clears_it() {
-        let mut buf = buffer_with_notices(1);
-        assert!(buf.toggle_visual_anchor(40));
-        assert!(buf.has_visual());
-        assert!(!buf.toggle_visual_anchor(40));
-        assert!(!buf.has_visual());
-    }
-
-    #[test]
-    fn click_release_without_drag_clears_the_anchor() {
-        let mut buf = buffer_with_notices(2);
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 0,
-        });
-        assert!(buf.drag_is_click());
-        buf.end_drag();
-
-        assert!(!buf.has_visual());
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            })
-        );
-        assert!(!buf.is_dragging());
-    }
-
-    #[test]
-    fn drag_release_keeps_the_visual_range() {
-        let mut buf = buffer_with_notices(2);
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 0,
-        });
-        buf.drag_to(Cursor {
-            message: 1,
-            line: 0,
-        });
-        assert!(!buf.drag_is_click());
-        buf.end_drag();
-
-        assert!(buf.has_visual());
-        assert!(buf.is_visual(0, 0) && buf.is_visual(1, 0));
-    }
-
-    #[test]
-    fn trim_clears_visual_when_either_endpoint_is_evicted() {
-        let mut buf = VirtualChatBuffer::new(3, SyntaxTheme::default());
-        for id in 0..3 {
-            buf.push_chat(chat_message(id, 1_000 + id, "m"), false);
-        }
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 0,
-        });
-        buf.drag_to(Cursor {
-            message: 2,
-            line: 0,
-        });
-
-        buf.push_chat(chat_message(3, 2_000, "new"), false);
-
-        assert!(!buf.has_visual());
-        assert_eq!(
-            buf.cursor().map(|cursor| buf.message(cursor.message).id),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn remove_notice_clears_visual_when_cursor_endpoint_is_removed() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_notice("system", "one");
-        let notice = buf.push_notice("system", "two");
-        buf.begin_drag(Cursor {
-            message: 0,
-            line: 0,
-        });
-        buf.drag_to(Cursor {
-            message: 1,
-            line: 0,
-        });
-
-        assert!(buf.remove_notice(notice));
-
-        assert!(!buf.has_visual());
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            })
-        );
-    }
-
-    fn edited_message(id: u64, timestamp_ms: u64, body: &str) -> ChatMessage {
-        let mut message = chat_message(id, timestamp_ms, body);
-        message.flags.set_edited();
-        message
-    }
-
-    #[test]
-    fn edit_message_relayouts_preserving_cursor() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for id in 1..=3 {
-            buf.push_chat(chat_message(id, id * 1_000, "short"), false);
-        }
-        let _ = buf.total_lines_exact(40);
-        buf.set_cursor_to_message(1);
-        let lines_before = buf.total_lines_exact(40);
-
-        assert!(buf.edit_message(
-            2,
-            edited_message(2, 2_000, "a much longer body\nwith a second line")
-        ));
-
-        assert_eq!(
-            buf.cursor().map(|cursor| buf.message(cursor.message).id),
-            Some(2)
-        );
-        let entry = buf.message(1);
-        assert!(entry.edited);
-        assert_eq!(entry.body, "a much longer body\nwith a second line");
-        assert!(buf.total_lines_exact(40) > lines_before);
-        assert!(!buf.edit_message(99, edited_message(99, 9_000, "absent")));
-    }
-
-    #[test]
-    fn edit_message_preserves_expansion_and_local_flag() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_chat(chat_message(1, 1_000, &fenced(20)), true);
-        let _ = buf.total_lines_exact(40);
-        assert!(buf.toggle_expand(0, 40));
-
-        assert!(buf.edit_message(1, edited_message(1, 1_000, &fenced(21))));
-        let _ = buf.total_lines_exact(40);
-
-        assert!(buf.message(0).local);
-        assert!(buf.is_expanded(0));
-    }
-
-    #[test]
-    fn remove_message_fixes_cursor_and_anchor() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for id in 1..=3 {
-            buf.push_chat(chat_message(id, id * 1_000, "m"), false);
-        }
-        let _ = buf.total_lines_exact(40);
-        buf.set_cursor_to_message(2);
-
-        assert!(buf.remove_message(1));
-
-        assert_eq!(buf.len(), 2);
-        assert_eq!(
-            buf.cursor().map(|cursor| buf.message(cursor.message).id),
-            Some(3)
-        );
-        assert!(buf.find_message(1).is_none());
-        assert!(!buf.remove_message(1));
-    }
-
-    #[test]
-    fn remove_message_under_cursor_lands_on_neighbor() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for id in 1..=2 {
-            buf.push_chat(chat_message(id, id * 1_000, "m"), false);
-        }
-        let _ = buf.total_lines_exact(40);
-        buf.set_cursor_to_message(1);
-        buf.toggle_visual_anchor(40);
-
-        assert!(buf.remove_message(2));
-
-        assert!(!buf.has_visual());
-        assert_eq!(
-            buf.cursor().map(|cursor| buf.message(cursor.message).id),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn edited_message_breaks_block_grouping() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for id in 1..=3 {
-            buf.push_chat(chat_message(id, 1_000 + id, "grouped"), false);
-        }
-        assert_eq!(heading_ids(&mut buf, 40), vec![1]);
-
-        assert!(buf.edit_message(2, edited_message(2, 1_002, "revised")));
-
-        assert_eq!(heading_ids(&mut buf, 40), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn insert_before_cursor_shifts_it() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_chat(chat_message(1, 1_000, "first"), false);
-        buf.push_chat(chat_message(4, 4_000, "fourth"), false);
-        buf.set_cursor_to_message(1);
-
-        buf.insert_chat(chat_message(2, 2_000, "second"), false);
-
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 2,
-                line: 0
-            })
-        );
-        assert_eq!(buf.message(2).id, 4);
-    }
-
-    #[test]
-    fn eviction_clamps_cursor_to_oldest_resident() {
-        let mut buf = VirtualChatBuffer::new(3, SyntaxTheme::default());
-        for id in 0..3 {
-            buf.push_chat(chat_message(id, 1_000 + id, "m"), false);
-        }
-        buf.set_cursor_to_message(0);
-        buf.scroll_up(1, 40, 2);
-
-        buf.push_chat(chat_message(3, 2_000, "new"), false);
-
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            })
-        );
-        assert_eq!(buf.message(0).id, 1);
-    }
-
-    #[test]
-    fn follow_bottom_advances_cursor_on_new_message() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_chat(chat_message(1, 1_000, "old"), false);
-        buf.ensure_cursor(40);
-
-        buf.push_chat(chat_message(2, 2_000, "alpha\nbeta"), false);
-
-        assert_eq!(
-            buf.ensure_cursor(40),
-            Some(Cursor {
-                message: 1,
-                line: 1
-            }),
-            "cursor follows to the new newest message's last line"
-        );
-    }
-
-    #[test]
-    fn notice_append_follows_bottom_cursor() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_chat(chat_message(1, 1_000, "old"), false);
-        buf.ensure_cursor(40);
-
-        let notice = buf.push_notice("system", "connected");
-
-        assert_eq!(
-            buf.ensure_cursor(40),
-            Some(Cursor {
-                message: 1,
-                line: 0
-            }),
-            "cursor follows the newest notice while at bottom"
-        );
-        assert_eq!(buf.message(1).notice_id, Some(notice));
-    }
-
-    #[test]
-    fn scrolled_up_cursor_sticks_to_its_message() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for id in 0..6 {
-            buf.push_chat(chat_message(id, 1_000 + id, "m"), false);
-        }
-        buf.set_cursor_to_message(5);
-        buf.scroll_up(2, 40, 3);
-
-        buf.push_chat(chat_message(6, 2_000, "new"), false);
-
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 5,
-                line: 0
-            })
-        );
-    }
-
-    #[test]
-    fn visual_anchor_suppresses_follow_bottom() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_chat(chat_message(1, 1_000, "old"), false);
-        buf.ensure_cursor(40);
-        assert!(buf.toggle_visual_anchor(40));
-
-        buf.push_chat(chat_message(2, 2_000, "new"), false);
-
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 0,
-                line: 0
-            })
-        );
-    }
-
-    #[test]
-    fn collapse_clamps_cursor_into_preview() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", &fenced(13), 1_000_000, false);
-        assert!(buf.toggle_expand(0, 40), "expand");
-        buf.cursor_to_last(40);
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 0,
-                line: 12
-            })
-        );
-
-        assert!(buf.toggle_expand(0, 40), "collapse");
-
-        assert_eq!(
-            buf.cursor(),
-            Some(Cursor {
-                message: 0,
-                line: COLLAPSE_SHOW - 1,
-            })
-        );
-    }
-
-    #[test]
-    fn cursor_line_text_slices_one_wrapped_row() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.push_test("alice", "alpha\nbeta", 1_000_000, false);
-        let _ = buf.total_lines_exact(40);
-
-        buf.set_cursor_to_message(0);
-        buf.move_cursor_line(1, 40);
-
-        assert_eq!(buf.cursor_line_text().as_deref(), Some("beta"));
-    }
-
-    #[test]
-    fn cursor_ref_scans_only_the_cursor_message() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        buf.set_room_id(rpc::ids::RoomId(1));
-        buf.push_test("alice", "target", 1_000_000, false);
-        let code = ref_code(1);
-        buf.push_test("alice", &format!("see @@{code}"), 1_001_000, false);
-        buf.push_test("alice", "no reference here", 1_002_000, false);
-        let _ = buf.total_lines_exact(95);
-
-        buf.set_cursor_to_message(2);
-        assert_eq!(
-            buf.cursor_ref(),
-            None,
-            "sibling block members are not scanned"
-        );
-        buf.set_cursor_to_message(1);
-        assert_eq!(buf.cursor_ref().map(|target| target.message_id.0), Some(1));
-    }
-
-    #[test]
-    fn visual_text_requires_an_anchor() {
-        let mut buf = buffer_with_notices(2);
-        let _ = buf.total_lines_exact(40);
-        buf.ensure_cursor(40);
-        assert_eq!(buf.visual_text(40), None);
-    }
-
-    #[test]
-    fn keep_cursor_visible_scrolls_offscreen_cursor_into_view() {
-        let mut buf = buffer_with_notices(20);
-        let (width, height) = (40, 5);
-        buf.ensure_cursor(width);
-        buf.cursor_to_first();
-        buf.keep_cursor_visible(width, height);
-
-        let rows = buf.visible_lines(width, height, 0);
-        assert!(
-            rows.iter()
-                .any(|row| row.kind == LineKind::Body && row.message == 0),
-            "oldest message's body is on screen"
-        );
-
-        buf.cursor_to_last(width);
-        buf.keep_cursor_visible(width, height);
-        assert_eq!(buf.scroll_offset(), 0, "newest line sits at the bottom");
-    }
-
-    #[test]
-    fn cached_navigation_reuses_full_layout_index() {
-        let mut buf = buffer_with_notices(30);
-        let (width, height) = (40, 6);
-        let _ = buf.total_lines_exact(width);
-        let rebuilds = buf.layout_index.full_rebuilds;
-
-        buf.cursor_to_first();
-        for _ in 0..20 {
-            buf.move_cursor_line(1, width);
-            buf.keep_cursor_visible(width, height);
-        }
-
-        assert_eq!(buf.layout_index.full_rebuilds, rebuilds);
-    }
-
-    #[test]
-    fn rendering_builds_layout_index_on_cache_miss() {
-        let mut buf = buffer_with_notices(30);
-        let (width, height) = (40, 6);
-        assert!(!buf.layout_index.valid);
-
-        let rows = buf.visible_lines(width, height, 0);
-
-        assert_eq!(rows.len(), height as usize);
-        assert!(buf.layout_index.valid);
-        assert_eq!(buf.layout_index.width, width);
-        let rebuilds = buf.layout_index.full_rebuilds;
-
-        let rows = buf.visible_lines(width, height, 0);
-
-        assert_eq!(rows.len(), height as usize);
-        assert_eq!(buf.layout_index.full_rebuilds, rebuilds);
-    }
-
-    #[test]
-    fn tail_append_repairs_cache_without_full_rebuild() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for i in 0..5 {
-            buf.push_chat(chat_message(i, 1_000 + i, "m"), false);
-        }
-        let _ = buf.total_lines_exact(40);
-        let rebuilds = buf.layout_index.full_rebuilds;
-
-        buf.push_chat(chat_message(5, 2_000, "new"), false);
-        let total = buf.total_lines_exact(40);
-
-        assert_eq!(buf.layout_index.full_rebuilds, rebuilds);
-        assert_eq!(total, buf.visible_lines(40, 10_000, 0).len());
-    }
-
-    #[test]
-    fn capped_tail_append_repairs_cache_without_full_rebuild() {
-        let mut buf = VirtualChatBuffer::new(5, SyntaxTheme::default());
-        for i in 0..5 {
-            buf.push_chat(chat_message(i, 1_000 + i, "m"), false);
-        }
-        let _ = buf.total_lines_exact(40);
-        let rebuilds = buf.layout_index.full_rebuilds;
-
-        buf.push_chat(chat_message(5, 2_000, "new"), false);
-        let total = buf.total_lines_exact(40);
-
-        assert_eq!(buf.len(), 5);
-        assert_eq!(buf.message(0).id, 1);
-        assert!(buf.layout_index.valid);
-        assert_eq!(buf.layout_index.full_rebuilds, rebuilds);
-        assert_eq!(total, buf.visible_lines(40, 10_000, 0).len());
-    }
-
-    #[test]
-    fn layout_epoch_stable_across_tail_appends() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        let epoch = buf.layout_epoch();
-        for id in 1..6 {
-            buf.push_chat(chat_message(id, id * 1_000, "appended"), false);
-        }
-        buf.push_notice("net", "joined");
-        assert_eq!(buf.layout_epoch(), epoch);
-    }
-
-    #[test]
-    fn layout_epoch_bumps_when_existing_rows_shift() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for id in 10..15 {
-            buf.push_chat(chat_message(id, id * 1_000, "resident"), false);
-        }
-
-        let epoch = buf.layout_epoch();
-        buf.prepend_chat(vec![(chat_message(1, 1_000, "older"), false)]);
-        assert_ne!(buf.layout_epoch(), epoch, "prepend");
-
-        let epoch = buf.layout_epoch();
-        assert!(buf.edit_message(12, chat_message(12, 12_000, "edited")));
-        assert_ne!(buf.layout_epoch(), epoch, "edit");
-
-        let epoch = buf.layout_epoch();
-        buf.insert_chat(chat_message(2, 2_000, "straggler"), false);
-        assert_ne!(buf.layout_epoch(), epoch, "insert");
-
-        let epoch = buf.layout_epoch();
-        assert!(buf.remove_message(13));
-        assert_ne!(buf.layout_epoch(), epoch, "remove");
-
-        let epoch = buf.layout_epoch();
-        buf.on_reflow(30);
-        assert_ne!(buf.layout_epoch(), epoch, "reflow");
-
-        let epoch = buf.layout_epoch();
-        buf.clear();
-        assert_ne!(buf.layout_epoch(), epoch, "clear");
-    }
-
-    #[test]
-    fn layout_epoch_bumps_when_capacity_eviction_shifts_rows() {
-        let mut buf = VirtualChatBuffer::new(3, SyntaxTheme::default());
-        for id in 1..=3 {
-            buf.push_chat(chat_message(id, id * 1_000, "resident"), false);
-        }
-        let epoch = buf.layout_epoch();
-        buf.push_chat(chat_message(4, 4_000, "evicts the oldest"), false);
-        assert_ne!(buf.layout_epoch(), epoch);
-    }
-
-    #[test]
-    fn layout_epoch_bumps_only_on_effective_expand_toggle() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        let long_body = (0..COLLAPSE_LIMIT + 2)
-            .map(|line| format!("line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        buf.push_chat(chat_message(1, 1_000, &long_body), false);
-        buf.push_chat(chat_message(2, 2_000, "short"), false);
-
-        let epoch = buf.layout_epoch();
-        assert!(buf.toggle_expand(0, 40));
-        assert_ne!(buf.layout_epoch(), epoch);
-
-        let epoch = buf.layout_epoch();
-        assert!(!buf.toggle_expand(1, 40));
-        assert_eq!(buf.layout_epoch(), epoch);
-    }
-
-    #[test]
-    fn viewport_top_matches_visible_window_and_clamps() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        assert_eq!(buf.viewport_top(40, 5), 0, "empty buffer");
-        for id in 1..=10 {
-            buf.push_chat(chat_message(id, id * 1_000, "m"), false);
-        }
-        let top = buf.viewport_top(40, 5);
-        assert_eq!(top, buf.max_scroll(40, 5), "pinned to the bottom");
-
-        buf.scroll_up(2, 40, 5);
-        assert_eq!(buf.viewport_top(40, 5), top - 2);
-
-        buf.scroll_up(1_000, 40, 5);
-        assert_eq!(buf.viewport_top(40, 5), 0, "clamped at the oldest line");
-
-        assert_eq!(
-            buf.viewport_top(40, 10_000),
-            0,
-            "window taller than content"
-        );
-        assert_eq!(buf.viewport_top(40, 0), 0);
-    }
-
-    #[test]
-    fn viewport_top_advances_by_appended_rows_while_pinned() {
-        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
-        for id in 1..=10 {
-            buf.push_chat(chat_message(id, id * 1_000, "m"), false);
-        }
-        buf.bottom();
-        let top = buf.viewport_top(40, 5);
-
-        buf.push_chat(chat_message(11, 11_000, "new"), false);
-
-        let new_top = buf.viewport_top(40, 5);
-        assert!(new_top > top, "append while pinned shifts the window down");
-        assert_eq!(new_top, buf.max_scroll(40, 5));
-    }
 }

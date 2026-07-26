@@ -248,6 +248,17 @@ impl ClientThread {
             }
 
             while let Some(event) = events.next(terminal.is_raw()) {
+                // Resolve terminal I/O before borrowing canonical history. The
+                // session guard below covers only view computation.
+                if let Event::CursorStyleReport(shape) = event {
+                    terminal.set_restore_cursor_style(Some(shape));
+                    continue;
+                }
+                let resized = if matches!(&event, Event::Resized) {
+                    Some(terminal.size()?)
+                } else {
+                    None
+                };
                 let action = {
                     let session = session.read();
                     let config = config.read();
@@ -274,14 +285,10 @@ impl ClientThread {
                             (Action::Continue, cx.dirty_hint)
                         }
                         Event::Resized => {
-                            let (width, height) = terminal.size()?;
+                            let (width, height) = resized.expect("resized event measured above");
                             buffer.resize(width, height);
                             retained_seeded = false;
                             (Action::Continue, DirtySections::ALL)
-                        }
-                        Event::CursorStyleReport(shape) => {
-                            terminal.set_restore_cursor_style(Some(shape));
-                            (Action::Continue, DirtySections::EMPTY)
                         }
                         _ => (Action::Continue, DirtySections::EMPTY),
                     };

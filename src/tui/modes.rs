@@ -11,7 +11,7 @@ use crate::{
         command::{CoreCommand, SettingsOp},
     },
     bindings::{self, BindCommand, Resolved},
-    chat_buffer::{Cursor as ChatCursor, LineKind, VisibleLine},
+    chat_buffer::{LineKind, ViewCursor as ChatCursor, VisibleLine},
     client_channel::DirtySections,
     settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft},
     theme,
@@ -42,6 +42,13 @@ use crate::app::testing::TestApp;
 pub(crate) enum Action {
     Continue,
     Quit,
+}
+
+fn history_for_view(
+    session: &crate::app::RoomSession,
+    room_id: Option<rpc::ids::RoomId>,
+) -> Option<crate::app::room::RoomHistoryRef<'_>> {
+    session.history_ref(room_id?)
 }
 
 pub(crate) struct WelcomeMode {
@@ -1453,7 +1460,12 @@ impl RoomMode {
             }
             ChatPanelFocus::Lobby => {}
             ChatPanelFocus::ChatLog => {
-                cx.view.active.chat.ensure_cursor(self.layout.chat_width);
+                if let Some(history) = history_for_view(cx.session, cx.view.viewed_room) {
+                    cx.view
+                        .active
+                        .chat
+                        .ensure_cursor(&history, self.layout.chat_width);
+                }
             }
             ChatPanelFocus::Compose => {}
         }
@@ -1500,7 +1512,7 @@ impl RoomMode {
     }
 
     pub(crate) fn submit_input(&mut self, cx: &mut ViewCx<'_>) {
-        let Some(submission) = cx.view.submit_composer() else {
+        let Some(submission) = cx.view.submit_composer(cx.session) else {
             return;
         };
         match submission {
@@ -1737,7 +1749,7 @@ impl RoomMode {
         if cx.view.composer.mode() == EditorMode::Insert {
             if key.code == extui::event::KeyCode::Tab
                 && key.modifiers.is_empty()
-                && cx.view.complete_command()
+                && cx.view.complete_command(cx.session)
             {
                 cx.narrow_dirty(EDITOR_DIRTY);
                 return Action::Continue;
@@ -1970,18 +1982,23 @@ impl RoomMode {
                 match self.layout.chat_line_at(mouse.row) {
                     Some(line) => match line.kind {
                         LineKind::Heading | LineKind::Ellipsis => {
-                            cx.view
-                                .active
-                                .chat
-                                .toggle_expand(line.message, self.layout.chat_width);
-                            cx.view
-                                .active
-                                .chat
-                                .clamp_scroll(self.layout.chat_width, self.layout.chat_height);
+                            if let Some(history) = history_for_view(cx.session, cx.view.viewed_room)
+                            {
+                                cx.view.active.chat.toggle_expand(
+                                    &history,
+                                    line.message,
+                                    self.layout.chat_width,
+                                );
+                                cx.view.active.chat.clamp_scroll(
+                                    &history,
+                                    self.layout.chat_width,
+                                    self.layout.chat_height,
+                                );
+                            }
                         }
                         LineKind::Body => {
                             cx.view.active.chat.begin_drag(ChatCursor {
-                                message: line.message,
+                                entry: line.entry,
                                 line: line.line,
                             });
                         }
@@ -2120,10 +2137,11 @@ impl RoomMode {
             return None;
         }
         let col_in_line = column - content_x;
+        let history = history_for_view(cx.session, cx.view.viewed_room)?;
         cx.view
             .active
             .chat
-            .link_at(line.message, line.line, col_in_line)
+            .link_at(&history, line.message, line.line, col_in_line)
             .map(str::to_owned)
     }
 
@@ -2143,19 +2161,22 @@ impl RoomMode {
             return None;
         }
         let col_in_line = column - content_x;
+        let history = history_for_view(cx.session, cx.view.viewed_room)?;
         cx.view
             .active
             .chat
-            .ref_at(line.message, line.line, col_in_line)
+            .ref_at(&history, line.message, line.line, col_in_line)
     }
 
     /// Jumps to a reference's target: selects and scrolls to the message when
     /// present in the buffer, otherwise reports why not.
     fn jump_to_ref(&mut self, cx: &mut ViewCx<'_>, target: rpc::msgref::MessageRef) {
-        match cx
-            .view
-            .jump_to_ref(target, self.layout.chat_width, self.layout.chat_height)
-        {
+        match cx.view.jump_to_ref(
+            cx.session,
+            target,
+            self.layout.chat_width,
+            self.layout.chat_height,
+        ) {
             crate::app::room::RefJump::Jumped => self.set_focus_cx(cx, ChatPanelFocus::ChatLog),
             crate::app::room::RefJump::NotFound => {
                 cx.set_status("referenced message is not in this room's history");
@@ -2175,7 +2196,7 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        match cx.view.copy_message_ref(self.layout.chat_width) {
+        match cx.view.copy_message_ref(cx.session, self.layout.chat_width) {
             Some(code) => cx.set_status(format!("copied {code}")),
             None => cx.set_status("select a message to reference"),
         }
@@ -2185,7 +2206,11 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        if cx.view.insert_message_ref(self.layout.chat_width).is_some() {
+        if cx
+            .view
+            .insert_message_ref(cx.session, self.layout.chat_width)
+            .is_some()
+        {
             self.enter_compose_insert_mode(cx);
         } else {
             cx.set_status("select a message to reference");
@@ -2196,8 +2221,15 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        cx.view.active.chat.ensure_cursor(self.layout.chat_width);
-        let Some(target) = cx.view.active.chat.cursor_ref() else {
+        let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+            cx.set_status("no messages");
+            return;
+        };
+        cx.view
+            .active
+            .chat
+            .ensure_cursor(&history, self.layout.chat_width);
+        let Some(target) = cx.view.active.chat.cursor_ref(&history) else {
             cx.set_status("selected message contains no reference");
             return;
         };
@@ -2216,7 +2248,7 @@ impl RoomMode {
             && line.kind == LineKind::Body
         {
             cx.view.active.chat.drag_to(ChatCursor {
-                message: line.message,
+                entry: line.entry,
                 line: line.line,
             });
         }
@@ -2257,7 +2289,11 @@ impl RoomMode {
 
     fn toggle_selected_log_collapse(&mut self, cx: &mut ViewCx<'_>) {
         let width = self.layout.chat_width;
-        match cx.view.toggle_cursor_message_expand(width) {
+        let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+            cx.set_status("no messages");
+            return;
+        };
+        match cx.view.toggle_cursor_message_expand(cx.session, width) {
             ToggleExpandResult::Toggled => {}
             ToggleExpandResult::NoMessages => {
                 cx.set_status("no messages");
@@ -2270,20 +2306,25 @@ impl RoomMode {
         cx.view
             .active
             .chat
-            .clamp_scroll(width, self.layout.chat_height);
+            .clamp_scroll(&history, width, self.layout.chat_height);
         self.keep_chat_cursor_visible(cx);
     }
 
     fn scroll_chat_up(&mut self, cx: &mut ViewCx<'_>, rows: usize) {
-        cx.view
-            .active
-            .chat
-            .scroll_up(rows, self.layout.chat_width, self.layout.chat_height);
+        let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+            return;
+        };
+        cx.view.active.chat.scroll_up(
+            &history,
+            rows,
+            self.layout.chat_width,
+            self.layout.chat_height,
+        );
         if cx
             .view
             .active
             .chat
-            .is_at_top(self.layout.chat_width, self.layout.chat_height)
+            .is_at_top(&history, self.layout.chat_width, self.layout.chat_height)
             && let Some(room_id) = cx.view.viewed_room
         {
             cx.send(CoreCommand::RequestOlderHistory { room_id });
@@ -2293,7 +2334,7 @@ impl RoomMode {
     fn copy_chat_selection(&mut self, cx: &mut ViewCx<'_>) {
         if cx
             .view
-            .copy_chat_selection(self.layout.chat_width)
+            .copy_chat_selection(cx.session, self.layout.chat_width)
             .is_some()
         {
             cx.set_transient_status("copied to clipboard");
@@ -2302,19 +2343,21 @@ impl RoomMode {
 
     fn select_chat_top(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus == ChatPanelFocus::ChatLog {
+            let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+                return;
+            };
             cx.narrow_dirty(CHAT_SCROLL_DIRTY);
             cx.view
                 .active
                 .chat
-                .top(self.layout.chat_width, self.layout.chat_height);
+                .top(&history, self.layout.chat_width, self.layout.chat_height);
             cx.view.active.chat.cursor_to_first();
             self.keep_chat_cursor_visible(cx);
-            if cx
-                .view
-                .active
-                .chat
-                .is_at_top(self.layout.chat_width, self.layout.chat_height)
-                && let Some(room_id) = cx.view.viewed_room
+            if cx.view.active.chat.is_at_top(
+                &history,
+                self.layout.chat_width,
+                self.layout.chat_height,
+            ) && let Some(room_id) = cx.view.viewed_room
             {
                 cx.send(CoreCommand::RequestOlderHistory { room_id });
             }
@@ -2323,9 +2366,15 @@ impl RoomMode {
 
     fn select_chat_bottom(&mut self, cx: &mut ViewCx<'_>) {
         if self.focus == ChatPanelFocus::ChatLog {
+            let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+                return;
+            };
             cx.narrow_dirty(CHAT_SCROLL_DIRTY);
             cx.view.active.chat.bottom();
-            cx.view.active.chat.cursor_to_last(self.layout.chat_width);
+            cx.view
+                .active
+                .chat
+                .cursor_to_last(&history, self.layout.chat_width);
             self.keep_chat_cursor_visible(cx);
         }
     }
@@ -2340,7 +2389,11 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        if cx.view.copy_cursor_line(self.layout.chat_width).is_some() {
+        if cx
+            .view
+            .copy_cursor_line(cx.session, self.layout.chat_width)
+            .is_some()
+        {
             cx.set_transient_status("copied line to clipboard");
         }
     }
@@ -2351,7 +2404,7 @@ impl RoomMode {
         }
         if cx
             .view
-            .copy_cursor_message(self.layout.chat_width)
+            .copy_cursor_message(cx.session, self.layout.chat_width)
             .is_some()
         {
             cx.set_transient_status("copied message to clipboard");
@@ -2363,11 +2416,15 @@ impl RoomMode {
             return;
         }
         cx.narrow_dirty(CHAT_SCROLL_DIRTY);
+        let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+            cx.set_status("no messages");
+            return;
+        };
         if cx
             .view
             .active
             .chat
-            .move_cursor_paragraph(delta, self.layout.chat_width)
+            .move_cursor_paragraph(&history, delta, self.layout.chat_width)
             .is_none()
         {
             cx.set_status("no messages");
@@ -2380,10 +2437,13 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
+        let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+            return;
+        };
         cx.view
             .active
             .chat
-            .toggle_visual_anchor(self.layout.chat_width);
+            .toggle_visual_anchor(&history, self.layout.chat_width);
     }
 
     fn toggle_chat_expand_if_focused(&mut self, cx: &mut ViewCx<'_>) {
@@ -2486,7 +2546,10 @@ impl RoomMode {
 
     fn move_chat_cursor(&mut self, cx: &mut ViewCx<'_>, delta: isize) {
         self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
-        if !cx.view.move_chat_cursor(delta, self.layout.chat_width) {
+        if !cx
+            .view
+            .move_chat_cursor(cx.session, delta, self.layout.chat_width)
+        {
             cx.set_status("no messages");
             return;
         }
@@ -2494,10 +2557,14 @@ impl RoomMode {
     }
 
     fn keep_chat_cursor_visible(&mut self, cx: &mut ViewCx<'_>) {
-        cx.view
-            .active
-            .chat
-            .keep_cursor_visible(self.layout.chat_width, self.layout.chat_height);
+        let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+            return;
+        };
+        cx.view.active.chat.keep_cursor_visible(
+            &history,
+            self.layout.chat_width,
+            self.layout.chat_height,
+        );
     }
 
     fn move_room_view_with_focus(&mut self, cx: &mut ViewCx<'_>, delta: isize) {
@@ -2545,8 +2612,12 @@ impl RoomMode {
             return Action::Quit;
         }
         if let Some(search) = &mut self.history_search {
+            let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+                return Action::Continue;
+            };
             if search.process_key(
                 &mut cx.view.active.chat,
+                &history,
                 key,
                 self.layout.chat_width,
                 self.layout.chat_height,
@@ -2572,6 +2643,9 @@ impl RoomMode {
             && matches!(key.code, KeyCode::Char('n' | 'N'))
         {
             if let Some(search) = &mut self.last_history_search {
+                let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+                    return Action::Continue;
+                };
                 let delta = if key.code == KeyCode::Char('N') {
                     -1
                 } else {
@@ -2579,6 +2653,7 @@ impl RoomMode {
                 };
                 search.repeat(
                     &mut cx.view.active.chat,
+                    &history,
                     delta,
                     self.layout.chat_width,
                     self.layout.chat_height,
@@ -2592,7 +2667,9 @@ impl RoomMode {
             && key.modifiers.is_empty()
         {
             self.last_history_search = None;
-            self.history_search = Some(HistorySearch::new(&cx.view.active.chat));
+            if let Some(history) = history_for_view(cx.session, cx.view.viewed_room) {
+                self.history_search = Some(HistorySearch::new(&cx.view.active.chat, &history));
+            }
             return Action::Continue;
         }
         if self.focus == ChatPanelFocus::Compose {
@@ -2769,7 +2846,11 @@ mod tests {
     use toml_spanner::Arena;
 
     use super::*;
-    use crate::{chat_buffer::LineKind, client_net::TerminalVerb, config::Config};
+    use crate::{
+        chat_buffer::{HistoryEntryId, LineKind},
+        client_net::TerminalVerb,
+        config::Config,
+    };
 
     fn test_app() -> TestApp {
         TestApp::new(Config::default(), None).expect("test app")
@@ -3339,10 +3420,11 @@ mod tests {
         let mut term = vt100::Parser::new(24, 80, 0);
         let full = scrolled_room_fixture(&mut app, &mut room, &mut buffer, &mut term);
 
-        app.view
-            .active
+        let (core, view) = app.parts_mut();
+        let history = core.room.history_ref(RoomId(1)).unwrap();
+        view.active
             .chat
-            .scroll_up(3, room.layout.chat_width, room.layout.chat_height);
+            .scroll_up(&history, 3, room.layout.chat_width, room.layout.chat_height);
         let bytes = frame_bytes(
             &mut app,
             &mut room,
@@ -3401,10 +3483,11 @@ mod tests {
         let mut term = vt100::Parser::new(24, 80, 0);
         scrolled_room_fixture(&mut app, &mut room, &mut buffer, &mut term);
 
-        app.view
-            .active
+        let (core, view) = app.parts_mut();
+        let history = core.room.history_ref(RoomId(1)).unwrap();
+        view.active
             .chat
-            .scroll_up(3, room.layout.chat_width, room.layout.chat_height);
+            .scroll_up(&history, 3, room.layout.chat_width, room.layout.chat_height);
         let bytes = frame_bytes(
             &mut app,
             &mut room,
@@ -3429,8 +3512,9 @@ mod tests {
         let mut term = vt100::Parser::new(24, 80, 0);
         scrolled_room_fixture(&mut app, &mut room, &mut buffer, &mut term);
 
-        app.view.active.chat.prepend_chat(vec![(
-            ChatMessage {
+        app.room.merge_history(
+            RoomId(1),
+            vec![ChatMessage {
                 message_id: MessageId(1),
                 room_id: RoomId(1),
                 sender: UserId(9),
@@ -3440,9 +3524,10 @@ mod tests {
                 file_transfer_id: None,
                 flags: rpc::control::MessageFlags::default(),
                 target: None,
-            },
-            false,
-        )]);
+            }],
+        );
+        let (core, view) = app.parts_mut();
+        view.sync_independent(&core.room);
         let bytes = frame_bytes(
             &mut app,
             &mut room,
@@ -3467,10 +3552,11 @@ mod tests {
         let mut term = vt100::Parser::new(24, 80, 0);
         scrolled_room_fixture(&mut app, &mut room, &mut buffer, &mut term);
 
-        app.view
-            .active
+        let (core, view) = app.parts_mut();
+        let history = core.room.history_ref(RoomId(1)).unwrap();
+        view.active
             .chat
-            .top(room.layout.chat_width, room.layout.chat_height);
+            .top(&history, room.layout.chat_width, room.layout.chat_height);
         let bytes = frame_bytes(
             &mut app,
             &mut room,
@@ -3753,14 +3839,23 @@ mod tests {
         }
 
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
-        let cursor_message = |app: &TestApp| app.view.active.chat.cursor().map(|c| c.message);
-        assert_eq!(cursor_message(&app), Some(2));
+        let cursor_message = |app: &TestApp| app.view.active.chat.cursor().map(|c| c.entry);
+        assert_eq!(
+            cursor_message(&app),
+            Some(HistoryEntryId::Message(MessageId(3)))
+        );
 
         room.process_input(&mut app, key('k'));
-        assert_eq!(cursor_message(&app), Some(1));
+        assert_eq!(
+            cursor_message(&app),
+            Some(HistoryEntryId::Message(MessageId(2)))
+        );
 
         room.process_input(&mut app, key('j'));
-        assert_eq!(cursor_message(&app), Some(2));
+        assert_eq!(
+            cursor_message(&app),
+            Some(HistoryEntryId::Message(MessageId(3)))
+        );
     }
 
     #[test]
@@ -3780,10 +3875,13 @@ mod tests {
         let search = room.history_search.as_ref().expect("search open");
         assert_eq!(search.query(), "b t");
         assert_eq!(search.matches().len(), 1);
-        assert_eq!(search.selected_message(), Some(0));
         assert_eq!(
-            app.view.active.chat.cursor().map(|cursor| cursor.message),
-            Some(0)
+            search.selected_entry(),
+            Some(HistoryEntryId::Message(MessageId(1)))
+        );
+        assert_eq!(
+            app.view.active.chat.cursor().map(|cursor| cursor.entry),
+            Some(HistoryEntryId::Message(MessageId(1)))
         );
         assert_eq!(app.view.composer.text(), "draft /command");
 
@@ -3805,8 +3903,8 @@ mod tests {
             room.process_input(&mut app, key(ch));
         }
         assert_eq!(
-            app.view.active.chat.cursor().map(|cursor| cursor.message),
-            Some(2),
+            app.view.active.chat.cursor().map(|cursor| cursor.entry),
+            Some(HistoryEntryId::Message(MessageId(3))),
             "the nearest result starts selected"
         );
 
@@ -3815,8 +3913,8 @@ mod tests {
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
         );
         assert_eq!(
-            app.view.active.chat.cursor().map(|cursor| cursor.message),
-            Some(0),
+            app.view.active.chat.cursor().map(|cursor| cursor.entry),
+            Some(HistoryEntryId::Message(MessageId(1))),
             "Ctrl-K selects and follows the previous result"
         );
         room.process_input(
@@ -3824,8 +3922,8 @@ mod tests {
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
         );
         assert_eq!(
-            app.view.active.chat.cursor().map(|cursor| cursor.message),
-            Some(2)
+            app.view.active.chat.cursor().map(|cursor| cursor.entry),
+            Some(HistoryEntryId::Message(MessageId(3)))
         );
 
         room.process_input(
@@ -3841,14 +3939,14 @@ mod tests {
         );
         room.process_input(&mut app, key('n'));
         assert_eq!(
-            app.view.active.chat.cursor().map(|cursor| cursor.message),
-            Some(0),
+            app.view.active.chat.cursor().map(|cursor| cursor.entry),
+            Some(HistoryEntryId::Message(MessageId(1))),
             "n repeats the closed search and wraps to its next result"
         );
         room.process_input(&mut app, key('N'));
         assert_eq!(
-            app.view.active.chat.cursor().map(|cursor| cursor.message),
-            Some(2)
+            app.view.active.chat.cursor().map(|cursor| cursor.entry),
+            Some(HistoryEntryId::Message(MessageId(3)))
         );
         room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert!(room.last_history_search.is_none());
@@ -3877,7 +3975,7 @@ mod tests {
         assert_eq!(
             app.view.active.chat.cursor(),
             Some(ChatCursor {
-                message: 0,
+                entry: HistoryEntryId::Message(MessageId(1)),
                 line: 0
             })
         );
@@ -3887,7 +3985,7 @@ mod tests {
         assert_eq!(
             app.view.active.chat.cursor(),
             Some(ChatCursor {
-                message: 19,
+                entry: HistoryEntryId::Message(MessageId(20)),
                 line: 0,
             })
         );
@@ -3912,21 +4010,24 @@ mod tests {
         render_room(&mut app, &mut room, &mut buffer);
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
         // Scroll the viewport away, leaving the cursor on the newest message.
-        app.view
-            .active
-            .chat
-            .top(room.layout().chat_width, room.layout().chat_height);
+        let (core, view) = app.parts_mut();
+        let history = core.room.history_ref(RoomId(1)).unwrap();
+        view.active.chat.top(
+            &history,
+            room.layout().chat_width,
+            room.layout().chat_height,
+        );
         room.process_input(&mut app, key('k'));
         render_room(&mut app, &mut room, &mut buffer);
 
         let cursor = app.view.active.chat.cursor().expect("cursor present");
-        assert_eq!(cursor.message, 28);
+        assert_eq!(cursor.entry, HistoryEntryId::Message(MessageId(29)));
         assert!(
             room.layout()
                 .visible_chat_lines
                 .iter()
                 .any(|line| line.kind == LineKind::Body
-                    && line.message == cursor.message
+                    && line.entry == cursor.entry
                     && line.line == cursor.line),
             "cursor line must be visible after movement"
         );
@@ -3998,9 +4099,11 @@ mod tests {
         // at the top of the viewport. Collapsing now removes fewer rows than the
         // viewport height, which lands the scroll offset in the window where
         // `visible_lines` does not self-correct.
-        app.view.active.chat.toggle_expand(0, width);
-        assert!(app.view.active.chat.is_expanded(0));
-        app.view.active.chat.top(width, height);
+        let (core, view) = app.parts_mut();
+        let history = core.room.history_ref(RoomId(1)).unwrap();
+        view.active.chat.toggle_expand(&history, 0, width);
+        assert!(view.active.chat.is_expanded(0));
+        view.active.chat.top(&history, width, height);
         render_room(&mut app, &mut room, &mut buffer);
 
         let heading_row = room
@@ -4053,11 +4156,11 @@ mod tests {
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
         // A mouse-style drag over both messages produces the visual range.
         app.view.active.chat.begin_drag(ChatCursor {
-            message: 0,
+            entry: HistoryEntryId::Message(MessageId(1)),
             line: 0,
         });
         app.view.active.chat.drag_to(ChatCursor {
-            message: 1,
+            entry: HistoryEntryId::Message(MessageId(2)),
             line: 0,
         });
         app.view.active.chat.end_drag();
@@ -4149,7 +4252,7 @@ mod tests {
         assert_eq!(
             app.view.active.chat.cursor(),
             Some(ChatCursor {
-                message: 0,
+                entry: HistoryEntryId::Message(MessageId(1)),
                 line: 0
             }),
             "previous block start"
@@ -4158,7 +4261,7 @@ mod tests {
         assert_eq!(
             app.view.active.chat.cursor(),
             Some(ChatCursor {
-                message: 2,
+                entry: HistoryEntryId::Message(MessageId(3)),
                 line: 0
             }),
             "next block start"
@@ -4231,8 +4334,10 @@ mod tests {
         push_room_message(&mut app, 1, UserId(2), 1_000, "first");
 
         assert_eq!(room.workspace_layer(&app), bindings::WORKSPACE_LAYER);
-        app.view.active.chat.ensure_cursor(40);
-        app.view.active.chat.toggle_visual_anchor(40);
+        let (core, view) = app.parts_mut();
+        let history = core.room.history_ref(RoomId(1)).unwrap();
+        view.active.chat.ensure_cursor(&history, 40);
+        view.active.chat.toggle_visual_anchor(&history, 40);
         assert_eq!(room.workspace_layer(&app), bindings::CHAT_VISUAL_LAYER);
         app.view.active.chat.clear_visual_anchor();
         assert_eq!(room.workspace_layer(&app), bindings::WORKSPACE_LAYER);
@@ -4306,7 +4411,7 @@ mod tests {
         assert_eq!(
             app.view.active.chat.cursor(),
             Some(ChatCursor {
-                message: line.message,
+                entry: line.entry,
                 line: line.line,
             })
         );
@@ -4562,7 +4667,10 @@ mod tests {
 
         // The chosen height persists once the message clears on send.
         type_text(&mut room, &mut app, "hello");
-        app.view.submit_composer();
+        {
+            let cx = app.view_cx();
+            cx.view.submit_composer(cx.session);
+        }
         assert!(app.view.composer.text().is_empty());
         assert_eq!(app.view.composer_rows, Some(target));
         render_room(&mut app, &mut room, &mut buffer);

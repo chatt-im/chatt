@@ -2,146 +2,14 @@ use std::ops::Range;
 
 use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::chat_buffer::VirtualChatBuffer;
-
-#[derive(Clone, Debug)]
-struct SearchEntry {
-    message: usize,
-    start: usize,
-    end: usize,
-    /// Only non-ASCII entries need a lowercase-byte to source-byte map. ASCII,
-    /// overwhelmingly the common path, maps offsets directly with no allocation.
-    original: Option<Vec<Range<u32>>>,
-}
-
-#[derive(Debug, Default)]
-struct SearchIndex {
-    /// All normalized bodies separated by a byte that cannot occur in UTF-8.
-    /// This is the same cache-coherent layout used by devsm's log search.
-    lower: Vec<u8>,
-    entries: Vec<SearchEntry>,
-}
-
-impl SearchIndex {
-    fn build(chat: &VirtualChatBuffer) -> Self {
-        let mut index = Self {
-            lower: Vec::with_capacity(chat.len().saturating_mul(128)),
-            entries: Vec::with_capacity(chat.len()),
-        };
-        index.append(chat, 0);
-        index
-    }
-
-    fn append(&mut self, chat: &VirtualChatBuffer, from: usize) {
-        self.entries.reserve(chat.len().saturating_sub(from));
-        for message in from..chat.len() {
-            let body = &chat.message(message).body;
-            let start = self.lower.len();
-            let original = if body.is_ascii() {
-                self.lower
-                    .extend(body.bytes().map(|byte| byte.to_ascii_lowercase()));
-                None
-            } else {
-                let mut map = Vec::with_capacity(body.len());
-                for (source_start, ch) in body.char_indices() {
-                    let source_end = source_start + ch.len_utf8();
-                    for lowered in ch.to_lowercase() {
-                        let mut bytes = [0; 4];
-                        let lowered = lowered.encode_utf8(&mut bytes).as_bytes();
-                        self.lower.extend_from_slice(lowered);
-                        map.extend(
-                            (0..lowered.len()).map(|_| source_start as u32..source_end as u32),
-                        );
-                    }
-                }
-                Some(map)
-            };
-            let end = self.lower.len();
-            self.entries.push(SearchEntry {
-                message,
-                start,
-                end,
-                original,
-            });
-            self.lower.push(0xff);
-        }
-    }
-
-    fn search(&self, query: &str, out: &mut Vec<HistoryMatch>) {
-        out.clear();
-        let query = query.to_lowercase();
-        let mut chunks = query.split_whitespace();
-        let Some(first) = chunks.next() else {
-            out.extend(self.entries.iter().map(|entry| HistoryMatch {
-                message: entry.message,
-                ranges: Vec::new(),
-            }));
-            return;
-        };
-        let rest: Vec<_> = chunks
-            .map(|chunk| memchr::memmem::Finder::new(chunk.as_bytes()))
-            .collect();
-        let finder = memchr::memmem::Finder::new(first.as_bytes());
-        let mut search_from = 0usize;
-        let mut entry_index = 0usize;
-        while search_from < self.lower.len() {
-            let Some(relative) = finder.find(&self.lower[search_from..]) else {
-                break;
-            };
-            let found = search_from + relative;
-            while entry_index < self.entries.len() && self.entries[entry_index].end <= found {
-                entry_index += 1;
-            }
-            let Some(entry) = self.entries.get(entry_index) else {
-                break;
-            };
-            let first_end = found + first.len();
-            if found < entry.start || first_end > entry.end {
-                search_from = found + 1;
-                continue;
-            }
-
-            let mut normalized_ranges = vec![found - entry.start..first_end - entry.start];
-            let mut chunk_from = first_end;
-            let mut matched = true;
-            for chunk in &rest {
-                let Some(relative) = chunk.find(&self.lower[chunk_from..entry.end]) else {
-                    matched = false;
-                    break;
-                };
-                let start = chunk_from + relative;
-                let end = start + chunk.needle().len();
-                normalized_ranges.push(start - entry.start..end - entry.start);
-                chunk_from = end;
-            }
-            if matched {
-                out.push(HistoryMatch {
-                    message: entry.message,
-                    ranges: normalized_ranges
-                        .into_iter()
-                        .filter_map(|range| entry.original_range(range))
-                        .collect(),
-                });
-                search_from = entry.end.saturating_add(1);
-            } else {
-                search_from = found + 1;
-            }
-        }
-    }
-}
-
-impl SearchEntry {
-    fn original_range(&self, range: Range<usize>) -> Option<Range<u32>> {
-        match &self.original {
-            Some(map) => Some(map.get(range.start)?.start..map.get(range.end.checked_sub(1)?)?.end),
-            None => Some(range.start as u32..range.end as u32),
-        }
-    }
-}
+use crate::{
+    app::room::RoomHistoryRef,
+    chat_buffer::{ChatViewport, HistoryEntryId},
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct HistoryMatch {
-    pub(crate) message: usize,
+    pub(crate) entry: HistoryEntryId,
     pub(crate) ranges: Vec<Range<u32>>,
 }
 
@@ -151,37 +19,35 @@ pub(crate) enum SearchAction {
     Close,
 }
 
-/// Cache-coherent, per-view history search. Lowercasing is paid only when the
-/// chat changes; editing the query scans already-normalized contiguous strings.
+/// Per-view query and selection state. Search text is derived directly from
+/// canonical records and is never retained as another room-history model.
 #[derive(Debug)]
 pub(crate) struct HistorySearch {
     query: String,
-    index: SearchIndex,
     matches: Vec<HistoryMatch>,
     selected: usize,
     list_offset: usize,
+    indexed_generation: u64,
     indexed_revision: u64,
-    indexed_reindex_revision: u64,
-    anchor_message: usize,
+    anchor: Option<HistoryEntryId>,
 }
 
 impl HistorySearch {
-    pub(crate) fn new(chat: &VirtualChatBuffer) -> Self {
-        let anchor_message = chat
+    pub(crate) fn new(chat: &ChatViewport, history: &RoomHistoryRef<'_>) -> Self {
+        let anchor = chat
             .cursor()
-            .map(|cursor| cursor.message)
-            .unwrap_or_else(|| chat.len().saturating_sub(1));
+            .map(|cursor| cursor.entry)
+            .or_else(|| history.entry_ids().last().copied());
         let mut state = Self {
             query: String::new(),
-            index: SearchIndex::default(),
             matches: Vec::new(),
             selected: 0,
             list_offset: 0,
+            indexed_generation: u64::MAX,
             indexed_revision: u64::MAX,
-            indexed_reindex_revision: u64::MAX,
-            anchor_message,
+            anchor,
         };
-        state.sync(chat);
+        state.sync(history);
         state
     }
 
@@ -205,8 +71,8 @@ impl HistorySearch {
         self.matches.get(self.selected)
     }
 
-    pub(crate) fn selected_message(&self) -> Option<usize> {
-        self.selected_match().map(|found| found.message)
+    pub(crate) fn selected_entry(&self) -> Option<HistoryEntryId> {
+        self.selected_match().map(|found| found.entry)
     }
 
     pub(crate) fn set_visible_rows(&mut self, rows: usize) {
@@ -224,26 +90,21 @@ impl HistorySearch {
             .min(self.matches.len().saturating_sub(rows));
     }
 
-    pub(crate) fn sync(&mut self, chat: &VirtualChatBuffer) {
-        if self.indexed_revision == chat.revision() {
+    pub(crate) fn sync(&mut self, history: &RoomHistoryRef<'_>) {
+        if self.indexed_generation == history.generation()
+            && self.indexed_revision == history.order_revision()
+        {
             return;
         }
-        let selected_message = self.selected_message().unwrap_or(self.anchor_message);
-        if self.indexed_reindex_revision == chat.reindex_revision()
-            && self.index.entries.len() <= chat.len()
-        {
-            self.index.append(chat, self.index.entries.len());
-        } else {
-            self.index = SearchIndex::build(chat);
-        }
-        self.indexed_revision = chat.revision();
-        self.indexed_reindex_revision = chat.reindex_revision();
-        self.refresh(selected_message);
+        self.indexed_generation = history.generation();
+        self.indexed_revision = history.order_revision();
+        self.refresh(history, self.selected_entry().or(self.anchor));
     }
 
     pub(crate) fn process_key(
         &mut self,
-        chat: &mut VirtualChatBuffer,
+        chat: &mut ChatViewport,
+        history: &RoomHistoryRef<'_>,
         key: KeyEvent,
         width: u16,
         height: u16,
@@ -251,7 +112,7 @@ impl HistorySearch {
         if matches!(key.kind, KeyEventKind::Release) {
             return SearchAction::Continue;
         }
-        self.sync(chat);
+        self.sync(history);
         let mut modifiers = key.modifiers;
         modifiers.remove(KeyModifiers::SHIFT);
         match (key.code, modifiers) {
@@ -264,46 +125,53 @@ impl HistorySearch {
             }
             (KeyCode::Backspace, KeyModifiers::NONE) => {
                 if self.query.pop().is_some() {
-                    self.refresh_selected();
+                    self.refresh(history, self.selected_entry().or(self.anchor));
                 }
             }
             (KeyCode::Delete, KeyModifiers::NONE) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 if !self.query.is_empty() {
                     self.query.clear();
-                    self.refresh_selected();
+                    self.refresh(history, self.selected_entry().or(self.anchor));
                 }
             }
             (KeyCode::Char(ch), KeyModifiers::NONE) if !ch.is_control() => {
                 self.query.push(ch);
-                self.refresh_selected();
+                self.refresh(history, self.selected_entry().or(self.anchor));
             }
             _ => {}
         }
-        self.follow_selection(chat, width, height);
+        self.follow_selection(chat, history, width, height);
         SearchAction::Continue
     }
 
-    pub(crate) fn follow_selection(&self, chat: &mut VirtualChatBuffer, width: u16, height: u16) {
-        let Some(message) = self.selected_message() else {
+    pub(crate) fn follow_selection(
+        &self,
+        chat: &mut ChatViewport,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+        height: u16,
+    ) {
+        let Some(entry) = self.selected_entry() else {
             return;
         };
-        chat.set_cursor_to_message(message);
-        chat.scroll_message_into_view(message, width.max(1), height.max(1));
+        chat.set_cursor(entry);
+        chat.scroll_entry_into_view(history, entry, width.max(1), height.max(1));
     }
 
     pub(crate) fn repeat(
         &mut self,
-        chat: &mut VirtualChatBuffer,
+        chat: &mut ChatViewport,
+        history: &RoomHistoryRef<'_>,
         delta: isize,
         width: u16,
         height: u16,
     ) {
-        self.sync(chat);
+        self.sync(history);
         if !self.matches.is_empty() {
             self.selected =
                 (self.selected as isize + delta).rem_euclid(self.matches.len() as isize) as usize;
         }
-        self.follow_selection(chat, width, height);
+        self.follow_selection(chat, history, width, height);
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -315,20 +183,70 @@ impl HistorySearch {
             (self.selected as isize + delta).clamp(0, self.matches.len() as isize - 1) as usize;
     }
 
-    fn refresh_selected(&mut self) {
-        let selected = self.selected_message().unwrap_or(self.anchor_message);
-        self.refresh(selected);
-    }
-
-    fn refresh(&mut self, nearest: usize) {
-        self.index.search(&self.query, &mut self.matches);
-        self.selected = self
-            .matches
-            .partition_point(|found| found.message <= nearest)
-            .saturating_sub(1)
-            .min(self.matches.len().saturating_sub(1));
+    fn refresh(&mut self, history: &RoomHistoryRef<'_>, nearest: Option<HistoryEntryId>) {
+        self.matches.clear();
+        let entries = history.entry_ids();
+        let nearest = nearest
+            .and_then(|nearest| entries.iter().position(|id| *id == nearest))
+            .unwrap_or(0);
+        self.selected = 0;
+        for (index, id) in entries.into_iter().enumerate() {
+            let Some(record) = history.record(id) else {
+                continue;
+            };
+            if let Some(ranges) = match_ranges(record.body, &self.query) {
+                if index <= nearest {
+                    self.selected = self.matches.len();
+                }
+                self.matches.push(HistoryMatch { entry: id, ranges });
+            }
+        }
+        self.selected = self.selected.min(self.matches.len().saturating_sub(1));
         self.list_offset = 0;
     }
+}
+
+fn match_ranges(body: &str, query: &str) -> Option<Vec<Range<u32>>> {
+    let lower_query = query.to_lowercase();
+    let mut chunks = lower_query.split_whitespace().map(str::to_string);
+    let Some(first) = chunks.next() else {
+        return Some(Vec::new());
+    };
+    let (lower, map) = normalized(body);
+    let mut from = 0usize;
+    let mut ranges = Vec::new();
+    for chunk in std::iter::once(first).chain(chunks) {
+        let relative = memchr::memmem::find(&lower[from..], chunk.as_bytes())?;
+        let start = from + relative;
+        let end = start + chunk.len();
+        ranges.push(match &map {
+            Some(map) => map.get(start)?.start..map.get(end.checked_sub(1)?)?.end,
+            None => start as u32..end as u32,
+        });
+        from = end;
+    }
+    Some(ranges)
+}
+
+fn normalized(body: &str) -> (Vec<u8>, Option<Vec<Range<u32>>>) {
+    if body.is_ascii() {
+        return (
+            body.bytes().map(|byte| byte.to_ascii_lowercase()).collect(),
+            None,
+        );
+    }
+    let mut lower = Vec::with_capacity(body.len());
+    let mut map = Vec::with_capacity(body.len());
+    for (source_start, ch) in body.char_indices() {
+        let source_end = source_start + ch.len_utf8();
+        for lowered in ch.to_lowercase() {
+            let mut bytes = [0; 4];
+            let lowered = lowered.encode_utf8(&mut bytes).as_bytes();
+            lower.extend_from_slice(lowered);
+            map.extend((0..lowered.len()).map(|_| source_start as u32..source_end as u32));
+        }
+    }
+    (lower, Some(map))
 }
 
 #[cfg(test)]
@@ -337,25 +255,13 @@ mod tests {
 
     #[test]
     fn whitespace_is_an_ordered_wildcard() {
-        let mut chat = VirtualChatBuffer::new(10, Default::default());
-        chat.push_notice("test", "a Boat afloat");
-        let index = SearchIndex::build(&chat);
-        let mut matches = Vec::new();
-        index.search("b t", &mut matches);
-        assert_eq!(matches[0].ranges, vec![2..3, 5..6]);
-        index.search("t b", &mut matches);
-        assert!(matches.is_empty());
+        assert_eq!(match_ranges("a Boat afloat", "b t"), Some(vec![2..3, 5..6]));
+        assert_eq!(match_ranges("a Boat afloat", "t b"), None);
     }
 
     #[test]
     fn matching_is_case_insensitive_and_preserves_unicode_offsets() {
-        let mut chat = VirtualChatBuffer::new(10, Default::default());
-        chat.push_notice("test", "CAFÉ Straße");
-        let index = SearchIndex::build(&chat);
-        let mut matches = Vec::new();
-        index.search("café", &mut matches);
-        assert_eq!(matches[0].ranges, vec![0..5]);
-        index.search("straße", &mut matches);
-        assert_eq!(matches[0].ranges, vec![6..13]);
+        assert_eq!(match_ranges("CAFÉ Straße", "café"), Some(vec![0..5]));
+        assert_eq!(match_ranges("CAFÉ Straße", "straße"), Some(vec![6..13]));
     }
 }

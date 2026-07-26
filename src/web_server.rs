@@ -2,8 +2,8 @@
 //!
 //! A dedicated thread owns the [`Server`] and runs its blocking poll loop. The
 //! app forwards messages through a [`WebFeedSender`], which delivers them over an
-//! `mpsc` channel and wakes the loop via a [`darkhttp::WakeHandle`] so they
-//! broadcast immediately. On connect a client receives a recent window of
+//! bounded nonblocking channel and wakes the loop via a
+//! [`darkhttp::WakeHandle`] so they broadcast immediately. On connect a client receives a recent window of
 //! history, then a frame per new message. A browser pages older history on
 //! demand by sending a `load_older` request as it scrolls up. Chat history is
 //! requested from the app's canonical room store and is never retained here.
@@ -14,8 +14,8 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +39,9 @@ const WS_PATH: &str = "/ws";
 /// Loopback HTTP requests should always make prompt progress. This is an idle
 /// progress deadline, not a total request-duration limit.
 const HTTP_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds transient app-to-web projections. Queue pressure never blocks the
+/// app event loop; dropped chat projections cause a canonical resnapshot.
+const WEB_FEED_CAPACITY: usize = 512;
 #[cfg(not(feature = "embed-web"))]
 const WEB_ASSETS_DIR: &str = "web/dist";
 
@@ -267,9 +270,8 @@ impl WebMessage {
 }
 
 impl WebMessage {
-    /// Builds a file message from persisted history: the chat announcement plus
-    /// the stored served name and image dimensions. Used to populate the web
-    /// backlog with a room's file messages when the room is entered.
+    /// Builds a transient file-message projection from the canonical
+    /// announcement and its attached file detail.
     pub fn from_history_file(
         message: &ChatMessage,
         transfer_id: rpc::ids::FileTransferId,
@@ -401,9 +403,7 @@ enum WebFeed {
     ActionError(String),
     /// Changes the transport-visible room label. Chat content arrives only in
     /// authoritative windows projected by the app from canonical room history.
-    SetRoomName {
-        name: String,
-    },
+    SetRoomName { name: String },
     HistoryWindow {
         audience: WebAudience,
         kind: HistoryWindowKind,
@@ -426,16 +426,10 @@ enum WebFeed {
         message: Option<WebMessage>,
     },
     /// Read-only browser projection of the viewed DM's E2E security state.
-    E2eSecurity {
-        payload: String,
-        active: bool,
-    },
+    E2eSecurity { payload: String, active: bool },
     /// A `share_available` envelope. The web thread retains it by `stream_id` and
     /// replays it to a browser that connects after the share started.
-    ShareAvailable {
-        stream_id: u32,
-        payload: String,
-    },
+    ShareAvailable { stream_id: u32, payload: String },
     /// A `share_config` envelope sent when playback starts. Transient: it targets
     /// the browser that asked to play, so it is targeted and not retained.
     /// The stream id selects the cached keyframe-led burst sent immediately
@@ -447,21 +441,12 @@ enum WebFeed {
     },
     /// A `share_error` envelope reporting a failed play request. Transient and
     /// targeted like [`ShareConfig`](WebFeed::ShareConfig), not retained.
-    ShareError {
-        client: u64,
-        payload: String,
-    },
+    ShareError { client: u64, payload: String },
     /// A mutation/upload acknowledgement routed only to its originating tab.
-    RequestResult {
-        client: u64,
-        payload: String,
-    },
+    RequestResult { client: u64, payload: String },
     /// A `command_output` or `command_candidates` envelope routed only to the
     /// tab that issued the command. Transient, not retained.
-    CommandReply {
-        client: u64,
-        payload: String,
-    },
+    CommandReply { client: u64, payload: String },
     /// A `file_progress` envelope for an in-flight transfer. Transient: browsers
     /// merge it into the matching placeholder message and it is not retained, so a
     /// browser that connects mid-transfer simply sees the file once it lands.
@@ -472,10 +457,7 @@ enum WebFeed {
     FileTerminal(String),
     /// A `share_ended` envelope. Drops the retained `share_available` for its
     /// `stream_id`.
-    ShareEnded {
-        stream_id: u32,
-        payload: String,
-    },
+    ShareEnded { stream_id: u32, payload: String },
     /// One plaintext video frame body (the 17-byte header plus the bitstream),
     /// forwarded to browsers as a binary WebSocket message without re-framing.
     /// Shared so the fast-start cache and the WebSocket writer never copy it.
@@ -488,7 +470,19 @@ enum WebFeed {
         viewer: WebViewer,
         max_upload_bytes: u64,
     },
-    Stop,
+}
+
+impl WebFeed {
+    fn affects_history(&self) -> bool {
+        matches!(
+            self,
+            Self::Message { .. }
+                | Self::Delete { .. }
+                | Self::HistoryWindow { .. }
+                | Self::StaleHistory { .. }
+                | Self::RefPreview { .. }
+        )
+    }
 }
 
 /// A request a browser sends back to the app, forwarded over the web-to-app
@@ -666,17 +660,38 @@ impl CandidateKind {
 /// A cloneable handle the app uses to push messages to the web view.
 ///
 /// [`send`](WebFeedSender::send) queues the message and wakes the server's poll
-/// loop, so a connected browser sees it without any polling delay. Sends never
-/// fail loudly: a dead web thread must not break the chat client.
+/// loop, so a connected browser sees it without any polling delay. The sender
+/// never waits for queue capacity; dropped history projections schedule a
+/// fresh canonical snapshot.
 #[derive(Clone)]
 pub struct WebFeedSender {
-    tx: Sender<WebFeed>,
+    tx: SyncSender<WebFeed>,
     wake: WakeHandle,
+    resync_history: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
     #[cfg(test)]
     local_addr: SocketAddr,
 }
 
 impl WebFeedSender {
+    fn queue(&self, feed: WebFeed) {
+        let affects_history = feed.affects_history();
+        match self.tx.try_send(feed) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                if affects_history {
+                    self.resync_history.store(true, Ordering::Release);
+                }
+                kvlog::warn!(
+                    "dropping saturated web feed item",
+                    history_resync = affects_history
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => return,
+        }
+        self.wake.wake();
+    }
+
     #[cfg(test)]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
@@ -684,17 +699,15 @@ impl WebFeedSender {
 
     /// Pushes one transient canonical projection to every connected browser.
     pub fn send(&self, room_id: RoomId, room_generation: u64, message: WebMessage) {
-        let _ = self.tx.send(WebFeed::Message {
+        self.queue(WebFeed::Message {
             room_id,
             room_generation,
             message,
         });
-        self.wake.wake();
     }
 
     pub fn set_room_name(&self, name: String) {
-        let _ = self.tx.send(WebFeed::SetRoomName { name });
-        self.wake.wake();
+        self.queue(WebFeed::SetRoomName { name });
     }
 
     pub fn send_history_window(
@@ -707,7 +720,7 @@ impl WebFeedSender {
         older_cursor: Option<MessageId>,
         at_start: bool,
     ) {
-        let _ = self.tx.send(WebFeed::HistoryWindow {
+        self.queue(WebFeed::HistoryWindow {
             audience,
             kind,
             room_id,
@@ -716,21 +729,14 @@ impl WebFeedSender {
             older_cursor,
             at_start,
         });
-        self.wake.wake();
     }
 
-    pub fn send_stale_history(
-        &self,
-        client: u64,
-        room_id: RoomId,
-        room_generation: u64,
-    ) {
-        let _ = self.tx.send(WebFeed::StaleHistory {
+    pub fn send_stale_history(&self, client: u64, room_id: RoomId, room_generation: u64) {
+        self.queue(WebFeed::StaleHistory {
             client,
             room_id,
             room_generation,
         });
-        self.wake.wake();
     }
 
     pub fn send_ref_preview(
@@ -741,14 +747,13 @@ impl WebFeedSender {
         message_id: MessageId,
         message: Option<WebMessage>,
     ) {
-        let _ = self.tx.send(WebFeed::RefPreview {
+        self.queue(WebFeed::RefPreview {
             client,
             room_id,
             room_generation,
             message_id,
             message,
         });
-        self.wake.wake();
     }
 
     pub fn set_e2e_security(&self, level: &str, message: &str) {
@@ -757,93 +762,80 @@ impl WebFeedSender {
             level,
             message,
         };
-        let _ = self.tx.send(WebFeed::E2eSecurity {
+        self.queue(WebFeed::E2eSecurity {
             payload,
             active: level != "clear",
         });
-        self.wake.wake();
     }
 
     /// Announces a screen share to every browser, retained so a browser that
     /// connects later still learns the share is available.
     pub fn send_share_available(&self, stream_id: u32, payload: String) {
-        let _ = self.tx.send(WebFeed::ShareAvailable { stream_id, payload });
-        self.wake.wake();
+        self.queue(WebFeed::ShareAvailable { stream_id, payload });
     }
 
     /// Sends a decoder-config envelope when playback starts. Not retained.
     pub fn send_share_config(&self, client: u64, stream_id: u32, payload: String) {
-        let _ = self.tx.send(WebFeed::ShareConfig {
+        self.queue(WebFeed::ShareConfig {
             client,
             stream_id,
             payload,
         });
-        self.wake.wake();
     }
 
     /// Sends a play-failure envelope to the browser. Not retained.
     pub fn send_share_error(&self, client: u64, payload: String) {
-        let _ = self.tx.send(WebFeed::ShareError { client, payload });
-        self.wake.wake();
+        self.queue(WebFeed::ShareError { client, payload });
     }
 
     pub fn send_request_result(&self, client: u64, payload: String) {
-        let _ = self.tx.send(WebFeed::RequestResult { client, payload });
-        self.wake.wake();
+        self.queue(WebFeed::RequestResult { client, payload });
     }
 
     /// Sends slash-command output or argument candidates to the issuing tab.
     pub fn send_command_reply(&self, client: u64, payload: String) {
-        let _ = self.tx.send(WebFeed::CommandReply { client, payload });
-        self.wake.wake();
+        self.queue(WebFeed::CommandReply { client, payload });
     }
 
     /// Broadcasts a file-transfer progress envelope. Not retained: browsers merge
     /// it into the matching placeholder message.
     pub fn send_file_progress(&self, payload: String) {
-        let _ = self.tx.send(WebFeed::FileProgress(payload));
-        self.wake.wake();
+        self.queue(WebFeed::FileProgress(payload));
     }
 
     /// Broadcasts a file-transfer terminal envelope (skipped/cancelled/failed).
     /// Not retained: browsers merge it into the matching placeholder message,
     /// replacing its progress bar with the terminal label.
     pub fn send_file_terminal(&self, payload: String) {
-        let _ = self.tx.send(WebFeed::FileTerminal(payload));
-        self.wake.wake();
+        self.queue(WebFeed::FileTerminal(payload));
     }
 
     /// Tells every browser to drop a deleted canonical chat message.
     pub fn send_delete(&self, room_id: RoomId, room_generation: u64, message_id: u64) {
-        let _ = self.tx.send(WebFeed::Delete {
+        self.queue(WebFeed::Delete {
             room_id,
             room_generation,
             message_id,
         });
-        self.wake.wake();
     }
 
     /// Reports a rejected browser deletion request. Not retained.
     pub fn send_delete_error(&self, payload: String) {
-        let _ = self.tx.send(WebFeed::DeleteError(payload));
-        self.wake.wake();
+        self.queue(WebFeed::DeleteError(payload));
     }
 
     pub fn send_action_error(&self, payload: String) {
-        let _ = self.tx.send(WebFeed::ActionError(payload));
-        self.wake.wake();
+        self.queue(WebFeed::ActionError(payload));
     }
 
     /// Tells every browser a share ended and drops its retained announcement.
     pub fn send_share_ended(&self, stream_id: u32, payload: String) {
-        let _ = self.tx.send(WebFeed::ShareEnded { stream_id, payload });
-        self.wake.wake();
+        self.queue(WebFeed::ShareEnded { stream_id, payload });
     }
 
     /// Sends one plaintext video frame body as a binary WebSocket message.
     pub fn send_video_frame(&self, frame: SharedVideoFrame) {
-        let _ = self.tx.send(WebFeed::VideoFrame(frame));
-        self.wake.wake();
+        self.queue(WebFeed::VideoFrame(frame));
     }
 
     /// Replaces the browser behavior settings on the running server and
@@ -855,17 +847,16 @@ impl WebFeedSender {
         viewer: WebViewer,
         max_upload_bytes: u64,
     ) {
-        let _ = self.tx.send(WebFeed::Config {
+        self.queue(WebFeed::Config {
             readonly,
             autoplay,
             viewer,
             max_upload_bytes,
         });
-        self.wake.wake();
     }
 
     pub fn stop(&self) {
-        let _ = self.tx.send(WebFeed::Stop);
+        self.stopping.store(true, Ordering::Release);
         self.wake.wake();
     }
 }
@@ -1051,7 +1042,11 @@ pub fn spawn_with_upload_limit(
     let wake = server.wake_handle()?;
     let local = server.local_addr()?;
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(WEB_FEED_CAPACITY);
+    let resync_history = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let run_resync_history = Arc::clone(&resync_history);
+    let run_stopping = Arc::clone(&stopping);
     let autoplay = cfg.autoplay;
     let viewer = cfg.viewer;
     thread::Builder::new()
@@ -1066,6 +1061,8 @@ pub fn spawn_with_upload_limit(
                 viewer,
                 max_upload_bytes,
                 room_name,
+                run_resync_history,
+                run_stopping,
             )
         })?;
 
@@ -1073,6 +1070,8 @@ pub fn spawn_with_upload_limit(
     Ok(WebFeedSender {
         tx,
         wake,
+        resync_history,
+        stopping,
         #[cfg(test)]
         local_addr: local,
     })
@@ -1088,6 +1087,8 @@ fn run(
     mut viewer: WebViewer,
     mut max_upload_bytes: u64,
     mut room_name: String,
+    resync_history: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
 ) {
     // Open uploads keyed by connection and browser-assigned id, each an
     // append-mode file the binary chunk frames stream into until `upload_finish`.
@@ -1114,6 +1115,16 @@ fn run(
     let mut e2e_security = None::<String>;
 
     loop {
+        if stopping.load(Ordering::Acquire) {
+            for stream_id in share_subscriptions
+                .iter()
+                .map(|(_, stream_id)| *stream_id)
+                .collect::<HashSet<_>>()
+            {
+                let _ = web_requests.send(WebRequest::StopShare { stream_id });
+            }
+            return;
+        }
         if let Err(error) = server.poll_once(None) {
             kvlog::error!("web server poll failed", error = %error);
             return;
@@ -1173,9 +1184,7 @@ fn run(
                         for payload in active_shares.values() {
                             let _ = server.send_websocket_text(id, payload);
                         }
-                        let _ = web_requests.send(WebRequest::HistorySnapshot {
-                            client: id.get(),
-                        });
+                        let _ = web_requests.send(WebRequest::HistorySnapshot { client: id.get() });
                     }
                 }
                 ServerEvent::WebSocketClose { id, reason } => {
@@ -1723,8 +1732,7 @@ fn run(
                     room_generation,
                     message_id,
                 }) => {
-                    let frame =
-                        web_wire::encode_delete(room_id, room_generation, message_id);
+                    let frame = web_wire::encode_delete(room_id, room_generation, message_id);
                     for id in &clients {
                         let _ = server.send_websocket_binary(*id, &frame);
                     }
@@ -1901,16 +1909,6 @@ fn run(
                         .or_default()
                         .push(stream_id, frame, is_key);
                 }
-                Ok(WebFeed::Stop) => {
-                    for stream_id in share_subscriptions
-                        .iter()
-                        .map(|(_, stream_id)| *stream_id)
-                        .collect::<HashSet<_>>()
-                    {
-                        let _ = web_requests.send(WebRequest::StopShare { stream_id });
-                    }
-                    return;
-                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     for stream_id in share_subscriptions
@@ -1922,6 +1920,14 @@ fn run(
                     }
                     return;
                 }
+            }
+        }
+
+        if resync_history.swap(false, Ordering::AcqRel) {
+            for client in &clients {
+                let _ = web_requests.send(WebRequest::HistorySnapshot {
+                    client: client.get(),
+                });
             }
         }
     }
@@ -2504,16 +2510,12 @@ mod tests {
     #[test]
     fn text_message_encodes_without_attachment() {
         let message = WebMessage::text_for_test(1, "hi");
-        let frame = web_wire::encode_window(
-            web_wire::KIND_SYNC,
-            RoomId(1),
-            7,
-            &[message],
-            None,
-            true,
-        );
+        let frame =
+            web_wire::encode_window(web_wire::KIND_SYNC, RoomId(1), 7, &[message], None, true);
         let decoded = web_wire::decode_window(&frame);
         assert!(decoded.messages[0].attachment_name.is_none());
+        assert!(decoded.messages[0].attachment_file_id.is_none());
+        assert!(decoded.messages[0].attachment_timestamp_ms.is_none());
     }
 
     use std::io::{Read, Write};

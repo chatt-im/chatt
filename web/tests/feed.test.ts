@@ -56,3 +56,38 @@ test("decodes durable attachment identity from a message frame", () => {
     height: null,
   });
 });
+
+test("decodes canonical room generation and message paging cursor", () => {
+  const bytes = [0, 0, 0, 0, 1];
+  u64(bytes, 9);
+  u64(bytes, 7);
+  u8(bytes, 1);
+  u64(bytes, 42);
+  u8(bytes, 0);
+  u32(bytes, 0);
+
+  expect(decodeFeed(Uint8Array.from(bytes).buffer)).toEqual({
+    kind: "sync",
+    room_id: 9,
+    room_generation: 7,
+    messages: [],
+    older_cursor: 42,
+    at_start: false,
+  });
+});
+
+test("reference previews preserve room-local identity", () => {
+  const bytes = [0, 0, 0, 0, 4];
+  u64(bytes, 2);
+  u64(bytes, 7);
+  u64(bytes, 42);
+  u8(bytes, 0);
+
+  expect(decodeFeed(Uint8Array.from(bytes).buffer)).toEqual({
+    kind: "ref_preview",
+    room_id: 2,
+    room_generation: 7,
+    message_id: 42,
+    message: null,
+  });
+});

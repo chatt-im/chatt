@@ -334,7 +334,13 @@ pub(crate) fn draw_room_screen(
     let frame_rows = u16::from(composer_padding) * 2;
     let composer_width = screen.w.saturating_sub(u16::from(composer_padding) * 2);
     if let Some(search) = history_search.as_mut() {
-        search.sync(&app.view.active.chat);
+        if let Some(history) = app
+            .view
+            .viewed_room
+            .and_then(|room_id| app.room.history_ref(room_id))
+        {
+            search.sync(&history);
+        }
     }
     let max_bottom_rows = screen.h.saturating_sub(4 + frame_rows);
     let composer_layout = match history_search.as_deref() {
@@ -1728,6 +1734,7 @@ fn panel_mode_style(theme: Theme, panel: ChatPanelFocus) -> Style {
 fn queue_chat_scroll(
     area: Rect,
     app: &mut RenderState<'_>,
+    history: &crate::app::room::RoomHistoryRef<'_>,
     layout: &mut RoomLayout,
     content_width: u16,
     buf: &mut Buffer,
@@ -1736,7 +1743,11 @@ fn queue_chat_scroll(
         room: app.view.viewed_room,
         width: content_width,
         rect: area,
-        top: app.view.active.chat.viewport_top(content_width, area.h),
+        top: app
+            .view
+            .active
+            .chat
+            .viewport_top(history, content_width, area.h),
         epoch: app.view.active.chat.layout_epoch(),
     };
     if app.frame_retained
@@ -1768,17 +1779,32 @@ fn draw_chat(
         layout.clear_chat();
         return;
     }
-    // The leftmost column is a marker gutter (`▟`/`▌`), so content wraps to one
-    // column less than the full chat width.
+    // The chat panel's geometry exists even before a room is selected. Divider
+    // dragging and terminal-resize clamping use it independently of history.
     let content_width = area.w.saturating_sub(1).max(1);
-    if content_width != layout.chat_width {
-        // Reflow invalidates wrapped-line coordinates: the visual anchor is
-        // dropped and the cursor's line is clamped.
-        app.view.active.chat.on_reflow(content_width);
-    }
+    let width_changed = content_width != layout.chat_width;
     layout.chat_width = content_width;
     layout.chat_height = area.h;
     layout.chat_rect = area;
+    let Some(history) = app
+        .view
+        .viewed_room
+        .and_then(|room_id| app.room.history_ref(room_id))
+    else {
+        layout.chat_scroll_anchor = None;
+        layout.visible_chat_lines.clear();
+        area.with(app.view.theme.subtle)
+            .with(HAlign::Center)
+            .text(buf, "No messages");
+        return;
+    };
+    // The leftmost column is a marker gutter (`▟`/`▌`), so content wraps to one
+    // column less than the full chat width.
+    if width_changed {
+        // Reflow invalidates wrapped-line coordinates: the visual anchor is
+        // dropped and the cursor's line is clamped.
+        app.view.active.chat.on_reflow(&history, content_width);
+    }
     if app.view.active.chat.is_empty() {
         layout.chat_scroll_anchor = None;
         layout.visible_chat_lines.clear();
@@ -1788,9 +1814,10 @@ fn draw_chat(
         return;
     }
     // Clamp a stale cursor (eviction, collapse) before styling against it.
-    app.view.active.chat.ensure_cursor(content_width);
-    queue_chat_scroll(area, app, layout, content_width, buf);
+    app.view.active.chat.ensure_cursor(&history, content_width);
+    queue_chat_scroll(area, app, &history, layout, content_width, buf);
     app.view.active.chat.visible_lines_into(
+        &history,
         content_width,
         area.h,
         app.config.ui.overscan as usize,
@@ -1799,7 +1826,13 @@ fn draw_chat(
     let chat_focused = focus == ChatPanelFocus::ChatLog;
     let search_highlight = history_search
         .and_then(HistorySearch::selected_match)
-        .map(|found| (found.message, found.ranges.as_slice()));
+        .and_then(|found| {
+            app.view
+                .active
+                .chat
+                .entry_index(found.entry)
+                .map(|message| (message, found.ranges.as_slice()))
+        });
     // Content is top-anchored: lines are drawn from the top of `area` and the
     // already-background-filled rows below them stay empty.
     let mut row_area = area;
@@ -1807,9 +1840,13 @@ fn draw_chat(
         let mut row = row_area.take_top(1);
         let marker = row.take_left(1);
         match line.kind {
-            LineKind::Heading => draw_chat_heading(marker, row, app, line.message, now_ms, buf),
+            LineKind::Heading => {
+                draw_chat_heading(marker, row, app, &history, line.message, now_ms, buf)
+            }
             LineKind::Body => {
-                let msg = app.view.active.chat.message(line.message);
+                let Some(msg) = app.view.active.chat.record(&history, line.message) else {
+                    continue;
+                };
                 // A file message overlays its single body line, keyed by the
                 // server transfer id: an in-flight transfer draws a progress bar,
                 // one that ended without landing draws a terminal label. `transfer`
@@ -1845,15 +1882,22 @@ fn draw_chat(
                 {
                     // Copy out the name before the `msg` borrow of `app.room`
                     // ends: recording the button hit-box needs `&mut app`.
-                    let name = msg.body.split('`').nth(1).unwrap_or(&msg.body).to_string();
+                    let name = msg.body.split('`').nth(1).unwrap_or(msg.body).to_string();
                     draw_transfer_progress(row, base, progress, &name, transfer_id, app, buf);
                 } else {
                     for seg in app.view.active.chat.line(line.message, line.line) {
-                        let text = app.view.active.chat.segment_text(line.message, seg);
+                        let Some(text) =
+                            app.view
+                                .active
+                                .chat
+                                .segment_text(&history, line.message, seg)
+                        else {
+                            continue;
+                        };
                         let mut style = base.patch(app.view.theme.text).patch(seg.style);
+                        let links = chatt_message_format::inline_ranges(msg.body).urls;
                         if !seg.synth
-                            && msg
-                                .links
+                            && links
                                 .iter()
                                 .any(|link| seg.start < link.end && link.start < seg.end)
                         {
@@ -2010,11 +2054,14 @@ fn draw_chat_heading(
     marker: Rect,
     row: Rect,
     app: &RenderState<'_>,
+    history: &crate::app::room::RoomHistoryRef<'_>,
     message: usize,
     now_ms: u64,
     buf: &mut Buffer,
 ) {
-    let msg = app.view.active.chat.message(message);
+    let Some(msg) = app.view.active.chat.record(history, message) else {
+        return;
+    };
     let base = if msg.local {
         app.view.theme.local_line
     } else {
@@ -2028,7 +2075,7 @@ fn draw_chat_heading(
     let mut name = if msg.edited {
         format!("{} (edited)", msg.sender)
     } else {
-        msg.sender.clone()
+        msg.sender.to_string()
     };
     if app.view.active.chat.is_collapsed(message) {
         name.push_str(" (Collapsed)");
@@ -2837,6 +2884,13 @@ fn draw_history_search(
     if area.is_empty() {
         return;
     }
+    let Some(history) = app
+        .view
+        .viewed_room
+        .and_then(|room_id| app.room.history_ref(room_id))
+    else {
+        return;
+    };
     area.with(app.view.theme.background).fill(buf);
     if padded {
         area.take_left(1);
@@ -2880,9 +2934,11 @@ fn draw_history_search(
             app.view.theme.background
         };
         row.with(base).fill(buf);
-        let message = app.view.active.chat.message(found.message);
+        let Some(message) = history.record(found.entry) else {
+            continue;
+        };
         let first_match = found.ranges.first().map(|range| range.start as usize);
-        let (line_start, line_end) = body_line_around(&message.body, first_match);
+        let (line_start, line_end) = body_line_around(message.body, first_match);
         let prefix = if message.unverified {
             format!("{} (Unverified): ", message.sender)
         } else {
@@ -2996,8 +3052,11 @@ fn draw_composer(area: Rect, app: &mut RenderState<'_>, focus: ChatPanelFocus, b
         return;
     }
     app.view.composer.resize(area.w.max(1));
-    app.view
-        .refresh_command_completion(focus == ChatPanelFocus::Compose, app.view.theme.subtle);
+    app.view.refresh_command_completion(
+        app.room,
+        focus == ChatPanelFocus::Compose,
+        app.view.theme.subtle,
+    );
     app.view
         .composer_hl
         .render(&mut app.view.composer, area, buf, &app.view.theme);

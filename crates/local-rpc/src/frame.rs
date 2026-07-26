@@ -268,12 +268,14 @@ pub enum StateDelta {
     RoomSnapshot(RoomSnapshot),
     MessagesPrepended {
         room_id: RoomId,
+        room_generation: u64,
         messages: Vec<Message>,
         older_cursor: Option<MessageId>,
         at_start: bool,
     },
     HistoryStateChanged {
         room_id: RoomId,
+        room_generation: u64,
         older_cursor: Option<MessageId>,
         at_start: bool,
     },
@@ -340,12 +342,14 @@ pub enum ClientFrame {
     LoadOlder {
         request_id: RequestId,
         room_id: RoomId,
+        room_generation: u64,
         before: Option<MessageId>,
         limit: u16,
     },
     ResolveMessageReference {
         request_id: RequestId,
         room_id: RoomId,
+        room_generation: u64,
         message_id: MessageId,
     },
     SendMessage {
@@ -504,6 +508,7 @@ pub enum DaemonFrame {
     MessageReferenceResolved {
         request_id: RequestId,
         room_id: RoomId,
+        room_generation: u64,
         message_id: MessageId,
         message: Option<Message>,
     },
@@ -907,6 +912,7 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::MessageReferenceResolved {
             request_id,
             room_id,
+            room_generation: _,
             message_id,
             message,
         } => {
@@ -1184,12 +1190,14 @@ mod tests {
             ClientFrame::LoadOlder {
                 request_id,
                 room_id,
+                room_generation: 3,
                 before: Some(MessageId(4)),
                 limit: 20,
             },
             ClientFrame::ResolveMessageReference {
                 request_id,
                 room_id,
+                room_generation: 3,
                 message_id: MessageId(4),
             },
             ClientFrame::SendMessage {
@@ -1473,6 +1481,7 @@ mod tests {
             DaemonFrame::MessageReferenceResolved {
                 request_id,
                 room_id: RoomId(2),
+                room_generation: 3,
                 message_id: MessageId(4),
                 message: None,
             },

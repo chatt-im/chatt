@@ -233,8 +233,9 @@ impl TestApp {
     }
 
     pub(crate) fn request_older_history_if_at_top(&mut self, width: u16, height: u16) {
-        if self.view.active.chat.is_at_top(width, height)
-            && let Some(room_id) = self.view.viewed_room
+        if let Some(room_id) = self.view.viewed_room
+            && let Some(history) = self.app.room.history_ref(room_id)
+            && self.view.active.chat.is_at_top(&history, width, height)
         {
             self.app.request_older_history(room_id);
             self.sync_terminal_events();
@@ -307,7 +308,7 @@ impl TestApp {
                     height,
                 } => {
                     self.view.switch_room(target.room_id, &self.app.room);
-                    let _ = self.view.jump_to_ref(target, width, height);
+                    let _ = self.view.jump_to_ref(&self.app.room, target, width, height);
                 }
                 TerminalEvent::ClearVisualSelection => {
                     self.view.active.chat.clear_visual_anchor();
