@@ -635,7 +635,7 @@ fn scenario_server_config(
     config.network.public_tcp_addr.clear();
     config.network.public_udp_addr.clear();
     config.network.public_udp_probe_addr = None;
-    config.network.p2p_enabled = false;
+    config.network.p2p = false;
     config.security.server_identity_seed = dev_server_seed_hex();
     config.security.transport_encryption = true;
     config.storage.data_dir = Some(root.join("server").display().to_string());
