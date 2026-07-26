@@ -5,8 +5,8 @@
 //! `mpsc` channel and wakes the loop via a [`darkhttp::WakeHandle`] so they
 //! broadcast immediately. On connect a client receives a recent window of
 //! history, then a frame per new message. A browser pages older history on
-//! demand by sending a `load_older` request as it scrolls up, addressed by a
-//! server-assigned monotonic sequence number.
+//! demand by sending a `load_older` request as it scrolls up. Chat history is
+//! requested from the app's canonical room store and is never retained here.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -25,8 +25,8 @@ use darkhttp::{
 };
 use jsony::Jsony;
 use rpc::{
-    control::{ChatMessage, FileMetadata},
-    ids::UserId,
+    control::ChatMessage,
+    ids::{MessageId, RoomId, UserId},
     video::{self, SharedVideoFrame},
 };
 
@@ -54,11 +54,11 @@ mod embed {
 
 /// How many of the most recent messages a fresh `sync` frame carries. Older
 /// history is paged in on demand.
-const SYNC_WINDOW: usize = 100;
+pub(crate) const SYNC_WINDOW: usize = 100;
 
 /// Upper bound on the messages one `load_older` request can return, so a
 /// misbehaving client cannot ask for an unbounded slice.
-const MAX_PAGE: usize = 200;
+pub(crate) const MAX_PAGE: usize = 200;
 
 /// Largest UTF-8 file the highlighted preview endpoint will read and encode.
 const MAX_HIGHLIGHT_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -267,49 +267,6 @@ impl WebMessage {
 }
 
 impl WebMessage {
-    /// Builds a message representing a received file, with an inline attachment.
-    ///
-    /// `served_name` is the file's actual name on disk under the receive
-    /// directory, which is what `/files/<name>` resolves. It can differ from
-    /// `metadata.file_name` when a name collision was renamed on save.
-    ///
-    /// `dimensions`, when set, is the intrinsic pixel size of an image. It is
-    /// recorded only for the `image` kind so the frontend can reserve the box.
-    pub fn from_file(
-        metadata: &FileMetadata,
-        served_name: &str,
-        dimensions: Option<(u32, u32)>,
-        local_user: Option<UserId>,
-    ) -> Self {
-        // Name the body after the served file, not the sender's original name, so
-        // the recipient sees where the file actually landed after any save-time
-        // rename. Mirrors the announcement format so the size metadata survives
-        // whichever of the two messages wins the upsert merge.
-        let body = file_announcement_body(served_name, metadata.size);
-        WebMessage {
-            id: metadata.transfer_id.0,
-            sender: metadata.sender_name.clone(),
-            body: body.clone(),
-            local: Some(metadata.sender) == local_user,
-            unverified: false,
-            edited: false,
-            fragments: split_fragments(&body, &|_| None),
-            timestamp_ms: metadata.timestamp_ms,
-            attachment: Some(WebAttachment::from_served_file(
-                metadata.transfer_id.0,
-                metadata.timestamp_ms,
-                served_name,
-                dimensions,
-            )),
-            file_id: Some(metadata.transfer_id.0),
-            // The announcement message carries the identity; merge_from keeps it.
-            message_id: 0,
-            ref_code: String::new(),
-        }
-    }
-}
-
-impl WebMessage {
     /// Builds a file message from persisted history: the chat announcement plus
     /// the stored served name and image dimensions. Used to populate the web
     /// backlog with a room's file messages when the room is entered.
@@ -349,39 +306,6 @@ impl WebMessage {
     }
 }
 
-impl WebMessage {
-    /// Folds a later message for the same file into this one. Order-independent:
-    /// the incoming fields win, but an attachment is never dropped, so the inline
-    /// version's media survives whether it arrives before or after the
-    /// announcement placeholder. The reference identity survives the same way:
-    /// only the announcement message knows it, the inline file does not.
-    fn merge_from(&mut self, incoming: WebMessage) {
-        let attachment = incoming.attachment.or_else(|| self.attachment.take());
-        let message_id = if incoming.message_id != 0 {
-            incoming.message_id
-        } else {
-            self.message_id
-        };
-        let ref_code = if incoming.ref_code.is_empty() {
-            std::mem::take(&mut self.ref_code)
-        } else {
-            incoming.ref_code.clone()
-        };
-        let unverified = if incoming.message_id != 0 {
-            incoming.unverified
-        } else {
-            self.unverified
-        };
-        *self = WebMessage {
-            attachment,
-            message_id,
-            ref_code,
-            unverified,
-            ..incoming
-        };
-    }
-}
-
 #[cfg(test)]
 impl WebMessage {
     /// A plain text message with a fixed sender and timestamp, for tests.
@@ -401,12 +325,6 @@ impl WebMessage {
             ref_code: String::new(),
         }
     }
-}
-
-fn same_file(left: &WebMessage, right: &WebMessage) -> bool {
-    left.file_id.is_some()
-        && left.file_id == right.file_id
-        && left.timestamp_ms == right.timestamp_ms
 }
 
 /// Formats a byte count the way the server's file announcement does, so an
@@ -452,11 +370,27 @@ pub(crate) fn classify(name: &str) -> &'static str {
 }
 
 /// What the app sends to the web thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebAudience {
+    All,
+    One(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryWindowKind {
+    Sync,
+    Older,
+}
+
 enum WebFeed {
-    Message(WebMessage),
-    /// Drops the retained message with this chat message id and tells every
-    /// browser to remove it.
+    Message {
+        room_id: RoomId,
+        room_generation: u64,
+        message: WebMessage,
+    },
     Delete {
+        room_id: RoomId,
+        room_generation: u64,
         message_id: u64,
     },
     /// A transient `delete_error` envelope for a locally/server-rejected web
@@ -465,12 +399,31 @@ enum WebFeed {
     /// A browser-visible rejection that cannot be tied to one still-pending
     /// local request (for example, a later room-server mutation rejection).
     ActionError(String),
-    /// Replaces the backlog with the current room's messages (empty when there
-    /// is no current room) and re-syncs every connected browser. The web view
-    /// mirrors the room the client is in, nothing more.
-    SetRoom {
+    /// Changes the transport-visible room label. Chat content arrives only in
+    /// authoritative windows projected by the app from canonical room history.
+    SetRoomName {
         name: String,
+    },
+    HistoryWindow {
+        audience: WebAudience,
+        kind: HistoryWindowKind,
+        room_id: RoomId,
+        room_generation: u64,
         messages: Vec<WebMessage>,
+        older_cursor: Option<MessageId>,
+        at_start: bool,
+    },
+    StaleHistory {
+        client: u64,
+        room_id: RoomId,
+        room_generation: u64,
+    },
+    RefPreview {
+        client: u64,
+        room_id: RoomId,
+        room_generation: u64,
+        message_id: MessageId,
+        message: Option<WebMessage>,
     },
     /// Read-only browser projection of the viewed DM's E2E security state.
     E2eSecurity {
@@ -543,6 +496,22 @@ enum WebFeed {
 /// reach the app to spawn the viewer connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WebRequest {
+    HistorySnapshot {
+        client: u64,
+    },
+    LoadOlder {
+        client: u64,
+        room_id: RoomId,
+        room_generation: u64,
+        before_message_id: MessageId,
+        limit: u64,
+    },
+    RefPreview {
+        client: u64,
+        room_id: RoomId,
+        room_generation: u64,
+        message_id: MessageId,
+    },
     PlayShare {
         client: u64,
         stream_id: u32,
@@ -602,14 +571,22 @@ pub enum WebRequest {
 #[derive(Jsony)]
 #[jsony(Json, tag = "type")]
 enum ClientRequest {
-    /// Asks for up to `limit` messages immediately older than `before_seq`.
+    /// Asks for up to `limit` canonical messages immediately older than the
+    /// supplied room-local message id.
     #[jsony(rename = "load_older")]
-    LoadOlder { before_seq: u64, limit: u64 },
-    /// Asks for the message a `@@` reference targets, keyed by its timestamp and
-    /// message id, so a hover card can preview a target outside the browser's
-    /// loaded window without paging it into the view.
+    LoadOlder {
+        room_id: u64,
+        room_generation: u64,
+        before_message_id: u64,
+        limit: u64,
+    },
+    /// Asks the canonical owner for the message a `@@` reference targets.
     #[jsony(rename = "ref_preview")]
-    RefPreview { ts: u64, mid: u64 },
+    RefPreview {
+        room_id: u64,
+        room_generation: u64,
+        message_id: u64,
+    },
     /// Asks the app to start streaming a screen share into this browser.
     #[jsony(rename = "play_share")]
     PlayShare { stream_id: u32 },
@@ -705,19 +682,72 @@ impl WebFeedSender {
         self.local_addr
     }
 
-    /// Pushes a message to every connected browser and records it in history.
-    pub fn send(&self, message: WebMessage) {
-        let _ = self.tx.send(WebFeed::Message(message));
+    /// Pushes one transient canonical projection to every connected browser.
+    pub fn send(&self, room_id: RoomId, room_generation: u64, message: WebMessage) {
+        let _ = self.tx.send(WebFeed::Message {
+            room_id,
+            room_generation,
+            message,
+        });
         self.wake.wake();
     }
 
-    /// Replaces the feed's room name and backlog, then re-syncs every browser.
-    ///
-    /// Call this on entering a room (with that room's history) and on leaving
-    /// one (with an empty vector) so the web view always shows exactly the
-    /// current room's content.
-    pub fn set_room(&self, name: String, messages: Vec<WebMessage>) {
-        let _ = self.tx.send(WebFeed::SetRoom { name, messages });
+    pub fn set_room_name(&self, name: String) {
+        let _ = self.tx.send(WebFeed::SetRoomName { name });
+        self.wake.wake();
+    }
+
+    pub fn send_history_window(
+        &self,
+        audience: WebAudience,
+        kind: HistoryWindowKind,
+        room_id: RoomId,
+        room_generation: u64,
+        messages: Vec<WebMessage>,
+        older_cursor: Option<MessageId>,
+        at_start: bool,
+    ) {
+        let _ = self.tx.send(WebFeed::HistoryWindow {
+            audience,
+            kind,
+            room_id,
+            room_generation,
+            messages,
+            older_cursor,
+            at_start,
+        });
+        self.wake.wake();
+    }
+
+    pub fn send_stale_history(
+        &self,
+        client: u64,
+        room_id: RoomId,
+        room_generation: u64,
+    ) {
+        let _ = self.tx.send(WebFeed::StaleHistory {
+            client,
+            room_id,
+            room_generation,
+        });
+        self.wake.wake();
+    }
+
+    pub fn send_ref_preview(
+        &self,
+        client: u64,
+        room_id: RoomId,
+        room_generation: u64,
+        message_id: MessageId,
+        message: Option<WebMessage>,
+    ) {
+        let _ = self.tx.send(WebFeed::RefPreview {
+            client,
+            room_id,
+            room_generation,
+            message_id,
+            message,
+        });
         self.wake.wake();
     }
 
@@ -783,9 +813,13 @@ impl WebFeedSender {
         self.wake.wake();
     }
 
-    /// Tells every browser to drop a deleted chat message.
-    pub fn send_delete(&self, message_id: u64) {
-        let _ = self.tx.send(WebFeed::Delete { message_id });
+    /// Tells every browser to drop a deleted canonical chat message.
+    pub fn send_delete(&self, room_id: RoomId, room_generation: u64, message_id: u64) {
+        let _ = self.tx.send(WebFeed::Delete {
+            room_id,
+            room_generation,
+            message_id,
+        });
         self.wake.wake();
     }
 
@@ -945,8 +979,7 @@ fn websocket_origins(cfg: &WebConfig, addr: SocketAddr) -> Vec<String> {
 /// `/files` and `/highlight` resolve every served name through `download_store`,
 /// which maps each name to its source — in-memory bytes or an absolute disk
 /// path — so downloads resolve in any mode and from any directory without a
-/// captured mount. `max_messages` bounds the in-memory history replayed to new
-/// clients.
+/// captured mount.
 ///
 /// # Errors
 ///
@@ -956,14 +989,14 @@ fn websocket_origins(cfg: &WebConfig, addr: SocketAddr) -> Vec<String> {
 pub fn spawn(
     cfg: &WebConfig,
     download_store: DownloadStore,
-    max_messages: usize,
+    _max_messages: usize,
     web_requests: Sender<WebRequest>,
     readonly: bool,
 ) -> io::Result<WebFeedSender> {
     spawn_with_upload_limit(
         cfg,
         download_store,
-        max_messages,
+        _max_messages,
         web_requests,
         readonly,
         rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
@@ -974,7 +1007,7 @@ pub fn spawn(
 pub fn spawn_with_upload_limit(
     cfg: &WebConfig,
     download_store: DownloadStore,
-    max_messages: usize,
+    _max_messages: usize,
     web_requests: Sender<WebRequest>,
     readonly: bool,
     max_upload_bytes: u64,
@@ -1027,7 +1060,6 @@ pub fn spawn_with_upload_limit(
             run(
                 server,
                 rx,
-                max_messages,
                 web_requests,
                 readonly,
                 autoplay,
@@ -1050,7 +1082,6 @@ pub fn spawn_with_upload_limit(
 fn run(
     mut server: Server,
     rx: Receiver<WebFeed>,
-    max_messages: usize,
     web_requests: Sender<WebRequest>,
     mut readonly: bool,
     mut autoplay: WebAutoplay,
@@ -1064,11 +1095,6 @@ fn run(
     // from colliding, and lets a disconnect drop that client's in-flight files.
     // Empty and unused when read-only.
     let mut uploads: HashMap<(WebSocketId, u32), UploadSink> = HashMap::new();
-    let mut history: Vec<WebMessage> = Vec::new();
-    // The sequence number of `history[0]`. Sequence numbers are monotonic across
-    // the whole feed and survive front-draining, so a browser can address older
-    // history independent of the message ids (which span two id namespaces).
-    let mut base_seq: u64 = 0;
     let mut clients: Vec<WebSocketId> = Vec::new();
     // Browser playback subscriptions are scoped to the originating socket.
     // The app-level subscriber is started on the first subscription and stopped
@@ -1131,7 +1157,6 @@ fn run(
                             readonly
                         );
                         clients.push(id);
-                        let _ = server.send_websocket_binary(id, &sync_frame(&history, base_seq));
                         let _ = server.send_websocket_text(
                             id,
                             &config_envelope(
@@ -1148,6 +1173,9 @@ fn run(
                         for payload in active_shares.values() {
                             let _ = server.send_websocket_text(id, payload);
                         }
+                        let _ = web_requests.send(WebRequest::HistorySnapshot {
+                            client: id.get(),
+                        });
                     }
                 }
                 ServerEvent::WebSocketClose { id, reason } => {
@@ -1191,27 +1219,52 @@ fn run(
                     id,
                     message: WebSocketMessage::Text(text),
                 } => match jsony::from_json::<ClientRequest>(&text) {
-                    Ok(ClientRequest::LoadOlder { before_seq, limit }) => {
+                    Ok(ClientRequest::LoadOlder {
+                        room_id,
+                        room_generation,
+                        before_message_id,
+                        limit,
+                    }) => {
                         kvlog::debug!(
                             "websocket request",
                             ws_id = id.get(),
                             kind = "load_older",
-                            before_seq,
+                            room_id,
+                            room_generation,
+                            before_message_id,
                             limit
                         );
-                        let frame = older_frame(before_seq, limit, &history, base_seq);
-                        let _ = server.send_websocket_binary(id, &frame);
+                        if let Ok(room_id) = u32::try_from(room_id) {
+                            let _ = web_requests.send(WebRequest::LoadOlder {
+                                client: id.get(),
+                                room_id: RoomId(room_id),
+                                room_generation,
+                                before_message_id: MessageId(before_message_id),
+                                limit,
+                            });
+                        }
                     }
-                    Ok(ClientRequest::RefPreview { ts, mid }) => {
+                    Ok(ClientRequest::RefPreview {
+                        room_id,
+                        room_generation,
+                        message_id,
+                    }) => {
                         kvlog::debug!(
                             "websocket request",
                             ws_id = id.get(),
                             kind = "ref_preview",
-                            ts,
-                            mid
+                            room_id,
+                            room_generation,
+                            message_id
                         );
-                        let frame = ref_preview_frame(ts, mid, &history);
-                        let _ = server.send_websocket_binary(id, &frame);
+                        if let Ok(room_id) = u32::try_from(room_id) {
+                            let _ = web_requests.send(WebRequest::RefPreview {
+                                client: id.get(),
+                                room_id: RoomId(room_id),
+                                room_generation,
+                                message_id: MessageId(message_id),
+                            });
+                        }
                     }
                     Ok(ClientRequest::PlayShare { stream_id }) => {
                         kvlog::debug!(
@@ -1655,67 +1708,88 @@ fn run(
 
         loop {
             match rx.try_recv() {
-                Ok(WebFeed::Message(message)) => {
-                    // A file message upserts onto its existing entry (the
-                    // announcement placeholder, or the inline version if it
-                    // arrived first), so a file is one message enriched in place,
-                    // never two. The seq is preserved, so paging is untouched.
-                    // A re-sent text message (a fold of an edit) upserts by
-                    // its chat message id the same way.
-                    let existing = history.iter_mut().rev().find(|held| {
-                        if message.file_id.is_some() {
-                            same_file(held, &message)
-                        } else {
-                            message.message_id != 0 && held.message_id == message.message_id
-                        }
-                    });
-                    let frame = if let Some(existing) = existing {
-                        existing.merge_from(message);
-                        web_wire::encode_single(existing)
-                    } else {
-                        let frame = web_wire::encode_single(&message);
-                        history.push(message);
-                        if history.len() > max_messages {
-                            let excess = history.len() - max_messages;
-                            history.drain(0..excess);
-                            base_seq += excess as u64;
-                        }
-                        frame
-                    };
+                Ok(WebFeed::Message {
+                    room_id,
+                    room_generation,
+                    message,
+                }) => {
+                    let frame = web_wire::encode_single(room_id, room_generation, &message);
                     for id in &clients {
                         let _ = server.send_websocket_binary(*id, &frame);
                     }
                 }
-                Ok(WebFeed::Delete { message_id }) => {
-                    // Removing a middle entry shifts the `base_seq + index`
-                    // mapping by one for an in-flight `load_older` cursor;
-                    // bounded, and the next sync frame corrects it.
-                    history.retain(|held| held.message_id != message_id);
-                    let frame = web_wire::encode_delete(message_id);
+                Ok(WebFeed::Delete {
+                    room_id,
+                    room_generation,
+                    message_id,
+                }) => {
+                    let frame =
+                        web_wire::encode_delete(room_id, room_generation, message_id);
                     for id in &clients {
                         let _ = server.send_websocket_binary(*id, &frame);
                     }
                 }
-                Ok(WebFeed::SetRoom { name, messages }) => {
-                    // Advance the sequence past the dropped backlog so a browser
-                    // never confuses the new room's messages with the old ones,
-                    // then bound the replacement to the same window as live sends.
-                    base_seq += history.len() as u64;
-                    history = messages;
-                    if history.len() > max_messages {
-                        let excess = history.len() - max_messages;
-                        history.drain(0..excess);
-                        base_seq += excess as u64;
-                    }
-                    let frame = sync_frame(&history, base_seq);
-                    for id in &clients {
-                        let _ = server.send_websocket_binary(*id, &frame);
-                    }
+                Ok(WebFeed::SetRoomName { name }) => {
                     room_name = name;
                     let payload = room_envelope(&room_name);
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }
+                }
+                Ok(WebFeed::HistoryWindow {
+                    audience,
+                    kind,
+                    room_id,
+                    room_generation,
+                    messages,
+                    older_cursor,
+                    at_start,
+                }) => {
+                    let frame = web_wire::encode_window(
+                        match kind {
+                            HistoryWindowKind::Sync => web_wire::KIND_SYNC,
+                            HistoryWindowKind::Older => web_wire::KIND_OLDER,
+                        },
+                        room_id,
+                        room_generation,
+                        &messages,
+                        older_cursor,
+                        at_start,
+                    );
+                    send_binary_to_audience(&mut server, &clients, audience, &frame);
+                }
+                Ok(WebFeed::StaleHistory {
+                    client,
+                    room_id,
+                    room_generation,
+                }) => {
+                    let frame = web_wire::encode_stale(room_id, room_generation);
+                    send_binary_to_audience(
+                        &mut server,
+                        &clients,
+                        WebAudience::One(client),
+                        &frame,
+                    );
+                }
+                Ok(WebFeed::RefPreview {
+                    client,
+                    room_id,
+                    room_generation,
+                    message_id,
+                    message,
+                }) => {
+                    let frame = web_wire::encode_ref_preview(
+                        room_id,
+                        room_generation,
+                        message_id.0,
+                        message.as_ref(),
+                    );
+                    send_binary_to_audience(
+                        &mut server,
+                        &clients,
+                        WebAudience::One(client),
+                        &frame,
+                    );
                 }
                 Ok(WebFeed::E2eSecurity { payload, active }) => {
                     for id in &clients {
@@ -1853,52 +1927,24 @@ fn run(
     }
 }
 
-/// The `sync` frame sent on connect: the most recent [`SYNC_WINDOW`] messages.
-fn sync_frame(history: &[WebMessage], base_seq: u64) -> Vec<u8> {
-    let start = history.len().saturating_sub(SYNC_WINDOW);
-    web_wire::encode_window(
-        web_wire::KIND_SYNC,
-        &history[start..],
-        base_seq + start as u64,
-        start > 0,
-    )
-}
-
-/// Builds the `older` frame for a `load_older` cursor: the `limit` messages
-/// immediately before `before_seq`.
-fn older_frame(before_seq: u64, limit: u64, history: &[WebMessage], base_seq: u64) -> Vec<u8> {
-    // Clamp the cursor into the retained range, then take the `limit` messages
-    // immediately before it.
-    let end = before_seq
-        .saturating_sub(base_seq)
-        .min(history.len() as u64) as usize;
-    let limit = (limit as usize).clamp(1, MAX_PAGE);
-    let start = end.saturating_sub(limit);
-    web_wire::encode_window(
-        web_wire::KIND_OLDER,
-        &history[start..end],
-        base_seq + start as u64,
-        start > 0,
-    )
-}
-
-/// Builds the `ref_preview` response for one reference key: the matching
-/// message when the retained history holds it, else a not-found frame so the
-/// browser can cache the miss. `message_id` zero never matches, because it
-/// marks a message whose id is unknown, not a referenceable target.
-fn ref_preview_frame(ts: u64, mid: u64, history: &[WebMessage]) -> Vec<u8> {
-    let mut found = None;
-    if mid != 0 {
-        for message in history.iter().rev() {
-            if message.message_id == mid {
-                found = Some(message);
-                break;
+fn send_binary_to_audience(
+    server: &mut Server,
+    clients: &[WebSocketId],
+    audience: WebAudience,
+    frame: &[u8],
+) {
+    match audience {
+        WebAudience::All => {
+            for id in clients {
+                let _ = server.send_websocket_binary(*id, frame);
+            }
+        }
+        WebAudience::One(client) => {
+            if let Some(id) = clients.iter().find(|id| id.get() == client) {
+                let _ = server.send_websocket_binary(*id, frame);
             }
         }
     }
-    // The `ts` echo stays in the frame so its layout is stable for the
-    // browser's fixed reader, even though the id alone is the identity.
-    web_wire::encode_ref_preview(ts, mid, found)
 }
 
 /// The JSON envelope sent on connect (and re-sent on live settings changes)
@@ -2332,29 +2378,6 @@ mod tests {
         assert_eq!(classify("noext"), "file");
     }
 
-    fn text_message(id: u64, body: &str) -> WebMessage {
-        WebMessage::text_for_test(id, body)
-    }
-
-    #[test]
-    fn text_edit_resend_merges_replacing_fragments() {
-        let mut held = text_message(7, "original");
-        held.attachment = Some(WebAttachment {
-            file_id: 17,
-            timestamp_ms: 23,
-            name: "pic.png".to_string(),
-            kind: "image".to_string(),
-            width: None,
-            height: None,
-        });
-
-        held.merge_from(text_message(7, "revised"));
-
-        assert_eq!(held.message_id, 7);
-        assert_eq!(held.fragments, split_fragments("revised", &|_| None));
-        assert!(held.attachment.is_some(), "attachment survives the upsert");
-    }
-
     #[test]
     fn highlight_name_validation_allows_flat_dotted_names() {
         assert!(valid_highlight_name("trace..old.rs"));
@@ -2366,142 +2389,7 @@ mod tests {
         assert!(!valid_highlight_name(r"nested\main.rs"));
     }
 
-    /// Parses a `load_older` request and builds its frame, mirroring the run
-    /// loop's request handling.
-    fn older_frame_for(request: &str, history: &[WebMessage], base_seq: u64) -> Option<Vec<u8>> {
-        match jsony::from_json(request).ok()? {
-            ClientRequest::LoadOlder { before_seq, limit } => {
-                Some(older_frame(before_seq, limit, history, base_seq))
-            }
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn sync_frame_wraps_recent_window() {
-        let history = vec![text_message(7, "hi")];
-        let window = web_wire::decode_window(&sync_frame(&history, 0));
-        assert_eq!(window.kind, web_wire::KIND_SYNC);
-        assert_eq!(window.oldest_seq, 0);
-        assert!(!window.has_more);
-        assert_eq!(window.messages.len(), 1);
-        assert_eq!(window.messages[0].sender, "Alice");
-    }
-
-    #[test]
-    fn sync_frame_caps_window_and_flags_more() {
-        let history: Vec<WebMessage> = (0..SYNC_WINDOW as u64 + 5)
-            .map(|i| text_message(i, "m"))
-            .collect();
-        let window = web_wire::decode_window(&sync_frame(&history, 0));
-        // Only the last SYNC_WINDOW messages, starting at seq 5, with older
-        // history still available.
-        assert_eq!(window.oldest_seq, 5);
-        assert!(window.has_more);
-        assert_eq!(window.messages.len(), SYNC_WINDOW);
-    }
-
-    #[test]
-    fn older_frame_returns_window_before_cursor() {
-        let history: Vec<WebMessage> = (0..10).map(|i| text_message(i, "m")).collect();
-        // Ask for the 3 messages before seq 5, while base_seq is 0.
-        let request = r#"{"type":"load_older","before_seq":5,"limit":3}"#;
-        let frame = older_frame_for(request, &history, 0).expect("valid request");
-        let window = web_wire::decode_window(&frame);
-        assert_eq!(window.kind, web_wire::KIND_OLDER);
-        assert_eq!(window.oldest_seq, 2);
-        assert!(window.has_more);
-        assert_eq!(window.messages.len(), 3);
-    }
-
-    #[test]
-    fn older_frame_clears_more_at_start() {
-        let history: Vec<WebMessage> = (0..10).map(|i| text_message(i, "m")).collect();
-        let request = r#"{"type":"load_older","before_seq":2,"limit":50}"#;
-        let frame = older_frame_for(request, &history, 0).expect("valid request");
-        let window = web_wire::decode_window(&frame);
-        assert_eq!(window.oldest_seq, 0);
-        assert!(!window.has_more);
-        assert_eq!(window.messages.len(), 2);
-    }
-
-    #[test]
-    fn older_frame_rejects_garbage() {
-        let history = vec![text_message(0, "m")];
-        assert!(older_frame_for("not json", &history, 0).is_none());
-        assert!(older_frame_for(r#"{"type":"other"}"#, &history, 0).is_none());
-    }
-
-    #[test]
-    fn ref_preview_frame_finds_target_by_key() {
-        let history: Vec<WebMessage> = (1..=5).map(|i| text_message(i, "m")).collect();
-        let frame = ref_preview_frame(100, 3, &history);
-        assert_eq!(frame[4], web_wire::KIND_REF_PREVIEW);
-        assert_eq!(u64::from_le_bytes(frame[5..13].try_into().unwrap()), 100);
-        assert_eq!(u64::from_le_bytes(frame[13..21].try_into().unwrap()), 3);
-        assert_eq!(frame[21], 1);
-    }
-
-    #[test]
-    fn ref_preview_frame_reports_miss_and_never_matches_unknown_id() {
-        let history = vec![text_message(0, "m"), text_message(1, "m")];
-        let miss = ref_preview_frame(100, 9, &history);
-        assert_eq!(miss[21], 0);
-        // A stored message with id 0 has an unknown id; a mid-0 request must
-        // not claim it as the reference target.
-        let unknown = ref_preview_frame(100, 0, &history);
-        assert_eq!(unknown[21], 0);
-    }
-
-    use rpc::control::{FileContentEncoding, FileMetadata};
     use rpc::ids::{FileTransferId, RoomId, UserId};
-
-    #[test]
-    fn from_file_uses_served_name_for_attachment() {
-        let metadata = FileMetadata {
-            mls_event_id: None,
-            transfer_id: FileTransferId(3),
-            room_id: RoomId(1),
-            sender: UserId(2),
-            sender_name: "Alice".to_string(),
-            file_name: "wide.png".to_string(),
-            original_name: "wide.png".to_string(),
-            size: 10,
-            encoding: FileContentEncoding::Identity,
-            timestamp_ms: 5,
-        };
-        // A save-time collision renamed the file on disk.
-        let message = WebMessage::from_file(&metadata, "wide-1.png", Some((640, 480)), None);
-        let attachment = message.attachment.as_ref().expect("attachment present");
-        assert_eq!(attachment.name, "wide-1.png");
-        assert_eq!(attachment.file_id, 3);
-        assert_eq!(attachment.timestamp_ms, 5);
-        assert_eq!(attachment.kind, "image");
-        assert_eq!(attachment.width, Some(640));
-        assert_eq!(attachment.height, Some(480));
-
-        // The encoded frame carries the served name in its attachment.
-        let frame = web_wire::encode_single(&message);
-        let window_like =
-            web_wire::encode_window(web_wire::KIND_SYNC, &[message.clone()], 0, false);
-        let decoded = web_wire::decode_window(&window_like);
-        assert_eq!(
-            decoded.messages[0].attachment_name.as_deref(),
-            Some("wide-1.png")
-        );
-        assert_eq!(decoded.messages[0].attachment_file_id, Some(3));
-        assert_eq!(decoded.messages[0].attachment_timestamp_ms, Some(5));
-        assert!(!frame.is_empty());
-
-        // The file id carries the transfer id and the body names the served file
-        // (the renamed on-disk name), keeping the size, so the recipient sees
-        // where it actually landed.
-        assert_eq!(message.file_id, Some(3));
-        let Fragment::Text { html: body, .. } = &message.fragments[0] else {
-            panic!("expected a text fragment");
-        };
-        assert_eq!(body, "<p>sent file <code>wide-1.png</code> (10 B)</p>");
-    }
 
     #[test]
     fn history_attachment_preserves_durable_upload_identity() {
@@ -2526,21 +2414,6 @@ mod tests {
         let attachment = projected.attachment.expect("attachment present");
         assert_eq!(attachment.file_id, 37);
         assert_eq!(attachment.timestamp_ms, 8_000);
-    }
-
-    fn file_metadata(transfer_id: u64) -> FileMetadata {
-        FileMetadata {
-            mls_event_id: None,
-            transfer_id: FileTransferId(transfer_id),
-            room_id: RoomId(1),
-            sender: UserId(2),
-            sender_name: "Alice".to_string(),
-            file_name: "wide.png".to_string(),
-            original_name: "wide.png".to_string(),
-            size: 2048,
-            encoding: FileContentEncoding::Identity,
-            timestamp_ms: 5,
-        }
     }
 
     #[test]
@@ -2612,57 +2485,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_enriches_placeholder_in_place() {
-        let mut placeholder = file_placeholder(7, "sent file `wide.png` (2.0 KiB)");
-        let inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)), None);
-        placeholder.merge_from(inline);
-        let attachment = placeholder.attachment.as_ref().expect("attachment kept");
-        assert_eq!(attachment.width, Some(4));
-        assert_eq!(placeholder.file_id, Some(7));
-    }
-
-    #[test]
-    fn merge_keeps_attachment_when_placeholder_arrives_last() {
-        // Reverse order: the inline file arrived first, then the announcement.
-        let mut inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)), None);
-        let placeholder = file_placeholder(7, "sent file `wide.png` (2.0 KiB)");
-        inline.merge_from(placeholder);
-        assert!(
-            inline.attachment.is_some(),
-            "a late placeholder must not drop the attachment"
-        );
-    }
-
-    #[test]
-    fn merge_preserves_reference_identity_from_either_side() {
-        // Inline file enriches the announcement: the announcement's message
-        // identity must survive, since the inline side has none.
-        let mut placeholder = file_placeholder(7, "sent file `wide.png` (2.0 KiB)");
-        let inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)), None);
-        placeholder.merge_from(inline);
-        assert_eq!(placeholder.message_id, 99);
-        assert_eq!(placeholder.ref_code, "testref");
-
-        // Reverse order: the announcement arrives last and its identity wins.
-        let mut inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)), None);
-        assert_eq!(inline.message_id, 0);
-        inline.merge_from(file_placeholder(7, "sent file `wide.png` (2.0 KiB)"));
-        assert_eq!(inline.message_id, 99);
-        assert_eq!(inline.ref_code, "testref");
-    }
-
-    #[test]
-    fn file_identity_includes_announcement_timestamp() {
-        let first = WebMessage::from_file(&file_metadata(7), "first.png", None, None);
-        let mut second_metadata = file_metadata(7);
-        second_metadata.timestamp_ms += 1;
-        let second = WebMessage::from_file(&second_metadata, "second.png", None, None);
-
-        assert!(same_file(&first, &first));
-        assert!(!same_file(&first, &second));
-    }
-
-    #[test]
     fn image_dimensions_parses_png_header() {
         let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         png.extend_from_slice(&[0, 0, 0, 13]);
@@ -2680,48 +2502,16 @@ mod tests {
     }
 
     #[test]
-    fn non_image_attachment_drops_dimensions() {
-        let metadata = FileMetadata {
-            mls_event_id: None,
-            transfer_id: FileTransferId(4),
-            room_id: RoomId(1),
-            sender: UserId(2),
-            sender_name: "Alice".to_string(),
-            file_name: "clip.mp4".to_string(),
-            original_name: "clip.mp4".to_string(),
-            size: 10,
-            encoding: FileContentEncoding::Identity,
-            timestamp_ms: 5,
-        };
-        let message = WebMessage::from_file(&metadata, "clip.mp4", Some((1920, 1080)), None);
-        let attachment = message.attachment.as_ref().expect("attachment present");
-        assert_eq!(attachment.kind, "video");
-        assert_eq!(attachment.width, None);
-        assert_eq!(attachment.height, None);
-    }
-
-    /// A file announcement placeholder: a file id and body but no attachment yet.
-    fn file_placeholder(id: u64, body: &str) -> WebMessage {
-        WebMessage {
-            id,
-            sender: "Alice".to_string(),
-            body: body.to_string(),
-            local: false,
-            edited: false,
-            unverified: false,
-            fragments: split_fragments(body, &|_| None),
-            timestamp_ms: 5,
-            attachment: None,
-            file_id: Some(id),
-            message_id: 99,
-            ref_code: "testref".to_string(),
-        }
-    }
-
-    #[test]
     fn text_message_encodes_without_attachment() {
         let message = WebMessage::text_for_test(1, "hi");
-        let frame = web_wire::encode_window(web_wire::KIND_SYNC, &[message], 0, false);
+        let frame = web_wire::encode_window(
+            web_wire::KIND_SYNC,
+            RoomId(1),
+            7,
+            &[message],
+            None,
+            true,
+        );
         let decoded = web_wire::decode_window(&frame);
         assert!(decoded.messages[0].attachment_name.is_none());
     }
@@ -3080,18 +2870,13 @@ Sec-WebSocket-Version: 13\r\n\
             "{headers}"
         );
 
-        // The feed frames are binary (opcode 0x2). The first is an empty sync.
+        // Transport configuration is available immediately. History follows
+        // only after the app answers the socket's canonical snapshot request.
         let (opcode, payload) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x2);
-        let sync = web_wire::decode_window(&payload);
-        assert_eq!(sync.kind, web_wire::KIND_SYNC);
-        assert!(sync.messages.is_empty());
-
-        // The config envelope follows the sync frame as a text frame.
-        let (opcode, _) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x1);
+        assert!(String::from_utf8(payload).unwrap().contains("\"config\""));
 
-        sender.send(WebMessage::text_for_test(1, "hello web"));
+        sender.send(RoomId(1), 7, WebMessage::text_for_test(1, "hello web"));
 
         let (opcode, payload) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x2);
@@ -3126,20 +2911,25 @@ Sec-WebSocket-Version: 13\r\n\
         stream.write_all(&frame).unwrap();
     }
 
-    /// Consumes the config envelope that follows the sync frame on every connect.
+    /// Consumes the config envelope sent on every connect.
     fn drain_config(stream: &mut TcpStream) {
         let (opcode, config) = read_ws_frame(stream);
         assert_eq!(opcode, 0x1);
         assert!(String::from_utf8(config).unwrap().contains("\"config\""));
     }
 
-    /// Opens a browser feed, draining the sync frame and the config envelope that
-    /// always follow a connect, and returns the socket ready for live frames.
-    fn open_ready_ws(addr: impl std::net::ToSocketAddrs) -> TcpStream {
+    /// Opens a browser feed, draining the config envelope, and returns the
+    /// socket ready for app-projected history or live frames.
+    fn open_ready_ws(
+        addr: impl std::net::ToSocketAddrs,
+        requests: &Receiver<WebRequest>,
+    ) -> TcpStream {
         let mut stream = open_ws(addr);
-        let (_, sync) = read_ws_frame(&mut stream);
-        assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
         drain_config(&mut stream);
+        assert!(matches!(
+            requests.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WebRequest::HistorySnapshot { .. }
+        ));
         stream
     }
 
@@ -3183,7 +2973,7 @@ Sec-WebSocket-Version: 13\r\n\
             allowed_origins: vec!["http://localhost:5173".to_string()],
             ..WebConfig::default()
         };
-        let (web_tx, _web_rx) = mpsc::channel();
+        let (web_tx, web_rx) = mpsc::channel();
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
@@ -3213,20 +3003,22 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
 
         let mut allowed = open_ws_with_origin(sender.local_addr(), Some("http://localhost:5173"));
-        let (opcode, sync) = read_ws_frame(&mut allowed);
-        assert_eq!(opcode, 0x2);
-        assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
+        drain_config(&mut allowed);
+        assert!(matches!(
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WebRequest::HistorySnapshot { .. }
+        ));
     }
 
     #[test]
-    fn set_room_replaces_backlog_and_resyncs() {
+    fn targeted_history_window_is_transport_only() {
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
-        let (web_tx, _web_rx) = mpsc::channel();
+        let (web_tx, web_rx) = mpsc::channel();
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
@@ -3236,39 +3028,25 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ws(sender.local_addr());
-        let (_, sync) = read_ws_frame(&mut stream);
-        assert!(web_wire::decode_window(&sync).messages.is_empty());
-        drain_config(&mut stream);
-
-        // Entering a room re-syncs the connected browser with that room's history.
-        sender.set_room(
-            "lobby".to_string(),
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
+        sender.send_history_window(
+            WebAudience::One(1),
+            HistoryWindowKind::Sync,
+            RoomId(3),
+            11,
             vec![WebMessage::text_for_test(1, "room one")],
+            Some(MessageId(1)),
+            true,
         );
         let (opcode, payload) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x2);
         let window = web_wire::decode_window(&payload);
         assert_eq!(window.kind, web_wire::KIND_SYNC);
+        assert_eq!(window.room_id, 3);
+        assert_eq!(window.room_generation, 11);
         assert_eq!(
             window.messages[0].fragments,
             vec![Fragment::text("<p>room one</p>")]
-        );
-        let (opcode, payload) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x1);
-        assert_eq!(String::from_utf8(payload).unwrap(), room_envelope("lobby"));
-
-        // Leaving the room clears the view to nothing.
-        sender.set_room("servers".to_string(), Vec::new());
-        let (_, cleared) = read_ws_frame(&mut stream);
-        let window = web_wire::decode_window(&cleared);
-        assert_eq!(window.kind, web_wire::KIND_SYNC);
-        assert!(window.messages.is_empty());
-        let (opcode, payload) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x1);
-        assert_eq!(
-            String::from_utf8(payload).unwrap(),
-            room_envelope("servers")
         );
     }
 
@@ -3280,7 +3058,7 @@ Sec-WebSocket-Version: 13\r\n\
             bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
-        let (web_tx, _web_rx) = mpsc::channel();
+        let (web_tx, web_rx) = mpsc::channel();
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
@@ -3289,7 +3067,7 @@ Sec-WebSocket-Version: 13\r\n\
             false,
         )
         .unwrap();
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
 
         sender.send_delete_error(
             r#"{"type":"delete_error","target":7,"message":"too old"}"#.to_string(),
@@ -3304,14 +3082,14 @@ Sec-WebSocket-Version: 13\r\n\
     }
 
     #[test]
-    fn load_older_request_returns_older_frame() {
+    fn load_older_request_is_forwarded_to_the_app() {
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
-        let (web_tx, _web_rx) = mpsc::channel();
+        let (web_tx, web_rx) = mpsc::channel();
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
@@ -3321,37 +3099,20 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ws(sender.local_addr());
-        // Drain the initial empty sync frame and the config envelope.
-        let (_, payload) = read_ws_frame(&mut stream);
-        assert_eq!(web_wire::decode_window(&payload).kind, web_wire::KIND_SYNC);
-        drain_config(&mut stream);
-
-        // Three live messages take sequence numbers 0, 1, 2.
-        for i in 0..3 {
-            sender.send(WebMessage::text_for_test(i, &format!("m{i}")));
-            let _ = read_ws_frame(&mut stream);
-        }
-
-        // Page the two messages before seq 2.
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
-            r#"{"type":"load_older","before_seq":2,"limit":5}"#,
+            r#"{"type":"load_older","room_id":3,"room_generation":11,"before_message_id":42,"limit":5}"#,
         );
-        let (opcode, payload) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x2);
-        let window = web_wire::decode_window(&payload);
-        assert_eq!(window.kind, web_wire::KIND_OLDER);
-        assert_eq!(window.oldest_seq, 0);
-        assert!(!window.has_more);
-        let bodies: Vec<&Fragment> = window
-            .messages
-            .iter()
-            .flat_map(|message| &message.fragments)
-            .collect();
         assert_eq!(
-            bodies,
-            vec![&Fragment::text("<p>m0</p>"), &Fragment::text("<p>m1</p>"),]
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WebRequest::LoadOlder {
+                client: 1,
+                room_id: RoomId(3),
+                room_generation: 11,
+                before_message_id: MessageId(42),
+                limit: 5,
+            }
         );
     }
 
@@ -3363,7 +3124,7 @@ Sec-WebSocket-Version: 13\r\n\
             bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
-        let (web_tx, _web_rx) = mpsc::channel();
+        let (web_tx, web_rx) = mpsc::channel();
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
@@ -3379,11 +3140,9 @@ Sec-WebSocket-Version: 13\r\n\
             "{\"type\":\"share_available\",\"stream_id\":5}".to_string(),
         );
 
-        // A browser that connects after the share still learns it is available:
-        // the retained announcement follows the initial sync frame.
+        // A browser that connects after the share still learns it is available
+        // after the transport configuration, independent of history sync.
         let mut late = open_ws(sender.local_addr());
-        let (_, sync) = read_ws_frame(&mut late);
-        assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
         drain_config(&mut late);
         // Share announcements stay JSON text frames (opcode 0x1).
         let (opcode, payload) = read_ws_frame(&mut late);
@@ -3401,13 +3160,10 @@ Sec-WebSocket-Version: 13\r\n\
                 .contains("\"share_ended\"")
         );
 
-        // A browser that connects now sees no share. After sync, the next frame
-        // is a live chat message, with no stale share_available before it.
-        let mut fresh = open_ws(sender.local_addr());
-        let (_, sync2) = read_ws_frame(&mut fresh);
-        assert_eq!(web_wire::decode_window(&sync2).kind, web_wire::KIND_SYNC);
-        drain_config(&mut fresh);
-        sender.send(WebMessage::text_for_test(1, "hi"));
+        // A browser that connects now sees no share. After config, the next
+        // frame is a live chat message, with no stale share announcement.
+        let mut fresh = open_ready_ws(sender.local_addr(), &web_rx);
+        sender.send(RoomId(1), 7, WebMessage::text_for_test(1, "hi"));
         // The next frame is the live message (binary), not a stale share.
         let (opcode, next) = read_ws_frame(&mut fresh);
         assert_eq!(opcode, 0x2);
@@ -3432,7 +3188,7 @@ Sec-WebSocket-Version: 13\r\n\
             true,
         )
         .unwrap();
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
 
         let old_key = video::encode_video_frame(1, true, 15, &[1]);
         let old_delta = video::encode_video_frame(2, false, 15, &[2]);
@@ -3487,10 +3243,6 @@ Sec-WebSocket-Version: 13\r\n\
         .unwrap();
 
         let mut stream = open_ws(sender.local_addr());
-        // The sync frame comes first, then the config envelope as a text frame.
-        let (opcode, sync) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x2);
-        assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
         let (opcode, config) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x1);
         let text = String::from_utf8(config).unwrap();
@@ -3529,8 +3281,6 @@ Sec-WebSocket-Version: 13\r\n\
         .unwrap();
 
         let mut stream = open_ws(sender.local_addr());
-        let (opcode, _sync) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x2);
         let (opcode, config) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x1);
         let text = String::from_utf8(config).unwrap();
@@ -3567,7 +3317,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"send_message","request_id":11,"body":"hi there"}"#,
@@ -3602,7 +3352,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"edit_message","request_id":12,"target":7,"body":"revised"}"#,
@@ -3649,7 +3399,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"edit_message","request_id":12,"target":7,"body":"revised"}"#,
@@ -3679,7 +3429,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"abort_transfer","request_id":14,"transfer_id":7}"#,
@@ -3714,7 +3464,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"abort_transfer","request_id":14,"transfer_id":7}"#,
@@ -3742,7 +3492,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"send_message","request_id":11,"body":"hi there"}"#,
@@ -3770,7 +3520,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"run_command","request_id":21,"body":"/whoami"}"#,
@@ -3816,7 +3566,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"run_command","request_id":21,"body":"/mute"}"#,
@@ -3842,7 +3592,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"upload_start","request_id":20,"upload_id":42,"name":"note.txt","size":11}"#,
@@ -3890,7 +3640,7 @@ Sec-WebSocket-Version: 13\r\n\
         )
         .unwrap();
 
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
             r#"{"type":"upload_start","request_id":20,"upload_id":42,"name":"note.txt","size":11}"#,
@@ -3934,7 +3684,7 @@ Sec-WebSocket-Version: 13\r\n\
             String::new(),
         )
         .unwrap();
-        let mut stream = open_ready_ws(sender.local_addr());
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
 
         write_ws_text(
             &mut stream,
@@ -3995,8 +3745,8 @@ Sec-WebSocket-Version: 13\r\n\
             true,
         )
         .unwrap();
-        let mut first = open_ready_ws(sender.local_addr());
-        let mut second = open_ready_ws(sender.local_addr());
+        let mut first = open_ready_ws(sender.local_addr(), &web_rx);
+        let mut second = open_ready_ws(sender.local_addr(), &web_rx);
 
         write_ws_text(&mut first, r#"{"type":"play_share","stream_id":9}"#);
         write_ws_text(&mut second, r#"{"type":"play_share","stream_id":9}"#);

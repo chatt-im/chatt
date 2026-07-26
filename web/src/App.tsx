@@ -1925,9 +1925,11 @@ export default function App() {
       }
     | undefined;
 
-  // Paging cursor: the sequence number of the oldest message currently held and
-  // whether the server still has older history to send.
-  let oldestSeq = 0;
+  // Canonical room identity and oldest resident message cursor supplied by the
+  // latest authoritative sync.
+  let currentRoomId = 0;
+  let currentRoomGeneration = 0;
+  let olderCursor: number | null = null;
   let hasMore = false;
   let loadingOlder = false;
   let topPagingArmed = true;
@@ -2025,7 +2027,9 @@ export default function App() {
       messages: messages().length,
       visible: list.length,
       firstMessage: debugMessageKey(messages()[0]),
-      oldestSeq,
+      currentRoomId,
+      currentRoomGeneration,
+      olderCursor,
       hasMore,
       loadingOlder,
       topPagingArmed,
@@ -2254,15 +2258,21 @@ export default function App() {
       debugScrollState("request-older-skip", { source, reason: "socket" });
       return false;
     }
+    if (olderCursor === null || currentRoomId === 0) {
+      debugScrollState("request-older-skip", { source, reason: "cursor" });
+      return false;
+    }
     loadingOlder = true;
     const req: ClientRequest = {
       type: "load_older",
-      before_seq: oldestSeq,
+      room_id: currentRoomId,
+      room_generation: currentRoomGeneration,
+      before_message_id: olderCursor,
       limit: PAGE,
     };
     debugScrollState("request-older-send", {
       source,
-      beforeSeq: req.before_seq,
+      beforeMessageId: req.before_message_id,
       limit: req.limit,
     });
     socket.send(JSON.stringify(req));
@@ -2448,12 +2458,12 @@ export default function App() {
   const refPreviewCache = new Map<string, WebMessage | null>();
 
   function invalidateMessageReference(messageId: number) {
-    refPreviewCache.delete(refPreviewKey(0, messageId));
+    refPreviewCache.delete(refPreviewKey(currentRoomId, messageId));
     if (refHover()?.message.message_id === messageId) hideRefHover();
   }
 
-  function refPreviewKey(_ts: number, mid: number): string {
-    return `${mid}`;
+  function refPreviewKey(roomId: number, mid: number): string {
+    return `${roomId}:${mid}`;
   }
 
   function hideRefHover() {
@@ -2467,27 +2477,32 @@ export default function App() {
   }
 
   function showRefHover(anchor: HTMLElement) {
-    // Ref pills carry only `data-mid` now; the ts is a harmless echo.
     const ts = Number(anchor.dataset.ts ?? "0");
+    const roomId = Number(anchor.dataset.room ?? currentRoomId);
     const mid = Number(anchor.dataset.mid);
-    if (!Number.isFinite(ts) || !Number.isFinite(mid)) return;
-    const index = findMessageIndex(ts, mid);
+    if (!Number.isFinite(roomId) || !Number.isFinite(ts) || !Number.isFinite(mid)) return;
+    const index = roomId === currentRoomId ? findMessageIndex(ts, mid) : -1;
     if (index >= 0) {
       displayRefHover(anchor, messages()[index]!);
       return;
     }
-    const key = refPreviewKey(ts, mid);
+    const key = refPreviewKey(roomId, mid);
     if (refPreviewCache.has(key)) {
       const cached = refPreviewCache.get(key);
       if (cached) displayRefHover(anchor, cached);
       return;
     }
     refHoverPendingKey = key;
-    sendJson({ type: "ref_preview", ts, mid });
+    sendJson({
+      type: "ref_preview",
+      room_id: roomId,
+      room_generation: currentRoomGeneration,
+      message_id: mid,
+    });
   }
 
-  function onRefPreview(ts: number, mid: number, message: WebMessage | null) {
-    const key = refPreviewKey(ts, mid);
+  function onRefPreview(roomId: number, mid: number, message: WebMessage | null) {
+    const key = refPreviewKey(roomId, mid);
     refPreviewCache.set(key, message);
     if (key !== refHoverPendingKey) return;
     refHoverPendingKey = undefined;
@@ -3441,15 +3456,19 @@ export default function App() {
         if (feed.kind === "sync") {
           debugScrollState("sync-received", {
             count: feed.messages.length,
-            frameOldestSeq: feed.oldest_seq,
-            frameHasMore: feed.has_more,
+            roomId: feed.room_id,
+            roomGeneration: feed.room_generation,
+            olderCursor: feed.older_cursor,
+            atStart: feed.at_start,
           });
           preloadRecentImages(feed.messages);
           closeDeleteConfirmation(false);
           refPreviewCache.clear();
           setMessages(feed.messages);
-          oldestSeq = feed.oldest_seq;
-          hasMore = feed.has_more;
+          currentRoomId = feed.room_id;
+          currentRoomGeneration = feed.room_generation;
+          olderCursor = feed.older_cursor;
+          hasMore = !feed.at_start;
           loadingOlder = false;
           prependSettling = false;
           clearPrependSettleFrame();
@@ -3458,10 +3477,20 @@ export default function App() {
           setNewMessageCount(0);
           pin();
         } else if (feed.kind === "older") {
+          if (
+            feed.room_id !== currentRoomId ||
+            feed.room_generation !== currentRoomGeneration
+          ) {
+            debugScrollState("older-discarded", {
+              frameRoomId: feed.room_id,
+              frameRoomGeneration: feed.room_generation,
+            });
+            return;
+          }
           debugScrollState("older-received", {
             count: feed.messages.length,
-            frameOldestSeq: feed.oldest_seq,
-            frameHasMore: feed.has_more,
+            olderCursor: feed.older_cursor,
+            atStart: feed.at_start,
             loadingOlderBefore: loadingOlder,
             firstOlder: debugMessageKey(feed.messages[0]),
             lastOlder: debugMessageKey(feed.messages[feed.messages.length - 1]),
@@ -3474,21 +3503,29 @@ export default function App() {
             setMessages((prev) => [...feed.messages, ...prev]);
             debugScrollState("older-applied", {
               count: feed.messages.length,
-              frameOldestSeq: feed.oldest_seq,
-              frameHasMore: feed.has_more,
+              olderCursor: feed.older_cursor,
+              atStart: feed.at_start,
             });
           }
-          oldestSeq = feed.oldest_seq;
-          hasMore = feed.has_more;
+          olderCursor = feed.older_cursor;
+          hasMore = !feed.at_start;
           debugScrollState("older-cursor-updated", {
             count: feed.messages.length,
-            frameOldestSeq: feed.oldest_seq,
-            frameHasMore: feed.has_more,
+            olderCursor: feed.older_cursor,
+            atStart: feed.at_start,
           });
           scheduleResumePendingJump();
         } else if (feed.kind === "ref_preview") {
-          onRefPreview(feed.ts, feed.mid, feed.message);
+          if (feed.room_generation === currentRoomGeneration) {
+            onRefPreview(feed.room_id, feed.message_id, feed.message);
+          }
+        } else if (feed.kind === "stale") {
+          loadingOlder = false;
         } else if (feed.kind === "delete") {
+          if (
+            feed.room_id !== currentRoomId ||
+            feed.room_generation !== currentRoomGeneration
+          ) return;
           invalidateMessageReference(feed.message_id);
           if (editing()?.target === feed.message_id) cancelEdit();
           if (pendingDelete()?.message_id === feed.message_id) {
@@ -3499,6 +3536,10 @@ export default function App() {
           );
           pin();
         } else {
+          if (
+            feed.room_id !== currentRoomId ||
+            feed.room_generation !== currentRoomGeneration
+          ) return;
           // A live message. Upsert by the announcement timestamp and file id;
           // transfer ids are reused after server restarts, while the pair
           // identifies one file.

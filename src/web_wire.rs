@@ -25,6 +25,7 @@ pub const KIND_MESSAGE: u8 = 2;
 pub const KIND_OLDER: u8 = 3;
 pub const KIND_REF_PREVIEW: u8 = 4;
 pub const KIND_DELETE: u8 = 5;
+pub const KIND_STALE: u8 = 6;
 
 /// Fragment kind bytes.
 const FRAG_TEXT: u8 = 0;
@@ -288,15 +289,25 @@ fn escape_html(text: &str, out: &mut String) {
 /// message.
 pub fn encode_window(
     kind: u8,
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
     messages: &[WebMessage],
-    oldest_seq: u64,
-    has_more: bool,
+    older_cursor: Option<rpc::ids::MessageId>,
+    at_start: bool,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&SENTINEL);
     buf.push(kind);
-    put_u64(&mut buf, oldest_seq);
-    buf.push(has_more as u8);
+    put_u64(&mut buf, room_id.0 as u64);
+    put_u64(&mut buf, room_generation);
+    match older_cursor {
+        Some(cursor) => {
+            buf.push(1);
+            put_u64(&mut buf, cursor.0);
+        }
+        None => buf.push(0),
+    }
+    buf.push(at_start as u8);
     put_u32(&mut buf, messages.len() as u32);
     for message in messages {
         encode_message(&mut buf, message);
@@ -309,14 +320,16 @@ pub fn encode_window(
 /// holds it. The browser shows it as the hover card for a `@@` reference
 /// whose target is not in its loaded window.
 pub fn encode_ref_preview(
-    timestamp_ms: u64,
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
     message_id: u64,
     message: Option<&WebMessage>,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&SENTINEL);
     buf.push(KIND_REF_PREVIEW);
-    put_u64(&mut buf, timestamp_ms);
+    put_u64(&mut buf, room_id.0 as u64);
+    put_u64(&mut buf, room_generation);
     put_u64(&mut buf, message_id);
     match message {
         None => buf.push(0),
@@ -328,20 +341,43 @@ pub fn encode_ref_preview(
     buf
 }
 
-/// Encodes a `delete` frame: the chat message id the browser should drop.
-pub fn encode_delete(message_id: u64) -> Vec<u8> {
+/// Encodes a stale-generation response. The browser requests a fresh sync.
+pub fn encode_stale(room_id: rpc::ids::RoomId, room_generation: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&SENTINEL);
+    buf.push(KIND_STALE);
+    put_u64(&mut buf, room_id.0 as u64);
+    put_u64(&mut buf, room_generation);
+    buf
+}
+
+/// Encodes a `delete` frame: room identity plus the chat message id the
+/// browser should drop.
+pub fn encode_delete(
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
+    message_id: u64,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&SENTINEL);
     buf.push(KIND_DELETE);
+    put_u64(&mut buf, room_id.0 as u64);
+    put_u64(&mut buf, room_generation);
     put_u64(&mut buf, message_id);
     buf
 }
 
 /// Encodes a single live `message` frame.
-pub fn encode_single(message: &WebMessage) -> Vec<u8> {
+pub fn encode_single(
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
+    message: &WebMessage,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&SENTINEL);
     buf.push(KIND_MESSAGE);
+    put_u64(&mut buf, room_id.0 as u64);
+    put_u64(&mut buf, room_generation);
     encode_message(&mut buf, message);
     buf
 }
@@ -435,8 +471,10 @@ fn put_bytes(buf: &mut Vec<u8>, value: &[u8]) {
 #[cfg(test)]
 pub(crate) struct DecodedWindow {
     pub kind: u8,
-    pub oldest_seq: u64,
-    pub has_more: bool,
+    pub room_id: u64,
+    pub room_generation: u64,
+    pub older_cursor: Option<u64>,
+    pub at_start: bool,
     pub messages: Vec<DecodedMessage>,
 }
 
@@ -460,14 +498,18 @@ pub(crate) fn decode_window(frame: &[u8]) -> DecodedWindow {
     let mut reader = Reader { buf: frame, pos: 0 };
     assert_eq!(reader.take(4), &SENTINEL);
     let kind = reader.u8();
-    let oldest_seq = reader.u64();
-    let has_more = reader.u8() == 1;
+    let room_id = reader.u64();
+    let room_generation = reader.u64();
+    let older_cursor = (reader.u8() == 1).then(|| reader.u64());
+    let at_start = reader.u8() == 1;
     let count = reader.u32();
     let messages = (0..count).map(|_| reader.message()).collect();
     DecodedWindow {
         kind,
-        oldest_seq,
-        has_more,
+        room_id,
+        room_generation,
+        older_cursor,
+        at_start,
         messages,
     }
 }
@@ -478,6 +520,8 @@ pub(crate) fn decode_single(frame: &[u8]) -> DecodedMessage {
     let mut reader = Reader { buf: frame, pos: 0 };
     assert_eq!(reader.take(4), &SENTINEL);
     assert_eq!(reader.u8(), KIND_MESSAGE);
+    let _room_id = reader.u64();
+    let _room_generation = reader.u64();
     reader.message()
 }
 
@@ -582,11 +626,13 @@ mod tests {
 
     #[test]
     fn delete_frame_carries_sentinel_kind_and_id() {
-        let frame = encode_delete(0xABCD);
+        let frame = encode_delete(rpc::ids::RoomId(7), 9, 0xABCD);
         assert_eq!(&frame[0..4], &SENTINEL);
         assert_eq!(frame[4], KIND_DELETE);
-        assert_eq!(u64::from_le_bytes(frame[5..13].try_into().unwrap()), 0xABCD);
-        assert_eq!(frame.len(), 13);
+        assert_eq!(u64::from_le_bytes(frame[5..13].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(frame[13..21].try_into().unwrap()), 9);
+        assert_eq!(u64::from_le_bytes(frame[21..29].try_into().unwrap()), 0xABCD);
+        assert_eq!(frame.len(), 29);
     }
 
     #[test]
@@ -744,19 +790,31 @@ mod tests {
             WebMessage::text_for_test(1, "hi"),
             WebMessage::text_for_test(2, "yo"),
         ];
-        let frame = encode_window(KIND_SYNC, &messages, 7, true);
+        let frame = encode_window(
+            KIND_SYNC,
+            rpc::ids::RoomId(7),
+            11,
+            &messages,
+            Some(rpc::ids::MessageId(1)),
+            false,
+        );
         assert_eq!(&frame[0..4], &SENTINEL);
         assert_eq!(frame[4], KIND_SYNC);
-        let oldest = u64::from_le_bytes(frame[5..13].try_into().unwrap());
-        assert_eq!(oldest, 7);
-        assert_eq!(frame[13], 1);
-        let count = u32::from_le_bytes(frame[14..18].try_into().unwrap());
-        assert_eq!(count, 2);
+        let decoded = decode_window(&frame);
+        assert_eq!(decoded.room_id, 7);
+        assert_eq!(decoded.room_generation, 11);
+        assert_eq!(decoded.older_cursor, Some(1));
+        assert!(!decoded.at_start);
+        assert_eq!(decoded.messages.len(), 2);
     }
 
     #[test]
     fn single_frame_is_message_kind() {
-        let frame = encode_single(&WebMessage::text_for_test(9, "solo"));
+        let frame = encode_single(
+            rpc::ids::RoomId(7),
+            11,
+            &WebMessage::text_for_test(9, "solo"),
+        );
         assert_eq!(&frame[0..4], &SENTINEL);
         assert_eq!(frame[4], KIND_MESSAGE);
     }
@@ -767,7 +825,8 @@ mod tests {
         message.local = true;
         message.edited = true;
         message.unverified = true;
-        let decoded = decode_single(&encode_single(&message));
+        let decoded =
+            decode_single(&encode_single(rpc::ids::RoomId(7), 11, &message));
 
         assert_eq!(decoded.body, "revised");
         assert!(decoded.local);
@@ -777,16 +836,22 @@ mod tests {
 
     #[test]
     fn ref_preview_frame_echoes_key_and_flags_found() {
-        let frame = encode_ref_preview(100, 9, Some(&WebMessage::text_for_test(9, "target")));
+        let frame = encode_ref_preview(
+            rpc::ids::RoomId(3),
+            7,
+            9,
+            Some(&WebMessage::text_for_test(9, "target")),
+        );
         assert_eq!(&frame[0..4], &SENTINEL);
         assert_eq!(frame[4], KIND_REF_PREVIEW);
-        assert_eq!(u64::from_le_bytes(frame[5..13].try_into().unwrap()), 100);
-        assert_eq!(u64::from_le_bytes(frame[13..21].try_into().unwrap()), 9);
-        assert_eq!(frame[21], 1);
+        assert_eq!(u64::from_le_bytes(frame[5..13].try_into().unwrap()), 3);
+        assert_eq!(u64::from_le_bytes(frame[13..21].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(frame[21..29].try_into().unwrap()), 9);
+        assert_eq!(frame[29], 1);
 
-        let missing = encode_ref_preview(100, 9, None);
-        assert_eq!(missing[21], 0);
-        assert_eq!(missing.len(), 22);
+        let missing = encode_ref_preview(rpc::ids::RoomId(3), 7, 9, None);
+        assert_eq!(missing[29], 0);
+        assert_eq!(missing.len(), 30);
     }
 
     #[test]
@@ -899,7 +964,8 @@ mod tests {
     #[test]
     fn quote_boundaries_round_trip_on_the_wire() {
         let message = WebMessage::text_for_test(1, "> ```rust\n> fn f() {}\n> ```");
-        let decoded = decode_single(&encode_single(&message));
+        let decoded =
+            decode_single(&encode_single(rpc::ids::RoomId(7), 11, &message));
         assert_eq!(decoded.fragments, message.fragments);
     }
 }

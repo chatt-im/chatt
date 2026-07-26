@@ -197,8 +197,19 @@ export interface ShareInfo {
 // travel as separate binary frames between `upload_start` and `upload_finish`,
 // each prefixed with the little-endian upload id.
 export type ClientRequest =
-  | { type: "load_older"; before_seq: number; limit: number }
-  | { type: "ref_preview"; ts: number; mid: number }
+  | {
+      type: "load_older";
+      room_id: number;
+      room_generation: number;
+      before_message_id: number;
+      limit: number;
+    }
+  | {
+      type: "ref_preview";
+      room_id: number;
+      room_generation: number;
+      message_id: number;
+    }
   | { type: "play_share"; stream_id: number }
   | { type: "stop_share"; stream_id: number }
   | { type: "send_message"; request_id: number; body: string }

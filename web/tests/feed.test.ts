@@ -22,6 +22,8 @@ function string(bytes: number[], value: string) {
 
 test("decodes durable attachment identity from a message frame", () => {
   const bytes = [0, 0, 0, 0, 2];
+  u64(bytes, 3);
+  u64(bytes, 7);
   u64(bytes, 37);
   u64(bytes, 8_000);
   u64(bytes, 91);
