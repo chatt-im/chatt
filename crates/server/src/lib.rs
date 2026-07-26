@@ -478,7 +478,7 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         udp_probe_addr = udp_probe_label.as_str(),
         server_public_key = server_public_key.as_str(),
         transport_mode = config.transport_mode().as_str(),
-        p2p_enabled = config.network.p2p_enabled
+        p2p_enabled = config.network.p2p
     );
     let tcp_addr = config.network.tcp_addr;
     let udp_addr = config.network.udp_addr();
@@ -489,7 +489,7 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         .public_udp_probe_addr
         .clone()
         .unwrap_or_else(|| "disabled".to_string());
-    let p2p_enabled = config.network.p2p_enabled;
+    let p2p_enabled = config.network.p2p;
     let mut server = Server::bind(config)?;
     let admin_socket = AdminSocket::spawn(server.admin_sender()).map_err(invalid_config)?;
     if p2p_enabled && udp_probe_addr.is_some() {
@@ -514,7 +514,7 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "chatt P2P support: {}",
-        if server.config.network.p2p_enabled {
+        if server.config.network.p2p {
             "enabled"
         } else {
             "disabled"
@@ -530,7 +530,7 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         udp_addr = %udp_addr,
         udp_probe_addr = udp_probe_label.as_str(),
         transport_mode = server.config.transport_mode().as_str(),
-        p2p_enabled = server.config.network.p2p_enabled
+        p2p_enabled = server.config.network.p2p
     );
     let _admin_socket = admin_socket;
     server.run()
@@ -1300,7 +1300,7 @@ impl Server {
         let tcp_addr = config.network.tcp_addr;
         let udp_addr = config.network.udp_addr();
         let udp_probe_addr = config.network.udp_probe_addr;
-        let p2p_enabled = config.network.p2p_enabled;
+        let p2p_enabled = config.network.p2p;
         let poll = Poll::new()?;
         let mut listener = TcpListener::bind(tcp_addr)?;
         let udp = UdpSocket::bind(udp_addr)?;
@@ -5978,7 +5978,7 @@ impl Server {
     }
 
     fn broadcast_p2p_gone(&mut self, session_id: SessionId, room_id: RoomId) {
-        if !self.config.network.p2p_enabled {
+        if !self.config.network.p2p {
             return;
         }
         let Some(user_id) = self
@@ -6918,7 +6918,7 @@ impl Server {
         tie_breaker: u64,
         candidates: Vec<P2pCandidate>,
     ) -> Result<(), String> {
-        if !self.config.network.p2p_enabled {
+        if !self.config.network.p2p {
             kvlog::info!(
                 "p2p candidates ignored; p2p disabled",
                 session_id = session_id.0,
@@ -7087,8 +7087,7 @@ impl Server {
                 continue;
             };
             let _ = self.send_control_to_token(token, &ServerControl::UdpBound);
-            if self.config.network.p2p_enabled && self.live_token_for_session(session_id).is_some()
-            {
+            if self.config.network.p2p && self.live_token_for_session(session_id).is_some() {
                 let _ = self.send_control_to_token(
                     token,
                     &ServerControl::UdpReflexive {
@@ -7097,7 +7096,7 @@ impl Server {
                 );
             }
         }
-        if self.config.network.p2p_enabled {
+        if self.config.network.p2p {
             for ((session_id, probe_id), addr) in events.nat_probe.drain() {
                 let Some(token) = self.live_token_for_session(session_id) else {
                     continue;
@@ -8995,7 +8994,7 @@ mod tests {
         config.network.tcp_addr = "127.0.0.1:0".parse().expect("valid tcp addr");
         config.network.udp_addr = Some("127.0.0.1:0".parse().expect("valid udp addr"));
         config.network.udp_probe_addr = None;
-        config.network.p2p_enabled = false;
+        config.network.p2p = false;
         config
     }
 
@@ -10225,7 +10224,7 @@ mod tests {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
         config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
-        config.network.p2p_enabled = false;
+        config.network.p2p = false;
         config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
         config.rooms[0].memory_limit = Some(100);
         let mut server = Server::bind(config).expect("test server");
@@ -10264,7 +10263,7 @@ mod tests {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
         config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
-        config.network.p2p_enabled = false;
+        config.network.p2p = false;
         config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
         config.rooms[0].memory_limit = Some(256);
         let mut server = Server::bind(config).expect("test server");
@@ -10357,7 +10356,7 @@ mod tests {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
         config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
-        config.network.p2p_enabled = false;
+        config.network.p2p = false;
         config.rooms[0].persistence = config::RoomPersistenceConfig::Durable;
         config.storage.data_dir = Some(dir.display().to_string());
         let mut server = Server::bind(config).expect("test server");
@@ -11569,12 +11568,12 @@ mod tests {
     fn server_bind_normalizes_plaintext_transport_p2p_off() {
         let mut config = test_server_config();
         config.security.transport_encryption = false;
-        config.network.p2p_enabled = true;
+        config.network.p2p = true;
         config.network.udp_probe_addr = Some("127.0.0.1:0".parse().unwrap());
 
         let server = Server::bind(config).expect("test server");
 
-        assert!(!server.config.network.p2p_enabled);
+        assert!(!server.config.network.p2p);
     }
 
     #[test]
@@ -13028,7 +13027,7 @@ mod tests {
         let config_path = dir.join("chatt-server.toml");
         let content = format!(
             "# operator comment that must survive pairing\n\
-             [network]\ntcp-addr = \"127.0.0.1:0\"\np2p-enabled = false\n\n\
+             [network]\ntcp-addr = \"127.0.0.1:0\"\np2p = false\n\n\
              [security]\nserver-identity-seed = \"{}\"\n",
             rpc::crypto::dev_server_seed_hex()
         );

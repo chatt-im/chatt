@@ -55,7 +55,7 @@ pub struct NetworkConfig {
     #[toml(skip)]
     public_udp_probe_addr_overridden: bool,
     #[toml(default = true)]
-    pub p2p_enabled: bool,
+    pub p2p: bool,
 }
 
 impl NetworkConfig {
@@ -76,7 +76,7 @@ impl Default for NetworkConfig {
             public_udp_addr: String::new(),
             public_udp_probe_addr: None,
             public_udp_probe_addr_overridden: false,
-            p2p_enabled: true,
+            p2p: true,
         }
     }
 }
@@ -377,12 +377,7 @@ fn set_network_public_udp_probe_addr(config: &mut Config, value: &str) -> Result
     config.network.public_udp_probe_addr_overridden = true;
     Ok(())
 }
-scalar_parse_setter!(
-    set_network_p2p_enabled,
-    network.p2p_enabled,
-    bool,
-    "network.p2p-enabled"
-);
+scalar_parse_setter!(set_network_p2p_enabled, network.p2p, bool, "network.p2p");
 
 scalar_parse_setter!(
     set_security_transport_encryption,
@@ -487,7 +482,7 @@ pub(crate) const CONFIG_OPTION_SPECS: &[ConfigOptionSpec] = &[
         apply: set_network_public_udp_probe_addr,
     },
     ConfigOptionSpec {
-        name: "network.p2p-enabled",
+        name: "network.p2p",
         value_name: "BOOL",
         description: "enable direct peer-to-peer media",
         apply: set_network_p2p_enabled,
@@ -699,7 +694,7 @@ tcp-addr = "{listen_addr}"
 # public-tcp-addr = "chat.example.com:41000"
 # public-udp-addr = "chat.example.com:41000"
 # public-udp-probe-addr = "chat.example.com:41001"
-p2p-enabled = true
+p2p = true
 
 [security]
 server-identity-seed = "{seed}"
@@ -864,7 +859,7 @@ impl Config {
     pub(crate) fn normalize(&mut self) {
         // P2P transport is never available when transport encryption is off.
         if !self.security.transport_encryption {
-            self.network.p2p_enabled = false;
+            self.network.p2p = false;
         }
         self.network.public_tcp_addr = self.network.public_tcp_addr.trim().to_string();
         if self.network.public_tcp_addr.is_empty() {
@@ -1337,7 +1332,7 @@ mod tests {
         assert_eq!(config.network.public_tcp_addr, "127.0.0.1:41000");
         assert_eq!(config.network.public_udp_addr, "127.0.0.1:41000");
         assert_eq!(config.network.public_udp_probe_addr, None);
-        assert!(config.network.p2p_enabled);
+        assert!(config.network.p2p);
         assert!(config.security.transport_encryption);
         assert_ne!(config.security.server_identity_seed, dev_server_seed_hex());
         assert_eq!(config.rooms[0].room_id(), RoomId(1));
@@ -1370,7 +1365,7 @@ mod tests {
                 "network.public-tcp-addr",
                 "network.public-udp-addr",
                 "network.public-udp-probe-addr",
-                "network.p2p-enabled",
+                "network.p2p",
                 "security.transport-encryption",
                 "security.max-file-size-mb",
                 "security.bug-report-dir",
@@ -1398,7 +1393,7 @@ mod tests {
             config_override("network.public-tcp-addr", "chat.example.com:443"),
             config_override("network.public-udp-addr", "chat.example.com:444"),
             config_override("network.public-udp-probe-addr", "chat.example.com:445"),
-            config_override("network.p2p-enabled", "false"),
+            config_override("network.p2p", "false"),
             config_override("security.transport-encryption", "true"),
             config_override("security.max-file-size-mb", "12"),
             config_override("security.bug-report-dir", "/tmp/chatt-bugs"),
@@ -1449,7 +1444,7 @@ mod tests {
             config.network.public_udp_probe_addr.as_deref(),
             Some("chat.example.com:445")
         );
-        assert!(!config.network.p2p_enabled);
+        assert!(!config.network.p2p);
         assert_eq!(config.security.server_identity_seed, dev_server_seed_hex());
         assert!(config.security.transport_encryption);
         assert_eq!(config.security.max_file_size_mb, 12);
@@ -1495,7 +1490,7 @@ mod tests {
     #[test]
     fn override_supplies_tcp_addr_omitted_from_partial_network_section() {
         let content = format!(
-            "[network]\np2p-enabled = false\n\n[security]\nserver-identity-seed = \"{}\"\n",
+            "[network]\np2p = false\n\n[security]\nserver-identity-seed = \"{}\"\n",
             dev_server_seed_hex()
         );
         let overrides = [config_override("network.tcp-addr", "127.0.0.1:42000")];
@@ -1521,7 +1516,7 @@ mod tests {
         );
         let config = outcome.config.unwrap();
         assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:42000");
-        assert!(!config.network.p2p_enabled);
+        assert!(!config.network.p2p);
     }
 
     #[test]
@@ -1672,24 +1667,24 @@ mod tests {
 
     #[test]
     fn config_parses_p2p_disabled() {
-        let content = config_content("").replace("[network]", "[network]\np2p-enabled = false");
+        let content = config_content("").replace("[network]", "[network]\np2p = false");
 
         let config = parse(&content).unwrap();
 
-        assert!(!config.network.p2p_enabled);
+        assert!(!config.network.p2p);
     }
 
     #[test]
     fn disabled_transport_encryption_forces_p2p_off() {
-        // Even with p2p-enabled = true, plaintext transport disables P2P.
+        // Even with p2p = true, plaintext transport disables P2P.
         let content = config_content("")
-            .replace("[network]", "[network]\np2p-enabled = true")
+            .replace("[network]", "[network]\np2p = true")
             .replace("[security]", "[security]\ntransport-encryption = false");
 
         let config = parse(&content).unwrap();
 
         assert!(!config.security.transport_encryption);
-        assert!(!config.network.p2p_enabled);
+        assert!(!config.network.p2p);
     }
 
     #[test]

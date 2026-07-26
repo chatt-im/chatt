@@ -54,7 +54,7 @@ fn server_config() -> ServerConfig {
     config.network.tcp_addr = "127.0.0.1:0".parse().expect("valid loopback tcp addr");
     config.network.udp_addr = Some("127.0.0.1:0".parse().expect("valid loopback udp addr"));
     config.network.udp_probe_addr = None;
-    config.network.p2p_enabled = false;
+    config.network.p2p = false;
     // Use the well-known dev identity so clients with `server_public_key = None`
     // pin the matching key (see `pinned_server_public_key`).
     config.security.server_identity_seed = dev_server_seed_hex();

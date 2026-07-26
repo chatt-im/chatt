@@ -192,7 +192,7 @@ mod tests {
             "--dir",
             "./instance",
             "--network.tcp-addr=127.0.0.1:42000",
-            "--network.p2p-enabled",
+            "--network.p2p",
             "false",
         ]))
         .unwrap();
@@ -206,7 +206,7 @@ mod tests {
                 .iter()
                 .map(ConfigOverride::name)
                 .collect::<Vec<_>>(),
-            ["network.tcp-addr", "network.p2p-enabled"]
+            ["network.tcp-addr", "network.p2p"]
         );
     }
 

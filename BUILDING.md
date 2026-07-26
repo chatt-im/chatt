@@ -76,7 +76,7 @@ file:
 chatt-server serve \
   --dir ./chatt-server \
   --network.tcp-addr=127.0.0.1:42000 \
-  --network.p2p-enabled=false
+  --network.p2p=false
 ```
 
 Precedence is built-in defaults, then `chatt-server.toml`, then command-line
