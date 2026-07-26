@@ -55,16 +55,44 @@ install -m 0755 target/release/chatt target/release/chatt-server "$HOME/.local/b
 
 ## Start a local server
 
-Generate a server configuration, then start the server:
+Start a server by giving it a private instance directory:
+
+```sh
+chatt-server serve --dir ./chatt-server
+```
+
+The directory is created when absent. On the first run, the server writes
+`./chatt-server/chatt-server.toml` with a private identity seed and uses
+`./chatt-server/chatt-server-data/` for runtime state. Keep the directory and
+configuration private.
+
+Scalar settings under `network`, `security`, and `storage` can be overridden
+on the command line, except for `security.server-identity-seed`, which remains
+configuration-file-only so the private seed is never exposed through process
+arguments. Settings below an array, such as `rooms`, must be edited in the TOML
+file:
+
+```sh
+chatt-server serve \
+  --dir ./chatt-server \
+  --network.tcp-addr=127.0.0.1:42000 \
+  --network.p2p-enabled=false
+```
+
+Precedence is built-in defaults, then `chatt-server.toml`, then command-line
+overrides. Command-line overrides apply only to that process and do not rewrite
+the configuration file. Run `chatt-server --help` for the complete option list.
+
+The explicit configuration-file flow remains available when a separate
+instance directory is not wanted:
 
 ```sh
 chatt-server init-config chatt-server.toml
 chatt-server serve chatt-server.toml
 ```
 
-The generated file contains the server identity seed. Keep it private. Its
-comments describe the bind addresses, public endpoints, rooms, storage, and
-open pairing options.
+The generated file's comments describe bind addresses, public endpoints,
+rooms, storage, and open pairing options.
 
 In another terminal, create an invite:
 
