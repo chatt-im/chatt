@@ -95,11 +95,11 @@ pub(crate) enum CoreCommand {
     Settings(SettingsOp),
     PlaySoundboard(usize),
     ToggleVideo,
-    AcceptNativeEncryption {
+    AcceptTransportEncryption {
         label: String,
         generation: u64,
     },
-    CancelNativeEncryption {
+    CancelTransportEncryption {
         generation: u64,
     },
     CloseE2eIdentity,

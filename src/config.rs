@@ -63,7 +63,7 @@ pub struct ServerEntry {
     #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
     pub e2e_peer_pins: Vec<E2ePeerPin>,
     #[toml(default = true, ToToml skip_if = |value: &bool| *value)]
-    pub require_native_encryption: bool,
+    pub require_transport_encryption: bool,
     #[toml(default, style = Header, ToToml skip_if = FileOverrides::is_empty)]
     pub files: FileOverrides,
     #[toml(default, style = Header, ToToml skip_if = HistoryOverrides::is_empty)]
@@ -83,7 +83,7 @@ impl Default for ServerEntry {
             token: "alice-dev-token".to_string(),
             server_public_key: String::new(),
             e2e_peer_pins: Vec::new(),
-            require_native_encryption: true,
+            require_transport_encryption: true,
             files: FileOverrides::default(),
             history: HistoryOverrides::default(),
             rooms: Vec::new(),
@@ -150,7 +150,7 @@ impl ServerEntry {
             server_public_key: non_empty_string(&self.server_public_key),
             data_dir: crate::paths::client_data_dir(),
             e2e_peer_pins: self.e2e_peer_pins.clone(),
-            require_native_encryption: self.require_native_encryption,
+            require_transport_encryption: self.require_transport_encryption,
             file_policy: config.file_policy(self),
             download_store,
             max_upload_bytes: config.files.max_upload_bytes(),
@@ -3776,6 +3776,30 @@ server-public-key = ""
         assert!(content.contains("server-alias = \"local\""));
         assert!(content.contains("user-id = 2"));
         assert!(content.contains("volume-db = -5.5"));
+    }
+
+    #[test]
+    fn runtime_config_writes_transport_encryption_requirement_only_when_disabled() {
+        let mut config = Config::default();
+        config.servers.push(ServerEntry::default());
+        let mut plaintext_server = ServerEntry::default();
+        plaintext_server.label = "plaintext".to_string();
+        plaintext_server.require_transport_encryption = false;
+        config.servers.push(plaintext_server);
+
+        let rendered = render_runtime(&config);
+        assert_eq!(
+            rendered
+                .matches("require-transport-encryption = false")
+                .count(),
+            1
+        );
+
+        let arena = Arena::new();
+        let mut document = toml_spanner::parse(&rendered, &arena).unwrap();
+        let parsed: Config = document.to().unwrap();
+        assert!(parsed.servers[0].require_transport_encryption);
+        assert!(!parsed.servers[1].require_transport_encryption);
     }
 
     #[test]

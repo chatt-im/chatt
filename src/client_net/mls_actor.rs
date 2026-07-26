@@ -2908,7 +2908,7 @@ mod tests {
             server_public_key: None,
             data_dir,
             e2e_peer_pins: Vec::new(),
-            require_native_encryption: true,
+            require_transport_encryption: true,
             file_policy: FilePolicy::default(),
             download_store: crate::receive_store::DownloadStore::new(1024 * 1024),
             max_upload_bytes: 1024 * 1024,

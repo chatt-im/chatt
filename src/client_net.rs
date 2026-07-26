@@ -130,7 +130,7 @@ const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// server relay and to each direct peer.
 const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// Retry cadence for the UDP address claim while no `UdpBound` confirmation has
-/// arrived. External-link mode cannot use ordinary clear pings to establish the
+/// arrived. Plaintext mode cannot use ordinary clear pings to establish the
 /// address, so losing the first `Bind` must be recoverable.
 const UDP_BIND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Number of unconfirmed `Bind` retries (at [`UDP_BIND_RETRY_INTERVAL`]) after
@@ -312,7 +312,7 @@ pub struct ClientConfig {
     pub data_dir: Option<PathBuf>,
     /// Durable DM contact identity tuples and former trusted tuples.
     pub e2e_peer_pins: Vec<E2ePeerPin>,
-    pub require_native_encryption: bool,
+    pub require_transport_encryption: bool,
     pub file_policy: FilePolicy,
     /// The in-memory download ring buffer shared with the web server, filled
     /// when a room's download target resolves to [`DownloadTarget::Memory`].
@@ -825,9 +825,9 @@ pub enum NetworkEvent {
     LocalIdentityUnavailable {
         message: String,
     },
-    /// The server selected plaintext ExternalSecureLink transport, while this
-    /// saved server still requires chatt-native encryption.
-    NativeEncryptionRequired,
+    /// The server selected plaintext transport while this saved server still
+    /// requires transport encryption.
+    TransportEncryptionRequired,
     ReconnectScheduled {
         retry_in: Duration,
         reason: String,
@@ -1539,16 +1539,16 @@ fn run_worker_inner(
         Ok(None) => unreachable!("ordinary connections always pin a server key"),
         Err(error) => return SessionEnd::ConnectFailed(error),
     };
-    if transport_mode == TransportMode::ExternalSecureLink && config.require_native_encryption {
-        let _ = events.send(NetworkEvent::NativeEncryptionRequired);
+    if transport_mode == TransportMode::Plaintext && config.require_transport_encryption {
+        let _ = events.send(NetworkEvent::TransportEncryptionRequired);
         return SessionEnd::Shutdown;
     }
     let video_auth_key = transport.video_auth_key;
     let control = transport.control_record();
     let media = media::MediaProtection::from_transport(&transport);
-    // P2P would bypass an outer secure link, so it is only available when chatt
-    // secures the wire itself, regardless of the client's p2p config.
-    let p2p_enabled = config.p2p_enabled && transport_mode == TransportMode::NativeEncrypted;
+    // P2P is available only with transport encryption, regardless of the
+    // client's P2P config.
+    let p2p_enabled = config.p2p_enabled && transport_mode == TransportMode::Encrypted;
     let server_udp_addr = match resolve_endpoint(&config.udp_addr) {
         Ok(addr) => addr,
         Err(error) => return SessionEnd::ConnectFailed(format!("invalid UDP endpoint: {error}")),
@@ -2218,7 +2218,7 @@ struct WorkerState<'a> {
     control: RecordProtection,
     /// The negotiated transport mode is retained for control/UI/video checks.
     transport_mode: TransportMode,
-    /// Session-authentication key for external-link video connection setup.
+    /// Session-authentication key for plaintext video connection setup.
     video_auth_key: [u8; KEY_LEN],
     /// Server identity is part of every AccountId and MLS store namespace,
     /// preventing credentials or room state crossing server trust domains.
@@ -3673,11 +3673,11 @@ impl WorkerState<'_> {
                 // this lifecycle wake raced with a successful reconnect.
             }
             NetworkCommand::SetP2pEnabled(enabled) => {
-                // P2P would bypass an outer secure link, so it stays off in
-                // external-secure-link mode regardless of a runtime toggle.
-                if enabled && self.transport_mode != TransportMode::NativeEncrypted {
+                // P2P stays off without transport encryption regardless of a
+                // runtime toggle.
+                if enabled && self.transport_mode != TransportMode::Encrypted {
                     let _ = self.events.send(NetworkEvent::Status(
-                        "P2P unavailable in external-secure-link mode".to_string(),
+                        "P2P unavailable without transport encryption".to_string(),
                     ));
                     return Ok(());
                 }

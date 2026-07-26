@@ -27,7 +27,7 @@ use crate::{
 
 const LABEL_WIDTH: u16 = 12;
 const SERVER_SECTION: &str = "Server";
-const NATIVE_ENCRYPTION_CHOICES: [bool; 2] = [true, false];
+const TRANSPORT_ENCRYPTION_CHOICES: [bool; 2] = [true, false];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServerEditButton {
@@ -62,7 +62,7 @@ pub(crate) struct ServerSelectItem {
     pub(crate) label: String,
     pub(crate) username: String,
     pub(crate) tcp_addr: String,
-    pub(crate) require_native_encryption: bool,
+    pub(crate) require_transport_encryption: bool,
     pub(crate) search_text: String,
 }
 
@@ -89,7 +89,8 @@ pub(crate) struct ServerEditDraft {
     tcp_addr: String,
     udp_addr: String,
     udp_probe_addr: String,
-    require_native_encryption: bool,
+    require_transport_encryption: bool,
+    show_transport_encryption_setting: bool,
     download_choice: DownloadChoice,
     download_path: String,
     receive_limit: String,
@@ -124,7 +125,8 @@ impl ServerEditDraft {
             tcp_addr: server.tcp_addr.clone(),
             udp_addr: server.udp_addr.clone(),
             udp_probe_addr: server.udp_probe_addr.clone().unwrap_or_default(),
-            require_native_encryption: server.require_native_encryption,
+            require_transport_encryption: server.require_transport_encryption,
+            show_transport_encryption_setting: !server.require_transport_encryption,
             download_choice,
             download_path,
             receive_limit: mb_limit_text(server.files.max_download_mb),
@@ -157,7 +159,8 @@ impl ServerEditDraft {
 
     /// The number of form rows the dialog body currently lays out.
     pub(crate) fn form_height(&self) -> u16 {
-        22 + u16::from(self.download_choice.shows_path())
+        20 + 2 * u16::from(self.show_transport_encryption_setting)
+            + u16::from(self.download_choice.shows_path())
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent, theme: &Theme) -> ServerEditEvent {
@@ -248,7 +251,8 @@ impl ServerEditDraft {
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
-                require_native_encryption: &mut self.require_native_encryption,
+                require_transport_encryption: &mut self.require_transport_encryption,
+                show_transport_encryption_setting: self.show_transport_encryption_setting,
                 download_choice: &mut self.download_choice,
                 download_path: &mut self.download_path,
                 receive_limit: &mut self.receive_limit,
@@ -312,7 +316,7 @@ impl ServerEditDraft {
             token: self.token.clone(),
             server_public_key: self.server_public_key.clone(),
             e2e_peer_pins: self.e2e_peer_pins.clone(),
-            require_native_encryption: draft.require_native_encryption,
+            require_transport_encryption: draft.require_transport_encryption,
             files,
             history,
             rooms: self.rooms.clone(),
@@ -354,7 +358,8 @@ impl ServerEditDraft {
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
-                require_native_encryption: &mut self.require_native_encryption,
+                require_transport_encryption: &mut self.require_transport_encryption,
+                show_transport_encryption_setting: self.show_transport_encryption_setting,
                 download_choice: &mut self.download_choice,
                 download_path: &mut self.download_path,
                 receive_limit: &mut self.receive_limit,
@@ -407,7 +412,8 @@ impl ServerEditDraft {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.udp_addr.clone(),
             udp_probe_addr: self.udp_probe_addr.clone(),
-            require_native_encryption: self.require_native_encryption,
+            require_transport_encryption: self.require_transport_encryption,
+            show_transport_encryption_setting: self.show_transport_encryption_setting,
             download_choice: self.download_choice,
             download_path: self.download_path.clone(),
             receive_limit: self.receive_limit.clone(),
@@ -430,7 +436,8 @@ struct ServerEditValues<'a> {
     tcp_addr: &'a mut String,
     udp_addr: &'a mut String,
     udp_probe_addr: &'a mut String,
-    require_native_encryption: &'a mut bool,
+    require_transport_encryption: &'a mut bool,
+    show_transport_encryption_setting: bool,
     download_choice: &'a mut DownloadChoice,
     download_path: &'a mut String,
     receive_limit: &'a mut String,
@@ -469,17 +476,22 @@ fn server_edit_ui(
     {
         form.set_help("Optional UDP NAT-probe address for direct peer media checks. Empty disables the separate probe endpoint.");
     }
-    form.section("Security");
-    if form
-        .choice_value(
-            "Native enc",
-            values.require_native_encryption,
-            &NATIVE_ENCRYPTION_CHOICES,
-            native_encryption_choice_label,
-        )
-        .is_focus()
-    {
-        form.set_help("Requires chatt-native encryption. Disable only when another secure link protects this server connection.");
+    if values.show_transport_encryption_setting {
+        form.section("Security");
+        if form
+            .choice_value(
+                "Transport enc",
+                values.require_transport_encryption,
+                &TRANSPORT_ENCRYPTION_CHOICES,
+                transport_encryption_choice_label,
+            )
+            .is_focus()
+        {
+            form.set_help(
+                "Require transport encryption when connecting to this server. \
+                 Re-enabling it hides this setting after the server is saved.",
+            );
+        }
     }
     form.section("Downloads");
     let inherited_download_mode = values.inherited_download_mode;
@@ -549,11 +561,11 @@ fn server_edit_button_event(button: ServerEditButton) -> ServerEditEvent {
     }
 }
 
-fn native_encryption_choice_label(required: bool) -> String {
+fn transport_encryption_choice_label(required: bool) -> String {
     if required {
         "required".to_string()
     } else {
-        "external link allowed".to_string()
+        "not required".to_string()
     }
 }
 
@@ -786,6 +798,20 @@ mod tests {
         let saved = draft.to_update().unwrap().server;
         assert_eq!(saved.files, FileOverrides::default());
         assert_eq!(saved.history, HistoryOverrides::default());
+    }
+
+    #[test]
+    fn transport_encryption_setting_is_hidden_until_warning_was_accepted() {
+        let config = Config::default();
+        let encrypted = ServerEditDraft::from_server(&ServerEntry::default(), &config);
+        assert!(!encrypted.show_transport_encryption_setting);
+        assert_eq!(encrypted.form_height(), 20);
+
+        let mut server = ServerEntry::default();
+        server.require_transport_encryption = false;
+        let plaintext = ServerEditDraft::from_server(&server, &config);
+        assert!(plaintext.show_transport_encryption_setting);
+        assert_eq!(plaintext.form_height(), 22);
     }
 
     #[test]

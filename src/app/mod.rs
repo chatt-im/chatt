@@ -303,7 +303,7 @@ impl ServerCatalog {
                 label: server.label.clone(),
                 username: server.username.clone(),
                 tcp_addr: server.tcp_addr.clone(),
-                require_native_encryption: server.require_native_encryption,
+                require_transport_encryption: server.require_transport_encryption,
                 search_text: format!("{} {} {}", server.label, server.username, server.tcp_addr),
             })
             .collect();
@@ -1662,11 +1662,11 @@ impl App {
             CoreCommand::Settings(operation) => self.handle_settings_op(operation),
             CoreCommand::PlaySoundboard(slot) => self.trigger_soundboard_slot(slot),
             CoreCommand::ToggleVideo => self.activate_top_bar_video(),
-            CoreCommand::AcceptNativeEncryption { label, generation } => {
-                self.accept_native_encryption_warning(&label, generation);
+            CoreCommand::AcceptTransportEncryption { label, generation } => {
+                self.accept_transport_encryption_warning(&label, generation);
             }
-            CoreCommand::CancelNativeEncryption { generation } => {
-                self.cancel_native_encryption_warning(generation)
+            CoreCommand::CancelTransportEncryption { generation } => {
+                self.cancel_transport_encryption_warning(generation)
             }
             CoreCommand::CloseE2eIdentity => {
                 self.open_e2e_reviews.remove(&self.command_client);
@@ -2907,14 +2907,14 @@ impl App {
         });
     }
 
-    fn set_rpc_native_encryption_prompt(&mut self, attempt: &ConnectionAttempt) {
+    fn set_rpc_transport_encryption_prompt(&mut self, attempt: &ConnectionAttempt) {
         if !self.rpc_clients.contains(&attempt.owner) {
             return;
         }
         self.rpc_server_selection_issue = Some(OwnedRpcServerSelectionIssue {
             owner: attempt.owner,
             issue: RpcServerSelectionIssue::Prompt(
-                local_rpc::model::ServerSelectionPrompt::AllowExternalSecureLink {
+                local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
                     label: attempt.server_label.clone(),
                     attempt_id: attempt.generation,
                 },
@@ -4540,26 +4540,26 @@ impl App {
                     self.set_rpc_server_selection_error(&attempt, guidance);
                 }
             }
-            NetworkEvent::NativeEncryptionRequired => {
+            NetworkEvent::TransportEncryptionRequired => {
                 let Some(attempt) = self.connection_attempt.clone() else {
                     self.disconnect_network();
                     self.navigate_all(BaseScreen::Servers { query: None });
-                    self.set_error("server is not using native encryption");
+                    self.set_error("server transport encryption is disabled");
                     return;
                 };
                 self.disconnect_network();
                 self.navigate_all(BaseScreen::Servers { query: None });
-                self.set_rpc_native_encryption_prompt(&attempt);
+                self.set_rpc_transport_encryption_prompt(&attempt);
                 self.send_terminal_event(
                     Audience::Client(attempt.owner),
                     TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
-                        OverlaySpec::NativeEncryptionWarning {
+                        OverlaySpec::TransportEncryptionWarning {
                             label: attempt.server_label,
                             generation: attempt.generation,
                         },
                     )),
                 );
-                self.set_error("server is not using native encryption");
+                self.set_error("server transport encryption is disabled");
             }
             NetworkEvent::DeviceLinkCreated {
                 redemption_secret_hash,
@@ -4879,7 +4879,7 @@ impl App {
         }
     }
 
-    pub(crate) fn accept_native_encryption_warning(&mut self, label: &str, generation: u64) {
+    pub(crate) fn accept_transport_encryption_warning(&mut self, label: &str, generation: u64) {
         if !self
             .connection_attempt
             .as_ref()
@@ -4887,10 +4887,10 @@ impl App {
         {
             return;
         }
-        let _ = self.accept_native_encryption_warning_for(generation);
+        let _ = self.accept_transport_encryption_warning_for(generation);
     }
 
-    fn accept_native_encryption_warning_for(&mut self, generation: u64) -> bool {
+    fn accept_transport_encryption_warning_for(&mut self, generation: u64) -> bool {
         let Some(attempt) = self.connection_attempt.clone() else {
             return false;
         };
@@ -4910,7 +4910,7 @@ impl App {
             self.navigate_all(BaseScreen::Servers { query: None });
             return false;
         };
-        server.require_native_encryption = false;
+        server.require_transport_encryption = false;
 
         match self.config.save_runtime() {
             Ok(path) => {
@@ -4920,7 +4920,7 @@ impl App {
                     self.rpc_server_selection_issue = None;
                     self.navigate_all(BaseScreen::Room);
                     self.set_status(format!(
-                        "native encryption disabled for {label}; config saved to {}",
+                        "transport encryption requirement disabled for {label}; config saved to {}",
                         path.display()
                     ));
                     true
@@ -4942,11 +4942,11 @@ impl App {
         }
     }
 
-    pub(crate) fn cancel_native_encryption_warning(&mut self, generation: u64) {
-        self.cancel_native_encryption_warning_for(generation);
+    pub(crate) fn cancel_transport_encryption_warning(&mut self, generation: u64) {
+        self.cancel_transport_encryption_warning_for(generation);
     }
 
-    fn cancel_native_encryption_warning_for(&mut self, generation: u64) {
+    fn cancel_transport_encryption_warning_for(&mut self, generation: u64) {
         if !self.connection_attempt.as_ref().is_some_and(|attempt| {
             attempt.generation == generation && attempt.owner == self.command_client
         }) {
@@ -8497,7 +8497,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
         NetworkEvent::AuthFailed { .. } => "auth_failed",
-        NetworkEvent::NativeEncryptionRequired => "native_encryption_required",
+        NetworkEvent::TransportEncryptionRequired => "transport_encryption_required",
         NetworkEvent::MediaConnectivity { .. } => "media_connectivity",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::LocalIdentityUnavailable { .. } => "local_identity_unavailable",
@@ -8723,7 +8723,7 @@ mod tests {
     }
 
     #[test]
-    fn native_encryption_rejection_orders_base_reset_before_owner_warning() {
+    fn transport_encryption_rejection_orders_base_reset_before_owner_warning() {
         let mut app = test_app();
         let channel = app.terminal_channel();
         app.connection_attempt = Some(ConnectionAttempt {
@@ -8732,7 +8732,7 @@ mod tests {
             server_label: "legacy".to_string(),
         });
 
-        app.handle_network_event(NetworkEvent::NativeEncryptionRequired);
+        app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
 
         let mut events = channel.drain_events();
         assert!(matches!(
@@ -8744,7 +8744,7 @@ mod tests {
         assert!(matches!(
             events.pop_front(),
             Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
-                OverlaySpec::NativeEncryptionWarning {
+                OverlaySpec::TransportEncryptionWarning {
                     label,
                     generation: 9
                 }
@@ -8754,7 +8754,7 @@ mod tests {
     }
 
     #[test]
-    fn native_encryption_rejection_projects_prompt_to_rpc_owner() {
+    fn transport_encryption_rejection_projects_prompt_to_rpc_owner() {
         let mut app = test_app();
         let owner = crate::client_channel::ClientId(7);
         app.register_rpc_client(owner);
@@ -8764,11 +8764,11 @@ mod tests {
             server_label: "legacy".to_string(),
         });
 
-        app.handle_network_event(NetworkEvent::NativeEncryptionRequired);
+        app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
 
         assert!(matches!(
             app.rpc_snapshot(owner).server_selection.prompt,
-            Some(local_rpc::model::ServerSelectionPrompt::AllowExternalSecureLink {
+            Some(local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
                 label,
                 attempt_id: 9,
             }) if label == "legacy"
@@ -8788,7 +8788,7 @@ mod tests {
 
         app.handle_app_event(AppEvent::NetworkFor {
             generation: 1,
-            event: NetworkEvent::NativeEncryptionRequired,
+            event: NetworkEvent::TransportEncryptionRequired,
         });
 
         assert!(channel.drain_events().is_empty());
@@ -9342,7 +9342,7 @@ mod tests {
             rooms: vec![test_room_info(1)],
             users: vec![user_summary(UserId(1), "alice")],
             default_room: RoomId(1),
-            video_transport_mode: rpc::crypto::TransportMode::NativeEncrypted,
+            video_transport_mode: rpc::crypto::TransportMode::Encrypted,
             video_auth_key: [0; rpc::crypto::KEY_LEN],
         });
 
@@ -9370,7 +9370,7 @@ mod tests {
             rooms: vec![test_room_info(1), test_room_info(2)],
             users: vec![user_summary(UserId(1), "alice")],
             default_room: RoomId(2),
-            video_transport_mode: rpc::crypto::TransportMode::NativeEncrypted,
+            video_transport_mode: rpc::crypto::TransportMode::Encrypted,
             video_auth_key: [0; rpc::crypto::KEY_LEN],
         });
 
@@ -10041,7 +10041,7 @@ mod tests {
             rooms: vec![test_room_info(1)],
             users: vec![user_summary(UserId(1), "alice")],
             default_room: RoomId(1),
-            video_transport_mode: rpc::crypto::TransportMode::NativeEncrypted,
+            video_transport_mode: rpc::crypto::TransportMode::Encrypted,
             video_auth_key: [0; rpc::crypto::KEY_LEN],
         };
         app.handle_network_event(authenticated());
@@ -11605,7 +11605,7 @@ mod tests {
         app.active_tcp_addr = Some("127.0.0.1:1".to_string());
         app.room.voice_room = Some(RoomId(1));
         app.video_transport = Some(crate::video::VideoTransport::new(
-            rpc::crypto::TransportMode::NativeEncrypted,
+            rpc::crypto::TransportMode::Encrypted,
             [0u8; rpc::crypto::KEY_LEN],
         ));
         let missing = format!(

@@ -97,57 +97,55 @@ pub struct SessionSecrets {
     pub media_recv: KeyMaterial,
 }
 
-/// The trust boundary a session runs under, negotiated by the signed handshake.
+/// The transport encryption state negotiated by the signed handshake.
 ///
-/// Both modes derive full session material; the mode only decides whether chatt
-/// itself protects record and datagram payloads or defers to an outer secure
-/// link.
+/// Both modes derive full session material; the mode decides whether record and
+/// datagram payloads are encrypted or sent in plaintext.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportMode {
-    /// Chatt secures the wire: control, media, video, and file payloads are AEAD
-    /// protected by session keys.
-    NativeEncrypted,
-    /// An outer tunnel secures the wire: payloads travel clear after the signed
-    /// handshake, but UDP address claims still carry proof of possession. P2P is
-    /// unavailable because it would bypass the outer link.
-    ExternalSecureLink,
+    /// Control, media, video, and file payloads are AEAD-protected by session
+    /// keys.
+    Encrypted,
+    /// Payloads travel in plaintext after the signed handshake, but UDP address
+    /// claims still carry proof of possession. P2P is unavailable.
+    Plaintext,
 }
 
 impl TransportMode {
     pub const fn wire_id(self) -> u8 {
         match self {
-            TransportMode::NativeEncrypted => 1,
-            TransportMode::ExternalSecureLink => 2,
+            TransportMode::Encrypted => 1,
+            TransportMode::Plaintext => 2,
         }
     }
 
     pub fn from_wire_id(id: u8) -> Option<Self> {
         match id {
-            1 => Some(TransportMode::NativeEncrypted),
-            2 => Some(TransportMode::ExternalSecureLink),
+            1 => Some(TransportMode::Encrypted),
+            2 => Some(TransportMode::Plaintext),
             _ => None,
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            TransportMode::NativeEncrypted => "native-encrypted",
-            TransportMode::ExternalSecureLink => "external-secure-link",
+            TransportMode::Encrypted => "encrypted",
+            TransportMode::Plaintext => "plaintext",
         }
     }
 
     /// The transport-mode ids this build supports, advertised in `ClientHello`.
     pub fn supported_wire_ids() -> Vec<u8> {
         vec![
-            TransportMode::NativeEncrypted.wire_id(),
-            TransportMode::ExternalSecureLink.wire_id(),
+            TransportMode::Encrypted.wire_id(),
+            TransportMode::Plaintext.wire_id(),
         ]
     }
 }
 
 /// Everything a session derives from the handshake: the negotiated mode, the
 /// directional AEAD material, the UDP demux route id, and the auth keys for
-/// external-link UDP address claims and video connection setup. This is the
+/// plaintext-mode UDP address claims and video connection setup. This is the
 /// object callers ask to build the concrete lane codecs; they do not choose
 /// per-lane security states.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,11 +161,11 @@ impl SessionTransport {
     /// Builds the control-lane record codec selected by the session mode.
     pub fn control_record(&self) -> RecordProtection {
         match self.mode {
-            TransportMode::NativeEncrypted => RecordProtection::aead(
+            TransportMode::Encrypted => RecordProtection::aead(
                 self.secrets.control_send.clone(),
                 self.secrets.control_recv.clone(),
             ),
-            TransportMode::ExternalSecureLink => RecordProtection::clear(),
+            TransportMode::Plaintext => RecordProtection::clear(),
         }
     }
 }
@@ -466,7 +464,7 @@ enum Role {
 }
 
 /// Derives every session output from the handshake: the directional AEAD keys,
-/// the shared UDP demux route id, and the auth keys used for external-link UDP
+/// the shared UDP demux route id, and the auth keys used for plaintext UDP
 /// address claims and video connection setup.
 ///
 /// The route id and auth keys are direction-agnostic — both ends derive the same
@@ -713,9 +711,9 @@ impl TransportCipher {
 
 /// Record-framing codec for the control and video lanes. In
 /// [`Aead`](Self::Aead) mode records are ChaCha20-Poly1305 sealed by a
-/// [`TransportCipher`]; in [`Clear`](Self::Clear) mode the outer secure link
-/// protects the wire and record bytes pass through unchanged. The session's
-/// [`TransportMode`] selects the variant; this is not a per-lane policy.
+/// [`TransportCipher`]; in [`Clear`](Self::Clear) mode record bytes pass through
+/// unchanged. The session's [`TransportMode`] selects the variant; this is not
+/// a per-lane policy.
 #[derive(Debug)]
 pub enum RecordProtection {
     Aead(TransportCipher),
@@ -1074,7 +1072,7 @@ pub fn stun_verify(key: &[u8], message_prefix: &[u8], tag: &[u8]) -> bool {
 pub const AUTH_PROOF_LEN: usize = 16;
 
 /// Computes a 16-byte HMAC-SHA256 proof over `message` under `key`, used to
-/// authenticate external-link UDP address claims and video connection setup
+/// authenticate plaintext UDP address claims and video connection setup
 /// without putting AEAD on payload bytes.
 pub fn auth_proof(key: &[u8], message: &[u8]) -> [u8; AUTH_PROOF_LEN] {
     let full = stun_integrity(key, message);
@@ -1259,10 +1257,7 @@ mod tests {
 
     #[test]
     fn client_and_server_derive_opposite_keys() {
-        for mode in [
-            TransportMode::NativeEncrypted,
-            TransportMode::ExternalSecureLink,
-        ] {
+        for mode in [TransportMode::Encrypted, TransportMode::Plaintext] {
             let rng = rand::SystemRandom::new();
             let client = generate_client_hello(&rng).unwrap();
             let client_hello = client.hello.clone();
@@ -1311,11 +1306,11 @@ mod tests {
             &rng,
             &dev_server_key_pair(),
             &client_hello,
-            TransportMode::NativeEncrypted,
+            TransportMode::Encrypted,
         )
         .unwrap();
         let mut tampered = server.hello.clone();
-        tampered.mode = TransportMode::ExternalSecureLink.wire_id();
+        tampered.mode = TransportMode::Plaintext.wire_id();
         assert!(
             complete_client_transport_handshake(client, &tampered, Some(&dev_server_public_key()))
                 .is_err()
@@ -1326,13 +1321,13 @@ mod tests {
     fn server_rejects_unadvertised_mode() {
         let rng = rand::SystemRandom::new();
         let mut client = generate_client_hello(&rng).unwrap();
-        client.hello.modes = vec![TransportMode::NativeEncrypted.wire_id()];
+        client.hello.modes = vec![TransportMode::Encrypted.wire_id()];
         assert!(
             respond_to_client_hello(
                 &rng,
                 &dev_server_key_pair(),
                 &client.hello,
-                TransportMode::ExternalSecureLink,
+                TransportMode::Plaintext,
             )
             .is_err()
         );
@@ -1354,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn external_link_handshake_is_signed_and_derives_material() {
+    fn plaintext_handshake_is_signed_and_derives_material() {
         let rng = rand::SystemRandom::new();
         let client = generate_client_hello(&rng).unwrap();
         let client_hello = client.hello.clone();
@@ -1362,15 +1357,12 @@ mod tests {
             &rng,
             &dev_server_key_pair(),
             &client_hello,
-            TransportMode::ExternalSecureLink,
+            TransportMode::Plaintext,
         )
         .unwrap();
 
-        assert_eq!(
-            server.hello.mode,
-            TransportMode::ExternalSecureLink.wire_id()
-        );
-        // The external-link server still runs the signed ephemeral handshake.
+        assert_eq!(server.hello.mode, TransportMode::Plaintext.wire_id());
+        // A plaintext server still runs the signed ephemeral handshake.
         assert_eq!(server.hello.server_ephemeral.len(), X25519_PUBLIC_KEY_LEN);
         let (transport, trusted) = complete_client_transport_handshake(
             client,
@@ -1378,7 +1370,7 @@ mod tests {
             Some(&dev_server_public_key()),
         )
         .unwrap();
-        assert_eq!(transport.mode, TransportMode::ExternalSecureLink);
+        assert_eq!(transport.mode, TransportMode::Plaintext);
         assert_eq!(trusted, dev_server_public_key());
     }
 

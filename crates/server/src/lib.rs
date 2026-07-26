@@ -491,8 +491,8 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         "chatt transport mode: {}",
         server.config.transport_mode().as_str()
     );
-    if server.config.transport_mode() == rpc::crypto::TransportMode::ExternalSecureLink {
-        println!("chatt is relying on the outer secure link for wire security; P2P disabled");
+    if server.config.transport_mode() == rpc::crypto::TransportMode::Plaintext {
+        println!("chatt transport encryption is disabled; P2P disabled");
     }
     println!(
         "chatt P2P support: {}",
@@ -1437,9 +1437,9 @@ impl Server {
             "server identity loaded",
             public_key = encode_hex(server_key_pair.public_key().as_ref()).as_str()
         );
-        if config.transport_mode() == rpc::crypto::TransportMode::ExternalSecureLink {
+        if config.transport_mode() == rpc::crypto::TransportMode::Plaintext {
             kvlog::warn!(
-                "external-secure-link transport: chatt relies on the outer link for wire security; control, media, video, and file payloads travel clear and P2P is disabled"
+                "transport encryption disabled: control, media, video, and file payloads travel in plaintext and P2P is disabled"
             );
         }
         let file_size_limit_bytes = config.security.max_file_size_bytes();
@@ -2184,13 +2184,12 @@ impl Server {
             _ => return Err("video session is not authorized for this stream".to_string()),
         };
         let (send, recv) = derive_video_keys(&secret, VideoKeyRole::Server);
-        // The connection inherits its owning session's negotiated mode: native
-        // seals video records with the per-stream keys; external-link leaves them
-        // clear (the outer link secures the wire) and authenticates setup with a
-        // proof instead.
+        // The connection inherits its owning session's negotiated mode: encrypted
+        // transport seals video records with the per-stream keys; plaintext
+        // transport leaves them clear and authenticates setup with a proof.
         let record = match session_mode {
-            TransportMode::NativeEncrypted => RecordProtection::aead(send, recv),
-            TransportMode::ExternalSecureLink => RecordProtection::clear(),
+            TransportMode::Encrypted => RecordProtection::aead(send, recv),
+            TransportMode::Plaintext => RecordProtection::clear(),
         };
         let client = self
             .clients
@@ -2214,9 +2213,10 @@ impl Server {
     }
 
     fn handle_video_auth(&mut self, token: Token, record: &[u8]) -> Result<(), String> {
-        // Phase 1: read the connection identity and prove possession. Native
-        // proves it by opening the AEAD auth record; external-link verifies a
-        // compact HMAC proof under the session's video auth key.
+        // Phase 1: read the connection identity and prove possession. Encrypted
+        // transport proves it by opening the AEAD auth record; plaintext
+        // transport verifies a compact HMAC proof under the session's video auth
+        // key.
         let (session_id, stream_id, role) = {
             let client = self
                 .clients
@@ -2250,7 +2250,7 @@ impl Server {
             .get(&session_id)
             .map(|session| (session.transport.mode, session.transport.video_auth_key))
             .ok_or_else(|| "video auth session missing".to_string())?;
-        if mode == TransportMode::ExternalSecureLink
+        if mode == TransportMode::Plaintext
             && !video::video_auth_proof_verify(
                 &video_auth_key,
                 session_id,
@@ -8227,8 +8227,8 @@ enum VideoPhase {
 
 /// Per-connection state for a dedicated video connection. `stream_id`, `role`,
 /// and `record` are filled once the clear [`VideoHello`] arrives, before the
-/// auth record is opened. `record` is AEAD in native mode and clear in
-/// external-link mode.
+/// auth record is opened. `record` is AEAD with encrypted transport and clear
+/// with plaintext transport.
 struct VideoConn {
     phase: VideoPhase,
     session_id: Option<SessionId>,
@@ -9150,7 +9150,7 @@ mod tests {
     /// (as the peer) and opens (as this session) a datagram in tests.
     fn test_transport(route_id: u32) -> SessionTransport {
         SessionTransport {
-            mode: TransportMode::NativeEncrypted,
+            mode: TransportMode::Encrypted,
             secrets: SessionSecrets {
                 control_send: test_key(1, 1),
                 control_recv: test_key(2, 2),
@@ -11579,9 +11579,9 @@ mod tests {
     }
 
     #[test]
-    fn server_bind_normalizes_external_link_p2p_off() {
+    fn server_bind_normalizes_plaintext_transport_p2p_off() {
         let mut config = test_server_config();
-        config.security.transport_mode = crate::config::TransportModeConfig::ExternalSecureLink;
+        config.security.transport_encryption = false;
         config.network.p2p_enabled = true;
         config.network.udp_probe_addr = Some("127.0.0.1:0".parse().unwrap());
 

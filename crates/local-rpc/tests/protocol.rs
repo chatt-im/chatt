@@ -67,7 +67,7 @@ fn renderer_and_daemon_exchange_protocol_v11_frames_and_live_share_fd() {
                     label: "test-server".into(),
                     username: "alice".into(),
                     tcp_addr: "127.0.0.1:4000".into(),
-                    require_native_encryption: true,
+                    require_transport_encryption: true,
                     availability: ServerAvailability::Ready,
                 }],
                 error: None,

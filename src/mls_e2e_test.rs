@@ -18,10 +18,7 @@ use rpc::{
 };
 use server::{
     Server,
-    config::{
-        Config as ServerConfig, RoomConfig, RoomPersistenceConfig, TransportModeConfig, UserConfig,
-        hash_secret,
-    },
+    config::{Config as ServerConfig, RoomConfig, RoomPersistenceConfig, UserConfig, hash_secret},
     local_admin::{AdminCommand, AdminSender},
 };
 
@@ -279,7 +276,7 @@ fn start_server_with(root: &Path, rooms: Vec<RoomConfig>, users: Vec<UserConfig>
     config.network.public_udp_probe_addr = None;
     config.network.p2p_enabled = false;
     config.security.server_identity_seed = dev_server_seed_hex();
-    config.security.transport_mode = TransportModeConfig::NativeEncrypted;
+    config.security.transport_encryption = true;
     config.storage.data_dir = Some(root.join("server").display().to_string());
     config.rooms = rooms;
     let mut server = Server::bind(config).unwrap();
@@ -318,7 +315,7 @@ fn config(addrs: &Addrs, root: &Path, name: &str, token: &str, receive: bool) ->
         server_public_key: None,
         data_dir: Some(root.join(format!("{}-state", name.to_ascii_lowercase()))),
         e2e_peer_pins: Vec::new(),
-        require_native_encryption: true,
+        require_transport_encryption: true,
         file_policy: FilePolicy {
             default: EffectiveFiles {
                 target,

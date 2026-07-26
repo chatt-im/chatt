@@ -263,9 +263,8 @@ impl AppMode for ConfirmMode {
     }
 }
 
-/// Safety gate for connecting to a server that selected plaintext
-/// ExternalSecureLink transport.
-pub(crate) struct NativeEncryptionWarningMode {
+/// Safety gate for connecting to a server that disabled transport encryption.
+pub(crate) struct TransportEncryptionWarningMode {
     label: String,
     generation: u64,
     selected_connect: bool,
@@ -273,7 +272,7 @@ pub(crate) struct NativeEncryptionWarningMode {
     connect_button: Rect,
 }
 
-impl NativeEncryptionWarningMode {
+impl TransportEncryptionWarningMode {
     pub(crate) fn new(label: String, generation: u64) -> Self {
         Self {
             label,
@@ -285,14 +284,14 @@ impl NativeEncryptionWarningMode {
     }
 
     fn accept(&mut self, cx: &mut ViewCx<'_>) {
-        cx.send(CoreCommand::AcceptNativeEncryption {
+        cx.send(CoreCommand::AcceptTransportEncryption {
             label: self.label.clone(),
             generation: self.generation,
         });
     }
 
     fn cancel(&mut self, cx: &mut ViewCx<'_>) {
-        cx.send(CoreCommand::CancelNativeEncryption {
+        cx.send(CoreCommand::CancelTransportEncryption {
             generation: self.generation,
         });
     }
@@ -407,7 +406,7 @@ impl NativeEncryptionWarningMode {
     }
 }
 
-impl AppMode for NativeEncryptionWarningMode {
+impl AppMode for TransportEncryptionWarningMode {
     fn render(
         &mut self,
         cx: &mut ViewCx<'_>,
@@ -433,8 +432,8 @@ impl AppMode for NativeEncryptionWarningMode {
             panel,
             buf,
             theme,
-            "No Native Encryption to Server",
-            native_encryption_header_style(theme),
+            "Transport Encryption Disabled",
+            transport_encryption_header_style(theme),
         );
         body.take_top(1)
             .with(theme.dialog_panel.patch(theme.error | Modifier::BOLD))
@@ -445,23 +444,20 @@ impl AppMode for NativeEncryptionWarningMode {
         body.take_top(1)
             .with(theme.dialog_panel.patch(theme.text))
             .with(Ellipsis(true))
-            .text(
-                buf,
-                "The server selected plaintext ExternalSecureLink transport.",
-            );
+            .text(buf, "The server disabled transport encryption.");
         body.take_top(1)
             .with(theme.dialog_panel.patch(theme.text))
             .with(Ellipsis(true))
             .text(
                 buf,
-                "Connect only when another secure link already protects it.",
+                "Control, media, video, and file payloads will travel in plaintext.",
             );
         body.take_top(1)
             .with(theme.dialog_panel.patch(theme.muted))
             .with(Ellipsis(true))
             .text(
                 buf,
-                "Examples: WireGuard, SSH tunnel, or a private trusted network.",
+                "Connect only if this is intentional and you trust the network path.",
             );
         body.take_top(1);
         body.take_top(1)
@@ -470,7 +466,7 @@ impl AppMode for NativeEncryptionWarningMode {
             .text(
                 buf,
                 &format!(
-                    "Accepting saves require-native-encryption = false for {}.",
+                    "Accepting saves require-transport-encryption = false for {}.",
                     self.label
                 ),
             );
@@ -1612,7 +1608,7 @@ fn security_dialog_presentation() -> ModePresentation {
     }
 }
 
-fn native_encryption_header_style(theme: &Theme) -> extui::Style {
+fn transport_encryption_header_style(theme: &Theme) -> extui::Style {
     if let Some(error) = theme.error.fg() {
         theme.dialog_header.with_bg(error).with_fg_rgb(0, 0, 0)
     } else {
@@ -2441,7 +2437,7 @@ macro_rules! app_mode_test_bridge {
 app_mode_test_bridge!(
     DialogMode,
     ConfirmMode,
-    NativeEncryptionWarningMode,
+    TransportEncryptionWarningMode,
     E2eIdentityMode,
     PasswordPromptMode,
     PasteImageUploadMode,
@@ -3351,14 +3347,14 @@ mod tests {
     }
 
     #[test]
-    fn native_encryption_warning_header_uses_black_on_error_fill() {
+    fn transport_encryption_warning_header_uses_black_on_error_fill() {
         let black = extui::Style::DEFAULT.with_fg_rgb(0, 0, 0).fg();
         for theme in [
             Theme::tomorrow_night(),
             Theme::base16_dark(),
             Theme::base16_light(),
         ] {
-            let style = native_encryption_header_style(&theme);
+            let style = transport_encryption_header_style(&theme);
             assert_eq!(style.bg(), theme.error.fg());
             assert_eq!(style.fg(), black);
         }

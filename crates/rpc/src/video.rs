@@ -64,7 +64,7 @@ impl VideoRole {
     }
 }
 
-/// Domain-separated message the external-link video auth proof covers, binding
+/// Domain-separated message the plaintext video auth proof covers, binding
 /// the connection's identity, role, and transport mode so a proof issued for one
 /// stream/role/session cannot be reused for another.
 fn video_auth_message(
@@ -82,9 +82,9 @@ fn video_auth_message(
     msg
 }
 
-/// Computes the external-link video auth proof: a truncated HMAC under the
+/// Computes the plaintext-transport video auth proof: a truncated HMAC under the
 /// session's video auth key proving the connecting peer completed the session
-/// handshake. In native-encrypted mode possession is proven by opening the AEAD
+/// handshake. With encrypted transport, possession is proven by opening the AEAD
 /// auth record instead, so this is unused there.
 pub fn video_auth_proof(
     video_auth_key: &[u8],
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn video_auth_proof_binds_identity_and_role() {
         let key = [4u8; crate::crypto::KEY_LEN];
-        let mode = TransportMode::ExternalSecureLink;
+        let mode = TransportMode::Plaintext;
         let proof = video_auth_proof(&key, SessionId(7), StreamId(3), VideoRole::Publisher, mode);
         assert!(video_auth_proof_verify(
             &key,
@@ -502,7 +502,7 @@ mod tests {
             SessionId(7),
             StreamId(3),
             VideoRole::Publisher,
-            TransportMode::NativeEncrypted,
+            TransportMode::Encrypted,
             &proof
         ));
     }

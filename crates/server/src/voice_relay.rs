@@ -411,9 +411,9 @@ impl std::fmt::Display for PacketError {
             PacketError::UnknownRoute => f.write_str("unknown UDP route id"),
             PacketError::UnknownSession => f.write_str("unknown UDP session"),
             PacketError::NatProbeUnavailable => {
-                f.write_str("NAT probe not available in external-secure-link")
+                f.write_str("NAT probe not available without transport encryption")
             }
-            PacketError::UnboundSource => f.write_str("external-link media from an unbound source"),
+            PacketError::UnboundSource => f.write_str("plaintext media from an unbound source"),
             PacketError::UnknownNatProbe => f.write_str("unknown NAT probe id"),
         }
     }
@@ -1309,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn external_link_requires_proven_bind_and_bound_source() {
+    fn plaintext_transport_requires_proven_bind_and_bound_source() {
         let mut direct = DirectRelay::new(false);
         let session_id = SessionId(1);
         let bind_key = [9; KEY_LEN];
