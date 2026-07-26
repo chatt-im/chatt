@@ -1,4 +1,5 @@
 use jsony::Jsony;
+use kvlog::{Encode, ValueEncoder};
 
 use crate::ids::{FileTransferId, MessageId, RoomId, StreamId};
 
@@ -175,6 +176,48 @@ pub enum Operation {
     PreviewAppearance,
     CommitAppearance,
     EndAppearancePreview,
+}
+
+impl Encode for Operation {
+    fn encode_log_value_into(&self, output: ValueEncoder<'_>) {
+        let value = match self {
+            Self::SelectServer => "select-server",
+            Self::ResolveServerPrompt => "resolve-server-prompt",
+            Self::SelectRoom => "select-room",
+            Self::LoadOlder => "load-older",
+            Self::SendMessage => "send-message",
+            Self::EditMessage => "edit-message",
+            Self::DeleteMessage => "delete-message",
+            Self::BeginUpload => "begin-upload",
+            Self::FinishUpload => "finish-upload",
+            Self::CancelUpload => "cancel-upload",
+            Self::BeginAttachmentRead => "begin-attachment-read",
+            Self::OpenAttachmentSource => "open-attachment-source",
+            Self::CancelBulkTransfer => "cancel-bulk-transfer",
+            Self::CancelFileTransfer => "cancel-file-transfer",
+            Self::SetVoiceState => "set-voice-state",
+            Self::JoinVoice => "join-voice",
+            Self::LeaveVoice => "leave-voice",
+            Self::SetOutputVolume => "set-output-volume",
+            Self::StartLiveShare => "start-live-share",
+            Self::StopLiveShare => "stop-live-share",
+            Self::RunCommand => "run-command",
+            Self::Ping => "ping",
+            Self::RequestSnapshot => "request-snapshot",
+            Self::Disconnect => "disconnect",
+            Self::OpenSettings => "open-settings",
+            Self::SetAudioPreviewActive => "set-audio-preview-active",
+            Self::PreviewAudioSettings => "preview-audio-settings",
+            Self::RefreshSettingsChoices => "refresh-settings-choices",
+            Self::ReloadSettings => "reload-settings",
+            Self::SaveSettings => "save-settings",
+            Self::CloseSettings => "close-settings",
+            Self::PreviewAppearance => "preview-appearance",
+            Self::CommitAppearance => "commit-appearance",
+            Self::EndAppearancePreview => "end-appearance-preview",
+        };
+        value.encode_log_value_into(output);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]

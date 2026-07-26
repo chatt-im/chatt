@@ -6,6 +6,7 @@
 //! another field.
 
 use jsony::Jsony;
+use kvlog::{Encode, ValueEncoder};
 
 use crate::{
     MAX_SETTINGS_CHANGES, MAX_SETTINGS_CHOICES, MAX_SETTINGS_DIAGNOSTICS, MAX_SETTINGS_FIELDS,
@@ -31,6 +32,18 @@ pub struct SettingsSessionId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary, version)]
 pub struct SettingsFieldId(pub u16);
+
+impl Encode for SettingsSessionId {
+    fn encode_log_value_into(&self, output: ValueEncoder<'_>) {
+        self.0.encode_log_value_into(output);
+    }
+}
+
+impl Encode for SettingsFieldId {
+    fn encode_log_value_into(&self, output: ValueEncoder<'_>) {
+        self.0.encode_log_value_into(output);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
