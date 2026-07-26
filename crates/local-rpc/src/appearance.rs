@@ -5,6 +5,7 @@
 //! through the local RPC protocol version.
 
 use jsony::Jsony;
+use kvlog::{Encode, ValueEncoder};
 
 use crate::{MAX_APPEARANCE_BYTES, frame::Operation};
 
@@ -13,6 +14,12 @@ pub const APPEARANCE_FORMAT_TOML_V1: u16 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Jsony)]
 #[jsony(Binary, version)]
 pub struct AppearanceSessionId(pub u64);
+
+impl Encode for AppearanceSessionId {
+    fn encode_log_value_into(&self, output: ValueEncoder<'_>) {
+        self.0.encode_log_value_into(output);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]

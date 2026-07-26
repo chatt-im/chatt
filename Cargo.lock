@@ -368,7 +368,9 @@ name = "chatt-ids"
 version = "0.1.0"
 dependencies = [
  "jsony",
+ "kvlog",
  "toml-spanner",
+ "uuid",
 ]
 
 [[package]]
@@ -378,7 +380,9 @@ dependencies = [
  "chatt-ids",
  "chatt-video",
  "jsony",
+ "kvlog",
  "libc",
+ "uuid",
 ]
 
 [[package]]

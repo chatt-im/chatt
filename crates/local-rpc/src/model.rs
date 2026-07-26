@@ -1,10 +1,17 @@
 use jsony::Jsony;
+use kvlog::{Encode, ValueEncoder};
 
 use crate::ids::{FileTransferId, MessageId, RoomId, StreamId, UserId};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
 pub struct RequestId(pub u64);
+
+impl Encode for RequestId {
+    fn encode_log_value_into(&self, output: ValueEncoder<'_>) {
+        self.0.encode_log_value_into(output);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
@@ -17,9 +24,94 @@ pub struct AttachmentId {
 #[jsony(Binary)]
 pub struct BulkTransferId(pub u64);
 
+impl Encode for BulkTransferId {
+    fn encode_log_value_into(&self, output: ValueEncoder<'_>) {
+        self.0.encode_log_value_into(output);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
 pub struct DaemonInstanceId(pub [u8; 16]);
+
+impl Encode for DaemonInstanceId {
+    fn encode_log_value_into(&self, output: ValueEncoder<'_>) {
+        uuid::Uuid::from_bytes(self.0).encode_log_value_into(output);
+    }
+}
+
+#[cfg(test)]
+mod log_encoding_tests {
+    use kvlog::{
+        Encode,
+        encoding::{Encoder, Value},
+    };
+
+    use super::{AttachmentId, BulkTransferId, DaemonInstanceId, RequestId};
+    use crate::ids::FileTransferId;
+
+    fn with_encoded_value(value: &impl Encode, check: impl FnOnce(Value<'_>)) {
+        let mut encoder = Encoder::new();
+        {
+            let mut fields = encoder.append(kvlog::LogLevel::Info, 0);
+            value.encode_log_value_into(fields.dynamic_key("value"));
+        }
+        let (_, _, _, mut fields) = kvlog::encoding::decode(encoder.bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        check(fields.next().unwrap().unwrap().1);
+    }
+
+    #[test]
+    fn integer_rpc_ids_delegate_to_integer_encoding() {
+        with_encoded_value(&RequestId(17), |value| {
+            assert!(matches!(value, Value::U64(17)));
+        });
+        with_encoded_value(&BulkTransferId(23), |value| {
+            assert!(matches!(value, Value::U64(23)));
+        });
+    }
+
+    #[test]
+    fn daemon_instance_ids_use_uuid_encoding_without_changing_bytes() {
+        let bytes = *b"0123456789abcdef";
+        with_encoded_value(&DaemonInstanceId(bytes), |value| match value {
+            Value::UUID(uuid) => assert_eq!(uuid.as_bytes(), &bytes),
+            _ => panic!("expected UUID encoding"),
+        });
+    }
+
+    #[test]
+    fn composite_attachment_ids_expose_stable_components() {
+        let id = AttachmentId {
+            timestamp_ms: 1_234,
+            transfer_id: FileTransferId(56),
+        };
+        let mut encoder = Encoder::new();
+        {
+            let mut fields = encoder.append(kvlog::LogLevel::Info, 0);
+            id.timestamp_ms
+                .encode_log_value_into(fields.dynamic_key("attachment_timestamp_ms"));
+            id.transfer_id
+                .encode_log_value_into(fields.dynamic_key("attachment_transfer_id"));
+        }
+        let (_, _, _, fields) = kvlog::encoding::decode(encoder.bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let values = fields
+            .map(Result::unwrap)
+            .map(|(key, value)| (key.as_str().unwrap().to_owned(), value))
+            .collect::<Vec<_>>();
+        assert!(values.iter().any(
+            |(key, value)| key == "attachment_timestamp_ms" && matches!(value, Value::U64(1_234))
+        ));
+        assert!(values.iter().any(
+            |(key, value)| key == "attachment_transfer_id" && matches!(value, Value::U64(56))
+        ));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
@@ -133,6 +225,18 @@ pub enum MediaKind {
     Image,
     Video,
     Audio,
+}
+
+impl Encode for MediaKind {
+    fn encode_log_value_into(&self, output: ValueEncoder<'_>) {
+        let value = match self {
+            Self::File => "file",
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Audio => "audio",
+        };
+        value.encode_log_value_into(output);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]

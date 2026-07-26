@@ -9,4 +9,6 @@ toml = ["dep:toml-spanner"]
 
 [dependencies]
 jsony = "0.1.10"
+kvlog = { git = "https://github.com/exrok/kvlog", rev = "0e3092abc1a0be07683b42e689a2acef7cf6014b", default-features = false }
 toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"], optional = true }
+uuid = { version = "1.7.0", default-features = false }
