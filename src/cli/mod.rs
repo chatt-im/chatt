@@ -540,7 +540,13 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(("mute", sub)) => {
             let command = match sub.subcommand() {
-                Some(("set", set)) => local_control::VoiceCommand::SetMute(parse_voice_state(set)),
+                Some(("set", set)) => {
+                    local_control::VoiceCommand::SetVoiceState(if parse_voice_state(set) {
+                        rpc::control::VoiceState::Muted
+                    } else {
+                        rpc::control::VoiceState::Live
+                    })
+                }
                 _ => local_control::VoiceCommand::ToggleMute,
             };
             let response = local_control::send_voice(command)?;
@@ -550,7 +556,11 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         Some(("deafen", sub)) => {
             let command = match sub.subcommand() {
                 Some(("set", set)) => {
-                    local_control::VoiceCommand::SetDeafen(parse_voice_state(set))
+                    local_control::VoiceCommand::SetVoiceState(if parse_voice_state(set) {
+                        rpc::control::VoiceState::Deafened
+                    } else {
+                        rpc::control::VoiceState::Live
+                    })
                 }
                 _ => local_control::VoiceCommand::ToggleDeafen,
             };

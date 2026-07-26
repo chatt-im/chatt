@@ -7,7 +7,7 @@ use std::{
 use hashbrown::{HashMap, HashSet};
 
 use rpc::{
-    control::{ChatMessage, ParticipantVoiceStatus, RoomInfo, RoomKind, UserSummary},
+    control::{ChatMessage, RoomInfo, RoomKind, UserSummary, VoiceState},
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
 };
 
@@ -1946,7 +1946,7 @@ impl RoomSession {
                             username: peer_name.clone(),
                             online: false,
                             connected_at_ms: 0,
-                            voice_status: ParticipantVoiceStatus::default(),
+                            voice_state: VoiceState::default(),
                         });
                     }
                     ClientRoomKind::Dm {
@@ -3335,28 +3335,27 @@ impl RoomSession {
         self.participants.set_peer_rtt(user_id, rtt_ms);
     }
 
-    pub(super) fn voice_status_changed(&mut self, user_id: UserId, status: ParticipantVoiceStatus) {
-        let status = status.normalized();
+    pub(super) fn voice_state_changed(&mut self, user_id: UserId, state: VoiceState) {
         if let Some(user) = self.users.get_mut(&user_id) {
-            user.voice_status = status;
+            user.voice_state = state;
         }
         if self
             .voice_room
             .or(self.viewed_room)
             .is_some_and(|room_id| self.seen_in_voice(room_id, user_id))
         {
-            self.participants.set_voice_status(user_id, status);
+            self.participants.set_voice_state(user_id, state);
         }
     }
 
     /// Whether a user is currently muted/deafened per the last control-stream
-    /// voice status, used to seed a newly started stream's sender-mute fallback.
+    /// voice state, used to seed a newly started stream's sender-mute fallback.
     pub(super) fn voice_muted(&self, user_id: UserId) -> bool {
         self.participants.voice_muted(user_id)
             || self
                 .users
                 .get(&user_id)
-                .is_some_and(|user| user.voice_status.normalized().muted)
+                .is_some_and(|user| user.voice_state.is_muted())
     }
 
     pub(super) fn update_talking_display(
@@ -3531,7 +3530,7 @@ mod tests {
     use super::*;
     use crate::{config::DefaultBindings, theme::Theme, tui::view::ClientView};
     use rpc::{
-        control::ParticipantVoiceStatus,
+        control::VoiceState,
         ids::{MessageId, RoomId},
     };
 
@@ -3617,7 +3616,7 @@ mod tests {
             username: username.to_string(),
             online: true,
             connected_at_ms: 0,
-            voice_status: ParticipantVoiceStatus::default(),
+            voice_state: VoiceState::default(),
         }
     }
 
@@ -4828,7 +4827,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_status_survives_roster_rebuilds() {
+    fn voice_state_survives_roster_rebuilds() {
         let mut room = test_room();
         enter(
             &mut room,
@@ -4837,13 +4836,7 @@ mod tests {
             Some(UserId(1)),
         );
 
-        room.voice_status_changed(
-            UserId(2),
-            ParticipantVoiceStatus {
-                muted: true,
-                deafened: false,
-            },
-        );
+        room.voice_state_changed(UserId(2), VoiceState::Muted);
         assert!(room.voice_muted(UserId(2)));
 
         assert!(room.set_viewed_room(RoomId(2)));

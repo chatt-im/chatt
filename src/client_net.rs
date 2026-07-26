@@ -33,9 +33,9 @@ use rpc::{
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
         ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN, FileContentEncoding, FileMetadata,
         MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, MessageFlags, P2pCandidate, P2pCandidateKind,
-        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, ParticipantVoiceStatus, RoomInfo, RoomKind,
-        ServerControl, UserSummary, decode_server_control, decode_server_hello,
-        encode_client_control, encode_client_hello, encode_device_link_ticket, max_file_wire_bytes,
+        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind, ServerControl, UserSummary,
+        VoiceState, decode_server_control, decode_server_hello, encode_client_control,
+        encode_client_hello, encode_device_link_ticket, max_file_wire_bytes,
     },
     crypto::{
         CHANNEL_CONTROL, KEY_LEN, KeyMaterial, RecordProtection, SessionTransport, TransportMode,
@@ -485,7 +485,7 @@ pub enum NetworkCommand {
     },
     SetPlaybackSink(Option<LivePlaybackSink>),
     PlaybackFeedback(LivePlaybackFeedback),
-    SetVoiceStatus(ParticipantVoiceStatus),
+    SetVoiceState(VoiceState),
     StartShare {
         codec: String,
         coded_width: u32,
@@ -568,7 +568,7 @@ impl NetworkCommand {
                 | Self::LeaveVoice
                 | Self::FetchHistory { .. }
                 | Self::OpenDm(_)
-                | Self::SetVoiceStatus(_)
+                | Self::SetVoiceState(_)
                 | Self::StartShare { .. }
                 | Self::StopShare { .. }
                 | Self::ReportBug { .. }
@@ -776,9 +776,9 @@ pub enum NetworkEvent {
         user_id: UserId,
         rtt_ms: Option<u16>,
     },
-    VoiceStatus {
+    VoiceStateChanged {
         user_id: UserId,
-        status: ParticipantVoiceStatus,
+        state: VoiceState,
     },
     /// The server refused or failed a `JoinVoice` for `room_id`, so the
     /// pending join must be rolled back before the room can be retried.
@@ -3694,15 +3694,14 @@ impl WorkerState<'_> {
                 // intentionally drops them rather than doing packet work here.
                 kvlog::debug!("media fast-path command reached chatt-net fallback");
             }
-            NetworkCommand::SetVoiceStatus(status) => {
+            NetworkCommand::SetVoiceState(state) => {
                 if audio_pop_logging_enabled() {
                     kvlog::info!(
-                        "audio pop control voice status tx",
-                        muted = status.muted,
-                        deafened = status.deafened
+                        "audio pop control voice state tx",
+                        state = ?state
                     );
                 }
-                self.queue_control(ClientControl::SetVoiceStatus { status })?;
+                self.queue_control(ClientControl::SetVoiceState { state })?;
             }
             NetworkCommand::StartShare {
                 codec,
@@ -5376,26 +5375,22 @@ impl WorkerState<'_> {
                     stream_id,
                 });
             }
-            ServerControl::VoiceStatus {
-                user_id, status, ..
-            } => {
+            ServerControl::VoiceStateChanged { user_id, state, .. } => {
                 kvlog::info!(
-                    "client voice status received",
+                    "client voice state received",
                     user_id = user_id.0,
-                    muted = status.muted,
-                    deafened = status.deafened
+                    state = ?state
                 );
                 if audio_pop_logging_enabled() {
                     kvlog::info!(
-                        "audio pop control voice status rx",
+                        "audio pop control voice state rx",
                         user_id = user_id.0,
-                        muted = status.muted,
-                        deafened = status.deafened
+                        state = ?state
                     );
                 }
                 let _ = self
                     .events
-                    .send(NetworkEvent::VoiceStatus { user_id, status });
+                    .send(NetworkEvent::VoiceStateChanged { user_id, state });
             }
             ServerControl::VoiceJoinFailed { room_id, message } => {
                 kvlog::warn!(
@@ -6042,7 +6037,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SequencedLocalVoicePacket { .. } => "sequenced_local_voice_packet",
         NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",
         NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
-        NetworkCommand::SetVoiceStatus(_) => "set_voice_status",
+        NetworkCommand::SetVoiceState(_) => "set_voice_state",
         NetworkCommand::StartShare { .. } => "start_share",
         NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::ReportBug { .. } => "report_bug",
@@ -6174,7 +6169,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::Presence { .. } => "presence",
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
-        ServerControl::VoiceStatus { .. } => "voice_status",
+        ServerControl::VoiceStateChanged { .. } => "voice_state",
         ServerControl::VoiceJoinFailed { .. } => "voice_join_failed",
         ServerControl::RoomRttSnapshot { .. } => "room_rtt_snapshot",
         ServerControl::UdpBound => "udp_bound",

@@ -14,4 +14,4 @@ pub mod qos;
 pub mod recv;
 pub mod video;
 
-pub const PROTOCOL_VERSION: u16 = 23;
+pub const PROTOCOL_VERSION: u16 = 24;

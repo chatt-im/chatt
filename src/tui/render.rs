@@ -1,6 +1,5 @@
 use std::{
     cmp::Ordering as CmpOrdering,
-    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
@@ -9,15 +8,15 @@ use extui::{
 };
 use extui_bindings::LayerId;
 use extui_editor::{Editor, Mode as EditorMode};
-use rpc::ids::FileTransferId;
+use rpc::{control::VoiceState, ids::FileTransferId};
 use unicode_width::UnicodeWidthStr;
 
 use crate::audio::StatsSnapshot;
 
 use crate::{
     app::{
-        ChatPanelFocus, LocalVoiceMode, ParticipantState, ParticipantVoiceFeedback, RoomSession,
-        ScreencastPhase, ServerEditDraft, ServerSelectItem, StatusKind,
+        ChatPanelFocus, ParticipantState, ParticipantVoiceFeedback, RoomSession, ScreencastPhase,
+        ServerEditDraft, ServerSelectItem, StatusKind,
         audio_supervisor::AudioHealthState,
         room::{RoomSelectItem, TransferProgress, TransferStatus},
         volume_db_label,
@@ -597,7 +596,7 @@ fn draw_user_list(
             && lobby_list_focus == LobbyListFocus::Users
             && Some(participant.user_id) == app.view.participant_selected_user;
         let state = if Some(participant.user_id) == app.room.local_user
-            && app.view.deafened.load(Ordering::Relaxed)
+            && app.view.local_voice_state().is_deafened()
         {
             "deaf"
         } else if participant.online && Some(participant.user_id) == app.room.local_user {
@@ -1298,13 +1297,15 @@ fn room_user_status_indicator(
     if !participant.online {
         return ("▇", app.view.theme.muted);
     }
-    if participant.voice_status.deafened
-        || (local_user && app.view.deafened.load(Ordering::Relaxed))
-    {
+    let voice_state = if local_user {
+        app.view.local_voice_state()
+    } else {
+        participant.voice_state
+    };
+    if voice_state.is_deafened() {
         return ("▇", app.view.theme.error);
     }
-    if participant.voice_status.muted || (local_user && app.view.mic_muted.load(Ordering::Relaxed))
-    {
+    if voice_state.is_muted() {
         return ("▇", app.view.theme.warn);
     }
     if participant.voice_active {
@@ -1409,37 +1410,35 @@ fn draw_video_status_block(row: &mut Rect, app: &RenderState<'_>, buf: &mut Buff
 fn draw_top_bar_voice_buttons(row: &mut Rect, app: &mut RenderState<'_>, buf: &mut Buffer) {
     row.with(Ellipsis(true))
         .with(HAlign::Right)
-        .with(top_bar_voice_button_style(app, LocalVoiceMode::Deafened))
+        .with(top_bar_voice_button_style(app, VoiceState::Deafened))
         .text(buf, " DEAF ")
-        .with(top_bar_voice_button_style(app, LocalVoiceMode::Muted))
+        .with(top_bar_voice_button_style(app, VoiceState::Muted))
         .text(buf, " MUTE ")
-        .with(top_bar_voice_button_style(app, LocalVoiceMode::Live))
+        .with(top_bar_voice_button_style(app, VoiceState::Live))
         .text(buf, " LIVE ");
     app.view.chrome.top_bar.deafen = row.take_right(6);
     app.view.chrome.top_bar.mute = row.take_right(6);
     app.view.chrome.top_bar.live = row.take_right(6);
 }
 
-fn top_bar_voice_button_style(app: &RenderState<'_>, button: LocalVoiceMode) -> Style {
+fn top_bar_voice_button_style(app: &RenderState<'_>, button: VoiceState) -> Style {
     let theme = app.view.theme;
-    if app.view.local_voice_mode() != button {
+    if app.view.local_voice_state() != button {
         return top_bar_inactive_button_style(theme, button);
     }
 
     match button {
-        LocalVoiceMode::Live => top_bar_active_button_style(theme, theme.good) | Modifier::BOLD,
-        LocalVoiceMode::Muted => top_bar_active_button_style(theme, theme.warn) | Modifier::BOLD,
-        LocalVoiceMode::Deafened => {
-            top_bar_active_button_style(theme, theme.error) | Modifier::BOLD
-        }
+        VoiceState::Live => top_bar_active_button_style(theme, theme.good) | Modifier::BOLD,
+        VoiceState::Muted => top_bar_active_button_style(theme, theme.warn) | Modifier::BOLD,
+        VoiceState::Deafened => top_bar_active_button_style(theme, theme.error) | Modifier::BOLD,
     }
 }
 
-fn top_bar_inactive_button_style(theme: Theme, button: LocalVoiceMode) -> Style {
+fn top_bar_inactive_button_style(theme: Theme, button: VoiceState) -> Style {
     match button {
-        LocalVoiceMode::Live => theme.status_section.patch(theme.muted),
-        LocalVoiceMode::Muted => theme.status_fill.patch(theme.muted),
-        LocalVoiceMode::Deafened => theme.selected_line.patch(theme.muted),
+        VoiceState::Live => theme.status_section.patch(theme.muted),
+        VoiceState::Muted => theme.status_fill.patch(theme.muted),
+        VoiceState::Deafened => theme.selected_line.patch(theme.muted),
     }
 }
 
@@ -2408,9 +2407,9 @@ mod tests {
     #[test]
     fn top_bar_inactive_voice_buttons_use_visible_grey_backgrounds() {
         let theme = Theme::base16_dark();
-        let live = top_bar_inactive_button_style(theme, LocalVoiceMode::Live);
-        let mute = top_bar_inactive_button_style(theme, LocalVoiceMode::Muted);
-        let deaf = top_bar_inactive_button_style(theme, LocalVoiceMode::Deafened);
+        let live = top_bar_inactive_button_style(theme, VoiceState::Live);
+        let mute = top_bar_inactive_button_style(theme, VoiceState::Muted);
+        let deaf = top_bar_inactive_button_style(theme, VoiceState::Deafened);
 
         assert!(live.bg().is_some());
         assert!(mute.bg().is_some());

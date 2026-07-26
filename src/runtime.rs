@@ -1269,7 +1269,7 @@ fn projection_deltas(
         });
     }
     if old.voice != next.voice {
-        deltas.push(StateDelta::VoiceStateChanged {
+        deltas.push(StateDelta::VoiceSessionChanged {
             voice: next.voice.clone(),
         });
     }

@@ -33,7 +33,7 @@ use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, Mo
 use rpc::{
     control::{
         ChatMutationKind, DeviceLinkTicket, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN,
-        InviteTicket, ParticipantVoiceStatus,
+        InviteTicket, VoiceState,
     },
     crypto::OPEN_PAIR_RECOVERY_PREFIX,
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
@@ -61,11 +61,11 @@ use crate::{
 };
 
 use crate::audio::{
-    self, AudioStartError, BufferRequest, DeviceInfo, EchoCancellationControl, LOOPBACK_STREAM_ID,
-    LiveAudioFileSourceConfig, LiveAudioFileSourceReport, LiveAudioMuteState,
-    LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig, LiveEncoderProfile, LivePlayback,
-    LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink, LivePlaybackSnapshot,
-    LocalVoiceFrame, LoopbackTap, NotificationSound, PlaybackStreamControl,
+    self, AtomicVoiceState, AudioStartError, BufferRequest, DeviceInfo, EchoCancellationControl,
+    LOOPBACK_STREAM_ID, LiveAudioFileSourceConfig, LiveAudioFileSourceReport,
+    LiveAudioPacketLossProfile, LiveAudioSourceState, LiveCapture, LiveCaptureConfig,
+    LiveEncoderProfile, LivePlayback, LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink,
+    LivePlaybackSnapshot, LocalVoiceFrame, LoopbackTap, NotificationSound, PlaybackStreamControl,
 };
 
 use crate::audio::{AudioErrorKind, DeviceIdentityProbe};
@@ -409,8 +409,7 @@ pub(crate) struct App {
     /// auto-join on (re-)authentication until the next explicit join.
     voice_left: bool,
 
-    pub mic_muted: Arc<AtomicBool>,
-    pub deafened: Arc<AtomicBool>,
+    pub voice_state: Arc<AtomicVoiceState>,
     pub voice_tx_enabled: Arc<AtomicBool>,
     pub mic_error: Option<String>,
     pub playback_error: Option<String>,
@@ -503,13 +502,6 @@ pub(crate) struct App {
     /// TCP address of the connected server, reused by dedicated video
     /// connections. Set on connect, cleared on disconnect.
     active_tcp_addr: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LocalVoiceMode {
-    Live,
-    Muted,
-    Deafened,
 }
 
 /// A share this client can view: the secret to bring up a viewer connection and
@@ -1356,8 +1348,7 @@ impl App {
             None
         };
         let video_fanout = crate::video::VideoFrameFanout::new(web_feed.clone());
-        let mic_muted = Arc::new(AtomicBool::new(false));
-        let deafened = Arc::new(AtomicBool::new(false));
+        let voice_state = Arc::new(AtomicVoiceState::default());
         let app = Self {
             events,
             clients: HashMap::new(),
@@ -1382,8 +1373,7 @@ impl App {
             e2e_account_id: None,
             requested_voice_room: None,
             voice_left: false,
-            mic_muted,
-            deafened,
+            voice_state,
             voice_tx_enabled: Arc::new(AtomicBool::new(false)),
             mic_error: None,
             playback_error: None,
@@ -1463,8 +1453,7 @@ impl App {
         channel: Arc<crate::client_channel::ClientChannel>,
     ) -> ClientView {
         let mut view = ClientView::new(&self.config, self.config.ui.resolve_theme());
-        view.mic_muted = self.mic_muted.clone();
-        view.deafened = self.deafened.clone();
+        view.voice_state = self.voice_state.clone();
         if let Some(room_id) = self.room.viewed_room {
             view.switch_room(room_id, &self.room);
             self.room.prepare_client_view(client_id, room_id);
@@ -1639,10 +1628,8 @@ impl App {
             CoreCommand::JoinVoice(room_id) => self.join_voice_room(room_id),
             CoreCommand::LeaveVoice => self.leave_voice_command(),
             CoreCommand::ToggleMute => self.toggle_mute(),
-            CoreCommand::ToggleDeafen => {
-                self.set_deafen(!self.deafened.load(Ordering::Relaxed));
-            }
-            CoreCommand::SetVoiceMode(mode) => self.set_local_voice_mode(mode),
+            CoreCommand::ToggleDeafen => self.toggle_deafen(),
+            CoreCommand::SetVoiceState(state) => self.set_voice_state(state),
             CoreCommand::ToggleUserMute(user_id) => self.toggle_user_mute(user_id),
             CoreCommand::BeginVolumePreview { user_id, value_db } => {
                 self.room.begin_volume_preview(user_id, value_db);
@@ -1951,11 +1938,8 @@ impl App {
     fn apply_voice_command(&mut self, command: local_control::VoiceCommand) {
         match command {
             local_control::VoiceCommand::ToggleMute => self.toggle_mute(),
-            local_control::VoiceCommand::SetMute(state) => self.set_mute(state),
-            local_control::VoiceCommand::ToggleDeafen => {
-                self.set_deafen(!self.deafened.load(Ordering::Relaxed))
-            }
-            local_control::VoiceCommand::SetDeafen(state) => self.set_deafen(state),
+            local_control::VoiceCommand::ToggleDeafen => self.toggle_deafen(),
+            local_control::VoiceCommand::SetVoiceState(state) => self.set_voice_state(state),
         }
     }
 
@@ -3747,7 +3731,7 @@ impl App {
         if refresh.restart_preview
             && self.settings_preview_refresh_id.take() == Some(refresh.id)
             && !self.voice_tx_enabled.load(Ordering::Relaxed)
-            && !self.deafened.load(Ordering::Relaxed)
+            && !self.local_voice_state().is_deafened()
         {
             self.start_settings_preview_capture();
         }
@@ -3811,7 +3795,7 @@ impl App {
                         .unwrap_or(default_room);
                     self.requested_voice_room = Some(voice_target);
                     self.send_network_command(NetworkCommand::JoinVoice(voice_target), true);
-                    self.publish_voice_status();
+                    self.publish_voice_state();
                 }
                 self.mark_room_catalog_dirty();
                 self.set_status(format!("authenticated as {}", self.room.local_username));
@@ -4343,9 +4327,9 @@ impl App {
             NetworkEvent::PeerRtt { user_id, rtt_ms } => {
                 self.room.peer_rtt(user_id, rtt_ms);
             }
-            NetworkEvent::VoiceStatus { user_id, status } => {
-                self.room.voice_status_changed(user_id, status);
-                self.apply_remote_sender_mute(user_id, status.muted);
+            NetworkEvent::VoiceStateChanged { user_id, state } => {
+                self.room.voice_state_changed(user_id, state);
+                self.apply_remote_sender_mute(user_id, state.is_muted());
             }
             NetworkEvent::VoiceJoinFailed { room_id, message } => {
                 if self.requested_voice_room == Some(room_id) {
@@ -5694,8 +5678,9 @@ impl App {
             return;
         }
         self.pending_voice_teardown_at = None;
-        // A racing undeafen clears the deadline, so reaching here means we are
-        // still deafened and the fade tail has been sent.
+        if !self.local_voice_state().is_deafened() {
+            return;
+        }
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.stop_mic_capture();
     }
@@ -5723,8 +5708,8 @@ impl App {
 
     fn update_lobby_talking(&mut self, now: Instant) -> bool {
         let local_user = self.user_id;
-        let local_status = self.local_voice_status();
-        let local_raw_active = if local_status.muted {
+        let local_state = self.local_voice_state();
+        let local_raw_active = if local_state.is_muted() {
             false
         } else if self.config.soundboard.enabled {
             self.soundboard_busy.load(Ordering::Relaxed)
@@ -5834,8 +5819,8 @@ impl App {
         self.mic_error = None;
         self.playback_error = None;
         self.restart_capture_stream();
-        let playback_should_run =
-            self.voice_tx_enabled.load(Ordering::Relaxed) && !self.deafened.load(Ordering::Relaxed);
+        let playback_should_run = self.voice_tx_enabled.load(Ordering::Relaxed)
+            && !self.local_voice_state().is_deafened();
         if playback_should_run || self.playback.is_some() {
             self.restart_playback_stream();
         }
@@ -6172,7 +6157,7 @@ impl App {
         let Some(playback) = &self.playback else {
             self.supervisor.playback_watch = PlaybackWatch::default();
             let should_run = self.voice_tx_enabled.load(Ordering::Relaxed)
-                && !self.deafened.load(Ordering::Relaxed);
+                && !self.local_voice_state().is_deafened();
             if !should_run {
                 self.supervisor.playback.reset();
             }
@@ -6798,10 +6783,10 @@ impl App {
     fn run_slash_command(&mut self, room_id: Option<RoomId>, input: String) {
         match input.as_str() {
             "/quit" => self.set_status("use Ctrl-C to quit"),
-            "/mute" => self.set_mute(true),
-            "/unmute" => self.set_mute(false),
-            "/deafen" => self.set_deafen(true),
-            "/undeafen" => self.set_deafen(false),
+            "/mute" => self.set_voice_state(VoiceState::Muted),
+            "/unmute" => self.set_voice_state(VoiceState::Live),
+            "/deafen" => self.set_voice_state(VoiceState::Deafened),
+            "/undeafen" => self.set_voice_state(VoiceState::Live),
             "/muted" => self.show_mute_status(),
             "/deafened" => self.show_deafen_status(),
             "/audio" => self.show_audio_status(),
@@ -7146,7 +7131,7 @@ impl App {
         self.voice_left = false;
         self.requested_voice_room = Some(target);
         self.send_network_command(NetworkCommand::JoinVoice(target), true);
-        self.publish_voice_status();
+        self.publish_voice_state();
     }
 
     fn leave_voice_command(&mut self) {
@@ -7245,33 +7230,20 @@ impl App {
         self.set_status("slash commands listed");
     }
 
-    fn set_mute(&mut self, muted: bool) {
-        if !muted && self.deafened.load(Ordering::Relaxed) {
-            self.set_status("deafened; microphone remains muted");
-            return;
-        }
-        self.mic_muted.store(muted, Ordering::Relaxed);
-        self.publish_voice_status();
-        self.set_status(if muted {
-            "microphone muted"
-        } else {
-            "microphone unmuted"
-        });
-    }
-
     fn toggle_mute(&mut self) {
-        if self.deafened.load(Ordering::Relaxed) {
-            self.mic_muted.store(false, Ordering::Relaxed);
-            self.set_deafen(false);
-        } else {
-            self.set_mute(!self.mic_muted.load(Ordering::Relaxed));
-        }
+        let state = self.local_voice_state().toggle_mute();
+        self.set_voice_state(state);
     }
 
-    fn set_deafen(&mut self, deafened: bool) {
-        self.deafened.store(deafened, Ordering::Relaxed);
-        if deafened {
-            self.mic_muted.store(true, Ordering::Relaxed);
+    fn toggle_deafen(&mut self) {
+        let state = self.local_voice_state().toggle_deafen();
+        self.set_voice_state(state);
+    }
+
+    fn set_voice_state(&mut self, state: VoiceState) {
+        self.voice_state.store(state, Ordering::Relaxed);
+
+        if state.is_deafened() {
             // Keep active senders (and transport) alive briefly so they can send
             // their mute fade-out tail before capture/transport closes; the
             // deferred teardown in `supervise_voice_teardown` finishes the job.
@@ -7286,59 +7258,42 @@ impl App {
             self.set_network_playback_sink(None);
             self.playback.take();
             self.drop_notification_playback();
-            self.publish_voice_status();
-            self.set_status("deafened");
         } else {
             self.pending_voice_teardown_at = None;
-            self.publish_voice_status();
-            self.set_status("undeafened");
-            self.start_room_voice();
+            self.ensure_room_voice_running();
         }
-    }
-
-    fn set_local_voice_mode(&mut self, mode: LocalVoiceMode) {
-        match mode {
-            LocalVoiceMode::Live => {
-                self.deafened.store(false, Ordering::Relaxed);
-                self.mic_muted.store(false, Ordering::Relaxed);
-                self.pending_voice_teardown_at = None;
-                self.publish_voice_status();
-                self.set_status("live");
-                self.ensure_room_voice_running();
-            }
-            LocalVoiceMode::Muted => {
-                self.deafened.store(false, Ordering::Relaxed);
-                self.mic_muted.store(true, Ordering::Relaxed);
-                self.pending_voice_teardown_at = None;
-                self.publish_voice_status();
-                self.set_status("microphone muted");
-                self.ensure_room_voice_running();
-            }
-            LocalVoiceMode::Deafened => self.set_deafen(true),
-        }
+        self.publish_voice_state();
+        self.show_voice_state(state);
     }
 
     fn ensure_room_voice_running(&mut self) {
+        if self.room.voice_room.is_none() {
+            return;
+        }
         if self.voice_tx_enabled.load(Ordering::Relaxed) && self.playback.is_some() {
             return;
         }
         self.start_room_voice();
     }
 
-    fn local_voice_status(&self) -> ParticipantVoiceStatus {
-        ParticipantVoiceStatus {
-            muted: self.mic_muted.load(Ordering::Relaxed) || self.deafened.load(Ordering::Relaxed),
-            deafened: self.deafened.load(Ordering::Relaxed),
-        }
-        .normalized()
+    fn local_voice_state(&self) -> VoiceState {
+        self.voice_state.load(Ordering::Relaxed)
     }
 
-    fn publish_voice_status(&mut self) {
-        let status = self.local_voice_status();
+    fn publish_voice_state(&mut self) {
+        let state = self.local_voice_state();
         if let Some(user_id) = self.user_id {
-            self.room.voice_status_changed(user_id, status);
+            self.room.voice_state_changed(user_id, state);
         }
-        self.send_network_command(NetworkCommand::SetVoiceStatus(status), false);
+        self.send_network_command(NetworkCommand::SetVoiceState(state), false);
+    }
+
+    fn show_voice_state(&mut self, state: VoiceState) {
+        self.set_status(match state {
+            VoiceState::Live => "live",
+            VoiceState::Muted => "microphone muted",
+            VoiceState::Deafened => "deafened",
+        });
     }
 
     fn activate_top_bar_video(&mut self) {
@@ -7359,9 +7314,9 @@ impl App {
     }
 
     fn show_mute_status(&mut self) {
-        self.set_status(if self.deafened.load(Ordering::Relaxed) {
+        self.set_status(if self.local_voice_state().is_deafened() {
             "deafened; microphone muted"
-        } else if self.mic_muted.load(Ordering::Relaxed) {
+        } else if self.local_voice_state().is_muted() {
             "microphone muted"
         } else {
             "microphone unmuted"
@@ -7369,7 +7324,7 @@ impl App {
     }
 
     fn show_deafen_status(&mut self) {
-        self.set_status(if self.deafened.load(Ordering::Relaxed) {
+        self.set_status(if self.local_voice_state().is_deafened() {
             "deafened"
         } else {
             "not deafened"
@@ -7661,7 +7616,7 @@ impl App {
             self.set_error(format!("soundboard slot {} is not configured", slot + 1));
             return;
         };
-        if self.deafened.load(Ordering::Relaxed) {
+        if self.local_voice_state().is_deafened() {
             self.set_error("undeafen before using soundboard");
             return;
         }
@@ -7706,9 +7661,8 @@ impl App {
             max_amplification: self.config.audio.max_amplification,
             denoise: self.config.audio.denoise.is_enabled(),
             auto_gain: true,
-            mute_state: LiveAudioMuteState::new(
-                Arc::clone(&self.mic_muted),
-                Arc::clone(&self.deafened),
+            source_state: LiveAudioSourceState::new(
+                Arc::clone(&self.voice_state),
                 Arc::clone(&self.voice_tx_enabled),
             ),
         };
@@ -7770,8 +7724,7 @@ impl App {
             buffer_request: self.input_buffer_request(),
             tuning: self.config.audio.latency.to_tuning(),
             echo_control: Some(Arc::clone(&self.echo_control)),
-            mic_muted: Arc::clone(&self.mic_muted),
-            deafened: Arc::clone(&self.deafened),
+            voice_state: Arc::clone(&self.voice_state),
         }
     }
 
@@ -7898,7 +7851,7 @@ impl App {
         if !self.allow_settings_preview_capture
             || self.capture.is_some()
             || self.voice_tx_enabled.load(Ordering::Relaxed)
-            || self.deafened.load(Ordering::Relaxed)
+            || self.local_voice_state().is_deafened()
         {
             return Ok(());
         }
@@ -7921,7 +7874,7 @@ impl App {
             self.set_error("select a server before starting voice");
             return;
         }
-        if self.deafened.load(Ordering::Relaxed) {
+        if self.local_voice_state().is_deafened() {
             self.voice_tx_enabled.store(false, Ordering::Relaxed);
             self.stop_mic_capture();
             self.set_network_playback_sink(None);
@@ -8124,7 +8077,7 @@ impl App {
     }
 
     fn ensure_loopback_capture(&mut self) -> Result<(), AudioStartError> {
-        if self.deafened.load(Ordering::Relaxed) {
+        if self.local_voice_state().is_deafened() {
             return Err(AudioStartError::new(
                 AudioErrorKind::ConfigInvalid,
                 "undeafen before using loopback",
@@ -8216,7 +8169,7 @@ impl App {
     /// the tick supervisor tears down after an idle linger. Deafen always
     /// suppresses sounds.
     fn play_notification(&mut self, sound: NotificationSound) {
-        if self.deafened.load(Ordering::Relaxed) {
+        if self.local_voice_state().is_deafened() {
             return;
         }
         let mode = self.config.notifications.sounds;
@@ -8301,7 +8254,7 @@ impl App {
 
     fn stop_audio(&mut self) {
         let restart_settings_preview =
-            self.settings_preview_capture && !self.deafened.load(Ordering::Relaxed);
+            self.settings_preview_capture && !self.local_voice_state().is_deafened();
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.pending_voice_teardown_at = None;
         self.stop_mic_capture();
@@ -8491,7 +8444,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::OutboundFeedback { .. } => "outbound_feedback",
         NetworkEvent::ServerRtt { .. } => "server_rtt",
         NetworkEvent::PeerRtt { .. } => "peer_rtt",
-        NetworkEvent::VoiceStatus { .. } => "voice_status",
+        NetworkEvent::VoiceStateChanged { .. } => "voice_state",
         NetworkEvent::VoiceJoinFailed { .. } => "voice_join_failed",
         NetworkEvent::EncoderProfileChanged(_) => "encoder_profile_changed",
         NetworkEvent::Status(_) => "status",
@@ -8526,7 +8479,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SequencedLocalVoicePacket { .. } => "sequenced_local_voice_packet",
         NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",
         NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
-        NetworkCommand::SetVoiceStatus(_) => "set_voice_status",
+        NetworkCommand::SetVoiceState(_) => "set_voice_state",
         NetworkCommand::StartShare { .. } => "start_share",
         NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::ReportBug { .. } => "report_bug",
@@ -8603,7 +8556,7 @@ mod tests {
             username: username.to_string(),
             online: true,
             connected_at_ms: 0,
-            voice_status: ParticipantVoiceStatus::default(),
+            voice_state: VoiceState::default(),
         }
     }
 
@@ -8667,7 +8620,8 @@ mod tests {
     fn notification_suppressed_while_deafened() {
         let mut app = test_app();
         app.config.notifications.sounds = NotificationSoundMode::Always;
-        app.deafened.store(true, Ordering::Relaxed);
+        app.voice_state
+            .store(VoiceState::Deafened, Ordering::Relaxed);
 
         app.play_notification(NotificationSound::MessageReceived);
 
@@ -9222,7 +9176,8 @@ mod tests {
     #[test]
     fn loopback_enable_rejects_deafened_state() {
         let mut app = test_app();
-        app.deafened.store(true, Ordering::Relaxed);
+        app.voice_state
+            .store(VoiceState::Deafened, Ordering::Relaxed);
 
         app.set_loopback_enabled(true);
 
@@ -9950,7 +9905,8 @@ mod tests {
         enter_test_room(&mut app);
         // The deafened path skips audio device startup, keeping the test
         // hermetic; the join command must still go out.
-        app.deafened.store(true, Ordering::Relaxed);
+        app.voice_state
+            .store(VoiceState::Deafened, Ordering::Relaxed);
 
         app.view.composer.set_lines("/voice");
         app.submit_input();
@@ -9976,7 +9932,8 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
         enter_test_room(&mut app);
-        app.deafened.store(true, Ordering::Relaxed);
+        app.voice_state
+            .store(VoiceState::Deafened, Ordering::Relaxed);
 
         app.view.composer.set_lines("/voice");
         app.submit_input();
@@ -10027,7 +9984,8 @@ mod tests {
         let mut app = test_app();
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
-        app.deafened.store(true, Ordering::Relaxed);
+        app.voice_state
+            .store(VoiceState::Deafened, Ordering::Relaxed);
         enter_test_room(&mut app);
         app.room.voice_room = Some(rpc::ids::RoomId(1));
 
@@ -10350,43 +10308,38 @@ mod tests {
     }
 
     #[test]
-    fn local_mute_and_deafen_publish_voice_status() {
+    fn local_mute_and_deafen_publish_voice_state() {
         let mut app = test_app();
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
         enter_room_with_users(&mut app, vec![user_summary(UserId(1), "alice")]);
 
-        app.set_mute(true);
+        app.set_voice_state(VoiceState::Muted);
 
-        let status = match rx.try_recv().unwrap() {
-            NetworkCommand::SetVoiceStatus(status) => status,
-            other => panic!("unexpected command: {other:?}"),
-        };
-        assert_eq!(
-            status,
-            ParticipantVoiceStatus {
-                muted: true,
-                deafened: false,
-            }
-        );
-
-        app.set_deafen(true);
-
-        let status = loop {
-            match rx.try_recv().unwrap() {
-                NetworkCommand::SetVoiceStatus(status) => break status,
-                NetworkCommand::SetPlaybackSink(None) => {}
+        let state = loop {
+            match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+                NetworkCommand::SetVoiceState(state) => break state,
+                NetworkCommand::LocalVoicePacket(_)
+                | NetworkCommand::SequencedLocalVoicePacket { .. }
+                | NetworkCommand::SetPlaybackSink(_) => {}
                 other => panic!("unexpected command: {other:?}"),
             }
         };
-        assert_eq!(
-            status,
-            ParticipantVoiceStatus {
-                muted: true,
-                deafened: true,
+        assert_eq!(state, VoiceState::Muted);
+
+        app.set_voice_state(VoiceState::Deafened);
+
+        let state = loop {
+            match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+                NetworkCommand::SetVoiceState(state) => break state,
+                NetworkCommand::LocalVoicePacket(_)
+                | NetworkCommand::SequencedLocalVoicePacket { .. }
+                | NetworkCommand::SetPlaybackSink(_) => {}
+                other => panic!("unexpected command: {other:?}"),
             }
-        );
+        };
+        assert_eq!(state, VoiceState::Deafened);
     }
 
     #[test]
@@ -11023,7 +10976,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty()),
         );
 
-        assert!(app.mic_muted.load(Ordering::Relaxed));
+        assert!(app.local_voice_state().is_muted());
         assert_eq!(room.focus(), ChatPanelFocus::Compose);
         assert_eq!(app.view.composer.mode(), EditorMode::Normal);
     }
@@ -11429,14 +11382,14 @@ mod tests {
     #[test]
     fn toggle_mute_while_deafened_undeafens_and_unmutes() {
         let mut app = test_app();
-        app.set_deafen(true);
-        assert!(app.deafened.load(Ordering::Relaxed));
-        assert!(app.mic_muted.load(Ordering::Relaxed));
+        app.set_voice_state(VoiceState::Deafened);
+        assert!(app.local_voice_state().is_deafened());
+        assert!(app.local_voice_state().is_muted());
 
         app.process_global_command(BindCommand::ToggleMute);
 
-        assert!(!app.deafened.load(Ordering::Relaxed));
-        assert!(!app.mic_muted.load(Ordering::Relaxed));
+        assert!(!app.local_voice_state().is_deafened());
+        assert!(!app.local_voice_state().is_muted());
     }
 
     #[test]
@@ -11522,37 +11475,37 @@ mod tests {
         assert!(!deafen_rect.is_empty());
 
         click_top_bar_rect(&mut app, &mut room, mute_rect);
-        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Muted);
-        assert!(app.mic_muted.load(Ordering::Relaxed));
-        assert!(!app.deafened.load(Ordering::Relaxed));
+        assert_eq!(app.view.local_voice_state(), VoiceState::Muted);
+        assert!(app.local_voice_state().is_muted());
+        assert!(!app.local_voice_state().is_deafened());
 
         click_top_bar_rect(&mut app, &mut room, mute_rect);
-        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Live);
-        assert!(!app.mic_muted.load(Ordering::Relaxed));
-        assert!(!app.deafened.load(Ordering::Relaxed));
+        assert_eq!(app.view.local_voice_state(), VoiceState::Live);
+        assert!(!app.local_voice_state().is_muted());
+        assert!(!app.local_voice_state().is_deafened());
 
         click_top_bar_rect(&mut app, &mut room, deafen_rect);
-        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Deafened);
-        assert!(app.mic_muted.load(Ordering::Relaxed));
-        assert!(app.deafened.load(Ordering::Relaxed));
+        assert_eq!(app.view.local_voice_state(), VoiceState::Deafened);
+        assert!(app.local_voice_state().is_muted());
+        assert!(app.local_voice_state().is_deafened());
 
         click_top_bar_rect(&mut app, &mut room, mute_rect);
-        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Muted);
-        assert!(app.mic_muted.load(Ordering::Relaxed));
-        assert!(!app.deafened.load(Ordering::Relaxed));
+        assert_eq!(app.view.local_voice_state(), VoiceState::Muted);
+        assert!(app.local_voice_state().is_muted());
+        assert!(!app.local_voice_state().is_deafened());
 
         click_top_bar_rect(&mut app, &mut room, live_rect);
-        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Live);
-        assert!(!app.mic_muted.load(Ordering::Relaxed));
-        assert!(!app.deafened.load(Ordering::Relaxed));
+        assert_eq!(app.view.local_voice_state(), VoiceState::Live);
+        assert!(!app.local_voice_state().is_muted());
+        assert!(!app.local_voice_state().is_deafened());
 
         click_top_bar_rect(&mut app, &mut room, deafen_rect);
-        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Deafened);
+        assert_eq!(app.view.local_voice_state(), VoiceState::Deafened);
 
         click_top_bar_rect(&mut app, &mut room, deafen_rect);
-        assert_eq!(app.view.local_voice_mode(), LocalVoiceMode::Live);
-        assert!(!app.mic_muted.load(Ordering::Relaxed));
-        assert!(!app.deafened.load(Ordering::Relaxed));
+        assert_eq!(app.view.local_voice_state(), VoiceState::Live);
+        assert!(!app.local_voice_state().is_muted());
+        assert!(!app.local_voice_state().is_deafened());
     }
 
     #[test]
@@ -11742,7 +11695,8 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
         enter_test_room(&mut app);
-        app.deafened.store(true, Ordering::Relaxed);
+        app.voice_state
+            .store(VoiceState::Deafened, Ordering::Relaxed);
 
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);

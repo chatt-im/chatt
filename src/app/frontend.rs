@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use local_rpc::{
     bulk::BeginAttachmentRead,
     bulk::BeginUpload,
@@ -9,7 +7,7 @@ use local_rpc::{
         AttachmentDescriptor, AttachmentId, CommandCandidate, CommandCandidateKind,
         CommandOutputLine, ConnectionState, MediaKind, Message, RequestId, RoomKind, RoomSnapshot,
         RoomSummary, ServerAvailability, ServerSelectionState, ServerSummary, StateSnapshot,
-        TrustState, VoiceState,
+        TrustState, VoiceSessionState, VoiceState,
     },
 };
 
@@ -187,9 +185,8 @@ impl App {
             rooms,
             selected_room,
             room,
-            voice: VoiceState {
-                muted: self.mic_muted.load(Ordering::Relaxed),
-                deafened: self.deafened.load(Ordering::Relaxed),
+            voice: VoiceSessionState {
+                state: rpc_voice_state(self.local_voice_state()),
                 output_volume: self.config.audio.output_volume,
                 joined_room: self.room.voice_room,
             },
@@ -300,8 +297,7 @@ impl App {
                     name: user.username,
                     online: user.online,
                     speaking: false,
-                    muted: user.voice_status.muted,
-                    deafened: user.voice_status.deafened,
+                    voice_state: rpc_voice_state(user.voice_state),
                 })
                 .collect(),
         }
@@ -650,16 +646,9 @@ impl App {
                     RpcCommandEffect::Reply(accepted(request_id, Operation::DeleteMessage))
                 }
             }
-            ClientFrame::SetMuted { request_id, muted } => {
-                self.set_mute(muted);
-                RpcCommandEffect::Reply(accepted(request_id, Operation::SetMuted))
-            }
-            ClientFrame::SetDeafened {
-                request_id,
-                deafened,
-            } => {
-                self.set_deafen(deafened);
-                RpcCommandEffect::Reply(accepted(request_id, Operation::SetDeafened))
+            ClientFrame::SetVoiceState { request_id, state } => {
+                self.set_voice_state(core_voice_state(state));
+                RpcCommandEffect::Reply(accepted(request_id, Operation::SetVoiceState))
             }
             ClientFrame::SetOutputVolume { request_id, volume } => {
                 self.set_output_volume(volume);
@@ -1046,6 +1035,22 @@ impl App {
     }
 }
 
+fn rpc_voice_state(state: rpc::control::VoiceState) -> VoiceState {
+    match state {
+        rpc::control::VoiceState::Live => VoiceState::Live,
+        rpc::control::VoiceState::Muted => VoiceState::Muted,
+        rpc::control::VoiceState::Deafened => VoiceState::Deafened,
+    }
+}
+
+fn core_voice_state(state: VoiceState) -> rpc::control::VoiceState {
+    match state {
+        VoiceState::Live => rpc::control::VoiceState::Live,
+        VoiceState::Muted => rpc::control::VoiceState::Muted,
+        VoiceState::Deafened => rpc::control::VoiceState::Deafened,
+    }
+}
+
 fn rpc_message_size_estimate(message: &rpc::control::ChatMessage) -> usize {
     const STRUCTURAL_OVERHEAD: usize = 256;
     const ATTACHMENT_OVERHEAD: usize = 512;
@@ -1089,7 +1094,7 @@ fn rejected(
 mod tests {
     use super::*;
     use rpc::{
-        control::{ParticipantVoiceStatus, RoomInfo, RoomKind as WireRoomKind, UserSummary},
+        control::{RoomInfo, RoomKind as WireRoomKind, UserSummary, VoiceState},
         ids::UserId,
     };
 
@@ -1240,7 +1245,7 @@ mod tests {
                 username: "alice".into(),
                 online: true,
                 connected_at_ms: 1,
-                voice_status: ParticipantVoiceStatus::default(),
+                voice_state: VoiceState::default(),
             }],
             RoomId(1),
             Some(RoomId(1)),
@@ -1294,7 +1299,7 @@ mod tests {
                 username: "alice".into(),
                 online: true,
                 connected_at_ms: 1,
-                voice_status: ParticipantVoiceStatus::default(),
+                voice_state: VoiceState::default(),
             }]
         };
 

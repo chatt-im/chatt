@@ -9,7 +9,7 @@ use super::{
         AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo,
         CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, Message, Participant,
         RequestId, RoomSnapshot, RoomSummary, ServerSelectionState, StateSnapshot, TransferSummary,
-        TrustState, VoiceState,
+        TrustState, VoiceSessionState, VoiceState,
     },
     settings::{SettingsCommand, SettingsEvent, SettingsResult},
 };
@@ -155,8 +155,7 @@ pub enum Operation {
     OpenAttachmentSource,
     CancelBulkTransfer,
     CancelFileTransfer,
-    SetMuted,
-    SetDeafened,
+    SetVoiceState,
     JoinVoice,
     LeaveVoice,
     SetOutputVolume,
@@ -256,8 +255,8 @@ pub enum StateDelta {
     TransferRemoved {
         transfer_id: FileTransferId,
     },
-    VoiceStateChanged {
-        voice: VoiceState,
+    VoiceSessionChanged {
+        voice: VoiceSessionState,
     },
     LiveShareUpserted {
         share: LiveShare,
@@ -352,13 +351,9 @@ pub enum ClientFrame {
         request_id: RequestId,
         transfer_id: FileTransferId,
     },
-    SetMuted {
+    SetVoiceState {
         request_id: RequestId,
-        muted: bool,
-    },
-    SetDeafened {
-        request_id: RequestId,
-        deafened: bool,
+        state: VoiceState,
     },
     JoinVoice {
         request_id: RequestId,
@@ -425,8 +420,7 @@ impl ClientFrame {
             | Self::OpenAttachmentSource { request_id, .. }
             | Self::CancelBulkTransfer { request_id, .. }
             | Self::CancelFileTransfer { request_id, .. }
-            | Self::SetMuted { request_id, .. }
-            | Self::SetDeafened { request_id, .. }
+            | Self::SetVoiceState { request_id, .. }
             | Self::JoinVoice { request_id, .. }
             | Self::LeaveVoice { request_id }
             | Self::SetOutputVolume { request_id, .. }
@@ -977,7 +971,7 @@ fn validate_delta(delta: &StateDelta) -> Result<(), String> {
         StateDelta::TransferRemoved { transfer_id } if transfer_id.0 == 0 => {
             Err("transfer id must be nonzero".into())
         }
-        StateDelta::VoiceStateChanged { voice } => voice.validate(),
+        StateDelta::VoiceSessionChanged { voice } => voice.validate(),
         StateDelta::LiveShareUpserted { share } => share.validate(),
         StateDelta::ResyncRequired { reason } => super::model::check_nonempty_string(reason),
         _ => Ok(()),
@@ -1219,13 +1213,9 @@ mod tests {
                 request_id,
                 transfer_id: FileTransferId(4),
             },
-            ClientFrame::SetMuted {
+            ClientFrame::SetVoiceState {
                 request_id,
-                muted: true,
-            },
-            ClientFrame::SetDeafened {
-                request_id,
-                deafened: true,
+                state: VoiceState::Deafened,
             },
             ClientFrame::JoinVoice {
                 request_id,
@@ -1260,6 +1250,20 @@ mod tests {
             ClientFrame::Disconnect { request_id },
         ];
         for frame in frames {
+            assert_eq!(
+                decode_client(&encode_client(&frame).unwrap()).unwrap(),
+                frame
+            );
+        }
+    }
+
+    #[test]
+    fn every_voice_state_client_frame_round_trips() {
+        for state in [VoiceState::Live, VoiceState::Muted, VoiceState::Deafened] {
+            let frame = ClientFrame::SetVoiceState {
+                request_id: RequestId(1),
+                state,
+            };
             assert_eq!(
                 decode_client(&encode_client(&frame).unwrap()).unwrap(),
                 frame
@@ -1378,9 +1382,8 @@ mod tests {
                     rooms: Vec::new(),
                     selected_room: None,
                     room: None,
-                    voice: VoiceState {
-                        muted: false,
-                        deafened: false,
+                    voice: VoiceSessionState {
+                        state: VoiceState::Live,
                         output_volume: 100.0,
                         joined_room: None,
                     },

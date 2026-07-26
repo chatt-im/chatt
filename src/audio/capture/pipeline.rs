@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicU32, Ordering},
         mpsc::{Receiver, SyncSender},
     },
     time::Instant,
@@ -79,8 +79,7 @@ pub(crate) fn run_live_encoder_worker<F>(
     denoise: DenoiseConfig,
     max_amplification_bits: Arc<AtomicU32>,
     encoder_loss_percent: Arc<AtomicU32>,
-    mic_muted: Arc<AtomicBool>,
-    deafened: Arc<AtomicBool>,
+    voice_state: Arc<crate::audio::AtomicVoiceState>,
     tuning: LiveAudioTuning,
     suppression: DenoiseSuppression,
     typing_suppression: DenoiseTypingSuppression,
@@ -98,8 +97,7 @@ pub(crate) fn run_live_encoder_worker<F>(
         denoise,
         &max_amplification_bits,
         &encoder_loss_percent,
-        &mic_muted,
-        &deafened,
+        &voice_state,
         tuning,
         suppression,
         typing_suppression,
@@ -175,8 +173,7 @@ pub(crate) fn run_live_encoder_worker_inner(
     denoise: DenoiseConfig,
     max_amplification_bits: &AtomicU32,
     encoder_loss_percent: &AtomicU32,
-    mic_muted: &AtomicBool,
-    deafened: &AtomicBool,
+    voice_state: &crate::audio::AtomicVoiceState,
     tuning: LiveAudioTuning,
     suppression: DenoiseSuppression,
     typing_suppression: DenoiseTypingSuppression,
@@ -195,7 +192,7 @@ pub(crate) fn run_live_encoder_worker_inner(
         typing_suppression,
         echo_source,
         device_rate,
-        mic_muted.load(Ordering::Relaxed) || deafened.load(Ordering::Relaxed),
+        voice_state.load(Ordering::Relaxed).is_muted(),
     );
     let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
 
@@ -232,7 +229,7 @@ pub(crate) fn run_live_encoder_worker_inner(
             })?;
             applied_loss_percent = requested_loss_percent;
         }
-        let muted = mic_muted.load(Ordering::Relaxed) || deafened.load(Ordering::Relaxed);
+        let muted = voice_state.load(Ordering::Relaxed).is_muted();
         let process_start = Instant::now();
         let mut emitted_packets = 0u32;
         pipeline.push_chunk(
@@ -1085,6 +1082,7 @@ mod tests {
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
     use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
+    use rpc::control::VoiceState;
     use std::time::Duration;
 
     #[test]
@@ -1805,8 +1803,7 @@ mod tests {
         let max_amplification_bits = AtomicU32::new(DEFAULT_LIVE_MAX_AMPLIFICATION.to_bits());
         let encoder_loss_percent =
             AtomicU32::new(LiveEncoderProfile::DRED_20.packet_loss_percent as u32);
-        let mic_muted = AtomicBool::new(false);
-        let deafened = AtomicBool::new(false);
+        let voice_state = crate::audio::AtomicVoiceState::new(VoiceState::Live);
         let mut packets = Vec::new();
         run_live_encoder_worker_inner(
             receiver,
@@ -1815,8 +1812,7 @@ mod tests {
             DenoiseConfig::None,
             &max_amplification_bits,
             &encoder_loss_percent,
-            &mic_muted,
-            &deafened,
+            &voice_state,
             tuning,
             DenoiseSuppression::IDENTITY,
             DenoiseTypingSuppression::DISABLED,
