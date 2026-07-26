@@ -3,7 +3,6 @@ use std::{
     collections::VecDeque,
     io,
     net::{IpAddr, SocketAddr},
-    path::Path,
     sync::mpsc,
     sync::{Arc, OnceLock},
     thread,
@@ -11,6 +10,7 @@ use std::{
 };
 
 mod bug_report_writer;
+mod cli;
 pub mod config;
 mod config_diagnostics;
 mod event_queue;
@@ -65,9 +65,7 @@ use bug_report_writer::{
     BugReportWriteReply, BugReportWriteRequest, BugReportWriter,
     EnqueueError as BugReportEnqueueError,
 };
-use config::{
-    Config as ServerConfig, UserConfig, hash_secret, valid_username, value_arg, verify_secret_hash,
-};
+use config::{Config as ServerConfig, UserConfig, hash_secret, valid_username, verify_secret_hash};
 use event_queue::{
     ADMIN_EVENTS, BUG_REPORT_EVENTS, EventNotifier, EventQueue, HISTORY_EVENTS, IDENTITY_EVENTS,
     MLS_EVENTS, ROOM_LOG_EVENTS, ROOM_STATE_EVENTS, VOICE_EVENTS,
@@ -411,42 +409,62 @@ impl LoopWork {
 /// loop for `serve`.
 pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
+    let parsed = cli::parse(&args)
+        .map_err(|error| invalid_config(format!("{error}\n\n{}", cli::usage())))?;
+    if matches!(&parsed.command, cli::Command::Help) {
+        print!("{}", cli::usage());
+        return Ok(());
+    }
     // `--logfile PATH` (or CHATT_LOGFILE) writes the same kvlog stream the
     // client `--logfile` produces, so server and client traces can be analyzed
     // together. Without it, logging stays on the env-configured collector.
-    let logfile = value_arg(&args, "--logfile").or_else(|| std::env::var("CHATT_LOGFILE").ok());
+    let logfile = parsed
+        .logfile
+        .or_else(|| std::env::var("CHATT_LOGFILE").ok());
     let _logger = match logfile {
         Some(logfile) => kvlog::collector::init_file_logger(&logfile),
         None => kvlog::spawn_collector_from_env(Some("chatt-server"), false),
     };
 
-    let command = positional_args(&args);
-    let config = match command.as_slice() {
-        ["invite", user] if !user.trim().is_empty() => {
-            let join_string = local_admin::send_invite(user).map_err(invalid_config)?;
+    let config = match parsed.command {
+        cli::Command::Help => unreachable!("help returned before logger initialization"),
+        cli::Command::Invite(user) => {
+            let join_string = local_admin::send_invite(&user).map_err(invalid_config)?;
             println!("{join_string}");
             return Ok(());
         }
-        ["mls", "storage-status"] => {
+        cli::Command::MlsStorageStatus => {
             println!(
                 "{}",
                 local_admin::mls_storage_status().map_err(invalid_config)?
             );
             return Ok(());
         }
-        ["mls", "compact"] => {
+        cli::Command::MlsCompact => {
             println!("{}", local_admin::mls_compact().map_err(invalid_config)?);
             return Ok(());
         }
-        ["init-config", path] if !path.trim().is_empty() => {
-            config::write_generated_template(Path::new(path)).map_err(invalid_config)?;
-            println!("wrote chatt server config template to {path}");
+        cli::Command::InitConfig(path) => {
+            config::write_generated_template(&path).map_err(invalid_config)?;
+            println!("wrote chatt server config template to {}", path.display());
             return Ok(());
         }
-        ["serve", path] if !path.trim().is_empty() => {
-            ServerConfig::load(Path::new(path)).map_err(invalid_config)?
-        }
-        _ => return Err(invalid_config(server_usage()).into()),
+        cli::Command::Serve { target, overrides } => match target {
+            cli::ServeTarget::Config(path) => {
+                ServerConfig::load_with_overrides(&path, &overrides).map_err(invalid_config)?
+            }
+            cli::ServeTarget::Directory(dir) => {
+                let (config, initialized) = config::load_or_initialize_directory(&dir, &overrides)
+                    .map_err(invalid_config)?;
+                if initialized {
+                    println!(
+                        "initialized chatt server config at {}",
+                        dir.join(config::SERVER_CONFIG_FILE_NAME).display()
+                    );
+                }
+                config
+            }
+        },
     };
     let server_public_key = config.server_public_key_hex().map_err(invalid_config)?;
     let udp_probe_addr = config.network.udp_probe_addr;
@@ -8574,24 +8592,6 @@ fn invalid_config(error: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
 }
 
-fn server_usage() -> String {
-    "usage: chatt-server serve CONFIG_PATH | chatt-server init-config CONFIG_PATH | chatt-server invite USER | chatt-server mls storage-status | chatt-server mls compact".to_string()
-}
-
-fn positional_args(args: &[String]) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut index = 1;
-    while index < args.len() {
-        if args[index] == "--logfile" {
-            index += 2;
-        } else {
-            out.push(args[index].as_str());
-            index += 1;
-        }
-    }
-    out
-}
-
 fn is_fd_pressure_accept_error(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
@@ -8988,19 +8988,6 @@ mod tests {
         history::decode_chunk(payload)
             .expect("decode history chunk")
             .expect("history chunk payload")
-    }
-
-    #[test]
-    fn positional_args_skip_global_logfile_pair() {
-        let args = vec![
-            "chatt-server".to_string(),
-            "--logfile".to_string(),
-            "/tmp/chatt-server.log".to_string(),
-            "serve".to_string(),
-            "server.toml".to_string(),
-        ];
-
-        assert_eq!(positional_args(&args), vec!["serve", "server.toml"]);
     }
 
     fn test_server_config() -> ServerConfig {

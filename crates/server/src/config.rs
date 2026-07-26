@@ -19,6 +19,7 @@ use crate::config_diagnostics::{self, Diag};
 const SECRET_HASH_PREFIX: &str = "sha256:";
 const SHA256_HEX_LEN: usize = 64;
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:41000";
+pub const SERVER_CONFIG_FILE_NAME: &str = "chatt-server.toml";
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_FILE_SIZE_LIMIT_MB: u64 = DEFAULT_FILE_SIZE_LIMIT_BYTES / MIB;
 /// First user id handed out to a dynamic (open-paired) user. Ids below this are
@@ -34,7 +35,10 @@ pub const DEFAULT_MEMORY_HISTORY_LIMIT: usize = 512;
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
 pub struct NetworkConfig {
-    #[toml(FromToml with = toml_spanner::helper::parse_string)]
+    #[toml(
+        default = default_listen_addr(),
+        FromToml with = toml_spanner::helper::parse_string
+    )]
     pub tcp_addr: SocketAddr,
     /// UDP media bind address. `None` inherits `tcp-addr`; read through
     /// [`NetworkConfig::udp_addr`].
@@ -48,6 +52,8 @@ pub struct NetworkConfig {
     pub public_udp_addr: String,
     #[toml(default)]
     pub public_udp_probe_addr: Option<String>,
+    #[toml(skip)]
+    public_udp_probe_addr_overridden: bool,
     #[toml(default = true)]
     pub p2p_enabled: bool,
 }
@@ -63,15 +69,20 @@ impl NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            tcp_addr: DEFAULT_LISTEN_ADDR.parse().expect("valid default TCP addr"),
+            tcp_addr: default_listen_addr(),
             udp_addr: None,
             udp_probe_addr: None,
             public_tcp_addr: String::new(),
             public_udp_addr: String::new(),
             public_udp_probe_addr: None,
+            public_udp_probe_addr_overridden: false,
             p2p_enabled: true,
         }
     }
+}
+
+fn default_listen_addr() -> SocketAddr {
+    DEFAULT_LISTEN_ADDR.parse().expect("valid default TCP addr")
 }
 
 #[derive(Clone, Debug, Toml)]
@@ -265,6 +276,306 @@ pub struct Config {
     pub config_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConfigOverride {
+    name: &'static str,
+    value: String,
+}
+
+impl ConfigOverride {
+    pub(crate) fn new(name: &str, value: String) -> Result<Self, String> {
+        let spec = config_option_spec(name)
+            .ok_or_else(|| format!("unknown server configuration option --{name}"))?;
+        Ok(Self {
+            name: spec.name,
+            value,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+pub(crate) struct ConfigOptionSpec {
+    pub name: &'static str,
+    pub value_name: &'static str,
+    pub description: &'static str,
+    apply: fn(&mut Config, &str) -> Result<(), String>,
+}
+
+macro_rules! scalar_parse_setter {
+    ($function:ident, $section:ident.$field:ident, $type:ty, $name:literal) => {
+        fn $function(config: &mut Config, value: &str) -> Result<(), String> {
+            let parsed = value
+                .parse::<$type>()
+                .map_err(|error| format!("invalid value for --{}: {error}", $name))?;
+            config.$section.$field = parsed;
+            Ok(())
+        }
+    };
+}
+
+macro_rules! optional_parse_setter {
+    ($function:ident, $section:ident.$field:ident, $type:ty, $name:literal) => {
+        fn $function(config: &mut Config, value: &str) -> Result<(), String> {
+            let parsed = if value.is_empty() {
+                None
+            } else {
+                Some(
+                    value
+                        .parse::<$type>()
+                        .map_err(|error| format!("invalid value for --{}: {error}", $name))?,
+                )
+            };
+            config.$section.$field = parsed;
+            Ok(())
+        }
+    };
+}
+
+macro_rules! scalar_string_setter {
+    ($function:ident, $section:ident.$field:ident) => {
+        fn $function(config: &mut Config, value: &str) -> Result<(), String> {
+            config.$section.$field = value.to_string();
+            Ok(())
+        }
+    };
+}
+
+macro_rules! optional_string_setter {
+    ($function:ident, $section:ident.$field:ident) => {
+        fn $function(config: &mut Config, value: &str) -> Result<(), String> {
+            config.$section.$field = (!value.is_empty()).then(|| value.to_string());
+            Ok(())
+        }
+    };
+}
+
+scalar_parse_setter!(
+    set_network_tcp_addr,
+    network.tcp_addr,
+    SocketAddr,
+    "network.tcp-addr"
+);
+optional_parse_setter!(
+    set_network_udp_addr,
+    network.udp_addr,
+    SocketAddr,
+    "network.udp-addr"
+);
+optional_parse_setter!(
+    set_network_udp_probe_addr,
+    network.udp_probe_addr,
+    SocketAddr,
+    "network.udp-probe-addr"
+);
+scalar_string_setter!(set_network_public_tcp_addr, network.public_tcp_addr);
+scalar_string_setter!(set_network_public_udp_addr, network.public_udp_addr);
+fn set_network_public_udp_probe_addr(config: &mut Config, value: &str) -> Result<(), String> {
+    config.network.public_udp_probe_addr = (!value.is_empty()).then(|| value.to_string());
+    config.network.public_udp_probe_addr_overridden = true;
+    Ok(())
+}
+scalar_parse_setter!(
+    set_network_p2p_enabled,
+    network.p2p_enabled,
+    bool,
+    "network.p2p-enabled"
+);
+
+scalar_parse_setter!(
+    set_security_transport_encryption,
+    security.transport_encryption,
+    bool,
+    "security.transport-encryption"
+);
+scalar_parse_setter!(
+    set_security_max_file_size_mb,
+    security.max_file_size_mb,
+    u64,
+    "security.max-file-size-mb"
+);
+optional_string_setter!(set_security_bug_report_dir, security.bug_report_dir);
+scalar_parse_setter!(
+    set_security_public,
+    security.public,
+    bool,
+    "security.public"
+);
+optional_string_setter!(set_security_password_hash, security.password_hash);
+scalar_parse_setter!(
+    set_security_password_epoch,
+    security.password_epoch,
+    u32,
+    "security.password-epoch"
+);
+
+optional_string_setter!(set_storage_data_dir, storage.data_dir);
+scalar_parse_setter!(
+    set_storage_mls_retention_days,
+    storage.mls_retention_days,
+    u16,
+    "storage.mls-retention-days"
+);
+scalar_parse_setter!(
+    set_storage_mls_cleanup_interval_minutes,
+    storage.mls_cleanup_interval_minutes,
+    u64,
+    "storage.mls-cleanup-interval-minutes"
+);
+scalar_parse_setter!(
+    set_storage_mls_cleanup_batch_events,
+    storage.mls_cleanup_batch_events,
+    usize,
+    "storage.mls-cleanup-batch-events"
+);
+scalar_parse_setter!(
+    set_storage_mls_compaction_min_interval_hours,
+    storage.mls_compaction_min_interval_hours,
+    u64,
+    "storage.mls-compaction-min-interval-hours"
+);
+scalar_parse_setter!(
+    set_storage_mls_compaction_min_fragmented_mib,
+    storage.mls_compaction_min_fragmented_mib,
+    u64,
+    "storage.mls-compaction-min-fragmented-mib"
+);
+scalar_parse_setter!(
+    set_storage_mls_compaction_min_fragmented_percent,
+    storage.mls_compaction_min_fragmented_percent,
+    u8,
+    "storage.mls-compaction-min-fragmented-percent"
+);
+
+pub(crate) const CONFIG_OPTION_SPECS: &[ConfigOptionSpec] = &[
+    ConfigOptionSpec {
+        name: "network.tcp-addr",
+        value_name: "ADDR",
+        description: "TCP bind address",
+        apply: set_network_tcp_addr,
+    },
+    ConfigOptionSpec {
+        name: "network.udp-addr",
+        value_name: "ADDR",
+        description: "UDP media bind address; empty inherits TCP",
+        apply: set_network_udp_addr,
+    },
+    ConfigOptionSpec {
+        name: "network.udp-probe-addr",
+        value_name: "ADDR",
+        description: "UDP P2P probe bind address; empty disables it",
+        apply: set_network_udp_probe_addr,
+    },
+    ConfigOptionSpec {
+        name: "network.public-tcp-addr",
+        value_name: "ENDPOINT",
+        description: "TCP endpoint advertised to clients",
+        apply: set_network_public_tcp_addr,
+    },
+    ConfigOptionSpec {
+        name: "network.public-udp-addr",
+        value_name: "ENDPOINT",
+        description: "UDP endpoint advertised to clients",
+        apply: set_network_public_udp_addr,
+    },
+    ConfigOptionSpec {
+        name: "network.public-udp-probe-addr",
+        value_name: "ENDPOINT",
+        description: "UDP probe endpoint advertised to clients; empty disables it",
+        apply: set_network_public_udp_probe_addr,
+    },
+    ConfigOptionSpec {
+        name: "network.p2p-enabled",
+        value_name: "BOOL",
+        description: "enable direct peer-to-peer media",
+        apply: set_network_p2p_enabled,
+    },
+    ConfigOptionSpec {
+        name: "security.transport-encryption",
+        value_name: "BOOL",
+        description: "encrypt transport payloads",
+        apply: set_security_transport_encryption,
+    },
+    ConfigOptionSpec {
+        name: "security.max-file-size-mb",
+        value_name: "MIB",
+        description: "maximum relayed file size",
+        apply: set_security_max_file_size_mb,
+    },
+    ConfigOptionSpec {
+        name: "security.bug-report-dir",
+        value_name: "PATH",
+        description: "bug-report output directory; empty disables reports",
+        apply: set_security_bug_report_dir,
+    },
+    ConfigOptionSpec {
+        name: "security.public",
+        value_name: "BOOL",
+        description: "allow users to pair without an invite",
+        apply: set_security_public,
+    },
+    ConfigOptionSpec {
+        name: "security.password-hash",
+        value_name: "HASH",
+        description: "public-pairing password hash; empty clears it",
+        apply: set_security_password_hash,
+    },
+    ConfigOptionSpec {
+        name: "security.password-epoch",
+        value_name: "NUMBER",
+        description: "dynamic-token password epoch",
+        apply: set_security_password_epoch,
+    },
+    ConfigOptionSpec {
+        name: "storage.data-dir",
+        value_name: "PATH",
+        description: "runtime state directory; empty uses the config default",
+        apply: set_storage_data_dir,
+    },
+    ConfigOptionSpec {
+        name: "storage.mls-retention-days",
+        value_name: "DAYS",
+        description: "default MLS replay retention",
+        apply: set_storage_mls_retention_days,
+    },
+    ConfigOptionSpec {
+        name: "storage.mls-cleanup-interval-minutes",
+        value_name: "MINUTES",
+        description: "MLS cleanup interval",
+        apply: set_storage_mls_cleanup_interval_minutes,
+    },
+    ConfigOptionSpec {
+        name: "storage.mls-cleanup-batch-events",
+        value_name: "COUNT",
+        description: "maximum events removed per MLS cleanup batch",
+        apply: set_storage_mls_cleanup_batch_events,
+    },
+    ConfigOptionSpec {
+        name: "storage.mls-compaction-min-interval-hours",
+        value_name: "HOURS",
+        description: "minimum interval between MLS compactions",
+        apply: set_storage_mls_compaction_min_interval_hours,
+    },
+    ConfigOptionSpec {
+        name: "storage.mls-compaction-min-fragmented-mib",
+        value_name: "MIB",
+        description: "minimum fragmented space before MLS compaction",
+        apply: set_storage_mls_compaction_min_fragmented_mib,
+    },
+    ConfigOptionSpec {
+        name: "storage.mls-compaction-min-fragmented-percent",
+        value_name: "PERCENT",
+        description: "minimum fragmentation percentage before MLS compaction",
+        apply: set_storage_mls_compaction_min_fragmented_percent,
+    },
+];
+
+fn config_option_spec(name: &str) -> Option<&'static ConfigOptionSpec> {
+    CONFIG_OPTION_SPECS.iter().find(|spec| spec.name == name)
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut config = Self {
@@ -277,6 +588,66 @@ impl Default for Config {
         config.normalize();
         config
     }
+}
+
+pub(crate) fn load_or_initialize_directory(
+    dir: &Path,
+    overrides: &[ConfigOverride],
+) -> Result<(Config, bool), String> {
+    ensure_private_server_dir(dir)?;
+    let config_path = dir.join(SERVER_CONFIG_FILE_NAME);
+    let initialized = if config_path
+        .try_exists()
+        .map_err(|error| format!("failed to inspect {}: {error}", config_path.display()))?
+    {
+        false
+    } else {
+        write_generated_template(&config_path)?;
+        true
+    };
+    let config = Config::load_with_overrides(&config_path, overrides)?;
+    Ok((config, initialized))
+}
+
+fn ensure_private_server_dir(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("server directory must not be empty".to_string());
+    }
+    fs::create_dir_all(path)
+        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)
+            .map_err(|error| format!("failed to open directory {}: {error}", path.display()))?;
+        let metadata = dir
+            .metadata()
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid {
+            return Err(format!("{} is not owned by uid {uid}", path.display()));
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        dir.set_permissions(permissions)
+            .map_err(|error| format!("failed to chmod {}: {error}", path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if !metadata.is_dir() {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn write_generated_template(path: &Path) -> Result<(), String> {
@@ -308,8 +679,9 @@ pub fn generated_template_config() -> Result<String, String> {
     Ok(format!(
         r#"# chatt server configuration
 #
-# Generated by `chatt-server init-config`. Keep this file private: it contains
-# the server identity seed that authenticates handshakes and dynamic tokens.
+# Generated by `chatt-server init-config` or `chatt-server serve --dir`.
+# Keep this file private: it contains the server identity seed that
+# authenticates handshakes and dynamic tokens.
 #
 # The server never rewrites this file. Runtime state (the user registry, the
 # DM room registry, message logs) lives under storage.data-dir.
@@ -396,10 +768,22 @@ impl SecurityConfig {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::load_with_overrides(path, &[])
+    }
+
+    pub(crate) fn load_with_overrides(
+        path: &Path,
+        overrides: &[ConfigOverride],
+    ) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
         let source = path.display().to_string();
-        let outcome = collect_config_content(&content, &source, Some(path.to_path_buf()));
+        let outcome = collect_config_content_with_overrides(
+            &content,
+            &source,
+            Some(path.to_path_buf()),
+            overrides,
+        );
         config_diagnostics::render(&source, &content, &outcome.diagnostics);
         let errors = outcome
             .diagnostics
@@ -493,18 +877,22 @@ impl Config {
                 &self.network.public_tcp_addr,
             );
         }
-        self.network.public_udp_probe_addr = self
+        let public_udp_probe_addr = self
             .network
             .public_udp_probe_addr
             .as_deref()
             .map(str::trim)
             .filter(|addr| !addr.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
+            .map(str::to_string);
+        self.network.public_udp_probe_addr = if self.network.public_udp_probe_addr_overridden {
+            public_udp_probe_addr
+        } else {
+            public_udp_probe_addr.or_else(|| {
                 self.network
                     .udp_probe_addr
                     .map(|addr| public_endpoint_for_bind_addr(addr, &self.network.public_tcp_addr))
-            });
+            })
+        };
         for room in &mut self.rooms {
             room.name = room.name.trim().to_string();
             if let Some(members) = &mut room.members {
@@ -659,6 +1047,15 @@ fn collect_config_content(
     source: &str,
     config_path: Option<PathBuf>,
 ) -> LoadOutcome {
+    collect_config_content_with_overrides(content, source, config_path, &[])
+}
+
+fn collect_config_content_with_overrides(
+    content: &str,
+    source: &str,
+    config_path: Option<PathBuf>,
+    overrides: &[ConfigOverride],
+) -> LoadOutcome {
     let arena = toml_spanner::Arena::new();
     let mut doc = toml_spanner::parse_recoverable(content, &arena);
     let mut diagnostics = Vec::new();
@@ -675,10 +1072,17 @@ fn collect_config_content(
     );
     if !identity_seed_configured && !diagnostics.iter().any(|diagnostic| diagnostic.error) {
         diagnostics.push(Diag::error(format!(
-            "{source}: security.server-identity-seed is required; run `chatt-server init-config PATH` to generate a private server config"
+            "{source}: security.server-identity-seed is required; run `chatt-server init-config PATH` or use `chatt-server serve --dir DIR` to generate a private server config"
         )));
     }
     let config = config.map(|mut config| {
+        for config_override in overrides {
+            let spec = config_option_spec(config_override.name())
+                .expect("ConfigOverride names come from CONFIG_OPTION_SPECS");
+            if let Err(error) = (spec.apply)(&mut config, &config_override.value) {
+                diagnostics.push(Diag::error(error));
+            }
+        }
         config.config_path = config_path;
         config.normalize();
         if let Err(error) = config.validate(source) {
@@ -766,11 +1170,6 @@ fn sync_parent_dir(path: &Path) {
     if let Ok(dir) = File::open(parent) {
         let _ = dir.sync_all();
     }
-}
-
-pub fn value_arg(args: &[String], key: &str) -> Option<String> {
-    args.windows(2)
-        .find_map(|window| (window[0] == key).then(|| window[1].clone()))
 }
 
 pub fn hash_secret(secret: &str) -> String {
@@ -924,6 +1323,10 @@ mod tests {
         )
     }
 
+    fn config_override(name: &str, value: impl Into<String>) -> ConfigOverride {
+        ConfigOverride::new(name, value.into()).unwrap()
+    }
+
     #[test]
     fn default_config_parses_and_validates() {
         let config = Config::default();
@@ -951,6 +1354,269 @@ mod tests {
 
         assert_ne!(config.security.server_identity_seed, dev_server_seed_hex());
         assert_eq!(config.network.udp_addr(), config.network.tcp_addr);
+    }
+
+    #[test]
+    fn option_registry_covers_every_cli_overridable_config_field() {
+        assert_eq!(
+            CONFIG_OPTION_SPECS
+                .iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>(),
+            [
+                "network.tcp-addr",
+                "network.udp-addr",
+                "network.udp-probe-addr",
+                "network.public-tcp-addr",
+                "network.public-udp-addr",
+                "network.public-udp-probe-addr",
+                "network.p2p-enabled",
+                "security.transport-encryption",
+                "security.max-file-size-mb",
+                "security.bug-report-dir",
+                "security.public",
+                "security.password-hash",
+                "security.password-epoch",
+                "storage.data-dir",
+                "storage.mls-retention-days",
+                "storage.mls-cleanup-interval-minutes",
+                "storage.mls-cleanup-batch-events",
+                "storage.mls-compaction-min-interval-hours",
+                "storage.mls-compaction-min-fragmented-mib",
+                "storage.mls-compaction-min-fragmented-percent",
+            ]
+        );
+    }
+
+    #[test]
+    fn scalar_overrides_apply_to_every_registered_field() {
+        let password_hash = hash_secret("override-password");
+        let overrides = vec![
+            config_override("network.tcp-addr", "127.0.0.1:42000"),
+            config_override("network.udp-addr", "127.0.0.1:42001"),
+            config_override("network.udp-probe-addr", "127.0.0.1:42002"),
+            config_override("network.public-tcp-addr", "chat.example.com:443"),
+            config_override("network.public-udp-addr", "chat.example.com:444"),
+            config_override("network.public-udp-probe-addr", "chat.example.com:445"),
+            config_override("network.p2p-enabled", "false"),
+            config_override("security.transport-encryption", "true"),
+            config_override("security.max-file-size-mb", "12"),
+            config_override("security.bug-report-dir", "/tmp/chatt-bugs"),
+            config_override("security.public", "true"),
+            config_override("security.password-hash", &password_hash),
+            config_override("security.password-epoch", "9"),
+            config_override("storage.data-dir", "/tmp/chatt-data"),
+            config_override("storage.mls-retention-days", "120"),
+            config_override("storage.mls-cleanup-interval-minutes", "10"),
+            config_override("storage.mls-cleanup-batch-events", "100"),
+            config_override("storage.mls-compaction-min-interval-hours", "12"),
+            config_override("storage.mls-compaction-min-fragmented-mib", "64"),
+            config_override("storage.mls-compaction-min-fragmented-percent", "15"),
+        ];
+
+        let outcome = collect_config_content_with_overrides(
+            &config_content(""),
+            "<test>",
+            Some(PathBuf::from("server.toml")),
+            &overrides,
+        );
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.error),
+            "{:?}",
+            outcome
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let config = outcome.config.unwrap();
+
+        assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:42000");
+        assert_eq!(
+            config.network.udp_addr.map(|addr| addr.to_string()),
+            Some("127.0.0.1:42001".to_string())
+        );
+        assert_eq!(
+            config.network.udp_probe_addr.map(|addr| addr.to_string()),
+            Some("127.0.0.1:42002".to_string())
+        );
+        assert_eq!(config.network.public_tcp_addr, "chat.example.com:443");
+        assert_eq!(config.network.public_udp_addr, "chat.example.com:444");
+        assert_eq!(
+            config.network.public_udp_probe_addr.as_deref(),
+            Some("chat.example.com:445")
+        );
+        assert!(!config.network.p2p_enabled);
+        assert_eq!(config.security.server_identity_seed, dev_server_seed_hex());
+        assert!(config.security.transport_encryption);
+        assert_eq!(config.security.max_file_size_mb, 12);
+        assert_eq!(
+            config.security.bug_report_dir.as_deref(),
+            Some("/tmp/chatt-bugs")
+        );
+        assert!(config.security.public);
+        assert_eq!(
+            config.security.password_hash.as_deref(),
+            Some(password_hash.as_str())
+        );
+        assert_eq!(config.security.password_epoch, 9);
+        assert_eq!(config.storage.data_dir.as_deref(), Some("/tmp/chatt-data"));
+        assert_eq!(config.storage.mls_retention_days, 120);
+        assert_eq!(config.storage.mls_cleanup_interval_minutes, 10);
+        assert_eq!(config.storage.mls_cleanup_batch_events, 100);
+        assert_eq!(config.storage.mls_compaction_min_interval_hours, 12);
+        assert_eq!(config.storage.mls_compaction_min_fragmented_mib, 64);
+        assert_eq!(config.storage.mls_compaction_min_fragmented_percent, 15);
+    }
+
+    #[test]
+    fn overrides_precede_normalization_and_last_value_wins() {
+        let overrides = vec![
+            config_override("network.tcp-addr", "127.0.0.1:41999"),
+            config_override("network.tcp-addr", "127.0.0.1:42000"),
+        ];
+
+        let outcome = collect_config_content_with_overrides(
+            &config_content(""),
+            "<test>",
+            Some(PathBuf::from("server.toml")),
+            &overrides,
+        );
+        let config = outcome.config.unwrap();
+
+        assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:42000");
+        assert_eq!(config.network.public_tcp_addr, "127.0.0.1:42000");
+        assert_eq!(config.network.public_udp_addr, "127.0.0.1:42000");
+    }
+
+    #[test]
+    fn override_supplies_tcp_addr_omitted_from_partial_network_section() {
+        let content = format!(
+            "[network]\np2p-enabled = false\n\n[security]\nserver-identity-seed = \"{}\"\n",
+            dev_server_seed_hex()
+        );
+        let overrides = [config_override("network.tcp-addr", "127.0.0.1:42000")];
+
+        let outcome = collect_config_content_with_overrides(
+            &content,
+            "<test>",
+            Some(PathBuf::from("server.toml")),
+            &overrides,
+        );
+
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.error),
+            "{:?}",
+            outcome
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let config = outcome.config.unwrap();
+        assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:42000");
+        assert!(!config.network.p2p_enabled);
+    }
+
+    #[test]
+    fn empty_optional_override_clears_file_value() {
+        let content =
+            config_content("").replace("[network]", "[network]\nudp-addr = \"127.0.0.1:42001\"");
+        let overrides = [config_override("network.udp-addr", "")];
+
+        let outcome = collect_config_content_with_overrides(
+            &content,
+            "<test>",
+            Some(PathBuf::from("server.toml")),
+            &overrides,
+        );
+        let config = outcome.config.unwrap();
+
+        assert_eq!(config.network.udp_addr, None);
+        assert_eq!(config.network.udp_addr(), config.network.tcp_addr);
+    }
+
+    #[test]
+    fn empty_public_udp_probe_override_remains_disabled_after_normalization() {
+        let content = config_content("").replace(
+            "[network]",
+            "[network]\nudp-probe-addr = \"127.0.0.1:42002\"\npublic-udp-probe-addr = \"chat.example.com:445\"",
+        );
+        let overrides = [config_override("network.public-udp-probe-addr", "")];
+
+        let outcome = collect_config_content_with_overrides(
+            &content,
+            "<test>",
+            Some(PathBuf::from("server.toml")),
+            &overrides,
+        );
+        let mut config = outcome.config.unwrap();
+
+        assert_eq!(config.network.public_udp_probe_addr, None);
+        config.normalize();
+        assert_eq!(config.network.public_udp_probe_addr, None);
+    }
+
+    #[test]
+    fn directory_flow_initializes_once_and_does_not_persist_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("instance");
+
+        let (first, initialized) = load_or_initialize_directory(&dir, &[]).unwrap();
+        assert!(initialized);
+        let config_path = dir.join(SERVER_CONFIG_FILE_NAME);
+        let original = fs::read_to_string(&config_path).unwrap();
+        let seed = first.security.server_identity_seed.clone();
+        assert_eq!(first.config_path.as_deref(), Some(config_path.as_path()));
+        assert_eq!(first.data_dir(), Some(dir.join("chatt-server-data")));
+
+        let overrides = [config_override("network.tcp-addr", "127.0.0.1:42000")];
+        let (second, initialized) = load_or_initialize_directory(&dir, &overrides).unwrap();
+
+        assert!(!initialized);
+        assert_eq!(second.security.server_identity_seed, seed);
+        assert_eq!(second.network.tcp_addr.to_string(), "127.0.0.1:42000");
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn directory_flow_does_not_replace_invalid_existing_config() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("instance");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SERVER_CONFIG_FILE_NAME);
+        fs::write(&path, "not valid toml = [").unwrap();
+
+        let error = load_or_initialize_directory(&dir, &[]).unwrap_err();
+
+        assert!(error.contains("invalid configuration"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "not valid toml = [");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_flow_uses_private_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("instance");
+
+        load_or_initialize_directory(&dir, &[]).unwrap();
+
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let config_mode = fs::metadata(dir.join(SERVER_CONFIG_FILE_NAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(config_mode, 0o600);
     }
 
     #[test]
