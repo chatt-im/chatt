@@ -165,11 +165,152 @@ impl SessionEpoch {
     fn advance(&mut self) {
         self.0 = self.0.wrapping_add(1);
     }
+
+    pub(crate) fn wire(self) -> u64 {
+        self.0
+    }
 }
 
 /// A stable key for a journaled notice. Each view maps it to the buffer-local
 /// [`NoticeId`] it got when materializing the notice.
 pub(crate) type NoticeKey = u64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HistoryEntryId {
+    Message(MessageId),
+    Notice(NoticeKey),
+}
+
+pub(crate) enum HistoryEntryRef<'a> {
+    Message {
+        message: &'a ChatMessage,
+        local: bool,
+        unverified: bool,
+    },
+    Notice {
+        key: NoticeKey,
+        record: &'a NoticeRecord,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RoomHistoryRef<'a> {
+    room: &'a RoomShared,
+    local_user: Option<UserId>,
+    generation: u64,
+}
+
+pub(crate) struct HistoryPage<'a> {
+    pub(crate) messages: Vec<&'a ChatMessage>,
+    pub(crate) older_cursor: Option<MessageId>,
+    pub(crate) at_start: bool,
+    pub(crate) room_generation: u64,
+}
+
+impl<'a> RoomHistoryRef<'a> {
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn revision(self) -> Revision {
+        self.room.revision()
+    }
+
+    pub(crate) fn entry(self, id: HistoryEntryId) -> Option<HistoryEntryRef<'a>> {
+        match id {
+            HistoryEntryId::Message(id) => {
+                let message = self.room.message_by_key(id.0)?;
+                (!message.flags.deleted()).then(|| HistoryEntryRef::Message {
+                    message,
+                    local: Some(message.sender) == self.local_user,
+                    unverified: self
+                        .room
+                        .message_is_unverified(message, self.local_user),
+                })
+            }
+            HistoryEntryId::Notice(key) => {
+                let notice = self.room.notices.get(&key)?;
+                Some(HistoryEntryRef::Notice {
+                    key,
+                    record: &notice.record,
+                })
+            }
+        }
+    }
+
+    /// Stable identities in canonical display order. This is a derived id-only
+    /// index for a viewport rebuild; it never owns message payload.
+    pub(crate) fn visible_entry_ids(self) -> Vec<HistoryEntryId> {
+        let mut notices = self.room.notices.iter().collect::<Vec<_>>();
+        notices.sort_by_key(|(key, notice)| (notice.after, **key));
+        let mut notice = 0usize;
+        let mut ids =
+            Vec::with_capacity(self.room.messages.len().saturating_add(notices.len()));
+        for message in self.room.visible_messages() {
+            let message_key = MessageLog::key(message);
+            while let Some((key, anchored)) = notices.get(notice)
+                && anchored.after.is_none_or(|after| after < message_key)
+            {
+                ids.push(HistoryEntryId::Notice(**key));
+                notice += 1;
+            }
+            ids.push(HistoryEntryId::Message(message.message_id));
+            while let Some((key, anchored)) = notices.get(notice)
+                && anchored.after == Some(message_key)
+            {
+                ids.push(HistoryEntryId::Notice(**key));
+                notice += 1;
+            }
+        }
+        ids.extend(
+            notices[notice..]
+                .iter()
+                .map(|(key, _)| HistoryEntryId::Notice(**key)),
+        );
+        ids
+    }
+
+    pub(crate) fn latest_page(self, limit: usize) -> HistoryPage<'a> {
+        self.page_ending_at(self.room.messages.len(), limit)
+    }
+
+    pub(crate) fn page_before(
+        self,
+        before: MessageId,
+        limit: usize,
+    ) -> Option<HistoryPage<'a>> {
+        let end = self.room.messages.position(before.0)?;
+        Some(self.page_ending_at(end, limit))
+    }
+
+    fn page_ending_at(self, end: usize, limit: usize) -> HistoryPage<'a> {
+        let resident = self.room.messages.as_slice();
+        let mut messages = resident[..end]
+            .iter()
+            .rev()
+            .filter(|message| !message.flags.deleted())
+            .take(limit)
+            .collect::<Vec<_>>();
+        messages.reverse();
+        let older_cursor = messages.first().map(|message| message.message_id);
+        let at_start = messages.first().is_none_or(|first| {
+            let first = self
+                .room
+                .messages
+                .position(first.message_id.0)
+                .expect("page message is resident");
+            !resident[..first]
+                .iter()
+                .any(|message| !message.flags.deleted())
+        });
+        HistoryPage {
+            messages,
+            older_cursor,
+            at_start,
+            room_generation: self.generation(),
+        }
+    }
+}
 
 /// One system line recorded in a room's journal so every client buffer can
 /// materialize it.
@@ -181,6 +322,14 @@ pub(crate) struct NoticeRecord {
     /// Whether materializing the notice snaps the buffer to the bottom, as
     /// connection status lines do; gap markers leave the scroll alone.
     pub(crate) scroll_bottom: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AnchoredNotice {
+    record: NoticeRecord,
+    /// Numeric message head after which the notice was emitted. It remains
+    /// valid even if that message is later tombstoned or evicted.
+    after: Option<MessageKey>,
 }
 
 /// One buffer-visible change to a room's shared state. Views replay these in
@@ -198,7 +347,7 @@ pub(crate) enum RoomDelta {
     Edit(MessageKey),
     /// The target became a hidden tombstone.
     Delete(MessageKey),
-    Notice(NoticeKey, NoticeRecord),
+    Notice(NoticeKey),
     RemoveNotice(NoticeKey),
     /// `local_user` changed (authentication); re-derive local marks.
     RefreshLocals,
@@ -223,8 +372,6 @@ pub(crate) struct RoomShared {
     e2e_room: bool,
     files: std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
     history: Option<RoomHistoryStore>,
-    web_attachments: HashMap<MessageKey, WebAttachment>,
-    web_file_attachments: HashMap<FileHistoryKey, WebAttachment>,
     transfers: HashMap<FileTransferId, TransferStatus>,
     /// Per-target mutation state: the fold authority for resident messages and
     /// the pending stash for targets older pages have yet to deliver.
@@ -238,6 +385,7 @@ pub(crate) struct RoomShared {
     revision: Revision,
     journal: std::collections::VecDeque<(Revision, RoomDelta)>,
     next_notice_key: NoticeKey,
+    notices: HashMap<NoticeKey, AnchoredNotice>,
 }
 
 /// Folded mutation state of one target message.
@@ -265,9 +413,8 @@ pub(crate) enum MutationOutcome {
     Ignored,
     /// The target is not resident; the state is stashed for a later page.
     Pending,
-    /// The target's body was replaced; carries the folded message for the
-    /// web feed.
-    AppliedEdit(ChatMessage),
+    /// The target's body was replaced; projections re-read this canonical id.
+    AppliedEdit(MessageId),
     /// The target became a hidden tombstone.
     AppliedDelete,
 }
@@ -281,8 +428,6 @@ impl RoomShared {
             e2e_room: false,
             files: std::collections::HashMap::new(),
             history: None,
-            web_attachments: HashMap::new(),
-            web_file_attachments: HashMap::new(),
             transfers: HashMap::new(),
             mutations: HashMap::new(),
             seen_mutations: HashSet::new(),
@@ -290,6 +435,7 @@ impl RoomShared {
             revision: 0,
             journal: std::collections::VecDeque::new(),
             next_notice_key: 0,
+            notices: HashMap::new(),
         }
     }
 
@@ -377,12 +523,21 @@ impl RoomShared {
     fn push_notice_record(&mut self, record: NoticeRecord) -> NoticeKey {
         self.next_notice_key += 1;
         let key = self.next_notice_key;
-        self.record(RoomDelta::Notice(key, record));
+        self.notices.insert(
+            key,
+            AnchoredNotice {
+                record,
+                after: self.messages.last().map(MessageLog::key),
+            },
+        );
+        self.record(RoomDelta::Notice(key));
         key
     }
 
     fn remove_notice_record(&mut self, key: NoticeKey) {
-        self.record(RoomDelta::RemoveNotice(key));
+        if self.notices.remove(&key).is_some() {
+            self.record(RoomDelta::RemoveNotice(key));
+        }
     }
 
     /// Records one mutation's state without touching disk or the buffers, the
@@ -451,7 +606,6 @@ impl RoomShared {
             }
             message.flags = rpc::control::MessageFlags(rpc::control::MessageFlags::DELETED);
             message.body.clear();
-            self.web_attachments.remove(&target);
             self.record(RoomDelta::Delete(target));
             return MutationOutcome::AppliedDelete;
         }
@@ -464,7 +618,7 @@ impl RoomShared {
             }
             message.body = edit.body.clone();
             message.flags.set_edited();
-            let folded = message.clone();
+            let folded = message.message_id;
             self.record(RoomDelta::Edit(target));
             return MutationOutcome::AppliedEdit(folded);
         }
@@ -515,16 +669,6 @@ impl RoomShared {
             return true;
         }
         self.record(RoomDelta::Append(key));
-        if let Some(transfer_id) = message.file_transfer_id {
-            let key = FileHistoryKey {
-                timestamp_ms: message.timestamp_ms,
-                transfer_id,
-            };
-            if let Some(attachment) = self.web_file_attachments.get(&key).cloned() {
-                self.web_attachments
-                    .insert(message.message_id.0, attachment);
-            }
-        }
         true
     }
 
@@ -587,15 +731,6 @@ impl RoomShared {
                     .insert(record.message.message_id.0, provenance);
             }
         }
-        collect_web_attachments(
-            &fresh
-                .iter()
-                .map(|record| record.message.clone())
-                .collect::<Vec<_>>(),
-            &self.files,
-            &mut self.web_attachments,
-            &mut self.web_file_attachments,
-        );
         let oldest_resident = self.messages.first().map(MessageLog::key);
         let split = oldest_resident.map_or(fresh.len(), |oldest| {
             fresh.partition_point(|record| MessageLog::key(&record.message) < oldest)
@@ -640,17 +775,12 @@ impl RoomShared {
     fn trim_orphaned_attachments(&mut self) {
         let Some(oldest) = self.messages.first() else {
             self.files.clear();
-            self.web_attachments.clear();
-            self.web_file_attachments.clear();
             return;
         };
         let oldest_key = MessageLog::key(oldest);
         let oldest_timestamp = oldest.timestamp_ms;
         self.message_provenance.retain(|id, _| *id >= oldest_key);
-        self.web_attachments.retain(|id, _| *id >= oldest_key);
         self.files
-            .retain(|key, _| key.timestamp_ms >= oldest_timestamp);
-        self.web_file_attachments
             .retain(|key, _| key.timestamp_ms >= oldest_timestamp);
     }
 }
@@ -691,7 +821,13 @@ impl RoomView {
     /// they cover the gap, else rebuilds from the log (dropping notices, like
     /// a cold materialize).
     pub(crate) fn sync(&mut self, shared: &RoomShared, local_user: Option<UserId>) {
-        if self.applied_revision == Some(shared.revision()) {
+        let revision = RoomHistoryRef {
+            room: shared,
+            local_user,
+            generation: 0,
+        }
+        .revision();
+        if self.applied_revision == Some(revision) {
             return;
         }
         let deltas = self
@@ -705,7 +841,7 @@ impl RoomView {
             }
             None => self.rebuild(shared, local_user),
         }
-        self.applied_revision = Some(shared.revision());
+        self.applied_revision = Some(revision);
     }
 
     fn apply(&mut self, delta: &RoomDelta, shared: &RoomShared, local_user: Option<UserId>) {
@@ -761,7 +897,10 @@ impl RoomView {
             RoomDelta::Delete(key) => {
                 self.chat.remove_message(*key);
             }
-            RoomDelta::Notice(key, record) => {
+            RoomDelta::Notice(key) => {
+                let Some(record) = shared.notices.get(key).map(|notice| &notice.record) else {
+                    return;
+                };
                 let id = self.chat.push_notice_with_kind(
                     record.sender.clone(),
                     record.body.clone(),
@@ -807,19 +946,30 @@ impl RoomView {
             self.chat.set_room_id(room_id);
         }
         self.notice_ids.clear();
-        for message in shared.visible_messages() {
-            self.chat.push_authenticated_chat(
-                message.clone(),
-                Some(message.sender) == local_user,
-                shared.message_is_unverified(message, local_user),
-            );
-        }
-        // Journal-resident notices survive the rebuild (appended after the
-        // log, which matches their recency), so an attaching view still sees
-        // recent system lines and gap markers.
-        for (_, delta) in &shared.journal {
-            if matches!(delta, RoomDelta::Notice(..) | RoomDelta::RemoveNotice(_)) {
-                self.apply(delta, shared, local_user);
+        let history = RoomHistoryRef {
+            room: shared,
+            local_user,
+            generation: 0,
+        };
+        for id in history.visible_entry_ids() {
+            match history.entry(id) {
+                Some(HistoryEntryRef::Message {
+                    message,
+                    local,
+                    unverified,
+                }) => {
+                    self.chat
+                        .push_authenticated_chat(message.clone(), local, unverified);
+                }
+                Some(HistoryEntryRef::Notice { key, record }) => {
+                    let id = self.chat.push_notice_with_kind(
+                        record.sender.clone(),
+                        record.body.clone(),
+                        record.kind,
+                    );
+                    self.notice_ids.insert(key, id);
+                }
+                None => {}
             }
         }
         self.chat.bottom();
@@ -830,6 +980,25 @@ impl RoomView {
 /// catalog and logs, the user directory, presence, and voice occupancy.
 /// Scrollback buffers, the composer, and everything else one terminal owns
 /// exclusively live in [`crate::tui::view::ClientView`].
+#[derive(Default)]
+struct HistoryHub {
+    rooms: HashMap<RoomId, RoomShared>,
+}
+
+impl std::ops::Deref for HistoryHub {
+    type Target = HashMap<RoomId, RoomShared>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rooms
+    }
+}
+
+impl std::ops::DerefMut for HistoryHub {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rooms
+    }
+}
+
 pub(crate) struct RoomSession {
     epoch: SessionEpoch,
     pub server_alias: String,
@@ -893,8 +1062,8 @@ pub(crate) struct RoomSession {
     volume_preview: Option<(UserId, f32)>,
     /// Catalog facts for every known room, viewed or not.
     metas: BTreeMap<RoomId, RoomMeta>,
-    /// Shared state of every materialized room, accessible or archived.
-    rooms: HashMap<RoomId, RoomShared>,
+    /// Sole owner of retained in-memory chat history for this client core.
+    rooms: HistoryHub,
     /// Users this client process has seen in each room's voice call. The value
     /// is when they left the call: `None` while they are in it, `Some(instant)`
     /// once they leave (drives the `away` age column). A user stays in this map
@@ -1002,14 +1171,11 @@ pub(crate) enum TransferStatus {
     },
 }
 
-/// The canonical ordered message list and its dedup keys. The key set always
-/// holds exactly the keys of resident messages: inserts add them and trims
-/// remove them with the messages they belong to, so live dedup can never
-/// drift from the buffered scrollback.
+/// The canonical ordered message list. Sorted message ids provide lookup and
+/// deduplication without retaining a second id collection.
 #[derive(Default)]
 struct MessageLog {
     messages: Vec<ChatMessage>,
-    keys: HashSet<MessageKey>,
 }
 
 enum LogInsert {
@@ -1026,17 +1192,13 @@ impl MessageLog {
     /// Adopts a load that is already sorted and deduped by key, as
     /// [`room_history::LoadedHistory`] guarantees.
     fn from_sorted(messages: Vec<ChatMessage>) -> Self {
-        let keys = messages.iter().map(Self::key).collect();
-        Self { messages, keys }
+        Self { messages }
     }
 
     /// Inserts at the key's sorted position, appending on the common
     /// newest-message path. Returns where it landed, or `Duplicate`.
     fn insert(&mut self, message: ChatMessage) -> LogInsert {
         let key = Self::key(&message);
-        if !self.keys.insert(key) {
-            return LogInsert::Duplicate;
-        }
         if self
             .messages
             .last()
@@ -1045,25 +1207,20 @@ impl MessageLog {
             self.messages.push(message);
             return LogInsert::Appended;
         }
-        let index = self
-            .messages
-            .partition_point(|resident| Self::key(resident) < key);
+        let index = match self.messages.binary_search_by_key(&key, Self::key) {
+            Ok(_) => return LogInsert::Duplicate,
+            Err(index) => index,
+        };
         self.messages.insert(index, message);
         LogInsert::Inserted
     }
 
     fn contains(&self, key: MessageKey) -> bool {
-        self.keys.contains(&key)
+        self.position(key).is_some()
     }
 
     fn position(&self, key: MessageKey) -> Option<usize> {
-        if !self.keys.contains(&key) {
-            return None;
-        }
-        let index = self
-            .messages
-            .partition_point(|resident| Self::key(resident) < key);
-        (self.messages.get(index).map(Self::key) == Some(key)).then_some(index)
+        self.messages.binary_search_by_key(&key, Self::key).ok()
     }
 
     fn get_mut(&mut self, key: MessageKey) -> Option<&mut ChatMessage> {
@@ -1103,21 +1260,16 @@ impl MessageLog {
                 .zip(self.messages.first())
                 .is_none_or(|(newest, front)| Self::key(newest) < Self::key(front))
         );
-        for message in &messages {
-            self.keys.insert(Self::key(message));
-        }
         self.messages.splice(0..0, messages);
     }
 
-    /// Drops the oldest messages over `max`, removing their keys with them.
+    /// Drops the oldest messages over `max`.
     fn trim_front(&mut self, max: usize) {
         if self.messages.len() <= max {
             return;
         }
         let excess = self.messages.len() - max;
-        for message in self.messages.drain(..excess) {
-            self.keys.remove(&Self::key(&message));
-        }
+        self.messages.drain(..excess);
     }
 
     fn len(&self) -> usize {
@@ -1281,47 +1433,6 @@ impl DeleteDenied {
     }
 }
 
-/// Derives web attachments for file-announcement messages from their stored
-/// file details.
-fn collect_web_attachments(
-    messages: &[ChatMessage],
-    files: &std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
-    web_attachments: &mut HashMap<MessageKey, WebAttachment>,
-    web_file_attachments: &mut HashMap<FileHistoryKey, WebAttachment>,
-) {
-    for message in messages {
-        let Some(transfer_id) = message.file_transfer_id else {
-            continue;
-        };
-        let key = FileHistoryKey {
-            timestamp_ms: message.timestamp_ms,
-            transfer_id,
-        };
-        let Some(detail) = files.get(&key) else {
-            continue;
-        };
-        let attachment = WebAttachment::from_served_file(
-            transfer_id.0,
-            message.timestamp_ms,
-            &detail.file_name,
-            detail.dimensions(),
-        );
-        web_file_attachments.insert(key, attachment.clone());
-        web_attachments.insert(message.message_id.0, attachment);
-    }
-}
-
-fn file_message_id(
-    messages: &MessageLog,
-    timestamp_ms: u64,
-    transfer_id: FileTransferId,
-) -> Option<u64> {
-    messages.as_slice().iter().rev().find_map(|message| {
-        (message.timestamp_ms == timestamp_ms && message.file_transfer_id == Some(transfer_id))
-            .then_some(message.message_id.0)
-    })
-}
-
 fn record_room_file(
     room: &mut RoomShared,
     transfer_id: FileTransferId,
@@ -1347,12 +1458,6 @@ fn record_room_file(
             packed_dims,
         },
     );
-    let attachment =
-        WebAttachment::from_served_file(transfer_id.0, timestamp_ms, file_name, dimensions);
-    room.web_file_attachments.insert(key, attachment.clone());
-    if let Some(message_id) = file_message_id(&room.messages, timestamp_ms, transfer_id) {
-        room.web_attachments.insert(message_id, attachment);
-    }
 }
 
 fn update_transfer_progress(
@@ -1425,7 +1530,7 @@ impl RoomSession {
             stream_users: HashMap::new(),
             volume_preview: None,
             metas: BTreeMap::new(),
-            rooms: HashMap::new(),
+            rooms: HistoryHub::default(),
             voice_seen: HashMap::new(),
             presence_seen: HashMap::new(),
             archived_metas: BTreeMap::new(),
@@ -1444,6 +1549,20 @@ impl RoomSession {
 
     pub(crate) fn epoch(&self) -> SessionEpoch {
         self.epoch
+    }
+
+    /// Generation carried by projections of resident room history. Room ids
+    /// are stable only within this server-continuity epoch.
+    pub(crate) fn room_generation(&self, room_id: RoomId) -> Option<u64> {
+        self.rooms.contains_key(&room_id).then_some(self.epoch.wire())
+    }
+
+    pub(crate) fn history_ref(&self, room_id: RoomId) -> Option<RoomHistoryRef<'_>> {
+        Some(RoomHistoryRef {
+            room: self.rooms.get(&room_id)?,
+            local_user: self.local_user,
+            generation: self.epoch.wire(),
+        })
     }
 
     #[cfg(test)]
@@ -1711,12 +1830,6 @@ impl RoomSession {
         // Views must rebuild from the log rather than believe an empty
         // buffer matches revision zero.
         room.invalidate();
-        collect_web_attachments(
-            room.messages.as_slice(),
-            &room.files,
-            &mut room.web_attachments,
-            &mut room.web_file_attachments,
-        );
         room
     }
 
@@ -2263,27 +2376,6 @@ impl RoomSession {
         changed
     }
 
-    /// The viewed room's messages and file details, for mirroring into the web
-    /// feed. Tombstones stay internal.
-    pub(crate) fn viewed_history(&self) -> room_history::LoadedHistory {
-        let Some(room) = self
-            .viewed_room
-            .and_then(|room_id| self.rooms.get(&room_id))
-        else {
-            return room_history::LoadedHistory::default();
-        };
-        room_history::LoadedHistory {
-            messages: room.visible_messages().cloned().collect(),
-            files: room.files.clone(),
-            mutations: Vec::new(),
-            provenance: room
-                .message_provenance
-                .iter()
-                .map(|(id, provenance)| (*id, *provenance))
-                .collect(),
-        }
-    }
-
     pub(crate) fn resident_message_page(
         &self,
         room_id: RoomId,
@@ -2332,6 +2424,18 @@ impl RoomSession {
         key: &FileHistoryKey,
     ) -> Option<&room_history::FileDetail> {
         self.rooms.get(&room_id)?.files.get(key)
+    }
+
+    pub(crate) fn resident_file_message(
+        &self,
+        room_id: RoomId,
+        timestamp_ms: u64,
+        transfer_id: FileTransferId,
+    ) -> Option<&ChatMessage> {
+        self.rooms.get(&room_id)?.visible_messages().find(|message| {
+            message.timestamp_ms == timestamp_ms
+                && message.file_transfer_id == Some(transfer_id)
+        })
     }
 
     pub(crate) fn resident_message(
@@ -2885,11 +2989,19 @@ impl RoomSession {
         &self,
         target: rpc::msgref::MessageRef,
     ) -> Option<crate::web_server::WebAttachment> {
-        self.rooms
-            .get(&target.room_id)?
-            .web_attachments
-            .get(&target.message_id.0)
-            .cloned()
+        let room = self.rooms.get(&target.room_id)?;
+        let message = room.message_by_key(target.message_id.0)?;
+        let transfer_id = message.file_transfer_id?;
+        let detail = room.files.get(&FileHistoryKey {
+            timestamp_ms: message.timestamp_ms,
+            transfer_id,
+        })?;
+        Some(WebAttachment::from_served_file(
+            transfer_id.0,
+            message.timestamp_ms,
+            &detail.file_name,
+            detail.dimensions(),
+        ))
     }
 
     pub(crate) fn message_unverified(
@@ -5199,7 +5311,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_prunes_attachment_maps_for_evicted_messages() {
+    fn trim_prunes_file_details_for_evicted_messages() {
         let mut room = test_room();
         let transfer_old = FileTransferId(1);
         let transfer_kept = FileTransferId(2);
@@ -5226,39 +5338,13 @@ mod tests {
             length: 1,
             packed_dims: 0,
         };
-        let old_attachment = WebAttachment::from_served_file(
-            old_key.transfer_id.0,
-            old_key.timestamp_ms,
-            "file.bin",
-            None,
-        );
-        let kept_attachment = WebAttachment::from_served_file(
-            kept_key.transfer_id.0,
-            kept_key.timestamp_ms,
-            "file.bin",
-            None,
-        );
         room.shared_mut(1).files.insert(old_key, detail.clone());
         room.shared_mut(1).files.insert(kept_key, detail);
-        room.shared_mut(1)
-            .web_file_attachments
-            .insert(old_key, old_attachment.clone());
-        room.shared_mut(1)
-            .web_file_attachments
-            .insert(kept_key, kept_attachment.clone());
-        room.shared_mut(1).web_attachments.insert(1, old_attachment);
-        room.shared_mut(1)
-            .web_attachments
-            .insert(2, kept_attachment);
 
         room.set_max_messages(2);
 
         assert!(!room.shared(1).files.contains_key(&old_key));
         assert!(room.shared(1).files.contains_key(&kept_key));
-        assert!(!room.shared(1).web_file_attachments.contains_key(&old_key));
-        assert!(room.shared(1).web_file_attachments.contains_key(&kept_key));
-        assert!(!room.shared(1).web_attachments.contains_key(&1));
-        assert!(room.shared(1).web_attachments.contains_key(&2));
     }
 
     #[test]
@@ -5323,12 +5409,10 @@ mod tests {
         ));
         let ids: Vec<u64> = log.as_slice().iter().map(|m| m.message_id.0).collect();
         assert_eq!(ids, vec![1, 2, 3]);
-        assert_eq!(log.keys.len(), log.len());
 
         log.trim_front(2);
         let ids: Vec<u64> = log.as_slice().iter().map(|m| m.message_id.0).collect();
         assert_eq!(ids, vec![2, 3]);
-        assert_eq!(log.keys.len(), log.len());
         assert!(matches!(
             log.insert(message(1, UserId(1), "trimmed key gone")),
             LogInsert::Inserted
@@ -5367,7 +5451,9 @@ mod tests {
         room.load_offline_catalog(&catalog, None);
 
         assert_eq!(room.chat().len(), 4);
-        let history = room.viewed_history();
+        let history = room
+            .resident_message_page(room_id, None, 10, usize::MAX, |_| 0)
+            .expect("materialized room");
         assert_eq!(history.messages.len(), 4);
         assert_eq!(history.messages[0].message_id, MessageId(7));
     }
@@ -5624,7 +5710,13 @@ mod tests {
             vec![message(1, UserId(1), "old server")],
             Some(UserId(1)),
         );
-        assert_eq!(room.viewed_history().messages.len(), 1);
+        assert_eq!(
+            room.resident_message_page(RoomId(1), None, 10, usize::MAX, |_| 0)
+                .expect("room")
+                .messages
+                .len(),
+            1
+        );
 
         room.connect_to_server(
             "new".to_string(),
@@ -5633,8 +5725,7 @@ mod tests {
         );
         room.load_offline_catalog(&RoomCatalog::default(), Some(UserId(1)));
 
-        assert!(room.viewed_history().messages.is_empty());
-        assert!(room.viewed_history().files.is_empty());
+        assert!(room.rooms.is_empty());
         assert_eq!(room.viewed_room, None);
     }
 
@@ -5675,9 +5766,12 @@ mod tests {
         let update = room
             .mutation_received(&edit_record(3, 1, UserId(2), "revised"), Some(UserId(1)))
             .expect("known room");
-        let MutationOutcome::AppliedEdit(folded) = update.outcome else {
+        let MutationOutcome::AppliedEdit(target) = update.outcome else {
             panic!("expected an applied edit, got {:?}", update.outcome);
         };
+        let folded = room
+            .resident_message(RoomId(1), target)
+            .expect("folded target remains resident");
         assert_eq!(folded.body, "revised");
         assert!(folded.flags.edited());
         assert_eq!(folded.message_id, MessageId(1));
@@ -6346,14 +6440,14 @@ mod tests {
         room.set_e2e_trust_state(room_id, accepted_identity(room_id, None));
 
         let first_len = room.shared(1).journal.len();
-        assert!(matches!(
-            room.shared(1).journal.back(),
-            Some((_, RoomDelta::Notice(_, notice)))
-                if notice.kind == NoticeKind::Warning
-                    && notice.body.contains("unverified")
-                    && notice.body.contains("/identity")
-                    && notice.body.contains("out-of-band")
-        ));
+        let Some((_, RoomDelta::Notice(key))) = room.shared(1).journal.back() else {
+            panic!("expected notice");
+        };
+        let notice = &room.shared(1).notices[key].record;
+        assert_eq!(notice.kind, NoticeKind::Warning);
+        assert!(notice.body.contains("unverified"));
+        assert!(notice.body.contains("/identity"));
+        assert!(notice.body.contains("out-of-band"));
 
         room.ensure_e2e_security_notice(room_id);
         assert_eq!(room.shared(1).journal.len(), first_len);
@@ -6384,10 +6478,13 @@ mod tests {
         room.ensure_e2e_security_notice(room_id);
 
         assert!(room.e2e_identity_notices_shown.contains_key(&room_id));
-        assert!(matches!(
-            room.shared(2).journal.back(),
-            Some((_, RoomDelta::Notice(_, notice))) if notice.kind == NoticeKind::Warning
-        ));
+        let Some((_, RoomDelta::Notice(key))) = room.shared(2).journal.back() else {
+            panic!("expected notice");
+        };
+        assert_eq!(
+            room.shared(2).notices[key].record.kind,
+            NoticeKind::Warning
+        );
     }
 
     #[test]
@@ -6406,16 +6503,16 @@ mod tests {
         );
 
         let first_len = room.shared(1).journal.len();
-        assert!(matches!(
-            room.shared(1).journal.back(),
-            Some((_, RoomDelta::Notice(_, notice)))
-                if notice.kind == NoticeKind::Error
-                    && notice.body.contains("previously verified")
-                    && notice.body.contains("changed")
-                    && notice.body.contains("unverified")
-                    && notice.body.contains("/identity")
-                    && notice.body.contains("out-of-band")
-        ));
+        let Some((_, RoomDelta::Notice(key))) = room.shared(1).journal.back() else {
+            panic!("expected notice");
+        };
+        let notice = &room.shared(1).notices[key].record;
+        assert_eq!(notice.kind, NoticeKind::Error);
+        assert!(notice.body.contains("previously verified"));
+        assert!(notice.body.contains("changed"));
+        assert!(notice.body.contains("unverified"));
+        assert!(notice.body.contains("/identity"));
+        assert!(notice.body.contains("out-of-band"));
         room.ensure_e2e_security_notice(room_id);
         assert_eq!(room.shared(1).journal.len(), first_len);
     }

@@ -12,6 +12,7 @@ const KIND_MESSAGE = 2;
 const KIND_OLDER = 3;
 const KIND_REF_PREVIEW = 4;
 const KIND_DELETE = 5;
+const KIND_STALE = 6;
 
 const FRAG_TEXT = 0;
 const FRAG_CODE = 1;
@@ -23,13 +24,32 @@ const MEDIA_KINDS: MediaKind[] = ["image", "video", "audio", "file"];
 const decoder = new TextDecoder();
 
 export type FeedFrame =
-  | { kind: "sync"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
-  | { kind: "older"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
-  | { kind: "message"; message: WebMessage }
-  | { kind: "delete"; message_id: number }
-  // The response to a `ref_preview` request: the echoed reference key and the
-  // target message, or null when the feed history no longer holds it.
-  | { kind: "ref_preview"; ts: number; mid: number; message: WebMessage | null };
+  | {
+      kind: "sync";
+      room_id: number;
+      room_generation: number;
+      messages: WebMessage[];
+      older_cursor: number | null;
+      at_start: boolean;
+    }
+  | {
+      kind: "older";
+      room_id: number;
+      room_generation: number;
+      messages: WebMessage[];
+      older_cursor: number | null;
+      at_start: boolean;
+    }
+  | { kind: "message"; room_id: number; room_generation: number; message: WebMessage }
+  | { kind: "delete"; room_id: number; room_generation: number; message_id: number }
+  | { kind: "stale"; room_id: number; room_generation: number }
+  | {
+      kind: "ref_preview";
+      room_id: number;
+      room_generation: number;
+      message_id: number;
+      message: WebMessage | null;
+    };
 
 // Decodes a feed frame, or returns null when the buffer is not one (a video
 // frame), so the caller falls back to the video path.
@@ -39,25 +59,52 @@ export function decodeFeed(buffer: ArrayBuffer): FeedFrame | null {
   const reader = new Reader(view, new Uint8Array(buffer), 5);
   const kind = view.getUint8(4);
   if (kind === KIND_MESSAGE) {
-    return { kind: "message", message: reader.message() };
+    return {
+      kind: "message",
+      room_id: reader.u53(),
+      room_generation: reader.u53(),
+      message: reader.message(),
+    };
   }
   if (kind === KIND_REF_PREVIEW) {
-    const ts = reader.u53();
-    const mid = reader.u53();
+    const room_id = reader.u53();
+    const room_generation = reader.u53();
+    const message_id = reader.u53();
     const message = reader.u8() === 1 ? reader.message() : null;
-    return { kind: "ref_preview", ts, mid, message };
+    return { kind: "ref_preview", room_id, room_generation, message_id, message };
   }
   if (kind === KIND_DELETE) {
-    return { kind: "delete", message_id: reader.u53() };
+    return {
+      kind: "delete",
+      room_id: reader.u53(),
+      room_generation: reader.u53(),
+      message_id: reader.u53(),
+    };
+  }
+  if (kind === KIND_STALE) {
+    return {
+      kind: "stale",
+      room_id: reader.u53(),
+      room_generation: reader.u53(),
+    };
   }
   // Unknown kinds (newer server) must not fall into the window parser.
   if (kind !== KIND_SYNC && kind !== KIND_OLDER) return null;
-  const oldest_seq = reader.u53();
-  const has_more = reader.u8() === 1;
+  const room_id = reader.u53();
+  const room_generation = reader.u53();
+  const older_cursor = reader.u8() === 1 ? reader.u53() : null;
+  const at_start = reader.u8() === 1;
   const count = reader.u32();
   const messages: WebMessage[] = [];
   for (let i = 0; i < count; i++) messages.push(reader.message());
-  return { kind: kind === KIND_SYNC ? "sync" : "older", messages, oldest_seq, has_more };
+  return {
+    kind: kind === KIND_SYNC ? "sync" : "older",
+    room_id,
+    room_generation,
+    messages,
+    older_cursor,
+    at_start,
+  };
 }
 
 class Reader {
