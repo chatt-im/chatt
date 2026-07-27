@@ -140,6 +140,12 @@ pub struct SecurityConfig {
     /// Whether users may self-join via `chatt pair <addr>` without an admin invite.
     #[toml(default)]
     pub public: bool,
+    /// Whether a `ClientHello` must carry a valid `mac1` before the server will
+    /// answer it. See [`Config::require_hello_mac`], which is what the server
+    /// actually enforces: open pairing needs a first contact from a client that
+    /// holds no key yet, so a public server cannot require the MAC.
+    #[toml(default = true)]
+    pub require_hello_mac: bool,
     /// SHA-256 hash (`sha256:<hex>`) of the shared secret required for open
     /// pairing. `None`/empty means no password.
     #[toml(default)]
@@ -159,6 +165,7 @@ impl Default for SecurityConfig {
             max_file_size_mb: DEFAULT_FILE_SIZE_LIMIT_MB,
             bug_report_dir: None,
             public: false,
+            require_hello_mac: true,
             password_hash: None,
             password_epoch: 0,
         }
@@ -471,6 +478,12 @@ scalar_parse_setter!(
 );
 optional_string_setter!(set_security_bug_report_dir, security.bug_report_dir);
 scalar_parse_setter!(
+    set_security_require_hello_mac,
+    security.require_hello_mac,
+    bool,
+    "security.require-hello-mac"
+);
+scalar_parse_setter!(
     set_security_public,
     security.public,
     bool,
@@ -608,6 +621,12 @@ pub(crate) const CONFIG_OPTION_SPECS: &[ConfigOptionSpec] = &[
         value_name: "BOOL",
         description: "allow users to pair without an invite",
         apply: set_security_public,
+    },
+    ConfigOptionSpec {
+        name: "security.require-hello-mac",
+        value_name: "BOOL",
+        description: "ignore client hellos without a valid server-key MAC",
+        apply: set_security_require_hello_mac,
     },
     ConfigOptionSpec {
         name: "security.password-hash",
@@ -824,6 +843,13 @@ max-file-size-mb = {max_file_size_mb}
 
 # Public mode lets users self-join with `chatt pair <host:port>`.
 public = false
+# Ignore client hellos that do not carry a MAC keyed by this server's public
+# key, sending nothing back. Invites and device links ship that key, so real
+# clients always have it, and a port scan learns neither the key nor that Chatt
+# is listening. Forced off while public = true, whose first contact has no key
+# yet. The TCP port still accepts connections: to hide it entirely, bind it to a
+# WireGuard or loopback address.
+require-hello-mac = true
 # SHA-256 hash of the shared secret gating public open pairing. Omit for no
 # password. Generate with: printf %s 'secret' | sha256sum
 # password-hash = "sha256:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
@@ -927,6 +953,24 @@ impl Config {
 
     pub fn is_public(&self) -> bool {
         self.security.public
+    }
+
+    /// Whether to drop a `ClientHello` that carries no valid `mac1`, silently
+    /// and before any asymmetric work.
+    ///
+    /// Open pairing is the one flow whose first contact legitimately has no
+    /// server key to bind a MAC to, so a public server cannot enforce this no
+    /// matter how `security.require-hello-mac` is set. Every other entry point
+    /// — invite tickets and device links alike — ships the server public key
+    /// with the join string, so the client always holds it before it connects.
+    pub fn require_hello_mac(&self) -> bool {
+        self.security.require_hello_mac && !self.is_public()
+    }
+
+    /// Whether the configured identity is the well-known development seed,
+    /// whose private half is published in this repository.
+    pub fn uses_dev_server_identity(&self) -> bool {
+        self.security.server_identity_seed == rpc::crypto::dev_server_seed_hex()
     }
 
     /// The stored `sha256:` hash gating open pairing, `None` when open pairing
@@ -1509,6 +1553,7 @@ mod tests {
                 "security.max-file-size-mb",
                 "security.bug-report-dir",
                 "security.public",
+                "security.require-hello-mac",
                 "security.password-hash",
                 "security.password-epoch",
                 "storage.data-dir",

@@ -69,6 +69,14 @@ pub struct ClientHello {
     pub modes: Vec<u8>,
     pub client_nonce: Vec<u8>,
     pub client_ephemeral: Vec<u8>,
+    /// Scan-resistance MAC over the other fields, keyed by a hash of the
+    /// server's static Ed25519 public key. A server configured to require it
+    /// answers nothing at all unless this verifies, so a peer that does not
+    /// already hold the server key learns neither the key nor that Chatt is
+    /// listening. All zeroes when the client has no key to bind to, which is
+    /// only the trust-on-first-use open-pairing path. See
+    /// [`crate::crypto::client_hello_mac1`].
+    pub mac1: [u8; crate::crypto::HELLO_MAC_LEN],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
