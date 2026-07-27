@@ -13,8 +13,7 @@ use rpc::ids::UserId;
 use toml_spanner::Toml;
 
 use crate::config::{
-    FIRST_DYNAMIC_USER_ID, UserConfig, atomic_write_toml, toml_quote_value, valid_username,
-    validate_secret_hash,
+    FIRST_DYNAMIC_USER_ID, UserConfig, atomic_write_toml, toml_quote_value, validate_secret_hash,
 };
 
 const USERS_FILE: &str = "users.toml";
@@ -113,10 +112,10 @@ impl UserStore {
         username: String,
         token_hash: String,
     ) -> Result<(UserConfig, Vec<UserConfig>), String> {
-        if !valid_username(&username) {
-            return Err("username must be 1-64 bytes with no control characters".to_string());
+        if let Err(error) = rpc::username::validate(&username) {
+            return Err(error.to_string());
         }
-        let username = username.trim().to_string();
+        let username = rpc::username::trim(&username).to_string();
         let mut users = self.users.clone();
         if let Some(user) = users
             .iter_mut()
@@ -170,10 +169,10 @@ impl UserStore {
         user_id: UserId,
         username: String,
     ) -> Result<(UserConfig, Vec<UserConfig>), String> {
-        if !valid_username(&username) {
-            return Err("username must be 1-64 bytes with no control characters".to_string());
+        if let Err(error) = rpc::username::validate(&username) {
+            return Err(error.to_string());
         }
-        let username = username.trim().to_string();
+        let username = rpc::username::trim(&username).to_string();
         let mut users = self.users.clone();
         let Some(user) = users.iter_mut().find(|user| user.id == user_id) else {
             return Err(format!("no user with id {user_id}"));
@@ -251,9 +250,9 @@ impl UserStore {
             if user.internal_reference.is_empty() {
                 return Err(format!("{source}: user name must not be empty"));
             }
-            if !valid_username(&user.username) {
+            if let Err(error) = rpc::username::validate(&user.username) {
                 return Err(format!(
-                    "{source}: user {} username must be 1-64 bytes with no control characters",
+                    "{source}: user {} {error}",
                     user.internal_reference
                 ));
             }
@@ -266,9 +265,9 @@ impl UserStore {
                     user.internal_reference
                 ));
             }
-            // Usernames must be unique server-wide, compared case-insensitively,
-            // to match the runtime uniqueness the registry enforces.
-            if !user.username.is_empty() && !usernames.insert(user.username.trim().to_lowercase()) {
+            // Usernames must be unique server-wide under the same fold the
+            // registry applies at runtime.
+            if !user.username.is_empty() && !usernames.insert(rpc::username::fold(&user.username)) {
                 return Err(format!("{source}: duplicate username {}", user.username));
             }
             if !user.token_hash.trim().is_empty() {

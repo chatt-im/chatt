@@ -12,6 +12,7 @@ pub mod mls;
 pub mod msgref;
 pub mod qos;
 pub mod recv;
+pub mod username;
 pub mod video;
 
 pub const PROTOCOL_VERSION: u16 = 24;

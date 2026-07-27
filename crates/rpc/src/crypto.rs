@@ -1428,7 +1428,10 @@ mod tests {
 
         let mut version = original.clone();
         version.version = version.version.wrapping_add(1);
-        assert!(!verify_client_hello_mac1(&dev_server_public_key(), &version));
+        assert!(!verify_client_hello_mac1(
+            &dev_server_public_key(),
+            &version
+        ));
 
         let mut modes = original.clone();
         modes.modes = vec![TransportMode::Plaintext.wire_id()];

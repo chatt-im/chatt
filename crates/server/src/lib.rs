@@ -3420,6 +3420,27 @@ impl Server {
                 }
             }
             ClientControl::TakeKeyPackage { device_id } => {
+                if bound.is_none() {
+                    return Err("bind an active MLS device first".to_string());
+                }
+                if !self.may_take_key_package(user_id, device_id) {
+                    kvlog::warn!(
+                        "key package take rejected",
+                        session_id = session_id.0,
+                        user_id = user_id.0,
+                        device_id = device_id,
+                        reason = "no_shared_encrypted_room"
+                    );
+                    // Answered as an exhausted pool rather than an error: the
+                    // refusal must not tell a stranger which device ids exist.
+                    return self.send_control_to_token(
+                        token,
+                        &ServerControl::KeyPackage {
+                            device_id,
+                            package: None,
+                        },
+                    );
+                }
                 if !self.pending_mls.insert(token) {
                     return Err("connection already has an MLS delivery operation pending".into());
                 }
@@ -3441,8 +3462,16 @@ impl Server {
                 let bound = bound
                     .as_ref()
                     .ok_or_else(|| "bind an active MLS device first".to_string())?;
-                let account_id = self.mls_account_id(user_id)?;
                 let room_id = descriptor.room_id;
+                // Gated before anything branches on the room's existence or
+                // shape. `validate_encrypted_room_descriptor` below reports
+                // which of those the request got wrong, so reaching it without
+                // access would turn room creation into an enumeration oracle
+                // for private rooms and their membership.
+                if !self.check_room_access(session_id, room_id) {
+                    return Err("encrypted room is not accessible".to_string());
+                }
+                let account_id = self.mls_account_id(user_id)?;
                 let existing_group =
                     self.mls
                         .group_info(room_id)
@@ -3450,9 +3479,6 @@ impl Server {
                             (descriptor.clone(), epoch, group_info.to_vec())
                         });
                 if let Some((existing, epoch, group_info)) = existing_group {
-                    if !self.check_room_access(session_id, room_id) {
-                        return Err("encrypted room is not accessible".to_string());
-                    }
                     return self.send_control_to_token(
                         token,
                         &ServerControl::GroupInfo {
@@ -3650,6 +3676,32 @@ impl Server {
             .roster(user_id)
             .map(|roster| roster.body.account_id)
             .ok_or_else(|| "account has no MLS device roster".to_string())
+    }
+
+    /// Whether `user_id` may consume a KeyPackage published by `device_id`.
+    ///
+    /// A take permanently retires one single-use join credential, and a device
+    /// whose pool is empty falls back to its reused last-resort package for
+    /// every later add. So the take is restricted to accounts the caller could
+    /// actually build an encrypted group with: the two share a room that admits
+    /// one. Public rooms never carry an MLS group
+    /// ([`Self::validate_encrypted_room_descriptor`] refuses them), so they
+    /// grant nothing here and a stranger on a public server cannot drain a pool
+    /// it could never legitimately spend.
+    fn may_take_key_package(&self, user_id: UserId, device_id: DeviceId) -> bool {
+        let Some(owner) = self.mls.device_owner(device_id) else {
+            return false;
+        };
+        owner == user_id || self.shares_encryptable_room(user_id, owner)
+    }
+
+    /// Whether both users belong to a room that can hold an MLS group.
+    fn shares_encryptable_room(&self, user_id: UserId, other: UserId) -> bool {
+        self.rooms.values().any(|room| {
+            !matches!(room.access, RoomAccess::Public)
+                && room.access.allows(user_id)
+                && room.access.allows(other)
+        })
     }
 
     fn require_mls_room_member(&self, user_id: UserId, room_id: RoomId) -> Result<(), String> {
@@ -4043,7 +4095,7 @@ impl Server {
         if let Some((user_id, _device_id, _credential_hash)) =
             self.mls.authenticate_credential(auth_token)
         {
-            let username = username.trim();
+            let username = rpc::username::trim(username);
             if !valid_username(username) || !self.usernames.is_available(username, Some(user_id)) {
                 return self.reject_auth(
                     token,
@@ -4095,7 +4147,7 @@ impl Server {
                     "authentication failed: use an active MLS device credential".to_string(),
                 );
             }
-            let username = username.trim();
+            let username = rpc::username::trim(username);
             if !valid_username(username)
                 || !self.usernames.is_available(username, Some(claims.user_id))
             {
@@ -4162,8 +4214,8 @@ impl Server {
                 "authentication failed: the token is not valid for this server".to_string(),
             );
         };
-        let username = username.trim();
-        if !valid_username(username) {
+        let username = rpc::username::trim(username);
+        if let Err(error) = rpc::username::validate(username) {
             kvlog::warn!(
                 "authenticate rejected",
                 token = token.0,
@@ -4173,8 +4225,7 @@ impl Server {
             return self.reject_auth(
                 token,
                 ERROR_PAIRING_INVALID_REQUEST,
-                "authentication failed: username must be 1-64 bytes with no control characters"
-                    .to_string(),
+                format!("authentication failed: {error}"),
             );
         }
         if !self.usernames.is_available(username, Some(user.id)) {
@@ -4260,7 +4311,7 @@ impl Server {
     /// details are never stored server-side. The user id doubles as the internal
     /// identifier since there is no username.
     fn dynamic_user(user_id: UserId, username: &str) -> UserConfig {
-        let username = username.trim();
+        let username = rpc::username::trim(username);
         let username = if valid_username(username) {
             username.to_string()
         } else {
@@ -4302,8 +4353,8 @@ impl Server {
                 "pairing failed: no active invite matches this join string; the invite may have expired, been replaced, or already been used. Ask the admin to issue a new one".to_string(),
             );
         };
-        let username = username.trim();
-        if !valid_username(username) {
+        let username = rpc::username::trim(username);
+        if let Err(error) = rpc::username::validate(username) {
             kvlog::warn!(
                 "pairing rejected",
                 token = token.0,
@@ -4313,8 +4364,7 @@ impl Server {
             return self.reject_auth(
                 token,
                 ERROR_PAIRING_INVALID_REQUEST,
-                "pairing failed: username must be 1-64 bytes with no control characters"
-                    .to_string(),
+                format!("pairing failed: {error}"),
             );
         }
 
@@ -4470,13 +4520,12 @@ impl Server {
             }
             current_password_verified = true;
         }
-        let username = username.trim();
-        if !valid_username(username) {
+        let username = rpc::username::trim(username);
+        if let Err(error) = rpc::username::validate(username) {
             return self.reject_auth(
                 token,
                 ERROR_PAIRING_INVALID_REQUEST,
-                "open pairing failed: username must be 1-64 bytes with no control characters"
-                    .to_string(),
+                format!("open pairing failed: {error}"),
             );
         }
         let seed = self.config.security.server_identity_seed.clone();
@@ -11274,7 +11323,10 @@ mod tests {
         conn.control = None;
         conn.transport = None;
         conn.pre_auth = true;
-        server.pre_auth.admit(conn.addr.ip()).expect("pre-auth slot");
+        server
+            .pre_auth
+            .admit(conn.addr.ip())
+            .expect("pre-auth slot");
         server.clients.insert(token, conn);
         peer
     }
@@ -12544,6 +12596,66 @@ mod tests {
         let tokens = accessible_recipient_tokens(&rooms, &sessions, room_id, None, |_| true);
 
         assert_eq!(tokens, vec![Token(3)]);
+    }
+
+    #[test]
+    fn key_package_takes_are_limited_to_encryptable_room_peers() {
+        let mut server = test_server();
+        let alice = UserId(1);
+        let bob = UserId(2);
+        let stranger = UserId(3);
+        server
+            .rooms
+            .insert(RoomId(2), private_room(RoomId(2), &[alice, bob]));
+
+        assert!(server.shares_encryptable_room(alice, bob));
+        assert!(server.shares_encryptable_room(bob, alice));
+        assert!(!server.shares_encryptable_room(alice, stranger));
+        assert!(!server.shares_encryptable_room(stranger, bob));
+    }
+
+    #[test]
+    fn public_room_membership_grants_no_key_package_access() {
+        let mut server = test_server();
+        // Every user reaches a public room, so it must never be what authorizes
+        // draining another account's one-time join credentials.
+        server
+            .rooms
+            .insert(RoomId(1), test_room(RoomId(1), &[SessionId(1)]));
+
+        assert!(!server.shares_encryptable_room(UserId(1), UserId(2)));
+    }
+
+    #[test]
+    fn key_package_take_for_an_unknown_device_is_refused() {
+        let server = test_server();
+
+        assert!(!server.may_take_key_package(UserId(1), DeviceId([9; 16])));
+    }
+
+    #[test]
+    fn creating_an_encrypted_room_reports_404_before_probing_room_shape() {
+        let mut server = test_server();
+        let session_id = SessionId(1);
+        let mut peer = live_user(&mut server, Token(1), session_id, UserId(9));
+        let hidden = RoomId(2);
+        server
+            .rooms
+            .insert(hidden, private_room(hidden, &[UserId(1)]));
+
+        // A room the caller cannot see and a room id that was never allocated
+        // must be indistinguishable: same code, same message, no hint that the
+        // private room exists or who is in it.
+        for room_id in [hidden, RoomId(77)] {
+            assert!(!server.check_room_access(session_id, room_id));
+            assert_eq!(
+                read_plaintext_server_control(&mut server, &mut peer),
+                ServerControl::Error {
+                    code: control::ERROR_ROOM_NOT_FOUND,
+                    message: "room not found".to_string(),
+                }
+            );
+        }
     }
 
     #[test]

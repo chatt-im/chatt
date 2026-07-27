@@ -318,11 +318,12 @@ impl UserConfig {
     }
 }
 
-/// Whether a user-chosen username is valid on the server: non-empty after
-/// trimming, at most 64 bytes, and free of control characters.
+/// Whether a user-chosen username is valid on the server.
+///
+/// Delegates to [`rpc::username::validate`] so the client rejects exactly what
+/// the server would refuse to register.
 pub(crate) fn valid_username(name: &str) -> bool {
-    let name = name.trim();
-    !name.is_empty() && name.len() <= 64 && !name.chars().any(char::is_control)
+    rpc::username::is_valid(name)
 }
 
 /// The operator's server configuration.
