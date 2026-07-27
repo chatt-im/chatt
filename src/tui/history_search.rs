@@ -90,7 +90,9 @@ impl SearchIndex {
         let kept = self
             .entries
             .iter()
-            .position(|entry| !matches!(entry.entry, HistoryEntryId::Message(id) if id <= watermark))
+            .position(
+                |entry| !matches!(entry.entry, HistoryEntryId::Message(id) if id <= watermark),
+            )
             .unwrap_or(self.entries.len());
         if kept == 0 {
             return;
@@ -481,9 +483,7 @@ impl HistorySearch {
             .partition_point(|found| found.ordinal <= nearest)
             .saturating_sub(1)
             .min(self.matches.len().saturating_sub(1));
-        self.selected_ordinal = self
-            .selected_match()
-            .map_or(nearest, |found| found.ordinal);
+        self.selected_ordinal = self.selected_match().map_or(nearest, |found| found.ordinal);
         self.list_offset = 0;
     }
 }

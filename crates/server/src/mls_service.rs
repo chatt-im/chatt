@@ -23,6 +23,33 @@ use crate::mls_store::{
 
 const MAX_KEY_PACKAGES_PER_DEVICE: usize = 64;
 
+/// How long each encrypted room retains undelivered MLS events, resolved from
+/// the server configuration.
+#[derive(Clone, Debug)]
+pub(super) struct MlsRetentionPolicy {
+    /// `storage.mls-retention-days`, applied to configured rooms without an
+    /// override.
+    pub(super) default_days: u16,
+    /// Per-room `[[rooms]] mls-retention-days` overrides.
+    pub(super) room_days: HashMap<RoomId, u16>,
+    /// `[dm] retention-days`, applied to runtime-created DM rooms.
+    pub(super) dm_days: u16,
+}
+
+impl MlsRetentionPolicy {
+    /// Retention for `room_id`: its explicit override, the DM window for
+    /// runtime-created rooms, otherwise the global default.
+    pub(super) fn days_for(&self, room_id: RoomId) -> u16 {
+        if let Some(days) = self.room_days.get(&room_id) {
+            return *days;
+        }
+        if room_id.0 >= crate::config::FIRST_DYNAMIC_ROOM_ID {
+            return self.dm_days;
+        }
+        self.default_days
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CurrentLastResortKeyPackage {
     hash: [u8; 32],
@@ -35,8 +62,7 @@ struct CurrentLastResortKeyPackage {
 pub(super) struct MlsService {
     server_id: Vec<u8>,
     store: MlsStore,
-    default_retention_days: u16,
-    room_retention_days: HashMap<RoomId, u16>,
+    retention: MlsRetentionPolicy,
     initialized_accounts: HashSet<UserId>,
     identities: ChattIdentityProvider,
     validator: PublicGroupValidator,
@@ -78,14 +104,21 @@ impl MlsService {
 
     #[allow(dead_code)]
     pub fn open(data_dir: Option<PathBuf>, server_id: Vec<u8>) -> Result<Self, String> {
-        Self::open_with_retention(data_dir, server_id, 90, HashMap::new())
+        Self::open_with_retention(
+            data_dir,
+            server_id,
+            MlsRetentionPolicy {
+                default_days: 90,
+                room_days: HashMap::new(),
+                dm_days: 90,
+            },
+        )
     }
 
     pub fn open_with_retention(
         data_dir: Option<PathBuf>,
         server_id: Vec<u8>,
-        default_retention_days: u16,
-        room_retention_days: HashMap<RoomId, u16>,
+        retention: MlsRetentionPolicy,
     ) -> Result<Self, String> {
         let identities = ChattIdentityProvider::new(server_id.clone());
         let validator = PublicGroupValidator::new(identities.clone());
@@ -94,8 +127,7 @@ impl MlsService {
         let mut service = Self {
             server_id,
             store,
-            default_retention_days,
-            room_retention_days,
+            retention,
             initialized_accounts: HashSet::new(),
             identities,
             validator,
@@ -116,18 +148,37 @@ impl MlsService {
             global: loaded.global,
             rooms: loaded.rooms,
         })?;
+        if data_dir.is_some() {
+            service.apply_retention_policy_to_stored_rooms()?;
+        }
         Ok(service)
+    }
+
+    /// Rewrites the retention baked into each persisted room when the operator
+    /// has since edited the configuration, so a changed window also covers
+    /// rooms created under the previous one.
+    fn apply_retention_policy_to_stored_rooms(&mut self) -> Result<(), String> {
+        let mut updated = Vec::new();
+        for room in self.rooms.values_mut() {
+            let days = self.retention.days_for(room.descriptor.room_id);
+            if room.retention_days == days {
+                continue;
+            }
+            room.retention_days = days;
+            updated.push(room.clone());
+        }
+        if updated.is_empty() {
+            return Ok(());
+        }
+        let global = self.store.snapshot_state().global;
+        self.store.replace_global_and_rooms(&global, &updated)
     }
 
     /// Builds the cache view used for network-loop authorization and reads.
     /// Both views share the same hot store; only the worker view owns storage.
     pub(super) fn in_memory_view(&self) -> Result<Self, String> {
-        let mut view = Self::open_with_retention(
-            None,
-            self.server_id.clone(),
-            self.default_retention_days,
-            self.room_retention_days.clone(),
-        )?;
+        let mut view =
+            Self::open_with_retention(None, self.server_id.clone(), self.retention.clone())?;
         view.store = self.store.read_handle();
         view.restore(self.snapshot())?;
         Ok(view)
@@ -798,11 +849,7 @@ impl MlsService {
             head_sequence: sequence,
             oldest_available_sequence: 1,
             last_event_time_unix_ms: now,
-            retention_days: self
-                .room_retention_days
-                .get(&descriptor.room_id)
-                .copied()
-                .unwrap_or(self.default_retention_days),
+            retention_days: self.retention.days_for(descriptor.room_id),
             required_devices,
         };
         let event = MlsDeliveryEvent::Commit {
@@ -2266,6 +2313,101 @@ mod tests {
                 sequence: 3,
                 epoch: 2,
             }
+        );
+    }
+
+    #[test]
+    fn dm_rooms_use_dm_retention_days_and_follow_configuration_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_id = [21u8; 32];
+        let (alice, _) = LocalInstallation::open_or_create(
+            &temp.path().join("retention-alice"),
+            server_id,
+            UserId(1),
+            "alice",
+        )
+        .unwrap();
+        let (bob, _) = LocalInstallation::open_or_create(
+            &temp.path().join("retention-bob"),
+            server_id,
+            UserId(2),
+            "bob",
+        )
+        .unwrap();
+        alice.install_roster(&bob.bootstrap.own_roster).unwrap();
+        bob.install_roster(&alice.bootstrap.own_roster).unwrap();
+        let state_dir = temp.path().join("retention-server");
+        std::fs::create_dir(&state_dir).unwrap();
+        let configured_room = RoomId(50);
+        let dm_room = RoomId(crate::config::FIRST_DYNAMIC_ROOM_ID);
+        let policy = |dm_days| MlsRetentionPolicy {
+            default_days: 90,
+            room_days: HashMap::from([(configured_room, 30)]),
+            dm_days,
+        };
+        let mut service =
+            MlsService::open_with_retention(Some(state_dir.clone()), server_id.to_vec(), policy(7))
+                .unwrap();
+        service
+            .put_roster(UserId(1), None, alice.bootstrap.own_roster.clone(), None)
+            .unwrap();
+        service
+            .put_roster(UserId(2), None, bob.bootstrap.own_roster.clone(), None)
+            .unwrap();
+        service
+            .publish_key_packages(
+                UserId(2),
+                bob.bootstrap.device_id,
+                bob.client
+                    .generate_key_packages(bob.bootstrap.device_id, 2)
+                    .unwrap(),
+            )
+            .unwrap();
+        for (index, room_id) in [configured_room, dm_room].into_iter().enumerate() {
+            let package = service
+                .take_key_package(bob.bootstrap.device_id)
+                .unwrap()
+                .unwrap();
+            let descriptor = EncryptedRoomDescriptor::new(
+                room_id,
+                alice.bootstrap.account_id,
+                vec![alice.bootstrap.account_id, bob.bootstrap.account_id],
+                10 + index as u64,
+            )
+            .unwrap();
+            let bundle = alice
+                .client
+                .create_room(&descriptor, &[(bob.bootstrap.device_id, package)])
+                .unwrap();
+            service
+                .create_room(
+                    alice.bootstrap.account_id,
+                    &alice.bootstrap.device_certificate.body.mls_client_id,
+                    descriptor.clone(),
+                    &[
+                        roster_checkpoint(&alice.bootstrap.own_roster),
+                        roster_checkpoint(&bob.bootstrap.own_roster),
+                    ],
+                    bundle,
+                )
+                .unwrap();
+            alice.client.accept_pending_commit(&descriptor, 1).unwrap();
+        }
+        assert_eq!(service.rooms[&configured_room].retention_days, 30);
+        assert_eq!(service.rooms[&dm_room].retention_days, 7);
+        drop(service);
+
+        let service =
+            MlsService::open_with_retention(Some(state_dir), server_id.to_vec(), policy(14))
+                .unwrap();
+
+        assert_eq!(
+            service.rooms[&dm_room].retention_days, 14,
+            "an edited DM window must reach rooms created under the previous one"
+        );
+        assert_eq!(
+            service.rooms[&configured_room].retention_days, 30,
+            "an explicit room override still wins over the DM window"
         );
     }
 

@@ -661,8 +661,10 @@ impl RoomHistory {
         let Some(newest) = evicted.last() else {
             return;
         };
-        self.evicted_through =
-            Some(self.evicted_through.map_or(newest.0, |seen| seen.max(newest.0)));
+        self.evicted_through = Some(
+            self.evicted_through
+                .map_or(newest.0, |seen| seen.max(newest.0)),
+        );
         self.prune_evicted_mutations();
         self.record(HistoryDelta::EvictedThrough(*newest));
     }
@@ -1201,9 +1203,7 @@ impl RefLookupCache {
             return None;
         }
         let index = self.entries.iter().position(|entry| {
-            entry.room_id == room_id
-                && entry.key == key
-                && entry.evicted_through == evicted_through
+            entry.room_id == room_id && entry.key == key && entry.evicted_through == evicted_through
         })?;
         let entry = self.entries.remove(index).expect("index from position");
         let value = entry.value.clone();
@@ -1713,8 +1713,7 @@ impl RoomHistoryFixture {
     /// canonical log as a tombstone and leaves the visible sequence.
     pub(crate) fn tombstone(&mut self, id: u64) {
         let record = self.history.messages.get_mut(id).expect("fixture message");
-        record.message.flags =
-            rpc::control::MessageFlags(rpc::control::MessageFlags::DELETED);
+        record.message.flags = rpc::control::MessageFlags(rpc::control::MessageFlags::DELETED);
         record.message.body.clear();
         self.history.record(HistoryDelta::Tombstoned(MessageId(id)));
     }
@@ -6329,7 +6328,14 @@ mod tests {
             .collect::<Vec<_>>();
         enter(&mut room, Vec::new(), resident, Some(UserId(1)));
         assert!(room.begin_history_fetch(RoomId(1)));
-        room.history_chunk_received(RoomId(1), None, Vec::<ChatMessage>::new(), false, true, Some(UserId(1)));
+        room.history_chunk_received(
+            RoomId(1),
+            None,
+            Vec::<ChatMessage>::new(),
+            false,
+            true,
+            Some(UserId(1)),
+        );
         assert!(room.older_history_request(RoomId(1)).is_none());
         room.session
             .metas

@@ -77,7 +77,7 @@ use identity_writer::{
 };
 use local_admin::{AdminCommand, AdminSender, AdminSocket};
 use mls_delivery::MlsEventQueue;
-use mls_service::{CacheState as MlsCacheState, MlsService, PutRosterError};
+use mls_service::{CacheState as MlsCacheState, MlsRetentionPolicy, MlsService, PutRosterError};
 use room_store::{MutationKind, OpenDmResult, RoomStore};
 use user_store::UserStore;
 use username_registry::UsernameRegistry;
@@ -1353,16 +1353,19 @@ impl Server {
         let server_key_pair = config
             .server_key_pair()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let room_retention_days = config
-            .rooms
-            .iter()
-            .filter_map(|room| room.mls_retention_days.map(|days| (room.room_id(), days)))
-            .collect();
+        let retention = MlsRetentionPolicy {
+            default_days: config.storage.mls_retention_days,
+            room_days: config
+                .rooms
+                .iter()
+                .filter_map(|room| room.mls_retention_days.map(|days| (room.room_id(), days)))
+                .collect(),
+            dm_days: config.dm_retention_days(),
+        };
         let durable_mls = MlsService::open_with_retention(
             config.data_dir(),
             server_key_pair.public_key().as_ref().to_vec(),
-            config.storage.mls_retention_days,
-            room_retention_days,
+            retention,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mls = durable_mls
@@ -4908,6 +4911,7 @@ impl Server {
                 rooms,
                 users,
                 default_room: self.default_room,
+                dms_enabled: self.config.dm.enabled,
             },
         };
         self.send_control_to_token(token, &response)?;
@@ -5844,12 +5848,30 @@ impl Server {
             );
             return;
         }
+        let existing = self.store.dm_room_for(requester, peer);
+        if !self.config.dm.enabled && existing.is_none() {
+            kvlog::warn!(
+                "dm open rejected",
+                session_id = session_id.0,
+                requester = requester.0,
+                peer = peer.0,
+                error = "direct messages are disabled"
+            );
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::Error {
+                    code: control::ERROR_REQUEST_REJECTED,
+                    message: "direct messages are disabled on this server".to_string(),
+                },
+            );
+            return;
+        }
         let peer_known = self.users.users.iter().any(|user| user.id == peer)
             || self
                 .sessions
                 .values()
                 .any(|session| session.user_id == peer)
-            || self.store.dm_room_for(requester, peer).is_some();
+            || existing.is_some();
         if !peer_known {
             let _ = self.send_control_to_token(
                 token,
@@ -5860,7 +5882,6 @@ impl Server {
             );
             return;
         }
-        let existing = self.store.dm_room_for(requester, peer);
         let room_id = match self.store.begin_open_dm(requester, peer, now_ms()) {
             Ok(OpenDmResult::Existing(room_id)) => room_id,
             Ok(OpenDmResult::Pending { operation_id }) => {
@@ -9744,6 +9765,63 @@ mod tests {
                 .all(|room| !matches!(room.access, RoomAccess::Dm(..))),
             "a self dm room must not be created"
         );
+    }
+
+    #[test]
+    fn dm_open_rejected_when_dms_disabled() {
+        let mut server = test_server();
+        server.config.dm.enabled = false;
+        let requester = SessionId(1);
+        let mut requester_peer = live_user(&mut server, Token(11), requester, UserId(1));
+        let _peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
+
+        server.open_dm(requester, UserId(2));
+
+        let control = read_until(&mut server, &mut requester_peer, |control| {
+            matches!(control, ServerControl::Error { .. })
+        });
+        let ServerControl::Error { code, message } = control else {
+            unreachable!();
+        };
+        assert_eq!(code, control::ERROR_REQUEST_REJECTED);
+        assert!(message.contains("direct messages are disabled"));
+        assert!(server.store.dm_rooms().is_empty());
+        assert!(
+            server
+                .rooms
+                .values()
+                .all(|room| !matches!(room.access, RoomAccess::Dm(..)))
+        );
+    }
+
+    #[test]
+    fn existing_dm_room_still_opens_when_dms_disabled() {
+        let mut server = test_server();
+        let requester = SessionId(1);
+        let mut requester_peer = live_user(&mut server, Token(11), requester, UserId(1));
+        let _peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
+        server.open_dm(requester, UserId(2));
+        let dm_room = server
+            .store
+            .dm_room_for(UserId(1), UserId(2))
+            .expect("dm registered");
+        read_until(&mut server, &mut requester_peer, |control| {
+            matches!(control, ServerControl::DmOpened { .. })
+        });
+
+        server.config.dm.enabled = false;
+        server.open_dm(requester, UserId(2));
+
+        let control = read_until(&mut server, &mut requester_peer, |control| {
+            matches!(
+                control,
+                ServerControl::DmOpened { .. } | ServerControl::Error { .. }
+            )
+        });
+        assert!(matches!(
+            control,
+            ServerControl::DmOpened { room_id, .. } if room_id == dm_room
+        ));
     }
 
     #[test]

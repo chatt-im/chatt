@@ -13,9 +13,9 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -1447,8 +1447,8 @@ fn run(
                                 room_id,
                                 before_message_id
                             );
-                            let _ = web_requests
-                                .send(WebRequest::HistorySnapshot { client: id.get() });
+                            let _ =
+                                web_requests.send(WebRequest::HistorySnapshot { client: id.get() });
                         }
                     }
                     Ok(ClientRequest::RefPreview {
@@ -3030,13 +3030,7 @@ mod tests {
         let (web_tx, _web_rx) = mpsc::channel();
         // An empty store must 404 rather than fall through to the static asset
         // mount.
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -3094,13 +3088,7 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -3153,13 +3141,7 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -3287,13 +3269,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut rejected = TcpStream::connect(sender.local_addr()).unwrap();
         rejected
@@ -3331,13 +3307,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         sender.send_history_window(
@@ -3370,13 +3340,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            false,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, false).unwrap();
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
 
         sender.send_delete_error(
@@ -3400,13 +3364,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3459,13 +3417,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         // A share starts before any browser connects.
         sender.send_share_available(
@@ -3513,13 +3465,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
 
         let old_key = video::encode_video_frame(1, true, 15, &[1]);
@@ -3638,13 +3584,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            false,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, false).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3672,13 +3612,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            false,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, false).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3718,13 +3652,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3747,13 +3675,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            false,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, false).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3781,13 +3703,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3808,13 +3724,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3835,13 +3745,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            false,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, false).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3880,13 +3784,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3905,13 +3803,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            false,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, false).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -3952,13 +3844,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            false,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, false).unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
@@ -4056,13 +3942,7 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
         let mut first = open_ready_ws(sender.local_addr(), &web_rx);
         let mut second = open_ready_ws(sender.local_addr(), &web_rx);
 
