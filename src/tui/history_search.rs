@@ -20,15 +20,23 @@ struct SearchEntry {
 #[derive(Debug, Default)]
 struct SearchIndex {
     /// All normalized bodies separated by a byte that cannot occur in UTF-8.
+    /// Entry offsets are logical: `lower[0]` sits at [`Self::base`], so
+    /// dropping evicted entries need not rewrite every offset.
     lower: Vec<u8>,
+    /// Logical offset of `lower[0]`, advanced when an evicted prefix is
+    /// dropped and reset whenever the buffer is physically compacted.
+    base: usize,
     entries: Vec<SearchEntry>,
     tail: Option<rpc::ids::MessageId>,
 }
 
 impl SearchIndex {
-    fn build(history: &RoomHistoryRef<'_>) -> Self {
+    /// Indexes what the view displays rather than what history retains: a
+    /// `/clear` hides rows from the buffer, and offering them as matches would
+    /// scroll the user to a row that is not there.
+    fn build(chat: &ChatViewport, history: &RoomHistoryRef<'_>) -> Self {
         let mut index = Self::default();
-        let ids = history.entry_ids();
+        let ids = chat.entry_ids();
         index.entries.reserve(ids.len());
         for id in ids {
             index.append_entry(history, id);
@@ -49,11 +57,39 @@ impl SearchIndex {
         true
     }
 
+    /// Drops the leading entries retention has evicted.
+    ///
+    /// The normalized bytes of the survivors are never rewritten: the dropped
+    /// prefix is simply left unowned at the front of `lower`, and is discarded
+    /// physically only once it outweighs the live remainder. That amortizes to
+    /// a constant per evicted message.
+    fn drop_front(&mut self, watermark: rpc::ids::MessageId) {
+        let kept = self
+            .entries
+            .iter()
+            .position(|entry| !matches!(entry.entry, HistoryEntryId::Message(id) if id <= watermark))
+            .unwrap_or(self.entries.len());
+        if kept == 0 {
+            return;
+        }
+        self.entries.drain(..kept);
+        let Some(live) = self.entries.first().map(|entry| entry.start) else {
+            self.lower.clear();
+            self.base = 0;
+            return;
+        };
+        let unowned = live - self.base;
+        if unowned * 2 >= self.lower.len() {
+            self.lower.drain(..unowned);
+            self.base = live;
+        }
+    }
+
     fn append_entry(&mut self, history: &RoomHistoryRef<'_>, id: HistoryEntryId) {
         let Some(record) = history.record(id) else {
             return;
         };
-        let start = self.lower.len();
+        let start = self.base + self.lower.len();
         let original = if record.body.is_ascii() {
             self.lower
                 .extend(record.body.bytes().map(|byte| byte.to_ascii_lowercase()));
@@ -71,7 +107,7 @@ impl SearchIndex {
             }
             Some(map)
         };
-        let end = self.lower.len();
+        let end = self.base + self.lower.len();
         self.entries.push(SearchEntry {
             entry: id,
             start,
@@ -102,13 +138,18 @@ impl SearchIndex {
             .map(|chunk| memchr::memmem::Finder::new(chunk.as_bytes()))
             .collect();
         let finder = memchr::memmem::Finder::new(first.as_bytes());
-        let mut search_from = 0usize;
+        // `search_from` indexes `lower`; entry offsets are logical, so the two
+        // are converted through `base` at each comparison.
+        let mut search_from = self
+            .entries
+            .first()
+            .map_or(0, |entry| entry.start - self.base);
         let mut entry_index = 0usize;
         while search_from < self.lower.len() {
             let Some(relative) = finder.find(&self.lower[search_from..]) else {
                 break;
             };
-            let found = search_from + relative;
+            let found = self.base + search_from + relative;
             while entry_index < self.entries.len() && self.entries[entry_index].end <= found {
                 entry_index += 1;
             }
@@ -117,7 +158,7 @@ impl SearchIndex {
             };
             let first_end = found + first.len();
             if found < entry.start || first_end > entry.end {
-                search_from = found + 1;
+                search_from = found + 1 - self.base;
                 continue;
             }
 
@@ -125,7 +166,9 @@ impl SearchIndex {
             let mut chunk_from = first_end;
             let mut matched = true;
             for chunk in &rest {
-                let Some(relative) = chunk.find(&self.lower[chunk_from..entry.end]) else {
+                let Some(relative) =
+                    chunk.find(&self.lower[chunk_from - self.base..entry.end - self.base])
+                else {
                     matched = false;
                     break;
                 };
@@ -143,9 +186,9 @@ impl SearchIndex {
                         .collect(),
                     ordinal: entry_index,
                 });
-                search_from = entry.end.saturating_add(1);
+                search_from = entry.end.saturating_add(1) - self.base;
             } else {
-                search_from = found + 1;
+                search_from = found + 1 - self.base;
             }
         }
     }
@@ -183,12 +226,54 @@ pub(crate) struct HistorySearch {
     matches: Vec<HistoryMatch>,
     selected: usize,
     list_offset: usize,
-    indexed_generation: u64,
-    indexed_revision: u64,
-    indexed_reindex_revision: u64,
+    identity: Option<IndexIdentity>,
     anchor: Option<HistoryEntryId>,
+    /// Ordinal of the last resolved selection, so a selection that vanishes
+    /// falls back to its neighbourhood rather than to the oldest match.
+    selected_ordinal: usize,
     #[cfg(test)]
     full_rebuilds: usize,
+}
+
+/// What the built index is a projection of. Message ids restart at one in every
+/// room, so the room is part of the identity: without it an index built for one
+/// room could alias same-numbered messages in another and hand render byte
+/// ranges into a body they never described.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IndexIdentity {
+    room_id: Option<rpc::ids::RoomId>,
+    generation: u64,
+    content_revision: u64,
+    order_revision: u64,
+    reindex_revision: u64,
+    evicted_through: Option<rpc::ids::MessageId>,
+    clear_generation: u64,
+}
+
+impl IndexIdentity {
+    fn of(chat: &ChatViewport, history: &RoomHistoryRef<'_>) -> Self {
+        Self {
+            room_id: history.room_id(),
+            generation: history.generation(),
+            content_revision: history.content_revision(),
+            order_revision: history.order_revision(),
+            reindex_revision: history.reindex_revision(),
+            evicted_through: history.evicted_through(),
+            clear_generation: chat.clear_generation(),
+        }
+    }
+
+    /// Whether the already-normalized bytes of existing entries stay valid, so
+    /// the index only has to lose an evicted prefix and gain a tail. Any body
+    /// changing in place invalidates them, as does a reindex, a `/clear`, or a
+    /// different room.
+    fn extends(&self, next: &Self) -> bool {
+        self.room_id == next.room_id
+            && self.generation == next.generation
+            && self.content_revision == next.content_revision
+            && self.reindex_revision == next.reindex_revision
+            && self.clear_generation == next.clear_generation
+    }
 }
 
 impl HistorySearch {
@@ -203,14 +288,13 @@ impl HistorySearch {
             matches: Vec::new(),
             selected: 0,
             list_offset: 0,
-            indexed_generation: u64::MAX,
-            indexed_revision: u64::MAX,
-            indexed_reindex_revision: u64::MAX,
+            identity: None,
             anchor,
+            selected_ordinal: 0,
             #[cfg(test)]
             full_rebuilds: 0,
         };
-        state.sync(history);
+        state.sync(chat, history);
         state
     }
 
@@ -253,28 +337,26 @@ impl HistorySearch {
             .min(self.matches.len().saturating_sub(rows));
     }
 
-    pub(crate) fn sync(&mut self, history: &RoomHistoryRef<'_>) {
-        if self.indexed_generation == history.generation()
-            && self.indexed_revision == history.order_revision()
-        {
+    pub(crate) fn sync(&mut self, chat: &ChatViewport, history: &RoomHistoryRef<'_>) {
+        let next = IndexIdentity::of(chat, history);
+        if self.identity == Some(next) {
             return;
         }
         let nearest = self.selected_entry().or(self.anchor);
-        if self.indexed_generation == history.generation()
-            && self.indexed_reindex_revision == history.reindex_revision()
-            && self.index.append_tail(history)
-        {
-            // The normalized bytes for existing entries remain valid.
-        } else {
-            self.index = SearchIndex::build(history);
+        let extends = self.identity.is_some_and(|current| current.extends(&next));
+        if extends {
+            if let Some(watermark) = next.evicted_through {
+                self.index.drop_front(watermark);
+            }
+        }
+        if !extends || !self.index.append_tail(history) {
+            self.index = SearchIndex::build(chat, history);
             #[cfg(test)]
             {
                 self.full_rebuilds += 1;
             }
         }
-        self.indexed_generation = history.generation();
-        self.indexed_revision = history.order_revision();
-        self.indexed_reindex_revision = history.reindex_revision();
+        self.identity = Some(next);
         self.refresh(nearest);
     }
 
@@ -289,7 +371,7 @@ impl HistorySearch {
         if matches!(key.kind, KeyEventKind::Release) {
             return SearchAction::Continue;
         }
-        self.sync(history);
+        self.sync(chat, history);
         let mut modifiers = key.modifiers;
         modifiers.remove(KeyModifiers::SHIFT);
         match (key.code, modifiers) {
@@ -346,7 +428,7 @@ impl HistorySearch {
         width: u16,
         height: u16,
     ) {
-        self.sync(history);
+        self.sync(chat, history);
         if !self.matches.is_empty() {
             self.selected =
                 (self.selected as isize + delta).rem_euclid(self.matches.len() as isize) as usize;
@@ -364,6 +446,10 @@ impl HistorySearch {
     }
 
     fn refresh(&mut self, nearest: Option<HistoryEntryId>) {
+        // An entry that no longer exists — evicted, tombstoned, or cleared —
+        // leaves its last known ordinal as the best estimate of where the
+        // reader was. Falling back to zero would throw them to the very oldest
+        // match instead of the nearest surviving one.
         let nearest = nearest
             .and_then(|nearest| {
                 self.index
@@ -371,13 +457,19 @@ impl HistorySearch {
                     .iter()
                     .position(|entry| entry.entry == nearest)
             })
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                self.selected_ordinal
+                    .min(self.index.entries.len().saturating_sub(1))
+            });
         self.index.search(&self.query, &mut self.matches);
         self.selected = self
             .matches
             .partition_point(|found| found.ordinal <= nearest)
             .saturating_sub(1)
             .min(self.matches.len().saturating_sub(1));
+        self.selected_ordinal = self
+            .selected_match()
+            .map_or(nearest, |found| found.ordinal);
         self.list_offset = 0;
     }
 }
@@ -454,7 +546,8 @@ mod tests {
         let rebuilds = search.full_rebuilds;
 
         history.push(2, "alice", "needle");
-        search.sync(&history.history());
+        viewport.reconcile(&history.history());
+        search.sync(&viewport, &history.history());
         search.query = "needle".to_string();
         search.refresh(None);
 
@@ -465,7 +558,103 @@ mod tests {
         );
 
         history.edit(2, "changed");
-        search.sync(&history.history());
+        viewport.reconcile(&history.history());
+        search.sync(&viewport, &history.history());
         assert_eq!(search.full_rebuilds, rebuilds + 1);
+    }
+
+    #[test]
+    fn eviction_drops_the_index_prefix_without_rebuilding() {
+        let mut history = RoomHistoryFixture::new();
+        for id in 1..=40 {
+            history.push(id, "alice", &format!("body {id} needle"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        let mut search = HistorySearch::new(&viewport, &history.history());
+        search.query = "needle".to_string();
+        search.refresh(None);
+        let rebuilds = search.full_rebuilds;
+        assert_eq!(search.matches().len(), 40);
+
+        history.evict(30);
+        viewport.reconcile(&history.history());
+        search.sync(&viewport, &history.history());
+
+        assert_eq!(search.full_rebuilds, rebuilds);
+        assert_eq!(search.matches().len(), 10);
+        assert_eq!(
+            search.matches().first().map(|found| found.entry),
+            Some(HistoryEntryId::Message(rpc::ids::MessageId(31)))
+        );
+    }
+
+    #[test]
+    fn index_excludes_cleared_scrollback() {
+        let mut history = RoomHistoryFixture::new();
+        history.push(1, "alice", "cleared needle");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.clear_scrollback();
+        history.push(2, "alice", "kept needle");
+        viewport.reconcile(&history.history());
+
+        let mut search = HistorySearch::new(&viewport, &history.history());
+        search.query = "needle".to_string();
+        search.refresh(None);
+
+        // Selecting a row the buffer no longer displays would be a no-op jump.
+        assert_eq!(
+            search
+                .matches()
+                .iter()
+                .map(|found| found.entry)
+                .collect::<Vec<_>>(),
+            vec![HistoryEntryId::Message(rpc::ids::MessageId(2))]
+        );
+    }
+
+    #[test]
+    fn clearing_scrollback_reindexes_an_open_search() {
+        let mut history = RoomHistoryFixture::new();
+        history.push(1, "alice", "needle one");
+        history.push(2, "alice", "needle two");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        let mut search = HistorySearch::new(&viewport, &history.history());
+        search.query = "needle".to_string();
+        search.refresh(None);
+        assert_eq!(search.matches().len(), 2);
+
+        viewport.clear_scrollback();
+        search.sync(&viewport, &history.history());
+
+        assert!(search.matches().is_empty());
+    }
+
+    #[test]
+    fn vanished_selection_falls_back_to_its_own_neighbourhood() {
+        let mut history = RoomHistoryFixture::new();
+        for id in 1..=6 {
+            history.push(id, "alice", &format!("needle {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        let mut search = HistorySearch::new(&viewport, &history.history());
+        search.query = "needle".to_string();
+        search.refresh(None);
+        search.selected = 4;
+        search.selected_ordinal = 4;
+
+        // The selected entry disappears while the rest of the index survives.
+        history.remove(5);
+        viewport.reconcile(&history.history());
+        search.sync(&viewport, &history.history());
+
+        assert_eq!(
+            search.selected_entry(),
+            Some(HistoryEntryId::Message(rpc::ids::MessageId(6))),
+            "a vanished selection lands beside where it was, not at the oldest match"
+        );
     }
 }

@@ -13,7 +13,7 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
@@ -69,9 +69,15 @@ const MAX_HIGHLIGHT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// exceeds this bound, caching pauses until the next keyframe rather than
 /// retaining an undecodable delta suffix.
 const VIDEO_FAST_START_MAX_BYTES: usize = video::MAX_VIDEO_FRAME_LEN;
-/// Bounds allocations waiting on the app-to-web handoff. Every item is charged
-/// for inline storage plus retained heap allocations.
-const WEB_FEED_MAX_BYTES: usize = video::MAX_VIDEO_FRAME_LEN + std::mem::size_of::<WebFeed>();
+/// Bounds video frames waiting on the app-to-web handoff.
+///
+/// Sized so a frame at the protocol's own maximum always fits an empty queue
+/// with room for the item's inline storage: charging that overhead against a
+/// bound of exactly one frame made the largest legal payload undeliverable.
+const WEB_FEED_VIDEO_MAX_BYTES: usize = 2 * video::MAX_VIDEO_FRAME_LEN;
+/// Bounds chat projections waiting on the same handoff. Kept separate from the
+/// video bound so a keyframe burst cannot starve chat, or the reverse.
+const WEB_FEED_HISTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WEBSOCKET_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVE_UPLOADS_PER_SOCKET: usize = 4;
 const MAX_ACTIVE_UPLOADS_GLOBAL: usize = 32;
@@ -524,15 +530,89 @@ impl WebFeed {
             .saturating_add(video)
     }
 
-    fn affects_history(&self) -> bool {
-        matches!(
-            self,
+    /// Which byte budget this item is charged against.
+    ///
+    /// Video and history share nothing but a channel: one keyframe burst must
+    /// not be able to starve chat, and a page of chat must not be able to stall
+    /// a share. Small state-bearing envelopes are charged against neither,
+    /// because dropping one has no recovery path at all — a lost `ShareEnded`
+    /// leaves a phantom share replayed to every future browser, and a lost
+    /// `Config` silently skips a live readonly or upload-limit change.
+    fn budget(&self) -> FeedBudget {
+        match self {
+            Self::VideoFrame(_) => FeedBudget::Video,
             Self::Message { .. }
-                | Self::Delete { .. }
-                | Self::HistoryWindow { .. }
-                | Self::RefPreview { .. }
-        )
+            | Self::Delete { .. }
+            | Self::HistoryWindow { .. }
+            | Self::RefPreview { .. } => FeedBudget::History,
+            Self::Config { .. }
+            | Self::SetRoomName { .. }
+            | Self::E2eSecurity { .. }
+            | Self::ShareAvailable { .. }
+            | Self::ShareEnded { .. } => FeedBudget::Unmetered,
+            Self::DeleteError(_)
+            | Self::ActionError(_)
+            | Self::FileProgress(_)
+            | Self::FileTerminal(_)
+            | Self::ShareConfig { .. }
+            | Self::ShareError { .. }
+            | Self::RequestResult { .. }
+            | Self::CommandReply { .. } => FeedBudget::Transient,
+        }
     }
+
+    /// Who has to resynchronize if this item is dropped.
+    ///
+    /// A reference preview is deliberately absent: it is cosmetic, the browser
+    /// re-requests it, and treating it as history made one dropped preview cost
+    /// every connected tab a fresh snapshot.
+    fn resync_on_drop(&self) -> Option<WebAudience> {
+        match self {
+            Self::Message { .. } | Self::Delete { .. } => Some(WebAudience::All),
+            Self::HistoryWindow { audience, .. } => Some(*audience),
+            _ => None,
+        }
+    }
+}
+
+/// Who owes a fresh canonical snapshot because their projection was dropped.
+///
+/// Targeted: a saturated queue that cost one tab its page must not reset every
+/// other tab's window and bounce all of them to the bottom.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ResyncHistory {
+    #[default]
+    None,
+    Clients(Vec<u64>),
+    All,
+}
+
+impl ResyncHistory {
+    fn request(&mut self, audience: WebAudience) {
+        match (&mut *self, audience) {
+            (Self::All, _) | (_, WebAudience::All) => *self = Self::All,
+            (Self::Clients(clients), WebAudience::One(client)) => {
+                if !clients.contains(&client) {
+                    clients.push(client);
+                }
+            }
+            (Self::None, WebAudience::One(client)) => *self = Self::Clients(vec![client]),
+        }
+    }
+
+    fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
+/// The queue allowance an item is charged against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedBudget {
+    Video,
+    History,
+    /// Charged against nothing: state the browser cannot re-derive.
+    Unmetered,
+    Transient,
 }
 
 /// A request a browser sends back to the app, forwarded over the web-to-app
@@ -717,8 +797,9 @@ impl CandidateKind {
 pub struct WebFeedSender {
     tx: Sender<WebFeed>,
     wake: WakeHandle,
-    resync_history: Arc<AtomicBool>,
-    queued_feed_bytes: Arc<AtomicUsize>,
+    resync_history: Arc<Mutex<ResyncHistory>>,
+    queued_video_bytes: Arc<AtomicUsize>,
+    queued_history_bytes: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
     #[cfg(test)]
     local_addr: SocketAddr,
@@ -726,17 +807,30 @@ pub struct WebFeedSender {
 
 impl WebFeedSender {
     fn queue(&self, feed: WebFeed) {
-        let affects_history = feed.affects_history();
+        let budget = feed.budget();
         let retained_bytes = feed.retained_bytes();
-        if !reserve_feed_bytes(&self.queued_feed_bytes, retained_bytes) {
-            if affects_history {
-                self.resync_history.store(true, Ordering::Release);
+        let charged = match budget {
+            FeedBudget::Video => Some((&self.queued_video_bytes, WEB_FEED_VIDEO_MAX_BYTES)),
+            FeedBudget::History | FeedBudget::Transient => {
+                Some((&self.queued_history_bytes, WEB_FEED_HISTORY_MAX_BYTES))
+            }
+            FeedBudget::Unmetered => None,
+        };
+        if let Some((queued, limit)) = charged
+            && !reserve_feed_bytes(queued, retained_bytes, limit)
+        {
+            if let Some(audience) = feed.resync_on_drop() {
+                self.resync_history
+                    .lock()
+                    .expect("web resync state poisoned")
+                    .request(audience);
             }
             kvlog::warn!(
                 "dropping byte-saturated web feed item",
-                queued_bytes = self.queued_feed_bytes.load(Ordering::Relaxed),
+                queued_bytes = queued.load(Ordering::Relaxed),
                 item_bytes = retained_bytes,
-                history_resync = affects_history
+                budget = ?budget,
+                history_resync = feed.resync_on_drop().is_some()
             );
             self.wake.wake();
             return;
@@ -744,8 +838,9 @@ impl WebFeedSender {
         match self.tx.send(feed) {
             Ok(()) => {}
             Err(_) => {
-                self.queued_feed_bytes
-                    .fetch_sub(retained_bytes, Ordering::AcqRel);
+                if let Some((queued, _)) = charged {
+                    queued.fetch_sub(retained_bytes, Ordering::AcqRel);
+                }
                 return;
             }
         }
@@ -913,13 +1008,13 @@ impl WebFeedSender {
     }
 }
 
-fn reserve_feed_bytes(queued: &AtomicUsize, bytes: usize) -> bool {
+fn reserve_feed_bytes(queued: &AtomicUsize, bytes: usize, limit: usize) -> bool {
     let mut current = queued.load(Ordering::Acquire);
     loop {
         let Some(next) = current.checked_add(bytes) else {
             return false;
         };
-        if next > WEB_FEED_MAX_BYTES {
+        if next > limit {
             return false;
         }
         match queued.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
@@ -929,7 +1024,13 @@ fn reserve_feed_bytes(queued: &AtomicUsize, bytes: usize) -> bool {
     }
 }
 
-fn release_queued_feed(feed: &WebFeed, queued: &AtomicUsize) {
+/// Returns an item's reservation to whichever budget charged it.
+fn release_queued_feed(feed: &WebFeed, video: &AtomicUsize, history: &AtomicUsize) {
+    let queued = match feed.budget() {
+        FeedBudget::Video => video,
+        FeedBudget::History | FeedBudget::Transient => history,
+        FeedBudget::Unmetered => return,
+    };
     queued.fetch_sub(feed.retained_bytes(), Ordering::AcqRel);
 }
 
@@ -1052,14 +1153,12 @@ fn websocket_origins(cfg: &WebConfig, addr: SocketAddr) -> Vec<String> {
 pub fn spawn(
     cfg: &WebConfig,
     download_store: DownloadStore,
-    _max_messages: usize,
     web_requests: Sender<WebRequest>,
     readonly: bool,
 ) -> io::Result<WebFeedSender> {
     spawn_with_upload_limit(
         cfg,
         download_store,
-        _max_messages,
         web_requests,
         readonly,
         rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
@@ -1070,7 +1169,6 @@ pub fn spawn(
 pub fn spawn_with_upload_limit(
     cfg: &WebConfig,
     download_store: DownloadStore,
-    _max_messages: usize,
     web_requests: Sender<WebRequest>,
     readonly: bool,
     max_upload_bytes: u64,
@@ -1115,11 +1213,13 @@ pub fn spawn_with_upload_limit(
     let local = server.local_addr()?;
 
     let (tx, rx) = mpsc::channel();
-    let resync_history = Arc::new(AtomicBool::new(false));
-    let queued_feed_bytes = Arc::new(AtomicUsize::new(0));
+    let resync_history = Arc::new(Mutex::new(ResyncHistory::None));
+    let queued_video_bytes = Arc::new(AtomicUsize::new(0));
+    let queued_history_bytes = Arc::new(AtomicUsize::new(0));
     let stopping = Arc::new(AtomicBool::new(false));
     let run_resync_history = Arc::clone(&resync_history);
-    let run_queued_feed_bytes = Arc::clone(&queued_feed_bytes);
+    let run_queued_video_bytes = Arc::clone(&queued_video_bytes);
+    let run_queued_history_bytes = Arc::clone(&queued_history_bytes);
     let run_stopping = Arc::clone(&stopping);
     let autoplay = cfg.autoplay;
     let viewer = cfg.viewer;
@@ -1136,7 +1236,8 @@ pub fn spawn_with_upload_limit(
                 max_upload_bytes,
                 room_name,
                 run_resync_history,
-                run_queued_feed_bytes,
+                run_queued_video_bytes,
+                run_queued_history_bytes,
                 run_stopping,
             )
         })?;
@@ -1146,7 +1247,8 @@ pub fn spawn_with_upload_limit(
         tx,
         wake,
         resync_history,
-        queued_feed_bytes,
+        queued_video_bytes,
+        queued_history_bytes,
         stopping,
         #[cfg(test)]
         local_addr: local,
@@ -1163,8 +1265,9 @@ fn run(
     mut viewer: WebViewer,
     mut max_upload_bytes: u64,
     mut room_name: String,
-    resync_history: Arc<AtomicBool>,
-    queued_feed_bytes: Arc<AtomicUsize>,
+    resync_history: Arc<Mutex<ResyncHistory>>,
+    queued_video_bytes: Arc<AtomicUsize>,
+    queued_history_bytes: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
 ) {
     // Open uploads keyed by connection and browser-assigned id, each an
@@ -1334,6 +1437,18 @@ fn run(
                                 before_message_id: MessageId(before_message_id),
                                 limit,
                             });
+                        } else {
+                            // A request we cannot even parse still has a tab
+                            // waiting on it. Answering with a snapshot releases
+                            // that wait instead of wedging its paging forever.
+                            kvlog::warn!(
+                                "unparseable load_older request",
+                                ws_id = id.get(),
+                                room_id,
+                                before_message_id
+                            );
+                            let _ = web_requests
+                                .send(WebRequest::HistorySnapshot { client: id.get() });
                         }
                     }
                     Ok(ClientRequest::RefPreview {
@@ -1809,7 +1924,7 @@ fn run(
         let mut batch_full = true;
         for _ in 0..WEB_FEED_BATCH {
             match rx.try_recv().map(|feed| {
-                release_queued_feed(&feed, &queued_feed_bytes);
+                release_queued_feed(&feed, &queued_video_bytes, &queued_history_bytes);
                 feed
             }) {
                 Ok(WebFeed::Message {
@@ -2021,11 +2136,25 @@ fn run(
         }
         feed_pending = batch_full;
 
-        if resync_history.swap(false, Ordering::AcqRel) {
-            for client in &clients {
-                let _ = web_requests.send(WebRequest::HistorySnapshot {
-                    client: client.get(),
-                });
+        match resync_history
+            .lock()
+            .expect("web resync state poisoned")
+            .take()
+        {
+            ResyncHistory::None => {}
+            ResyncHistory::All => {
+                for client in &clients {
+                    let _ = web_requests.send(WebRequest::HistorySnapshot {
+                        client: client.get(),
+                    });
+                }
+            }
+            ResyncHistory::Clients(dropped) => {
+                for client in dropped {
+                    if clients.iter().any(|id| id.get() == client) {
+                        let _ = web_requests.send(WebRequest::HistorySnapshot { client });
+                    }
+                }
             }
         }
     }
@@ -2460,6 +2589,93 @@ mod tests {
     }
 
     #[test]
+    fn a_maximum_size_video_frame_fits_an_empty_queue() {
+        // A frame arrives in its whole received record, so the reservation is
+        // charged the transport header and tag on top of the payload. Sizing
+        // the bound at exactly one frame made the largest legal payload
+        // permanently undeliverable, even against an idle queue.
+        let record = vec![0u8; video::MAX_VIDEO_FRAME_LEN + 64];
+        let frame = SharedVideoFrame::from_vec(record);
+        let item = WebFeed::VideoFrame(frame);
+        assert_eq!(item.budget(), FeedBudget::Video);
+        assert!(reserve_feed_bytes(
+            &AtomicUsize::new(0),
+            item.retained_bytes(),
+            WEB_FEED_VIDEO_MAX_BYTES
+        ));
+    }
+
+    #[test]
+    fn state_bearing_envelopes_bypass_every_byte_budget() {
+        // None of these can be re-derived by a browser: a dropped share_ended
+        // leaves a phantom share replayed forever, and a dropped config
+        // silently skips a live readonly change.
+        for item in [
+            WebFeed::ShareEnded {
+                stream_id: 1,
+                payload: String::new(),
+            },
+            WebFeed::ShareAvailable {
+                stream_id: 1,
+                payload: String::new(),
+            },
+            WebFeed::Config {
+                readonly: true,
+                autoplay: WebAutoplay::default(),
+                viewer: WebViewer::default(),
+                max_upload_bytes: 1,
+            },
+            WebFeed::SetRoomName {
+                name: String::new(),
+            },
+        ] {
+            assert_eq!(item.budget(), FeedBudget::Unmetered);
+            assert!(item.resync_on_drop().is_none());
+        }
+    }
+
+    #[test]
+    fn a_dropped_reference_preview_does_not_resync_history() {
+        let preview = WebFeed::RefPreview {
+            client: 1,
+            room_id: RoomId(1),
+            room_generation: 1,
+            message_id: MessageId(1),
+            message: None,
+        };
+        // Cosmetic and re-requested by the browser: treating it as history made
+        // one dropped preview cost every tab a fresh snapshot.
+        assert_eq!(preview.budget(), FeedBudget::History);
+        assert!(preview.resync_on_drop().is_none());
+    }
+
+    #[test]
+    fn a_dropped_targeted_window_resyncs_only_that_client() {
+        let window = WebFeed::HistoryWindow {
+            audience: WebAudience::One(3),
+            kind: HistoryWindowKind::Older,
+            room_id: RoomId(1),
+            room_generation: 1,
+            messages: Vec::new(),
+            older_cursor: None,
+            at_start: false,
+        };
+        let mut resync = ResyncHistory::None;
+        resync.request(window.resync_on_drop().expect("history window resyncs"));
+        assert_eq!(resync, ResyncHistory::Clients(vec![3]));
+
+        resync.request(WebAudience::One(3));
+        assert_eq!(resync, ResyncHistory::Clients(vec![3]));
+
+        // A broadcast projection escalates; nothing de-escalates it.
+        resync.request(WebAudience::All);
+        resync.request(WebAudience::One(4));
+        assert_eq!(resync, ResyncHistory::All);
+        assert_eq!(resync.take(), ResyncHistory::All);
+        assert_eq!(resync, ResyncHistory::None);
+    }
+
+    #[test]
     fn video_frame_meta_validates_header_and_key_flag() {
         let frame = video::encode_video_frame(9, true, 42, &[1, 2, 3]);
         assert_eq!(video_frame_meta(&frame), Some((42, true)));
@@ -2635,7 +2851,7 @@ mod tests {
         let (web_tx, _web_rx) = mpsc::channel();
         let store = DownloadStore::new(64 * 1024 * 1024);
         store.register_disk("trace..old.rs".to_string(), dir.join("trace..old.rs"));
-        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, store, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -2671,7 +2887,7 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, store, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -2704,7 +2920,7 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, store, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -2744,7 +2960,7 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, store, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -2783,7 +2999,7 @@ mod tests {
         // wherever it lives, with Range support.
         let store = DownloadStore::new(64 * 1024 * 1024);
         store.register_disk("doc.txt".to_string(), dir.join("doc.txt"));
-        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, store, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -2817,7 +3033,6 @@ mod tests {
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -2850,7 +3065,7 @@ mod tests {
         let (web_tx, _web_rx) = mpsc::channel();
         let store = DownloadStore::new(64 * 1024 * 1024);
         store.register_disk("large.txt".to_string(), dir.join("large.txt"));
-        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, store, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -2882,7 +3097,6 @@ mod tests {
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -2942,7 +3156,6 @@ mod tests {
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3077,7 +3290,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3122,7 +3334,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3162,7 +3373,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             false,
         )
@@ -3193,7 +3403,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3217,6 +3426,31 @@ Sec-WebSocket-Version: 13\r\n\
     }
 
     #[test]
+    fn unparseable_load_older_is_answered_with_a_snapshot() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
+
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"load_older","room_id":3,"room_generation":11,"before_message_id":"not-hex","limit":5}"#,
+        );
+
+        // Dropping it silently would leave the tab spinning on a reply that
+        // never comes, wedging its paging until an unrelated sync.
+        assert_eq!(
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WebRequest::HistorySnapshot { client: 1 }
+        );
+    }
+
+    #[test]
     fn share_available_replays_to_late_client_until_ended() {
         let cfg = WebConfig {
             enabled: true,
@@ -3228,7 +3462,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3283,7 +3516,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3334,7 +3566,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn_with_upload_limit(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
             rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
@@ -3372,7 +3603,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn_with_upload_limit(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
             rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
@@ -3411,7 +3641,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             false,
         )
@@ -3446,7 +3675,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             false,
         )
@@ -3493,7 +3721,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3523,7 +3750,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             false,
         )
@@ -3558,7 +3784,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3586,7 +3811,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3614,7 +3838,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             false,
         )
@@ -3660,7 +3883,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )
@@ -3686,7 +3908,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             false,
         )
@@ -3734,7 +3955,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             false,
         )
@@ -3777,7 +3997,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn_with_upload_limit(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             false,
             10,
@@ -3840,7 +4059,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            100,
             web_tx,
             true,
         )

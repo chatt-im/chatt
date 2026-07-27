@@ -1168,7 +1168,6 @@ fn register_existing_downloads(
 fn spawn_web_feed(
     web: &config::WebConfig,
     download_store: crate::receive_store::DownloadStore,
-    max_messages: usize,
     max_upload_bytes: u64,
     room_name: String,
     events: &EventSender,
@@ -1177,7 +1176,6 @@ fn spawn_web_feed(
     let feed = match crate::web_server::spawn_with_upload_limit(
         web,
         download_store,
-        max_messages,
         web_tx,
         web.readonly,
         max_upload_bytes,
@@ -1357,7 +1355,6 @@ impl App {
             spawn_web_feed(
                 &config.web,
                 download_store.clone(),
-                config.ui.max_messages as usize,
                 config.files.max_upload_bytes(),
                 room.room_name.clone(),
                 &events.tx,
@@ -2525,11 +2522,14 @@ impl App {
             return;
         };
         let Some(room_id) = self.room.viewed_room else {
+            // No room is shown, so there is no generation to stamp. Room
+            // generations start at one, so zero can never collide with a real
+            // one and every later request re-syncs against this empty window.
             feed.send_history_window(
                 audience,
                 crate::web_server::HistoryWindowKind::Sync,
                 RoomId(0),
-                self.room.epoch().wire(),
+                0,
                 Vec::new(),
                 None,
                 true,
@@ -2586,7 +2586,7 @@ impl App {
         let page_limit = (limit as usize).clamp(1, crate::web_server::MAX_PAGE);
         let (canonical_before, _) = self.room.history_cursor(room_id);
         let Some(history) = self.room.history_ref(room_id) else {
-            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
+            self.send_web_older_empty(client, room_id, requested_generation);
             return;
         };
         let page = if let Some(page) = history.page_before(before, page_limit) {
@@ -2594,7 +2594,10 @@ impl App {
         } else if canonical_before == Some(before) || !allow_fetch {
             history.page_before_position(before, page_limit)
         } else {
-            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
+            // The cursor is neither resident nor the canonical paging cursor.
+            // Handing back the canonical one lets this tab resume from a usable
+            // position instead of being reset to the bottom.
+            self.send_web_older_empty(client, room_id, requested_generation);
             return;
         };
         if !page.messages.is_empty() || page.at_start {
@@ -2617,18 +2620,7 @@ impl App {
             return;
         }
         if !allow_fetch {
-            let (older_cursor, at_start) = self.room.history_cursor(room_id);
-            if let Some(feed) = &self.web_feed {
-                feed.send_history_window(
-                    crate::web_server::WebAudience::One(client),
-                    crate::web_server::HistoryWindowKind::Older,
-                    room_id,
-                    requested_generation,
-                    Vec::new(),
-                    older_cursor,
-                    at_start,
-                );
-            }
+            self.send_web_older_empty(client, room_id, requested_generation);
             return;
         }
 
@@ -2647,7 +2639,7 @@ impl App {
         let Some((_, network_before, network_limit)) = self.room.older_history_request(room_id)
         else {
             self.pending_web_history.remove(&client);
-            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
+            self.send_web_older_empty(client, room_id, requested_generation);
             return;
         };
         if !self.send_network_command(
@@ -2660,7 +2652,40 @@ impl App {
         ) {
             self.room.abort_history_fetch(room_id, network_before);
             self.pending_web_history.remove(&client);
-            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
+            self.send_web_older_empty(client, room_id, requested_generation);
+        }
+    }
+
+    /// Answers an older-page request that cannot be served with an empty frame
+    /// rather than a fresh snapshot.
+    ///
+    /// A snapshot is an authoritative reset: the browser replaces its window,
+    /// re-pins to the bottom and resumes any pending reference jump. Using one
+    /// as a "no" turns an un-pageable request into an unbounded page-up /
+    /// bounce-down loop, and teleports an offline reader away from what they
+    /// were reading. An empty frame leaves them in place, and when nothing
+    /// older can ever arrive it tells them to stop asking.
+    fn send_web_older_empty(&self, client: u64, room_id: RoomId, requested_generation: u64) {
+        let Some(feed) = &self.web_feed else {
+            return;
+        };
+        let (older_cursor, at_start) = self.room.history_cursor(room_id);
+        feed.send_history_window(
+            crate::web_server::WebAudience::One(client),
+            crate::web_server::HistoryWindowKind::Older,
+            room_id,
+            requested_generation,
+            Vec::new(),
+            older_cursor,
+            at_start || self.room.older_paging_exhausted(room_id),
+        );
+    }
+
+    /// Releases every outstanding browser page request, so a disconnect cannot
+    /// leave a tab spinning on a reply that will never come.
+    fn abandon_pending_web_history(&mut self) {
+        for (client, request) in std::mem::take(&mut self.pending_web_history) {
+            self.send_web_older_empty(client, request.room_id, request.room_generation);
         }
     }
 
@@ -2698,7 +2723,13 @@ impl App {
         if self.web_feed.is_none() {
             return;
         }
-        if self.room.epoch().wire() != requested_generation {
+        // The browser stamps every request with the generation of the room it
+        // is showing, which is what `load_older` is validated against too.
+        let viewed_generation = self
+            .room
+            .viewed_room
+            .and_then(|viewed| self.room.room_generation(viewed));
+        if viewed_generation != Some(requested_generation) {
             self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
             return;
         }
@@ -3212,7 +3243,7 @@ impl App {
         self.pending_identity_review.clear();
         self.open_e2e_reviews.clear();
         self.pending_mutation_clients.clear();
-        self.pending_web_history.clear();
+        self.abandon_pending_web_history();
         self.supervisor.network.reset();
         self.supervisor.capture.reset();
         self.supervisor.playback.reset();
@@ -5690,7 +5721,6 @@ impl App {
             let feed = spawn_web_feed(
                 &self.config.web,
                 self.download_store.clone(),
-                self.config.ui.max_messages as usize,
                 self.config.files.max_upload_bytes(),
                 self.room.room_name.clone(),
                 &self.events.tx,
@@ -10620,6 +10650,36 @@ mod tests {
 
         assert!(!change.refresh_window);
         assert!(!app.pending_web_history.contains_key(&7));
+    }
+
+    #[test]
+    fn disconnect_releases_pending_web_history() {
+        let mut config = Config::default();
+        config.web.enabled = true;
+        config.web.bind = "127.0.0.1:0".to_string();
+        let mut app = TestApp::new(config, None).expect("test app");
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+
+        assert!(app.room.begin_history_fetch(RoomId(1)));
+        let newest = (101..=200)
+            .map(|id| test_chat_record(RoomId(1), MessageId(id)))
+            .collect::<Vec<_>>();
+        let user_id = app.user_id;
+        app.room
+            .history_chunk_received(RoomId(1), None, newest, false, true, user_id);
+
+        let (tx, _rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        let generation = app.room.room_generation(RoomId(1)).unwrap();
+        app.send_web_older_page(7, RoomId(1), generation, MessageId(101), 100);
+        assert!(app.pending_web_history.contains_key(&7));
+
+        app.disconnect_network();
+
+        // Dropping the request unanswered left the tab's paging wedged until
+        // some unrelated sync arrived.
+        assert!(app.pending_web_history.is_empty());
     }
 
     #[test]

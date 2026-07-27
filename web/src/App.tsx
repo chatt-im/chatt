@@ -2284,12 +2284,23 @@ export default function App() {
   // A click on a `@@` reference jumps to its target, paging older history until
   // the target loads, durable history ends, or the server makes no progress.
   let pendingJump: { ts: number; mid: MessageId } | undefined;
+  // Pages a single reference jump may drive before giving up. A jump that keeps
+  // making progress would otherwise page the whole room in.
+  const MAX_JUMP_PAGES = 20;
+  let jumpPages = 0;
   let refToastTimer: number | undefined;
 
   function showRefToast(text: string) {
     setRefToast(text);
     if (refToastTimer) clearTimeout(refToastTimer);
     refToastTimer = window.setTimeout(() => setRefToast(null), 2500);
+  }
+
+  // Ids arrive as unpadded lowercase hex, so a shorter string is always the
+  // smaller number and equal lengths compare lexicographically.
+  function compareMessageIds(a: MessageId, b: MessageId): number {
+    if (a.length !== b.length) return a.length - b.length;
+    return a < b ? -1 : a > b ? 1 : 0;
   }
 
   // Message ids are the durable identity; `ts` rides along for display only.
@@ -2393,6 +2404,7 @@ export default function App() {
     if (hasMore) {
       if (!pendingJump || pendingJump.ts !== ts || pendingJump.mid !== mid) {
         pendingJump = { ts, mid };
+        jumpPages = 0;
       }
       requestOlder("ref");
       return;
@@ -2426,6 +2438,11 @@ export default function App() {
     if (!hasMore) {
       pendingJump = undefined;
       showRefToast("Referenced message isn't in the loaded history");
+      return;
+    }
+    if (++jumpPages > MAX_JUMP_PAGES) {
+      pendingJump = undefined;
+      showRefToast("Referenced message is too far back to load");
       return;
     }
     requestOlder("ref");
@@ -3478,7 +3495,15 @@ export default function App() {
           });
           preloadRecentImages(feed.messages);
           closeDeleteConfirmation(false);
-          refPreviewCache.clear();
+          // Previews resolve against durable message identities, so they stay
+          // valid across a same-room resync. Clearing them there would make a
+          // resync storm re-trigger a disk read per reference.
+          if (
+            feed.room_id !== currentRoomId ||
+            feed.room_generation !== currentRoomGeneration
+          ) {
+            refPreviewCache.clear();
+          }
           setMessages(feed.messages);
           currentRoomId = feed.room_id;
           currentRoomGeneration = feed.room_generation;
@@ -3604,6 +3629,19 @@ export default function App() {
               // An edit of a target outside this tab's loaded window updates
               // canonical history but must not appear as a new tail row.
               if (msg.edited) return prev;
+              // A message can land mid-log — a gap backfill, or a server that
+              // assigned an id below our tail. Appending it would leave the
+              // window out of order until an unrelated sync repaired it.
+              const at = prev.findIndex(
+                (m) =>
+                  m.message_id !== "0" &&
+                  compareMessageIds(m.message_id, msg.message_id) > 0
+              );
+              if (at >= 0) {
+                const next = prev.slice();
+                next.splice(at, 0, msg);
+                return next;
+              }
             }
             appended = true;
             return [...prev, msg];

@@ -70,6 +70,11 @@ enum HistoryFetchState {
         oldest_received: Option<MessageId>,
         oldest_retained_normal: Option<MessageId>,
         dropped_normal: bool,
+        /// This request bridges a known gap rather than extending the oldest
+        /// end. Its records land *inside* spans consumers already display, so
+        /// its completion has to refresh them rather than silently extend
+        /// residency.
+        backfill: bool,
     },
 }
 
@@ -77,6 +82,7 @@ enum HistoryFetchState {
 pub(crate) struct HistoryFetchCompletion {
     resident_newest_before: Option<MessageKey>,
     page_oldest: Option<MessageKey>,
+    backfill: bool,
 }
 
 pub(crate) struct ResidentMessagePage {
@@ -227,16 +233,28 @@ impl<'a> RoomHistoryRef<'a> {
         self.max_messages
     }
 
-    pub(crate) fn revision(self) -> Revision {
-        self.room.revision()
+    /// Advances only when a resident body or its labelling was replaced in
+    /// place. A view seeing this move alone keeps its id vector and refreshes
+    /// just the records whose own content revision moved.
+    pub(crate) fn content_revision(self) -> Revision {
+        self.room.content_revision()
     }
 
+    /// Advances only when the visible id sequence changes. A pure body edit
+    /// leaves it stable.
     pub(crate) fn order_revision(self) -> Revision {
-        self.revision()
+        self.room.order_revision()
     }
 
     pub(crate) fn reindex_revision(self) -> Revision {
         self.room.reindex_revision()
+    }
+
+    /// Newest message key retention has dropped off the front of this room.
+    /// A front drop is an ordered prefix removal, so a derived view can apply
+    /// it directly instead of reindexing.
+    pub(crate) fn evicted_through(self) -> Option<MessageId> {
+        self.room.evicted_through.map(MessageId)
     }
 
     pub(crate) fn tail_message_id(self) -> Option<MessageId> {
@@ -453,11 +471,27 @@ pub(crate) struct RoomHistory {
     /// Newest mutation id seen in this room; keeps the read watermark from
     /// trailing the head a mutation advanced past every visible message.
     newest_mutation_seen: MessageKey,
-    revision: Revision,
-    /// Changes when existing ids/content may need a full derived-view rebuild.
-    /// Pure, non-evicting tail appends leave it stable so every attached view
-    /// can catch up directly from the canonical tail without a replay journal.
+    /// Changes when a resident record's body or labelling was replaced without
+    /// moving any id.
+    ///
+    /// This and `order_revision` are deliberately independent, so an in-process
+    /// view can pick the cheapest repair: seeing exactly one of them move means
+    /// the other held, and seeing both move means falling back to a rebuild.
+    /// [`Self::revision`] is their sum — every change advances exactly one or
+    /// both, and both are monotone, so the sum is the strictly increasing "is
+    /// my copy current" token out-of-process consumers need.
+    content_revision: Revision,
+    /// Changes when the visible id sequence changes: a tail append, a front
+    /// eviction, or a reindex.
+    order_revision: Revision,
+    /// Changes when ids may have moved arbitrarily and a derived index has to
+    /// be rebuilt from scratch. Appends, evictions and edits all leave it
+    /// stable, so every attached view catches up without a replay journal.
     reindex_revision: Revision,
+    /// Newest message key retention has dropped off the front. Retention only
+    /// ever removes an ordered prefix, so this one watermark tells a derived
+    /// view exactly which of its leading entries are gone.
+    evicted_through: Option<MessageKey>,
     next_notice_key: NoticeKey,
     notices: BTreeMap<NoticeKey, AnchoredNotice>,
     generation: u64,
@@ -503,8 +537,10 @@ impl RoomHistory {
             mutations: HashMap::new(),
             seen_mutations: HashSet::new(),
             newest_mutation_seen: 0,
-            revision: 0,
+            content_revision: 0,
+            order_revision: 0,
             reindex_revision: 0,
+            evicted_through: None,
             next_notice_key: 0,
             notices: BTreeMap::new(),
             generation,
@@ -512,7 +548,15 @@ impl RoomHistory {
     }
 
     pub(crate) fn revision(&self) -> Revision {
-        self.revision
+        self.content_revision.wrapping_add(self.order_revision)
+    }
+
+    fn content_revision(&self) -> Revision {
+        self.content_revision
+    }
+
+    fn order_revision(&self) -> Revision {
+        self.order_revision
     }
 
     fn reindex_revision(&self) -> Revision {
@@ -594,13 +638,62 @@ impl RoomHistory {
         original_unverified || edit_unverified
     }
 
+    /// Ids may have moved arbitrarily: every derived index rebuilds.
     fn record_change(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+        self.record_content_change();
+        self.record_edge_change();
         self.reindex_revision = self.reindex_revision.wrapping_add(1);
     }
 
-    fn record_tail_append(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+    /// The id sequence gained a tail, lost a front, or both. No interior id
+    /// moved relative to its neighbours and no body changed, so a view catches
+    /// up from its own ends instead of rebuilding.
+    fn record_edge_change(&mut self) {
+        self.order_revision = self.order_revision.wrapping_add(1);
+    }
+
+    /// A record's body or labelling changed in place. Every id keeps its
+    /// position, so views re-read only the records whose own content revision
+    /// moved.
+    fn record_content_change(&mut self) {
+        self.content_revision = self.content_revision.wrapping_add(1);
+    }
+
+    /// Retention dropped an ordered prefix. The id sequence changed, so the
+    /// ordering counter moves, but every surviving id kept its relative
+    /// position: a view applies the watermark to its own leading entries rather
+    /// than reindexing.
+    fn record_front_evict(&mut self, evicted: &[MessageId]) {
+        let Some(newest) = evicted.last() else {
+            return;
+        };
+        self.evicted_through =
+            Some(self.evicted_through.map_or(newest.0, |seen| seen.max(newest.0)));
+        self.prune_evicted_mutations();
+        self.record_edge_change();
+    }
+
+    /// Drops fold state for targets retention can never make resident again.
+    ///
+    /// Eviction only ever runs with the log exactly at `max_messages`, and at
+    /// the cap [`RoomSession::older_history_request`] and
+    /// [`RoomSession::gap_backfill_request`] both refuse while
+    /// [`RoomHistory::merge_history_page`] budgets its prepend to zero — so
+    /// nothing at or below the watermark can become resident again. The stash
+    /// for newer, still-unpaged targets is untouched, as is
+    /// `newest_mutation_seen`.
+    ///
+    /// The one way back is a user raising `ui.max-messages` mid-session, which
+    /// reopens paging below the watermark. A message paged in then can render
+    /// without an edit whose record this room already folded and forgot;
+    /// rematerializing the room re-seeds every mutation from the on-disk
+    /// capture, so a reconnect or restart restores it.
+    fn prune_evicted_mutations(&mut self) {
+        let Some(watermark) = self.evicted_through else {
+            return;
+        };
+        self.mutations.retain(|target, _| *target > watermark);
+        self.seen_mutations.retain(|id| *id > watermark);
     }
 
     fn invalidate(&mut self) {
@@ -725,7 +818,7 @@ impl RoomHistory {
                 record.edit_provenance = Some(edit.provenance);
                 let folded = message.message_id;
                 record.touch();
-                self.record_change();
+                self.record_content_change();
                 return FoldOutcome::AppliedEdit(folded);
             }
             message.body.clone_from(&edit.body);
@@ -733,7 +826,7 @@ impl RoomHistory {
             record.edit_provenance = Some(edit.provenance);
             let folded = message.message_id;
             record.touch();
-            self.record_change();
+            self.record_content_change();
             return FoldOutcome::AppliedEdit(folded);
         }
         FoldOutcome::Ignored
@@ -767,13 +860,12 @@ impl RoomHistory {
     }
 
     /// Applies one live message: dedup, disk capture, canonical insertion, file
-    /// correlation, and retention. A fresh insert returns the ids evicted by
-    /// that one retention pass; a duplicate returns `None`.
-    fn receive_chat(
-        &mut self,
-        record: AuthenticatedChat,
-        max_messages: usize,
-    ) -> Option<Vec<MessageId>> {
+    /// correlation, and retention. Returns whether the record was fresh.
+    ///
+    /// Retention eviction is deliberately not reported: it is this client's
+    /// local memory bound, not a canonical removal, and projecting it as one
+    /// would make every scrolled-back consumer watch its own history vanish.
+    fn receive_chat(&mut self, record: AuthenticatedChat, max_messages: usize) -> bool {
         let AuthenticatedChat {
             mut message,
             provenance,
@@ -781,7 +873,7 @@ impl RoomHistory {
         let edit_provenance = self.fold_pending_state(&mut message);
         let key = MessageLog::key(&message);
         if self.messages.contains(key) {
-            return None;
+            return false;
         }
         if let Some(store) = &mut self.history {
             store.append_authenticated_message(&message, provenance);
@@ -799,12 +891,13 @@ impl RoomHistory {
         self.trim_orphaned_attachments();
         // Even an invisible tombstone can advance the canonical retention
         // window, so every fresh record advances the room revision.
-        if matches!(inserted_at, LogInsert::Appended) && evicted.is_empty() {
-            self.record_tail_append();
+        if matches!(inserted_at, LogInsert::Appended) {
+            self.record_edge_change();
         } else {
             self.record_change();
         }
-        Some(evicted)
+        self.record_front_evict(&evicted);
+        true
     }
 
     /// Merges one server history page: dedups against the resident log and
@@ -845,7 +938,9 @@ impl RoomHistory {
             }
         }
         if provenance_enriched {
-            self.invalidate();
+            // Provenance only relabels resident records; every id keeps its
+            // place, so this is a content change like an edit.
+            self.record_content_change();
             changed = true;
         }
         fresh.retain(|record| !self.messages.contains(MessageLog::key(&record.message)));
@@ -917,9 +1012,8 @@ impl RoomHistory {
                 self.record_change();
             }
         }
-        if !self.messages.trim_front(max_messages).is_empty() {
-            self.record_change();
-        }
+        let evicted = self.messages.trim_front(max_messages);
+        self.record_front_evict(&evicted);
         self.trim_orphaned_attachments();
         true
     }
@@ -969,6 +1063,10 @@ impl RoomView {
 struct HistoryHub {
     rooms: HashMap<RoomId, RoomHistory>,
     max_messages_per_room: usize,
+    /// Hands each materialized room its own generation. Room ids repeat across
+    /// servers and reconnects; a generation never does, so a consumer holding a
+    /// stale window can always tell it apart from the live one.
+    next_generation: u64,
 }
 
 impl HistoryHub {
@@ -976,7 +1074,16 @@ impl HistoryHub {
         Self {
             rooms: HashMap::new(),
             max_messages_per_room: max_messages_per_room.max(1),
+            next_generation: 1,
         }
+    }
+
+    /// Reserves the next never-reused generation for a room about to be
+    /// materialized.
+    fn take_generation(&mut self) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        generation
     }
 
     fn room(&self, room_id: RoomId) -> Option<&RoomHistory> {
@@ -995,6 +1102,10 @@ impl HistoryHub {
         self.rooms.insert(room_id, history);
     }
 
+    /// Drops every materialized room. Rematerialization draws fresh
+    /// generations from [`Self::take_generation`], so no consumer can mistake a
+    /// window captured before the reset for one captured after it — the caller
+    /// need not advance any other identity to make this safe.
     fn reset_server(&mut self) {
         self.rooms.clear();
     }
@@ -1015,9 +1126,101 @@ impl HistoryHub {
             let notices_trimmed = history.trim_notices(max_messages);
             if !evicted.is_empty() || notices_trimmed {
                 history.trim_orphaned_attachments();
-                history.invalidate();
+                history.record_front_evict(&evicted);
+                if notices_trimmed {
+                    history.record_change();
+                }
             }
         }
+    }
+}
+
+/// How many resolved references the disk fallback memoizes.
+const REF_LOOKUP_CACHE_ENTRIES: usize = 64;
+
+/// One reference resolved out of a room's on-disk capture.
+#[derive(Debug)]
+struct CapturedRef {
+    message: ChatMessage,
+    detail: Option<room_history::FileDetail>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefLookupKey {
+    Message(MessageId),
+    Attachment(FileHistoryKey),
+}
+
+/// Memoizes references that miss resident history.
+///
+/// Resolving one parses a room's entire on-disk capture on the core thread
+/// while the session guard is held, and the misses cluster: a screenful of
+/// references into evicted history, or a browser re-requesting the same
+/// previews after a resync. Misses are cached alongside hits, since a dangling
+/// reference is precisely the lookup that would otherwise repeat forever.
+///
+/// Entries carry the room's retention watermark. A message only leaves
+/// residency by eviction, so while that watermark holds, neither a hit nor a
+/// miss can have become stale.
+#[derive(Default)]
+struct RefLookupCache {
+    epoch: SessionEpoch,
+    /// Newest first; the tail is evicted once the cache is full.
+    entries: std::collections::VecDeque<RefLookupEntry>,
+}
+
+struct RefLookupEntry {
+    room_id: RoomId,
+    key: RefLookupKey,
+    evicted_through: Option<MessageId>,
+    value: Option<Arc<CapturedRef>>,
+}
+
+impl RefLookupCache {
+    fn get(
+        &mut self,
+        epoch: SessionEpoch,
+        room_id: RoomId,
+        key: RefLookupKey,
+        evicted_through: Option<MessageId>,
+    ) -> Option<Option<Arc<CapturedRef>>> {
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.entries.clear();
+            return None;
+        }
+        let index = self.entries.iter().position(|entry| {
+            entry.room_id == room_id
+                && entry.key == key
+                && entry.evicted_through == evicted_through
+        })?;
+        let entry = self.entries.remove(index).expect("index from position");
+        let value = entry.value.clone();
+        self.entries.push_front(entry);
+        Some(value)
+    }
+
+    fn insert(
+        &mut self,
+        epoch: SessionEpoch,
+        room_id: RoomId,
+        key: RefLookupKey,
+        evicted_through: Option<MessageId>,
+        value: Option<Arc<CapturedRef>>,
+    ) {
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.entries.clear();
+        }
+        self.entries
+            .retain(|entry| entry.room_id != room_id || entry.key != key);
+        self.entries.push_front(RefLookupEntry {
+            room_id,
+            key,
+            evicted_through,
+            value,
+        });
+        self.entries.truncate(REF_LOOKUP_CACHE_ENTRIES);
     }
 }
 
@@ -1089,6 +1292,8 @@ pub(crate) struct RoomSession {
     /// Empty canonical counterpart used to lay out view-local notices before
     /// any room is selected.
     detached_history: RoomHistory,
+    /// Bounds the disk work references into non-resident history cost.
+    ref_lookups: Mutex<RefLookupCache>,
     /// Live transfer state, separate from retained room history.
     transfers: HashMap<RoomId, HashMap<FileTransferId, TransferStatus>>,
     /// Users this client process has seen in each room's voice call. The value
@@ -1426,9 +1631,16 @@ impl MessageLog {
         self.records = merged;
     }
 
-    /// Drops the oldest messages over `max`.
+    /// Drops the oldest messages over `max`, in batches.
+    ///
+    /// Every eviction forces each derived view to repair its leading entries,
+    /// so evicting one message per arrival would make an at-capacity room pay
+    /// that repair on every single message. The log is instead allowed to run
+    /// [`Self::trim_slack`] messages past `max` and is then cut back to `max`,
+    /// amortizing the repair over a whole band. The slack scales with the cap
+    /// it amortizes, so small caps keep evicting exactly at the bound.
     fn trim_front(&mut self, max: usize) -> Vec<MessageId> {
-        if self.records.len() <= max {
+        if self.records.len() <= max.saturating_add(Self::trim_slack(max)) {
             return Vec::new();
         }
         let excess = self.records.len() - max;
@@ -1442,6 +1654,11 @@ impl MessageLog {
             removed.push(record.message.message_id);
         }
         removed
+    }
+
+    /// How far past `max` the log runs before a batched eviction cuts it back.
+    fn trim_slack(max: usize) -> usize {
+        max / 64
     }
 
     fn len(&self) -> usize {
@@ -1485,7 +1702,19 @@ impl RoomHistoryFixture {
         let record = self.history.messages.get_mut(id).expect("fixture message");
         record.message.body = body.to_string();
         record.touch();
-        self.history.invalidate();
+        self.history.record_content_change();
+    }
+
+    /// Drops the oldest `count` messages the way retention does.
+    pub(crate) fn evict(&mut self, count: usize) {
+        let evicted = self
+            .history
+            .messages
+            .records
+            .drain(..count)
+            .map(|record| record.message.message_id)
+            .collect::<Vec<_>>();
+        self.history.record_front_evict(&evicted);
     }
 
     pub(crate) fn remove(&mut self, id: u64) {
@@ -1833,6 +2062,7 @@ impl RoomSession {
             metas: BTreeMap::new(),
             rooms: HistoryHub::new(config.ui.max_messages as usize),
             detached_history: RoomHistory::empty(SessionEpoch::default().wire()),
+            ref_lookups: Mutex::default(),
             transfers: HashMap::new(),
             voice_seen: HashMap::new(),
             presence_seen: HashMap::new(),
@@ -2135,10 +2365,10 @@ impl RoomSession {
     /// append handle so live messages keep being captured. An oversized
     /// capture is trimmed to the message cap so it cannot lock out server
     /// history paging.
-    fn materialize_room(&self, room_id: RoomId) -> RoomHistory {
+    fn materialize_room(&self, room_id: RoomId, generation: u64) -> RoomHistory {
         let opened = room_history::open_in(self.history.room_dir(room_id), room_id);
         let mut loaded = opened.loaded;
-        let mut room = RoomHistory::empty(self.epoch.wire());
+        let mut room = RoomHistory::empty(generation);
         room.messages = MessageLog::from_sorted(loaded.messages);
         let _ = room.messages.trim_front(self.rooms.max_messages());
         for record in room.messages.records_mut() {
@@ -2194,7 +2424,8 @@ impl RoomSession {
             return None;
         }
         if !self.rooms.contains(room_id) {
-            let room = self.materialize_room(room_id);
+            let generation = self.rooms.take_generation();
+            let room = self.materialize_room(room_id, generation);
             self.rooms.insert(room_id, room);
         }
         self.rooms.room_mut(room_id)
@@ -2286,7 +2517,8 @@ impl RoomSession {
                 continue;
             };
             if !self.rooms.contains(room_id) {
-                let room = self.materialize_room(room_id);
+                let generation = self.rooms.take_generation();
+                let room = self.materialize_room(room_id, generation);
                 self.rooms.insert(room_id, room);
             }
             self.archived_metas.insert(room_id, meta);
@@ -2490,6 +2722,7 @@ impl RoomSession {
             oldest_received: None,
             oldest_retained_normal: None,
             dropped_normal: false,
+            backfill: false,
         };
         true
     }
@@ -2573,6 +2806,7 @@ impl RoomSession {
             mut oldest_received,
             oldest_retained_normal,
             dropped_normal,
+            backfill,
         ) = {
             let meta = self.metas.get_mut(&room_id)?;
             let HistoryFetchState::InFlight {
@@ -2581,6 +2815,7 @@ impl RoomSession {
                 oldest_received,
                 oldest_retained_normal,
                 dropped_normal,
+                backfill,
             } = meta.history_fetch
             else {
                 return None;
@@ -2595,6 +2830,7 @@ impl RoomSession {
                 oldest_received,
                 oldest_retained_normal,
                 dropped_normal,
+                backfill,
             )
         };
         if let Some(first) = page_first {
@@ -2626,6 +2862,7 @@ impl RoomSession {
         Some(HistoryFetchCompletion {
             resident_newest_before,
             page_oldest: oldest_received.map(|id| id.0),
+            backfill,
         })
     }
 
@@ -2657,6 +2894,7 @@ impl RoomSession {
             oldest_received: None,
             oldest_retained_normal: None,
             dropped_normal: false,
+            backfill: false,
         };
         Some((room_id, Some(before), limit))
     }
@@ -2688,6 +2926,7 @@ impl RoomSession {
             oldest_received: None,
             oldest_retained_normal: None,
             dropped_normal: false,
+            backfill: true,
         };
         Some((room_id, Some(before), limit))
     }
@@ -2785,12 +3024,17 @@ impl RoomSession {
             );
         }
         let initial_complete = before.is_none() && completion.is_some();
+        // A gap backfill splices records *inside* the span frontends already
+        // display, so unlike an ordinary older page it cannot be projected as a
+        // residency extension the requester will page in for itself.
+        let backfill_complete = completion.is_some_and(|completion| completion.backfill);
+        let refresh = initial_complete || backfill_complete;
         if let Some(change) = &mut change {
             // Older pages extend canonical residency but must not replace each
             // frontend's independently paged window. The requester receives a
             // targeted prepend once the ordered fetch completes.
-            change.refresh_window = initial_complete;
-        } else if initial_complete {
+            change.refresh_window = refresh;
+        } else if refresh {
             // Partial initial chunks deliberately suppress full snapshots; a
             // final refresh is still required when the terminal chunk itself
             // contains no new records.
@@ -2926,22 +3170,66 @@ impl RoomSession {
             return Some((message, detail));
         }
 
+        let captured = self.captured_ref(room_id, RefLookupKey::Message(message_id))?;
+        Some((captured.message.clone(), captured.detail.clone()))
+    }
+
+    /// Resolves one reference out of a room's on-disk capture, memoized through
+    /// [`RefLookupCache`] so a cluster of references into evicted history parses
+    /// the log once instead of once per reference.
+    fn captured_ref(&self, room_id: RoomId, key: RefLookupKey) -> Option<Arc<CapturedRef>> {
+        let evicted_through = self
+            .rooms
+            .room(room_id)
+            .and_then(|room| room.evicted_through)
+            .map(MessageId);
+        let mut cache = self.ref_lookups.lock().expect("ref lookup cache poisoned");
+        if let Some(cached) = cache.get(self.epoch, room_id, key, evicted_through) {
+            return cached;
+        }
+        drop(cache);
+
+        let captured = self.load_captured_ref(room_id, key).map(Arc::new);
+        self.ref_lookups
+            .lock()
+            .expect("ref lookup cache poisoned")
+            .insert(self.epoch, room_id, key, evicted_through, captured.clone());
+        captured
+    }
+
+    fn load_captured_ref(&self, room_id: RoomId, key: RefLookupKey) -> Option<CapturedRef> {
         let dir = self.history.room_dir(room_id)?;
         let loaded = room_history::open_in(Some(dir), room_id).loaded;
-        let message = loaded
-            .messages
-            .into_iter()
-            .find(|message| message.message_id == message_id && !message.flags.deleted())?;
-        let detail = message
-            .file_transfer_id
-            .and_then(|transfer_id| {
-                loaded.files.get(&FileHistoryKey {
-                    timestamp_ms: message.timestamp_ms,
-                    transfer_id,
+        match key {
+            RefLookupKey::Message(message_id) => {
+                let message = loaded
+                    .messages
+                    .into_iter()
+                    .find(|message| message.message_id == message_id && !message.flags.deleted())?;
+                let detail = message
+                    .file_transfer_id
+                    .and_then(|transfer_id| {
+                        loaded.files.get(&FileHistoryKey {
+                            timestamp_ms: message.timestamp_ms,
+                            transfer_id,
+                        })
+                    })
+                    .cloned();
+                Some(CapturedRef { message, detail })
+            }
+            RefLookupKey::Attachment(file_key) => {
+                let detail = loaded.files.get(&file_key)?.clone();
+                let message = loaded.messages.into_iter().find(|message| {
+                    !message.flags.deleted()
+                        && message.timestamp_ms == file_key.timestamp_ms
+                        && message.file_transfer_id == Some(file_key.transfer_id)
+                })?;
+                Some(CapturedRef {
+                    message,
+                    detail: Some(detail),
                 })
-            })
-            .cloned();
-        Some((message, detail))
+            }
+        }
     }
 
     /// Resolves an attachment announcement and its retained metadata without
@@ -2962,15 +3250,22 @@ impl RoomSession {
             return Some((record.message.clone(), detail.clone()));
         }
 
-        let dir = self.history.room_dir(room_id)?;
-        let loaded = room_history::open_in(Some(dir), room_id).loaded;
-        let detail = loaded.files.get(key)?.clone();
-        let message = loaded.messages.into_iter().find(|message| {
-            !message.flags.deleted()
-                && message.timestamp_ms == key.timestamp_ms
-                && message.file_transfer_id == Some(key.transfer_id)
-        })?;
-        Some((message, detail))
+        let captured = self.captured_ref(room_id, RefLookupKey::Attachment(*key))?;
+        Some((captured.message.clone(), captured.detail.clone()?))
+    }
+
+    /// Whether this client will never hold anything older than it already
+    /// does: either the server reported the durable start of history, or
+    /// residency reached the retention cap, which is this client's own floor.
+    pub(crate) fn older_paging_exhausted(&self, room_id: RoomId) -> bool {
+        let Some(meta) = self.metas.get(&room_id) else {
+            return true;
+        };
+        let resident = self
+            .rooms
+            .room(room_id)
+            .map_or(0, |room| room.messages.len());
+        meta.history_at_start || resident >= self.rooms.max_messages()
     }
 
     pub(crate) fn history_cursor(&self, room_id: RoomId) -> (Option<MessageId>, bool) {
@@ -3509,9 +3804,9 @@ impl RoomSession {
         let viewed = self.room_is_viewed(room_id);
         let max_messages = self.rooms.max_messages();
         let room = self.room_mut_materializing(room_id)?;
-        let evicted = room.receive_chat(record, max_messages);
-        let change = evicted
-            .map(|evicted| HistoryChange::upsert(room_id, room.generation, message_id, evicted));
+        let fresh = room.receive_chat(record, max_messages);
+        let change =
+            fresh.then(|| HistoryChange::upsert(room_id, room.generation, message_id, Vec::new()));
         let mut read_advanced = false;
         if change.is_some() {
             if viewed {
@@ -4106,16 +4401,12 @@ impl RoomSession {
                 target.room_id.0, message.sender_name
             ));
         }
-        let dir = self.history.room_dir(target.room_id)?;
-        let loaded = room_history::open_in(Some(dir), target.room_id).loaded;
-        let message = loaded
-            .messages
-            .iter()
-            .find(|message| message.message_id == target.message_id)?;
-        let first_line = message.body.lines().next().unwrap_or("");
+        let captured =
+            self.captured_ref(target.room_id, RefLookupKey::Message(target.message_id))?;
+        let first_line = captured.message.body.lines().next().unwrap_or("");
         Some(format!(
             "room {}: {}: {first_line}",
-            target.room_id.0, message.sender_name
+            target.room_id.0, captured.message.sender_name
         ))
     }
 
@@ -5923,6 +6214,97 @@ mod tests {
     }
 
     #[test]
+    fn gap_backfill_completion_refreshes_the_window() {
+        let mut room = test_room();
+        let resident = (1..=5)
+            .map(|id| message(id, UserId(2), "resident"))
+            .collect::<Vec<_>>();
+        enter(&mut room, Vec::new(), resident, Some(UserId(1)));
+        assert!(room.begin_history_fetch(RoomId(1)));
+        let page = (20..=22)
+            .map(|id| message(id, UserId(2), "newer"))
+            .collect::<Vec<_>>();
+        let initial =
+            room.history_chunk_received(RoomId(1), None, page, false, true, Some(UserId(1)));
+        assert!(initial.next_backfill.is_some());
+
+        let backfill = (10..=12)
+            .map(|id| message(id, UserId(2), "backfill"))
+            .collect::<Vec<_>>();
+        let update = room.history_chunk_received(
+            RoomId(1),
+            Some(MessageId(20)),
+            backfill,
+            false,
+            true,
+            Some(UserId(1)),
+        );
+
+        // Unlike an ordinary older page, a backfill lands inside the span
+        // frontends already display, so they cannot page it in for themselves.
+        assert!(
+            update
+                .change
+                .expect("backfill merged records")
+                .refresh_window
+        );
+    }
+
+    #[test]
+    fn an_ordinary_older_page_does_not_refresh_the_window() {
+        let mut room = test_room();
+        let resident = (10..=15)
+            .map(|id| message(id, UserId(2), "resident"))
+            .collect::<Vec<_>>();
+        enter(&mut room, Vec::new(), resident, Some(UserId(1)));
+        assert!(room.begin_history_fetch(RoomId(1)));
+        room.history_chunk_received(RoomId(1), None, Vec::<ChatMessage>::new(), false, true, Some(UserId(1)));
+        assert!(room.older_history_request(RoomId(1)).is_none());
+        room.session
+            .metas
+            .get_mut(&RoomId(1))
+            .unwrap()
+            .history_before = Some(MessageId(10));
+        assert!(room.older_history_request(RoomId(1)).is_some());
+
+        let older = (1..=5)
+            .map(|id| message(id, UserId(2), "older"))
+            .collect::<Vec<_>>();
+        let update = room.history_chunk_received(
+            RoomId(1),
+            Some(MessageId(10)),
+            older,
+            false,
+            true,
+            Some(UserId(1)),
+        );
+
+        assert!(!update.change.expect("older page merged").refresh_window);
+    }
+
+    #[test]
+    fn older_paging_is_exhausted_at_the_retention_cap() {
+        let mut room = test_room();
+        room.set_max_messages(4);
+        let resident = (1..=4)
+            .map(|id| message(id, UserId(2), "resident"))
+            .collect::<Vec<_>>();
+        enter(&mut room, Vec::new(), resident, Some(UserId(1)));
+
+        // The cap is this client's own floor: nothing older will ever arrive,
+        // so a frontend paging up must be told to stop rather than be reset.
+        assert!(room.session.older_paging_exhausted(RoomId(1)));
+
+        room.set_max_messages(64);
+        room.session
+            .metas
+            .get_mut(&RoomId(1))
+            .unwrap()
+            .history_at_start = false;
+        assert!(!room.session.older_paging_exhausted(RoomId(1)));
+    }
+
+    #[test]
     fn history_gap_auto_fetch_stops_at_cap_and_at_start() {
         let mut capped = test_room();
         capped.set_max_messages(8);
@@ -6120,7 +6502,7 @@ mod tests {
     }
 
     #[test]
-    fn live_insert_reports_the_one_canonical_retention_trim() {
+    fn live_insert_at_the_cap_evicts_without_reporting_a_removal() {
         let mut room = test_room();
         room.set_max_messages(2);
         enter(
@@ -6136,19 +6518,96 @@ mod tests {
         let update = room
             .chat_received(message(3, UserId(2), "third"), Some(UserId(1)))
             .unwrap();
-        assert_eq!(
-            update.change.expect("fresh insert").removed,
-            vec![MessageId(1)]
-        );
-        let resident = room
-            .history_ref(RoomId(1))
-            .unwrap()
+        // Retention is this client's memory bound, not a canonical delete:
+        // projecting it would make scrolled-back consumers watch their own
+        // history disappear.
+        let change = update.change.expect("fresh insert");
+        assert!(change.removed.is_empty());
+        assert_eq!(change.upserted, Some(MessageId(3)));
+        let history = room.history_ref(RoomId(1)).unwrap();
+        assert_eq!(history.evicted_through(), Some(MessageId(1)));
+        let resident = history
             .latest_page(10)
             .messages
             .iter()
             .map(|message| message.message_id)
             .collect::<Vec<_>>();
         assert_eq!(resident, vec![MessageId(2), MessageId(3)]);
+    }
+
+    #[test]
+    fn eviction_prunes_mutation_state_below_the_watermark() {
+        let mut room = test_room();
+        room.set_max_messages(2);
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![
+                message(1, UserId(2), "first"),
+                message(2, UserId(2), "second"),
+            ],
+            Some(UserId(1)),
+        );
+        let mut edit = message(3, UserId(2), "edited");
+        edit.target = Some(MessageId(1));
+        edit.flags = rpc::control::MessageFlags(rpc::control::MessageFlags::EDITED);
+        room.mutation_received(&edit, Some(UserId(1)));
+        assert!(room.shared(1).mutations.contains_key(&1));
+
+        room.chat_received(message(4, UserId(2), "fourth"), Some(UserId(1)));
+
+        // The fold state — which retains a cloned body per sender — goes as
+        // soon as its target can never become resident again.
+        assert_eq!(room.shared(1).evicted_through, Some(1));
+        assert!(!room.shared(1).mutations.contains_key(&1));
+        // The capture-idempotency set is keyed by mutation id, which outranks
+        // its own target, so it clears one watermark later.
+        assert!(room.shared(1).seen_mutations.contains(&3));
+        room.chat_received(message(5, UserId(2), "fifth"), Some(UserId(1)));
+        room.chat_received(message(6, UserId(2), "sixth"), Some(UserId(1)));
+        assert_eq!(room.shared(1).evicted_through, Some(4));
+        assert!(room.shared(1).seen_mutations.is_empty());
+    }
+
+    #[test]
+    fn batched_trim_evicts_once_per_slack_band() {
+        let cap = 128usize;
+        let slack = MessageLog::trim_slack(cap);
+        assert!(slack > 0);
+        let mut room = test_room();
+        room.set_max_messages(cap as u32);
+        enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
+        for id in 1..=(cap as u64 + slack as u64) {
+            room.chat_received(message(id, UserId(2), "filler"), Some(UserId(1)));
+        }
+
+        // The band absorbs the overflow without evicting.
+        assert!(room.shared(1).evicted_through.is_none());
+        assert_eq!(room.shared(1).messages.len(), cap + slack);
+
+        room.chat_received(
+            message(cap as u64 + slack as u64 + 1, UserId(2), "overflow"),
+            Some(UserId(1)),
+        );
+
+        assert_eq!(room.shared(1).messages.len(), cap);
+        assert_eq!(
+            room.shared(1).evicted_through,
+            Some(slack as u64 + 1),
+            "one batch cuts the whole band back to the cap"
+        );
+    }
+
+    #[test]
+    fn rooms_get_distinct_generations() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
+        room.session.set_viewed_room(RoomId(2));
+
+        let first = room.session.room_generation(RoomId(1));
+        let second = room.session.room_generation(RoomId(2));
+        assert!(first.is_some() && second.is_some());
+        assert_ne!(first, second);
     }
 
     #[test]

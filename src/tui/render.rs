@@ -339,7 +339,7 @@ pub(crate) fn draw_room_screen(
             .viewed_room
             .and_then(|room_id| app.room.history_ref(room_id))
         {
-            search.sync(&history);
+            search.sync(&app.view.active.chat, &history);
         }
     }
     let max_bottom_rows = screen.h.saturating_sub(4 + frame_rows);

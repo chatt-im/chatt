@@ -266,6 +266,69 @@ mod viewport_tests {
     }
 
     #[test]
+    fn front_eviction_drops_the_prefix_without_remeasuring() {
+        let mut history = TestHistory::new();
+        for id in 1..=200 {
+            history.push(id, "alice", &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+        let measured = viewport.layout_index.measured_messages;
+
+        history.evict(50);
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+
+        assert_eq!(viewport.len(), 150);
+        assert_eq!(
+            viewport.record(&history.history(), 0).unwrap().entry_id,
+            HistoryEntryId::Message(MessageId(51))
+        );
+        // Retention removes a prefix and nothing else, so the survivors' rows
+        // are regrouped from counts already taken rather than laid out again.
+        assert_eq!(viewport.layout_index.measured_messages, measured);
+        assert_eq!(viewport.layout_index.line_counts.len(), viewport.len());
+    }
+
+    #[test]
+    fn eviction_repoints_a_cursor_that_left_with_the_prefix() {
+        let mut history = TestHistory::new();
+        for id in 1..=10 {
+            history.push(id, "alice", &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.set_cursor(HistoryEntryId::Message(MessageId(2)));
+
+        history.evict(4);
+        viewport.reconcile(&history.history());
+
+        assert_eq!(
+            viewport.cursor().unwrap().entry,
+            HistoryEntryId::Message(MessageId(5))
+        );
+    }
+
+    #[test]
+    fn stale_view_id_lays_out_without_panicking() {
+        let mut history = TestHistory::new();
+        for id in 1..=3 {
+            history.push(id, "alice", &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+
+        // The core can tombstone between one reconcile and the next input
+        // event, leaving this view holding an id canonical history no longer
+        // resolves. Laying it out must degrade, not abort the render thread.
+        history.remove(2);
+        let lines = viewport.visible_lines(&history.history(), 40, 8, 2);
+
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
     fn notice_scroll_policy_survives_canonical_projection() {
         let mut history = TestHistory::new();
         for id in 1..=30 {
@@ -632,9 +695,13 @@ impl ClearBoundary {
 pub struct ChatViewport {
     entries: Vec<ViewEntry>,
     observed_generation: Option<u64>,
-    observed_revision: u64,
+    observed_content_revision: u64,
+    observed_order_revision: u64,
     observed_reindex_revision: u64,
     observed_tail: Option<MessageId>,
+    /// Canonical retention watermark this view has already applied to its
+    /// leading entries.
+    observed_evicted_through: Option<MessageId>,
     scroll_offset: usize,
     scroll_anchor: Option<ViewScrollAnchor>,
     /// Navigation cursor; `None` only while the buffer is empty. A stale
@@ -653,6 +720,9 @@ pub struct ChatViewport {
     max_local_notices: usize,
     next_notice_id: u64,
     clear_boundary: Option<ClearBoundary>,
+    /// Advances on every `/clear`. Derived overlays key their index on it, so
+    /// a clear invalidates them even though canonical history did not move.
+    clear_generation: u64,
     layout_index: LayoutIndex,
     /// Advances on any mutation that can move existing rendered rows: edits,
     /// removals, prepends, eviction, collapse toggles, reflow. Pure tail
@@ -667,9 +737,11 @@ impl ChatViewport {
         Self {
             entries: Vec::new(),
             observed_generation: None,
-            observed_revision: 0,
+            observed_content_revision: 0,
+            observed_order_revision: 0,
             observed_reindex_revision: 0,
             observed_tail: None,
+            observed_evicted_through: None,
             scroll_offset: 0,
             scroll_anchor: None,
             cursor: None,
@@ -681,6 +753,7 @@ impl ChatViewport {
             max_local_notices: usize::MAX,
             next_notice_id: 1,
             clear_boundary: None,
+            clear_generation: 0,
             layout_index: LayoutIndex::default(),
             layout_epoch: 0,
         }
@@ -722,16 +795,27 @@ impl ChatViewport {
         }
         let generation_changed = self.observed_generation != Some(history.generation());
         let generation_reset = self.observed_generation.is_some() && generation_changed;
-        let revision_changed = self.observed_revision != history.order_revision();
+        let content_changed = self.observed_content_revision != history.content_revision();
+        let order_changed = self.observed_order_revision != history.order_revision();
+        let revision_changed = content_changed || order_changed;
         if !generation_changed && !revision_changed && !local_trimmed {
             return;
         }
+        // Two cheaper tiers sit ahead of the full rebuild, one per canonical
+        // counter. Seeing exactly one move is what makes them safe: bodies
+        // changed and no id moved, or ids shifted at the ends and no body
+        // changed. Anything else — both at once, or a reindex — rebuilds.
         if !generation_changed
             && !local_trimmed
             && self.observed_reindex_revision == history.reindex_revision()
-            && self.reconcile_tail_appends(history)
         {
-            return;
+            if !order_changed {
+                self.reconcile_content(history);
+                return;
+            }
+            if !content_changed && self.reconcile_edges(history) {
+                return;
+            }
         }
 
         let cursor_position = self.cursor.and_then(|cursor| {
@@ -850,10 +934,7 @@ impl ChatViewport {
                 .eq(previous_ids.iter().copied());
         self.entries = messages;
         self.room_id = history.room_id();
-        self.observed_generation = Some(history.generation());
-        self.observed_revision = history.order_revision();
-        self.observed_reindex_revision = history.reindex_revision();
-        self.observed_tail = history.tail_message_id();
+        self.observe(history);
 
         if generation_changed {
             self.scroll_offset = 0;
@@ -926,6 +1007,138 @@ impl ChatViewport {
         }
     }
 
+    /// Records the canonical position this view has caught up to.
+    fn observe(&mut self, history: &RoomHistoryRef<'_>) {
+        self.observed_generation = Some(history.generation());
+        self.observed_content_revision = history.content_revision();
+        self.observed_order_revision = history.order_revision();
+        self.observed_reindex_revision = history.reindex_revision();
+        self.observed_tail = history.tail_message_id();
+        self.observed_evicted_through = history.evicted_through();
+    }
+
+    /// Catches up after canonical changes that only touched the ends of the id
+    /// sequence: retention dropping a leading prefix, tail appends, or both.
+    fn reconcile_edges(&mut self, history: &RoomHistoryRef<'_>) -> bool {
+        self.drop_evicted_front(history);
+        self.reconcile_tail_appends(history)
+    }
+
+    /// Applies the canonical retention watermark to this view's leading
+    /// entries.
+    ///
+    /// Retention removes an ordered prefix and nothing else, so every survivor
+    /// keeps its relative position and the row index regroups from line counts
+    /// already measured — no body is laid out again. Notices anchored among the
+    /// evicted messages stay: they are retained independently of the message
+    /// log.
+    fn drop_evicted_front(&mut self, history: &RoomHistoryRef<'_>) {
+        let watermark = history.evicted_through();
+        if self.observed_evicted_through == watermark {
+            return;
+        }
+        self.observed_evicted_through = watermark;
+        let Some(watermark) = watermark else {
+            return;
+        };
+        let counts_valid = self.layout_index.valid
+            && self.layout_index.line_counts.len() == self.entries.len();
+        let mut kept = 0usize;
+        for index in 0..self.entries.len() {
+            if matches!(self.entries[index].id, HistoryEntryId::Message(id) if id <= watermark) {
+                continue;
+            }
+            if kept != index {
+                self.entries.swap(kept, index);
+                if counts_valid {
+                    self.layout_index.line_counts.swap(kept, index);
+                }
+            }
+            kept += 1;
+        }
+        if kept == self.entries.len() {
+            return;
+        }
+        self.entries.truncate(kept);
+        let front = self.entries.first().map(|entry| entry.id);
+        for cursor in [&mut self.cursor, &mut self.anchor] {
+            if let Some(current) = cursor
+                && !self.entries.iter().any(|entry| entry.id == current.entry)
+            {
+                *cursor = front.map(|entry| ViewCursor { entry, line: 0 });
+            }
+        }
+        if let Some(anchor) = self.scroll_anchor
+            && !self.entries.iter().any(|entry| entry.id == anchor.entry)
+        {
+            self.scroll_anchor = None;
+        }
+        if counts_valid {
+            self.layout_index.line_counts.truncate(kept);
+            let line_counts = std::mem::take(&mut self.layout_index.line_counts);
+            self.install_layout_index(history, line_counts);
+        } else {
+            self.layout_index.invalidate();
+        }
+        self.bump_layout_epoch();
+    }
+
+    /// Catches up after canonical changes that replaced bodies in place: an
+    /// edit folding in, or provenance arriving for an already-displayed
+    /// message. Every id keeps its position, so only the records whose content
+    /// revision moved are re-read and re-measured.
+    fn reconcile_content(&mut self, history: &RoomHistoryRef<'_>) {
+        let counts_valid = self.layout_index.valid
+            && self.layout_index.line_counts.len() == self.entries.len();
+        let width = self.layout_index.width;
+        let mut remeasure = false;
+        for index in 0..self.entries.len() {
+            let id = self.entries[index].id;
+            let Some((content_revision, has_refs)) = self.resolve_record(history, id).map(|record| {
+                (
+                    record.content_revision,
+                    record
+                        .body
+                        .contains(chatt_message_format::reference::REF_PREFIX),
+                )
+            }) else {
+                continue;
+            };
+            let entry = &mut self.entries[index];
+            // Reference pill labels resolve through other canonical records, so
+            // a body carrying one can need a fresh layout even when its own
+            // content revision held.
+            if entry.content_revision == content_revision && !has_refs {
+                continue;
+            }
+            entry.content_revision = content_revision;
+            entry.invalidate_layout();
+            if counts_valid {
+                let lines = self.ensure_lines(history, index, width);
+                #[cfg(test)]
+                {
+                    self.layout_index.measured_messages += 1;
+                }
+                self.layout_index.line_counts[index] = lines;
+                // The visible pass repopulates its own bounded window; a layout
+                // built only to recover a row count may be anywhere in history.
+                self.entries[index].layout = None;
+                remeasure = true;
+            }
+        }
+        self.observe(history);
+        if !counts_valid {
+            self.layout_index.invalidate();
+        } else if remeasure {
+            // Grouping reads sender, edit marker and line count, so the blocks
+            // are repacked — but from counts, without laying out untouched
+            // bodies again.
+            let line_counts = std::mem::take(&mut self.layout_index.line_counts);
+            self.install_layout_index(history, line_counts);
+            self.bump_layout_epoch();
+        }
+    }
+
     /// Catches up after one or more non-evicting canonical tail appends. No
     /// existing id or payload can have changed while the reindex revision is
     /// stable, so rebuilding the full id list or row index would be wasted
@@ -955,10 +1168,7 @@ impl ChatViewport {
             self.repair_layout_index_after_append(append_index, history);
         }
         self.room_id = history.room_id();
-        self.observed_generation = Some(history.generation());
-        self.observed_revision = history.order_revision();
-        self.observed_reindex_revision = history.reindex_revision();
-        self.observed_tail = history.tail_message_id();
+        self.observe(history);
 
         if self.cursor.is_none() && !self.entries.is_empty() {
             self.cursor = self.entries.last().map(|entry| ViewCursor {
@@ -1107,6 +1317,7 @@ impl ChatViewport {
         for entry in &self.entries {
             boundary.observe(entry.id);
         }
+        self.clear_generation = self.clear_generation.wrapping_add(1);
         self.clear_boundary = (!self.entries.is_empty()).then_some(boundary);
         self.local_notices.clear();
         self.entries.clear();
@@ -1146,6 +1357,19 @@ impl ChatViewport {
 
     pub(crate) fn entry_index(&self, id: HistoryEntryId) -> Option<usize> {
         self.entries.iter().position(|entry| entry.id == id)
+    }
+
+    /// The ids this view actually displays, in order. Unlike the canonical id
+    /// list this already excludes whatever a `/clear` hid, so derived overlays
+    /// built from it cannot offer the user rows the view will not show.
+    pub(crate) fn entry_ids(&self) -> impl ExactSizeIterator<Item = HistoryEntryId> + '_ {
+        self.entries.iter().map(|entry| entry.id)
+    }
+
+    /// Advances on every `/clear`, so an overlay can tell that the displayed id
+    /// set shrank even when canonical history did not move.
+    pub(crate) fn clear_generation(&self) -> u64 {
+        self.clear_generation
     }
 
     pub fn toggle_expand_entry(
@@ -1919,9 +2143,15 @@ impl ChatViewport {
             layout.ensure(width, &body, &refs, syntax);
             return layout.lines().max(1);
         }
-        let record = history
-            .record(id)
-            .expect("viewport id must resolve through canonical history");
+        // A view id can outlive its record: the core may tombstone or evict
+        // between one reconcile and the next input event. Lay the row out as a
+        // single blank line and let the following reconcile drop it.
+        let Some(record) = history.record(id) else {
+            let msg = &mut self.entries[idx];
+            let layout = msg.layout_mut();
+            layout.ensure(width, "", &[], syntax);
+            return layout.lines().max(1);
+        };
         let inline = chatt_message_format::inline_ranges(record.body);
         let refs = self.build_ref_spans(history, record.body, inline.refs);
         let msg = &mut self.entries[idx];
@@ -2114,12 +2344,15 @@ impl ChatViewport {
         cur: usize,
         line_counts: &[usize],
     ) -> bool {
-        let prev_record = self
-            .resolve_record(history, self.entries[prev].id)
-            .expect("viewport id must resolve through canonical history");
-        let cur_record = self
-            .resolve_record(history, self.entries[cur].id)
-            .expect("viewport id must resolve through canonical history");
+        // An id whose record has already gone stands alone rather than joining
+        // a group: grouping it would style the survivors against a body this
+        // view can no longer read.
+        let (Some(prev_record), Some(cur_record)) = (
+            self.resolve_record(history, self.entries[prev].id),
+            self.resolve_record(history, self.entries[cur].id),
+        ) else {
+            return true;
+        };
         if prev_record.timestamp_ms == 0 || cur_record.timestamp_ms == 0 {
             return true;
         }
