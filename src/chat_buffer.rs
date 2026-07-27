@@ -4,7 +4,10 @@ use extui::{Style, vt::Modifier};
 use rpc::ids::{FileTransferId, MessageId, RoomId};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{app::room::RoomHistoryRef, theme::SyntaxTheme};
+use crate::{
+    app::room::{HistoryDelta, Revision, RoomHistoryRef},
+    theme::SyntaxTheme,
+};
 use chatt_message_format::{
     Token, TokenKind,
     highlight::{self, HlClass},
@@ -292,6 +295,129 @@ mod viewport_tests {
     }
 
     #[test]
+    fn tombstone_drops_one_entry_without_remeasuring_the_rest() {
+        let mut history = TestHistory::new();
+        for id in 1..=200 {
+            history.push(id, "alice", &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+        let measured = viewport.layout_index.measured_messages;
+
+        history.tombstone(100);
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+
+        assert_eq!(viewport.len(), 199);
+        assert!(viewport.entry_index(HistoryEntryId::Message(MessageId(100))).is_none());
+        // The delta named the id that left, so nothing else is laid out again.
+        assert_eq!(viewport.layout_index.measured_messages, measured);
+        assert_eq!(viewport.layout_index.line_counts.len(), viewport.len());
+    }
+
+    #[test]
+    fn prepended_page_keeps_the_measurements_of_surviving_entries() {
+        let mut history = TestHistory::new();
+        for id in 100..=200 {
+            history.push(id, "alice", &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+        let measured = viewport.layout_index.measured_messages;
+
+        history.prepend(&[1, 2, 3]);
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+
+        assert_eq!(viewport.len(), 104);
+        assert_eq!(
+            viewport.record(&history.history(), 0).unwrap().entry_id,
+            HistoryEntryId::Message(MessageId(1))
+        );
+        // A prepend rebuilds the id sequence but touches no resident body, so
+        // only the three arrivals are measured.
+        assert_eq!(viewport.layout_index.measured_messages, measured + 3);
+    }
+
+    #[test]
+    fn page_that_prepends_and_splices_does_not_duplicate_the_spliced_entry() {
+        let mut history = TestHistory::new();
+        history.push(100, "alice", "hundred");
+        history.push(200, "alice", "two hundred");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+
+        // One page, two shapes: 1 lands under the resident front, 150 threads
+        // between residents. The room journals a rebuild *and* a splice, and a
+        // rebuild already reflects the splice.
+        history.merge_page(&[1, 150]);
+        viewport.reconcile(&history.history());
+
+        assert_eq!(
+            viewport.entry_ids().collect::<Vec<_>>(),
+            history.history().entry_ids()
+        );
+    }
+
+    #[test]
+    fn falling_past_the_journal_rebuilds_instead_of_desynchronizing() {
+        let mut history = TestHistory::new();
+        history.push(1, "alice", "first");
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        let stale = history.revision();
+
+        // Well past the journal cap, so the span from `stale` is no longer
+        // covered and replay must refuse it.
+        for id in 2..=600 {
+            history.push(id, "alice", &format!("message {id}"));
+        }
+        assert!(history.history().deltas_since(stale).is_none());
+        viewport.reconcile(&history.history());
+
+        assert_eq!(viewport.len(), 600);
+        assert_eq!(
+            viewport.record(&history.history(), 599).unwrap().body,
+            "message 600"
+        );
+        assert_eq!(
+            viewport.entry_ids().collect::<Vec<_>>(),
+            history.history().entry_ids()
+        );
+    }
+
+    #[test]
+    fn replayed_appends_match_a_rebuild_entry_for_entry() {
+        let mut history = TestHistory::new();
+        history.push(1, "alice", "first");
+        history.notice("connected", true);
+        history.push(2, "bob", "second");
+        let mut replayed = ChatViewport::new(SyntaxTheme::default());
+        replayed.reconcile(&history.history());
+
+        history.push(3, "alice", "third");
+        history.notice("reconnected", true);
+        history.tombstone(2);
+        history.edit(1, "edited");
+        replayed.reconcile(&history.history());
+
+        // A viewport seeing every step must land where one seeing only the end
+        // state does; the journal is an optimization, never a different answer.
+        let mut rebuilt = ChatViewport::new(SyntaxTheme::default());
+        rebuilt.reconcile(&history.history());
+        assert_eq!(
+            replayed.entry_ids().collect::<Vec<_>>(),
+            rebuilt.entry_ids().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            replayed.entry_ids().collect::<Vec<_>>(),
+            history.history().entry_ids()
+        );
+    }
+
+    #[test]
     fn eviction_repoints_a_cursor_that_left_with_the_prefix() {
         let mut history = TestHistory::new();
         for id in 1..=10 {
@@ -429,15 +555,17 @@ pub struct ChatRecord<'a> {
     /// the render-time progress overlay in [`crate::app::room::RoomSession`].
     pub file_transfer_id: Option<FileTransferId>,
     pub notice_kind: Option<NoticeKind>,
-    /// Changes whenever this record's display content changes.
-    pub content_revision: u64,
 }
 
 struct ViewEntry {
     id: HistoryEntryId,
-    content_revision: u64,
     /// Whether a collapsible (over [`COLLAPSE_LIMIT`] lines) message is expanded.
     expanded: bool,
+    /// Whether the body carries a message reference. A reference pill resolves
+    /// through *another* canonical record, so any change to a different id can
+    /// restyle this one; the flag keeps that fan-out a bool scan instead of a
+    /// substring search over every resident body.
+    has_refs: bool,
     /// Present only inside the bounded visible/overscan cache window.
     layout: Option<Box<MessageLayout>>,
 }
@@ -659,6 +787,35 @@ struct ViewScrollAnchor {
     kind: LineKind,
 }
 
+/// What a batch of applied deltas left for the end of the reconcile pass.
+///
+/// Deltas are applied one at a time but their consequences are not: repacking
+/// blocks, re-resolving reference pills and bumping the render epoch are all
+/// once-per-pass work, so each delta records that it is needed and the pass
+/// pays for it once.
+/// Where the reader sat before a reconcile pass, sampled before anything moves.
+#[derive(Clone, Copy)]
+struct FollowState {
+    /// The viewport was pinned to the newest row.
+    following: bool,
+    /// The cursor sat on the newest entry.
+    cursor_at_tail: bool,
+}
+
+#[derive(Default)]
+struct ReplayEffects {
+    /// Line counts moved, so blocks must be repacked from them.
+    repack: bool,
+    /// Rows already on screen moved, so the renderer cannot scroll its existing
+    /// output into place.
+    reflow: bool,
+    /// A canonical id arrived, changed or left, so reference pill labels
+    /// resolving through it may have changed.
+    references_dirty: bool,
+    /// A newly materialized notice asked every view to snap to the bottom.
+    scroll_bottom: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 struct ClearBoundary {
     message: Option<MessageId>,
@@ -695,13 +852,10 @@ impl ClearBoundary {
 pub struct ChatViewport {
     entries: Vec<ViewEntry>,
     observed_generation: Option<u64>,
-    observed_content_revision: u64,
-    observed_order_revision: u64,
-    observed_reindex_revision: u64,
-    observed_tail: Option<MessageId>,
-    /// Canonical retention watermark this view has already applied to its
-    /// leading entries.
-    observed_evicted_through: Option<MessageId>,
+    /// The canonical revision these entries reflect. Catching up replays
+    /// `deltas_since(observed_revision)`, or rebuilds when that span has fallen
+    /// out of the journal.
+    observed_revision: Revision,
     scroll_offset: usize,
     scroll_anchor: Option<ViewScrollAnchor>,
     /// Navigation cursor; `None` only while the buffer is empty. A stale
@@ -737,11 +891,7 @@ impl ChatViewport {
         Self {
             entries: Vec::new(),
             observed_generation: None,
-            observed_content_revision: 0,
-            observed_order_revision: 0,
-            observed_reindex_revision: 0,
-            observed_tail: None,
-            observed_evicted_through: None,
+            observed_revision: 0,
             scroll_offset: 0,
             scroll_anchor: None,
             cursor: None,
@@ -786,6 +936,11 @@ impl ChatViewport {
 
     /// Reconciles stable view ids and disposable layout state with canonical
     /// history. Payload is always re-read through `history`.
+    ///
+    /// The canonical room names every change it makes, so the common path is a
+    /// replay of the journal entries this view has not seen. A rebuild is the
+    /// fallback for exactly two situations: a different room generation, and
+    /// falling further behind than the journal reaches.
     pub fn reconcile(&mut self, history: &RoomHistoryRef<'_>) {
         self.max_local_notices = history.max_messages().max(1);
         let local_trimmed = self.local_notices.len() > self.max_local_notices;
@@ -793,78 +948,303 @@ impl ChatViewport {
             let excess = self.local_notices.len() - self.max_local_notices;
             self.local_notices.drain(..excess);
         }
-        let generation_changed = self.observed_generation != Some(history.generation());
-        let generation_reset = self.observed_generation.is_some() && generation_changed;
-        let content_changed = self.observed_content_revision != history.content_revision();
-        let order_changed = self.observed_order_revision != history.order_revision();
-        let revision_changed = content_changed || order_changed;
-        if !generation_changed && !revision_changed && !local_trimmed {
+        // Sampled before anything moves: whether the reader was pinned to the
+        // tail decides where the cursor lands afterwards.
+        let follow = self.follow_state();
+        if self.observed_generation != Some(history.generation()) {
+            self.rebuild(history, follow);
             return;
         }
-        // Two cheaper tiers sit ahead of the full rebuild, one per canonical
-        // counter. Seeing exactly one move is what makes them safe: bodies
-        // changed and no id moved, or ids shifted at the ends and no body
-        // changed. Anything else — both at once, or a reindex — rebuilds.
-        if !generation_changed
-            && !local_trimmed
-            && self.observed_reindex_revision == history.reindex_revision()
-        {
-            if !order_changed {
-                self.reconcile_content(history);
-                return;
+        if self.observed_revision == history.revision() && !local_trimmed {
+            return;
+        }
+        if local_trimmed {
+            // Trimming this view's own notices drops ids the journal never
+            // mentioned, so the sequence is rebuilt either way. No canonical
+            // body moved, so the measurements survive.
+            let mut effects = ReplayEffects::default();
+            self.resync_entries(history, false, &mut effects);
+            self.observe(history);
+            self.settle_cursor(follow);
+            self.finish(history, effects);
+            return;
+        }
+        if !self.replay(history, follow) {
+            self.rebuild(history, follow);
+        }
+    }
+
+    /// Whether the reader is pinned to the newest entry, so a pass that appends
+    /// past it should carry them along.
+    fn follow_state(&self) -> FollowState {
+        FollowState {
+            following: self.scroll_offset == 0,
+            cursor_at_tail: self.entries.is_empty()
+                || self.cursor.is_some_and(|cursor| {
+                    self.entries
+                        .last()
+                        .is_some_and(|entry| entry.id == cursor.entry)
+                }),
+        }
+    }
+
+    /// Seeds and re-pins the cursor after a pass moved entries under it.
+    fn settle_cursor(&mut self, follow: FollowState) {
+        if self.cursor.is_none() && !self.entries.is_empty() {
+            self.cursor = self.entries.last().map(|entry| ViewCursor {
+                entry: entry.id,
+                line: 0,
+            });
+            self.anchor = None;
+        }
+        if follow.following && follow.cursor_at_tail && self.anchor.is_none() {
+            self.cursor = self.entries.last().map(|entry| ViewCursor {
+                entry: entry.id,
+                line: usize::MAX,
+            });
+        }
+    }
+
+    /// Discards every derived id and rebuilds from the canonical sequence, for
+    /// a change the journal could not describe.
+    fn rebuild(&mut self, history: &RoomHistoryRef<'_>, follow: FollowState) {
+        let generation_changed = self.observed_generation != Some(history.generation());
+        if generation_changed {
+            // Ids mean nothing outside their generation, so state derived from
+            // the outgoing one cannot be carried across. A view that has not
+            // observed any generation keeps its pre-connect notices: they were
+            // never bound to a room in the first place.
+            if self.observed_generation.is_some() {
+                self.entries.clear();
+                self.layout_index.clear();
+                self.local_notices.clear();
             }
-            if !content_changed && self.reconcile_edges(history) {
-                return;
+            self.clear_boundary = None;
+            self.scroll_offset = 0;
+            self.cursor = None;
+            self.anchor = None;
+            self.scroll_anchor = None;
+            self.dragging = false;
+        }
+        let mut effects = ReplayEffects::default();
+        // Nothing named which bodies changed, so no measurement can be trusted.
+        self.resync_entries(history, true, &mut effects);
+        self.observe(history);
+        if generation_changed {
+            // A fresh room seeds its cursor on the first navigation or render,
+            // like a newly opened buffer, and snapping to notices it has never
+            // shown would fight the scroll reset above.
+            effects.scroll_bottom = false;
+        } else {
+            self.settle_cursor(follow);
+        }
+        self.finish(history, effects);
+    }
+
+    /// Replays the canonical changes this view has not applied. Returns false
+    /// when the journal no longer covers the span, which demands a rebuild.
+    fn replay(&mut self, history: &RoomHistoryRef<'_>, follow: FollowState) -> bool {
+        let Some(deltas) = history.deltas_since(self.observed_revision) else {
+            return false;
+        };
+        let mut effects = ReplayEffects::default();
+        // A `Relaid` rebuilds from the sequence as it stands *now*, which
+        // already reflects every other delta in the batch — including ones
+        // journaled after it, as a history page that both prepends and splices
+        // does. Applying those on top would insert them a second time, so the
+        // rebuild subsumes the batch and only the bodies it names are re-read.
+        if deltas
+            .clone()
+            .any(|delta| matches!(delta, HistoryDelta::Relaid))
+        {
+            self.resync_entries(history, false, &mut effects);
+            for delta in deltas {
+                match *delta {
+                    HistoryDelta::Replaced(message_id) => {
+                        self.replace_entry(
+                            history,
+                            HistoryEntryId::Message(message_id),
+                            &mut effects,
+                        );
+                        effects.references_dirty = true;
+                    }
+                    HistoryDelta::Appended(_)
+                    | HistoryDelta::Inserted(_)
+                    | HistoryDelta::Tombstoned(_)
+                    | HistoryDelta::EvictedThrough(_) => effects.references_dirty = true,
+                    HistoryDelta::NoticeAdded(_)
+                    | HistoryDelta::NoticeRemoved(_)
+                    | HistoryDelta::Relaid
+                    | HistoryDelta::Relabelled => {}
+                }
+            }
+        } else {
+            for delta in deltas {
+                self.apply_delta(history, delta, &mut effects);
             }
         }
+        self.observe(history);
+        self.settle_cursor(follow);
+        self.finish(history, effects);
+        true
+    }
 
-        let cursor_position = self.cursor.and_then(|cursor| {
-            self.entries
-                .iter()
-                .position(|entry| entry.id == cursor.entry)
-        });
-        let anchor_position = self.anchor.and_then(|anchor| {
-            self.entries
-                .iter()
-                .position(|entry| entry.id == anchor.entry)
-        });
-        let scroll_anchor_position = self.scroll_anchor.and_then(|anchor| {
-            self.entries
-                .iter()
-                .position(|entry| entry.id == anchor.entry)
-        });
-        let was_following = self.scroll_offset == 0;
-        let cursor_was_tail = self.entries.is_empty()
-            || cursor_position.is_some_and(|message| message + 1 == self.entries.len());
+    fn apply_delta(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        delta: &HistoryDelta,
+        effects: &mut ReplayEffects,
+    ) {
+        match *delta {
+            HistoryDelta::Appended(message_id) => {
+                self.insert_entry(history, HistoryEntryId::Message(message_id), None, effects);
+                effects.references_dirty = true;
+            }
+            HistoryDelta::Inserted(message_id) => {
+                let at = self.message_insert_position(message_id);
+                self.insert_entry(
+                    history,
+                    HistoryEntryId::Message(message_id),
+                    Some(at),
+                    effects,
+                );
+                effects.references_dirty = true;
+            }
+            HistoryDelta::Replaced(message_id) => {
+                self.replace_entry(history, HistoryEntryId::Message(message_id), effects);
+                effects.references_dirty = true;
+            }
+            HistoryDelta::Tombstoned(message_id) => {
+                self.remove_entry(HistoryEntryId::Message(message_id), effects);
+                effects.references_dirty = true;
+            }
+            HistoryDelta::EvictedThrough(watermark) => {
+                self.drop_evicted_front(watermark, effects);
+                effects.references_dirty = true;
+            }
+            HistoryDelta::NoticeAdded(key) => {
+                self.insert_entry(history, HistoryEntryId::Notice(key), None, effects);
+            }
+            HistoryDelta::NoticeRemoved(key) => {
+                self.remove_entry(HistoryEntryId::Notice(key), effects);
+            }
+            HistoryDelta::Relaid => {
+                unreachable!("a batch carrying a rebuild is handled whole by replay")
+            }
+            HistoryDelta::Relabelled => {
+                // Marks live in the heading, which the renderer draws from the
+                // record every frame. No body, id or measurement moved.
+                effects.reflow = true;
+            }
+        }
+    }
+
+    /// Rebuilds the id sequence from canonical history, carrying per-entry
+    /// state across for every id that survives.
+    ///
+    /// `remeasure` drops the preserved line counts, for a caller that cannot
+    /// rule out a body having changed unseen.
+    fn resync_entries(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        remeasure: bool,
+        effects: &mut ReplayEffects,
+    ) {
+        let cursor_position = self.cursor.and_then(|cursor| self.entry_index(cursor.entry));
+        let anchor_position = self.anchor.and_then(|anchor| self.entry_index(anchor.entry));
+        let scroll_anchor_position = self
+            .scroll_anchor
+            .and_then(|anchor| self.entry_index(anchor.entry));
         let previous_ids = self
             .entries
             .iter()
             .map(|entry| entry.id)
             .collect::<Vec<_>>();
-        let previous_len = previous_ids.len();
 
-        let preserved_width = (!generation_changed
-            && self.layout_index.valid
-            && self.layout_index.line_counts.len() == self.entries.len())
-        .then_some(self.layout_index.width);
-        let preserved_line_counts =
-            preserved_width.map(|_| std::mem::take(&mut self.layout_index.line_counts));
+        let counts_valid = !remeasure && self.counts_valid();
+        let width = self.layout_index.width;
+        let preserved_counts =
+            counts_valid.then(|| std::mem::take(&mut self.layout_index.line_counts));
         let mut previous = self
             .entries
             .drain(..)
             .enumerate()
             .map(|(index, entry)| {
-                let line_count = preserved_line_counts.as_ref().map(|counts| counts[index]);
-                (entry.id, (entry, line_count))
+                let lines = preserved_counts.as_ref().map(|counts| counts[index]);
+                (entry.id, (entry, lines))
             })
             .collect::<hashbrown::HashMap<_, _>>();
-        if generation_reset {
-            previous.clear();
-            self.local_notices.clear();
+
+        let ids = self.sequence_ids(history);
+        let mut entries = Vec::with_capacity(ids.len());
+        let mut line_counts = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(has_refs) = self.body_has_references(history, id) else {
+                continue;
+            };
+            match previous.remove(&id) {
+                Some((mut entry, lines)) => {
+                    entry.has_refs = has_refs;
+                    entries.push(entry);
+                    line_counts.push(lines);
+                }
+                None => {
+                    if history.notice_scrolls_bottom(id) {
+                        effects.scroll_bottom = true;
+                    }
+                    entries.push(ViewEntry {
+                        id,
+                        expanded: false,
+                        has_refs,
+                        layout: None,
+                    });
+                    line_counts.push(None);
+                }
+            }
         }
-        if generation_changed {
-            self.clear_boundary = None;
+        self.entries = entries;
+        self.room_id = history.room_id();
+
+        // An id that survived keeps its cursor. One that did not hands the
+        // cursor to the nearest survivor, preferring the newer side.
+        let survives = |id: HistoryEntryId| !previous.contains_key(&id);
+        let successor = |id: HistoryEntryId, position: Option<usize>| {
+            survives(id).then_some(id).or_else(|| {
+                remap_missing_entry(&previous_ids, position?, survives)
+            })
+        };
+        self.cursor = self.cursor.and_then(|cursor| {
+            Some(ViewCursor {
+                entry: successor(cursor.entry, cursor_position)?,
+                line: cursor.line,
+            })
+        });
+        self.anchor = self.anchor.and_then(|anchor| {
+            Some(ViewCursor {
+                entry: successor(anchor.entry, anchor_position)?,
+                line: anchor.line,
+            })
+        });
+        self.scroll_anchor = self.scroll_anchor.and_then(|anchor| {
+            Some(ViewScrollAnchor {
+                entry: successor(anchor.entry, scroll_anchor_position)?,
+                line: anchor.line,
+                kind: anchor.kind,
+            })
+        });
+        if counts_valid {
+            self.rebuild_layout_index_from_counts(history, width, line_counts);
+        } else {
+            self.layout_index.invalidate();
         }
+        effects.reflow = true;
+        // The index was just installed from the counts carried across.
+        effects.repack = false;
+    }
+
+    /// The ids this view should display: canonical history with this view's own
+    /// notices threaded in and whatever a `/clear` hid removed.
+    fn sequence_ids(&self, history: &RoomHistoryRef<'_>) -> Vec<HistoryEntryId> {
         let canonical_ids = history.entry_ids();
         let mut ids = Vec::with_capacity(canonical_ids.len() + self.local_notices.len());
         let mut local = self.local_notices.iter().peekable();
@@ -885,143 +1265,233 @@ impl ChatViewport {
         if let Some(boundary) = self.clear_boundary {
             ids.retain(|id| !boundary.hides(*id));
         }
-        let mut messages = Vec::with_capacity(ids.len());
-        let mut preserved_counts = Vec::with_capacity(ids.len());
-        let mut content_changed = false;
-        let mut scroll_bottom = false;
-        for id in ids {
-            let Some(record) = self.resolve_record(history, id) else {
-                continue;
-            };
-            let prior = previous.remove(&record.entry_id);
-            if prior.is_none() && history.notice_scrolls_bottom(record.entry_id) {
-                scroll_bottom = true;
-            }
-            let (mut entry, mut line_count) = prior.unwrap_or((
-                ViewEntry {
-                    id: record.entry_id,
-                    content_revision: record.content_revision,
-                    expanded: false,
-                    layout: None,
-                },
-                None,
-            ));
-            if entry.content_revision != record.content_revision {
-                entry.content_revision = record.content_revision;
-                entry.invalidate_layout();
-                line_count = None;
-                content_changed = true;
-            } else if revision_changed
-                && record
-                    .body
-                    .contains(chatt_message_format::reference::REF_PREFIX)
-            {
-                // Reference pill labels resolve through other canonical
-                // records. A room revision can therefore change this layout
-                // even when this record's own body did not.
-                entry.invalidate_layout();
-                line_count = None;
-            }
-            messages.push(entry);
-            preserved_counts.push(line_count);
-        }
-        let pure_tail_append = !generation_changed
-            && !content_changed
-            && messages.len() > previous_len
-            && messages[..previous_len]
-                .iter()
-                .map(|entry| entry.id)
-                .eq(previous_ids.iter().copied());
-        self.entries = messages;
-        self.room_id = history.room_id();
-        self.observe(history);
+        ids
+    }
 
-        if generation_changed {
-            self.scroll_offset = 0;
-            self.cursor = None;
-            self.anchor = None;
-            self.scroll_anchor = None;
-            self.dragging = false;
-        } else {
-            self.cursor = self.cursor.and_then(|cursor| {
-                if !previous.contains_key(&cursor.entry) {
-                    Some(cursor)
-                } else {
-                    Some(ViewCursor {
-                        entry: remap_missing_entry(&previous_ids, cursor_position?, |id| {
-                            !previous.contains_key(&id)
-                        })?,
-                        line: cursor.line,
-                    })
-                }
-            });
-            self.anchor = self.anchor.and_then(|anchor| {
-                if !previous.contains_key(&anchor.entry) {
-                    Some(anchor)
-                } else {
-                    Some(ViewCursor {
-                        entry: remap_missing_entry(&previous_ids, anchor_position?, |id| {
-                            !previous.contains_key(&id)
-                        })?,
-                        line: anchor.line,
-                    })
-                }
-            });
-            self.scroll_anchor = self.scroll_anchor.and_then(|anchor| {
-                if !previous.contains_key(&anchor.entry) {
-                    Some(anchor)
-                } else {
-                    Some(ViewScrollAnchor {
-                        entry: remap_missing_entry(&previous_ids, scroll_anchor_position?, |id| {
-                            !previous.contains_key(&id)
-                        })?,
-                        line: anchor.line,
-                        kind: anchor.kind,
-                    })
-                }
-            });
-            if self.cursor.is_none() && !self.entries.is_empty() {
-                self.cursor = Some(ViewCursor {
-                    entry: self.entries.last().expect("nonempty").id,
-                    line: 0,
-                });
-                self.anchor = None;
-            }
-            if was_following && cursor_was_tail && self.anchor.is_none() {
-                self.cursor = self.entries.last().map(|entry| ViewCursor {
-                    entry: entry.id,
-                    line: usize::MAX,
-                });
-            }
-        }
-        if let Some(width) = preserved_width {
-            self.rebuild_layout_index_from_counts(history, width, preserved_counts);
-        } else {
-            self.layout_index.invalidate();
-        }
-        if !pure_tail_append {
-            self.bump_layout_epoch();
-        }
-        if scroll_bottom {
-            self.bottom();
-        }
+    /// Whether `id` resolves to a displayable record, and whether its body
+    /// carries a message reference. `None` means the id has no visible record —
+    /// a tombstone, or an entry this view's `/clear` hid.
+    fn body_has_references(
+        &self,
+        history: &RoomHistoryRef<'_>,
+        id: HistoryEntryId,
+    ) -> Option<bool> {
+        self.resolve_record(history, id).map(|record| {
+            record
+                .body
+                .contains(chatt_message_format::reference::REF_PREFIX)
+        })
     }
 
     /// Records the canonical position this view has caught up to.
     fn observe(&mut self, history: &RoomHistoryRef<'_>) {
         self.observed_generation = Some(history.generation());
-        self.observed_content_revision = history.content_revision();
-        self.observed_order_revision = history.order_revision();
-        self.observed_reindex_revision = history.reindex_revision();
-        self.observed_tail = history.tail_message_id();
-        self.observed_evicted_through = history.evicted_through();
+        self.observed_revision = history.revision();
     }
 
-    /// Catches up after canonical changes that only touched the ends of the id
-    /// sequence: retention dropping a leading prefix, tail appends, or both.
-    fn reconcile_edges(&mut self, history: &RoomHistoryRef<'_>) -> bool {
-        self.drop_evicted_front(history);
-        self.reconcile_tail_appends(history)
+    /// Whether the row index's per-entry line counts still line up with the
+    /// entries they measure.
+    fn counts_valid(&self) -> bool {
+        self.layout_index.valid && self.layout_index.line_counts.len() == self.entries.len()
+    }
+
+    /// Applies whatever the replayed deltas left outstanding: reference pill
+    /// labels that resolve through changed records, a block repack from the
+    /// carried line counts, and the render-side epoch.
+    fn finish(&mut self, history: &RoomHistoryRef<'_>, mut effects: ReplayEffects) {
+        if effects.references_dirty {
+            self.remeasure_reference_bodies(history, &mut effects);
+        }
+        if effects.repack {
+            if self.counts_valid() {
+                let line_counts = std::mem::take(&mut self.layout_index.line_counts);
+                self.install_layout_index(history, line_counts);
+            } else {
+                self.layout_index.invalidate();
+            }
+        }
+        if effects.reflow {
+            self.bump_layout_epoch();
+        }
+        if effects.scroll_bottom {
+            self.bottom();
+        }
+    }
+
+    /// Re-lays the bodies whose reference pills resolve through canonical
+    /// records that just changed.
+    ///
+    /// A pill's label comes from *another* message, so an append, edit,
+    /// tombstone or eviction can change the rendered width of a body whose own
+    /// text never moved. Only bodies flagged as carrying a reference are
+    /// touched, so a room with none pays a bool scan.
+    fn remeasure_reference_bodies(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        effects: &mut ReplayEffects,
+    ) {
+        if !self.entries.iter().any(|entry| entry.has_refs) {
+            return;
+        }
+        let counts_valid = self.counts_valid();
+        let width = self.layout_index.width;
+        for index in 0..self.entries.len() {
+            if !self.entries[index].has_refs {
+                continue;
+            }
+            self.entries[index].invalidate_layout();
+            if !counts_valid {
+                continue;
+            }
+            let lines = self.ensure_lines(history, index, width);
+            #[cfg(test)]
+            {
+                self.layout_index.measured_messages += 1;
+            }
+            self.layout_index.line_counts[index] = lines;
+            // The visible pass repopulates its own bounded window; a layout
+            // built only to recover a row count may be anywhere in history.
+            self.entries[index].layout = None;
+            effects.repack = true;
+        }
+        if !counts_valid {
+            self.layout_index.invalidate();
+        }
+        effects.reflow = true;
+    }
+
+    /// Where a message threaded into canonical history lands among this view's
+    /// entries: ahead of the first newer message.
+    ///
+    /// Notices anchored under an older message sort above the newcomer, which
+    /// is exactly where leaving them put in place leaves them.
+    fn message_insert_position(&self, message_id: MessageId) -> usize {
+        self.entries
+            .iter()
+            .position(|entry| matches!(entry.id, HistoryEntryId::Message(id) if id > message_id))
+            .unwrap_or(self.entries.len())
+    }
+
+    /// Materializes one canonical id. `at` is `None` for the tail, which is
+    /// where appends and notices always land.
+    fn insert_entry(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        id: HistoryEntryId,
+        at: Option<usize>,
+        effects: &mut ReplayEffects,
+    ) {
+        if self.clear_boundary.is_some_and(|boundary| boundary.hides(id)) {
+            return;
+        }
+        // A tombstone lands in the canonical log but has no visible record.
+        let Some(has_refs) = self.body_has_references(history, id) else {
+            return;
+        };
+        if history.notice_scrolls_bottom(id) {
+            effects.scroll_bottom = true;
+        }
+        let entry = ViewEntry {
+            id,
+            expanded: false,
+            has_refs,
+            layout: None,
+        };
+        let Some(index) = at.filter(|index| *index < self.entries.len()) else {
+            let append_index = self.entries.len();
+            self.entries.push(entry);
+            self.repair_layout_index_after_append(append_index, history);
+            // Rows already on screen keep their positions, so the renderer may
+            // scroll rather than rewrite: deliberately no reflow.
+            return;
+        };
+        let counts_valid = self.counts_valid();
+        self.entries.insert(index, entry);
+        if counts_valid {
+            let width = self.layout_index.width;
+            let lines = self.ensure_lines(history, index, width);
+            self.entries[index].layout = None;
+            self.layout_index.line_counts.insert(index, lines);
+            effects.repack = true;
+        } else {
+            self.layout_index.invalidate();
+        }
+        effects.reflow = true;
+    }
+
+    /// Re-reads one record whose body or labelling was replaced in place.
+    fn replace_entry(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        id: HistoryEntryId,
+        effects: &mut ReplayEffects,
+    ) {
+        let Some(index) = self.entry_index(id) else {
+            return;
+        };
+        // An edit folding into an already-tombstoned target leaves nothing to
+        // show; the entry goes with it.
+        let Some(has_refs) = self.body_has_references(history, id) else {
+            self.remove_entry_at(index, id, effects);
+            return;
+        };
+        let counts_valid = self.counts_valid();
+        let entry = &mut self.entries[index];
+        entry.has_refs = has_refs;
+        entry.invalidate_layout();
+        if counts_valid {
+            let width = self.layout_index.width;
+            let lines = self.ensure_lines(history, index, width);
+            #[cfg(test)]
+            {
+                self.layout_index.measured_messages += 1;
+            }
+            self.entries[index].layout = None;
+            self.layout_index.line_counts[index] = lines;
+            effects.repack = true;
+        } else {
+            self.layout_index.invalidate();
+        }
+        effects.reflow = true;
+    }
+
+    fn remove_entry(&mut self, id: HistoryEntryId, effects: &mut ReplayEffects) {
+        let Some(index) = self.entry_index(id) else {
+            return;
+        };
+        self.remove_entry_at(index, id, effects);
+    }
+
+    fn remove_entry_at(
+        &mut self,
+        index: usize,
+        id: HistoryEntryId,
+        effects: &mut ReplayEffects,
+    ) {
+        let counts_valid = self.counts_valid();
+        self.entries.remove(index);
+        if counts_valid {
+            self.layout_index.line_counts.remove(index);
+            effects.repack = true;
+        } else {
+            self.layout_index.invalidate();
+        }
+        // Prefer the newer survivor, matching what a rebuild would pick, so a
+        // reader whose cursor sat on a deleted message keeps moving forward.
+        let replacement = self
+            .entries
+            .get(index)
+            .or_else(|| index.checked_sub(1).and_then(|prev| self.entries.get(prev)))
+            .map(|entry| entry.id);
+        for cursor in [&mut self.cursor, &mut self.anchor] {
+            if cursor.is_some_and(|current| current.entry == id) {
+                *cursor = replacement.map(|entry| ViewCursor { entry, line: 0 });
+            }
+        }
+        if self.scroll_anchor.is_some_and(|anchor| anchor.entry == id) {
+            self.scroll_anchor = None;
+        }
+        effects.reflow = true;
     }
 
     /// Applies the canonical retention watermark to this view's leading
@@ -1032,17 +1502,8 @@ impl ChatViewport {
     /// already measured — no body is laid out again. Notices anchored among the
     /// evicted messages stay: they are retained independently of the message
     /// log.
-    fn drop_evicted_front(&mut self, history: &RoomHistoryRef<'_>) {
-        let watermark = history.evicted_through();
-        if self.observed_evicted_through == watermark {
-            return;
-        }
-        self.observed_evicted_through = watermark;
-        let Some(watermark) = watermark else {
-            return;
-        };
-        let counts_valid = self.layout_index.valid
-            && self.layout_index.line_counts.len() == self.entries.len();
+    fn drop_evicted_front(&mut self, watermark: MessageId, effects: &mut ReplayEffects) {
+        let counts_valid = self.counts_valid();
         let mut kept = 0usize;
         for index in 0..self.entries.len() {
             if matches!(self.entries[index].id, HistoryEntryId::Message(id) if id <= watermark) {
@@ -1075,115 +1536,11 @@ impl ChatViewport {
         }
         if counts_valid {
             self.layout_index.line_counts.truncate(kept);
-            let line_counts = std::mem::take(&mut self.layout_index.line_counts);
-            self.install_layout_index(history, line_counts);
+            effects.repack = true;
         } else {
             self.layout_index.invalidate();
         }
-        self.bump_layout_epoch();
-    }
-
-    /// Catches up after canonical changes that replaced bodies in place: an
-    /// edit folding in, or provenance arriving for an already-displayed
-    /// message. Every id keeps its position, so only the records whose content
-    /// revision moved are re-read and re-measured.
-    fn reconcile_content(&mut self, history: &RoomHistoryRef<'_>) {
-        let counts_valid = self.layout_index.valid
-            && self.layout_index.line_counts.len() == self.entries.len();
-        let width = self.layout_index.width;
-        let mut remeasure = false;
-        for index in 0..self.entries.len() {
-            let id = self.entries[index].id;
-            let Some((content_revision, has_refs)) = self.resolve_record(history, id).map(|record| {
-                (
-                    record.content_revision,
-                    record
-                        .body
-                        .contains(chatt_message_format::reference::REF_PREFIX),
-                )
-            }) else {
-                continue;
-            };
-            let entry = &mut self.entries[index];
-            // Reference pill labels resolve through other canonical records, so
-            // a body carrying one can need a fresh layout even when its own
-            // content revision held.
-            if entry.content_revision == content_revision && !has_refs {
-                continue;
-            }
-            entry.content_revision = content_revision;
-            entry.invalidate_layout();
-            if counts_valid {
-                let lines = self.ensure_lines(history, index, width);
-                #[cfg(test)]
-                {
-                    self.layout_index.measured_messages += 1;
-                }
-                self.layout_index.line_counts[index] = lines;
-                // The visible pass repopulates its own bounded window; a layout
-                // built only to recover a row count may be anywhere in history.
-                self.entries[index].layout = None;
-                remeasure = true;
-            }
-        }
-        self.observe(history);
-        if !counts_valid {
-            self.layout_index.invalidate();
-        } else if remeasure {
-            // Grouping reads sender, edit marker and line count, so the blocks
-            // are repacked — but from counts, without laying out untouched
-            // bodies again.
-            let line_counts = std::mem::take(&mut self.layout_index.line_counts);
-            self.install_layout_index(history, line_counts);
-            self.bump_layout_epoch();
-        }
-    }
-
-    /// Catches up after one or more non-evicting canonical tail appends. No
-    /// existing id or payload can have changed while the reindex revision is
-    /// stable, so rebuilding the full id list or row index would be wasted
-    /// work for every attached terminal.
-    fn reconcile_tail_appends(&mut self, history: &RoomHistoryRef<'_>) -> bool {
-        let Some(ids) = history.tail_entry_ids(self.observed_tail) else {
-            return false;
-        };
-        let was_following = self.scroll_offset == 0;
-        let cursor_was_tail = self.entries.is_empty()
-            || self.cursor.is_some_and(|cursor| {
-                self.entries
-                    .last()
-                    .is_some_and(|entry| entry.id == cursor.entry)
-            });
-        for id in ids {
-            let Some(record) = history.record(id) else {
-                return false;
-            };
-            let append_index = self.entries.len();
-            self.entries.push(ViewEntry {
-                id: record.entry_id,
-                content_revision: record.content_revision,
-                expanded: false,
-                layout: None,
-            });
-            self.repair_layout_index_after_append(append_index, history);
-        }
-        self.room_id = history.room_id();
-        self.observe(history);
-
-        if self.cursor.is_none() && !self.entries.is_empty() {
-            self.cursor = self.entries.last().map(|entry| ViewCursor {
-                entry: entry.id,
-                line: 0,
-            });
-            self.anchor = None;
-        }
-        if was_following && cursor_was_tail && self.anchor.is_none() {
-            self.cursor = self.entries.last().map(|entry| ViewCursor {
-                entry: entry.id,
-                line: usize::MAX,
-            });
-        }
-        true
+        effects.reflow = true;
     }
 
     fn resolve_record<'a>(
@@ -1203,7 +1560,6 @@ impl ChatViewport {
                 edited: false,
                 file_transfer_id: None,
                 notice_kind: Some(notice.kind),
-                content_revision: id.0,
             });
         }
         history.record(id)
@@ -1289,10 +1645,12 @@ impl ChatViewport {
             HistoryEntryId::Message(id) => Some(id),
             HistoryEntryId::Notice(_) | HistoryEntryId::LocalNotice(_) => None,
         });
+        let body = body.into();
+        let has_refs = body.contains(chatt_message_format::reference::REF_PREFIX);
         self.local_notices.push(LocalNotice {
             id,
             sender: sender.into(),
-            body: body.into(),
+            body,
             kind,
             after,
         });
@@ -1303,8 +1661,8 @@ impl ChatViewport {
         }
         self.entries.push(ViewEntry {
             id: HistoryEntryId::LocalNotice(id),
-            content_revision: id.0,
             expanded: false,
+            has_refs,
             layout: None,
         });
         self.layout_index.invalidate();
@@ -1413,7 +1771,6 @@ impl ChatViewport {
             edited: false,
             file_transfer_id: None,
             notice_kind: Some(notice.kind),
-            content_revision: id.0,
         })
     }
 
