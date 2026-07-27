@@ -1,9 +1,11 @@
 use hashbrown::HashSet;
 use std::{
+    fmt,
     fs::{self, File, OpenOptions},
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use aws_lc_rs::{digest, rand::SecureRandom, signature::KeyPair};
@@ -32,18 +34,90 @@ pub const FIRST_DYNAMIC_ROOM_ID: u32 = 0x8000_0000;
 /// `memory-limit`.
 pub const DEFAULT_MEMORY_HISTORY_LIMIT: usize = 512;
 
-#[derive(Clone, Copy, Debug)]
+/// Most addresses one transport may bind. The voice relay tracks per-socket
+/// readiness in a `u64` bitmask keyed by bind index, so this bound is
+/// load-bearing there rather than a bare sanity limit.
+pub const MAX_BIND_ADDRS: usize = 32;
+
+/// The addresses one transport listens on, parsed from a comma-separated list.
+/// Never empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindAddrs(Vec<SocketAddr>);
+
+impl BindAddrs {
+    /// The address invite tickets advertise and public endpoints fall back to.
+    pub fn first(&self) -> SocketAddr {
+        self.0[0]
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = SocketAddr> + '_ {
+        self.0.iter().copied()
+    }
+}
+
+impl From<SocketAddr> for BindAddrs {
+    fn from(addr: SocketAddr) -> Self {
+        Self(vec![addr])
+    }
+}
+
+impl FromStr for BindAddrs {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut addrs = Vec::new();
+        for (index, field) in value.split(',').enumerate() {
+            let field = field.trim();
+            if field.is_empty() {
+                return Err(format!("bind address {} is empty", index + 1));
+            }
+            let addr = field
+                .parse::<SocketAddr>()
+                .map_err(|error| format!("invalid bind address {}: {error}", index + 1))?;
+            if addrs.len() == MAX_BIND_ADDRS {
+                return Err(format!(
+                    "at most {MAX_BIND_ADDRS} bind addresses are supported"
+                ));
+            }
+            // Port 0 asks the OS for an ephemeral port, so a repeat is a
+            // distinct socket rather than a duplicate.
+            if addr.port() != 0 && addrs.contains(&addr) {
+                return Err(format!("duplicate bind address {addr}"));
+            }
+            addrs.push(addr);
+        }
+        Ok(Self(addrs))
+    }
+}
+
+impl fmt::Display for BindAddrs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, addr) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(",")?;
+            }
+            addr.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Binds {
-    pub tcp: SocketAddr,
-    pub udp: SocketAddr,
+    pub tcp: BindAddrs,
+    pub udp: BindAddrs,
 }
 
 impl Default for Binds {
     fn default() -> Self {
         let addr = default_listen_addr();
         Self {
-            tcp: addr,
-            udp: addr,
+            tcp: addr.into(),
+            udp: addr.into(),
         }
     }
 }
@@ -51,16 +125,16 @@ impl Default for Binds {
 impl<'de> FromToml<'de> for Binds {
     fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
         if item.as_str().is_some() {
-            let addr = toml_spanner::helper::parse_string::from_toml(ctx, item)?;
+            let addr: BindAddrs = toml_spanner::helper::parse_string::from_toml(ctx, item)?;
             return Ok(Self {
-                tcp: addr,
+                tcp: addr.clone(),
                 udp: addr,
             });
         }
 
         let mut table = item.table_helper(ctx)?;
-        let tcp = table.required_mapped("tcp", Item::parse::<SocketAddr>)?;
-        let udp = table.required_mapped("udp", Item::parse::<SocketAddr>)?;
+        let tcp = table.required_mapped("tcp", Item::parse::<BindAddrs>)?;
+        let udp = table.required_mapped("udp", Item::parse::<BindAddrs>)?;
         table.require_empty()?;
         Ok(Self { tcp, udp })
     }
@@ -416,24 +490,24 @@ macro_rules! optional_string_setter {
 }
 
 fn set_network_bind(config: &mut Config, value: &str) -> Result<(), String> {
-    let addr = value
-        .parse::<SocketAddr>()
+    let addrs = value
+        .parse::<BindAddrs>()
         .map_err(|error| format!("invalid value for --network.bind: {error}"))?;
     config.network.bind = Binds {
-        tcp: addr,
-        udp: addr,
+        tcp: addrs.clone(),
+        udp: addrs,
     };
     Ok(())
 }
 fn set_network_bind_tcp(config: &mut Config, value: &str) -> Result<(), String> {
     config.network.bind.tcp = value
-        .parse::<SocketAddr>()
+        .parse::<BindAddrs>()
         .map_err(|error| format!("invalid value for --network.bind.tcp: {error}"))?;
     Ok(())
 }
 fn set_network_bind_udp(config: &mut Config, value: &str) -> Result<(), String> {
     config.network.bind.udp = value
-        .parse::<SocketAddr>()
+        .parse::<BindAddrs>()
         .map_err(|error| format!("invalid value for --network.bind.udp: {error}"))?;
     Ok(())
 }
@@ -548,19 +622,19 @@ pub(crate) const CONFIG_OPTION_SPECS: &[ConfigOptionSpec] = &[
     ConfigOptionSpec {
         name: "network.bind",
         value_name: "ADDR",
-        description: "TCP and UDP bind address",
+        description: "comma-separated TCP and UDP bind addresses",
         apply: set_network_bind,
     },
     ConfigOptionSpec {
         name: "network.bind.tcp",
         value_name: "ADDR",
-        description: "TCP bind address",
+        description: "comma-separated TCP bind addresses",
         apply: set_network_bind_tcp,
     },
     ConfigOptionSpec {
         name: "network.bind.udp",
         value_name: "ADDR",
-        description: "UDP media bind address",
+        description: "comma-separated UDP media bind addresses",
         apply: set_network_bind_udp,
     },
     ConfigOptionSpec {
@@ -815,14 +889,19 @@ pub fn generated_template_config() -> Result<String, String> {
 [network]
 # Bind addresses on this host.
 bind = "{listen_addr}"
+# Separate multiple bind addresses with commas, up to 32 per transport, to
+# reach clients over more than one network path. Clients that pair by address
+# keep the address they dialed; when UDP differs they must set it in their
+# client server editor. Only invites use `public-addr` below.
 # To use different transport addresses, replace `bind` above with:
 # bind.tcp = "127.0.0.1:41000"
 # bind.udp = "127.0.0.1:41000"
 # Optional UDP socket used for P2P path probes.
 # udp-probe-addr = "127.0.0.1:41001"
 
-# Public endpoints embedded in invites and returned during open pairing. Set
-# these when clients need a DNS name, reverse proxy port, or forwarded NAT port.
+# Public endpoints embedded in invites, derived from the first bind address of
+# each transport. Set these when invited clients need a DNS name, reverse proxy
+# port, or forwarded NAT port.
 # public-addr = "chat.example.com:41000"
 # To advertise different transport endpoints, use:
 # public-addr.tcp = "chat.example.com:41000"
@@ -1038,12 +1117,14 @@ impl Config {
         }
         self.network.public_addr.tcp = self.network.public_addr.tcp.trim().to_string();
         if self.network.public_addr.tcp.is_empty() {
-            self.network.public_addr.tcp = self.network.bind.tcp.to_string();
+            self.network.public_addr.tcp = self.network.bind.tcp.first().to_string();
         }
         self.network.public_addr.udp = self.network.public_addr.udp.trim().to_string();
         if self.network.public_addr.udp.is_empty() {
-            self.network.public_addr.udp =
-                public_endpoint_for_bind_addr(self.network.bind.udp, &self.network.public_addr.tcp);
+            self.network.public_addr.udp = public_endpoint_for_bind_addr(
+                self.network.bind.udp.first(),
+                &self.network.public_addr.tcp,
+            );
         }
         let public_udp_probe_addr = self
             .network
@@ -1901,6 +1982,81 @@ mod tests {
         assert_eq!(
             config.network.udp_probe_addr.map(|addr| addr.to_string()),
             Some("127.0.0.1:42002".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_comma_separated_binds_and_uses_first_as_public_fallback() {
+        let content = config_content("").replace(
+            "bind = \"127.0.0.1:41000\"",
+            "bind.tcp = \"127.0.0.1:42000, 127.0.0.2:42001\"\n\
+             bind.udp = \"127.0.0.3:42002,127.0.0.4:42003\"",
+        );
+
+        let config = parse(&content).unwrap();
+
+        assert_eq!(
+            config.network.bind.tcp.to_string(),
+            "127.0.0.1:42000,127.0.0.2:42001"
+        );
+        assert_eq!(
+            config.network.bind.udp.to_string(),
+            "127.0.0.3:42002,127.0.0.4:42003"
+        );
+        assert_eq!(config.network.public_addr.tcp, "127.0.0.1:42000");
+        assert_eq!(config.network.public_addr.udp, "127.0.0.3:42002");
+    }
+
+    #[test]
+    fn comma_separated_bind_rejects_empty_entries() {
+        let content =
+            config_content("").replace("127.0.0.1:41000", "127.0.0.1:41000,,127.0.0.2:41000");
+
+        let error = parse(&content).unwrap_err();
+
+        assert!(error.contains("bind address 2 is empty"), "{error}");
+    }
+
+    #[test]
+    fn bind_rejects_more_addresses_than_the_readiness_bitmask_holds() {
+        let addrs = (0..=MAX_BIND_ADDRS)
+            .map(|index| format!("127.0.0.1:{}", 41000 + index))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let error = addrs.parse::<BindAddrs>().unwrap_err();
+
+        assert!(
+            error.contains(&format!("at most {MAX_BIND_ADDRS} bind addresses")),
+            "{error}"
+        );
+        assert!(
+            addrs
+                .rsplit_once(',')
+                .unwrap()
+                .0
+                .parse::<BindAddrs>()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn bind_rejects_repeated_addresses_but_allows_repeated_ephemeral_ports() {
+        let error = "127.0.0.1:41000,127.0.0.1:41000"
+            .parse::<BindAddrs>()
+            .unwrap_err();
+
+        assert!(
+            error.contains("duplicate bind address 127.0.0.1:41000"),
+            "{error}"
+        );
+        // Port 0 asks the OS for a fresh port each time, so it is not a repeat.
+        assert_eq!(
+            "127.0.0.1:0,127.0.0.1:0"
+                .parse::<BindAddrs>()
+                .unwrap()
+                .len(),
+            2
         );
     }
 

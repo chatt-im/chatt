@@ -854,8 +854,6 @@ pub(crate) enum PairingEvent {
     OpenSucceeded {
         token: String,
         server_public_key: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
     },
     OpenNeedsPassword {
         retry: bool,
@@ -864,8 +862,6 @@ pub(crate) enum PairingEvent {
     DeviceSucceeded {
         token: String,
         username: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
         server_public_key: String,
     },
     DeviceIdentityExists {
@@ -1071,15 +1067,11 @@ pub fn spawn_device_pair_once(
                 overwrite_existing,
                 &cancellation,
             ) {
-                Ok((token, username, udp_addr, udp_probe_addr, server_public_key)) => {
-                    PairingEvent::DeviceSucceeded {
-                        token,
-                        username,
-                        udp_addr,
-                        udp_probe_addr,
-                        server_public_key,
-                    }
-                }
+                Ok((token, username, server_public_key)) => PairingEvent::DeviceSucceeded {
+                    token,
+                    username,
+                    server_public_key,
+                },
                 Err(DevicePairFailure::IdentityExists { message }) => {
                     PairingEvent::DeviceIdentityExists { message }
                 }
@@ -1097,7 +1089,7 @@ fn device_pair_once(
     device_name: &str,
     overwrite_existing: bool,
     cancellation: &AtomicU8,
-) -> Result<(String, String, String, Option<String>, String), DevicePairFailure> {
+) -> Result<(String, String, String), DevicePairFailure> {
     let (mut stream, transport, trusted) = connect_and_handshake(config, false)?;
     let secrets = crate::device_link::derive_pairing_secrets(&ticket.pairing_secret, &trusted)?;
     let redemption_secret = secrets.redemption_secret.as_str();
@@ -1264,8 +1256,6 @@ fn device_pair_once(
             ServerControl::DeviceLinked {
                 token,
                 username: linked_username,
-                udp_addr,
-                udp_probe_addr,
                 user_id: linked_user_id,
                 ..
             } => {
@@ -1280,13 +1270,7 @@ fn device_pair_once(
                         .into());
                 }
                 installation.mark_pair_active()?;
-                return Ok((
-                    token,
-                    username,
-                    udp_addr,
-                    udp_probe_addr,
-                    encode_hex(&trusted),
-                ));
+                return Ok((token, username, encode_hex(&trusted)));
             }
             ServerControl::Error { message, .. } => return Err(message.into()),
             _ => {}
@@ -1298,8 +1282,6 @@ enum OpenPairOutcome {
     Paired {
         token: String,
         server_public_key: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
     },
     NeedsPassword {
         retry: bool,
@@ -1346,17 +1328,10 @@ fn open_pair_once(
             Err(error) => return OpenPairOutcome::Failed(error.to_string()),
         };
         match decode_server_control(&plaintext) {
-            Ok(ServerControl::OpenPaired {
-                token,
-                udp_addr,
-                udp_probe_addr,
-                ..
-            }) => {
+            Ok(ServerControl::OpenPaired { token, .. }) => {
                 return OpenPairOutcome::Paired {
                     token,
                     server_public_key: encode_hex(&trusted),
-                    udp_addr,
-                    udp_probe_addr,
                 };
             }
             Ok(ServerControl::Error { code, message }) => {
@@ -1393,13 +1368,9 @@ pub fn spawn_open_pair_once(
                 OpenPairOutcome::Paired {
                     token,
                     server_public_key,
-                    udp_addr,
-                    udp_probe_addr,
                 } => PairingEvent::OpenSucceeded {
                     token,
                     server_public_key,
-                    udp_addr,
-                    udp_probe_addr,
                 },
                 OpenPairOutcome::NeedsPassword {
                     retry,

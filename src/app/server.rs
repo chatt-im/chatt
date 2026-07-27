@@ -468,7 +468,9 @@ fn server_edit_ui(
         form.set_help("TCP control address for login, room state, and chat messages.");
     }
     if form.text("UDP", values.udp_addr, |_| None).is_focus() {
-        form.set_help("UDP media relay address. Empty uses the TCP address host and port.");
+        form.set_help(
+            "UDP media relay address. Empty uses TCP; set this when its host or port differs.",
+        );
     }
     if form
         .text("Probe", values.udp_probe_addr, |_| None)

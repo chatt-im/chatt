@@ -425,8 +425,6 @@ fn pair_device(
             PairingEvent::DeviceSucceeded {
                 token,
                 username,
-                udp_addr,
-                udp_probe_addr,
                 server_public_key,
             },
         ..
@@ -436,8 +434,6 @@ fn pair_device(
     };
     pair_config.token = token;
     pair_config.username = username;
-    pair_config.udp_addr = udp_addr;
-    pair_config.udp_probe_addr = udp_probe_addr;
     pair_config.server_public_key = Some(server_public_key);
     let client = spawn(pair_config.clone());
     let device_id = wait_authenticated(&client, device_name);
@@ -1759,8 +1755,6 @@ fn mls_live_pair_response_loss_reconciles_exact_device() {
             PairingEvent::DeviceSucceeded {
                 token,
                 username,
-                udp_addr,
-                udp_probe_addr,
                 server_public_key,
             },
         ..
@@ -1770,8 +1764,6 @@ fn mls_live_pair_response_loss_reconciles_exact_device() {
     };
     pair_config.token = token;
     pair_config.username = username;
-    pair_config.udp_addr = udp_addr;
-    pair_config.udp_probe_addr = udp_probe_addr;
     pair_config.server_public_key = Some(server_public_key);
     let linked = spawn(pair_config);
     let linked_device = wait_authenticated(&linked, "pair response loss linked recovery");

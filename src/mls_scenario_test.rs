@@ -642,8 +642,8 @@ fn scenario_server_config(
 }
 
 fn bind_scenario_server(config: ServerConfig) -> Result<Server, String> {
-    let tcp = config.network.bind.tcp;
-    let udp = config.network.bind.udp;
+    let tcp = config.network.bind.tcp.clone();
+    let udp = config.network.bind.udp.clone();
     Server::bind(config)
         .map_err(|error| format!("binding scenario server at TCP {tcp} and UDP {udp}: {error}"))
 }
@@ -1727,16 +1727,12 @@ impl ScenarioRunner {
                     PairingEvent::DeviceSucceeded {
                         token,
                         username,
-                        udp_addr,
-                        udp_probe_addr,
                         server_public_key,
                     },
                 ..
             } => {
                 config.token = token;
                 config.username = username;
-                config.udp_addr = udp_addr;
-                config.udp_probe_addr = udp_probe_addr;
                 config.server_public_key = Some(server_public_key);
                 let runtime = spawn_live_client(config.clone())?;
                 Ok((config, runtime))

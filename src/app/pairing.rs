@@ -428,29 +428,26 @@ impl PairingCoordinator {
     ) {
         match event {
             PairingEvent::InviteSucceeded => self.commit(app, attempt, owner, pending, false),
+            // Media endpoints are not taken from the server: it cannot know
+            // which of its binds this client can route to, nor its own mapped
+            // port behind NAT. `udp_addr` keeps whatever the entry already had
+            // — the invite ticket's operator-declared endpoint, or empty, which
+            // falls back to the control address the user dialed.
             PairingEvent::OpenSucceeded {
                 token,
                 server_public_key,
-                udp_addr,
-                udp_probe_addr,
             } => {
                 pending.server.token = token;
                 pending.server.server_public_key = server_public_key;
-                pending.server.udp_addr = udp_addr;
-                pending.server.udp_probe_addr = udp_probe_addr;
                 self.commit(app, attempt, owner, pending, true);
             }
             PairingEvent::DeviceSucceeded {
                 token,
                 username,
-                udp_addr,
-                udp_probe_addr,
                 server_public_key,
             } => {
                 pending.server.token = token;
                 pending.server.username = username;
-                pending.server.udp_addr = udp_addr;
-                pending.server.udp_probe_addr = udp_probe_addr;
                 pending.server.server_public_key = server_public_key;
                 self.commit(app, attempt, owner, pending, true);
             }
