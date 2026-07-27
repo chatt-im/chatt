@@ -261,6 +261,29 @@ impl Default for StorageConfig {
     }
 }
 
+/// Operator policy for direct-message rooms.
+#[derive(Clone, Debug, Toml)]
+#[toml(FromToml, rename_all = "kebab-case")]
+pub struct DmConfig {
+    /// Whether users may open new DM rooms. Rooms opened before this was
+    /// cleared stay listed and keep accepting messages.
+    #[toml(default = true)]
+    pub enabled: bool,
+    /// Maximum offline MLS replay period for DM rooms. When absent the global
+    /// [`StorageConfig::mls_retention_days`] applies.
+    #[toml(default)]
+    pub retention_days: Option<u16>,
+}
+
+impl Default for DmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: None,
+        }
+    }
+}
+
 /// One record in the server-managed user registry (see
 /// [`crate::user_store::UserStore`]).
 #[derive(Clone, Debug, Toml)]
@@ -309,6 +332,8 @@ pub struct Config {
     pub security: SecurityConfig,
     #[toml(default)]
     pub storage: StorageConfig,
+    #[toml(default)]
+    pub dm: DmConfig,
     #[toml(default = default_rooms())]
     pub rooms: Vec<RoomConfig>,
     #[toml(skip)]
@@ -497,6 +522,14 @@ scalar_parse_setter!(
     "storage.mls-compaction-min-fragmented-percent"
 );
 
+scalar_parse_setter!(set_dm_enabled, dm.enabled, bool, "dm.enabled");
+optional_parse_setter!(
+    set_dm_retention_days,
+    dm.retention_days,
+    u16,
+    "dm.retention-days"
+);
+
 pub(crate) const CONFIG_OPTION_SPECS: &[ConfigOptionSpec] = &[
     ConfigOptionSpec {
         name: "network.bind",
@@ -630,6 +663,18 @@ pub(crate) const CONFIG_OPTION_SPECS: &[ConfigOptionSpec] = &[
         description: "minimum fragmentation percentage before MLS compaction",
         apply: set_storage_mls_compaction_min_fragmented_percent,
     },
+    ConfigOptionSpec {
+        name: "dm.enabled",
+        value_name: "BOOL",
+        description: "allow users to open new direct-message rooms",
+        apply: set_dm_enabled,
+    },
+    ConfigOptionSpec {
+        name: "dm.retention-days",
+        value_name: "DAYS",
+        description: "MLS replay retention for DM rooms; empty uses the storage default",
+        apply: set_dm_retention_days,
+    },
 ];
 
 fn config_option_spec(name: &str) -> Option<&'static ConfigOptionSpec> {
@@ -642,6 +687,7 @@ impl Default for Config {
             network: NetworkConfig::default(),
             security: SecurityConfig::default(),
             storage: StorageConfig::default(),
+            dm: DmConfig::default(),
             rooms: default_rooms(),
             config_path: None,
         };
@@ -796,6 +842,14 @@ password-epoch = 0
 # mls-compaction-min-fragmented-mib = 256
 # mls-compaction-min-fragmented-percent = 25
 
+[dm]
+# Whether users may open new direct-message rooms. Rooms opened before this was
+# cleared stay listed and keep accepting messages.
+enabled = true
+# How long the server holds a DM room's undelivered MLS events for devices that
+# are offline. Defaults to storage.mls-retention-days.
+# retention-days = 90
+
 [[rooms]]
 id = 1
 name = "lobby"
@@ -886,6 +940,14 @@ impl Config {
 
     pub fn password_epoch(&self) -> u32 {
         self.security.password_epoch
+    }
+
+    /// Offline MLS replay window applied to DM rooms: the `[dm]` override when
+    /// set, otherwise the global storage default.
+    pub fn dm_retention_days(&self) -> u16 {
+        self.dm
+            .retention_days
+            .unwrap_or(self.storage.mls_retention_days)
     }
 
     /// The room clients drop into on connect: the room marked `default = true`,
@@ -989,6 +1051,15 @@ impl Config {
         if !(1..=3650).contains(&self.storage.mls_retention_days) {
             return Err(format!(
                 "{source}: storage.mls-retention-days must be between 1 and 3650"
+            ));
+        }
+        if self
+            .dm
+            .retention_days
+            .is_some_and(|days| !(1..=3650).contains(&days))
+        {
+            return Err(format!(
+                "{source}: dm.retention-days must be between 1 and 3650"
             ));
         }
         if self.storage.mls_cleanup_interval_minutes == 0
@@ -1447,6 +1518,8 @@ mod tests {
                 "storage.mls-compaction-min-interval-hours",
                 "storage.mls-compaction-min-fragmented-mib",
                 "storage.mls-compaction-min-fragmented-percent",
+                "dm.enabled",
+                "dm.retention-days",
             ]
         );
     }
@@ -1477,6 +1550,8 @@ mod tests {
             config_override("storage.mls-compaction-min-interval-hours", "12"),
             config_override("storage.mls-compaction-min-fragmented-mib", "64"),
             config_override("storage.mls-compaction-min-fragmented-percent", "15"),
+            config_override("dm.enabled", "false"),
+            config_override("dm.retention-days", "7"),
         ];
 
         let outcome = collect_config_content_with_overrides(
@@ -1532,6 +1607,8 @@ mod tests {
         assert_eq!(config.storage.mls_compaction_min_interval_hours, 12);
         assert_eq!(config.storage.mls_compaction_min_fragmented_mib, 64);
         assert_eq!(config.storage.mls_compaction_min_fragmented_percent, 15);
+        assert!(!config.dm.enabled);
+        assert_eq!(config.dm.retention_days, Some(7));
     }
 
     #[test]
@@ -2064,6 +2141,36 @@ mod tests {
         let defaults = Config::default();
         assert_eq!(defaults.storage.mls_retention_days, 90);
         assert_eq!(defaults.storage.mls_cleanup_interval_minutes, 15);
+    }
+
+    #[test]
+    fn dm_section_defaults_and_overrides_parse() {
+        let defaults = Config::default();
+        assert!(defaults.dm.enabled);
+        assert_eq!(defaults.dm.retention_days, None);
+        assert_eq!(defaults.dm_retention_days(), 90);
+
+        let config = parse(&config_content(
+            "[storage]\nmls-retention-days = 120\n\n[dm]\nenabled = false\nretention-days = 7\n",
+        ))
+        .unwrap();
+        assert!(!config.dm.enabled);
+        assert_eq!(config.dm_retention_days(), 7);
+
+        let inherited = parse(&config_content(
+            "[storage]\nmls-retention-days = 120\n\n[dm]\nenabled = true\n",
+        ))
+        .unwrap();
+        assert_eq!(inherited.dm_retention_days(), 120);
+    }
+
+    #[test]
+    fn out_of_range_dm_retention_is_rejected() {
+        let zero = parse(&config_content("[dm]\nretention-days = 0\n")).unwrap_err();
+        assert!(zero.contains("dm.retention-days must be between 1 and 3650"));
+
+        let excessive = parse(&config_content("[dm]\nretention-days = 3651\n")).unwrap_err();
+        assert!(excessive.contains("dm.retention-days must be between 1 and 3650"));
     }
 
     #[test]

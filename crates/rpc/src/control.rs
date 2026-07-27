@@ -325,6 +325,9 @@ pub enum ServerControl {
         users: Vec<UserSummary>,
         /// The room clients drop into (voice and first view) on connect.
         default_room: RoomId,
+        /// Whether the server accepts [`ClientControl::OpenDm`] for a pair that
+        /// has no DM room yet. Already-created DM rooms stay usable regardless.
+        dms_enabled: bool,
     },
     /// Open pairing succeeded. Carries the issued bearer token the client must
     /// store, alongside the same session details as [`ServerControl::Authenticated`].

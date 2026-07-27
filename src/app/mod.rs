@@ -411,6 +411,9 @@ pub(crate) struct App {
     pub control_socket: Option<local_control::ControlSocket>,
     pub session_id: Option<SessionId>,
     pub user_id: Option<UserId>,
+    /// Whether the connected server lets this session open a DM room it has
+    /// not opened before. Assumed until a server says otherwise.
+    server_dms_enabled: bool,
     e2e_account_id: Option<rpc::ids::AccountId>,
     requested_voice_room: Option<RoomId>,
     /// The user explicitly left voice this session; suppresses the voice
@@ -1385,6 +1388,7 @@ impl App {
             control_socket,
             session_id: None,
             user_id: None,
+            server_dms_enabled: true,
             e2e_account_id: None,
             requested_voice_room: None,
             voice_left: false,
@@ -3228,6 +3232,7 @@ impl App {
         self.room.network_selected = false;
         self.session_id = None;
         self.user_id = None;
+        self.server_dms_enabled = true;
         self.e2e_account_id = None;
         self.reset_room_for_disconnect();
         self.room.server_rtt_ms = None;
@@ -4074,12 +4079,14 @@ impl App {
                 rooms,
                 users,
                 default_room,
+                dms_enabled,
                 video_transport_mode,
                 video_auth_key,
             } => {
                 self.rpc_server_selection_issue = None;
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
+                self.server_dms_enabled = dms_enabled;
                 self.video_transport = Some(crate::video::VideoTransport::new(
                     video_transport_mode,
                     video_auth_key,
@@ -7362,6 +7369,12 @@ impl App {
             self.set_error("select a server before opening dms");
             return;
         }
+        // The server keeps serving DM rooms opened before the operator turned
+        // DMs off, so only a first-time open is refused here.
+        if !self.server_dms_enabled && self.room.dm_room_for_peer(user_id).is_none() {
+            self.set_error("this server has direct messages disabled");
+            return;
+        }
         if self.send_network_command(NetworkCommand::OpenDm(user_id), true) {
             self.pending_dm_clients
                 .entry(user_id)
@@ -9590,6 +9603,7 @@ mod tests {
             rooms: vec![test_room_info(1)],
             users: vec![user_summary(UserId(1), "alice")],
             default_room: RoomId(1),
+            dms_enabled: true,
             video_transport_mode: rpc::crypto::TransportMode::Encrypted,
             video_auth_key: [0; rpc::crypto::KEY_LEN],
         });
@@ -9618,6 +9632,7 @@ mod tests {
             rooms: vec![test_room_info(1), test_room_info(2)],
             users: vec![user_summary(UserId(1), "alice")],
             default_room: RoomId(2),
+            dms_enabled: true,
             video_transport_mode: rpc::crypto::TransportMode::Encrypted,
             video_auth_key: [0; rpc::crypto::KEY_LEN],
         });
@@ -9718,6 +9733,57 @@ mod tests {
         });
 
         assert_eq!(app.view.status.text(), "steady");
+    }
+
+    #[test]
+    fn disabled_server_dms_refuse_a_new_dm_without_a_round_trip() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+
+        app.handle_network_event(NetworkEvent::Authenticated {
+            session_id: SessionId(1),
+            user_id: UserId(1),
+            rooms: vec![
+                test_room_info(1),
+                dm_room_info(0x8000_0001, UserId(1), UserId(2)),
+            ],
+            users: vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+                user_summary(UserId(3), "carol"),
+            ],
+            default_room: RoomId(1),
+            dms_enabled: false,
+            video_transport_mode: rpc::crypto::TransportMode::Encrypted,
+            video_auth_key: [0; rpc::crypto::KEY_LEN],
+        });
+        while rx.try_recv().is_ok() {}
+
+        app.view.composer.set_lines("/dm carol");
+        app.submit_input();
+
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert_eq!(
+            app.view.status.text(),
+            "this server has direct messages disabled"
+        );
+        assert!(app.pending_dm_clients.is_empty());
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|command| matches!(command, NetworkCommand::OpenDm(_))),
+            "a refused dm must not reach the server"
+        );
+
+        // The server keeps serving DM rooms opened before it was disabled.
+        app.view.composer.set_lines("/dm bob");
+        app.submit_input();
+
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|command| matches!(command, NetworkCommand::OpenDm(UserId(2)))),
+            "an existing dm must still be openable"
+        );
     }
 
     #[test]
@@ -10292,6 +10358,7 @@ mod tests {
             rooms: vec![test_room_info(1)],
             users: vec![user_summary(UserId(1), "alice")],
             default_room: RoomId(1),
+            dms_enabled: true,
             video_transport_mode: rpc::crypto::TransportMode::Encrypted,
             video_auth_key: [0; rpc::crypto::KEY_LEN],
         };

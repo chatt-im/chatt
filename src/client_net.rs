@@ -634,6 +634,8 @@ pub enum NetworkEvent {
         rooms: Vec<RoomInfo>,
         users: Vec<UserSummary>,
         default_room: RoomId,
+        /// Whether the server allows opening DM rooms that do not exist yet.
+        dms_enabled: bool,
         video_transport_mode: TransportMode,
         video_auth_key: [u8; KEY_LEN],
     },
@@ -2332,6 +2334,7 @@ struct PendingAuthentication {
     rooms: Vec<RoomInfo>,
     users: Vec<UserSummary>,
     default_room: RoomId,
+    dms_enabled: bool,
 }
 
 enum PendingMlsFileOffer {
@@ -5270,7 +5273,7 @@ impl WorkerState<'_> {
                 rooms,
                 users,
                 default_room,
-                ..
+                dms_enabled,
             } => {
                 let pending = PendingAuthentication {
                     session_id,
@@ -5278,6 +5281,7 @@ impl WorkerState<'_> {
                     rooms,
                     users,
                     default_room,
+                    dms_enabled,
                 };
                 self.finish_authenticated(pending, DEFAULT_INITIAL_DEVICE_NAME)?;
             }
@@ -5641,6 +5645,7 @@ impl WorkerState<'_> {
             rooms,
             users,
             default_room,
+            dms_enabled,
         } = pending;
         self.session_id = Some(session_id);
         self.user_id = Some(user_id);
@@ -5690,6 +5695,7 @@ impl WorkerState<'_> {
             rooms,
             users,
             default_room,
+            dms_enabled,
             video_transport_mode: self.transport_mode,
             video_auth_key: self.video_auth_key,
         });

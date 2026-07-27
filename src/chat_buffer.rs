@@ -310,7 +310,11 @@ mod viewport_tests {
         viewport.visible_lines(&history.history(), 40, 8, 2);
 
         assert_eq!(viewport.len(), 199);
-        assert!(viewport.entry_index(HistoryEntryId::Message(MessageId(100))).is_none());
+        assert!(
+            viewport
+                .entry_index(HistoryEntryId::Message(MessageId(100)))
+                .is_none()
+        );
         // The delta named the id that left, so nothing else is laid out again.
         assert_eq!(viewport.layout_index.measured_messages, measured);
         assert_eq!(viewport.layout_index.line_counts.len(), viewport.len());
@@ -1150,8 +1154,12 @@ impl ChatViewport {
         remeasure: bool,
         effects: &mut ReplayEffects,
     ) {
-        let cursor_position = self.cursor.and_then(|cursor| self.entry_index(cursor.entry));
-        let anchor_position = self.anchor.and_then(|anchor| self.entry_index(anchor.entry));
+        let cursor_position = self
+            .cursor
+            .and_then(|cursor| self.entry_index(cursor.entry));
+        let anchor_position = self
+            .anchor
+            .and_then(|anchor| self.entry_index(anchor.entry));
         let scroll_anchor_position = self
             .scroll_anchor
             .and_then(|anchor| self.entry_index(anchor.entry));
@@ -1209,9 +1217,9 @@ impl ChatViewport {
         // cursor to the nearest survivor, preferring the newer side.
         let survives = |id: HistoryEntryId| !previous.contains_key(&id);
         let successor = |id: HistoryEntryId, position: Option<usize>| {
-            survives(id).then_some(id).or_else(|| {
-                remap_missing_entry(&previous_ids, position?, survives)
-            })
+            survives(id)
+                .then_some(id)
+                .or_else(|| remap_missing_entry(&previous_ids, position?, survives))
         };
         self.cursor = self.cursor.and_then(|cursor| {
             Some(ViewCursor {
@@ -1381,7 +1389,10 @@ impl ChatViewport {
         at: Option<usize>,
         effects: &mut ReplayEffects,
     ) {
-        if self.clear_boundary.is_some_and(|boundary| boundary.hides(id)) {
+        if self
+            .clear_boundary
+            .is_some_and(|boundary| boundary.hides(id))
+        {
             return;
         }
         // A tombstone lands in the canonical log but has no visible record.
@@ -1462,12 +1473,7 @@ impl ChatViewport {
         self.remove_entry_at(index, id, effects);
     }
 
-    fn remove_entry_at(
-        &mut self,
-        index: usize,
-        id: HistoryEntryId,
-        effects: &mut ReplayEffects,
-    ) {
+    fn remove_entry_at(&mut self, index: usize, id: HistoryEntryId, effects: &mut ReplayEffects) {
         let counts_valid = self.counts_valid();
         self.entries.remove(index);
         if counts_valid {
