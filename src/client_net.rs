@@ -2049,7 +2049,12 @@ fn connect_and_handshake(
         .set_nodelay(true)
         .map_err(|error| format!("failed to set TCP_NODELAY: {error}"))?;
     let rng = aws_lc_rs::rand::SystemRandom::new();
-    let client = generate_client_hello(&rng).map_err(|error| error.to_string())?;
+    // Resolved before the hello is built, not after the reply: the pinned key
+    // is what keys `mac1`, and a server configured to require it sends no
+    // reply at all to a hello that lacks one.
+    let pinned_server_public_key = pinned_server_public_key(config, allow_tofu)?;
+    let client = generate_client_hello(&rng, pinned_server_public_key.as_ref())
+        .map_err(|error| error.to_string())?;
     let hello = encode_client_hello(&client.hello);
     let mut framed = Vec::new();
     frame::encode_frame(&hello, &mut framed).map_err(|error| error.to_string())?;
@@ -2062,9 +2067,8 @@ fn connect_and_handshake(
         .write_all(&framed)
         .map_err(|error| format!("failed to write client hello: {error}"))?;
     let response = read_blocking_frame(&mut stream)
-        .map_err(|error| format!("failed to read server hello: {error}"))?;
+        .map_err(|error| server_hello_read_error(&error, pinned_server_public_key.as_ref()))?;
     let server_hello = decode_server_hello(&response)?;
-    let pinned_server_public_key = pinned_server_public_key(config, allow_tofu)?;
     let (transport, trusted_key) = complete_client_transport_handshake(
         client,
         &server_hello,
@@ -2173,6 +2177,38 @@ fn pinned_server_public_key(
             .map_err(|error| format!("invalid configured server-public-key: {error}")),
         None if allow_tofu => Ok(None),
         None => Ok(Some(dev_server_public_key())),
+    }
+}
+
+/// Explains a failure to read the server hello.
+///
+/// A hardened server answers nothing when the hello's `mac1` was keyed by the
+/// wrong identity, so the mismatch that used to surface as a signature error
+/// now surfaces as an unexplained close. The pinned key is the first thing to
+/// suspect whenever the server goes quiet right after the hello.
+fn server_hello_read_error(
+    error: &io::Error,
+    pinned_server_public_key: Option<&[u8; 32]>,
+) -> String {
+    let silent = matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+    );
+    if !silent {
+        return format!("failed to read server hello: {error}");
+    }
+    match pinned_server_public_key {
+        Some(pinned) => format!(
+            "server accepted the connection but sent no hello ({error}); it may not recognize the server key this client is pinned to ({}). Re-pair with a current invite if the server identity changed",
+            encode_hex(pinned)
+        ),
+        None => format!(
+            "server accepted the connection but sent no hello ({error}); it may require an invite rather than open pairing"
+        ),
     }
 }
 

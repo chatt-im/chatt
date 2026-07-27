@@ -45,10 +45,11 @@ use rpc::{
         encode_server_control, encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
-        CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims, KEY_LEN,
-        KeyMaterial, OPEN_PAIR_RECOVERY_PREFIX, RecordProtection, SessionTransport, TransportMode,
-        VideoKeyRole, derive_video_keys, dynamic_user_id_from_recovery_token, encode_hex,
-        issue_dynamic_token, respond_to_client_hello, verify_dynamic_token,
+        CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims,
+        ED25519_PUBLIC_KEY_LEN, KEY_LEN, KeyMaterial, OPEN_PAIR_RECOVERY_PREFIX, RecordProtection,
+        SessionTransport, TransportMode, VideoKeyRole, derive_video_keys,
+        dynamic_user_id_from_recovery_token, encode_hex, issue_dynamic_token,
+        respond_to_client_hello, verify_client_hello_mac1, verify_dynamic_token,
     },
     evented::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
@@ -100,6 +101,24 @@ const SLOW_EVENT_LOOP_WORK: Duration = Duration::from_millis(20);
 const EVENT_LOOP_STATS_INTERVAL: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
+/// Connections accepted but not yet through classification, handshake, and
+/// auth. Budgeted separately from [`MAX_CLIENTS`] so a flood of half-open
+/// peers can only exhaust its own class: established sessions keep the
+/// remaining slots no matter how many strangers are mid-handshake.
+///
+/// A quarter of the total is the balance between the two ways this can fail.
+/// Too low and a thundering-herd reconnect after a restart refuses legitimate
+/// clients; too high and slot hoarding starves the established class it exists
+/// to protect. [`MAX_HANDSHAKING_PER_IP`] is what actually bounds a single
+/// attacker — this bounds the aggregate.
+const MAX_HANDSHAKING: usize = MAX_CLIENTS / 4;
+/// Pre-auth connections one source address may hold at once. Legitimate
+/// clients open a control connection plus a video connection per stream, so
+/// this is well above real use while making a single-host lockout impossible.
+const MAX_HANDSHAKING_PER_IP: usize = 8;
+/// Minimum spacing between pre-auth refusal log lines. A refused accept is
+/// free for the peer to retry, so the log must not scale with the flood.
+const PRE_AUTH_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const ACCEPT_BUDGET: usize = 64;
 /// Maximum distinct sockets serviced in each direction during one loop pass.
 /// Per-connection byte/record budgets still apply; these caps bound aggregate
@@ -126,7 +145,7 @@ const CONTROL_STEPS_PER_READ: usize = 64;
 const VIDEO_RECORDS_PER_READ: usize = 8;
 /// A connection that has not finished classification, handshake, and auth
 /// within this bound is dropped; without it a socket that connects and sends
-/// nothing occupies one of the [`MAX_CLIENTS`] slots forever.
+/// nothing occupies one of the [`MAX_HANDSHAKING`] slots forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// An established connection with no socket traffic for this long is dropped.
 /// The client has no TCP keepalive, but from the moment it authenticates it
@@ -566,6 +585,8 @@ pub struct Server {
     voice_relay: VoiceRelayHandle,
     voice_events: VoiceEventBatch,
     clients: HashMap<Token, ClientConn>,
+    /// Admission control for connections that have not finished setting up.
+    pre_auth: PreAuthLimiter,
     pending_controls: HashMap<Token, VecDeque<PendingControl>>,
     pending_control_bytes: HashMap<Token, usize>,
     pending_control_total_bytes: usize,
@@ -604,6 +625,12 @@ pub struct Server {
     open_pair_ip_allocations: HashMap<IpAddr, VecDeque<Instant>>,
     rng: aws_lc_rs::rand::SystemRandom,
     server_key_pair: aws_lc_rs::signature::Ed25519KeyPair,
+    /// The public half of `server_key_pair`, kept unpacked because it keys the
+    /// `mac1` check run on every inbound `ClientHello`.
+    server_public_key: [u8; ED25519_PUBLIC_KEY_LEN],
+    /// Whether to drop `ClientHello`s without a valid `mac1`. Resolved once at
+    /// bind from [`ServerConfig::require_hello_mac`].
+    require_hello_mac: bool,
     next_media_sweep_at: Option<Instant>,
     next_rtt_snapshot_at: Instant,
     next_idle_sweep_at: Instant,
@@ -1343,6 +1370,16 @@ impl Server {
             endpoint.set_port(socket.local_addr()?.port());
             *public = endpoint.to_string();
         }
+        // With the hello MAC required, no server state exists until a peer has
+        // proven it holds the server key — but only if the kernel withholds the
+        // socket until that peer actually sends something. Without this a bare
+        // connect scan still costs an fd, a token, and a pre-auth slot.
+        if let Err(error) = set_defer_accept(&listener, HANDSHAKE_TIMEOUT) {
+            kvlog::warn!(
+                "tcp defer-accept unavailable; bare connects will occupy a pre-auth slot",
+                error = %error
+            );
+        }
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
 
@@ -1467,6 +1504,27 @@ impl Server {
                 "transport encryption disabled: control, media, video, and file payloads travel in plaintext and P2P is disabled"
             );
         }
+        let server_public_key: [u8; ED25519_PUBLIC_KEY_LEN] = server_key_pair
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("Ed25519 public keys are ED25519_PUBLIC_KEY_LEN bytes");
+        let require_hello_mac = config.require_hello_mac();
+        if require_hello_mac && config.uses_dev_server_identity() {
+            kvlog::warn!(
+                "hello MAC required while running the development identity: its seed is published, so anyone can compute the MAC and the port stays discoverable"
+            );
+        }
+        if !require_hello_mac {
+            kvlog::warn!(
+                "hello MAC not required: any peer can elicit a server hello and learn the server public key",
+                reason = if config.is_public() {
+                    "open pairing needs a keyless first contact"
+                } else {
+                    "security.require-hello-mac is false"
+                }
+            );
+        }
         let file_size_limit_bytes = config.security.max_file_size_bytes();
         let next_mls_cleanup_at =
             Instant::now() + Duration::from_secs(config.storage.mls_cleanup_interval_minutes * 60);
@@ -1493,6 +1551,7 @@ impl Server {
             voice_relay,
             voice_events: VoiceEventBatch::with_capacity(),
             clients: HashMap::new(),
+            pre_auth: PreAuthLimiter::default(),
             pending_controls: HashMap::new(),
             pending_control_bytes: HashMap::new(),
             pending_control_total_bytes: 0,
@@ -1528,6 +1587,8 @@ impl Server {
             open_pair_ip_allocations: HashMap::new(),
             rng: aws_lc_rs::rand::SystemRandom::new(),
             server_key_pair,
+            server_public_key,
+            require_hello_mac,
             next_media_sweep_at: None,
             next_rtt_snapshot_at: Instant::now() + RTT_SNAPSHOT_INTERVAL,
             next_idle_sweep_at: Instant::now() + IDLE_SWEEP_INTERVAL,
@@ -1849,6 +1910,27 @@ impl Server {
                 drop(socket);
                 continue;
             }
+            // Taken before any per-connection state exists, so the cost of a
+            // stranger is one accept and one close. Established sessions are
+            // budgeted separately and cannot be crowded out from here.
+            if let Err(refusal) = self.pre_auth.admit(addr.ip()) {
+                if let Some(refused) = self.pre_auth.refusals_to_report(Instant::now()) {
+                    kvlog::warn!(
+                        "pre-auth cap reached, rejecting connections",
+                        scope = match refusal {
+                            PreAuthRefusal::Global => "global",
+                            PreAuthRefusal::PerIp => "per_ip",
+                        },
+                        refused,
+                        handshaking = self.pre_auth.held,
+                        max_handshaking = MAX_HANDSHAKING,
+                        max_handshaking_per_ip = MAX_HANDSHAKING_PER_IP,
+                        addr = %addr
+                    );
+                }
+                drop(socket);
+                continue;
+            }
             // Disable Nagle so relayed frames (including bulk file chunks) are
             // not held waiting for an ACK, matching the client's `set_nodelay`.
             if let Err(error) = socket.set_nodelay(true) {
@@ -1862,11 +1944,16 @@ impl Server {
                 addr = %addr,
                 client_count = self.clients.len() + 1
             );
-            self.poll.registry().register(
+            if let Err(error) = self.poll.registry().register(
                 &mut socket,
                 token,
                 Interest::READABLE | Interest::WRITABLE,
-            )?;
+            ) {
+                // No `ClientConn` exists yet, so nothing else would ever
+                // return the slot this connection was admitted into.
+                self.pre_auth.release(addr.ip());
+                return Err(error);
+            }
             let now = Instant::now();
             self.clients.insert(
                 token,
@@ -1883,11 +1970,28 @@ impl Server {
                     session_id: None,
                     user_id: None,
                     close: Close::Open,
+                    pre_auth: true,
                     created_at: now,
                     last_activity: now,
                 },
             );
         }
+    }
+
+    /// Returns the connection's pre-auth slot now that it has finished setting
+    /// up. From here it is budgeted as an established connection under
+    /// [`MAX_CLIENTS`] and timed out by [`IDLE_TIMEOUT`] rather than
+    /// [`HANDSHAKE_TIMEOUT`].
+    fn finish_pre_auth(&mut self, token: Token) {
+        let Some(client) = self.clients.get_mut(&token) else {
+            return;
+        };
+        if !client.pre_auth {
+            return;
+        }
+        client.pre_auth = false;
+        let addr = client.addr.ip();
+        self.pre_auth.release(addr);
     }
 
     fn read_client(&mut self, token: Token) {
@@ -2308,6 +2412,7 @@ impl Server {
         video::write_record(client.write_buf.tail_mut(), &sealed)
             .map_err(|error| error.to_string())?;
         self.write_queue_total_bytes += client.write_buf.len() - queued_before;
+        self.finish_pre_auth(token);
         self.write_client(token);
         match role {
             VideoRole::Publisher => {
@@ -2827,6 +2932,17 @@ impl Server {
             client_nonce_size = hello.client_nonce.len(),
             client_ephemeral_size = hello.client_ephemeral.len()
         );
+        // Checked before the ephemeral keygen, the agreement, and the
+        // signature below, so a peer without the server key costs a symmetric
+        // MAC rather than a full handshake. The connection is then dropped
+        // with nothing written back: no server hello, no error frame, and so
+        // no way to learn the public key, the protocol version, or that this
+        // is Chatt at all.
+        if self.require_hello_mac && !verify_client_hello_mac1(&self.server_public_key, &hello) {
+            kvlog::debug!("client hello dropped: mac1 mismatch", token = token.0);
+            self.disconnect(token);
+            return Ok(());
+        }
         let mode = self.config.transport_mode();
         // Rejects the client (connection dropped) if it did not advertise the
         // server's configured mode; there is one server mode, no per-client mix.
@@ -4872,6 +4988,7 @@ impl Server {
             client.session_id = Some(session_id);
             client.user_id = Some(user_id);
         }
+        self.finish_pre_auth(token);
 
         kvlog::info!(
             "authenticate accepted",
@@ -7524,6 +7641,10 @@ impl Server {
         let Some(mut client) = self.clients.remove(&token) else {
             return;
         };
+        if client.pre_auth {
+            client.pre_auth = false;
+            self.pre_auth.release(client.addr.ip());
+        }
         self.write_queue_total_bytes = self
             .write_queue_total_bytes
             .saturating_sub(client.write_buf.len());
@@ -8001,6 +8122,75 @@ enum ConnState {
     Ready,
 }
 
+/// Admission control for connections that have not finished setting up.
+///
+/// Pre-auth connections are the only ones an unauthenticated peer can create,
+/// so they get their own budget rather than competing with established
+/// sessions for [`MAX_CLIENTS`]. Every admitted connection carries a
+/// [`ClientConn::pre_auth`] flag; the flag, not a recount, is what drives
+/// release, so each admission is released exactly once whether the connection
+/// graduates or dies mid-handshake.
+#[derive(Default)]
+struct PreAuthLimiter {
+    held: usize,
+    per_ip: HashMap<IpAddr, usize>,
+    /// Refusals since the last log line. A flood refuses once per accept, so
+    /// logging each one would hand an unauthenticated peer an amplifier;
+    /// [`Self::refusals_to_report`] collapses them into one throttled line.
+    refused: u64,
+    report_refusals_at: Option<Instant>,
+}
+
+/// Why a connection was refused before it was given a slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreAuthRefusal {
+    Global,
+    PerIp,
+}
+
+impl PreAuthLimiter {
+    /// Takes a pre-auth slot for `addr`, or reports which cap refused it.
+    fn admit(&mut self, addr: IpAddr) -> Result<(), PreAuthRefusal> {
+        if self.held >= MAX_HANDSHAKING {
+            return Err(PreAuthRefusal::Global);
+        }
+        let per_ip = self.per_ip.entry(addr).or_default();
+        if *per_ip >= MAX_HANDSHAKING_PER_IP {
+            return Err(PreAuthRefusal::PerIp);
+        }
+        *per_ip += 1;
+        self.held += 1;
+        Ok(())
+    }
+
+    /// Records a refusal and returns the number to report, or `None` while the
+    /// log is throttled. The first refusal of a burst reports immediately; the
+    /// rest accumulate into the next line one interval later.
+    fn refusals_to_report(&mut self, now: Instant) -> Option<u64> {
+        self.refused += 1;
+        match self.report_refusals_at {
+            Some(at) if now < at => None,
+            _ => {
+                self.report_refusals_at = Some(now + PRE_AUTH_REFUSAL_LOG_INTERVAL);
+                Some(std::mem::take(&mut self.refused))
+            }
+        }
+    }
+
+    /// Returns the slot taken by [`Self::admit`] for `addr`. The per-address
+    /// entry is removed at zero so the map stays proportional to live
+    /// handshakes rather than to every address ever seen.
+    fn release(&mut self, addr: IpAddr) {
+        self.held = self.held.saturating_sub(1);
+        if let hashbrown::hash_map::Entry::Occupied(mut entry) = self.per_ip.entry(addr) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
 struct ClientConn {
     socket: TcpStream,
     addr: SocketAddr,
@@ -8021,6 +8211,10 @@ struct ClientConn {
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
     close: Close,
+    /// Whether this connection still holds a [`PreAuthLimiter`] slot. Cleared
+    /// by the promotion or teardown that returns it, so the slot is released
+    /// exactly once.
+    pre_auth: bool,
     created_at: Instant,
     last_activity: Instant,
 }
@@ -8615,6 +8809,43 @@ fn invalid_config(error: String) -> io::Error {
 
 fn is_fd_pressure_accept_error(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+/// Withholds an accepted connection from `accept()` until the peer sends data,
+/// or until `timeout` elapses and the kernel drops it.
+///
+/// This is what keeps a bare TCP connect from reaching the accept loop at all.
+/// The kernel still completes the three-way handshake — nothing in userspace
+/// can prevent that, which is why the TCP port stays visibly open — but a
+/// scanner that never speaks costs no fd, no token, and no pre-auth slot.
+#[cfg(target_os = "linux")]
+fn set_defer_accept(listener: &TcpListener, timeout: Duration) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let seconds = libc::c_int::try_from(timeout.as_secs()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `seconds` outlives the call and its size is passed explicitly;
+    // the fd is owned by `listener` and stays open for the call's duration.
+    let result = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_DEFER_ACCEPT,
+            std::ptr::from_ref(&seconds).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Platforms without `TCP_DEFER_ACCEPT` fall back to accepting on connect. The
+/// pre-auth budget still bounds what that costs.
+#[cfg(not(target_os = "linux"))]
+fn set_defer_accept(_listener: &TcpListener, _timeout: Duration) -> io::Result<()> {
+    Ok(())
 }
 
 fn random_secret_hex(rng: &aws_lc_rs::rand::SystemRandom) -> Result<String, String> {
@@ -11034,6 +11265,162 @@ mod tests {
         assert!(server.clients.contains_key(&Token(6)));
     }
 
+    /// A connection in the state a freshly accepted socket has: awaiting the
+    /// hello and holding a pre-auth slot.
+    fn test_handshaking_client(server: &mut Server, token: Token) -> std::net::TcpStream {
+        let (mut conn, peer) = test_live_client();
+        conn.kind = ConnKind::Unidentified;
+        conn.state = ConnState::AwaitClientHello;
+        conn.control = None;
+        conn.transport = None;
+        conn.pre_auth = true;
+        server.pre_auth.admit(conn.addr.ip()).expect("pre-auth slot");
+        server.clients.insert(token, conn);
+        peer
+    }
+
+    fn test_client_hello(server: &Server, mac_key: Option<&[u8; 32]>) -> control::ClientHello {
+        rpc::crypto::generate_client_hello(&server.rng, mac_key)
+            .expect("client hello")
+            .hello
+    }
+
+    #[test]
+    fn client_hello_without_a_valid_mac_gets_no_reply() {
+        let mut server = test_server();
+        assert!(server.require_hello_mac);
+        let token = Token(5);
+        let mut peer = test_handshaking_client(&mut server, token);
+
+        // A scanner that does not hold the server key cannot key the MAC.
+        let hello = test_client_hello(&server, None);
+        server.handle_client_hello(token, hello).expect("handled");
+
+        // Nothing is written back, so the peer cannot learn the server public
+        // key, the protocol version, or that this is Chatt.
+        assert!(!server.clients.contains_key(&token));
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout");
+        let mut buf = [0u8; 64];
+        assert_eq!(peer.read(&mut buf).ok(), Some(0));
+        assert_eq!(server.pre_auth.held, 0);
+    }
+
+    #[test]
+    fn client_hello_with_a_valid_mac_completes_the_handshake() {
+        let mut server = test_server();
+        let token = Token(5);
+        let _peer = test_handshaking_client(&mut server, token);
+
+        let server_public_key = server.server_public_key;
+        let hello = test_client_hello(&server, Some(&server_public_key));
+        server.handle_client_hello(token, hello).expect("handled");
+
+        let client = server.clients.get(&token).expect("connection kept");
+        assert_eq!(client.state, ConnState::AwaitAuth);
+        assert!(client.transport.is_some());
+        // Still pre-auth: the hello is answered, but the slot is only returned
+        // once the connection authenticates.
+        assert!(client.pre_auth);
+        assert_eq!(server.pre_auth.held, 1);
+    }
+
+    #[test]
+    fn public_server_answers_a_keyless_hello() {
+        // Open pairing's first contact has no server key to bind a MAC to, so
+        // a public server cannot require one.
+        let mut config = test_server_config();
+        config.security.public = true;
+        let mut server = Server::bind(config).expect("test server");
+        assert!(!server.require_hello_mac);
+        let token = Token(5);
+        let _peer = test_handshaking_client(&mut server, token);
+
+        let hello = test_client_hello(&server, None);
+        server.handle_client_hello(token, hello).expect("handled");
+
+        assert_eq!(
+            server.clients.get(&token).map(|client| client.state),
+            Some(ConnState::AwaitAuth)
+        );
+    }
+
+    #[test]
+    fn pre_auth_limiter_caps_total_and_per_address() {
+        let mut limiter = PreAuthLimiter::default();
+        let noisy: IpAddr = "203.0.113.5".parse().unwrap();
+        for _ in 0..MAX_HANDSHAKING_PER_IP {
+            limiter.admit(noisy).expect("under the per-address cap");
+        }
+        assert_eq!(limiter.admit(noisy), Err(PreAuthRefusal::PerIp));
+
+        // One address hitting its cap must not lock anyone else out.
+        let other: IpAddr = "203.0.113.6".parse().unwrap();
+        limiter.admit(other).expect("a different address");
+
+        let held = limiter.held;
+        for index in 0..(MAX_HANDSHAKING - held) {
+            let addr = IpAddr::from([198, 51, 100, index as u8]);
+            limiter.admit(addr).expect("under the global cap");
+        }
+        assert_eq!(limiter.held, MAX_HANDSHAKING);
+        assert_eq!(
+            limiter.admit("198.51.100.254".parse().unwrap()),
+            Err(PreAuthRefusal::Global)
+        );
+    }
+
+    #[test]
+    fn pre_auth_release_frees_the_slot_and_forgets_the_address() {
+        let mut limiter = PreAuthLimiter::default();
+        let addr: IpAddr = "203.0.113.5".parse().unwrap();
+        limiter.admit(addr).expect("first");
+        limiter.admit(addr).expect("second");
+        limiter.release(addr);
+        assert_eq!(limiter.per_ip.get(&addr), Some(&1));
+        limiter.release(addr);
+        assert_eq!(limiter.held, 0);
+        assert!(limiter.per_ip.is_empty());
+    }
+
+    #[test]
+    fn pre_auth_refusal_logging_is_throttled() {
+        let mut limiter = PreAuthLimiter::default();
+        let now = Instant::now();
+        assert_eq!(limiter.refusals_to_report(now), Some(1));
+        assert_eq!(limiter.refusals_to_report(now), None);
+        assert_eq!(limiter.refusals_to_report(now), None);
+        // The suppressed refusals are carried into the next line rather than
+        // lost: two throttled plus the one that reports them.
+        assert_eq!(
+            limiter.refusals_to_report(now + PRE_AUTH_REFUSAL_LOG_INTERVAL),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn pre_auth_slot_is_released_once_by_promotion_or_teardown() {
+        let mut server = test_server();
+        let promoted = Token(5);
+        let dropped = Token(6);
+        let _promoted_peer = test_handshaking_client(&mut server, promoted);
+        let _dropped_peer = test_handshaking_client(&mut server, dropped);
+        assert_eq!(server.pre_auth.held, 2);
+
+        server.finish_pre_auth(promoted);
+        assert_eq!(server.pre_auth.held, 1);
+        // The promoted connection keeps its slot released even if the
+        // authentication path reaches this twice.
+        server.finish_pre_auth(promoted);
+        assert_eq!(server.pre_auth.held, 1);
+        // And disconnecting it later must not release a slot it no longer holds.
+        server.disconnect(promoted);
+        assert_eq!(server.pre_auth.held, 1);
+
+        server.disconnect(dropped);
+        assert_eq!(server.pre_auth.held, 0);
+    }
+
     #[test]
     fn sweep_drops_ready_connection_idle_past_timeout() {
         let mut server = test_server();
@@ -12770,6 +13157,7 @@ mod tests {
             session_id: None,
             user_id: None,
             close: Close::Open,
+            pre_auth: false,
             created_at: now,
             last_activity: now,
         };

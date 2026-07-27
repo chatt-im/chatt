@@ -29,6 +29,11 @@ pub const DYNAMIC_TOKEN_PREFIX: &str = "tct1_";
 pub const OPEN_PAIR_RECOVERY_PREFIX: &str = "tcr1_";
 /// AEAD channel byte domain-separating dynamic token sealing from transport frames.
 const TOKEN_CHANNEL: u8 = 0;
+/// Length of the [`ClientHello`] scan-resistance MAC. Truncated from HMAC-SHA256;
+/// 128 bits is far past what a filter that gates an Ed25519 signature needs.
+pub const HELLO_MAC_LEN: usize = 16;
+/// Domain-separation label for the key and the message of the `ClientHello` MAC.
+const LABEL_MAC1: &[u8] = b"chatt mac1 v1";
 pub const REKEY_AFTER_TIME_SECS: u64 = 120;
 pub const REJECT_AFTER_TIME_SECS: u64 = 180;
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 4);
@@ -248,7 +253,18 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, CryptoError> {
     }
 }
 
-pub fn generate_client_hello(rng: &dyn rand::SecureRandom) -> Result<ClientHandshake, CryptoError> {
+/// Generates the client's ephemeral key and `ClientHello`.
+///
+/// `server_public_key` is the Ed25519 identity the client has already pinned
+/// for this server, taken from its invite ticket or config. It keys the hello's
+/// [`ClientHello::mac1`], which is what lets a hardened server stay silent to
+/// peers that do not hold the key. Pass `None` only on the trust-on-first-use
+/// open-pairing path, where by definition no key is known yet; the MAC is then
+/// all zeroes and only a server that does not require it will answer.
+pub fn generate_client_hello(
+    rng: &dyn rand::SecureRandom,
+    server_public_key: Option<&[u8; ED25519_PUBLIC_KEY_LEN]>,
+) -> Result<ClientHandshake, CryptoError> {
     let private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, rng)
         .map_err(|_| CryptoError::Random)?;
     let public = private
@@ -256,15 +272,69 @@ pub fn generate_client_hello(rng: &dyn rand::SecureRandom) -> Result<ClientHands
         .map_err(|_| CryptoError::Random)?;
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill(&mut nonce).map_err(|_| CryptoError::Random)?;
-    Ok(ClientHandshake {
-        private,
-        hello: ClientHello {
-            version: PROTOCOL_VERSION,
-            modes: TransportMode::supported_wire_ids(),
-            client_nonce: nonce.to_vec(),
-            client_ephemeral: public.as_ref().to_vec(),
-        },
-    })
+    let mut hello = ClientHello {
+        version: PROTOCOL_VERSION,
+        modes: TransportMode::supported_wire_ids(),
+        client_nonce: nonce.to_vec(),
+        client_ephemeral: public.as_ref().to_vec(),
+        mac1: [0u8; HELLO_MAC_LEN],
+    };
+    if let Some(server_public_key) = server_public_key {
+        hello.mac1 = client_hello_mac1(server_public_key, &hello);
+    }
+    Ok(ClientHandshake { private, hello })
+}
+
+/// Computes the scan-resistance MAC binding a `ClientHello` to the server
+/// identity the client believes it is talking to.
+///
+/// The MAC key is `SHA-256(LABEL_MAC1 || server_public_key)`, so producing a
+/// hello a hardened server will answer requires already holding that key. The
+/// `mac1` field itself is excluded from the message; every other field is
+/// covered, with `modes` length-prefixed so no two field layouts collide.
+///
+/// This is a cheap admission filter, not authentication: it is replayable by an
+/// on-path observer, and the handshake's Ed25519 signature remains the only
+/// thing that authenticates the server. Its job is to keep unauthenticated
+/// peers from eliciting a `ServerHello` or costing the server a signature.
+pub fn client_hello_mac1(
+    server_public_key: &[u8; ED25519_PUBLIC_KEY_LEN],
+    hello: &ClientHello,
+) -> [u8; HELLO_MAC_LEN] {
+    let mut key_input = [0u8; LABEL_MAC1.len() + ED25519_PUBLIC_KEY_LEN];
+    key_input[..LABEL_MAC1.len()].copy_from_slice(LABEL_MAC1);
+    key_input[LABEL_MAC1.len()..].copy_from_slice(server_public_key);
+    let mac_key = digest::digest(&digest::SHA256, &key_input);
+
+    let mut context = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, mac_key.as_ref()));
+    context.update(LABEL_MAC1);
+    context.update(&hello.version.to_le_bytes());
+    context.update(&(hello.modes.len() as u32).to_le_bytes());
+    context.update(&hello.modes);
+    context.update(&(hello.client_nonce.len() as u32).to_le_bytes());
+    context.update(&hello.client_nonce);
+    context.update(&(hello.client_ephemeral.len() as u32).to_le_bytes());
+    context.update(&hello.client_ephemeral);
+    let tag = context.sign();
+    tag.as_ref()[..HELLO_MAC_LEN]
+        .try_into()
+        .expect("HMAC-SHA256 is longer than HELLO_MAC_LEN")
+}
+
+/// Whether `hello` carries a [`client_hello_mac1`] for `server_public_key`.
+///
+/// Callers verify this before spending any asymmetric work on a connection.
+/// The comparison is constant time, though the MAC is a public value.
+pub fn verify_client_hello_mac1(
+    server_public_key: &[u8; ED25519_PUBLIC_KEY_LEN],
+    hello: &ClientHello,
+) -> bool {
+    let expected = client_hello_mac1(server_public_key, hello);
+    let mut diff = 0u8;
+    for (left, right) in expected.iter().zip(&hello.mac1) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 /// Runs the server side of the signed handshake for the server-selected
@@ -1259,7 +1329,7 @@ mod tests {
     fn client_and_server_derive_opposite_keys() {
         for mode in [TransportMode::Encrypted, TransportMode::Plaintext] {
             let rng = rand::SystemRandom::new();
-            let client = generate_client_hello(&rng).unwrap();
+            let client = generate_client_hello(&rng, Some(&dev_server_public_key())).unwrap();
             let client_hello = client.hello.clone();
             let server =
                 respond_to_client_hello(&rng, &dev_server_key_pair(), &client_hello, mode).unwrap();
@@ -1300,7 +1370,7 @@ mod tests {
         // A ServerHello signed for one mode must not verify when its mode byte is
         // swapped to the other.
         let rng = rand::SystemRandom::new();
-        let client = generate_client_hello(&rng).unwrap();
+        let client = generate_client_hello(&rng, Some(&dev_server_public_key())).unwrap();
         let client_hello = client.hello.clone();
         let server = respond_to_client_hello(
             &rng,
@@ -1320,7 +1390,7 @@ mod tests {
     #[test]
     fn server_rejects_unadvertised_mode() {
         let rng = rand::SystemRandom::new();
-        let mut client = generate_client_hello(&rng).unwrap();
+        let mut client = generate_client_hello(&rng, Some(&dev_server_public_key())).unwrap();
         client.hello.modes = vec![TransportMode::Encrypted.wire_id()];
         assert!(
             respond_to_client_hello(
@@ -1331,6 +1401,62 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn hello_mac_verifies_only_under_the_servers_own_key() {
+        let rng = rand::SystemRandom::new();
+        let client = generate_client_hello(&rng, Some(&dev_server_public_key())).unwrap();
+        assert!(verify_client_hello_mac1(
+            &dev_server_public_key(),
+            &client.hello
+        ));
+
+        // A peer that has not been given this server's key cannot produce a
+        // hello it will answer, which is the whole scan-resistance property.
+        let mut other_key = dev_server_public_key();
+        other_key[0] ^= 1;
+        assert!(!verify_client_hello_mac1(&other_key, &client.hello));
+    }
+
+    #[test]
+    fn hello_mac_covers_every_negotiated_field() {
+        let rng = rand::SystemRandom::new();
+        let original = generate_client_hello(&rng, Some(&dev_server_public_key()))
+            .unwrap()
+            .hello;
+
+        let mut version = original.clone();
+        version.version = version.version.wrapping_add(1);
+        assert!(!verify_client_hello_mac1(&dev_server_public_key(), &version));
+
+        let mut modes = original.clone();
+        modes.modes = vec![TransportMode::Plaintext.wire_id()];
+        assert!(!verify_client_hello_mac1(&dev_server_public_key(), &modes));
+
+        let mut nonce = original.clone();
+        nonce.client_nonce[0] ^= 1;
+        assert!(!verify_client_hello_mac1(&dev_server_public_key(), &nonce));
+
+        let mut ephemeral = original.clone();
+        ephemeral.client_ephemeral[0] ^= 1;
+        assert!(!verify_client_hello_mac1(
+            &dev_server_public_key(),
+            &ephemeral
+        ));
+    }
+
+    #[test]
+    fn hello_without_a_pinned_key_carries_a_zero_mac() {
+        // The open-pairing path has no key to bind to yet. It must still build
+        // a hello; only a server that does not require the MAC will answer it.
+        let rng = rand::SystemRandom::new();
+        let client = generate_client_hello(&rng, None).unwrap();
+        assert_eq!(client.hello.mac1, [0u8; HELLO_MAC_LEN]);
+        assert!(!verify_client_hello_mac1(
+            &dev_server_public_key(),
+            &client.hello
+        ));
     }
 
     #[test]
@@ -1351,7 +1477,7 @@ mod tests {
     #[test]
     fn plaintext_handshake_is_signed_and_derives_material() {
         let rng = rand::SystemRandom::new();
-        let client = generate_client_hello(&rng).unwrap();
+        let client = generate_client_hello(&rng, Some(&dev_server_public_key())).unwrap();
         let client_hello = client.hello.clone();
         let server = respond_to_client_hello(
             &rng,
