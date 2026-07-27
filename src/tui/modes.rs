@@ -1400,6 +1400,8 @@ pub(crate) struct RoomMode {
     scrollbar_drag: Option<ScrollbarDrag>,
     history_search: Option<HistorySearch>,
     last_history_search: Option<HistorySearch>,
+    /// Room the search state above belongs to.
+    searched_room: Option<rpc::ids::RoomId>,
 }
 
 impl Default for RoomMode {
@@ -1418,6 +1420,7 @@ impl RoomMode {
             scrollbar_drag: None,
             history_search: None,
             last_history_search: None,
+            searched_room: None,
         }
     }
 
@@ -1431,7 +1434,20 @@ impl RoomMode {
             scrollbar_drag: None,
             history_search: None,
             last_history_search: None,
+            searched_room: None,
         }
+    }
+
+    /// Drops search state belonging to a room this panel no longer shows.
+    /// Message ids restart at one in every room, so a query carried across a
+    /// switch would select and highlight unrelated messages.
+    fn discard_foreign_search(&mut self, cx: &ViewCx<'_>) {
+        if self.searched_room == cx.view.viewed_room {
+            return;
+        }
+        self.searched_room = cx.view.viewed_room;
+        self.history_search = None;
+        self.last_history_search = None;
     }
 
     #[cfg(test)]
@@ -2611,6 +2627,7 @@ impl RoomMode {
         if is_quit_key(&key) {
             return Action::Quit;
         }
+        self.discard_foreign_search(cx);
         if let Some(search) = &mut self.history_search {
             let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
                 return Action::Continue;
@@ -2687,6 +2704,7 @@ impl RoomMode {
     }
 
     fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.discard_foreign_search(cx);
         if self.process_top_bar_mouse(cx, mouse) {
             return Action::Continue;
         }
@@ -2701,6 +2719,7 @@ impl RoomMode {
 
 impl AppMode for RoomMode {
     fn render(&mut self, cx: &mut ViewCx<'_>, buf: &mut Buffer, now_ms: u64, dirty: DirtySections) {
+        self.discard_foreign_search(cx);
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
         crate::tui::render::draw_room_screen(

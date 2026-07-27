@@ -24,6 +24,7 @@ use crate::{
     app::{App, AppEvent, EventSender, PendingJoin, command::CoreCommand},
     attach,
     client_channel::{ClientChannel, ClientId, DirtySections},
+    client_net::NetworkEvent,
     config::Config,
     tui::{
         client_thread::{ClientThread, InitialMode},
@@ -821,14 +822,37 @@ fn handle_runtime_event(
             }
         }
         event => {
+            let projects = affects_rpc_projection(&event);
             if let Some(change) = app.handle_app_event(event)
                 && !rpc_clients.is_empty()
             {
                 project_rpc_history_change(app, rpc_clients, daemon_instance, &change);
             }
-            broadcast_rpc_snapshots(app, rpc_clients, daemon_instance);
+            if projects {
+                broadcast_rpc_snapshots(app, rpc_clients, daemon_instance);
+            }
         }
     }
+}
+
+/// Whether an event can move any field of [`StateSnapshot`].
+///
+/// Broadcasting rebuilds a whole snapshot per attached client just to diff it,
+/// so the high-rate telemetry that provably touches nothing in the projection
+/// skips it. The list is deliberately a deny-list of known-inert events: an
+/// event not named here still broadcasts.
+fn affects_rpc_projection(event: &AppEvent) -> bool {
+    let (AppEvent::Network(event) | AppEvent::NetworkFor { event, .. }) = event else {
+        return !matches!(event, AppEvent::ScreencastProgress(_));
+    };
+    !matches!(
+        event,
+        NetworkEvent::VoicePacketObserved { .. }
+            | NetworkEvent::PlaybackFeedback(_)
+            | NetworkEvent::OutboundFeedback { .. }
+            | NetworkEvent::ServerRtt { .. }
+            | NetworkEvent::PeerRtt { .. }
+    )
 }
 
 fn daemon_instance_id() -> DaemonInstanceId {
@@ -1210,8 +1234,6 @@ fn project_rpc_history_change(
             }
         }
     }
-    failed.sort_unstable_by_key(|id| id.0);
-    failed.dedup();
     for id in failed {
         if let Some(client) = clients.get(&id) {
             let _ = client.control.shutdown(std::net::Shutdown::Both);
@@ -1226,28 +1248,22 @@ fn sync_rpc_state(
     instance_id: DaemonInstanceId,
 ) -> Result<(), String> {
     complete_pending_rpc_history(app, id, client, instance_id)?;
-    let mut next = app.rpc_projection_state(id);
-    let same_room = client.last_snapshot.selected_room == next.selected_room
+    // Decide on room identity before projecting anything. A client that
+    // switched rooms needs a whole snapshot, and building the delta projection
+    // first only to throw it away doubled the cost of every runtime event.
+    let selected_room = app.room.selected_room_for(id);
+    let same_room = client.last_snapshot.selected_room == selected_room
         && client
             .last_snapshot
             .room
             .as_ref()
             .map(|room| (room.room_id, room.room_generation))
-            == next
-                .room
-                .as_ref()
-                .map(|room| (room.room_id, room.room_generation));
-    if same_room
-        && let (Some(previous), Some(next_room)) = (&client.last_snapshot.room, &mut next.room)
-    {
-        next_room.older_cursor = previous.older_cursor;
-        next_room.at_start = previous.at_start;
-    }
-    client.live_viewers.retain(|stream_id, _| {
-        next.live_shares
-            .iter()
-            .any(|share| share.stream_id == *stream_id)
-    });
+            == selected_room.map(|room_id| {
+                (
+                    room_id,
+                    app.room.room_generation(room_id).unwrap_or_default(),
+                )
+            });
     if !same_room {
         let seq = client.next_event_seq;
         let mut snapshot = client
@@ -1256,10 +1272,27 @@ fn sync_rpc_state(
         if let Some(room) = snapshot.room.as_mut() {
             room.messages.clear();
         }
+        client.live_viewers.retain(|stream_id, _| {
+            snapshot
+                .live_shares
+                .iter()
+                .any(|share| share.stream_id == *stream_id)
+        });
         client.next_event_seq = seq.wrapping_add(1);
         client.last_snapshot = snapshot;
         return Ok(());
     }
+
+    let mut next = app.rpc_projection_state(id);
+    if let (Some(previous), Some(next_room)) = (&client.last_snapshot.room, &mut next.room) {
+        next_room.older_cursor = previous.older_cursor;
+        next_room.at_start = previous.at_start;
+    }
+    client.live_viewers.retain(|stream_id, _| {
+        next.live_shares
+            .iter()
+            .any(|share| share.stream_id == *stream_id)
+    });
 
     let deltas = projection_deltas(&client.last_snapshot, &next);
     for delta in deltas {
@@ -2679,11 +2712,41 @@ mod tests {
     };
 
     use super::{
-        RemoteClient, RemoteShutdown, daemon_instance_id, handle_runtime_event,
-        panic_payload_message, shutdown_remote, upload_staging_active,
+        RemoteClient, RemoteShutdown, affects_rpc_projection, daemon_instance_id,
+        handle_runtime_event, panic_payload_message, shutdown_remote, upload_staging_active,
     };
     use crate::{attach, client_channel::ClientChannel};
     use parking_lot::Mutex;
+
+    #[test]
+    fn voice_telemetry_does_not_rebuild_rpc_snapshots() {
+        use crate::app::AppEvent;
+        use crate::client_net::NetworkEvent;
+
+        // These arrive per packet and touch no StateSnapshot field, so paying a
+        // full snapshot rebuild per attached client for each one is pure waste.
+        for event in [
+            NetworkEvent::ServerRtt { rtt_ms: Some(4) },
+            NetworkEvent::PeerRtt {
+                user_id: rpc::ids::UserId(1),
+                rtt_ms: Some(4),
+            },
+        ] {
+            assert!(!affects_rpc_projection(&AppEvent::Network(event)));
+        }
+        assert!(!affects_rpc_projection(&AppEvent::NetworkFor {
+            generation: 1,
+            event: NetworkEvent::ServerRtt { rtt_ms: Some(4) },
+        }));
+
+        // Anything not explicitly known to be inert still broadcasts.
+        assert!(affects_rpc_projection(&AppEvent::Network(
+            NetworkEvent::Connected
+        )));
+        assert!(affects_rpc_projection(&AppEvent::Network(
+            NetworkEvent::DeviceLinkCanceled
+        )));
+    }
 
     fn remote_client() -> (RemoteClient, UnixStream, Arc<ClientChannel>) {
         let (control, peer) = UnixStream::pair().unwrap();

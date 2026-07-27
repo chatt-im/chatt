@@ -171,16 +171,7 @@ impl ClientThread {
                     url_open_command = config.url_open.clone();
                     url_opener = crate::url_open::UrlOpener::new(url_open_command.clone());
                 }
-                let previous_room = view.viewed_room;
-                view.sync_independent(&session);
-                if view.viewed_room != previous_room
-                    && let Some(room_id) = view.viewed_room
-                {
-                    queued.push(CoreCommand::SetViewedRoom(room_id));
-                }
-                if view.viewed_room != previous_room {
-                    dirty = DirtySections::ALL;
-                }
+                dirty |= sync_view(&mut view, &session, &mut queued);
                 let mut cx = ViewCx {
                     view: &mut view,
                     session: &session,
@@ -262,6 +253,11 @@ impl ClientThread {
                 let action = {
                     let session = session.read();
                     let config = config.read();
+                    // The loop slept in `poll` since the render pass synced, and
+                    // the core is free to tombstone or evict while it sleeps.
+                    // Dispatching against that older reconcile would hand the
+                    // handlers view ids canonical history no longer resolves.
+                    dirty |= sync_view(&mut view, &session, &mut queued);
                     let mut cx = ViewCx {
                         view: &mut view,
                         session: &session,
@@ -313,6 +309,24 @@ impl ClientThread {
         }
         Ok(())
     }
+}
+
+/// Reconciles the view's room selection and chat viewport with canonical
+/// history, returning the sections a room change invalidates.
+fn sync_view(
+    view: &mut ClientView,
+    session: &RoomSession,
+    queued: &mut Vec<CoreCommand>,
+) -> DirtySections {
+    let previous_room = view.viewed_room;
+    view.sync_independent(session);
+    if view.viewed_room == previous_room {
+        return DirtySections::EMPTY;
+    }
+    if let Some(room_id) = view.viewed_room {
+        queued.push(CoreCommand::SetViewedRoom(room_id));
+    }
+    DirtySections::ALL
 }
 
 /// Transmits the commands a dispatch queued. Callers drop the session/config/view
