@@ -164,7 +164,15 @@ or from `--config` / `CHATT_SERVER_CONFIG`.
 Important fields:
 
 - `network.bind`: shared TCP control and UDP media bind address. Use
-  `network.bind.tcp` and `network.bind.udp` instead when they differ.
+  `network.bind.tcp` and `network.bind.udp` instead when they differ. Either
+  accepts a comma-separated list of up to 32 addresses, so one server can be
+  reached over several network paths (a LAN or VPN address alongside a public
+  one). A client that pairs by address keeps the address it dialed for media
+  too; the server never picks a bind on the client's behalf, because it cannot
+  know which of them that client can route to, nor its own mapped port behind
+  NAT. After address pairing, set the UDP and optional Probe fields in the
+  client server editor when they differ from the dialed TCP endpoint. Invite
+  pairing fills those fields from the server-issued ticket instead.
 - `network.udp-probe-addr`: optional second UDP endpoint for P2P NAT
   classification.
 - `network.public-addr`: shared TCP and UDP endpoint embedded in invites. This

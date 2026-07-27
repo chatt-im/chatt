@@ -339,10 +339,12 @@ pub enum ServerControl {
     },
     /// Open pairing succeeded. Carries the issued bearer token the client must
     /// store, alongside the same session details as [`ServerControl::Authenticated`].
+    /// Carries no media endpoint: the client keeps the host and port it dialed.
+    /// A multi-bind server cannot pick one for it, and behind NAT it does not
+    /// even know its own mapped port — only the operator does, which is what
+    /// `public-addr` is for, and that reaches clients through invites alone.
     OpenPaired {
         token: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
         session_id: SessionId,
         user_id: UserId,
         rooms: Vec<RoomInfo>,
@@ -570,11 +572,11 @@ pub enum ServerControl {
         user_id: UserId,
         username: String,
     },
+    /// Carries no media endpoint, for the reasons on [`ServerControl::OpenPaired`].
+    /// The linking device already put its own working endpoints in the ticket.
     DeviceLinked {
         token: String,
         username: String,
-        udp_addr: String,
-        udp_probe_addr: Option<String>,
         session_id: SessionId,
         user_id: UserId,
         rooms: Vec<RoomInfo>,
@@ -1759,8 +1761,6 @@ mod tests {
     fn open_paired_control_round_trips_endpoints() {
         let control = ServerControl::OpenPaired {
             token: "tct1_token".to_string(),
-            udp_addr: "198.51.100.20:54100".to_string(),
-            udp_probe_addr: Some("198.51.100.20:54101".to_string()),
             session_id: SessionId(7),
             user_id: UserId(4_294_967_296),
             rooms: vec![RoomInfo {

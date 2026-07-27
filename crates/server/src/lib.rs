@@ -66,7 +66,10 @@ use bug_report_writer::{
     BugReportWriteReply, BugReportWriteRequest, BugReportWriter,
     EnqueueError as BugReportEnqueueError,
 };
-use config::{Config as ServerConfig, UserConfig, hash_secret, valid_username, verify_secret_hash};
+use config::{
+    Config as ServerConfig, MAX_BIND_ADDRS, UserConfig, hash_secret, valid_username,
+    verify_secret_hash,
+};
 use event_queue::{
     ADMIN_EVENTS, BUG_REPORT_EVENTS, EventNotifier, EventQueue, HISTORY_EVENTS, IDENTITY_EVENTS,
     MLS_EVENTS, ROOM_LOG_EVENTS, ROOM_STATE_EVENTS, VOICE_EVENTS,
@@ -89,10 +92,12 @@ use rpc::evented::{ReadPumpOutcome, recv_datagram_with};
 #[cfg(test)]
 use rpc::history;
 
-const LISTENER: Token = Token(0);
+// TCP listeners use their bind index as their poll token. Keeping the token
+// range fixed at the configured maximum leaves client tokens independent of
+// the number of binds selected at runtime.
 /// Wake-only token the history reader thread signals after queueing a reply.
-const WAKER: Token = Token(1);
-const FIRST_CLIENT: usize = 2;
+const WAKER: Token = Token(MAX_BIND_ADDRS);
+const FIRST_CLIENT: usize = MAX_BIND_ADDRS + 1;
 /// The default config's lobby room id, used by tests asserting lobby state.
 #[cfg(test)]
 const DEFAULT_ROOM: RoomId = RoomId(1);
@@ -218,7 +223,8 @@ const AUDIO_POP_PACKET_FLAG_MUTE: u8 = 0x08;
 
 #[derive(Debug, Default)]
 struct LoopWork {
-    accept_clients: bool,
+    accept_listeners: VecDeque<usize>,
+    accept_listener_bits: u64,
     client_reads: VecDeque<Token>,
     client_read_set: HashSet<Token>,
     client_writes: VecDeque<Token>,
@@ -334,7 +340,7 @@ impl LoopWork {
 
     #[inline]
     fn has_immediate_work(&self) -> bool {
-        self.accept_clients
+        !self.accept_listeners.is_empty()
             || !self.client_reads.is_empty()
             || !self.client_writes.is_empty()
             || self.background_work
@@ -355,8 +361,13 @@ impl LoopWork {
     }
 
     #[inline]
-    fn queue_accept_clients(&mut self) {
-        self.accept_clients = true;
+    fn queue_accept_listener(&mut self, index: usize) {
+        debug_assert!(index < MAX_BIND_ADDRS);
+        let bit = 1u64 << index;
+        if self.accept_listener_bits & bit == 0 {
+            self.accept_listener_bits |= bit;
+            self.accept_listeners.push_back(index);
+        }
     }
 
     #[inline]
@@ -370,10 +381,16 @@ impl LoopWork {
     }
 
     #[inline]
-    fn take_accept_clients(&mut self) -> bool {
-        let accept_clients = self.accept_clients;
-        self.accept_clients = false;
-        accept_clients
+    fn pop_accept_listener(&mut self) -> Option<usize> {
+        let index = self.accept_listeners.pop_front()?;
+        self.accept_listener_bits &= !(1u64 << index);
+        Some(index)
+    }
+
+    #[inline]
+    fn clear_accept_listeners(&mut self) {
+        self.accept_listeners.clear();
+        self.accept_listener_bits = 0;
     }
 
     #[inline]
@@ -499,17 +516,20 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         transport_mode = config.transport_mode().as_str(),
         p2p_enabled = config.network.p2p
     );
-    let tcp_addr = config.network.bind.tcp;
-    let udp_addr = config.network.bind.udp;
-    let public_tcp_addr = config.network.public_addr.tcp.clone();
-    let public_udp_addr = config.network.public_addr.udp.clone();
-    let public_udp_probe_addr = config
+    let tcp_addr = config.network.bind.tcp.clone();
+    let udp_addr = config.network.bind.udp.clone();
+    let p2p_enabled = config.network.p2p;
+    let mut server = Server::bind(config)?;
+    // Read the public endpoints back from the bound server: an ephemeral `:0`
+    // bind only gets its real port stamped in during `Server::bind`.
+    let public_tcp_addr = server.config.network.public_addr.tcp.clone();
+    let public_udp_addr = server.config.network.public_addr.udp.clone();
+    let public_udp_probe_addr = server
+        .config
         .network
         .public_udp_probe_addr
         .clone()
         .unwrap_or_else(|| "disabled".to_string());
-    let p2p_enabled = config.network.p2p;
-    let mut server = Server::bind(config)?;
     let admin_socket = AdminSocket::spawn(server.admin_sender()).map_err(invalid_config)?;
     if p2p_enabled && udp_probe_addr.is_some() {
         println!(
@@ -581,7 +601,9 @@ pub struct Server {
     event_notifier: Arc<EventNotifier>,
     admin_events: Arc<EventQueue<AdminCommand>>,
     poll: Poll,
-    listener: TcpListener,
+    /// Every configured TCP bind, index 0 primary. Its poll token is its index,
+    /// allowing the accept path to touch only listeners reported as ready.
+    listeners: Vec<TcpListener>,
     voice_relay: VoiceRelayHandle,
     voice_events: VoiceEventBatch,
     clients: HashMap<Token, ClientConn>,
@@ -1296,20 +1318,30 @@ impl Server {
         Ok(())
     }
 
-    /// Local TCP address the listener is bound to, resolving an ephemeral `:0`
+    /// Local TCP address of the first listener, resolving an ephemeral `:0`
     /// port to the concrete port the OS assigned.
     pub fn tcp_local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.listeners[0].local_addr()
     }
 
-    /// Local UDP address the media socket is bound to.
+    /// Local TCP addresses of all configured listeners.
+    pub fn tcp_local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        self.listeners.iter().map(TcpListener::local_addr).collect()
+    }
+
+    /// Local UDP address of the first media socket.
     pub fn udp_local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.voice_relay.local_addr())
     }
 
+    /// Local UDP addresses of all configured media sockets.
+    pub fn udp_local_addrs(&self) -> &[SocketAddr] {
+        self.voice_relay.local_addrs()
+    }
+
     pub fn bind(mut config: ServerConfig) -> io::Result<Self> {
         let infer_public_tcp = config.network.public_addr.tcp.trim().is_empty()
-            || (config.network.bind.tcp.port() == 0
+            || (config.network.bind.tcp.first().port() == 0
                 && config
                     .network
                     .public_addr
@@ -1317,7 +1349,7 @@ impl Server {
                     .parse::<SocketAddr>()
                     .is_ok_and(|endpoint| endpoint.port() == 0));
         let infer_public_udp = config.network.public_addr.udp.trim().is_empty()
-            || (config.network.bind.udp.port() == 0
+            || (config.network.bind.udp.first().port() == 0
                 && config
                     .network
                     .public_addr
@@ -1326,15 +1358,21 @@ impl Server {
                     .is_ok_and(|endpoint| endpoint.port() == 0));
         let infer_public_udp_probe = config.network.public_udp_probe_addr.is_none();
         config.normalize();
-        let tcp_addr = config.network.bind.tcp;
-        let udp_addr = config.network.bind.udp;
         let udp_probe_addr = config.network.udp_probe_addr;
         let p2p_enabled = config.network.p2p;
         let poll = Poll::new()?;
-        let mut listener = TcpListener::bind(tcp_addr)?;
-        let udp = UdpSocket::bind(udp_addr)?;
+        let mut listeners = Vec::with_capacity(config.network.bind.tcp.len());
+        for (index, addr) in config.network.bind.tcp.iter().enumerate() {
+            listeners.push(bind_transport("tcp", index, addr, TcpListener::bind)?);
+        }
+        let mut udp = Vec::with_capacity(config.network.bind.udp.len());
+        for (index, addr) in config.network.bind.udp.iter().enumerate() {
+            udp.push(bind_transport("udp", index, addr, UdpSocket::bind)?);
+        }
         let udp_probe = if p2p_enabled {
-            udp_probe_addr.map(UdpSocket::bind).transpose()?
+            udp_probe_addr
+                .map(|addr| bind_transport("udp probe", 0, addr, UdpSocket::bind))
+                .transpose()?
         } else {
             None
         };
@@ -1345,7 +1383,7 @@ impl Server {
                 .tcp
                 .parse::<SocketAddr>()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            public.set_port(listener.local_addr()?.port());
+            public.set_port(listeners[0].local_addr()?.port());
             config.network.public_addr.tcp = public.to_string();
         }
         if infer_public_udp {
@@ -1355,7 +1393,7 @@ impl Server {
                 .udp
                 .parse::<SocketAddr>()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            public.set_port(udp.local_addr()?.port());
+            public.set_port(udp[0].local_addr()?.port());
             config.network.public_addr.udp = public.to_string();
         }
         if infer_public_udp_probe
@@ -1374,14 +1412,17 @@ impl Server {
         // proven it holds the server key — but only if the kernel withholds the
         // socket until that peer actually sends something. Without this a bare
         // connect scan still costs an fd, a token, and a pre-auth slot.
-        if let Err(error) = set_defer_accept(&listener, HANDSHAKE_TIMEOUT) {
-            kvlog::warn!(
-                "tcp defer-accept unavailable; bare connects will occupy a pre-auth slot",
-                error = %error
-            );
+        for (index, listener) in listeners.iter_mut().enumerate() {
+            if let Err(error) = set_defer_accept(listener, HANDSHAKE_TIMEOUT) {
+                kvlog::warn!(
+                    "tcp defer-accept unavailable; bare connects will occupy a pre-auth slot",
+                    bind_index = index,
+                    error = %error
+                );
+            }
+            poll.registry()
+                .register(listener, Token(index), Interest::READABLE)?;
         }
-        poll.registry()
-            .register(&mut listener, LISTENER, Interest::READABLE)?;
 
         let users = UserStore::open(config.data_dir())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -1547,7 +1588,7 @@ impl Server {
             event_notifier,
             admin_events,
             poll,
-            listener,
+            listeners,
             voice_relay,
             voice_events: VoiceEventBatch::with_capacity(),
             clients: HashMap::new(),
@@ -1617,7 +1658,9 @@ impl Server {
             let now = Instant::now();
             if self.accept_retry_at.is_some_and(|retry| retry <= now) {
                 self.accept_retry_at = None;
-                self.loop_work.queue_accept_clients();
+                for index in 0..self.listeners.len() {
+                    self.loop_work.queue_accept_listener(index);
+                }
             }
             let idle_timeout = self
                 .accept_retry_at
@@ -1639,32 +1682,31 @@ impl Server {
             let event_count = events.iter().count();
             for event in events.iter() {
                 let ready = MioReady::from_event(event);
-                match event.token() {
-                    LISTENER => {
-                        if ready.readable_like() && self.accept_retry_at.is_none() {
-                            self.loop_work.queue_accept_clients();
-                        }
+                let token = event.token();
+                if token.0 < self.listeners.len() {
+                    if ready.readable_like() && self.accept_retry_at.is_none() {
+                        self.loop_work.queue_accept_listener(token.0);
                     }
-                    WAKER => ready_workers |= self.event_notifier.take_ready(),
-                    token => {
-                        if ready.readable_like() {
-                            if let Some(client) = self.clients.get_mut(&token) {
-                                client.readiness.mark_ready();
-                            }
-                            self.loop_work.queue_client_read(token);
+                } else if token == WAKER {
+                    ready_workers |= self.event_notifier.take_ready();
+                } else {
+                    if ready.readable_like() {
+                        if let Some(client) = self.clients.get_mut(&token) {
+                            client.readiness.mark_ready();
                         }
-                        if ready.writable_like()
-                            && self
-                                .clients
-                                .get(&token)
-                                .is_some_and(|client| !client.write_buf.is_empty())
-                        {
-                            self.loop_work.queue_client_write(token);
-                        }
+                        self.loop_work.queue_client_read(token);
+                    }
+                    if ready.writable_like()
+                        && self
+                            .clients
+                            .get(&token)
+                            .is_some_and(|client| !client.write_buf.is_empty())
+                    {
+                        self.loop_work.queue_client_write(token);
                     }
                 }
             }
-            if self.loop_work.take_accept_clients() {
+            if !self.loop_work.accept_listeners.is_empty() {
                 self.accept_clients()?;
             }
             let client_read_count = self.loop_work.client_read_batch_len();
@@ -1870,112 +1912,134 @@ impl Server {
     }
 
     fn accept_clients(&mut self) -> io::Result<()> {
+        // Listener tokens identify exactly which backlogs need draining. A
+        // budget-capped listener returns to the FIFO tail so other ready binds
+        // get a turn before it resumes.
         let mut accepted = 0usize;
-        loop {
-            if accepted >= ACCEPT_BUDGET {
-                self.loop_work.queue_accept_clients();
-                return Ok(());
+        while let Some(listener_index) = self.loop_work.pop_accept_listener() {
+            loop {
+                if accepted >= ACCEPT_BUDGET {
+                    self.loop_work.queue_accept_listener(listener_index);
+                    return Ok(());
+                }
+                let (socket, addr) = match self.listeners[listener_index].accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if is_interrupted_io_error(&error) => {
+                        self.loop_work.queue_accept_listener(listener_index);
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => {
+                        // The peer went away before we accepted. One backlog
+                        // entry is gone, so stay here, but spend budget so an
+                        // aborting listener cannot pin the event loop.
+                        accepted += 1;
+                        continue;
+                    }
+                    Err(error) if is_fd_pressure_accept_error(&error) => {
+                        // fd pressure (EMFILE/ENFILE) is process-wide. Drop the
+                        // immediate work so the loop does not spin; the retry
+                        // deadline queues every listener because readiness
+                        // edges observed during the backoff may have coalesced.
+                        kvlog::warn!(
+                            "transient tcp accept failure",
+                            bind_index = listener_index,
+                            error = %error
+                        );
+                        self.loop_work.clear_accept_listeners();
+                        self.accept_retry_at = Some(Instant::now() + ACCEPT_ERROR_BACKOFF);
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                accepted += 1;
+                self.accept_client(socket, addr)?;
             }
-            let (mut socket, addr) = match self.listener.accept() {
-                Ok(value) => value,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if is_interrupted_io_error(&error) => {
-                    self.loop_work.queue_accept_clients();
-                    return Ok(());
-                }
-                Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => {
-                    continue;
-                }
-                Err(error) if is_fd_pressure_accept_error(&error) => {
-                    // fd pressure (EMFILE/ENFILE) cannot drain by accepting.
-                    // Keep serving established clients until this deadline.
-                    kvlog::warn!("transient tcp accept failure", error = %error);
-                    self.accept_retry_at = Some(Instant::now() + ACCEPT_ERROR_BACKOFF);
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
-            accepted += 1;
-            // Accept then close over-cap connections so the backlog keeps
-            // draining. Returning early would leave the listener readable with
-            // an edge-triggered poll, so it would not wake again until the next
-            // new connection.
-            if self.clients.len() >= MAX_CLIENTS {
+        }
+        Ok(())
+    }
+
+    fn accept_client(&mut self, mut socket: TcpStream, addr: SocketAddr) -> io::Result<()> {
+        // Accept then close over-cap connections so the backlog keeps
+        // draining. Returning early would leave the listener readable with
+        // an edge-triggered poll, so it would not wake again until the next
+        // new connection.
+        if self.clients.len() >= MAX_CLIENTS {
+            kvlog::warn!(
+                "tcp client cap reached, rejecting connection",
+                client_count = self.clients.len(),
+                max_clients = MAX_CLIENTS,
+                addr = %addr
+            );
+            drop(socket);
+            return Ok(());
+        }
+        // Taken before any per-connection state exists, so the cost of a
+        // stranger is one accept and one close. Established sessions are
+        // budgeted separately and cannot be crowded out from here.
+        if let Err(refusal) = self.pre_auth.admit(addr.ip()) {
+            if let Some(refused) = self.pre_auth.refusals_to_report(Instant::now()) {
                 kvlog::warn!(
-                    "tcp client cap reached, rejecting connection",
-                    client_count = self.clients.len(),
-                    max_clients = MAX_CLIENTS,
+                    "pre-auth cap reached, rejecting connections",
+                    scope = match refusal {
+                        PreAuthRefusal::Global => "global",
+                        PreAuthRefusal::PerIp => "per_ip",
+                    },
+                    refused,
+                    handshaking = self.pre_auth.held,
+                    max_handshaking = MAX_HANDSHAKING,
+                    max_handshaking_per_ip = MAX_HANDSHAKING_PER_IP,
                     addr = %addr
                 );
-                drop(socket);
-                continue;
             }
-            // Taken before any per-connection state exists, so the cost of a
-            // stranger is one accept and one close. Established sessions are
-            // budgeted separately and cannot be crowded out from here.
-            if let Err(refusal) = self.pre_auth.admit(addr.ip()) {
-                if let Some(refused) = self.pre_auth.refusals_to_report(Instant::now()) {
-                    kvlog::warn!(
-                        "pre-auth cap reached, rejecting connections",
-                        scope = match refusal {
-                            PreAuthRefusal::Global => "global",
-                            PreAuthRefusal::PerIp => "per_ip",
-                        },
-                        refused,
-                        handshaking = self.pre_auth.held,
-                        max_handshaking = MAX_HANDSHAKING,
-                        max_handshaking_per_ip = MAX_HANDSHAKING_PER_IP,
-                        addr = %addr
-                    );
-                }
-                drop(socket);
-                continue;
-            }
-            // Disable Nagle so relayed frames (including bulk file chunks) are
-            // not held waiting for an ACK, matching the client's `set_nodelay`.
-            if let Err(error) = socket.set_nodelay(true) {
-                kvlog::warn!("failed to set tcp_nodelay on client socket", error = %error);
-            }
-            let token = Token(self.next_token);
-            self.next_token += 1;
-            kvlog::info!(
-                "tcp client accepted",
-                token = token.0,
-                addr = %addr,
-                client_count = self.clients.len() + 1
-            );
-            if let Err(error) = self.poll.registry().register(
-                &mut socket,
-                token,
-                Interest::READABLE | Interest::WRITABLE,
-            ) {
-                // No `ClientConn` exists yet, so nothing else would ever
-                // return the slot this connection was admitted into.
-                self.pre_auth.release(addr.ip());
-                return Err(error);
-            }
-            let now = Instant::now();
-            self.clients.insert(
-                token,
-                ClientConn {
-                    socket,
-                    addr,
-                    read_buf: RecvBuffer::new(),
-                    readiness: Readiness::new(),
-                    write_buf: WriteQueue::new(),
-                    kind: ConnKind::Unidentified,
-                    state: ConnState::AwaitClientHello,
-                    control: None,
-                    transport: None,
-                    session_id: None,
-                    user_id: None,
-                    close: Close::Open,
-                    pre_auth: true,
-                    created_at: now,
-                    last_activity: now,
-                },
-            );
+            drop(socket);
+            return Ok(());
         }
+        // Disable Nagle so relayed frames (including bulk file chunks) are
+        // not held waiting for an ACK, matching the client's `set_nodelay`.
+        if let Err(error) = socket.set_nodelay(true) {
+            kvlog::warn!("failed to set tcp_nodelay on client socket", error = %error);
+        }
+        let token = Token(self.next_token);
+        self.next_token += 1;
+        kvlog::info!(
+            "tcp client accepted",
+            token = token.0,
+            addr = %addr,
+            client_count = self.clients.len() + 1
+        );
+        if let Err(error) = self.poll.registry().register(
+            &mut socket,
+            token,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            // No `ClientConn` exists yet, so nothing else would ever
+            // return the slot this connection was admitted into.
+            self.pre_auth.release(addr.ip());
+            return Err(error);
+        }
+        let now = Instant::now();
+        self.clients.insert(
+            token,
+            ClientConn {
+                socket,
+                addr,
+                read_buf: RecvBuffer::new(),
+                readiness: Readiness::new(),
+                write_buf: WriteQueue::new(),
+                kind: ConnKind::Unidentified,
+                state: ConnState::AwaitClientHello,
+                control: None,
+                transport: None,
+                session_id: None,
+                user_id: None,
+                close: Close::Open,
+                pre_auth: true,
+                created_at: now,
+                last_activity: now,
+            },
+        );
+        Ok(())
     }
 
     /// Returns the connection's pre-auth slot now that it has finished setting
@@ -5052,8 +5116,6 @@ impl Server {
         let response = match issued_token {
             Some(IssuedSessionToken::OpenPair(token)) => ServerControl::OpenPaired {
                 token,
-                udp_addr: self.config.network.public_addr.udp.clone(),
-                udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
                 session_id,
                 user_id,
                 rooms,
@@ -5063,8 +5125,6 @@ impl Server {
             Some(IssuedSessionToken::DeviceLink(token)) => ServerControl::DeviceLinked {
                 token,
                 username: username.clone(),
-                udp_addr: self.config.network.public_addr.udp.clone(),
-                udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
                 session_id,
                 user_id,
                 rooms,
@@ -8860,6 +8920,23 @@ fn is_fd_pressure_accept_error(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
+/// Binds one socket, naming the transport and list position in the error. With
+/// several binds per transport a bare `EADDRINUSE` does not say which address
+/// the operator has to fix.
+fn bind_transport<T>(
+    transport: &str,
+    index: usize,
+    addr: SocketAddr,
+    bind: impl FnOnce(SocketAddr) -> io::Result<T>,
+) -> io::Result<T> {
+    bind(addr).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{transport} bind {} ({addr}): {error}", index + 1),
+        )
+    })
+}
+
 /// Withholds an accepted connection from `accept()` until the peer sends data,
 /// or until `timeout` elapses and the kernel drops it.
 ///
@@ -9298,6 +9375,90 @@ mod tests {
         config.network.udp_probe_addr = None;
         config.network.p2p = false;
         config
+    }
+
+    #[test]
+    fn server_listens_on_every_configured_tcp_and_udp_bind() {
+        let mut config = test_server_config();
+        config.network.bind.tcp = "127.0.0.1:0,127.0.0.1:0".parse().unwrap();
+        config.network.bind.udp = "127.0.0.1:0,127.0.0.1:0".parse().unwrap();
+        config.network.public_addr = config::PublicAddrs::default();
+
+        let mut server = Server::bind(config).unwrap();
+        let tcp_addrs = server.tcp_local_addrs().unwrap();
+        let udp_addrs = server.udp_local_addrs().to_vec();
+
+        assert_eq!(tcp_addrs.len(), 2);
+        assert_ne!(tcp_addrs[0], tcp_addrs[1]);
+        assert_eq!(udp_addrs.len(), 2);
+        assert_ne!(udp_addrs[0], udp_addrs[1]);
+        assert_eq!(
+            server.config.network.public_addr.tcp,
+            tcp_addrs[0].to_string()
+        );
+        assert_eq!(
+            server.config.network.public_addr.udp,
+            udp_addrs[0].to_string()
+        );
+
+        let mut first = std::net::TcpStream::connect(tcp_addrs[0]).unwrap();
+        let mut second = std::net::TcpStream::connect(tcp_addrs[1]).unwrap();
+        first.write_all(&[0]).unwrap();
+        second.write_all(&[0]).unwrap();
+        server.loop_work.queue_accept_listener(0);
+        server.loop_work.queue_accept_listener(1);
+        server.accept_clients().unwrap();
+
+        assert_eq!(server.clients.len(), 2);
+    }
+
+    /// Ready listeners are drained without touching unreported binds, while a
+    /// backlog on one bind does not strand another ready listener.
+    #[test]
+    fn ready_listener_queue_drains_each_signaled_backlog() {
+        let mut config = test_server_config();
+        config.network.bind.tcp = "127.0.0.1:0,127.0.0.1:0,127.0.0.1:0".parse().unwrap();
+        config.network.bind.udp = "127.0.0.1:0".parse().unwrap();
+        config.network.public_addr = config::PublicAddrs::default();
+        let mut server = Server::bind(config).unwrap();
+        let tcp_addrs = server.tcp_local_addrs().unwrap();
+
+        let mut peers = Vec::new();
+        for _ in 0..5 {
+            let mut peer = std::net::TcpStream::connect(tcp_addrs[0]).unwrap();
+            peer.write_all(&[0]).unwrap();
+            peers.push(peer);
+        }
+        let mut last = std::net::TcpStream::connect(tcp_addrs[2]).unwrap();
+        last.write_all(&[0]).unwrap();
+        peers.push(last);
+        server.loop_work.queue_accept_listener(0);
+        server.loop_work.queue_accept_listener(2);
+        server.accept_clients().unwrap();
+
+        assert_eq!(server.clients.len(), 6);
+    }
+
+    /// Pairing must not hand back a media endpoint. The server cannot know
+    /// which of its binds a client can route to, nor its own mapped port behind
+    /// NAT, so the client keeps the control address it dialed.
+    #[test]
+    fn pairing_response_carries_no_media_endpoint() {
+        let mut server = open_pair_test_server();
+        server.config.network.public_addr.udp = "198.51.100.20:54100".to_string();
+        server.config.network.public_udp_probe_addr = Some("198.51.100.20:54101".to_string());
+        let token = Token(21);
+        let (conn, mut peer) = test_live_client();
+        server.clients.insert(token, conn);
+
+        server
+            .open_pair_client(token, "Zoe", "", &open_pair_recovery(3), true, 0)
+            .unwrap();
+
+        let response = read_plaintext_server_control(&mut server, &mut peer);
+        let ServerControl::OpenPaired { .. } = response else {
+            panic!("expected OpenPaired");
+        };
     }
 
     fn test_server() -> Server {
@@ -11637,16 +11798,20 @@ mod tests {
         let mut work = LoopWork::default();
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), POLL_TIMEOUT);
 
-        work.queue_accept_clients();
-        work.queue_accept_clients();
+        work.queue_accept_listener(2);
+        work.queue_accept_listener(2);
+        work.queue_accept_listener(1);
         work.queue_client_read(Token(7));
         work.queue_client_read(Token(7));
         work.queue_client_write(Token(9));
         work.queue_client_write(Token(9));
 
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), Duration::ZERO);
-        assert!(work.take_accept_clients());
-        assert!(!work.take_accept_clients());
+        assert_eq!(work.pop_accept_listener(), Some(2));
+        work.queue_accept_listener(2);
+        assert_eq!(work.pop_accept_listener(), Some(1));
+        assert_eq!(work.pop_accept_listener(), Some(2));
+        assert_eq!(work.pop_accept_listener(), None);
         assert_eq!(work.queued_client_reads(), vec![Token(7)]);
         assert_eq!(work.client_read_count(), 1);
         assert_eq!(work.pop_client_read(), Some(Token(7)));
@@ -12981,20 +13146,12 @@ mod tests {
             .unwrap();
 
         let response = read_plaintext_server_control(&mut server, &mut peer);
-        let ServerControl::OpenPaired {
-            token,
-            udp_addr,
-            udp_probe_addr,
-            ..
-        } = response
-        else {
+        let ServerControl::OpenPaired { token, .. } = response else {
             panic!("expected OpenPaired");
         };
         let claims = verify_dynamic_token(&seed, &token).unwrap();
         assert_eq!(claims.user_id, user_id);
         assert_eq!(claims.password_epoch, 7);
-        assert_eq!(udp_addr, "198.51.100.20:54100");
-        assert_eq!(udp_probe_addr.as_deref(), Some("198.51.100.20:54101"));
     }
 
     #[test]
