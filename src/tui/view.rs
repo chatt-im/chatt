@@ -363,18 +363,15 @@ impl ClientView {
             .complete(&mut self.composer, &self.active.chat, &history)
     }
 
-    pub(crate) fn submit_composer(&mut self, session: &RoomSession) -> Option<ComposerSubmission> {
+    pub(crate) fn submit_composer(&mut self) -> Option<ComposerSubmission> {
         let text = self.composer.text();
         let mut input = strip_blank_edge_lines(&text);
         if input.is_empty() {
             return None;
         }
         if let Some(edit) = self.pending_edit.take() {
-            let unchanged = session
-                .resident_message(edit.room_id, edit.target)
-                .is_some_and(|message| message.body == input);
             self.reset_composer(&edit.parked_draft);
-            if unchanged {
+            if input == edit.original {
                 return None;
             }
             return Some(ComposerSubmission::Edit {
@@ -447,6 +444,7 @@ impl ClientView {
         self.pending_edit = Some(PendingEdit {
             room_id,
             target,
+            original,
             parked_draft,
         });
         Ok(())

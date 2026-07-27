@@ -16,12 +16,6 @@ const COLLAPSE_LIMIT: usize = 12;
 const COLLAPSE_SHOW: usize = 10;
 /// Maximum gap between adjacent same-sender messages that still groups them.
 const GROUP_GAP_MS: u64 = 90_000;
-/// Detached pre-room output is view-local and deliberately small.
-const MAX_LOCAL_NOTICES: usize = 128;
-/// Layout retention is the visible terminal window plus at most this many
-/// disposable rows on either side. Since terminal height is `u16`, this also
-/// gives the cache a hard upper bound independent of history length.
-const MAX_LAYOUT_OVERSCAN_ROWS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoticeId(u64);
@@ -192,6 +186,24 @@ mod viewport_tests {
     }
 
     #[test]
+    fn configured_overscan_above_256_is_honored() {
+        let mut history = TestHistory::new();
+        for id in 1..=400 {
+            history.push(id, &format!("user-{id}"), &format!("message body {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 1, 300);
+
+        let resident = viewport
+            .entries
+            .iter()
+            .filter(|entry| entry.layout.is_some())
+            .count();
+        assert!(resident > 130, "{resident} layouts remained resident");
+    }
+
+    #[test]
     fn append_while_scrolled_preserves_the_visible_entry_anchor() {
         let mut history = TestHistory::new();
         for id in 1..=30 {
@@ -209,6 +221,68 @@ mod viewport_tests {
         let after = viewport.entries[after[0].message].id;
 
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn tail_append_repairs_the_existing_layout_index() {
+        let mut history = TestHistory::new();
+        for id in 1..=200 {
+            history.push(id, "alice", &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+        let rebuilds = viewport.layout_index.full_rebuilds;
+
+        history.push(201, "alice", "new tail");
+        history.push(202, "alice", "second batched tail");
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+
+        assert_eq!(viewport.layout_index.full_rebuilds, rebuilds);
+        assert_eq!(viewport.layout_index.line_counts.len(), viewport.len());
+    }
+
+    #[test]
+    fn edit_remeasures_only_the_changed_non_reference_layout() {
+        let mut history = TestHistory::new();
+        for id in 1..=200 {
+            history.push(id, "alice", &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+        let measured = viewport.layout_index.measured_messages;
+
+        history.edit(
+            100,
+            "changed body that wraps onto another line at this width",
+        );
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 2);
+
+        assert_eq!(viewport.layout_index.measured_messages, measured + 1);
+        assert_eq!(viewport.layout_index.line_counts.len(), viewport.len());
+    }
+
+    #[test]
+    fn notice_scroll_policy_survives_canonical_projection() {
+        let mut history = TestHistory::new();
+        for id in 1..=30 {
+            history.push(id, "alice", &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.scroll_up(&history.history(), 8, 40, 6);
+        assert!(viewport.scroll_offset() > 0);
+
+        history.notice("gap", false);
+        viewport.reconcile(&history.history());
+        assert!(viewport.scroll_offset() > 0);
+
+        history.notice("error", true);
+        viewport.reconcile(&history.history());
+        assert_eq!(viewport.scroll_offset(), 0);
     }
 }
 
@@ -325,11 +399,10 @@ impl ViewEntry {
 }
 
 fn remap_missing_entry(
-    entries: &[ViewEntry],
     previous: &[HistoryEntryId],
     old_position: usize,
+    survives: impl Fn(HistoryEntryId) -> bool,
 ) -> Option<HistoryEntryId> {
-    let survives = |id| entries.iter().any(|entry| entry.id == id);
     previous
         .get(old_position.saturating_add(1)..)
         .and_then(|newer| newer.iter().copied().find(|id| survives(*id)))
@@ -374,6 +447,8 @@ struct LayoutIndex {
     rows: FenwickRows,
     #[cfg(test)]
     full_rebuilds: usize,
+    #[cfg(test)]
+    measured_messages: usize,
 }
 
 impl LayoutIndex {
@@ -414,6 +489,10 @@ impl FenwickRows {
         self.total = 0;
     }
 
+    fn len(&self) -> usize {
+        self.tree.len()
+    }
+
     fn total(&self) -> usize {
         self.total
     }
@@ -428,6 +507,11 @@ impl FenwickRows {
             .saturating_sub(self.prefix_sum(start));
         self.tree.push(previous.saturating_add(value));
         self.total = self.total.saturating_add(value);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.tree.truncate(len);
+        self.total = self.prefix_sum(len);
     }
 
     fn set(&mut self, index: usize, value: usize) {
@@ -549,6 +633,8 @@ pub struct ChatViewport {
     entries: Vec<ViewEntry>,
     observed_generation: Option<u64>,
     observed_revision: u64,
+    observed_reindex_revision: u64,
+    observed_tail: Option<MessageId>,
     scroll_offset: usize,
     scroll_anchor: Option<ViewScrollAnchor>,
     /// Navigation cursor; `None` only while the buffer is empty. A stale
@@ -564,6 +650,7 @@ pub struct ChatViewport {
     syntax: SyntaxTheme,
     room_id: Option<RoomId>,
     local_notices: Vec<LocalNotice>,
+    max_local_notices: usize,
     next_notice_id: u64,
     clear_boundary: Option<ClearBoundary>,
     layout_index: LayoutIndex,
@@ -581,6 +668,8 @@ impl ChatViewport {
             entries: Vec::new(),
             observed_generation: None,
             observed_revision: 0,
+            observed_reindex_revision: 0,
+            observed_tail: None,
             scroll_offset: 0,
             scroll_anchor: None,
             cursor: None,
@@ -589,6 +678,7 @@ impl ChatViewport {
             syntax,
             room_id: None,
             local_notices: Vec::new(),
+            max_local_notices: usize::MAX,
             next_notice_id: 1,
             clear_boundary: None,
             layout_index: LayoutIndex::default(),
@@ -624,10 +714,23 @@ impl ChatViewport {
     /// Reconciles stable view ids and disposable layout state with canonical
     /// history. Payload is always re-read through `history`.
     pub fn reconcile(&mut self, history: &RoomHistoryRef<'_>) {
+        self.max_local_notices = history.max_messages().max(1);
+        let local_trimmed = self.local_notices.len() > self.max_local_notices;
+        if local_trimmed {
+            let excess = self.local_notices.len() - self.max_local_notices;
+            self.local_notices.drain(..excess);
+        }
         let generation_changed = self.observed_generation != Some(history.generation());
         let generation_reset = self.observed_generation.is_some() && generation_changed;
         let revision_changed = self.observed_revision != history.order_revision();
-        if !generation_changed && !revision_changed {
+        if !generation_changed && !revision_changed && !local_trimmed {
+            return;
+        }
+        if !generation_changed
+            && !local_trimmed
+            && self.observed_reindex_revision == history.reindex_revision()
+            && self.reconcile_tail_appends(history)
+        {
             return;
         }
 
@@ -656,10 +759,20 @@ impl ChatViewport {
             .collect::<Vec<_>>();
         let previous_len = previous_ids.len();
 
+        let preserved_width = (!generation_changed
+            && self.layout_index.valid
+            && self.layout_index.line_counts.len() == self.entries.len())
+        .then_some(self.layout_index.width);
+        let preserved_line_counts =
+            preserved_width.map(|_| std::mem::take(&mut self.layout_index.line_counts));
         let mut previous = self
             .entries
             .drain(..)
-            .map(|entry| (entry.id, entry))
+            .enumerate()
+            .map(|(index, entry)| {
+                let line_count = preserved_line_counts.as_ref().map(|counts| counts[index]);
+                (entry.id, (entry, line_count))
+            })
             .collect::<hashbrown::HashMap<_, _>>();
         if generation_reset {
             previous.clear();
@@ -668,42 +781,65 @@ impl ChatViewport {
         if generation_changed {
             self.clear_boundary = None;
         }
-        let mut ids = history.entry_ids();
-        for notice in &self.local_notices {
-            let insert_at = notice.after.map_or(0, |after| {
-                ids.partition_point(|id| match id {
-                    HistoryEntryId::Message(id) => *id <= after,
-                    HistoryEntryId::Notice(_) | HistoryEntryId::LocalNotice(_) => true,
-                })
-            });
-            ids.insert(insert_at, HistoryEntryId::LocalNotice(notice.id));
+        let canonical_ids = history.entry_ids();
+        let mut ids = Vec::with_capacity(canonical_ids.len() + self.local_notices.len());
+        let mut local = self.local_notices.iter().peekable();
+        for id in canonical_ids {
+            if let HistoryEntryId::Message(message_id) = id {
+                while local
+                    .peek()
+                    .is_some_and(|notice| notice.after.is_none_or(|after| after < message_id))
+                {
+                    ids.push(HistoryEntryId::LocalNotice(
+                        local.next().expect("peeked local notice").id,
+                    ));
+                }
+            }
+            ids.push(id);
         }
+        ids.extend(local.map(|notice| HistoryEntryId::LocalNotice(notice.id)));
         if let Some(boundary) = self.clear_boundary {
             ids.retain(|id| !boundary.hides(*id));
         }
         let mut messages = Vec::with_capacity(ids.len());
+        let mut preserved_counts = Vec::with_capacity(ids.len());
         let mut content_changed = false;
+        let mut scroll_bottom = false;
         for id in ids {
             let Some(record) = self.resolve_record(history, id) else {
                 continue;
             };
-            let mut entry = previous.remove(&record.entry_id).unwrap_or(ViewEntry {
-                id: record.entry_id,
-                content_revision: record.content_revision,
-                expanded: false,
-                layout: None,
-            });
+            let prior = previous.remove(&record.entry_id);
+            if prior.is_none() && history.notice_scrolls_bottom(record.entry_id) {
+                scroll_bottom = true;
+            }
+            let (mut entry, mut line_count) = prior.unwrap_or((
+                ViewEntry {
+                    id: record.entry_id,
+                    content_revision: record.content_revision,
+                    expanded: false,
+                    layout: None,
+                },
+                None,
+            ));
             if entry.content_revision != record.content_revision {
                 entry.content_revision = record.content_revision;
                 entry.invalidate_layout();
+                line_count = None;
                 content_changed = true;
-            } else if revision_changed {
+            } else if revision_changed
+                && record
+                    .body
+                    .contains(chatt_message_format::reference::REF_PREFIX)
+            {
                 // Reference pill labels resolve through other canonical
                 // records. A room revision can therefore change this layout
                 // even when this record's own body did not.
                 entry.invalidate_layout();
+                line_count = None;
             }
             messages.push(entry);
+            preserved_counts.push(line_count);
         }
         let pure_tail_append = !generation_changed
             && !content_changed
@@ -716,6 +852,8 @@ impl ChatViewport {
         self.room_id = history.room_id();
         self.observed_generation = Some(history.generation());
         self.observed_revision = history.order_revision();
+        self.observed_reindex_revision = history.reindex_revision();
+        self.observed_tail = history.tail_message_id();
 
         if generation_changed {
             self.scroll_offset = 0;
@@ -725,35 +863,37 @@ impl ChatViewport {
             self.dragging = false;
         } else {
             self.cursor = self.cursor.and_then(|cursor| {
-                if self.entries.iter().any(|entry| entry.id == cursor.entry) {
+                if !previous.contains_key(&cursor.entry) {
                     Some(cursor)
                 } else {
                     Some(ViewCursor {
-                        entry: remap_missing_entry(&self.entries, &previous_ids, cursor_position?)?,
+                        entry: remap_missing_entry(&previous_ids, cursor_position?, |id| {
+                            !previous.contains_key(&id)
+                        })?,
                         line: cursor.line,
                     })
                 }
             });
             self.anchor = self.anchor.and_then(|anchor| {
-                if self.entries.iter().any(|entry| entry.id == anchor.entry) {
+                if !previous.contains_key(&anchor.entry) {
                     Some(anchor)
                 } else {
                     Some(ViewCursor {
-                        entry: remap_missing_entry(&self.entries, &previous_ids, anchor_position?)?,
+                        entry: remap_missing_entry(&previous_ids, anchor_position?, |id| {
+                            !previous.contains_key(&id)
+                        })?,
                         line: anchor.line,
                     })
                 }
             });
             self.scroll_anchor = self.scroll_anchor.and_then(|anchor| {
-                if self.entries.iter().any(|entry| entry.id == anchor.entry) {
+                if !previous.contains_key(&anchor.entry) {
                     Some(anchor)
                 } else {
                     Some(ViewScrollAnchor {
-                        entry: remap_missing_entry(
-                            &self.entries,
-                            &previous_ids,
-                            scroll_anchor_position?,
-                        )?,
+                        entry: remap_missing_entry(&previous_ids, scroll_anchor_position?, |id| {
+                            !previous.contains_key(&id)
+                        })?,
                         line: anchor.line,
                         kind: anchor.kind,
                     })
@@ -773,10 +913,67 @@ impl ChatViewport {
                 });
             }
         }
-        self.layout_index.invalidate();
+        if let Some(width) = preserved_width {
+            self.rebuild_layout_index_from_counts(history, width, preserved_counts);
+        } else {
+            self.layout_index.invalidate();
+        }
         if !pure_tail_append {
             self.bump_layout_epoch();
         }
+        if scroll_bottom {
+            self.bottom();
+        }
+    }
+
+    /// Catches up after one or more non-evicting canonical tail appends. No
+    /// existing id or payload can have changed while the reindex revision is
+    /// stable, so rebuilding the full id list or row index would be wasted
+    /// work for every attached terminal.
+    fn reconcile_tail_appends(&mut self, history: &RoomHistoryRef<'_>) -> bool {
+        let Some(ids) = history.tail_entry_ids(self.observed_tail) else {
+            return false;
+        };
+        let was_following = self.scroll_offset == 0;
+        let cursor_was_tail = self.entries.is_empty()
+            || self.cursor.is_some_and(|cursor| {
+                self.entries
+                    .last()
+                    .is_some_and(|entry| entry.id == cursor.entry)
+            });
+        for id in ids {
+            let Some(record) = history.record(id) else {
+                return false;
+            };
+            let append_index = self.entries.len();
+            self.entries.push(ViewEntry {
+                id: record.entry_id,
+                content_revision: record.content_revision,
+                expanded: false,
+                layout: None,
+            });
+            self.repair_layout_index_after_append(append_index, history);
+        }
+        self.room_id = history.room_id();
+        self.observed_generation = Some(history.generation());
+        self.observed_revision = history.order_revision();
+        self.observed_reindex_revision = history.reindex_revision();
+        self.observed_tail = history.tail_message_id();
+
+        if self.cursor.is_none() && !self.entries.is_empty() {
+            self.cursor = self.entries.last().map(|entry| ViewCursor {
+                entry: entry.id,
+                line: 0,
+            });
+            self.anchor = None;
+        }
+        if was_following && cursor_was_tail && self.anchor.is_none() {
+            self.cursor = self.entries.last().map(|entry| ViewCursor {
+                entry: entry.id,
+                line: usize::MAX,
+            });
+        }
+        true
     }
 
     fn resolve_record<'a>(
@@ -823,8 +1020,7 @@ impl ChatViewport {
     }
 
     /// Resolves a reference target to its pill label when the message is in
-    /// this buffer and this room, the same lookup pushes use. The web feed
-    /// resolves through this so both views label references identically.
+    /// this buffer and this room.
     pub fn ref_label_for(
         &self,
         history: &RoomHistoryRef<'_>,
@@ -890,7 +1086,7 @@ impl ChatViewport {
             kind,
             after,
         });
-        if self.local_notices.len() > MAX_LOCAL_NOTICES {
+        if self.local_notices.len() > self.max_local_notices {
             let removed = self.local_notices.remove(0).id;
             self.entries
                 .retain(|entry| entry.id != HistoryEntryId::LocalNotice(removed));
@@ -1647,7 +1843,6 @@ impl ChatViewport {
         self.scroll_offset = self.scroll_offset.min(max_scroll);
         let top = total.saturating_sub(self.scroll_offset.saturating_add(target));
         let bottom = top.saturating_add(target).min(total);
-        let overscan = overscan.min(MAX_LAYOUT_OVERSCAN_ROWS);
         let cache_top = top.saturating_sub(overscan);
         let cache_bottom = bottom.saturating_add(overscan).min(total);
         let cache_range = self.message_range_for_rows(cache_top, cache_bottom);
@@ -1756,13 +1951,52 @@ impl ChatViewport {
         line_counts.reserve(self.entries.len());
         for idx in 0..self.entries.len() {
             let lines = self.ensure_lines(history, idx, width);
+            #[cfg(test)]
+            {
+                self.layout_index.measured_messages += 1;
+            }
             line_counts.push(lines);
             // A full row-index rebuild measures every record, but those
             // layouts are not the cache. Release each immediately; the
             // visible/overscan pass below repopulates only its bounded window.
             self.entries[idx].layout = None;
         }
+        self.install_layout_index(history, line_counts);
+    }
 
+    fn rebuild_layout_index_from_counts(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+        preserved: Vec<Option<usize>>,
+    ) {
+        debug_assert_eq!(preserved.len(), self.entries.len());
+        self.layout_index.valid = false;
+        self.layout_index.width = width;
+
+        let mut line_counts = std::mem::take(&mut self.layout_index.line_counts);
+        line_counts.clear();
+        line_counts.reserve(self.entries.len());
+        for (idx, preserved) in preserved.into_iter().enumerate() {
+            if let Some(lines) = preserved {
+                line_counts.push(lines);
+                continue;
+            }
+            let lines = self.ensure_lines(history, idx, width);
+            #[cfg(test)]
+            {
+                self.layout_index.measured_messages += 1;
+            }
+            line_counts.push(lines);
+            // Preserve only the already-bounded visible cache. Layouts built
+            // solely to recover a changed row count may be anywhere in the
+            // retained history and are released immediately.
+            self.entries[idx].layout = None;
+        }
+        self.install_layout_index(history, line_counts);
+    }
+
+    fn install_layout_index(&mut self, history: &RoomHistoryRef<'_>, line_counts: Vec<usize>) {
         let mut blocks = std::mem::take(&mut self.layout_index.blocks);
         blocks.clear();
         let mut cursor = 0usize;
@@ -1782,6 +2016,76 @@ impl ChatViewport {
         #[cfg(test)]
         {
             self.layout_index.full_rebuilds += 1;
+        }
+    }
+
+    fn repair_layout_index_after_append(&mut self, old_len: usize, history: &RoomHistoryRef<'_>) {
+        if !self.layout_index.valid {
+            return;
+        }
+        if old_len + 1 != self.entries.len()
+            || self.layout_index.line_counts.len() != old_len
+            || self.layout_index.rows.len() != self.layout_index.blocks.len()
+        {
+            self.layout_index.invalidate();
+            return;
+        }
+        let width = self.layout_index.width;
+        let lines = self.ensure_lines(history, old_len, width);
+        self.layout_index.line_counts.push(lines);
+        let repair_start = if old_len == 0 {
+            0
+        } else if self.boundary_before_cached(
+            history,
+            old_len - 1,
+            old_len,
+            &self.layout_index.line_counts,
+        ) {
+            old_len
+        } else if let Some(block_index) = self.layout_index.block_containing_message(old_len - 1) {
+            self.layout_index.blocks[block_index].first
+        } else {
+            self.layout_index.invalidate();
+            return;
+        };
+        self.rebuild_layout_index_tail_from(history, repair_start);
+    }
+
+    fn rebuild_layout_index_tail_from(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        repair_start: usize,
+    ) {
+        if !self.layout_index.valid
+            || self.layout_index.line_counts.len() != self.entries.len()
+            || repair_start > self.entries.len()
+        {
+            self.layout_index.invalidate();
+            return;
+        }
+        let keep_blocks = self
+            .layout_index
+            .blocks
+            .partition_point(|block| block.last < repair_start);
+        self.layout_index.blocks.truncate(keep_blocks);
+        self.layout_index.rows.truncate(keep_blocks);
+
+        let mut tail_blocks = Vec::new();
+        let mut cursor = repair_start;
+        while cursor < self.entries.len() {
+            let run_end = self.run_end_cached(history, cursor, &self.layout_index.line_counts);
+            self.pack_run_cached(
+                history,
+                cursor,
+                run_end,
+                &self.layout_index.line_counts,
+                &mut tail_blocks,
+            );
+            cursor = run_end + 1;
+        }
+        for block in tail_blocks {
+            self.layout_index.rows.push(Self::block_rows(&block));
+            self.layout_index.blocks.push(block);
         }
     }
 
@@ -2534,12 +2838,21 @@ impl MessageLayout {
 
         for token in &self.tokens[start..end] {
             match &token.kind {
-                TokenKind::Text | TokenKind::Url => append_piece(
+                TokenKind::Text => append_piece(
                     text,
                     display,
                     pieces,
                     token_range(token),
                     self.inline_style(base_style, bold, italic, false),
+                ),
+                TokenKind::Url => append_piece(
+                    text,
+                    display,
+                    pieces,
+                    token_range(token),
+                    self.inline_style(base_style, bold, italic, false)
+                        .patch(self.syntax.namespace)
+                        | Modifier::UNDERLINED,
                 ),
                 TokenKind::MessageRef => {
                     let span = refs

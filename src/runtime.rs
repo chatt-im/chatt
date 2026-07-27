@@ -1156,6 +1156,15 @@ fn project_rpc_history_change(
     instance_id: DaemonInstanceId,
     change: &crate::app::HistoryChange,
 ) {
+    let selects_changed_room = |client: &RemoteRpcClient| {
+        client.last_snapshot.selected_room == Some(change.room_id)
+            && client.last_snapshot.room.as_ref().is_some_and(|room| {
+                room.room_id == change.room_id && room.room_generation == change.room_generation
+            })
+    };
+    if !clients.values().any(|client| selects_changed_room(client)) {
+        return;
+    }
     let (deltas, cursor) = if change.refresh_window {
         let snapshot = app.rpc_room_snapshot(change.room_id);
         let cursor = Some((snapshot.older_cursor, snapshot.at_start));
@@ -1179,11 +1188,7 @@ fn project_rpc_history_change(
     };
     let mut failed = Vec::new();
     for (id, client) in clients.iter_mut() {
-        let selected = client.last_snapshot.selected_room == Some(change.room_id)
-            && client.last_snapshot.room.as_ref().is_some_and(|room| {
-                room.room_id == change.room_id && room.room_generation == change.room_generation
-            });
-        if !selected {
+        if !selects_changed_room(client) {
             continue;
         }
         if deltas
@@ -1223,8 +1228,15 @@ fn sync_rpc_state(
     complete_pending_rpc_history(app, id, client, instance_id)?;
     let mut next = app.rpc_projection_state(id);
     let same_room = client.last_snapshot.selected_room == next.selected_room
-        && client.last_snapshot.room.as_ref().map(|room| room.room_id)
-            == next.room.as_ref().map(|room| room.room_id);
+        && client
+            .last_snapshot
+            .room
+            .as_ref()
+            .map(|room| (room.room_id, room.room_generation))
+            == next
+                .room
+                .as_ref()
+                .map(|room| (room.room_id, room.room_generation));
     if same_room
         && let (Some(previous), Some(next_room)) = (&client.last_snapshot.room, &mut next.room)
     {
@@ -1274,26 +1286,33 @@ fn complete_pending_rpc_history(
         client.pending_history = None;
         return Ok(());
     }
+    // History responses may arrive in several ordered chunks. Do not satisfy
+    // the frontend from the first resident prefix: the echoed cursor and
+    // `at_start` state become authoritative only when the fetch completes.
+    if app.room.history_fetch_active(request.room_id) {
+        return Ok(());
+    }
     if let Some(page) =
         app.rpc_resident_history_page(request.room_id, request.before, request.limit)
     {
         send_rpc_history_page(client, instance_id, request.room_id, page)?;
         client.pending_history = None;
-    } else if !app.room.history_fetch_active(request.room_id) {
-        let (_, at_start) = app.room.history_cursor(request.room_id);
+    } else {
+        let (older_cursor, at_start) = app.room.history_cursor(request.room_id);
         send_rpc_event(
             client,
             instance_id,
             StateDelta::HistoryStateChanged {
                 room_id: request.room_id,
                 room_generation: request.room_generation,
-                older_cursor: Some(request.before),
+                older_cursor,
                 at_start,
             },
         )?;
         if let Some(room) = client.last_snapshot.room.as_mut()
             && room.room_id == request.room_id
         {
+            room.older_cursor = older_cursor;
             room.at_start = at_start;
         }
         client.pending_history = None;
@@ -1635,6 +1654,26 @@ fn handle_rpc_command(
                 {
                     client.sender.abort();
                 }
+                return;
+            }
+
+            if app.room.history_fetch_active(room_id) {
+                let Some(client) = clients.get_mut(&id) else {
+                    return;
+                };
+                client.pending_history = Some(RpcHistoryRequest {
+                    room_id,
+                    room_generation,
+                    before,
+                    limit,
+                });
+                client.sender.send_or_abort(&DaemonFrame::RequestResult(
+                    local_rpc::frame::RequestResult {
+                        request_id,
+                        operation: local_rpc::frame::Operation::LoadOlder,
+                        outcome: local_rpc::frame::RequestOutcome::Accepted,
+                    },
+                ));
                 return;
             }
 

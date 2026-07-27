@@ -379,6 +379,14 @@ struct OwnedRpcServerSelectionIssue {
     issue: RpcServerSelectionIssue,
 }
 
+#[derive(Clone, Copy)]
+struct PendingWebHistoryRequest {
+    room_id: RoomId,
+    room_generation: u64,
+    before: MessageId,
+    limit: u64,
+}
+
 pub(crate) struct App {
     pub config: CoreRw<Config>,
     events: AppEvents,
@@ -477,6 +485,9 @@ pub(crate) struct App {
     /// Web-originated deletes awaiting either a mutation echo or an explicit
     /// server rejection, keyed by room because ids are room-local.
     pending_web_deletes: HashSet<(RoomId, MessageId)>,
+    /// Browser pages waiting for the canonical owner to finish one ordered
+    /// server fetch. Each browser can have only one load outstanding.
+    pending_web_history: HashMap<u64, PendingWebHistoryRequest>,
     /// While a frontend-originated slash command runs, status and notice output
     /// is teed here and returned only to the issuing frontend.
     frontend_command_capture: Option<Vec<local_rpc::model::CommandOutputLine>>,
@@ -1046,7 +1057,7 @@ fn share_error_envelope(stream_id: StreamId, message: &str) -> String {
 fn delete_error_envelope(target: MessageId, message: &str) -> String {
     jsony::object! {
         type: "delete_error",
-        target: target.0,
+        target: format!("{:x}", target.0),
         message: message,
     }
 }
@@ -1418,6 +1429,7 @@ impl App {
             web_feed,
             video_fanout,
             pending_web_deletes: HashSet::new(),
+            pending_web_history: HashMap::new(),
             frontend_command_capture: None,
             download_store,
             screencast: None,
@@ -2542,47 +2554,138 @@ impl App {
     }
 
     fn send_web_older_page(
-        &self,
+        &mut self,
         client: u64,
         room_id: RoomId,
         requested_generation: u64,
         before: MessageId,
         limit: u64,
     ) {
-        let Some(feed) = &self.web_feed else {
+        self.send_web_older_page_inner(client, room_id, requested_generation, before, limit, true);
+    }
+
+    fn send_web_older_page_inner(
+        &mut self,
+        client: u64,
+        room_id: RoomId,
+        requested_generation: u64,
+        before: MessageId,
+        limit: u64,
+        allow_fetch: bool,
+    ) {
+        if self.web_feed.is_none() {
             return;
-        };
+        }
         let current_generation = self.room.room_generation(room_id);
         if self.room.viewed_room != Some(room_id)
             || current_generation != Some(requested_generation)
         {
-            feed.send_stale_history(
-                client,
-                self.room.viewed_room.unwrap_or(RoomId(0)),
-                self.room.epoch().wire(),
-            );
+            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
             return;
         }
-        let Some(page) = self.room.history_ref(room_id).and_then(|history| {
-            history.page_before(
-                before,
-                (limit as usize).clamp(1, crate::web_server::MAX_PAGE),
-            )
-        }) else {
-            feed.send_stale_history(client, room_id, requested_generation);
+        let page_limit = (limit as usize).clamp(1, crate::web_server::MAX_PAGE);
+        let (canonical_before, _) = self.room.history_cursor(room_id);
+        let Some(history) = self.room.history_ref(room_id) else {
+            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
             return;
         };
-        let projected =
-            web_messages_from_canonical(page.messages.iter().copied(), &self.room, self.user_id);
-        feed.send_history_window(
-            crate::web_server::WebAudience::One(client),
-            crate::web_server::HistoryWindowKind::Older,
-            room_id,
-            requested_generation,
-            projected,
-            page.older_cursor,
-            page.at_start,
+        let page = if let Some(page) = history.page_before(before, page_limit) {
+            page
+        } else if canonical_before == Some(before) || !allow_fetch {
+            history.page_before_position(before, page_limit)
+        } else {
+            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
+            return;
+        };
+        if !page.messages.is_empty() || page.at_start {
+            let projected = web_messages_from_canonical(
+                page.messages.iter().copied(),
+                &self.room,
+                self.user_id,
+            );
+            if let Some(feed) = &self.web_feed {
+                feed.send_history_window(
+                    crate::web_server::WebAudience::One(client),
+                    crate::web_server::HistoryWindowKind::Older,
+                    room_id,
+                    requested_generation,
+                    projected,
+                    page.older_cursor,
+                    page.at_start,
+                );
+            }
+            return;
+        }
+        if !allow_fetch {
+            let (older_cursor, at_start) = self.room.history_cursor(room_id);
+            if let Some(feed) = &self.web_feed {
+                feed.send_history_window(
+                    crate::web_server::WebAudience::One(client),
+                    crate::web_server::HistoryWindowKind::Older,
+                    room_id,
+                    requested_generation,
+                    Vec::new(),
+                    older_cursor,
+                    at_start,
+                );
+            }
+            return;
+        }
+
+        self.pending_web_history.insert(
+            client,
+            PendingWebHistoryRequest {
+                room_id,
+                room_generation: requested_generation,
+                before,
+                limit,
+            },
         );
+        if self.room.history_fetch_active(room_id) {
+            return;
+        }
+        let Some((_, network_before, network_limit)) = self.room.older_history_request(room_id)
+        else {
+            self.pending_web_history.remove(&client);
+            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
+            return;
+        };
+        if !self.send_network_command(
+            NetworkCommand::FetchHistory {
+                room_id,
+                before: network_before,
+                limit: network_limit,
+            },
+            false,
+        ) {
+            self.room.abort_history_fetch(room_id, network_before);
+            self.pending_web_history.remove(&client);
+            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
+        }
+    }
+
+    fn complete_pending_web_history(&mut self, room_id: RoomId) {
+        if self.room.history_fetch_active(room_id) {
+            return;
+        }
+        let clients = self
+            .pending_web_history
+            .iter()
+            .filter_map(|(client, request)| (request.room_id == room_id).then_some(*client))
+            .collect::<Vec<_>>();
+        for client in clients {
+            let Some(request) = self.pending_web_history.remove(&client) else {
+                continue;
+            };
+            self.send_web_older_page_inner(
+                client,
+                request.room_id,
+                request.room_generation,
+                request.before,
+                request.limit,
+                false,
+            );
+        }
     }
 
     fn send_web_ref_preview(
@@ -2592,15 +2695,11 @@ impl App {
         requested_generation: u64,
         message_id: MessageId,
     ) {
-        let Some(feed) = &self.web_feed else {
+        if self.web_feed.is_none() {
             return;
-        };
+        }
         if self.room.epoch().wire() != requested_generation {
-            feed.send_stale_history(
-                client,
-                self.room.viewed_room.unwrap_or(RoomId(0)),
-                self.room.epoch().wire(),
-            );
+            self.send_web_history_snapshot(crate::web_server::WebAudience::One(client));
             return;
         }
         let projected =
@@ -2629,7 +2728,9 @@ impl App {
                         ),
                     },
                 );
-        feed.send_ref_preview(client, room_id, requested_generation, message_id, projected);
+        if let Some(feed) = &self.web_feed {
+            feed.send_ref_preview(client, room_id, requested_generation, message_id, projected);
+        }
     }
 
     /// Runs a browser-composed slash command through the shared dispatch,
@@ -3111,6 +3212,7 @@ impl App {
         self.pending_identity_review.clear();
         self.open_e2e_reviews.clear();
         self.pending_mutation_clients.clear();
+        self.pending_web_history.clear();
         self.supervisor.network.reset();
         self.supervisor.capture.reset();
         self.supervisor.playback.reset();
@@ -3145,6 +3247,7 @@ impl App {
     }
 
     fn sync_web_room_feed(&mut self) {
+        self.pending_web_history.clear();
         if let Some(feed) = &self.web_feed {
             feed.set_room_name(self.room.room_name.clone());
             self.send_web_history_snapshot(crate::web_server::WebAudience::All);
@@ -3210,17 +3313,18 @@ impl App {
             TerminalEvent::SelectRoom(room_id),
         );
         self.room.ensure_e2e_security_notice(room_id);
-        if self.room.begin_history_fetch(room_id)
-            && !self.send_network_command(
+        if self.room.begin_history_fetch(room_id) {
+            let limit = self.room.initial_history_limit(room_id);
+            if !self.send_network_command(
                 NetworkCommand::FetchHistory {
                     room_id,
                     before: None,
-                    limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+                    limit,
                 },
                 false,
-            )
-        {
-            self.room.abort_history_fetch(room_id, None);
+            ) {
+                self.room.abort_history_fetch(room_id, None);
+            }
         }
         self.mark_room_catalog_dirty();
         let status = match self.room.room_name_of(room_id) {
@@ -3368,11 +3472,12 @@ impl App {
             return;
         };
         if self.room.begin_history_fetch(room_id) {
+            let limit = self.room.initial_history_limit(room_id);
             if !self.send_network_command(
                 NetworkCommand::FetchHistory {
                     room_id,
                     before: None,
-                    limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+                    limit,
                 },
                 false,
             ) {
@@ -3964,11 +4069,12 @@ impl App {
                 self.sync_viewed_room_to_feeds();
                 for room_id in known {
                     if self.room.begin_history_fetch(room_id) {
+                        let limit = self.room.initial_history_limit(room_id);
                         if !self.send_network_command(
                             NetworkCommand::FetchHistory {
                                 room_id,
                                 before: None,
-                                limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+                                limit,
                             },
                             false,
                         ) {
@@ -4044,6 +4150,9 @@ impl App {
                 if let Some(change) = update.change {
                     self.project_history_change_to_web(&change);
                     *history_change = Some(change);
+                }
+                if complete {
+                    self.complete_pending_web_history(room_id);
                 }
                 if let Some((room_id, before, limit)) = update.next_backfill
                     && !self.send_network_command(
@@ -5545,6 +5654,7 @@ impl App {
 
     fn apply_web_setting(&mut self, old: &config::WebConfig, old_max_upload_bytes: u64) {
         if old.enabled && !self.config.web.enabled {
+            self.pending_web_history.clear();
             if let Some(feed) = self.web_feed.take() {
                 feed.stop();
                 self.set_status("web log server stopped");
@@ -5557,6 +5667,7 @@ impl App {
             && (old.bind != self.config.web.bind
                 || old.allowed_origins != self.config.web.allowed_origins)
         {
+            self.pending_web_history.clear();
             if let Some(feed) = self.web_feed.take() {
                 feed.stop();
             }
@@ -10459,6 +10570,138 @@ mod tests {
         }
         app.request_older_history_if_at_top(40, 5);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn web_history_fetch_crosses_the_resident_front_without_broadcast_reset() {
+        let mut config = Config::default();
+        config.web.enabled = true;
+        config.web.bind = "127.0.0.1:0".to_string();
+        let mut app = TestApp::new(config, None).expect("test app");
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+
+        assert!(app.room.begin_history_fetch(RoomId(1)));
+        let newest = (101..=200)
+            .map(|id| test_chat_record(RoomId(1), MessageId(id)))
+            .collect::<Vec<_>>();
+        let user_id = app.user_id;
+        let initial =
+            app.room
+                .history_chunk_received(RoomId(1), None, newest, false, true, user_id);
+        assert!(initial.change.unwrap().refresh_window);
+
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        let generation = app.room.room_generation(RoomId(1)).unwrap();
+        app.send_web_older_page(7, RoomId(1), generation, MessageId(101), 100);
+        assert!(app.pending_web_history.contains_key(&7));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::FetchHistory {
+                room_id: RoomId(1),
+                before: Some(MessageId(101)),
+                limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+            })
+        ));
+
+        let older = (1..=100)
+            .map(|id| test_chat_record(RoomId(1), MessageId(id)))
+            .collect::<Vec<_>>();
+        let change = app
+            .handle_network_event_change(NetworkEvent::HistoryChunk {
+                room_id: RoomId(1),
+                before: Some(MessageId(101)),
+                messages: older,
+                at_start: true,
+                complete: true,
+            })
+            .unwrap();
+
+        assert!(!change.refresh_window);
+        assert!(!app.pending_web_history.contains_key(&7));
+    }
+
+    #[test]
+    fn web_history_can_continue_after_a_mutation_only_page() {
+        let mut config = Config::default();
+        config.web.enabled = true;
+        config.web.bind = "127.0.0.1:0".to_string();
+        let mut app = TestApp::new(config, None).expect("test app");
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+
+        assert!(app.room.begin_history_fetch(RoomId(1)));
+        let mut mutation = test_chat_record(RoomId(1), MessageId(100));
+        mutation.message.target = Some(MessageId(1));
+        let user_id = app.user_id;
+        app.room
+            .history_chunk_received(RoomId(1), None, vec![mutation], false, true, user_id);
+        assert_eq!(
+            app.room
+                .history_ref(RoomId(1))
+                .unwrap()
+                .latest_page(crate::web_server::SYNC_WINDOW)
+                .older_cursor,
+            Some(MessageId(100))
+        );
+
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        let generation = app.room.room_generation(RoomId(1)).unwrap();
+        app.send_web_older_page(7, RoomId(1), generation, MessageId(100), 100);
+
+        assert!(app.pending_web_history.contains_key(&7));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::FetchHistory {
+                room_id: RoomId(1),
+                before: Some(MessageId(100)),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rpc_history_returns_messages_fetched_before_a_mutation_only_cursor() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+
+        assert!(app.room.begin_history_fetch(RoomId(1)));
+        let mut mutation = test_chat_record(RoomId(1), MessageId(100));
+        mutation.message.target = Some(MessageId(1));
+        let user_id = app.user_id;
+        app.room
+            .history_chunk_received(RoomId(1), None, vec![mutation], false, true, user_id);
+        assert!(matches!(
+            app.room.older_history_request(RoomId(1)),
+            Some((RoomId(1), Some(MessageId(100)), _))
+        ));
+        let older = (1..100)
+            .map(|id| test_chat_record(RoomId(1), MessageId(id)))
+            .collect::<Vec<_>>();
+        app.room.history_chunk_received(
+            RoomId(1),
+            Some(MessageId(100)),
+            older,
+            true,
+            true,
+            user_id,
+        );
+
+        let page = app
+            .rpc_resident_history_page(RoomId(1), MessageId(100), 200)
+            .expect("fetched page");
+        assert_eq!(
+            page.messages.first().map(|message| message.message_id),
+            Some(MessageId(1))
+        );
+        assert_eq!(
+            page.messages.last().map(|message| message.message_id),
+            Some(MessageId(99))
+        );
+        assert!(page.at_start);
     }
 
     #[test]

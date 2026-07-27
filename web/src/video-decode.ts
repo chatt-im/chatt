@@ -35,7 +35,10 @@ export function parseFrame(buffer: ArrayBuffer): VideoFrame | null {
   const view = new DataView(buffer);
   const size = view.getUint32(0, true);
   if (size < VIDEO_FRAME_HEADER_LEN || size > buffer.byteLength) return null;
-  const tsMs = Number(view.getBigInt64(4, true));
+  // Decoder timestamps already use JS numbers and Unix milliseconds remain
+  // exact well inside 53 bits. Combining the signed high word avoids creating
+  // a BigInt for every video frame only to convert it immediately.
+  const tsMs = view.getInt32(8, true) * 0x1_0000_0000 + view.getUint32(4, true);
   const isKey = view.getUint8(12) === 1;
   const streamId = view.getUint32(13, true);
   const data = new Uint8Array(buffer, VIDEO_FRAME_HEADER_LEN, size - VIDEO_FRAME_HEADER_LEN);

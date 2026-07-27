@@ -28,6 +28,7 @@ import type {
   WebCommandInfo,
   CandidateItem,
   CandidateKind,
+  MessageId,
 } from "./types";
 import {
   acceptReplacement,
@@ -151,7 +152,7 @@ type MessageList = {
 type CollapsedSections = ReadonlyMap<string, string | null>;
 
 type PendingWebEdit = {
-  target: number;
+  target: MessageId;
   original: string;
   parkedDraft: string;
   parkedFiles: File[];
@@ -1110,13 +1111,13 @@ function MessageRow(props: {
   const continuation = () => props.group.continuation;
   const canEdit = () =>
     props.message.local &&
-    props.message.message_id !== 0 &&
+    props.message.message_id !== "0" &&
     props.message.file_id === null &&
     props.group.newestOffset <= EDIT_ACTION_WINDOW &&
     !!props.onEdit;
   const canDelete = () =>
     props.message.local &&
-    props.message.message_id !== 0 &&
+    props.message.message_id !== "0" &&
     props.group.newestOffset <= DELETE_ACTION_WINDOW &&
     !!props.onDelete;
   const groupLabel = () => {
@@ -1930,7 +1931,7 @@ export default function App() {
   // latest authoritative sync.
   let currentRoomId = 0;
   let currentRoomGeneration = 0;
-  let olderCursor: number | null = null;
+  let olderCursor: MessageId | null = null;
   let hasMore = false;
   let loadingOlder = false;
   let topPagingArmed = true;
@@ -2280,11 +2281,9 @@ export default function App() {
     return true;
   }
 
-  // A click on a `@@` reference jumps to its target, paging older history in
-  // until the target loads. Capped so a reference outside this room's history
-  // does not drain the whole backlog.
-  const MAX_JUMP_PAGES = 10;
-  let pendingJump: { ts: number; mid: number; tries: number } | undefined;
+  // A click on a `@@` reference jumps to its target, paging older history until
+  // the target loads, durable history ends, or the server makes no progress.
+  let pendingJump: { ts: number; mid: MessageId } | undefined;
   let refToastTimer: number | undefined;
 
   function showRefToast(text: string) {
@@ -2294,7 +2293,7 @@ export default function App() {
   }
 
   // Message ids are the durable identity; `ts` rides along for display only.
-  function findMessageIndex(_ts: number, mid: number): number {
+  function findMessageIndex(_ts: number, mid: MessageId): number {
     return messages().findIndex((m) => m.message_id === mid);
   }
 
@@ -2342,7 +2341,7 @@ export default function App() {
     );
   }
 
-  function flashMessage(_ts: number, mid: number) {
+  function flashMessage(_ts: number, mid: MessageId) {
     const row = logEl?.querySelector(`.message[data-mid="${mid}"]`);
     if (!(row instanceof HTMLElement)) return;
     row.classList.remove("msg-flash");
@@ -2352,7 +2351,7 @@ export default function App() {
     window.setTimeout(() => row.classList.remove("msg-flash"), 1600);
   }
 
-  function scrollToMessage(index: number, ts: number, mid: number) {
+  function scrollToMessage(index: number, ts: number, mid: MessageId) {
     detachForRefJump();
     holdRefJump(1200);
     suppressProgrammaticScroll(1200);
@@ -2382,7 +2381,7 @@ export default function App() {
     else scroll();
   }
 
-  function jumpToRef(ts: number, mid: number) {
+  function jumpToRef(ts: number, mid: MessageId) {
     detachForRefJump();
     holdRefJump(2000);
     const index = findMessageIndex(ts, mid);
@@ -2393,7 +2392,7 @@ export default function App() {
     }
     if (hasMore) {
       if (!pendingJump || pendingJump.ts !== ts || pendingJump.mid !== mid) {
-        pendingJump = { ts, mid, tries: 0 };
+        pendingJump = { ts, mid };
       }
       requestOlder("ref");
       return;
@@ -2424,8 +2423,7 @@ export default function App() {
       scrollToMessage(index, ts, mid);
       return;
     }
-    pendingJump.tries += 1;
-    if (pendingJump.tries >= MAX_JUMP_PAGES || !hasMore) {
+    if (!hasMore) {
       pendingJump = undefined;
       showRefToast("Referenced message isn't in the loaded history");
       return;
@@ -2458,12 +2456,12 @@ export default function App() {
   let refHoverPendingKey: string | undefined;
   const refPreviewCache = new Map<string, WebMessage | null>();
 
-  function invalidateMessageReference(messageId: number) {
+  function invalidateMessageReference(messageId: MessageId) {
     refPreviewCache.delete(refPreviewKey(currentRoomId, messageId));
     if (refHover()?.message.message_id === messageId) hideRefHover();
   }
 
-  function refPreviewKey(roomId: number, mid: number): string {
+  function refPreviewKey(roomId: number, mid: MessageId): string {
     return `${roomId}:${mid}`;
   }
 
@@ -2480,8 +2478,8 @@ export default function App() {
   function showRefHover(anchor: HTMLElement) {
     const ts = Number(anchor.dataset.ts ?? "0");
     const roomId = Number(anchor.dataset.room ?? currentRoomId);
-    const mid = Number(anchor.dataset.mid);
-    if (!Number.isFinite(roomId) || !Number.isFinite(ts) || !Number.isFinite(mid)) return;
+    const mid = anchor.dataset.mid;
+    if (!Number.isFinite(roomId) || !Number.isFinite(ts) || mid === undefined) return;
     const index = roomId === currentRoomId ? findMessageIndex(ts, mid) : -1;
     if (index >= 0) {
       displayRefHover(anchor, messages()[index]!);
@@ -2502,7 +2500,7 @@ export default function App() {
     });
   }
 
-  function onRefPreview(roomId: number, mid: number, message: WebMessage | null) {
+  function onRefPreview(roomId: number, mid: MessageId, message: WebMessage | null) {
     const key = refPreviewKey(roomId, mid);
     refPreviewCache.set(key, message);
     if (key !== refHoverPendingKey) return;
@@ -2604,8 +2602,13 @@ export default function App() {
       }
     }
     const ts = Number(anchor.dataset.ts ?? "0");
-    const mid = Number(anchor.dataset.mid);
-    if (!Number.isFinite(ts) || !Number.isFinite(mid)) return;
+    const roomId = Number(anchor.dataset.room ?? currentRoomId);
+    const mid = anchor.dataset.mid;
+    if (!Number.isFinite(ts) || !Number.isFinite(roomId) || mid === undefined) return;
+    if (roomId !== currentRoomId) {
+      showRefToast("Reference points to another room");
+      return;
+    }
     jumpToRef(ts, mid);
   }
 
@@ -3462,6 +3465,10 @@ export default function App() {
           return;
         }
         if (feed.kind === "sync") {
+          const resumeJump =
+            pendingJump !== undefined &&
+            feed.room_id === currentRoomId &&
+            feed.room_generation === currentRoomGeneration;
           debugScrollState("sync-received", {
             count: feed.messages.length,
             roomId: feed.room_id,
@@ -3485,6 +3492,8 @@ export default function App() {
           following = true;
           setNewMessageCount(0);
           pin();
+          if (resumeJump) scheduleResumePendingJump();
+          else pendingJump = undefined;
         } else if (feed.kind === "older") {
           if (
             feed.room_id !== currentRoomId ||
@@ -3504,6 +3513,7 @@ export default function App() {
             firstOlder: debugMessageKey(feed.messages[0]),
             lastOlder: debugMessageKey(feed.messages[feed.messages.length - 1]),
           });
+          const previousCursor = olderCursor;
           loadingOlder = false;
           if (feed.messages.length > 0) {
             preloadRecentImages(feed.messages);
@@ -3523,13 +3533,21 @@ export default function App() {
             olderCursor: feed.older_cursor,
             atStart: feed.at_start,
           });
-          scheduleResumePendingJump();
+          if (
+            pendingJump &&
+            feed.messages.length === 0 &&
+            !feed.at_start &&
+            feed.older_cursor === previousCursor
+          ) {
+            pendingJump = undefined;
+            showRefToast("Older history is temporarily unavailable");
+          } else {
+            scheduleResumePendingJump();
+          }
         } else if (feed.kind === "ref_preview") {
           if (feed.room_generation === currentRoomGeneration) {
             onRefPreview(feed.room_id, feed.message_id, feed.message);
           }
-        } else if (feed.kind === "stale") {
-          loadingOlder = false;
         } else if (feed.kind === "delete") {
           if (
             feed.room_id !== currentRoomId ||
@@ -3574,7 +3592,7 @@ export default function App() {
                 next[i] = msg;
                 return next;
               }
-            } else if (msg.message_id !== 0) {
+            } else if (msg.message_id !== "0") {
               const i = prev.findIndex(
                 (m) => m.message_id === msg.message_id
               );
@@ -3723,7 +3741,7 @@ export default function App() {
         // delete path away from them.
         const rows = env.lines.map(
           (line): WebMessage => ({
-            id: systemRowId--,
+            id: String(systemRowId--),
             sender: "chatt",
             body: line.text,
             local: true,
@@ -3732,7 +3750,7 @@ export default function App() {
             timestamp_ms: Date.now(),
             attachment: null,
             file_id: null,
-            message_id: 0,
+            message_id: "0",
             ref_code: "",
             fragments: [],
             system: line.error ? "error" : "info",

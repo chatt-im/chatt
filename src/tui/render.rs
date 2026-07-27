@@ -1786,11 +1786,15 @@ fn draw_chat(
     layout.chat_width = content_width;
     layout.chat_height = area.h;
     layout.chat_rect = area;
-    let Some(history) = app
+    let history = app
         .view
         .viewed_room
-        .and_then(|room_id| app.room.history_ref(room_id))
-    else {
+        .and_then(|room_id| app.room.history_ref(room_id));
+    let history = if let Some(history) = history {
+        history
+    } else if !app.view.active.chat.is_empty() {
+        app.room.detached_history_ref()
+    } else {
         layout.chat_scroll_anchor = None;
         layout.visible_chat_lines.clear();
         area.with(app.view.theme.subtle)
@@ -1885,6 +1889,10 @@ fn draw_chat(
                     let name = msg.body.split('`').nth(1).unwrap_or(msg.body).to_string();
                     draw_transfer_progress(row, base, progress, &name, transfer_id, app, buf);
                 } else {
+                    let ranges = search_highlight
+                        .filter(|(message, _)| *message == line.message)
+                        .map(|(_, ranges)| ranges)
+                        .unwrap_or_default();
                     for seg in app.view.active.chat.line(line.message, line.line) {
                         let Some(text) =
                             app.view
@@ -1894,24 +1902,11 @@ fn draw_chat(
                         else {
                             continue;
                         };
-                        let mut style = base.patch(app.view.theme.text).patch(seg.style);
-                        let links = chatt_message_format::inline_ranges(msg.body).urls;
-                        if !seg.synth
-                            && links
-                                .iter()
-                                .any(|link| seg.start < link.end && link.start < seg.end)
-                        {
-                            style = style.patch(app.view.theme.syntax.namespace)
-                                | extui::vt::Modifier::UNDERLINED;
-                        }
+                        let style = base.patch(app.view.theme.text).patch(seg.style);
                         let max_width = row.w.saturating_sub(seg.col) as usize;
                         if max_width == 0 {
                             continue;
                         }
-                        let ranges = search_highlight
-                            .filter(|(message, _)| *message == line.message)
-                            .map(|(_, ranges)| ranges)
-                            .unwrap_or_default();
                         draw_segment_with_highlights(
                             row.x + seg.col,
                             row.y,

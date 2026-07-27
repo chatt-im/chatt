@@ -1,8 +1,8 @@
 //! The browser chat-log view served over [`darkhttp`].
 //!
 //! A dedicated thread owns the [`Server`] and runs its blocking poll loop. The
-//! app forwards messages through a [`WebFeedSender`], which delivers them over an
-//! bounded nonblocking channel and wakes the loop via a
+//! app forwards messages through a [`WebFeedSender`], which delivers them over a
+//! byte-budgeted channel and wakes the loop via a
 //! [`darkhttp::WakeHandle`] so they broadcast immediately. On connect a client receives a recent window of
 //! history, then a frame per new message. A browser pages older history on
 //! demand by sending a `load_older` request as it scrolls up. Chat history is
@@ -14,8 +14,8 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -39,9 +39,8 @@ const WS_PATH: &str = "/ws";
 /// Loopback HTTP requests should always make prompt progress. This is an idle
 /// progress deadline, not a total request-duration limit.
 const HTTP_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
-/// Bounds transient app-to-web projections. Queue pressure never blocks the
-/// app event loop; dropped chat projections cause a canonical resnapshot.
-const WEB_FEED_CAPACITY: usize = 512;
+/// Fairness quantum between socket polls while draining app-to-web projections.
+const WEB_FEED_BATCH: usize = 512;
 #[cfg(not(feature = "embed-web"))]
 const WEB_ASSETS_DIR: &str = "web/dist";
 
@@ -70,6 +69,9 @@ const MAX_HIGHLIGHT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// exceeds this bound, caching pauses until the next keyframe rather than
 /// retaining an undecodable delta suffix.
 const VIDEO_FAST_START_MAX_BYTES: usize = video::MAX_VIDEO_FRAME_LEN;
+/// Bounds allocations waiting on the app-to-web handoff. Every item is charged
+/// for inline storage plus retained heap allocations.
+const WEB_FEED_MAX_BYTES: usize = video::MAX_VIDEO_FRAME_LEN + std::mem::size_of::<WebFeed>();
 const MAX_WEBSOCKET_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVE_UPLOADS_PER_SOCKET: usize = 4;
 const MAX_ACTIVE_UPLOADS_GLOBAL: usize = 32;
@@ -241,6 +243,29 @@ fn chat_ref_code(message: &ChatMessage) -> String {
 }
 
 impl WebMessage {
+    fn heap_bytes(&self) -> usize {
+        let attachment_bytes = self.attachment.as_ref().map_or(0, |attachment| {
+            attachment.name.capacity() + attachment.kind.capacity()
+        });
+        let fragment_bytes = self.fragments.capacity() * std::mem::size_of::<Fragment>()
+            + self
+                .fragments
+                .iter()
+                .map(|fragment| match fragment {
+                    Fragment::Text { html } => html.capacity(),
+                    Fragment::Code { lang, text, spans } => {
+                        lang.capacity() + text.capacity() + spans.capacity()
+                    }
+                    Fragment::QuoteStart | Fragment::QuoteEnd => 0,
+                })
+                .sum::<usize>();
+        self.sender.capacity()
+            + self.body.capacity()
+            + self.ref_code.capacity()
+            + attachment_bytes
+            + fragment_bytes
+    }
+
     /// Builds a message from a relayed chat message, resolving any `@@`
     /// references in its body through `resolver`.
     pub fn from_chat(
@@ -413,11 +438,6 @@ enum WebFeed {
         older_cursor: Option<MessageId>,
         at_start: bool,
     },
-    StaleHistory {
-        client: u64,
-        room_id: RoomId,
-        room_generation: u64,
-    },
     RefPreview {
         client: u64,
         room_id: RoomId,
@@ -473,13 +493,43 @@ enum WebFeed {
 }
 
 impl WebFeed {
+    fn retained_bytes(&self) -> usize {
+        let heap = match self {
+            Self::Message { message, .. } => message.heap_bytes(),
+            Self::Delete { .. } | Self::VideoFrame(_) | Self::Config { .. } => 0,
+            Self::DeleteError(payload)
+            | Self::ActionError(payload)
+            | Self::FileProgress(payload)
+            | Self::FileTerminal(payload) => payload.capacity(),
+            Self::SetRoomName { name } => name.capacity(),
+            Self::HistoryWindow { messages, .. } => {
+                messages.capacity() * std::mem::size_of::<WebMessage>()
+                    + messages.iter().map(WebMessage::heap_bytes).sum::<usize>()
+            }
+            Self::RefPreview { message, .. } => message.as_ref().map_or(0, WebMessage::heap_bytes),
+            Self::E2eSecurity { payload, .. }
+            | Self::ShareAvailable { payload, .. }
+            | Self::ShareConfig { payload, .. }
+            | Self::ShareError { payload, .. }
+            | Self::RequestResult { payload, .. }
+            | Self::CommandReply { payload, .. }
+            | Self::ShareEnded { payload, .. } => payload.capacity(),
+        };
+        let video = match self {
+            Self::VideoFrame(frame) => frame.retained_bytes(),
+            _ => 0,
+        };
+        std::mem::size_of::<Self>()
+            .saturating_add(heap)
+            .saturating_add(video)
+    }
+
     fn affects_history(&self) -> bool {
         matches!(
             self,
             Self::Message { .. }
                 | Self::Delete { .. }
                 | Self::HistoryWindow { .. }
-                | Self::StaleHistory { .. }
                 | Self::RefPreview { .. }
         )
     }
@@ -571,7 +621,7 @@ enum ClientRequest {
     LoadOlder {
         room_id: u64,
         room_generation: u64,
-        before_message_id: u64,
+        before_message_id: String,
         limit: u64,
     },
     /// Asks the canonical owner for the message a `@@` reference targets.
@@ -579,7 +629,7 @@ enum ClientRequest {
     RefPreview {
         room_id: u64,
         room_generation: u64,
-        message_id: u64,
+        message_id: String,
     },
     /// Asks the app to start streaming a screen share into this browser.
     #[jsony(rename = "play_share")]
@@ -594,12 +644,12 @@ enum ClientRequest {
     #[jsony(rename = "edit_message")]
     EditMessage {
         request_id: u64,
-        target: u64,
+        target: String,
         body: String,
     },
     /// Deletes a locally-authored message. Ignored when read-only.
     #[jsony(rename = "delete_message")]
-    DeleteMessage { request_id: u64, target: u64 },
+    DeleteMessage { request_id: u64, target: String },
     /// Opens a file upload. The binary chunk frames that follow carry its bytes,
     /// keyed by `upload_id`, and `upload_finish` closes it. Ignored when
     /// read-only.
@@ -665,9 +715,10 @@ impl CandidateKind {
 /// fresh canonical snapshot.
 #[derive(Clone)]
 pub struct WebFeedSender {
-    tx: SyncSender<WebFeed>,
+    tx: Sender<WebFeed>,
     wake: WakeHandle,
     resync_history: Arc<AtomicBool>,
+    queued_feed_bytes: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
     #[cfg(test)]
     local_addr: SocketAddr,
@@ -676,18 +727,27 @@ pub struct WebFeedSender {
 impl WebFeedSender {
     fn queue(&self, feed: WebFeed) {
         let affects_history = feed.affects_history();
-        match self.tx.try_send(feed) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                if affects_history {
-                    self.resync_history.store(true, Ordering::Release);
-                }
-                kvlog::warn!(
-                    "dropping saturated web feed item",
-                    history_resync = affects_history
-                );
+        let retained_bytes = feed.retained_bytes();
+        if !reserve_feed_bytes(&self.queued_feed_bytes, retained_bytes) {
+            if affects_history {
+                self.resync_history.store(true, Ordering::Release);
             }
-            Err(TrySendError::Disconnected(_)) => return,
+            kvlog::warn!(
+                "dropping byte-saturated web feed item",
+                queued_bytes = self.queued_feed_bytes.load(Ordering::Relaxed),
+                item_bytes = retained_bytes,
+                history_resync = affects_history
+            );
+            self.wake.wake();
+            return;
+        }
+        match self.tx.send(feed) {
+            Ok(()) => {}
+            Err(_) => {
+                self.queued_feed_bytes
+                    .fetch_sub(retained_bytes, Ordering::AcqRel);
+                return;
+            }
         }
         self.wake.wake();
     }
@@ -728,14 +788,6 @@ impl WebFeedSender {
             messages,
             older_cursor,
             at_start,
-        });
-    }
-
-    pub fn send_stale_history(&self, client: u64, room_id: RoomId, room_generation: u64) {
-        self.queue(WebFeed::StaleHistory {
-            client,
-            room_id,
-            room_generation,
         });
     }
 
@@ -859,6 +911,26 @@ impl WebFeedSender {
         self.stopping.store(true, Ordering::Release);
         self.wake.wake();
     }
+}
+
+fn reserve_feed_bytes(queued: &AtomicUsize, bytes: usize) -> bool {
+    let mut current = queued.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(bytes) else {
+            return false;
+        };
+        if next > WEB_FEED_MAX_BYTES {
+            return false;
+        }
+        match queued.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn release_queued_feed(feed: &WebFeed, queued: &AtomicUsize) {
+    queued.fetch_sub(feed.retained_bytes(), Ordering::AcqRel);
 }
 
 /// Builds the `/files/<name>` handler that resolves a served name through the
@@ -1042,10 +1114,12 @@ pub fn spawn_with_upload_limit(
     let wake = server.wake_handle()?;
     let local = server.local_addr()?;
 
-    let (tx, rx) = mpsc::sync_channel(WEB_FEED_CAPACITY);
+    let (tx, rx) = mpsc::channel();
     let resync_history = Arc::new(AtomicBool::new(false));
+    let queued_feed_bytes = Arc::new(AtomicUsize::new(0));
     let stopping = Arc::new(AtomicBool::new(false));
     let run_resync_history = Arc::clone(&resync_history);
+    let run_queued_feed_bytes = Arc::clone(&queued_feed_bytes);
     let run_stopping = Arc::clone(&stopping);
     let autoplay = cfg.autoplay;
     let viewer = cfg.viewer;
@@ -1062,6 +1136,7 @@ pub fn spawn_with_upload_limit(
                 max_upload_bytes,
                 room_name,
                 run_resync_history,
+                run_queued_feed_bytes,
                 run_stopping,
             )
         })?;
@@ -1071,6 +1146,7 @@ pub fn spawn_with_upload_limit(
         tx,
         wake,
         resync_history,
+        queued_feed_bytes,
         stopping,
         #[cfg(test)]
         local_addr: local,
@@ -1088,6 +1164,7 @@ fn run(
     mut max_upload_bytes: u64,
     mut room_name: String,
     resync_history: Arc<AtomicBool>,
+    queued_feed_bytes: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
 ) {
     // Open uploads keyed by connection and browser-assigned id, each an
@@ -1113,6 +1190,8 @@ fn run(
     // with live delta frames.
     let mut video_fast_start: HashMap<u32, VideoFastStart> = HashMap::new();
     let mut e2e_security = None::<String>;
+    let mut feed_frame = Vec::new();
+    let mut feed_pending = false;
 
     loop {
         if stopping.load(Ordering::Acquire) {
@@ -1125,7 +1204,8 @@ fn run(
             }
             return;
         }
-        if let Err(error) = server.poll_once(None) {
+        let poll_timeout = feed_pending.then_some(Duration::ZERO);
+        if let Err(error) = server.poll_once(poll_timeout) {
             kvlog::error!("web server poll failed", error = %error);
             return;
         }
@@ -1243,7 +1323,10 @@ fn run(
                             before_message_id,
                             limit
                         );
-                        if let Ok(room_id) = u32::try_from(room_id) {
+                        if let (Ok(room_id), Ok(before_message_id)) = (
+                            u32::try_from(room_id),
+                            u64::from_str_radix(&before_message_id, 16),
+                        ) {
                             let _ = web_requests.send(WebRequest::LoadOlder {
                                 client: id.get(),
                                 room_id: RoomId(room_id),
@@ -1266,7 +1349,9 @@ fn run(
                             room_generation,
                             message_id
                         );
-                        if let Ok(room_id) = u32::try_from(room_id) {
+                        if let (Ok(room_id), Ok(message_id)) =
+                            (u32::try_from(room_id), u64::from_str_radix(&message_id, 16))
+                        {
                             let _ = web_requests.send(WebRequest::RefPreview {
                                 client: id.get(),
                                 room_id: RoomId(room_id),
@@ -1379,15 +1464,16 @@ fn run(
                             target,
                             body_len = body.len()
                         );
-                        if web_requests
-                            .send(WebRequest::EditChat {
-                                client: id.get(),
-                                request_id,
-                                target,
-                                body,
-                            })
-                            .is_err()
-                        {
+                        if u64::from_str_radix(&target, 16).is_ok_and(|target| {
+                            web_requests
+                                .send(WebRequest::EditChat {
+                                    client: id.get(),
+                                    request_id,
+                                    target,
+                                    body,
+                                })
+                                .is_err()
+                        }) {
                             let payload = request_result_envelope(
                                 request_id,
                                 "edit_message",
@@ -1404,14 +1490,15 @@ fn run(
                             kind = "delete_message",
                             target
                         );
-                        if web_requests
-                            .send(WebRequest::DeleteChat {
-                                client: id.get(),
-                                request_id,
-                                target,
-                            })
-                            .is_err()
-                        {
+                        if u64::from_str_radix(&target, 16).is_ok_and(|target| {
+                            web_requests
+                                .send(WebRequest::DeleteChat {
+                                    client: id.get(),
+                                    request_id,
+                                    target,
+                                })
+                                .is_err()
+                        }) {
                             let payload = request_result_envelope(
                                 request_id,
                                 "delete_message",
@@ -1715,16 +1802,29 @@ fn run(
             }
         }
 
-        loop {
-            match rx.try_recv() {
+        // Bound one drain pass so a continuous video producer cannot starve
+        // browser input and disconnect handling. A full pass makes the next
+        // socket poll nonblocking so already-queued feed work keeps moving
+        // without relying on another wake.
+        let mut batch_full = true;
+        for _ in 0..WEB_FEED_BATCH {
+            match rx.try_recv().map(|feed| {
+                release_queued_feed(&feed, &queued_feed_bytes);
+                feed
+            }) {
                 Ok(WebFeed::Message {
                     room_id,
                     room_generation,
                     message,
                 }) => {
-                    let frame = web_wire::encode_single(room_id, room_generation, &message);
+                    web_wire::encode_single_into(
+                        &mut feed_frame,
+                        room_id,
+                        room_generation,
+                        &message,
+                    );
                     for id in &clients {
-                        let _ = server.send_websocket_binary(*id, &frame);
+                        let _ = server.send_websocket_binary(*id, &feed_frame);
                     }
                 }
                 Ok(WebFeed::Delete {
@@ -1732,9 +1832,14 @@ fn run(
                     room_generation,
                     message_id,
                 }) => {
-                    let frame = web_wire::encode_delete(room_id, room_generation, message_id);
+                    web_wire::encode_delete_into(
+                        &mut feed_frame,
+                        room_id,
+                        room_generation,
+                        message_id,
+                    );
                     for id in &clients {
-                        let _ = server.send_websocket_binary(*id, &frame);
+                        let _ = server.send_websocket_binary(*id, &feed_frame);
                     }
                 }
                 Ok(WebFeed::SetRoomName { name }) => {
@@ -1753,7 +1858,8 @@ fn run(
                     older_cursor,
                     at_start,
                 }) => {
-                    let frame = web_wire::encode_window(
+                    web_wire::encode_window_into(
+                        &mut feed_frame,
                         match kind {
                             HistoryWindowKind::Sync => web_wire::KIND_SYNC,
                             HistoryWindowKind::Older => web_wire::KIND_OLDER,
@@ -1764,20 +1870,7 @@ fn run(
                         older_cursor,
                         at_start,
                     );
-                    send_binary_to_audience(&mut server, &clients, audience, &frame);
-                }
-                Ok(WebFeed::StaleHistory {
-                    client,
-                    room_id,
-                    room_generation,
-                }) => {
-                    let frame = web_wire::encode_stale(room_id, room_generation);
-                    send_binary_to_audience(
-                        &mut server,
-                        &clients,
-                        WebAudience::One(client),
-                        &frame,
-                    );
+                    send_binary_to_audience(&mut server, &clients, audience, &feed_frame);
                 }
                 Ok(WebFeed::RefPreview {
                     client,
@@ -1786,7 +1879,8 @@ fn run(
                     message_id,
                     message,
                 }) => {
-                    let frame = web_wire::encode_ref_preview(
+                    web_wire::encode_ref_preview_into(
+                        &mut feed_frame,
                         room_id,
                         room_generation,
                         message_id.0,
@@ -1796,7 +1890,7 @@ fn run(
                         &mut server,
                         &clients,
                         WebAudience::One(client),
-                        &frame,
+                        &feed_frame,
                     );
                 }
                 Ok(WebFeed::E2eSecurity { payload, active }) => {
@@ -1909,7 +2003,10 @@ fn run(
                         .or_default()
                         .push(stream_id, frame, is_key);
                 }
-                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Empty) => {
+                    batch_full = false;
+                    break;
+                }
                 Err(TryRecvError::Disconnected) => {
                     for stream_id in share_subscriptions
                         .iter()
@@ -1922,6 +2019,7 @@ fn run(
                 }
             }
         }
+        feed_pending = batch_full;
 
         if resync_history.swap(false, Ordering::AcqRel) {
             for client in &clients {
@@ -3072,14 +3170,14 @@ Sec-WebSocket-Version: 13\r\n\
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
 
         sender.send_delete_error(
-            r#"{"type":"delete_error","target":7,"message":"too old"}"#.to_string(),
+            r#"{"type":"delete_error","target":"7","message":"too old"}"#.to_string(),
         );
 
         let (opcode, payload) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x1);
         assert_eq!(
             String::from_utf8(payload).unwrap(),
-            r#"{"type":"delete_error","target":7,"message":"too old"}"#
+            r#"{"type":"delete_error","target":"7","message":"too old"}"#
         );
     }
 
@@ -3104,7 +3202,7 @@ Sec-WebSocket-Version: 13\r\n\
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
-            r#"{"type":"load_older","room_id":3,"room_generation":11,"before_message_id":42,"limit":5}"#,
+            r#"{"type":"load_older","room_id":3,"room_generation":11,"before_message_id":"800000000000002a","limit":5}"#,
         );
         assert_eq!(
             web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -3112,7 +3210,7 @@ Sec-WebSocket-Version: 13\r\n\
                 client: 1,
                 room_id: RoomId(3),
                 room_generation: 11,
-                before_message_id: MessageId(42),
+                before_message_id: MessageId((1 << 63) | 42),
                 limit: 5,
             }
         );
@@ -3357,28 +3455,28 @@ Sec-WebSocket-Version: 13\r\n\
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
-            r#"{"type":"edit_message","request_id":12,"target":7,"body":"revised"}"#,
+            r#"{"type":"edit_message","request_id":12,"target":"8000000000000007","body":"revised"}"#,
         );
         assert_eq!(
             web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             WebRequest::EditChat {
                 client: 1,
                 request_id: 12,
-                target: 7,
+                target: (1 << 63) | 7,
                 body: "revised".to_string(),
             }
         );
 
         write_ws_text(
             &mut stream,
-            r#"{"type":"delete_message","request_id":13,"target":7}"#,
+            r#"{"type":"delete_message","request_id":13,"target":"8000000000000007"}"#,
         );
         assert_eq!(
             web_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             WebRequest::DeleteChat {
                 client: 1,
                 request_id: 13,
-                target: 7
+                target: (1 << 63) | 7
             }
         );
     }
@@ -3404,11 +3502,11 @@ Sec-WebSocket-Version: 13\r\n\
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
         write_ws_text(
             &mut stream,
-            r#"{"type":"edit_message","request_id":12,"target":7,"body":"revised"}"#,
+            r#"{"type":"edit_message","request_id":12,"target":"7","body":"revised"}"#,
         );
         write_ws_text(
             &mut stream,
-            r#"{"type":"delete_message","request_id":13,"target":7}"#,
+            r#"{"type":"delete_message","request_id":13,"target":"7"}"#,
         );
         assert!(web_rx.recv_timeout(Duration::from_millis(300)).is_err());
     }

@@ -14,6 +14,11 @@ function u64(bytes: number[], value: number) {
   u32(bytes, Math.floor(value / 0x1_0000_0000));
 }
 
+function u64Parts(bytes: number[], lo: number, hi: number) {
+  u32(bytes, lo);
+  u32(bytes, hi);
+}
+
 function string(bytes: number[], value: string) {
   const encoded = new TextEncoder().encode(value);
   u32(bytes, encoded.length);
@@ -71,7 +76,7 @@ test("decodes canonical room generation and message paging cursor", () => {
     room_id: 9,
     room_generation: 7,
     messages: [],
-    older_cursor: 42,
+    older_cursor: "2a",
     at_start: false,
   });
 });
@@ -87,7 +92,23 @@ test("reference previews preserve room-local identity", () => {
     kind: "ref_preview",
     room_id: 2,
     room_generation: 7,
-    message_id: 42,
+    message_id: "2a",
+    message: null,
+  });
+});
+
+test("preserves high-bit MLS message identities", () => {
+  const bytes = [0, 0, 0, 0, 4];
+  u64(bytes, 2);
+  u64(bytes, 7);
+  u64Parts(bytes, 7, 0x8000_0000);
+  u8(bytes, 0);
+
+  expect(decodeFeed(Uint8Array.from(bytes).buffer)).toEqual({
+    kind: "ref_preview",
+    room_id: 2,
+    room_generation: 7,
+    message_id: "8000000000000007",
     message: null,
   });
 });
