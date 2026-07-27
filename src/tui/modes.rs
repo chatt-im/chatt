@@ -1512,7 +1512,7 @@ impl RoomMode {
     }
 
     pub(crate) fn submit_input(&mut self, cx: &mut ViewCx<'_>) {
-        let Some(submission) = cx.view.submit_composer(cx.session) else {
+        let Some(submission) = cx.view.submit_composer() else {
             return;
         };
         match submission {
@@ -4669,7 +4669,7 @@ mod tests {
         type_text(&mut room, &mut app, "hello");
         {
             let cx = app.view_cx();
-            cx.view.submit_composer(cx.session);
+            cx.view.submit_composer();
         }
         assert!(app.view.composer.text().is_empty());
         assert_eq!(app.view.composer_rows, Some(target));

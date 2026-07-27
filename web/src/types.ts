@@ -3,6 +3,10 @@
 
 export type MediaKind = "image" | "video" | "audio" | "file";
 export type AutoplayMode = "disabled" | "muted" | "with-audio";
+// Canonical chat ids may use the high bit for MLS sequencing, so they cannot
+// round-trip through JavaScript's 53-bit integer range. Hex strings remain
+// exact in DOM attributes, equality checks, and JSON requests without BigInt.
+export type MessageId = string;
 // Where a clicked file preview opens: the in-page side panel or its own tab.
 export type ViewerMode = "panel" | "tab";
 // Which side of a transfer this view is on: "incoming" is a download this
@@ -40,7 +44,7 @@ export type Fragment =
   | { kind: "quote_end" };
 
 export interface WebMessage {
-  id: number;
+  id: MessageId;
   sender: string;
   // Original plaintext body. It is used only as textarea input for editing;
   // rendered message content continues to come from the safe fragments below.
@@ -59,7 +63,7 @@ export interface WebMessage {
   // The chat message id (distinct from `id`, which collapses to the transfer id
   // for file messages). This is the durable key `@@` references and mutations
   // target. Zero when unknown.
-  message_id: number;
+  message_id: MessageId;
   // Precomputed `@@` reference code (without the prefix) for copying/quoting a
   // reference to this message. Empty when the message is not referenceable.
   ref_code: string;
@@ -173,7 +177,7 @@ export type ServerEnvelope =
   // Argument candidates answering a `command_candidates` request.
   | { type: "command_candidates"; request_id: number; kind: CandidateKind; items: CandidateItem[] }
   // A deletion request was rejected by the local client or room server.
-  | { type: "delete_error"; target: number; message: string }
+  | { type: "delete_error"; target: MessageId; message: string }
   | {
       type: "request_result";
       request_id: number;
@@ -201,20 +205,20 @@ export type ClientRequest =
       type: "load_older";
       room_id: number;
       room_generation: number;
-      before_message_id: number;
+      before_message_id: MessageId;
       limit: number;
     }
   | {
       type: "ref_preview";
       room_id: number;
       room_generation: number;
-      message_id: number;
+      message_id: MessageId;
     }
   | { type: "play_share"; stream_id: number }
   | { type: "stop_share"; stream_id: number }
   | { type: "send_message"; request_id: number; body: string }
-  | { type: "edit_message"; request_id: number; target: number; body: string }
-  | { type: "delete_message"; request_id: number; target: number }
+  | { type: "edit_message"; request_id: number; target: MessageId; body: string }
+  | { type: "delete_message"; request_id: number; target: MessageId }
   | { type: "upload_start"; request_id: number; upload_id: number; name: string; size: number }
   | { type: "upload_finish"; request_id: number; upload_id: number }
   | { type: "upload_cancel"; request_id: number; upload_id: number }

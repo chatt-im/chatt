@@ -25,7 +25,6 @@ pub const KIND_MESSAGE: u8 = 2;
 pub const KIND_OLDER: u8 = 3;
 pub const KIND_REF_PREVIEW: u8 = 4;
 pub const KIND_DELETE: u8 = 5;
-pub const KIND_STALE: u8 = 6;
 
 /// Fragment kind bytes.
 const FRAG_TEXT: u8 = 0;
@@ -236,7 +235,7 @@ fn render_ref(code: &str, resolver: RefResolver, html: &mut String) {
     };
     let _ = write!(
         html,
-        "<a href=\"#\" class=\"{class}\" data-mid=\"{}\" data-room=\"{}\"",
+        "<a href=\"#\" class=\"{class}\" data-mid=\"{:x}\" data-room=\"{}\"",
         target.message_id.0, target.room_id.0,
     );
     if let Some(attachment) = resolved
@@ -287,6 +286,7 @@ fn escape_html(text: &str, out: &mut String) {
 
 /// Encodes a `sync` or `older` window frame: sentinel, kind, cursor, then each
 /// message.
+#[cfg(test)]
 pub fn encode_window(
     kind: u8,
     room_id: rpc::ids::RoomId,
@@ -296,29 +296,51 @@ pub fn encode_window(
     at_start: bool,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
+    encode_window_into(
+        &mut buf,
+        kind,
+        room_id,
+        room_generation,
+        messages,
+        older_cursor,
+        at_start,
+    );
+    buf
+}
+
+pub fn encode_window_into(
+    buf: &mut Vec<u8>,
+    kind: u8,
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
+    messages: &[WebMessage],
+    older_cursor: Option<rpc::ids::MessageId>,
+    at_start: bool,
+) {
+    buf.clear();
     buf.extend_from_slice(&SENTINEL);
     buf.push(kind);
-    put_u64(&mut buf, room_id.0 as u64);
-    put_u64(&mut buf, room_generation);
+    put_u64(buf, room_id.0 as u64);
+    put_u64(buf, room_generation);
     match older_cursor {
         Some(cursor) => {
             buf.push(1);
-            put_u64(&mut buf, cursor.0);
+            put_u64(buf, cursor.0);
         }
         None => buf.push(0),
     }
     buf.push(at_start as u8);
-    put_u32(&mut buf, messages.len() as u32);
+    put_u32(buf, messages.len() as u32);
     for message in messages {
-        encode_message(&mut buf, message);
+        encode_message(buf, message);
     }
-    buf
 }
 
 /// Encodes a `ref_preview` response: the echoed `(timestamp, message id)`
 /// request key, a found flag, and the target message when the feed history
 /// holds it. The browser shows it as the hover card for a `@@` reference
 /// whose target is not in its loaded window.
+#[cfg(test)]
 pub fn encode_ref_preview(
     room_id: rpc::ids::RoomId,
     room_generation: u64,
@@ -326,56 +348,79 @@ pub fn encode_ref_preview(
     message: Option<&WebMessage>,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
+    encode_ref_preview_into(&mut buf, room_id, room_generation, message_id, message);
+    buf
+}
+
+pub fn encode_ref_preview_into(
+    buf: &mut Vec<u8>,
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
+    message_id: u64,
+    message: Option<&WebMessage>,
+) {
+    buf.clear();
     buf.extend_from_slice(&SENTINEL);
     buf.push(KIND_REF_PREVIEW);
-    put_u64(&mut buf, room_id.0 as u64);
-    put_u64(&mut buf, room_generation);
-    put_u64(&mut buf, message_id);
+    put_u64(buf, room_id.0 as u64);
+    put_u64(buf, room_generation);
+    put_u64(buf, message_id);
     match message {
         None => buf.push(0),
         Some(message) => {
             buf.push(1);
-            encode_message(&mut buf, message);
+            encode_message(buf, message);
         }
     }
-    buf
-}
-
-/// Encodes a stale-generation response. The browser requests a fresh sync.
-pub fn encode_stale(room_id: rpc::ids::RoomId, room_generation: u64) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&SENTINEL);
-    buf.push(KIND_STALE);
-    put_u64(&mut buf, room_id.0 as u64);
-    put_u64(&mut buf, room_generation);
-    buf
 }
 
 /// Encodes a `delete` frame: room identity plus the chat message id the
 /// browser should drop.
+#[cfg(test)]
 pub fn encode_delete(room_id: rpc::ids::RoomId, room_generation: u64, message_id: u64) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.extend_from_slice(&SENTINEL);
-    buf.push(KIND_DELETE);
-    put_u64(&mut buf, room_id.0 as u64);
-    put_u64(&mut buf, room_generation);
-    put_u64(&mut buf, message_id);
+    encode_delete_into(&mut buf, room_id, room_generation, message_id);
     buf
 }
 
+pub fn encode_delete_into(
+    buf: &mut Vec<u8>,
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
+    message_id: u64,
+) {
+    buf.clear();
+    buf.extend_from_slice(&SENTINEL);
+    buf.push(KIND_DELETE);
+    put_u64(buf, room_id.0 as u64);
+    put_u64(buf, room_generation);
+    put_u64(buf, message_id);
+}
+
 /// Encodes a single live `message` frame.
+#[cfg(test)]
 pub fn encode_single(
     room_id: rpc::ids::RoomId,
     room_generation: u64,
     message: &WebMessage,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
+    encode_single_into(&mut buf, room_id, room_generation, message);
+    buf
+}
+
+pub fn encode_single_into(
+    buf: &mut Vec<u8>,
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
+    message: &WebMessage,
+) {
+    buf.clear();
     buf.extend_from_slice(&SENTINEL);
     buf.push(KIND_MESSAGE);
-    put_u64(&mut buf, room_id.0 as u64);
-    put_u64(&mut buf, room_generation);
-    encode_message(&mut buf, message);
-    buf
+    put_u64(buf, room_id.0 as u64);
+    put_u64(buf, room_generation);
+    encode_message(buf, message);
 }
 
 /// Encodes one message: identity, author/display state, optional attachment,

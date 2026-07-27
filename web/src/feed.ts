@@ -5,14 +5,13 @@
 // first field is a length), so `decodeFeed` returns null for one, letting the
 // caller treat it as video. All integers are little-endian.
 
-import type { WebMessage, Fragment, MediaKind } from "./types";
+import type { WebMessage, Fragment, MediaKind, MessageId } from "./types";
 
 const KIND_SYNC = 1;
 const KIND_MESSAGE = 2;
 const KIND_OLDER = 3;
 const KIND_REF_PREVIEW = 4;
 const KIND_DELETE = 5;
-const KIND_STALE = 6;
 
 const FRAG_TEXT = 0;
 const FRAG_CODE = 1;
@@ -29,7 +28,7 @@ export type FeedFrame =
       room_id: number;
       room_generation: number;
       messages: WebMessage[];
-      older_cursor: number | null;
+      older_cursor: MessageId | null;
       at_start: boolean;
     }
   | {
@@ -37,17 +36,16 @@ export type FeedFrame =
       room_id: number;
       room_generation: number;
       messages: WebMessage[];
-      older_cursor: number | null;
+      older_cursor: MessageId | null;
       at_start: boolean;
     }
   | { kind: "message"; room_id: number; room_generation: number; message: WebMessage }
-  | { kind: "delete"; room_id: number; room_generation: number; message_id: number }
-  | { kind: "stale"; room_id: number; room_generation: number }
+  | { kind: "delete"; room_id: number; room_generation: number; message_id: MessageId }
   | {
       kind: "ref_preview";
       room_id: number;
       room_generation: number;
-      message_id: number;
+      message_id: MessageId;
       message: WebMessage | null;
     };
 
@@ -69,7 +67,7 @@ export function decodeFeed(buffer: ArrayBuffer): FeedFrame | null {
   if (kind === KIND_REF_PREVIEW) {
     const room_id = reader.u53();
     const room_generation = reader.u53();
-    const message_id = reader.u53();
+    const message_id = reader.messageId();
     const message = reader.u8() === 1 ? reader.message() : null;
     return { kind: "ref_preview", room_id, room_generation, message_id, message };
   }
@@ -78,21 +76,14 @@ export function decodeFeed(buffer: ArrayBuffer): FeedFrame | null {
       kind: "delete",
       room_id: reader.u53(),
       room_generation: reader.u53(),
-      message_id: reader.u53(),
-    };
-  }
-  if (kind === KIND_STALE) {
-    return {
-      kind: "stale",
-      room_id: reader.u53(),
-      room_generation: reader.u53(),
+      message_id: reader.messageId(),
     };
   }
   // Unknown kinds (newer server) must not fall into the window parser.
   if (kind !== KIND_SYNC && kind !== KIND_OLDER) return null;
   const room_id = reader.u53();
   const room_generation = reader.u53();
-  const older_cursor = reader.u8() === 1 ? reader.u53() : null;
+  const older_cursor = reader.u8() === 1 ? reader.messageId() : null;
   const at_start = reader.u8() === 1;
   const count = reader.u32();
   const messages: WebMessage[] = [];
@@ -124,13 +115,22 @@ class Reader {
     return value;
   }
 
-  // Reads a u64 as a JS number. Sequence numbers, ids, and timestamps stay well
-  // inside 2^53 for this app.
+  // Reads bounded quantities as a JS number. Room generations, transfer ids,
+  // and timestamps stay well inside 2^53 for this app; chat ids use messageId.
   u53(): number {
     const lo = this.view.getUint32(this.pos, true);
     const hi = this.view.getUint32(this.pos + 4, true);
     this.pos += 8;
     return hi * 0x1_0000_0000 + lo;
+  }
+
+  messageId(): MessageId {
+    const lo = this.view.getUint32(this.pos, true);
+    const hi = this.view.getUint32(this.pos + 4, true);
+    this.pos += 8;
+    return hi === 0
+      ? lo.toString(16)
+      : `${hi.toString(16)}${lo.toString(16).padStart(8, "0")}`;
   }
 
   slice(): Uint8Array {
@@ -145,9 +145,9 @@ class Reader {
   }
 
   message(): WebMessage {
-    const id = this.u53();
+    const id = this.messageId();
     const timestamp_ms = this.u53();
-    const message_id = this.u53();
+    const message_id = this.messageId();
     const ref_code = this.string();
     const sender = this.string();
     const body = this.string();
