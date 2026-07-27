@@ -749,7 +749,11 @@ fn device_choices(
                 label: device.name,
                 detail,
                 search,
-                enabled: device.supported,
+                // Enumeration establishes that this is a real selection
+                // target. Capability probing only supplies picker metadata:
+                // some backends reject that probe even though they can open
+                // the device when it is selected.
+                enabled: true,
             }
         })
         .collect();
@@ -2055,7 +2059,7 @@ mod tests {
     }
 
     #[test]
-    fn device_choices_preserve_selection_aliases_and_search_metadata() {
+    fn device_choices_keep_devices_selectable_when_metadata_probe_fails() {
         let choices = device_choices(
             vec![settings::AudioDeviceItem {
                 selection: Some("alsa:usb-studio".into()),
@@ -2078,7 +2082,21 @@ mod tests {
         assert!(choices[0].detail.contains("unsupported sample format"));
         assert!(choices[0].detail.contains("alsa:usb-studio"));
         assert!(choices[0].search.contains("legacy-usb"));
+        assert!(choices[0].enabled);
+    }
+
+    #[test]
+    fn device_choices_keep_unreported_current_device_unavailable() {
+        let choices = device_choices(Vec::new(), &Some("missing-device".into()));
+
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].value, "missing-device");
         assert!(!choices[0].enabled);
+        assert!(
+            choices[0]
+                .detail
+                .contains("not currently reported by the audio backend")
+        );
     }
 
     #[test]
