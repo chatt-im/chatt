@@ -185,6 +185,47 @@ pub(crate) type NoticeKey = u64;
 /// Shared room notices are canonical history too, so they have an explicit
 /// retention bound independent of attached view count.
 
+/// One change to a room's canonical entry sequence, in the terms a derived
+/// view needs to repair itself: which id moved, not that something did.
+///
+/// Every variant names an id the consumer can resolve back through
+/// [`RoomHistoryRef`], so a delta never carries payload — that is what lets one
+/// journal serve every attached view without duplicating message bodies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryDelta {
+    /// A message landed past the previous newest.
+    Appended(MessageId),
+    /// A history page threaded a message between resident neighbours.
+    Inserted(MessageId),
+    /// A resident record's body or labelling was replaced in place; its id kept
+    /// its position.
+    Replaced(MessageId),
+    /// The target became a hidden tombstone and leaves the visible sequence.
+    Tombstoned(MessageId),
+    /// Retention dropped every message at or below this id. Only ever an
+    /// ordered prefix, so survivors keep their relative positions.
+    EvictedThrough(MessageId),
+    NoticeAdded(NoticeKey),
+    NoticeRemoved(NoticeKey),
+    /// Ids moved in ways no single id names — a history page prepended beneath
+    /// entries a consumer already shows. No resident body changed, so a
+    /// consumer rebuilds its id sequence but keeps every measurement it holds.
+    Relaid,
+    /// Every record's labelling was re-derived: authentication settling
+    /// `local_user`, or a trust change moving the unverified marks. Ids, bodies
+    /// and measurements all hold; only the rendering differs.
+    Relabelled,
+}
+
+/// Deltas retained per room. A consumer further behind than this rebuilds from
+/// the canonical sequence instead of replaying.
+///
+/// The cap is the whole safety argument: [`RoomHistory::deltas_since`] hands
+/// back a replayable span only while `revision - applied` entries are still
+/// resident, so falling behind degrades to a rebuild rather than to a silently
+/// wrong index.
+const JOURNAL_CAP: usize = 256;
+
 pub(crate) enum HistoryEntryRef<'a> {
     Message {
         record: &'a MessageRecord,
@@ -233,28 +274,20 @@ impl<'a> RoomHistoryRef<'a> {
         self.max_messages
     }
 
-    /// Advances only when a resident body or its labelling was replaced in
-    /// place. A view seeing this move alone keeps its id vector and refreshes
-    /// just the records whose own content revision moved.
-    pub(crate) fn content_revision(self) -> Revision {
-        self.room.content_revision()
+    /// The room's change counter. Every canonical change advances it by
+    /// exactly one, and [`Self::deltas_since`] names what each step was.
+    pub(crate) fn revision(self) -> Revision {
+        self.room.revision
     }
 
-    /// Advances only when the visible id sequence changes. A pure body edit
-    /// leaves it stable.
-    pub(crate) fn order_revision(self) -> Revision {
-        self.room.order_revision()
-    }
-
-    pub(crate) fn reindex_revision(self) -> Revision {
-        self.room.reindex_revision()
-    }
-
-    /// Newest message key retention has dropped off the front of this room.
-    /// A front drop is an ordered prefix removal, so a derived view can apply
-    /// it directly instead of reindexing.
-    pub(crate) fn evicted_through(self) -> Option<MessageId> {
-        self.room.evicted_through.map(MessageId)
+    /// The changes newer than `applied`, when the journal still covers that
+    /// span contiguously; `None` demands a rebuild from
+    /// [`Self::visible_entry_ids`].
+    pub(crate) fn deltas_since(
+        self,
+        applied: Revision,
+    ) -> Option<impl Iterator<Item = &'a HistoryDelta> + Clone> {
+        self.room.deltas_since(applied)
     }
 
     pub(crate) fn tail_message_id(self) -> Option<MessageId> {
@@ -263,24 +296,6 @@ impl<'a> RoomHistoryRef<'a> {
 
     pub(crate) fn entry_ids(self) -> Vec<HistoryEntryId> {
         self.visible_entry_ids()
-    }
-
-    /// Visible message ids appended after `after`, provided the caller already
-    /// established that only tail appends occurred since its last sync.
-    pub(crate) fn tail_entry_ids(
-        self,
-        after: Option<MessageId>,
-    ) -> Option<impl Iterator<Item = HistoryEntryId> + 'a> {
-        let start = match after {
-            Some(after) => self.room.messages.position(after.0)?.saturating_add(1),
-            None => 0,
-        };
-        Some(
-            self.room.messages.records()[start..]
-                .iter()
-                .filter(|record| !record.message.flags.deleted())
-                .map(|record| HistoryEntryId::Message(record.message.message_id)),
-        )
     }
 
     pub(crate) fn notice_scrolls_bottom(self, id: HistoryEntryId) -> bool {
@@ -408,7 +423,6 @@ impl<'a> RoomHistoryRef<'a> {
                 edited: record.message.flags.edited(),
                 file_transfer_id: record.message.file_transfer_id,
                 notice_kind: None,
-                content_revision: record.content_revision,
             }),
             HistoryEntryRef::Notice { record, .. } => Some(ChatRecord {
                 entry_id: id,
@@ -420,15 +434,6 @@ impl<'a> RoomHistoryRef<'a> {
                 edited: false,
                 file_transfer_id: None,
                 notice_kind: Some(record.kind),
-                // Notice records are immutable and their keys are never reused
-                // within a room generation. Unrelated chat changes therefore
-                // cannot invalidate their cached layout.
-                content_revision: match id {
-                    HistoryEntryId::Notice(key) => key,
-                    HistoryEntryId::Message(_) | HistoryEntryId::LocalNotice(_) => {
-                        unreachable!("notice entry resolved above")
-                    }
-                },
             }),
         }
     }
@@ -471,26 +476,16 @@ pub(crate) struct RoomHistory {
     /// Newest mutation id seen in this room; keeps the read watermark from
     /// trailing the head a mutation advanced past every visible message.
     newest_mutation_seen: MessageKey,
-    /// Changes when a resident record's body or labelling was replaced without
-    /// moving any id.
-    ///
-    /// This and `order_revision` are deliberately independent, so an in-process
-    /// view can pick the cheapest repair: seeing exactly one of them move means
-    /// the other held, and seeing both move means falling back to a rebuild.
-    /// [`Self::revision`] is their sum — every change advances exactly one or
-    /// both, and both are monotone, so the sum is the strictly increasing "is
-    /// my copy current" token out-of-process consumers need.
-    content_revision: Revision,
-    /// Changes when the visible id sequence changes: a tail append, a front
-    /// eviction, or a reindex.
-    order_revision: Revision,
-    /// Changes when ids may have moved arbitrarily and a derived index has to
-    /// be rebuilt from scratch. Appends, evictions and edits all leave it
-    /// stable, so every attached view catches up without a replay journal.
-    reindex_revision: Revision,
+    /// Strictly increasing change counter. A consumer records the value it has
+    /// applied and catches up through `journal`.
+    revision: Revision,
+    /// The last [`JOURNAL_CAP`] changes, newest last. Every entry names the id
+    /// it touched, so a consumer repairs exactly what moved instead of
+    /// re-deriving it by comparing counters.
+    journal: std::collections::VecDeque<(Revision, HistoryDelta)>,
     /// Newest message key retention has dropped off the front. Retention only
-    /// ever removes an ordered prefix, so this one watermark tells a derived
-    /// view exactly which of its leading entries are gone.
+    /// ever removes an ordered prefix, so this one watermark also bounds the
+    /// disk-fallback reference cache.
     evicted_through: Option<MessageKey>,
     next_notice_key: NoticeKey,
     notices: BTreeMap<NoticeKey, AnchoredNotice>,
@@ -537,9 +532,8 @@ impl RoomHistory {
             mutations: HashMap::new(),
             seen_mutations: HashSet::new(),
             newest_mutation_seen: 0,
-            content_revision: 0,
-            order_revision: 0,
-            reindex_revision: 0,
+            revision: 0,
+            journal: std::collections::VecDeque::new(),
             evicted_through: None,
             next_notice_key: 0,
             notices: BTreeMap::new(),
@@ -548,19 +542,32 @@ impl RoomHistory {
     }
 
     pub(crate) fn revision(&self) -> Revision {
-        self.content_revision.wrapping_add(self.order_revision)
+        self.revision
     }
 
-    fn content_revision(&self) -> Revision {
-        self.content_revision
-    }
-
-    fn order_revision(&self) -> Revision {
-        self.order_revision
-    }
-
-    fn reindex_revision(&self) -> Revision {
-        self.reindex_revision
+    /// The journal entries newer than `applied`, when the journal still covers
+    /// that span contiguously; `None` demands a rebuild.
+    ///
+    /// `applied > revision` cannot happen for a consumer of this room, but a
+    /// consumer carrying a revision from a different room (a recycled viewport)
+    /// must be told to rebuild rather than handed a suffix.
+    fn deltas_since(
+        &self,
+        applied: Revision,
+    ) -> Option<impl Iterator<Item = &HistoryDelta> + Clone> {
+        if applied > self.revision {
+            return None;
+        }
+        let missing = (self.revision - applied) as usize;
+        if missing > self.journal.len() {
+            return None;
+        }
+        Some(
+            self.journal
+                .iter()
+                .skip(self.journal.len() - missing)
+                .map(|(_, delta)| delta),
+        )
     }
 
     /// The resident non-deleted messages in canonical key order.
@@ -638,31 +645,18 @@ impl RoomHistory {
         original_unverified || edit_unverified
     }
 
-    /// Ids may have moved arbitrarily: every derived index rebuilds.
-    fn record_change(&mut self) {
-        self.record_content_change();
-        self.record_edge_change();
-        self.reindex_revision = self.reindex_revision.wrapping_add(1);
+    /// Appends one replayable change and advances the revision.
+    fn record(&mut self, delta: HistoryDelta) {
+        self.revision = self.revision.wrapping_add(1);
+        if self.journal.len() == JOURNAL_CAP {
+            self.journal.pop_front();
+        }
+        self.journal.push_back((self.revision, delta));
     }
 
-    /// The id sequence gained a tail, lost a front, or both. No interior id
-    /// moved relative to its neighbours and no body changed, so a view catches
-    /// up from its own ends instead of rebuilding.
-    fn record_edge_change(&mut self) {
-        self.order_revision = self.order_revision.wrapping_add(1);
-    }
-
-    /// A record's body or labelling changed in place. Every id keeps its
-    /// position, so views re-read only the records whose own content revision
-    /// moved.
-    fn record_content_change(&mut self) {
-        self.content_revision = self.content_revision.wrapping_add(1);
-    }
-
-    /// Retention dropped an ordered prefix. The id sequence changed, so the
-    /// ordering counter moves, but every surviving id kept its relative
-    /// position: a view applies the watermark to its own leading entries rather
-    /// than reindexing.
+    /// Retention dropped an ordered prefix. Every surviving id kept its
+    /// relative position, so a consumer applies the watermark to its own
+    /// leading entries rather than reindexing.
     fn record_front_evict(&mut self, evicted: &[MessageId]) {
         let Some(newest) = evicted.last() else {
             return;
@@ -670,7 +664,7 @@ impl RoomHistory {
         self.evicted_through =
             Some(self.evicted_through.map_or(newest.0, |seen| seen.max(newest.0)));
         self.prune_evicted_mutations();
-        self.record_edge_change();
+        self.record(HistoryDelta::EvictedThrough(*newest));
     }
 
     /// Drops fold state for targets retention can never make resident again.
@@ -696,8 +690,11 @@ impl RoomHistory {
         self.seen_mutations.retain(|id| *id > watermark);
     }
 
+    /// Demands that every consumer rebuild its id sequence, for a change no
+    /// single id describes. Measurements survive: nothing resident was
+    /// rewritten.
     fn invalidate(&mut self) {
-        self.record_change();
+        self.record(HistoryDelta::Relaid);
     }
 
     fn push_notice_record(&mut self, record: NoticeRecord, max_notices: usize) -> NoticeKey {
@@ -710,25 +707,34 @@ impl RoomHistory {
                 .is_none_or(|(_, notice)| notice.after <= after)
         );
         self.notices.insert(key, AnchoredNotice { record, after });
-        self.trim_notices(max_notices);
-        self.record_change();
+        // The fresh key is the largest, so trimming can only drop older
+        // notices. Report those before the addition so a consumer never sees an
+        // id it has yet to materialize being removed.
+        for evicted in self.trim_notices(max_notices) {
+            self.record(HistoryDelta::NoticeRemoved(evicted));
+        }
+        // A notice is anchored after the newest message, so it always lands at
+        // the tail of the canonical sequence.
+        self.record(HistoryDelta::NoticeAdded(key));
         key
     }
 
-    fn trim_notices(&mut self, max_notices: usize) -> bool {
+    /// Drops the oldest notices over `max_notices`, returning their keys.
+    fn trim_notices(&mut self, max_notices: usize) -> Vec<NoticeKey> {
         let excess = self.notices.len().saturating_sub(max_notices.max(1));
-        if excess == 0 {
-            return false;
-        }
+        let mut evicted = Vec::with_capacity(excess);
         for _ in 0..excess {
-            self.notices.pop_first();
+            let Some((key, _)) = self.notices.pop_first() else {
+                break;
+            };
+            evicted.push(key);
         }
-        true
+        evicted
     }
 
     fn remove_notice_record(&mut self, key: NoticeKey) {
         if self.notices.remove(&key).is_some() {
-            self.record_change();
+            self.record(HistoryDelta::NoticeRemoved(key));
         }
     }
 
@@ -801,10 +807,10 @@ impl RoomHistory {
             if message.flags.deleted() {
                 return FoldOutcome::Ignored;
             }
+            let tombstoned = message.message_id;
             message.flags = rpc::control::MessageFlags(rpc::control::MessageFlags::DELETED);
             message.body.clear();
-            record.touch();
-            self.record_change();
+            self.record(HistoryDelta::Tombstoned(tombstoned));
             return FoldOutcome::AppliedDelete;
         }
         if let Some(edit) = &state.latest_edit {
@@ -817,16 +823,14 @@ impl RoomHistory {
                 }
                 record.edit_provenance = Some(edit.provenance);
                 let folded = message.message_id;
-                record.touch();
-                self.record_content_change();
+                self.record(HistoryDelta::Replaced(folded));
                 return FoldOutcome::AppliedEdit(folded);
             }
             message.body.clone_from(&edit.body);
             message.flags.set_edited();
             record.edit_provenance = Some(edit.provenance);
             let folded = message.message_id;
-            record.touch();
-            self.record_content_change();
+            self.record(HistoryDelta::Replaced(folded));
             return FoldOutcome::AppliedEdit(folded);
         }
         FoldOutcome::Ignored
@@ -884,17 +888,19 @@ impl RoomHistory {
                 transfer_id,
             })
         });
+        let message_id = message.message_id;
         let inserted = MessageRecord::new(message, provenance, edit_provenance, file);
         let inserted_at = self.messages.insert(inserted);
         debug_assert!(!matches!(inserted_at, LogInsert::Duplicate));
         let evicted = self.messages.trim_front(max_messages);
         self.trim_orphaned_attachments();
-        // Even an invisible tombstone can advance the canonical retention
-        // window, so every fresh record advances the room revision.
-        if matches!(inserted_at, LogInsert::Appended) {
-            self.record_edge_change();
-        } else {
-            self.record_change();
+        // An invisible tombstone still lands in the canonical log: consumers
+        // resolve the id, find it deleted, and skip it. Reporting it keeps the
+        // revision a faithful count of canonical changes.
+        match inserted_at {
+            LogInsert::Appended => self.record(HistoryDelta::Appended(message_id)),
+            LogInsert::Inserted => self.record(HistoryDelta::Inserted(message_id)),
+            LogInsert::Duplicate => {}
         }
         self.record_front_evict(&evicted);
         true
@@ -922,7 +928,7 @@ impl RoomHistory {
         let mut fresh = normals;
         fresh.sort_by_key(|record| MessageLog::key(&record.message));
         fresh.dedup_by_key(|record| MessageLog::key(&record.message));
-        let mut provenance_enriched = false;
+        let mut enriched = Vec::new();
         for record in &fresh {
             let key = MessageLog::key(&record.message);
             if let Some(provenance) = record.provenance
@@ -930,17 +936,16 @@ impl RoomHistory {
                 && resident.provenance.is_none()
             {
                 resident.provenance = Some(provenance);
-                resident.touch();
                 if let Some(store) = &mut self.history {
                     store.append_authenticated_message(&record.message, Some(provenance));
                 }
-                provenance_enriched = true;
+                enriched.push(record.message.message_id);
             }
         }
-        if provenance_enriched {
-            // Provenance only relabels resident records; every id keeps its
-            // place, so this is a content change like an edit.
-            self.record_content_change();
+        // Provenance only relabels resident records; every id keeps its place,
+        // so this is a replacement like an edit.
+        for message_id in enriched {
+            self.record(HistoryDelta::Replaced(message_id));
             changed = true;
         }
         fresh.retain(|record| !self.messages.contains(MessageLog::key(&record.message)));
@@ -984,17 +989,15 @@ impl RoomHistory {
             })
             .collect();
         if !older.is_empty() {
-            let any_visible = older.iter().any(|record| !record.message.flags.deleted());
             self.messages.prepend(older);
-            if any_visible {
-                self.record_change();
-            }
+            // A prepend can re-place notices anchored below the previous front
+            // relative to the messages arriving under them, so it is not an
+            // edge repair any consumer can splice. Demand a rebuild.
+            self.invalidate();
         }
         let mut rest_records = Vec::with_capacity(rest.len());
-        let mut rest_visible = false;
         for record in rest {
             let message = record.message;
-            let deleted = message.flags.deleted();
             let file = message.file_transfer_id.and_then(|transfer_id| {
                 self.pending_files.remove(&FileHistoryKey {
                     timestamp_ms: message.timestamp_ms,
@@ -1002,14 +1005,21 @@ impl RoomHistory {
                 })
             });
             let edit_provenance = edit_provenance.remove(&MessageLog::key(&message));
-            let record = MessageRecord::new(message, record.provenance, edit_provenance, file);
-            rest_visible |= !deleted;
-            rest_records.push(record);
+            rest_records.push(MessageRecord::new(
+                message,
+                record.provenance,
+                edit_provenance,
+                file,
+            ));
         }
         if !rest_records.is_empty() {
+            let inserted = rest_records
+                .iter()
+                .map(|record| record.message.message_id)
+                .collect::<Vec<_>>();
             self.messages.merge_sorted(rest_records);
-            if rest_visible {
-                self.record_change();
+            for message_id in inserted {
+                self.record(HistoryDelta::Inserted(message_id));
             }
         }
         let evicted = self.messages.trim_front(max_messages);
@@ -1123,13 +1133,14 @@ impl HistoryHub {
         self.max_messages_per_room = max_messages;
         for history in self.rooms.values_mut() {
             let evicted = history.messages.trim_front(max_messages);
-            let notices_trimmed = history.trim_notices(max_messages);
-            if !evicted.is_empty() || notices_trimmed {
-                history.trim_orphaned_attachments();
-                history.record_front_evict(&evicted);
-                if notices_trimmed {
-                    history.record_change();
-                }
+            let trimmed_notices = history.trim_notices(max_messages);
+            if evicted.is_empty() && trimmed_notices.is_empty() {
+                continue;
+            }
+            history.trim_orphaned_attachments();
+            history.record_front_evict(&evicted);
+            for key in trimmed_notices {
+                history.record(HistoryDelta::NoticeRemoved(key));
             }
         }
     }
@@ -1411,7 +1422,6 @@ pub(crate) struct MessageRecord {
     /// differs from the original message.
     edit_provenance: Option<Option<MessageProvenance>>,
     file: Option<room_history::FileDetail>,
-    content_revision: u64,
 }
 
 impl MessageRecord {
@@ -1426,12 +1436,7 @@ impl MessageRecord {
             provenance,
             edit_provenance,
             file,
-            content_revision: 1,
         }
-    }
-
-    fn touch(&mut self) {
-        self.content_revision = self.content_revision.wrapping_add(1).max(1);
     }
 }
 
@@ -1701,8 +1706,71 @@ impl RoomHistoryFixture {
     pub(crate) fn edit(&mut self, id: u64, body: &str) {
         let record = self.history.messages.get_mut(id).expect("fixture message");
         record.message.body = body.to_string();
-        record.touch();
-        self.history.record_content_change();
+        self.history.record(HistoryDelta::Replaced(MessageId(id)));
+    }
+
+    /// Hides a message the way a folded delete record does: the id stays in the
+    /// canonical log as a tombstone and leaves the visible sequence.
+    pub(crate) fn tombstone(&mut self, id: u64) {
+        let record = self.history.messages.get_mut(id).expect("fixture message");
+        record.message.flags =
+            rpc::control::MessageFlags(rpc::control::MessageFlags::DELETED);
+        record.message.body.clear();
+        self.history.record(HistoryDelta::Tombstoned(MessageId(id)));
+    }
+
+    /// Splices older messages under the resident front, the way a server
+    /// history page does.
+    pub(crate) fn prepend(&mut self, ids: &[u64]) {
+        let records = ids
+            .iter()
+            .map(|id| {
+                MessageRecord::new(
+                    ChatMessage {
+                        message_id: MessageId(*id),
+                        room_id: self.room_id,
+                        sender: UserId(*id),
+                        sender_name: "alice".to_string(),
+                        timestamp_ms: id * 1_000,
+                        body: format!("older {id}"),
+                        file_transfer_id: None,
+                        flags: rpc::control::MessageFlags::default(),
+                        target: None,
+                    },
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.history.messages.prepend(records);
+        self.history.invalidate();
+    }
+
+    /// Merges a server history page through the real merge path, so the
+    /// journal carries whatever batch that produces.
+    pub(crate) fn merge_page(&mut self, ids: &[u64]) {
+        let page = ids
+            .iter()
+            .map(|id| {
+                AuthenticatedChat::from(ChatMessage {
+                    message_id: MessageId(*id),
+                    room_id: self.room_id,
+                    sender: UserId(*id),
+                    sender_name: "alice".to_string(),
+                    timestamp_ms: id * 1_000,
+                    body: format!("paged {id}"),
+                    file_transfer_id: None,
+                    flags: rpc::control::MessageFlags::default(),
+                    target: None,
+                })
+            })
+            .collect();
+        self.history.merge_history_page(page, usize::MAX);
+    }
+
+    pub(crate) fn revision(&self) -> Revision {
+        self.history.revision
     }
 
     /// Drops the oldest `count` messages the way retention does.
@@ -1981,8 +2049,7 @@ fn record_room_file(
     if let Some(record) = room.messages.file_record_mut(&key) {
         let message_id = record.message.message_id;
         record.file = Some(detail);
-        record.touch();
-        room.record_change();
+        room.record(HistoryDelta::Replaced(message_id));
         Some(message_id)
     } else {
         room.pending_files.insert(key, detail);
@@ -2549,8 +2616,10 @@ impl RoomSession {
                 .map(|meta| meta.name.clone())
                 .unwrap_or_default();
         }
+        // Local marks are derived from `local_user` for every resident record
+        // at once, so there is no id to name: every consumer relabels wholesale.
         for room in self.rooms.histories_mut() {
-            room.record_change();
+            room.record(HistoryDelta::Relabelled);
         }
         self.mark_viewed_read();
         self.rebuild_roster();
@@ -3482,7 +3551,9 @@ impl RoomSession {
         }
         self.e2e_verified_keys.insert(room_id, keys);
         if let Some(room) = self.rooms.room_mut(room_id) {
-            room.invalidate();
+            // Verification moves the unverified marks on existing records; no
+            // body or id changes.
+            room.record(HistoryDelta::Relabelled);
         }
     }
 
@@ -6515,6 +6586,7 @@ mod tests {
             Some(UserId(1)),
         );
 
+        let before = room.room_history_revision(RoomId(1)).unwrap();
         let update = room
             .chat_received(message(3, UserId(2), "third"), Some(UserId(1)))
             .unwrap();
@@ -6525,7 +6597,13 @@ mod tests {
         assert!(change.removed.is_empty());
         assert_eq!(change.upserted, Some(MessageId(3)));
         let history = room.history_ref(RoomId(1)).unwrap();
-        assert_eq!(history.evicted_through(), Some(MessageId(1)));
+        assert_eq!(
+            history.deltas_since(before).unwrap().collect::<Vec<_>>(),
+            vec![
+                &HistoryDelta::Appended(MessageId(3)),
+                &HistoryDelta::EvictedThrough(MessageId(1)),
+            ]
+        );
         let resident = history
             .latest_page(10)
             .messages
@@ -6649,7 +6727,7 @@ mod tests {
             vec![file_message(10, UserId(2), "landed.png", FileTransferId(7))],
             Some(UserId(1)),
         );
-        let before = room.shared(1).record_by_key(10).unwrap().content_revision;
+        let before = room.room_history_revision(RoomId(1)).unwrap();
 
         room.file_received(
             RoomId(1),
@@ -6660,8 +6738,15 @@ mod tests {
             None,
         );
 
+        assert_eq!(
+            room.history_ref(RoomId(1))
+                .unwrap()
+                .deltas_since(before)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![&HistoryDelta::Replaced(MessageId(10))]
+        );
         let record = room.shared(1).record_by_key(10).unwrap();
-        assert!(record.content_revision > before);
         assert_eq!(record.file.as_ref().unwrap().file_name, "landed.png");
     }
 

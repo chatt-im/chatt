@@ -3,7 +3,7 @@ use std::ops::Range;
 use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::{
-    app::room::RoomHistoryRef,
+    app::room::{HistoryDelta, Revision, RoomHistoryRef},
     chat_buffer::{ChatViewport, HistoryEntryId},
 };
 
@@ -27,7 +27,6 @@ struct SearchIndex {
     /// dropped and reset whenever the buffer is physically compacted.
     base: usize,
     entries: Vec<SearchEntry>,
-    tail: Option<rpc::ids::MessageId>,
 }
 
 impl SearchIndex {
@@ -41,20 +40,44 @@ impl SearchIndex {
         for id in ids {
             index.append_entry(history, id);
         }
-        index.tail = history.tail_message_id();
         index
     }
 
-    fn append_tail(&mut self, history: &RoomHistoryRef<'_>) -> bool {
-        let Some(ids) = history.tail_entry_ids(self.tail) else {
-            return false;
-        };
-        self.entries.reserve(ids.size_hint().1.unwrap_or(0));
-        for id in ids {
+    /// Applies the canonical changes since `applied`, when every one of them
+    /// leaves the already-normalized bytes of surviving entries valid.
+    ///
+    /// Only a tail append and a front eviction qualify: the index is one flat
+    /// byte buffer addressed by per-entry offsets, so anything that rewrites a
+    /// body or moves an interior entry invalidates those offsets. `None` asks
+    /// the caller to rebuild.
+    fn extend(&mut self, history: &RoomHistoryRef<'_>, applied: Revision) -> Option<()> {
+        let deltas = history.deltas_since(applied)?;
+        let mut evicted: Option<rpc::ids::MessageId> = None;
+        let mut appended = Vec::new();
+        for delta in deltas {
+            match *delta {
+                HistoryDelta::Appended(message_id) => {
+                    appended.push(HistoryEntryId::Message(message_id));
+                }
+                HistoryDelta::NoticeAdded(key) => appended.push(HistoryEntryId::Notice(key)),
+                HistoryDelta::EvictedThrough(watermark) => {
+                    evicted = Some(evicted.map_or(watermark, |seen| seen.max(watermark)));
+                }
+                // Marks live in the heading; the indexed bodies are untouched.
+                HistoryDelta::Relabelled => {}
+                _ => return None,
+            }
+        }
+        // Retention only ever reaches a prefix, so the watermark is below
+        // everything appended in the same batch and the order is immaterial.
+        if let Some(watermark) = evicted {
+            self.drop_front(watermark);
+        }
+        self.entries.reserve(appended.len());
+        for id in appended {
             self.append_entry(history, id);
         }
-        self.tail = history.tail_message_id();
-        true
+        Some(())
     }
 
     /// Drops the leading entries retention has evicted.
@@ -243,10 +266,7 @@ pub(crate) struct HistorySearch {
 struct IndexIdentity {
     room_id: Option<rpc::ids::RoomId>,
     generation: u64,
-    content_revision: u64,
-    order_revision: u64,
-    reindex_revision: u64,
-    evicted_through: Option<rpc::ids::MessageId>,
+    revision: Revision,
     clear_generation: u64,
 }
 
@@ -255,23 +275,18 @@ impl IndexIdentity {
         Self {
             room_id: history.room_id(),
             generation: history.generation(),
-            content_revision: history.content_revision(),
-            order_revision: history.order_revision(),
-            reindex_revision: history.reindex_revision(),
-            evicted_through: history.evicted_through(),
+            revision: history.revision(),
             clear_generation: chat.clear_generation(),
         }
     }
 
-    /// Whether the already-normalized bytes of existing entries stay valid, so
-    /// the index only has to lose an evicted prefix and gain a tail. Any body
-    /// changing in place invalidates them, as does a reindex, a `/clear`, or a
-    /// different room.
-    fn extends(&self, next: &Self) -> bool {
+    /// Whether the two identities describe the same indexed id space, so the
+    /// difference between them is describable by canonical deltas alone. A
+    /// different room, generation or `/clear` changes which ids the view shows
+    /// at all, which no delta reports.
+    fn same_space(&self, next: &Self) -> bool {
         self.room_id == next.room_id
             && self.generation == next.generation
-            && self.content_revision == next.content_revision
-            && self.reindex_revision == next.reindex_revision
             && self.clear_generation == next.clear_generation
     }
 }
@@ -343,13 +358,12 @@ impl HistorySearch {
             return;
         }
         let nearest = self.selected_entry().or(self.anchor);
-        let extends = self.identity.is_some_and(|current| current.extends(&next));
-        if extends {
-            if let Some(watermark) = next.evicted_through {
-                self.index.drop_front(watermark);
-            }
-        }
-        if !extends || !self.index.append_tail(history) {
+        let extended = self
+            .identity
+            .filter(|current| current.same_space(&next))
+            .and_then(|current| self.index.extend(history, current.revision))
+            .is_some();
+        if !extended {
             self.index = SearchIndex::build(chat, history);
             #[cfg(test)]
             {
