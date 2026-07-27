@@ -30,11 +30,10 @@ use crate::config::{FIRST_DYNAMIC_USER_ID, UserConfig, valid_username};
 
 const USERNAMES_LOG_FILE: &str = "usernames.log.bin";
 
-/// Case-insensitive fold used for the uniqueness comparison. The original
-/// casing is preserved in [`UsernameRegistry::by_user`]; only the lookup key is
-/// folded.
+/// Fold used for the uniqueness comparison. The original casing is preserved in
+/// [`UsernameRegistry::by_user`]; only the lookup key is folded.
 fn fold(name: &str) -> String {
-    name.trim().to_lowercase()
+    rpc::username::fold(name)
 }
 
 /// In-memory username -> owner index, backed on disk (for dynamic users only)
@@ -119,7 +118,7 @@ impl UsernameRegistry {
     }
 
     pub(crate) fn needs_dynamic_claim(&self, user_id: UserId, name: &str) -> bool {
-        self.by_user.get(&user_id).map(String::as_str) != Some(name.trim())
+        self.by_user.get(&user_id).map(String::as_str) != Some(rpc::username::trim(name))
     }
 
     /// Whether `name` is free, or already owned by `claimant`.
@@ -140,10 +139,10 @@ impl UsernameRegistry {
         if user_id.0 < FIRST_DYNAMIC_USER_ID {
             return Err(format!("user {user_id} is not a dynamic user"));
         }
-        if !valid_username(name) {
-            return Err("username must be 1-64 bytes with no control characters".to_string());
+        if let Err(error) = rpc::username::validate(name) {
+            return Err(error.to_string());
         }
-        let name = name.trim();
+        let name = rpc::username::trim(name);
         if !self.is_available(name, Some(user_id)) {
             return Err(format!("username '{name}' is already in use"));
         }
@@ -166,10 +165,10 @@ impl UsernameRegistry {
         if user_id.0 < FIRST_DYNAMIC_USER_ID {
             return Err(format!("user {user_id} is not a dynamic user"));
         }
-        if !valid_username(name) {
-            return Err("username must be 1-64 bytes with no control characters".to_string());
+        if let Err(error) = rpc::username::validate(name) {
+            return Err(error.to_string());
         }
-        let name = name.trim();
+        let name = rpc::username::trim(name);
         if !self.is_available(name, Some(user_id)) {
             return Err(format!("username '{name}' is already in use"));
         }

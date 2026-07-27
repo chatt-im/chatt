@@ -1415,6 +1415,14 @@ impl MlsService {
         })
     }
 
+    /// Returns the account that owns `device_id`, active or revoked.
+    ///
+    /// Device ids are reserved globally and never reassigned, so this answers
+    /// for revoked devices too.
+    pub fn device_owner(&self, device_id: DeviceId) -> Option<UserId> {
+        self.device_owners.get(&device_id).copied()
+    }
+
     fn device_is_active(&self, device_id: DeviceId) -> bool {
         self.device_owners
             .get(&device_id)

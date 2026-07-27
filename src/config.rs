@@ -2423,15 +2423,7 @@ pub fn validate_server_label(label: &str) -> Result<(), String> {
 }
 
 pub fn validate_username(username: &str) -> Result<(), String> {
-    let username = username.trim();
-    validate_non_empty(username, "username")?;
-    if username.len() > 64 {
-        return Err("username exceeds 64 bytes".to_string());
-    }
-    if username.chars().any(char::is_control) {
-        return Err("username must not contain control characters".to_string());
-    }
-    Ok(())
+    rpc::username::validate(username).map_err(|error| error.to_string())
 }
 
 pub fn validate_server_entry(server: &ServerEntry) -> Result<(), String> {
