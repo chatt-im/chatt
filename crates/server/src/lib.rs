@@ -3,6 +3,7 @@ use std::{
     collections::VecDeque,
     io,
     net::{IpAddr, SocketAddr},
+    process::ExitCode,
     sync::mpsc,
     sync::{Arc, OnceLock},
     thread,
@@ -443,25 +444,44 @@ impl LoopWork {
 /// Runs the server command-line entry point: parses `std::env::args`, handles
 /// the `invite` / `init-config` / `serve` subcommands, and drives the event
 /// loop for `serve`.
-pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_cli() -> ExitCode {
     let args = std::env::args().collect::<Vec<_>>();
-    let parsed = cli::parse(&args)
-        .map_err(|error| invalid_config(format!("{error}\n\n{}", cli::usage())))?;
-    if matches!(&parsed.command, cli::Command::Help) {
+    let parsed = cli::parse(&args);
+    if matches!(
+        parsed.as_ref().map(|parsed| &parsed.command),
+        Ok(cli::Command::Help)
+    ) {
         print!("{}", cli::usage());
-        return Ok(());
+        return ExitCode::SUCCESS;
     }
     // `--logfile PATH` (or CHATT_LOGFILE) writes the same kvlog stream the
     // client `--logfile` produces, so server and client traces can be analyzed
     // together. Without it, logging stays on the env-configured collector.
     let logfile = parsed
-        .logfile
+        .as_ref()
+        .ok()
+        .and_then(|parsed| parsed.logfile.clone())
         .or_else(|| std::env::var("CHATT_LOGFILE").ok());
-    let _logger = match logfile {
+    let logger = match logfile {
         Some(logfile) => kvlog::collector::init_file_logger(&logfile),
         None => kvlog::spawn_collector_from_env(Some("chatt-server"), false),
     };
 
+    let result = match parsed {
+        Ok(parsed) => run_cli_command(parsed),
+        Err(error) => Err(invalid_config(format!("{error}\n\n{}", cli::usage())).into()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            kvlog::error!("server exited with error", error = %error);
+            logger.flush();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_cli_command(parsed: cli::ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
     let config = match parsed.command {
         cli::Command::Help => unreachable!("help returned before logger initialization"),
         cli::Command::Invite(user) => {
