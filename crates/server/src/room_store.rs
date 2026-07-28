@@ -2385,6 +2385,44 @@ mod tests {
     }
 
     #[test]
+    fn terminal_state_writer_closes_before_publishing_failure() {
+        let dir = temp_dir("terminal-state-writer-order");
+        let poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1)).unwrap());
+        let notifier = Arc::new(EventNotifier::new(waker));
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
+        store.enable_async_state_writes(notifier);
+        let pause = {
+            let writer = store.state_writer.as_ref().expect("persistent store");
+            let pause = writer.pause_after_failed_completion();
+            writer.fail_next_write();
+            pause
+        };
+
+        let OpenDmResult::Pending { .. } =
+            store.begin_open_dm(UserId(1), UserId(2), 1_000).unwrap()
+        else {
+            panic!("first async DM unexpectedly already existed");
+        };
+        pause.wait_until_published();
+        let error = match store.drain_dm_completions() {
+            Ok(_) => panic!("terminal state failure was not surfaced"),
+            Err(error) => error,
+        };
+        assert!(error.contains("forced room-state write failure"));
+
+        // The writer remains paused after publishing the completion. If it
+        // closed submissions afterward, this retry would deterministically
+        // enter the old race window and succeed.
+        let retry = store.begin_open_dm(UserId(1), UserId(2), 2_000);
+        pause.resume();
+        assert!(
+            retry.is_err(),
+            "state writer accepted another DM after publishing a terminal failure"
+        );
+    }
+
+    #[test]
     fn dm_rooms_allocate_distinct_ids() {
         let dir = temp_dir("dm-distinct");
         let mut store = RoomStore::open(Some(dir.to_path_buf()), &[durable_room(1)]);

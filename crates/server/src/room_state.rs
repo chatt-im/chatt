@@ -305,6 +305,8 @@ pub(super) struct StateWriter {
     thread: Option<thread::JoinHandle<()>>,
     #[cfg(test)]
     fail_next_write: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    failure_completion_pause: Arc<Mutex<Option<FailureCompletionPauseWorker>>>,
 }
 
 impl StateWriter {
@@ -317,6 +319,11 @@ impl StateWriter {
         let fail_next_write = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(test)]
         let worker_fail_next_write = Arc::clone(&fail_next_write);
+        #[cfg(test)]
+        let failure_completion_pause: Arc<Mutex<Option<FailureCompletionPauseWorker>>> =
+            Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let worker_failure_completion_pause = Arc::clone(&failure_completion_pause);
         let thread = thread::Builder::new()
             .name("chatt-room-state-writer".to_string())
             .spawn(move || {
@@ -349,12 +356,25 @@ impl StateWriter {
                         Err(PersistError::Conflict(error)) => Err(error),
                     };
                     let terminal_error = result.as_ref().err().cloned();
-                    if let Some(error) = &terminal_error {
-                        kvlog::error!(
-                            "room state writer failed; server must stop before allocating more ids",
-                            error = error.as_str()
-                        );
-                    }
+                    let (terminated_waiters, fatal_events) =
+                        if let Some(error) = &terminal_error {
+                            // Close submissions before publishing any failed
+                            // completion. Publishing wakes the event loop,
+                            // which may immediately enqueue another write.
+                            let waiters = worker_submission.terminate();
+                            let events = {
+                                let mut notifications = worker_notifications.lock().unwrap();
+                                notifications.terminal_error = Some(error.clone());
+                                notifications.events.clone()
+                            };
+                            kvlog::error!(
+                                "room state writer failed; server must stop before allocating more ids",
+                                error = error.as_str()
+                            );
+                            (waiters, events)
+                        } else {
+                            (Vec::new(), None)
+                        };
                     for waiter in write.waiters {
                         match waiter {
                             StateWriteWaiter::Sync(reply) => {
@@ -369,15 +389,17 @@ impl StateWriter {
                             }),
                         }
                     }
+                    #[cfg(test)]
+                    if terminal_error.is_some() {
+                        let pause = worker_failure_completion_pause.lock().unwrap().take();
+                        if let Some(pause) = pause {
+                            pause.wait();
+                        }
+                    }
                     let Some(error) = terminal_error else {
                         continue;
                     };
-                    let fatal_events = {
-                        let mut notifications = worker_notifications.lock().unwrap();
-                        notifications.terminal_error = Some(error.clone());
-                        notifications.events.clone()
-                    };
-                    for waiter in worker_submission.terminate() {
+                    for waiter in terminated_waiters {
                         match waiter {
                             StateWriteWaiter::Sync(reply) => {
                                 let _ = reply.send(Err(error.clone()));
@@ -404,6 +426,8 @@ impl StateWriter {
             thread: Some(thread),
             #[cfg(test)]
             fail_next_write,
+            #[cfg(test)]
+            failure_completion_pause,
         })
     }
 
@@ -456,6 +480,75 @@ impl StateWriter {
     pub(super) fn fail_next_write(&self) {
         self.fail_next_write
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_after_failed_completion(&self) -> FailureCompletionPause {
+        let (published, published_rx) = mpsc::sync_channel(1);
+        let (resume, resume_rx) = mpsc::sync_channel(1);
+        let previous =
+            self.failure_completion_pause
+                .lock()
+                .unwrap()
+                .replace(FailureCompletionPauseWorker {
+                    published,
+                    resume: resume_rx,
+                });
+        assert!(previous.is_none(), "failure completion pause already armed");
+        FailureCompletionPause {
+            published: published_rx,
+            resume: Some(resume),
+        }
+    }
+}
+
+#[cfg(test)]
+struct FailureCompletionPauseWorker {
+    published: mpsc::SyncSender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl FailureCompletionPauseWorker {
+    fn wait(self) {
+        self.published
+            .send(())
+            .expect("failure completion observer dropped");
+        self.resume
+            .recv()
+            .expect("failure completion observer dropped");
+    }
+}
+
+#[cfg(test)]
+pub(super) struct FailureCompletionPause {
+    published: mpsc::Receiver<()>,
+    resume: Option<mpsc::SyncSender<()>>,
+}
+
+#[cfg(test)]
+impl FailureCompletionPause {
+    pub(super) fn wait_until_published(&self) {
+        self.published
+            .recv()
+            .expect("state writer stopped before publishing failure");
+    }
+
+    pub(super) fn resume(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if let Some(resume) = self.resume.take() {
+            let _ = resume.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailureCompletionPause {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
