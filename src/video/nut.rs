@@ -249,7 +249,7 @@ impl NutDemuxer {
         }
         let startcode = cursor.u64_be()?;
         let forward_ptr = cursor.varlen()?;
-        if forward_ptr < 4 || forward_ptr > MAX_PACKET_BYTES {
+        if !(4..=MAX_PACKET_BYTES).contains(&forward_ptr) {
             return malformed("packet forward pointer out of range");
         }
         if forward_ptr > 4096 {
@@ -739,7 +739,7 @@ mod tests {
             &test_main_header(),
             &test_stream_header(b"H264", &extradata()),
             &test_syncpoint(0),
-            &test_frame(FLAG_KEY, 0 + (1 << 7), IDR),
+            &test_frame(FLAG_KEY, 1 << 7, IDR),
             &test_frame(0, 33 + (1 << 7), SLICE),
         ]
         .concat()

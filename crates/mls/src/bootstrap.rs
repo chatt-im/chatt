@@ -41,7 +41,7 @@ pub enum BootstrapState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootstrapLoad {
     Missing,
-    Loaded(E2eBootstrap),
+    Loaded(Box<E2eBootstrap>),
     Unreadable(String),
 }
 
@@ -114,7 +114,7 @@ pub fn load_bootstrap(path: &Path) -> BootstrapLoad {
     }
     match jsony::from_binary::<E2eBootstrap>(&bytes) {
         Ok(bootstrap) => match bootstrap.validate() {
-            Ok(()) => BootstrapLoad::Loaded(bootstrap),
+            Ok(()) => BootstrapLoad::Loaded(Box::new(bootstrap)),
             Err(error) => BootstrapLoad::Unreadable(error),
         },
         Err(error) => BootstrapLoad::Unreadable(error.to_string()),
@@ -130,7 +130,7 @@ pub fn classify_installation(
     let bootstrap = match loaded {
         BootstrapLoad::Missing => return InstallationState::Missing,
         BootstrapLoad::Unreadable(error) => return InstallationState::Unreadable(error),
-        BootstrapLoad::Loaded(bootstrap) => bootstrap,
+        BootstrapLoad::Loaded(bootstrap) => *bootstrap,
     };
     if &bootstrap.server_public_key != server_public_key || bootstrap.user_id != user_id {
         return InstallationState::BrokenInstallation {

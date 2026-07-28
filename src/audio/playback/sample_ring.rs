@@ -302,7 +302,7 @@ mod tests {
         let span = ring.readable_span();
         assert_eq!(span.len(), 2);
         assert!(span.get(2).is_none());
-        assert!(span.is_empty() == false);
+        assert!(!span.is_empty());
     }
 
     #[test]

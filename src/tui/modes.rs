@@ -3851,7 +3851,7 @@ mod tests {
             push_room_message(
                 &mut app,
                 index + 1,
-                UserId(index as u64 + 1),
+                UserId(index + 1),
                 index * 120_000,
                 format!("message {index}"),
             );
@@ -3979,7 +3979,7 @@ mod tests {
             push_room_message(
                 &mut app,
                 index + 1,
-                UserId(index as u64 + 1),
+                UserId(index + 1),
                 index * 120_000,
                 format!("message {index}"),
             );

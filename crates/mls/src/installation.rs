@@ -80,7 +80,7 @@ impl LocalInstallation {
                         "MLS bootstrap belongs to a different server or account".to_string()
                     );
                 }
-                (bootstrap, false, None)
+                (*bootstrap, false, None)
             }
             BootstrapLoad::Unreadable(error) => {
                 return Err(format!("MLS bootstrap is unreadable: {error}"));

@@ -567,12 +567,10 @@ impl MlsService {
             .get(&device_id)
             .cloned();
         let new_last_resort = new_packages.iter().find(|(_, _, last_resort)| *last_resort);
-        let replace_last_resort = match (&current_last_resort, new_last_resort) {
-            (Some(current), Some((_, new_reference, _))) if &current.reference != new_reference => {
-                true
-            }
-            _ => false,
-        };
+        let replace_last_resort = matches!(
+            (&current_last_resort, new_last_resort),
+            (Some(current), Some((_, new_reference, _))) if &current.reference != new_reference
+        );
         let current_len = self.key_packages.get(&device_id).map_or(0, VecDeque::len);
         let replaced = usize::from(replace_last_resort);
         if current_len - replaced + new_packages.len() > MAX_KEY_PACKAGES_PER_DEVICE {
@@ -1084,6 +1082,9 @@ impl MlsService {
         Ok(outcome)
     }
 
+    // The target filter is two distinct membership exclusions; keeping them
+    // as a conjunction mirrors the protocol rule.
+    #[allow(clippy::nonminimal_bool)]
     fn validate_welcome_targets(
         identities: &ChattIdentityProvider,
         current: &PublicGroupState,

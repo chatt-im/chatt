@@ -164,17 +164,20 @@ fn run_playback_wav_writer(
     let mut reader = unsafe { RingReader::new(Arc::clone(&inner.ring)) };
 
     loop {
-        let span = reader.readable_span();
-        let len = span.len();
+        let len = {
+            let span = reader.readable_span();
+            let len = span.len();
+            if len > 0 {
+                let (first, second) = span.slices();
+                writer.write_samples(first)?;
+                writer.write_samples(second)?;
+            }
+            len
+        };
         if len > 0 {
-            let (first, second) = span.slices();
-            writer.write_samples(first)?;
-            writer.write_samples(second)?;
-            drop(span);
             reader.advance(len);
             continue;
         }
-        drop(span);
 
         if inner.shutdown.load(Ordering::Acquire) {
             break;

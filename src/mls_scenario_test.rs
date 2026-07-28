@@ -2995,6 +2995,9 @@ fn mls_live_stateful_scenario_regression_corpus() {
 #[ignore = "stateful live MLS exploration; configure CHATT_MLS_SCENARIO_DURATION"]
 fn mls_live_stateful_scenario_campaign() {
     let config = CampaignConfig::from_env().expect("valid MLS scenario campaign configuration");
+    // The non-instrumented stub returns unit; the instrumented build keeps
+    // this guard alive for the whole campaign.
+    #[allow(clippy::let_unit_value)]
     let _logger = init_scenario_logging(&config.log_path);
     run_campaign(config).unwrap_or_else(|error| panic!("{error}"));
 }

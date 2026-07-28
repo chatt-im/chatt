@@ -11,7 +11,7 @@
 //! backend to exercise the classification rules without a real clipboard.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -211,7 +211,7 @@ fn classify(backend: &dyn ClipboardBackend) -> Result<PastePayload, ClipboardPas
 }
 
 /// Whether a path's file name classifies as an image by extension.
-fn path_is_image(path: &PathBuf) -> bool {
+fn path_is_image(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -219,7 +219,7 @@ fn path_is_image(path: &PathBuf) -> bool {
 }
 
 /// The file name of `path`, or `fallback` when it has none.
-fn file_name_or(path: &PathBuf, fallback: &str) -> String {
+fn file_name_or(path: &Path, fallback: &str) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(fallback)
@@ -227,7 +227,7 @@ fn file_name_or(path: &PathBuf, fallback: &str) -> String {
 }
 
 /// Reads the header of an on-disk image to recover its dimensions.
-fn image_dimensions_of_path(path: &PathBuf) -> Option<(u32, u32)> {
+fn image_dimensions_of_path(path: &Path) -> Option<(u32, u32)> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path).ok()?;

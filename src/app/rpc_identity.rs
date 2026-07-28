@@ -358,7 +358,10 @@ impl App {
             return None;
         }
         let document = self.rpc_identity_document(owner)?;
-        Some((generation, wire::IdentityEvent::Document(document)))
+        Some((
+            generation,
+            wire::IdentityEvent::Document(Box::new(document)),
+        ))
     }
 
     fn rpc_identity_document(&self, owner: ClientId) -> Option<wire::IdentityDocument> {

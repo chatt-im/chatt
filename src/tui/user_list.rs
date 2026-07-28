@@ -398,7 +398,7 @@ impl AppMode for UserListMode {
             return;
         }
         let lines = self.display_lines();
-        let width = area.w.min(60).max(24);
+        let width = area.w.clamp(24, 60);
         let body_rows = lines
             .len()
             .max(1)

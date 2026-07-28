@@ -1215,10 +1215,10 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("invalid MLS application message length".to_string());
             }
         }
-        ClientControl::FetchMlsEvents { limit, .. } => {
-            if *limit == 0 || usize::from(*limit) > crate::mls::MAX_MLS_EVENT_BATCH {
-                return Err("invalid MLS event fetch limit".to_string());
-            }
+        ClientControl::FetchMlsEvents { limit, .. }
+            if *limit == 0 || usize::from(*limit) > crate::mls::MAX_MLS_EVENT_BATCH =>
+        {
+            return Err("invalid MLS event fetch limit".to_string());
         }
         _ => {}
     }

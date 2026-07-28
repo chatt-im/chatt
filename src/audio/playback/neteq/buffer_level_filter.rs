@@ -31,7 +31,7 @@ impl BufferLevelFilter {
     /// IIR update with the current buffer span, subtracting time-stretched
     /// samples (which bypass the filter). Port of `BufferLevelFilter::Update`.
     pub(crate) fn update(&mut self, buffer_size_samples: usize, time_stretched_samples: i32) {
-        let filtered = (self.level_factor * self.filtered_current_level >> 8)
+        let filtered = ((self.level_factor * self.filtered_current_level) >> 8)
             + (256 - self.level_factor) * buffer_size_samples as i64;
         self.filtered_current_level =
             (filtered - (time_stretched_samples as i64) * (1 << 8)).max(0);

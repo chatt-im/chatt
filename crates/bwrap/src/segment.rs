@@ -228,7 +228,7 @@ mod tests {
     use super::*;
     use std::{vec, vec::Vec};
 
-    fn slices<'a>(text: &'a str, ranges: impl Iterator<Item = Range<usize>>) -> Vec<&'a str> {
+    fn slices(text: &str, ranges: impl Iterator<Item = Range<usize>>) -> Vec<&str> {
         ranges.map(|range| &text[range]).collect()
     }
 

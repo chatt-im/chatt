@@ -1334,7 +1334,7 @@ fn room_user_control_label(app: &RenderState<'_>, participant: &ParticipantState
     let muted = app.room.muted_user(participant.user_id);
     let volume_db = app
         .room
-        .effective_user_volume_db(&app.config, participant.user_id);
+        .effective_user_volume_db(app.config, participant.user_id);
     match (muted, volume_db == 0.0) {
         (false, true) => String::new(),
         (false, false) => volume_db_label(volume_db),
@@ -2771,7 +2771,7 @@ fn build_key_preview_entries(
             toggle,
         });
     }
-    out.sort_by(|left, right| key_preview_entry_cmp(left, right));
+    out.sort_by(key_preview_entry_cmp);
 }
 
 fn key_preview_entry_cmp(left: &KeyPreviewEntry, right: &KeyPreviewEntry) -> CmpOrdering {

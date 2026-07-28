@@ -244,16 +244,10 @@ pub fn validate_device_roster(
             return Err("device roster is not uniquely sorted by device id".to_string());
         }
         previous = Some(certificate.body.device_id);
-        if client_ids
-            .iter()
-            .any(|known| *known == certificate.body.mls_client_id.as_slice())
-        {
+        if client_ids.contains(&certificate.body.mls_client_id.as_slice()) {
             return Err("device roster contains a duplicate MLS client id".to_string());
         }
-        if signature_keys
-            .iter()
-            .any(|known| *known == certificate.body.mls_signature_public_key.as_slice())
-        {
+        if signature_keys.contains(&certificate.body.mls_signature_public_key.as_slice()) {
             return Err("device roster contains a duplicate MLS signature key".to_string());
         }
         client_ids.push(&certificate.body.mls_client_id);

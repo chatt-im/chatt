@@ -226,10 +226,10 @@ impl RpcQueueBudget {
         if state.closed {
             return Err("RPC client writer stopped".into());
         }
-        if !state
+        if state
             .bytes
             .checked_add(bytes)
-            .is_some_and(|next| next <= limit)
+            .is_none_or(|next| next > limit)
         {
             return Err("RPC client outbound queue is full".into());
         }
@@ -501,7 +501,7 @@ fn run_app_inner(
         app.release_core_state();
     } else {
         let initial_mode = if show_welcome {
-            InitialMode::Welcome(WelcomeMode::new(&app, pending_join))
+            InitialMode::Welcome(Box::new(WelcomeMode::new(&app, pending_join)))
         } else if app.network.is_some() || !app.room.server_alias.is_empty() {
             InitialMode::Room
         } else {
@@ -1192,7 +1192,7 @@ fn project_rpc_history_change(
                 room.room_id == change.room_id && room.room_generation == change.room_generation
             })
     };
-    if !clients.values().any(|client| selects_changed_room(client)) {
+    if !clients.values().any(&selects_changed_room) {
         return;
     }
     let (deltas, cursor) = if change.refresh_window {
@@ -1513,12 +1513,11 @@ fn handle_rpc_command(
         } => {
             let result = app.handle_rpc_settings(id, request_id, command);
             if let Some(client) = clients.get_mut(&id) {
-                match &result.payload {
-                    local_rpc::settings::SettingsResultPayload::Document(document) => {
-                        client.settings_device_generation = app.rpc_settings_device_generation();
-                        client.last_settings_audio_runtime = Some(document.audio_runtime.clone());
-                    }
-                    _ => {}
+                if let local_rpc::settings::SettingsResultPayload::Document(document) =
+                    &result.payload
+                {
+                    client.settings_device_generation = app.rpc_settings_device_generation();
+                    client.last_settings_audio_runtime = Some(document.audio_runtime.clone());
                 }
                 client
                     .sender
@@ -2365,31 +2364,33 @@ fn handle_rpc_effect(
                     code: 429,
                     message: "too many active uploads".into(),
                 }
-            } else if uploads.contains_key(&upload.transfer_id) {
-                local_rpc::frame::RequestOutcome::Rejected {
-                    code: 409,
-                    message: "upload transfer id is already active".into(),
-                }
             } else {
-                match tempfile::Builder::new()
-                    .prefix("chatt-rpc-upload-")
-                    .tempfile()
-                {
-                    Ok(file) => {
-                        uploads.insert(
-                            upload.transfer_id,
-                            RpcUpload {
-                                upload,
-                                file,
-                                offset: 0,
-                            },
-                        );
-                        local_rpc::frame::RequestOutcome::Accepted
+                match uploads.entry(upload.transfer_id) {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        local_rpc::frame::RequestOutcome::Rejected {
+                            code: 409,
+                            message: "upload transfer id is already active".into(),
+                        }
                     }
-                    Err(error) => local_rpc::frame::RequestOutcome::Rejected {
-                        code: 500,
-                        message: format!("cannot create upload staging file: {error}"),
-                    },
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        match tempfile::Builder::new()
+                            .prefix("chatt-rpc-upload-")
+                            .tempfile()
+                        {
+                            Ok(file) => {
+                                entry.insert(RpcUpload {
+                                    upload,
+                                    file,
+                                    offset: 0,
+                                });
+                                local_rpc::frame::RequestOutcome::Accepted
+                            }
+                            Err(error) => local_rpc::frame::RequestOutcome::Rejected {
+                                code: 500,
+                                message: format!("cannot create upload staging file: {error}"),
+                            },
+                        }
+                    }
                 }
             };
             drop(uploads);

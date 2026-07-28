@@ -54,6 +54,10 @@ impl BindAddrs {
         self.0.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn iter(&self) -> impl ExactSizeIterator<Item = SocketAddr> + '_ {
         self.0.iter().copied()
     }
@@ -985,7 +989,7 @@ default = true
 
 impl SecurityConfig {
     pub fn max_file_size_bytes(&self) -> u64 {
-        self.max_file_size_mb.checked_mul(MIB).unwrap_or(u64::MAX)
+        self.max_file_size_mb.saturating_mul(MIB)
     }
 }
 

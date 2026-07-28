@@ -691,7 +691,7 @@ impl RecoveryState {
     }
 
     fn take_due(&mut self, now: Instant) -> Option<String> {
-        if self.exhausted || !self.next_retry_at.is_some_and(|deadline| now >= deadline) {
+        if self.exhausted || self.next_retry_at.is_none_or(|deadline| now < deadline) {
             return None;
         }
         self.next_retry_at = None;
@@ -1227,6 +1227,9 @@ pub(crate) struct PairingEventSender {
 }
 
 impl EventSender {
+    // Preserve `SendError<AppEvent>` so a caller can recover the unsent event;
+    // boxing would allocate only to wrap the channel's native error.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn send<E: Into<AppEvent>>(
         &self,
         event: E,
@@ -1258,6 +1261,8 @@ impl NetworkEventSender {
         }
     }
 
+    // Preserve the channel's native error and its recoverable unsent event.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn send(&self, event: NetworkEvent) -> Result<(), mpsc::SendError<AppEvent>> {
         match self.generation {
             Some(generation) => self.tx.send(AppEvent::NetworkFor { generation, event }),
@@ -1272,6 +1277,8 @@ impl PairingEventSender {
         Self { tx, attempt }
     }
 
+    // Preserve the channel's native error and its recoverable unsent event.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn send(&self, event: PairingEvent) -> Result<(), mpsc::SendError<AppEvent>> {
         self.tx.send(AppEvent::Pairing {
             attempt: self.attempt,
@@ -4269,7 +4276,7 @@ impl App {
                     (raw_message_id & (1 << 63) != 0).then_some(raw_message_id & !(1 << 63));
                 (|| {
                     let message = &record.message;
-                    if message.target.is_some() {
+                    if let Some(target) = message.target {
                         let update = self
                             .room
                             .authenticated_mutation_received(&record, self.user_id);
@@ -4283,7 +4290,6 @@ impl App {
                         if update.read_advanced {
                             self.mark_room_catalog_dirty();
                         }
-                        let target = message.target.expect("mutation record");
                         if update
                             .change
                             .as_ref()
@@ -5168,10 +5174,10 @@ impl App {
     }
 
     pub(crate) fn accept_transport_encryption_warning(&mut self, label: &str, generation: u64) {
-        if !self
+        if self
             .connection_attempt
             .as_ref()
-            .is_some_and(|attempt| attempt.server_label == label)
+            .is_none_or(|attempt| attempt.server_label != label)
         {
             return;
         }

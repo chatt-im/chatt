@@ -523,11 +523,11 @@ impl Default for FileConfig {
 
 impl FileConfig {
     pub fn download_memory_bytes(&self) -> u64 {
-        self.download_memory_mb.checked_mul(MIB).unwrap_or(u64::MAX)
+        self.download_memory_mb.saturating_mul(MIB)
     }
 
     pub fn max_upload_bytes(&self) -> u64 {
-        self.max_upload_mb.checked_mul(MIB).unwrap_or(u64::MAX)
+        self.max_upload_mb.saturating_mul(MIB)
     }
 }
 
@@ -1963,7 +1963,7 @@ impl Config {
             .unwrap_or(self.files.max_download_mb);
         EffectiveFiles {
             target,
-            max_download_bytes: max_download_mb.checked_mul(MIB).unwrap_or(u64::MAX),
+            max_download_bytes: max_download_mb.saturating_mul(MIB),
         }
     }
 

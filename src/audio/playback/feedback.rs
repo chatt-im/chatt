@@ -25,6 +25,7 @@ const SILENCE_GAP_HINT_MIN: Duration = Duration::from_millis(200);
 const SILENCE_GAP_MAX_SEQUENCE_DISTANCE: u32 = 10;
 
 /// Accumulates the receiver report over a feedback window.
+#[derive(Default)]
 pub(crate) struct LivePlaybackFeedbackState {
     window_started_at: Option<Instant>,
     /// Sequences accepted this window, for duplicate detection and loss counting.
@@ -46,27 +47,6 @@ pub(crate) struct LivePlaybackFeedbackState {
     max_interarrival_jitter_ms: u64,
     last_forward_arrival: Option<(u32, Instant)>,
     silence_hint_sequence: Option<u32>,
-}
-
-impl Default for LivePlaybackFeedbackState {
-    fn default() -> Self {
-        Self {
-            window_started_at: None,
-            received: HashSet::new(),
-            base_sequence: None,
-            next_window_sequence: None,
-            highest_arrived_sequence: None,
-            duplicate_packets: 0,
-            reordered_packets: 0,
-            max_output_ring_ms: 0,
-            max_neteq_target_ms: 0,
-            max_neteq_playout_delay_ms: 0,
-            max_neteq_packet_buffer_ms: 0,
-            max_interarrival_jitter_ms: 0,
-            last_forward_arrival: None,
-            silence_hint_sequence: None,
-        }
-    }
 }
 
 impl LivePlaybackFeedbackState {

@@ -100,6 +100,13 @@ impl VoicePayload {
             VoicePayload::Silence => 0,
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            VoicePayload::Opus(opus) => opus.is_empty(),
+            VoicePayload::Silence => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +120,13 @@ impl VoicePayloadRef<'_> {
         match self {
             VoicePayloadRef::Opus(opus) => opus.len(),
             VoicePayloadRef::Silence => 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            VoicePayloadRef::Opus(opus) => opus.is_empty(),
+            VoicePayloadRef::Silence => true,
         }
     }
 

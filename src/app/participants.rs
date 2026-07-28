@@ -324,9 +324,10 @@ impl Participants {
         if raw_active {
             entry.talking_display = true;
             entry.last_talking_at = Some(now);
-        } else if entry.last_talking_at.map_or(true, |last| {
-            now.saturating_duration_since(last) >= release_hold
-        }) {
+        } else if entry
+            .last_talking_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= release_hold)
+        {
             entry.talking_display = false;
         }
         entry.talking_display != was_talking
@@ -692,7 +693,6 @@ mod tests {
         );
 
         // Going away restarts the timer from roughly zero.
-        let mut info = info;
         info.user.online = false;
         participants.upsert(info);
         let away_age = participants.entries[0]

@@ -585,6 +585,13 @@ impl VoicePayload {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        match self {
+            VoicePayload::Opus(payload) => payload.is_empty(),
+            VoicePayload::Silence => true,
+        }
+    }
+
     pub fn is_silence(&self) -> bool {
         matches!(self, VoicePayload::Silence)
     }
@@ -602,6 +609,13 @@ impl VoicePayloadRef<'_> {
         match self {
             VoicePayloadRef::Opus(payload) => payload.len(),
             VoicePayloadRef::Silence => 0,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        match self {
+            VoicePayloadRef::Opus(payload) => payload.is_empty(),
+            VoicePayloadRef::Silence => true,
         }
     }
 }

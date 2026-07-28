@@ -74,9 +74,8 @@ impl Histogram {
         self.add_count += 1;
 
         // Ramp the forgetting factor toward its steady-state value.
-        if self.start_forget_weight.is_some() {
+        if let Some(weight) = self.start_forget_weight {
             if self.forget_factor != self.base_forget_factor {
-                let weight = self.start_forget_weight.unwrap();
                 let forget_factor =
                     ((1 << 15) as f64 * (1.0 - weight / (self.add_count as f64 + 1.0))) as i32;
                 self.forget_factor = forget_factor.clamp(0, self.base_forget_factor);

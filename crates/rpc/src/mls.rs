@@ -414,7 +414,7 @@ pub fn open_file_chunk(
     total_size: u64,
     digest: &[u8; 32],
     index: u64,
-    frame: &mut Vec<u8>,
+    frame: &mut [u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let key = KeyMaterial {
         id: 1,

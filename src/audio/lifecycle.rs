@@ -599,7 +599,7 @@ where
             build_input_stream(
                 &device,
                 selection.supported_config.sample_format(),
-                selection.stream_config.clone(),
+                selection.stream_config,
                 usize::from(selection.supported_config.channels()),
                 sender,
                 recycle_rx,
@@ -795,7 +795,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
             build_live_output_stream(
                 &device,
                 selection.supported_config.sample_format(),
-                selection.stream_config.clone(),
+                selection.stream_config,
                 usize::from(selection.supported_config.channels()),
                 mixer,
                 Arc::clone(&mixer_events),

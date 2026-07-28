@@ -1,10 +1,5 @@
 //! Safe, ergonomic wrappers around libopus for encoding/decoding Opus audio.
 #![warn(missing_docs)]
-#![warn(clippy::all)]
-#![warn(clippy::pedantic)]
-#![warn(clippy::cargo)]
-#![allow(clippy::cast_possible_wrap)]
-#![allow(clippy::cast_possible_truncation)]
 
 // Include the generated bindings
 #[allow(warnings)]

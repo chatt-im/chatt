@@ -280,37 +280,35 @@ fn device_pair_form(
     form.checkbox("Show secrets", show_secrets);
     form.description_with_error(feedback, feedback_error);
     form.spacer(1);
-    let activated = form
-        .actions(&[
-            ActionButton {
-                key: "cancel",
-                label: "Cancel",
-                value: DevicePairButton::Cancel,
-                help: "Cancel device pairing.",
+    form.actions(&[
+        ActionButton {
+            key: "cancel",
+            label: "Cancel",
+            value: DevicePairButton::Cancel,
+            help: "Cancel device pairing.",
+        },
+        ActionButton {
+            key: "pair",
+            label: if confirm_overwrite {
+                "Overwrite & pair"
+            } else {
+                "Pair"
             },
-            ActionButton {
-                key: "pair",
-                label: if confirm_overwrite {
-                    "Overwrite & pair"
-                } else {
-                    "Pair"
-                },
-                value: DevicePairButton::Pair,
-                help: if confirm_overwrite {
-                    "Replace the existing local identity, then redeem this one-time link."
-                } else {
-                    "Redeem this one-time link and create the device identity."
-                },
+            value: DevicePairButton::Pair,
+            help: if confirm_overwrite {
+                "Replace the existing local identity, then redeem this one-time link."
+            } else {
+                "Redeem this one-time link and create the device identity."
             },
-            ActionButton {
-                key: "close",
-                label: "Close",
-                value: DevicePairButton::Close,
-                help: "Hide this dialog without canceling a submitted pairing attempt.",
-            },
-        ])
-        .activated;
-    activated
+        },
+        ActionButton {
+            key: "close",
+            label: "Close",
+            value: DevicePairButton::Close,
+            help: "Hide this dialog without canceling a submitted pairing attempt.",
+        },
+    ])
+    .activated
 }
 
 fn required(value: &str) -> Option<String> {

@@ -835,7 +835,7 @@ fn ref_candidates(
     }
     // Stable sort keeps newest-first among equal scores, since the scan ran
     // newest to oldest.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     scored.truncate(REF_PICKER_MATCHES);
     let mut candidates = Vec::with_capacity(scored.len());
     for (_, index) in scored {

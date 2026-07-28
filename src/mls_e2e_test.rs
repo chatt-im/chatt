@@ -1167,6 +1167,9 @@ fn run_linked_matrix_case(case: LinkedMatrixCase) {
 #[ignore = "exhaustive MLS matrix; run alone with nightly-test-spans"]
 fn mls_live_linked_device_pairwise_matrix() {
     let _guard = live_mls_e2e_guard();
+    // The non-instrumented stub returns unit; the instrumented build keeps
+    // this guard alive for the whole matrix.
+    #[allow(clippy::let_unit_value)]
     let _logger = init_linked_matrix_logging();
     let cases = linked_matrix_cases();
     if cases.len() > 1 {

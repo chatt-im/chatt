@@ -1391,9 +1391,7 @@ mod tests {
 
         // SAFETY: the only `RingReader` built for this ring in the test.
         let mut reader = unsafe { RingReader::new(Arc::clone(&ring)) };
-        let span = reader.readable_span();
-        let drained = span.len();
-        drop(span);
+        let drained = reader.readable_span().len();
         reader.advance(drained);
         assert_eq!(ring.depth(), 0, "consumer drained the clip");
 

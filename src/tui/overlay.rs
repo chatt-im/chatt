@@ -238,7 +238,7 @@ impl AppMode for ConfirmMode {
             self.confirm_button = Rect::EMPTY;
             return;
         }
-        let width = area.w.min(54).max(24);
+        let width = area.w.clamp(24, 54);
         let height = area.h.min(5);
         let panel = Rect {
             x: area.x + area.w.saturating_sub(width) / 2,
@@ -421,7 +421,7 @@ impl AppMode for TransportEncryptionWarningMode {
         if area.w < 34 || area.h < 11 {
             return;
         }
-        let width = area.w.min(68).max(34);
+        let width = area.w.clamp(34, 68);
         let height = area.h.min(12);
         let panel = Rect {
             x: area.x + area.w.saturating_sub(width) / 2,
@@ -1124,7 +1124,7 @@ impl AppMode for E2eIdentityMode {
         if area.w < 30 || area.h < 10 {
             return;
         }
-        let width = area.w.min(92).max(30);
+        let width = area.w.clamp(30, 92);
         let height = identity_dialog_height(area.h);
         let panel = Rect {
             x: area.x + area.w.saturating_sub(width) / 2,
@@ -1842,7 +1842,7 @@ impl AppMode for PasswordPromptMode {
         if area.w < 28 || area.h < 9 {
             return;
         }
-        let width = area.w.min(58).max(28);
+        let width = area.w.clamp(28, 58);
         let height = area.h.min(9);
         let panel = Rect {
             x: area.x + area.w.saturating_sub(width) / 2,
@@ -2252,7 +2252,7 @@ impl AppMode for PasteImageUploadMode {
         if area.w < 28 || area.h < 7 {
             return;
         }
-        let width = area.w.min(58).max(28);
+        let width = area.w.clamp(28, 58);
         let height = area.h.min(7);
         let panel = Rect {
             x: area.x + area.w.saturating_sub(width) / 2,

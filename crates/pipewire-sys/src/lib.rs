@@ -59,12 +59,28 @@ macro_rules! pw_dlopen_api {
             }
         }
 
-        $(pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+        $(
+        #[doc = concat!("Calls the dynamically loaded `", stringify!($name), "` function.")]
+        ///
+        /// # Safety
+        ///
+        /// The caller must uphold the safety contract of the corresponding
+        /// PipeWire C API function.
+        pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
             unsafe { (api().$name)($($arg),*) }
-        })*
-        $(pub unsafe fn $vname($($varg: $vty),*) $(-> $vret)? {
+        }
+        )*
+        $(
+        #[doc = concat!("Calls the dynamically loaded `", stringify!($vname), "` function.")]
+        ///
+        /// # Safety
+        ///
+        /// The caller must uphold the safety contract of the corresponding
+        /// PipeWire C API function.
+        pub unsafe fn $vname($($varg: $vty),*) $(-> $vret)? {
             unsafe { (api().$vname)($($varg),*) }
-        })*
+        }
+        )*
     };
 }
 

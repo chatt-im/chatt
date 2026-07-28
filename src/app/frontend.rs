@@ -1114,13 +1114,11 @@ fn rpc_message_size_estimate(message: &rpc::control::ChatMessage) -> usize {
     STRUCTURAL_OVERHEAD
         .saturating_add(message.sender_name.len())
         .saturating_add(message.body.len())
-        .saturating_add(
-            message
-                .file_transfer_id
-                .is_some()
-                .then_some(ATTACHMENT_OVERHEAD)
-                .unwrap_or(0),
-        )
+        .saturating_add(if message.file_transfer_id.is_some() {
+            ATTACHMENT_OVERHEAD
+        } else {
+            0
+        })
 }
 
 fn accepted(request_id: RequestId, operation: Operation) -> RequestResult {
