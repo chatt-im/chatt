@@ -199,12 +199,12 @@ impl PairingCoordinator {
             ) => {
                 app.send_terminal_event(
                     Audience::Client(owner),
-                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                         OverlaySpec::DevicePair(device_pair::DevicePairDialog::new(
                             pairing_string,
                             app.config.ui.default_bindings,
                         )),
-                    )),
+                    ))),
                 );
                 app.send_terminal_event(
                     Audience::Client(owner),
@@ -486,9 +486,9 @@ impl PairingCoordinator {
                 } else {
                     app.send_terminal_event(
                         Audience::Client(owner),
-                        TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                        TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                             OverlaySpec::PairingPassword { retry },
-                        )),
+                        ))),
                     );
                 }
             }
@@ -498,9 +498,9 @@ impl PairingCoordinator {
                 self.state = PairingState::AwaitingUsername { owner, pending };
                 app.send_terminal_event(
                     Audience::Client(owner),
-                    TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(
+                    TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(Box::new(
                         ScreenSpec::ServerEditor(draft),
-                    )),
+                    ))),
                 );
                 app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
             }
@@ -586,9 +586,9 @@ impl PairingCoordinator {
                 let draft = ServerEditDraft::from_server(&pending.server, &app.config);
                 app.send_terminal_event(
                     Audience::Client(owner),
-                    TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(
+                    TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(Box::new(
                         ScreenSpec::ServerEditor(draft),
-                    )),
+                    ))),
                 );
                 app.send_terminal_event(
                     Audience::Client(owner),

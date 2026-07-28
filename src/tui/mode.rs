@@ -260,16 +260,18 @@ impl ModeStack {
             TerminalEvent::Navigation(event) => {
                 let transition = match event {
                     NavigationEvent::ResetBase(base) => ModeTransition::Set(base.into_mode()),
-                    NavigationEvent::OpenScreen(screen) => ModeTransition::Push(screen.into_mode()),
+                    NavigationEvent::OpenScreen(screen) => {
+                        ModeTransition::Push((*screen).into_mode())
+                    }
                     NavigationEvent::ReplaceScreen(screen) => {
-                        ModeTransition::Replace(screen.into_mode())
+                        ModeTransition::Replace((*screen).into_mode())
                     }
                     NavigationEvent::CloseScreen => ModeTransition::Pop,
                     NavigationEvent::ShowOverlay(overlay) => {
-                        ModeTransition::Push(overlay.into_mode(&cx.view.theme))
+                        ModeTransition::Push((*overlay).into_mode(&cx.view.theme))
                     }
                     NavigationEvent::ReplaceOverlay(overlay) => {
-                        ModeTransition::Replace(overlay.into_mode(&cx.view.theme))
+                        ModeTransition::Replace((*overlay).into_mode(&cx.view.theme))
                     }
                     NavigationEvent::CloseOverlay => ModeTransition::Pop,
                 };
@@ -615,12 +617,12 @@ mod tests {
             );
             stack.process_terminal_event(
                 &mut cx,
-                TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                     OverlaySpec::TransportEncryptionWarning {
                         label: "legacy".to_string(),
                         generation: 17,
                     },
-                )),
+                ))),
             );
         }
 

@@ -3,7 +3,7 @@ use extui::{
     event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
 };
 
-use crate::fuzzy::fuzzy_score;
+use crate::fuzzy::FuzzyPattern;
 
 pub trait SelectableItem {
     fn search_text(&self) -> &str;
@@ -96,9 +96,10 @@ impl FuzzySelect {
                     }),
             );
         } else {
+            let pattern = FuzzyPattern::new(&self.query);
             self.entries
                 .extend(items.iter().enumerate().filter_map(|(item_index, item)| {
-                    fuzzy_score(&self.query, item.search_text()).map(|score| SelectEntry {
+                    pattern.score(item.search_text()).map(|score| SelectEntry {
                         item_index,
                         score: score + item.rank(),
                     })

@@ -335,7 +335,7 @@ fn flush_commands(queued: &mut Vec<CoreCommand>, events: &EventSender, id: Clien
     for command in queued.drain(..) {
         let _ = events.send(AppEvent::ClientCommand {
             client_id: id,
-            command,
+            command: Box::new(command),
         });
     }
 }
@@ -378,15 +378,15 @@ mod tests {
             rx.try_recv(),
             Ok(AppEvent::ClientCommand {
                 client_id: ClientId(7),
-                command: CoreCommand::Quit,
-            })
+                command,
+            }) if matches!(*command, CoreCommand::Quit)
         ));
         assert!(matches!(
             rx.try_recv(),
             Ok(AppEvent::ClientCommand {
                 client_id: ClientId(7),
-                command: CoreCommand::ToggleMute,
-            })
+                command,
+            }) if matches!(*command, CoreCommand::ToggleMute)
         ));
     }
 }
