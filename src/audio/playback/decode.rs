@@ -521,15 +521,6 @@ impl LiveDecodeStreams {
         Some(self.stops_pushed)
     }
 
-    fn assign_stop_ordinal(&mut self, stream_id: u32, ordinal: u64) {
-        for entry in &mut self.retiring {
-            if entry.stream_id == stream_id && entry.stop_ordinal.is_none() {
-                entry.stop_ordinal = Some(ordinal);
-                return;
-            }
-        }
-    }
-
     /// Drops retired handles whose `StopStream` the mixer has acked: the mixer
     /// clone is gone, so the worker's drop here is the last one and the NetEQ
     /// is destroyed on this thread, never on the audio callback.
@@ -570,14 +561,25 @@ impl LiveDecodeStreams {
         if self.pending_mixer_stops.is_empty() {
             return;
         }
-        let pending: Vec<u32> = self.pending_mixer_stops.iter().copied().collect();
-        for stream_id in pending {
-            let Some(ordinal) = self.push_stop_event(mixer_events, stream_id) else {
-                continue;
+        let dropped = &mut self.dropped_mixer_events;
+        let stops_pushed = &mut self.stops_pushed;
+        let retiring = &mut self.retiring;
+        self.pending_mixer_stops.retain(|stream_id| {
+            let event = LivePlaybackMixerEvent::StopStream {
+                stream_id: *stream_id,
             };
-            self.pending_mixer_stops.remove(&stream_id);
-            self.assign_stop_ordinal(stream_id, ordinal);
-        }
+            if !push_mixer_event(mixer_events, dropped, event) {
+                return true;
+            }
+            *stops_pushed += 1;
+            if let Some(entry) = retiring
+                .iter_mut()
+                .find(|entry| entry.stream_id == *stream_id && entry.stop_ordinal.is_none())
+            {
+                entry.stop_ordinal = Some(*stops_pushed);
+            }
+            false
+        });
     }
 
     pub(crate) fn set_stream_control(

@@ -2023,7 +2023,8 @@ mod tests {
                 },
             )]),
             Arc::clone(&events),
-        );
+        )
+        .unwrap();
         let message = test_message(room_id, 1);
         let mut record = Vec::new();
         history::write_message(&message, &mut record);

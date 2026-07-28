@@ -533,7 +533,7 @@ fn run_app_inner(
                     let result = panic::catch_unwind(AssertUnwindSafe(|| client.run()));
                     let _ = render_events.send(AppEvent::ClientCommand {
                         client_id: ClientId::PRIMARY,
-                        command: CoreCommand::Quit,
+                        command: Box::new(CoreCommand::Quit),
                     });
                     result
                 }) {
@@ -680,13 +680,13 @@ fn handle_runtime_event(
 ) {
     match event {
         AppEvent::ClientCommand { client_id, command } => {
-            if matches!(&command, CoreCommand::Connect { .. })
+            if matches!(command.as_ref(), CoreCommand::Connect { .. })
                 && rpc_upload_staging_active(rpc_clients)
             {
                 app.reject_server_switch_for_client(client_id);
                 return;
             }
-            handle_runtime_command(app, clients, client_id, command);
+            handle_runtime_command(app, clients, client_id, *command);
         }
         AppEvent::ClientAttach {
             mut stream,

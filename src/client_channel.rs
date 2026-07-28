@@ -70,11 +70,11 @@ pub(crate) enum OverlaySpec {
 
 pub(crate) enum NavigationEvent {
     ResetBase(BaseScreen),
-    OpenScreen(ScreenSpec),
-    ReplaceScreen(ScreenSpec),
+    OpenScreen(Box<ScreenSpec>),
+    ReplaceScreen(Box<ScreenSpec>),
     CloseScreen,
-    ShowOverlay(OverlaySpec),
-    ReplaceOverlay(OverlaySpec),
+    ShowOverlay(Box<OverlaySpec>),
+    ReplaceOverlay(Box<OverlaySpec>),
     CloseOverlay,
 }
 

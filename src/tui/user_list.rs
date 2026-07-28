@@ -18,7 +18,7 @@ use crate::{
     },
     bindings::{self, BindCommand},
     client_channel::DirtySections,
-    fuzzy::fuzzy_score,
+    fuzzy::FuzzyPattern,
     theme,
     tui::{
         Action,
@@ -85,10 +85,10 @@ impl UserListMode {
     /// corrects its index, while a vanished id keeps the stale pair so a later
     /// movement can recover directionally.
     fn apply_rows(&mut self, rows: Vec<UserListRow>) {
-        let filter = self.filter.as_str();
+        let pattern = FuzzyPattern::new(&self.filter);
         self.visible = rows
             .into_iter()
-            .filter(|row| row_matches(filter, row))
+            .filter(|row| row_matches(&pattern, row))
             .collect();
         match &mut self.selected {
             Some(selection) => {
@@ -365,11 +365,11 @@ impl UserListMode {
     }
 }
 
-fn row_matches(filter: &str, row: &UserListRow) -> bool {
-    if filter.is_empty() {
+fn row_matches(pattern: &FuzzyPattern, row: &UserListRow) -> bool {
+    if pattern.is_empty() {
         return true;
     }
-    if fuzzy_score(filter, &row.name).is_some() {
+    if pattern.score(&row.name).is_some() {
         return true;
     }
     let UserPresence::Online {
@@ -378,7 +378,7 @@ fn row_matches(filter: &str, row: &UserListRow) -> bool {
     else {
         return false;
     };
-    fuzzy_score(filter, room_name).is_some()
+    pattern.score(room_name).is_some()
 }
 
 impl AppMode for UserListMode {

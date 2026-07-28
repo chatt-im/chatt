@@ -1988,10 +1988,10 @@ fn draw_transfer_progress(
     );
     let filled = (width as f64 * ratio).round() as usize;
     let text_style = base.patch(app.view.theme.text);
-    let chars: Vec<char> = label.chars().collect();
+    let mut chars = label.chars();
     let mut encoded = [0u8; 4];
     for col in 0..width {
-        let ch = chars.get(col).copied().unwrap_or(' ');
+        let ch = chars.next().unwrap_or(' ');
         let style = if col < filled {
             text_style.with_modifier(Modifier::REVERSED)
         } else {

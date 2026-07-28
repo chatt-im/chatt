@@ -71,11 +71,18 @@ pub fn stable_output_device_id(name: &str) -> String {
 pub(crate) fn stable_device_id(name: &str) -> String {
     let mut key = name.to_ascii_lowercase();
     for suffix in [", usb audio", ", loopback pcm"] {
-        if let Some(stripped) = key.strip_suffix(suffix) {
-            key = stripped.to_string();
+        if key.ends_with(suffix) {
+            key.truncate(key.len() - suffix.len());
         }
     }
-    key.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut normalized = String::with_capacity(key.len());
+    for word in key.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(word);
+    }
+    normalized
 }
 
 pub(crate) fn input_devices_inner(

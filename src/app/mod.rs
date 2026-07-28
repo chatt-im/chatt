@@ -800,7 +800,7 @@ pub(crate) struct ScreencastProgress {
 pub(crate) enum AppEvent {
     ClientCommand {
         client_id: crate::client_channel::ClientId,
-        command: command::CoreCommand,
+        command: Box<command::CoreCommand>,
     },
     Network(NetworkEvent),
     NetworkFor {
@@ -1639,7 +1639,11 @@ impl App {
             CoreCommand::RequestOlderHistory { room_id } => {
                 self.request_older_history(room_id);
             }
-            CoreCommand::OpenDm(user_id) => self.open_dm_with(user_id),
+            CoreCommand::OpenDm(user_id) => {
+                if let Err(error) = self.open_dm_with(user_id) {
+                    self.set_error(error);
+                }
+            }
             CoreCommand::JoinVoice(room_id) => self.join_voice_room(room_id),
             CoreCommand::LeaveVoice => self.leave_voice_command(),
             CoreCommand::ToggleMute => self.toggle_mute(),
@@ -1653,8 +1657,8 @@ impl App {
                 if self.apply_volume_event(event, &mut dialog) {
                     self.navigate_owner(NavigationEvent::CloseOverlay);
                 } else {
-                    self.navigate_owner(NavigationEvent::ReplaceOverlay(OverlaySpec::UserVolume(
-                        dialog,
+                    self.navigate_owner(NavigationEvent::ReplaceOverlay(Box::new(
+                        OverlaySpec::UserVolume(dialog),
                     )));
                 }
             }
@@ -1674,8 +1678,16 @@ impl App {
                 self.open_e2e_reviews.remove(&self.command_client);
                 self.navigate_owner(NavigationEvent::CloseOverlay);
             }
-            CoreCommand::ForgetE2eIdentity(identity) => self.forget_e2e_identity(identity),
-            CoreCommand::ConfirmE2eIdentity(target) => self.confirm_e2e_verification(target),
+            CoreCommand::ForgetE2eIdentity(identity) => {
+                if let Err(error) = self.forget_e2e_identity(identity) {
+                    self.set_error(error);
+                }
+            }
+            CoreCommand::ConfirmE2eIdentity(target) => {
+                if let Err(error) = self.confirm_e2e_verification(target) {
+                    self.set_error(error);
+                }
+            }
             CoreCommand::Connect { alias } => {
                 self.start_connection(&alias, self.command_client);
             }
@@ -1685,16 +1697,16 @@ impl App {
                 join_after_save,
             } => {
                 if !self.save_server_edit_with(&draft, join_after_save) {
-                    self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(
-                        draft,
+                    self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
+                        ScreenSpec::ServerEditor(draft),
                     )));
                 }
             }
             CoreCommand::CancelServerEdit => self.cancel_server_edit(),
             CoreCommand::SaveRoomSettings(draft) => {
                 if !self.save_room_settings(&draft) {
-                    self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::RoomSettings(
-                        draft,
+                    self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
+                        ScreenSpec::RoomSettings(draft),
                     )));
                 }
             }
@@ -2237,13 +2249,7 @@ impl App {
             self.room.screencast_status.clear_active();
         }
         self.screencast_stream_id = None;
-        for stream_id in self
-            .room
-            .available_shares
-            .keys()
-            .copied()
-            .collect::<Vec<_>>()
-        {
+        for &stream_id in self.room.available_shares.keys() {
             self.video_fanout.close_stream(stream_id);
         }
         self.room.available_shares.clear();
@@ -2888,11 +2894,10 @@ impl App {
         items.retain(|item| item.validate().is_ok());
         items.sort_by(|left, right| {
             left.value
-                .to_lowercase()
-                .cmp(&right.value.to_lowercase())
-                .then_with(|| left.value.cmp(&right.value))
+                .cmp(&right.value)
                 .then_with(|| left.detail.cmp(&right.detail))
         });
+        items.sort_by_cached_key(|item| item.value.to_lowercase());
         items.dedup();
         items.truncate(local_rpc::MAX_COMMAND_CANDIDATES);
         items
@@ -3040,8 +3045,8 @@ impl App {
             return;
         };
         let draft = ServerEditDraft::from_server_focused(&server, &self.config, field);
-        self.navigate_owner(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(
-            draft,
+        self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
+            ScreenSpec::ServerEditor(draft),
         )));
         self.set_status(format!("editing server {}", server.label));
     }
@@ -3250,7 +3255,7 @@ impl App {
         self.pending_dm_clients.clear();
         self.pending_identity_review.clear();
         self.open_e2e_reviews.clear();
-        self.rpc_identity.clear();
+        self.rpc_identity.close_all("disconnected from the server");
         self.pending_mutation_clients.clear();
         self.abandon_pending_web_history();
         self.supervisor.network.reset();
@@ -3271,7 +3276,7 @@ impl App {
         self.pending_dm_clients.clear();
         self.pending_identity_review.clear();
         self.open_e2e_reviews.clear();
-        self.rpc_identity.clear();
+        self.rpc_identity.close_all("disconnected from the server");
         self.broadcast_cancel_pending_edit();
         self.room.clear_e2e_trust_states();
         self.room.reset_for_disconnect();
@@ -3393,12 +3398,14 @@ impl App {
     }
 
     pub(crate) fn open_room_switcher(&mut self) {
-        self.navigate_owner(NavigationEvent::OpenScreen(ScreenSpec::RoomSwitcher));
+        self.navigate_owner(NavigationEvent::OpenScreen(Box::new(
+            ScreenSpec::RoomSwitcher,
+        )));
     }
 
     #[allow(dead_code)] // Removed after all modes dispatch through ViewCx.
     pub(crate) fn open_user_list(&mut self) {
-        self.navigate_owner(NavigationEvent::OpenScreen(ScreenSpec::UserList));
+        self.navigate_owner(NavigationEvent::OpenScreen(Box::new(ScreenSpec::UserList)));
     }
 
     pub(crate) fn open_room_settings(&mut self) {
@@ -3423,7 +3430,9 @@ impl App {
             room_id,
             self.room.room_name.clone(),
         );
-        self.navigate_owner(NavigationEvent::OpenScreen(ScreenSpec::RoomSettings(draft)));
+        self.navigate_owner(NavigationEvent::OpenScreen(Box::new(
+            ScreenSpec::RoomSettings(draft),
+        )));
     }
 
     pub(crate) fn save_room_settings(&mut self, draft: &RoomSettingsDraft) -> bool {
@@ -4490,19 +4499,8 @@ impl App {
                 if let Some(previous_level) = previous_level
                     && previous_level != identity.trust_level
                 {
-                    let username = if identity.identity.username.trim().is_empty() {
-                        self.room.username_of(identity.user_id)
-                    } else {
-                        identity.identity.username.clone()
-                    };
-                    self.set_status(match identity.trust_level {
-                        crate::config::E2eTrustLevel::Accepted => {
-                            format!("Forgot independent verification for {username}")
-                        }
-                        crate::config::E2eTrustLevel::Verified => {
-                            format!("Verified {username}'s encryption identity")
-                        }
-                    });
+                    let status = self.e2e_trust_change_status(&identity);
+                    self.set_status(status);
                 }
                 let stale_clients: Vec<_> = self
                     .open_e2e_reviews
@@ -4532,11 +4530,7 @@ impl App {
                     let target = crate::client_channel::E2eIdentityTarget {
                         room_id: identity.room_id,
                         user_id: identity.user_id,
-                        username: if identity.identity.username.trim().is_empty() {
-                            self.room.username_of(identity.user_id)
-                        } else {
-                            identity.identity.username.clone()
-                        },
+                        username: self.identity_display_username(&identity),
                         public_key: identity.identity.public_key.clone(),
                         accepted: identity.clone(),
                     };
@@ -4846,12 +4840,12 @@ impl App {
                 self.set_rpc_transport_encryption_prompt(&attempt);
                 self.send_terminal_event(
                     Audience::Client(attempt.owner),
-                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
+                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                         OverlaySpec::TransportEncryptionWarning {
                             label: attempt.server_label,
                             generation: attempt.generation,
                         },
-                    )),
+                    ))),
                 );
                 self.set_error("server transport encryption is disabled");
             }
@@ -4860,13 +4854,13 @@ impl App {
                 pairing_string,
                 expires_at_ms,
             } => {
-                self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::DeviceLink(
-                    device_pair::DeviceLinkDialog::new(
+                self.navigate_owner(NavigationEvent::ShowOverlay(Box::new(
+                    OverlaySpec::DeviceLink(device_pair::DeviceLinkDialog::new(
                         redemption_secret_hash,
                         pairing_string,
                         expires_at_ms,
                         self.config.ui.default_bindings,
-                    ),
+                    )),
                 )));
                 self.set_status("one-time device link created");
             }
@@ -5464,7 +5458,7 @@ impl App {
             &self.config,
             &self.room.audio_devices,
         ))));
-        self.navigate_owner(NavigationEvent::OpenScreen(ScreenSpec::Settings));
+        self.navigate_owner(NavigationEvent::OpenScreen(Box::new(ScreenSpec::Settings)));
     }
 
     /// Revokes core-owned leases for a terminal on every retirement path. UI
@@ -6859,8 +6853,8 @@ impl App {
             value_db,
             &self.config.ui.resolve_theme(),
         );
-        self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::UserVolume(
-            dialog,
+        self.navigate_owner(NavigationEvent::ShowOverlay(Box::new(
+            OverlaySpec::UserVolume(dialog),
         )));
         self.set_status(format!("adjusting local volume for {name}"));
     }
@@ -7210,10 +7204,21 @@ impl App {
             self.set_error(format!("no user named {name}"));
             return;
         };
-        self.open_dm_with(user_id);
+        if let Err(error) = self.open_dm_with(user_id) {
+            self.set_error(error);
+        }
     }
 
-    fn forget_e2e_identity(&mut self, identity: crate::e2e::AcceptedPeerIdentity) {
+    /// Drops the independent confirmation pinned for `identity`.
+    ///
+    /// Returns the reason it was refused, so a caller that owes someone a reply
+    /// — an RPC renderer, say — can report the refusal instead of claiming
+    /// success for work that never happened. A command merely queued while the
+    /// network is down is still `Ok`: it runs on reconnect.
+    fn forget_e2e_identity(
+        &mut self,
+        identity: crate::e2e::AcceptedPeerIdentity,
+    ) -> Result<(), String> {
         let matches =
             self.room
                 .e2e_trust_state(identity.room_id)
@@ -7234,8 +7239,7 @@ impl App {
                     }
                 });
         if !matches {
-            self.set_error("that saved identity is stale; review the current identity");
-            return;
+            return Err("that saved identity is stale; review the current identity".into());
         }
         if self.send_network_command(
             NetworkCommand::ForgetPeerIdentity { expected: identity },
@@ -7243,6 +7247,7 @@ impl App {
         ) {
             self.set_status("forgetting independent identity verification");
         }
+        Ok(())
     }
 
     fn active_server_identity_key(&self) -> Result<[u8; 32], String> {
@@ -7273,6 +7278,36 @@ impl App {
         crate::e2e_identity::VerificationText::new(&server_key, user_id.0, &account_id.0)
             .map(|text| text.encode())
             .map_err(|_| "could not build the local verification text".to_string())
+    }
+
+    /// The name to show for a peer, falling back to the roster when the pinned
+    /// profile carries no username.
+    pub(super) fn identity_display_username(
+        &self,
+        identity: &crate::e2e::AcceptedPeerIdentity,
+    ) -> String {
+        if identity.identity.username.trim().is_empty() {
+            self.room.username_of(identity.user_id)
+        } else {
+            identity.identity.username.clone()
+        }
+    }
+
+    /// What just happened to a peer's pin, phrased for a status line. Every
+    /// frontend reports a trust change in these words.
+    pub(super) fn e2e_trust_change_status(
+        &self,
+        identity: &crate::e2e::AcceptedPeerIdentity,
+    ) -> String {
+        let username = self.identity_display_username(identity);
+        match identity.trust_level {
+            crate::config::E2eTrustLevel::Accepted => {
+                format!("Forgot independent verification for {username}")
+            }
+            crate::config::E2eTrustLevel::Verified => {
+                format!("Verified {username}'s encryption identity")
+            }
+        }
     }
 
     fn open_e2e_identity(
@@ -7313,13 +7348,18 @@ impl App {
             error,
         });
         self.navigate_owner(if replaces_open {
-            NavigationEvent::ReplaceOverlay(overlay)
+            NavigationEvent::ReplaceOverlay(Box::new(overlay))
         } else {
-            NavigationEvent::ShowOverlay(overlay)
+            NavigationEvent::ShowOverlay(Box::new(overlay))
         });
     }
 
-    fn confirm_e2e_verification(&mut self, target: crate::client_channel::E2eIdentityTarget) {
+    /// Pins `target` as independently confirmed. Refusals come back as `Err` for
+    /// the same reason [`Self::forget_e2e_identity`]'s do.
+    fn confirm_e2e_verification(
+        &mut self,
+        target: crate::client_channel::E2eIdentityTarget,
+    ) -> Result<(), String> {
         let room_id = target.room_id;
         let expected = target.accepted.clone();
         let matches = self
@@ -7335,13 +7375,13 @@ impl App {
                 }
             });
         if !matches || expected.identity.public_key != target.public_key {
-            self.set_error("the accepted identity changed during verification");
-            return;
+            return Err("the accepted identity changed during verification".into());
         }
         let sent = self.send_network_command(NetworkCommand::VerifyPeerIdentity { expected }, true);
         if sent {
             self.set_status("saving independently confirmed identity");
         }
+        Ok(())
     }
 
     /// Opens the one identity screen for a DM peer. The command itself never
@@ -7366,33 +7406,44 @@ impl App {
             };
             user_id
         };
+        if let Err(error) = self.request_identity_review(user_id, self.command_client) {
+            self.set_error(error);
+        }
+    }
+
+    /// Asks the worker for `user_id`'s accepted identity on `client`'s behalf,
+    /// opening the DM first if there is not one yet.
+    ///
+    /// The client is queued for the answer only once the request is actually on
+    /// its way: a review that was refused must not leave an entry behind that a
+    /// later, unrelated identity event would deliver a surprise document to.
+    pub(super) fn request_identity_review(
+        &mut self,
+        user_id: UserId,
+        client: crate::client_channel::ClientId,
+    ) -> Result<(), String> {
         if self.room.dm_room_for_peer(user_id).is_none() {
-            self.pending_identity_review
-                .entry(user_id)
-                .or_default()
-                .push_back(self.command_client);
-            self.open_dm_with(user_id);
-            return;
+            self.open_dm_with(user_id)?;
+        } else {
+            self.send_network_command(NetworkCommand::ReviewPeerIdentity { user_id }, true);
         }
         self.pending_identity_review
             .entry(user_id)
             .or_default()
-            .push_back(self.command_client);
-        self.send_network_command(NetworkCommand::ReviewPeerIdentity { user_id }, true);
+            .push_back(client);
+        Ok(())
     }
 
     /// Asks the server for the DM room with `user_id`; the view switches when
     /// `DmOpened` arrives.
-    pub(crate) fn open_dm_with(&mut self, user_id: UserId) {
+    pub(crate) fn open_dm_with(&mut self, user_id: UserId) -> Result<(), String> {
         if self.network.is_none() {
-            self.set_error("select a server before opening dms");
-            return;
+            return Err("select a server before opening dms".into());
         }
         // The server keeps serving DM rooms opened before the operator turned
         // DMs off, so only a first-time open is refused here.
         if !self.server_dms_enabled && self.room.dm_room_for_peer(user_id).is_none() {
-            self.set_error("this server has direct messages disabled");
-            return;
+            return Err("this server has direct messages disabled".into());
         }
         if self.send_network_command(NetworkCommand::OpenDm(user_id), true) {
             self.pending_dm_clients
@@ -7404,6 +7455,7 @@ impl App {
             "opening dm with {}",
             self.room.username_of(user_id)
         ));
+        Ok(())
     }
 
     fn open_dm_room_for_client(
@@ -7510,8 +7562,8 @@ impl App {
     /// Opens the filename confirmation dialog for a pasted image or file.
     #[allow(dead_code)] // Removed after all modes dispatch through ViewCx.
     pub(crate) fn open_paste_image_dialog(&mut self, image: crate::clipboard_paste::ImagePaste) {
-        self.navigate_owner(NavigationEvent::ShowOverlay(OverlaySpec::PasteUpload(
-            image,
+        self.navigate_owner(NavigationEvent::ShowOverlay(Box::new(
+            OverlaySpec::PasteUpload(image),
         )));
     }
 
@@ -9022,12 +9074,12 @@ mod tests {
         ));
         assert!(matches!(
             events.pop_front(),
-            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(
-                OverlaySpec::TransportEncryptionWarning {
-                    label,
-                    generation: 9
-                }
-            ))) if label == "legacy"
+            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(overlay)))
+                if matches!(
+                    overlay.as_ref(),
+                    OverlaySpec::TransportEncryptionWarning { label, generation: 9 }
+                        if label == "legacy"
+                )
         ));
         assert!(events.is_empty());
     }
@@ -9278,7 +9330,8 @@ mod tests {
         let events = channel.drain_events();
         assert!(events.into_iter().any(|event| matches!(
             event,
-            TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(ScreenSpec::ServerEditor(_)))
+            TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(screen))
+                if matches!(screen.as_ref(), ScreenSpec::ServerEditor(_))
         )));
         assert_eq!(
             view.lock().status.text(),

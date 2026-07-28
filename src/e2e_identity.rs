@@ -8,8 +8,13 @@ use aws_lc_rs::digest::{SHA256, digest};
 use rpc::base32;
 use rpc::crypto::{decode_hex, encode_hex};
 
+use crate::{config::E2eTrustLevel, e2e::AcceptedPeerIdentity};
+
 const PUBLIC_KEY_LEN: usize = 32;
 const WORD_COUNT: usize = 24;
+/// Hex characters per displayed key group. Every frontend lays the key out in
+/// these groups, so they read the same aloud.
+pub(crate) const KEY_GROUP_LEN: usize = 8;
 const WORD_BITS: usize = 11;
 const VERIFICATION_TEXT_CHECKSUM_BYTES: usize = 8;
 const VERIFICATION_TEXT_PREFIX: &str = "chatt-e2e:v2";
@@ -282,6 +287,79 @@ pub(crate) fn check_verification_text(
     }
 }
 
+/// How much the local account trusts a peer key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityTrustState {
+    /// Accepted on first use but never independently confirmed.
+    Unverified,
+    /// Independently confirmed and pinned.
+    Verified,
+    /// The key changed after being accepted.
+    Changed,
+    /// The key changed after being independently confirmed.
+    ChangedFromVerified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityVerdictSeverity {
+    Good,
+    Warning,
+    Danger,
+}
+
+/// The verdict a frontend leads its identity review with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IdentityVerdict {
+    pub(crate) trust: IdentityTrustState,
+    pub(crate) severity: IdentityVerdictSeverity,
+    pub(crate) headline: &'static str,
+}
+
+/// Classifies an accepted identity for display.
+///
+/// Every frontend shares this so the words they lead with cannot drift; each one
+/// only maps `severity` onto its own styling.
+pub(crate) fn identity_verdict(accepted: &AcceptedPeerIdentity) -> IdentityVerdict {
+    let (trust, severity, headline) = match (accepted.trust_level, accepted.change_from) {
+        (E2eTrustLevel::Accepted, Some(E2eTrustLevel::Verified)) => (
+            IdentityTrustState::ChangedFromVerified,
+            IdentityVerdictSeverity::Danger,
+            "VERIFIED IDENTITY CHANGED: possible interception; verify through another channel",
+        ),
+        (E2eTrustLevel::Accepted, Some(_)) => (
+            IdentityTrustState::Changed,
+            IdentityVerdictSeverity::Danger,
+            "IDENTITY CHANGED: verify through another channel",
+        ),
+        (E2eTrustLevel::Accepted, None) => (
+            IdentityTrustState::Unverified,
+            IdentityVerdictSeverity::Warning,
+            "UNVERIFIED: identity not independently confirmed",
+        ),
+        (E2eTrustLevel::Verified, _) => (
+            IdentityTrustState::Verified,
+            IdentityVerdictSeverity::Good,
+            "VERIFIED: all identity words or verification text matched",
+        ),
+    };
+    IdentityVerdict {
+        trust,
+        severity,
+        headline,
+    }
+}
+
+/// The name a frontend titles an identity review with, for a peer whose profile
+/// carries no username.
+pub(crate) fn displayed_identity_name(username: &str, user_id: u64) -> String {
+    let username = username.trim();
+    if username.is_empty() {
+        format!("User {user_id}")
+    } else {
+        username.to_string()
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IdentityError {
@@ -343,6 +421,55 @@ fn verification_text_checksum(canonical: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Both frontends read this one table, so a key change after independent
+    /// confirmation must outrank a plain key change everywhere at once.
+    #[test]
+    fn verdicts_escalate_a_key_change_that_followed_a_confirmation() {
+        use crate::config::E2ePeerIdentity;
+        use rpc::ids::{RoomId, UserId};
+
+        let verdict_for = |trust_level, change_from| {
+            identity_verdict(&AcceptedPeerIdentity {
+                room_id: RoomId(0x8000_0001),
+                user_id: UserId(2),
+                identity: E2ePeerIdentity {
+                    room_id: 0x8000_0001,
+                    user_id: 2,
+                    username: "zoe".into(),
+                    public_key: "bb".repeat(32),
+                    trust_level,
+                },
+                trust_level,
+                change_from,
+                verified_keys: Vec::new(),
+            })
+        };
+
+        let unverified = verdict_for(E2eTrustLevel::Accepted, None);
+        assert_eq!(unverified.trust, IdentityTrustState::Unverified);
+        assert_eq!(unverified.severity, IdentityVerdictSeverity::Warning);
+
+        let verified = verdict_for(E2eTrustLevel::Verified, None);
+        assert_eq!(verified.trust, IdentityTrustState::Verified);
+        assert_eq!(verified.severity, IdentityVerdictSeverity::Good);
+
+        let changed = verdict_for(E2eTrustLevel::Accepted, Some(E2eTrustLevel::Accepted));
+        assert_eq!(changed.trust, IdentityTrustState::Changed);
+        assert_eq!(changed.severity, IdentityVerdictSeverity::Danger);
+
+        let betrayed = verdict_for(E2eTrustLevel::Accepted, Some(E2eTrustLevel::Verified));
+        assert_eq!(betrayed.trust, IdentityTrustState::ChangedFromVerified);
+        assert_eq!(betrayed.severity, IdentityVerdictSeverity::Danger);
+        assert!(betrayed.headline.starts_with("VERIFIED IDENTITY CHANGED"));
+        assert_ne!(betrayed.headline, changed.headline);
+    }
+
+    #[test]
+    fn names_fall_back_to_the_user_id_when_a_profile_carries_none() {
+        assert_eq!(displayed_identity_name("  zoe  ", 2), "zoe");
+        assert_eq!(displayed_identity_name("   ", 2), "User 2");
+    }
 
     #[test]
     fn wordlist_is_canonical() {

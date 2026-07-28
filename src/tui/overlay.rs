@@ -10,6 +10,7 @@ use crate::{
         ClipboardPasteProvider, HelperClipboard, ImagePaste, ImagePasteOrigin, ImagePasteSource,
         PastePayload,
     },
+    e2e_identity::{IdentityVerdictSeverity, KEY_GROUP_LEN, displayed_identity_name},
     theme,
     theme::Theme,
     tui::{
@@ -569,9 +570,8 @@ fn append_identity_block(
 }
 
 fn append_grouped_key_lines(lines: &mut Vec<SecurityDialogLine>, public_key: &str, width: usize) {
-    let groups: Vec<_> = public_key.as_bytes().chunks(8).collect();
     let mut row = String::new();
-    for group in groups {
+    for group in public_key.as_bytes().chunks(KEY_GROUP_LEN) {
         let group = String::from_utf8_lossy(group);
         if !row.is_empty() && row.len() + group.len() + 1 > width.max(8) {
             lines.push(SecurityDialogLine::new(
@@ -967,31 +967,13 @@ impl E2eIdentityMode {
         let username =
             displayed_identity_name(&self.dialog.target.username, self.dialog.target.user_id.0);
         let mut lines = Vec::new();
-        let (status, status_kind) = match (
-            self.dialog.target.accepted.trust_level,
-            self.dialog.target.accepted.change_from,
-        ) {
-            (
-                crate::config::E2eTrustLevel::Accepted,
-                Some(crate::config::E2eTrustLevel::Verified),
-            ) => (
-                "VERIFIED IDENTITY CHANGED: possible interception; verify through another channel",
-                SecurityLineKind::Danger,
-            ),
-            (crate::config::E2eTrustLevel::Accepted, Some(_)) => (
-                "IDENTITY CHANGED: verify through another channel",
-                SecurityLineKind::Danger,
-            ),
-            (crate::config::E2eTrustLevel::Accepted, None) => (
-                "UNVERIFIED: identity not independently confirmed",
-                SecurityLineKind::Warning,
-            ),
-            (crate::config::E2eTrustLevel::Verified, _) => (
-                "VERIFIED: all identity words or verification text matched",
-                SecurityLineKind::Lead,
-            ),
+        let verdict = crate::e2e_identity::identity_verdict(&self.dialog.target.accepted);
+        let status_kind = match verdict.severity {
+            IdentityVerdictSeverity::Good => SecurityLineKind::Lead,
+            IdentityVerdictSeverity::Warning => SecurityLineKind::Warning,
+            IdentityVerdictSeverity::Danger => SecurityLineKind::Danger,
         };
-        lines.push(SecurityDialogLine::new(status, status_kind));
+        lines.push(SecurityDialogLine::new(verdict.headline, status_kind));
         lines.push(SecurityDialogLine::blank());
         append_wrapped_security_lines(
             &mut lines,
@@ -1098,15 +1080,6 @@ impl E2eIdentityMode {
             "Previous keys are retained only to authenticate older messages.",
             SecurityLineKind::Muted,
         ));
-    }
-}
-
-fn displayed_identity_name(username: &str, user_id: u64) -> String {
-    let username = username.trim();
-    if username.is_empty() {
-        format!("User {user_id}")
-    } else {
-        username.to_string()
     }
 }
 

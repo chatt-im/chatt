@@ -3775,16 +3775,22 @@ impl RoomSession {
     /// online this process session, then the rest of the directory, each
     /// group alphabetical by name.
     pub(crate) fn user_list_rows(&self) -> Vec<UserListRow> {
+        let mut voice_rooms = HashMap::new();
+        for (room_id, meta) in &self.metas {
+            for user_id in &meta.voice_users {
+                voice_rooms
+                    .entry(*user_id)
+                    .or_insert((*room_id, meta.name.as_str()));
+            }
+        }
         let mut rows: Vec<UserListRow> = self
             .users
             .values()
             .map(|user| {
                 let presence = if user.online {
-                    let room = self
-                        .metas
-                        .iter()
-                        .find(|(_, meta)| meta.voice_users.contains(&user.user_id))
-                        .map(|(room_id, meta)| (*room_id, meta.name.clone()));
+                    let room = voice_rooms
+                        .get(&user.user_id)
+                        .map(|(room_id, name)| (*room_id, (*name).to_string()));
                     UserPresence::Online { room }
                 } else {
                     match self.presence_seen.get(&user.user_id).copied().flatten() {
@@ -3800,7 +3806,7 @@ impl RoomSession {
                 }
             })
             .collect();
-        rows.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        rows.sort_by_cached_key(UserListRow::sort_key);
         rows
     }
 
