@@ -193,6 +193,95 @@ impl VerificationText {
     }
 }
 
+/// The outcome of checking one person's pasted verification text against the
+/// identity the local account currently holds for them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VerificationTextCheck {
+    Match,
+    /// `danger` marks the outcomes that indicate an active substitution rather
+    /// than a typo or a stale paste.
+    Invalid {
+        danger: bool,
+        message: String,
+    },
+}
+
+impl VerificationTextCheck {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid {
+            danger: false,
+            message: message.into(),
+        }
+    }
+}
+
+/// Checks `pasted` against the identity under review, in the server and account
+/// context encoded by `local_text`.
+///
+/// Returns `None` for blank input, which means "nothing to report yet" rather
+/// than a failure. Every frontend shares this so their verdicts cannot drift.
+pub(crate) fn check_verification_text(
+    local_text: &str,
+    expected_user_id: u64,
+    expected_public_key_hex: &str,
+    pasted: &str,
+) -> Option<VerificationTextCheck> {
+    if pasted.trim().is_empty() {
+        return None;
+    }
+    let Ok(local) = VerificationText::parse(local_text) else {
+        return Some(VerificationTextCheck::invalid(
+            "Your local verification context is unavailable.",
+        ));
+    };
+    let Ok(expected) = E2ePublicIdentity::from_hex(expected_public_key_hex) else {
+        return Some(VerificationTextCheck::invalid(
+            "The identity under review is unavailable.",
+        ));
+    };
+    let text = match VerificationText::parse(pasted) {
+        Ok(text) => text,
+        Err(error) => {
+            return Some(VerificationTextCheck::invalid(match error {
+                VerificationTextError::UnsupportedVersion | VerificationTextError::Malformed => {
+                    "Verification text is incomplete or malformed."
+                }
+                VerificationTextError::ChecksumMismatch => {
+                    "Verification text has an invalid checksum."
+                }
+                VerificationTextError::InvalidServerKey
+                | VerificationTextError::InvalidUserId
+                | VerificationTextError::InvalidPublicKey
+                | VerificationTextError::NonCanonical => "Verification text is invalid.",
+            }));
+        }
+    };
+    match text.match_context(
+        local.server_public_key(),
+        local.user_id(),
+        expected_user_id,
+        expected.public_key(),
+    ) {
+        Ok(()) => Some(VerificationTextCheck::Match),
+        Err(VerificationTextMatchError::WrongServer) => Some(VerificationTextCheck::invalid(
+            "Verification text belongs to a different Chatt server.",
+        )),
+        Err(VerificationTextMatchError::SelfText) => Some(VerificationTextCheck::invalid(
+            "That is your verification text, not the other person's.",
+        )),
+        Err(VerificationTextMatchError::WrongUser {
+            presented,
+            expected,
+        }) => Some(VerificationTextCheck::invalid(format!(
+            "Verification text belongs to user {presented}, not user {expected}."
+        ))),
+        Err(VerificationTextMatchError::KeyMismatch) => Some(VerificationTextCheck::Invalid {
+            danger: true,
+            message: "DANGER: verification text contains a different public key.".to_string(),
+        }),
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IdentityError {
@@ -325,6 +414,61 @@ mod tests {
         assert_eq!(
             VerificationText::parse(&encoded),
             Err(VerificationTextError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn shared_check_reports_blank_match_self_wrong_user_and_key_substitution() {
+        const SERVER: [u8; 32] = [0x11; 32];
+        let local = VerificationText::new(&SERVER, 1, &[0xaa; 32])
+            .unwrap()
+            .encode();
+        let peer_key = encode_hex(&[0xbb; 32]);
+        let peer = VerificationText::new(&SERVER, 2, &[0xbb; 32])
+            .unwrap()
+            .encode();
+
+        assert_eq!(check_verification_text(&local, 2, &peer_key, "  "), None);
+        assert_eq!(
+            check_verification_text(&local, 2, &peer_key, &peer),
+            Some(VerificationTextCheck::Match)
+        );
+        assert_eq!(
+            check_verification_text(&local, 2, &peer_key, &local),
+            Some(VerificationTextCheck::invalid(
+                "That is your verification text, not the other person's."
+            ))
+        );
+
+        let other = VerificationText::new(&SERVER, 3, &[0xbb; 32])
+            .unwrap()
+            .encode();
+        assert_eq!(
+            check_verification_text(&local, 2, &peer_key, &other),
+            Some(VerificationTextCheck::invalid(
+                "Verification text belongs to user 3, not user 2."
+            ))
+        );
+
+        // A substituted key is the one outcome that means interception rather
+        // than a mistyped or stale paste, so it is the only `danger` verdict.
+        let substituted = encode_hex(&[0xcc; 32]);
+        assert_eq!(
+            check_verification_text(&local, 2, &substituted, &peer),
+            Some(VerificationTextCheck::Invalid {
+                danger: true,
+                message: "DANGER: verification text contains a different public key.".into(),
+            })
+        );
+
+        let mut corrupt = peer.clone();
+        let last = corrupt.pop().unwrap();
+        corrupt.push(if last == '0' { '1' } else { '0' });
+        assert_eq!(
+            check_verification_text(&local, 2, &peer_key, &corrupt),
+            Some(VerificationTextCheck::invalid(
+                "Verification text has an invalid checksum."
+            ))
         );
     }
 

@@ -1123,53 +1123,18 @@ fn validate_verification_text(
     target: &E2eIdentityTarget,
     verification_text: &str,
 ) -> Option<Result<(), String>> {
-    use crate::e2e_identity::{
-        VerificationText, VerificationTextError, VerificationTextMatchError,
-    };
+    use crate::e2e_identity::VerificationTextCheck;
 
-    if verification_text.trim().is_empty() {
-        return None;
-    }
-    let result = (|| {
-        let local = VerificationText::parse(local_text)
-            .map_err(|_| "Your local verification context is unavailable.".to_string())?;
-        let text = VerificationText::parse(verification_text).map_err(|error| match error {
-            VerificationTextError::UnsupportedVersion | VerificationTextError::Malformed => {
-                "Verification text is incomplete or malformed.".to_string()
-            }
-            VerificationTextError::ChecksumMismatch => {
-                "Verification text has an invalid checksum.".to_string()
-            }
-            VerificationTextError::InvalidServerKey
-            | VerificationTextError::InvalidUserId
-            | VerificationTextError::InvalidPublicKey
-            | VerificationTextError::NonCanonical => "Verification text is invalid.".to_string(),
-        })?;
-        let expected = E2ePublicIdentity::from_hex(&target.public_key)
-            .expect("worker target contains a validated key");
-        text.match_context(
-            local.server_public_key(),
-            local.user_id(),
-            target.user_id.0,
-            expected.public_key(),
-        )
-        .map_err(|error| match error {
-            VerificationTextMatchError::WrongServer => {
-                "Verification text belongs to a different Chatt server.".to_string()
-            }
-            VerificationTextMatchError::SelfText => {
-                "That is your verification text, not the other person's.".to_string()
-            }
-            VerificationTextMatchError::WrongUser {
-                presented,
-                expected,
-            } => format!("Verification text belongs to user {presented}, not user {expected}."),
-            VerificationTextMatchError::KeyMismatch => {
-                "DANGER: verification text contains a different public key.".to_string()
-            }
-        })
-    })();
-    Some(result)
+    let check = crate::e2e_identity::check_verification_text(
+        local_text,
+        target.user_id.0,
+        &target.public_key,
+        verification_text,
+    )?;
+    Some(match check {
+        VerificationTextCheck::Match => Ok(()),
+        VerificationTextCheck::Invalid { message, .. } => Err(message),
+    })
 }
 
 impl AppMode for E2eIdentityMode {
