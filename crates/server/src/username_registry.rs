@@ -223,8 +223,12 @@ impl UsernameRegistry {
     /// Replays every whole record in `path`, overlaying dynamic-user names on the
     /// explicit seed. A torn trailing record is dropped and the log truncated.
     fn replay_log(&mut self, path: &PathBuf) -> Result<(), String> {
-        let Ok(bytes) = fs::read(path) else {
-            return Ok(());
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!("failed to read {}: {error}", path.display()));
+            }
         };
         // Collapse the dynamic log independently before merging it with the
         // current explicit-user snapshot. An explicit user may legitimately own
@@ -255,11 +259,10 @@ impl UsernameRegistry {
                 total_bytes = bytes.len()
             );
             if let Err(error) = truncate(path, offset as u64) {
-                kvlog::error!(
-                    "username log tail truncation failed",
-                    path = path.display().to_string().as_str(),
-                    error = error.to_string().as_str()
-                );
+                return Err(format!(
+                    "failed to truncate corrupt username log {} to {offset} bytes: {error}",
+                    path.display()
+                ));
             }
         }
         for (user_id, name) in dynamic.by_user {
@@ -302,8 +305,14 @@ fn write_record(file: &mut File, user_id: UserId, name: &str) -> std::io::Result
     record.push(name.len() as u8);
     record.extend_from_slice(name);
     if let Err(error) = file.write_all(&record).and_then(|()| file.sync_data()) {
-        file.set_len(original_len)?;
-        file.sync_data()?;
+        if let Err(rollback_error) = file.set_len(original_len).and_then(|()| file.sync_data()) {
+            return Err(std::io::Error::new(
+                rollback_error.kind(),
+                format!(
+                    "{error}; also failed to roll the username log back to {original_len} bytes: {rollback_error}"
+                ),
+            ));
+        }
         return Err(error);
     }
     Ok(())
@@ -341,6 +350,18 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn existing_unreadable_log_shape_is_not_treated_as_empty() {
+        let dir = temp_data_dir("read-error");
+        fs::create_dir_all(dir.join(USERNAMES_LOG_FILE)).unwrap();
+
+        let error = UsernameRegistry::open(Some(dir.clone()), &[]).unwrap_err();
+
+        let _ = fs::remove_dir_all(&dir);
+        assert!(error.contains("failed to read"));
+        assert!(error.contains(USERNAMES_LOG_FILE));
     }
 
     fn explicit(id: u64, username: &str) -> UserConfig {

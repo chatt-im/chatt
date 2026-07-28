@@ -1725,12 +1725,13 @@ fn key_package_hash(package: &[u8]) -> [u8; 32] {
 }
 
 fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().try_into().unwrap_or(u64::MAX),
+        Err(error) => {
+            kvlog::warn!("system clock is before unix epoch for MLS", error = %error);
+            0
+        }
+    }
 }
 
 #[cfg(test)]
