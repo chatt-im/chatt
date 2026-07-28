@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "chatt"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "annotate-snippets 0.12.16",
  "aws-lc-rs",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "annotate-snippets 0.12.16",
  "aws-lc-rs",
