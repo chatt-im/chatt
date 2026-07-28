@@ -10,6 +10,7 @@ mod pairing;
 pub(crate) mod participants;
 pub(crate) mod room;
 pub(crate) mod room_settings;
+mod rpc_identity;
 mod rpc_settings;
 pub(crate) mod server;
 mod shared;
@@ -405,6 +406,7 @@ pub(crate) struct App {
     active_network_generation: Option<u64>,
     rpc_settings: Option<rpc_settings::RpcSettingsSession>,
     next_rpc_settings_session_id: u64,
+    rpc_identity: rpc_identity::RpcIdentityHub,
     appearance: appearance::AppearanceHub,
     pub room: CoreRw<RoomSession>,
     pub network: Option<NetworkClient>,
@@ -1382,6 +1384,7 @@ impl App {
             active_network_generation: None,
             rpc_settings: None,
             next_rpc_settings_session_id: 1,
+            rpc_identity: rpc_identity::RpcIdentityHub::default(),
             appearance: appearance::AppearanceHub::default(),
             room: CoreRw::new(room),
             network: None,
@@ -3247,6 +3250,7 @@ impl App {
         self.pending_dm_clients.clear();
         self.pending_identity_review.clear();
         self.open_e2e_reviews.clear();
+        self.rpc_identity.clear();
         self.pending_mutation_clients.clear();
         self.abandon_pending_web_history();
         self.supervisor.network.reset();
@@ -3267,6 +3271,7 @@ impl App {
         self.pending_dm_clients.clear();
         self.pending_identity_review.clear();
         self.open_e2e_reviews.clear();
+        self.rpc_identity.clear();
         self.broadcast_cancel_pending_edit();
         self.room.clear_e2e_trust_states();
         self.room.reset_for_disconnect();
@@ -4511,6 +4516,13 @@ impl App {
                     .collect();
                 for client_id in stale_clients {
                     self.open_e2e_reviews.remove(&client_id);
+                    if self.rpc_clients.contains(&client_id) {
+                        // Terminals read the outcome from the status line the
+                        // overlay leaves behind; renderers only see this reason.
+                        let reason = self.identity_review_outcome(client_id, &identity);
+                        self.rpc_identity.close(client_id, &reason);
+                        continue;
+                    }
                     self.send_terminal_event(
                         Audience::Client(client_id),
                         TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
@@ -5469,6 +5481,7 @@ impl App {
             self.rpc_server_selection_issue = None;
         }
         self.open_e2e_reviews.remove(&client_id);
+        self.rpc_identity.retire(client_id);
         for clients in self.pending_identity_review.values_mut() {
             clients.retain(|pending| *pending != client_id);
         }
@@ -7286,6 +7299,12 @@ impl App {
                 target.accepted.trust_level,
             ),
         );
+        // Native renderers get the same review as a pushed document; only
+        // terminals drive it through the overlay stack.
+        if self.rpc_clients.contains(&self.command_client) {
+            self.rpc_identity.open(self.command_client, &target, error);
+            return;
+        }
         let overlay = OverlaySpec::E2eIdentity(crate::client_channel::E2eIdentityOverlay {
             target,
             local_verification_text,

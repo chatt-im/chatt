@@ -56,6 +56,10 @@ pub(crate) struct SlashCommand {
     /// Whether the command is exposed to the web view; TUI-only commands
     /// (overlays, local view manipulation) stay false.
     pub(crate) web: bool,
+    /// Whether the command is exposed to native renderers over the local RPC.
+    /// A superset of `web`: a renderer can also drive the surfaces the daemon
+    /// projects for it, which the browser has no equivalent of.
+    pub(crate) rpc: bool,
 }
 
 pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
@@ -65,6 +69,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "list, link, recover, or revoke account devices",
         arg: SlashArg::FreeText("link|recovery|revoke DEVICE_ID"),
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/audio",
@@ -72,6 +77,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show receive and playback diagnostics",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/audio-reset",
@@ -79,6 +85,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "rebuild audio streams and re-scan devices",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/clear",
@@ -86,6 +93,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "clear the local chat view",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/config",
@@ -93,6 +101,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "open settings",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/deafen",
@@ -100,6 +109,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "stop playback and mute microphone send",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/deafened",
@@ -107,6 +117,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show deafen status",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/dm",
@@ -114,6 +125,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "open a direct message room with a user",
         arg: SlashArg::User,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/help",
@@ -121,6 +133,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show this command list",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/mute",
@@ -128,6 +141,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "mute microphone send",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/muted",
@@ -135,6 +149,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show microphone mute status",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/quit",
@@ -142,6 +157,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show the quit key hint",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/report-bug",
@@ -149,6 +165,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "send recent logs and diagnostics to the server",
         arg: SlashArg::FreeText("what went wrong"),
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/room",
@@ -156,6 +173,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "switch the viewed room by name",
         arg: SlashArg::Room,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/room-settings",
@@ -163,6 +181,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "open per-room download and persistence overrides",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/rooms",
@@ -170,6 +189,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "open the room switcher",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/servers",
@@ -177,6 +197,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "open the server list",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/settings",
@@ -184,6 +205,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "open settings",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/sound",
@@ -191,6 +213,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "play a soundboard clip",
         arg: SlashArg::Sound,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/soundboard",
@@ -198,6 +221,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "list soundboard clips",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/stats",
@@ -205,6 +229,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "toggle detailed lobby voice stats",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/identity",
@@ -212,6 +237,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "review, confirm, or forget a DM identity",
         arg: SlashArg::OptionalUser,
         web: false,
+        rpc: true,
     },
     SlashCommand {
         name: "/undeafen",
@@ -219,6 +245,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "resume playback and microphone send",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/unmute",
@@ -226,6 +253,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "unmute microphone send",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/upload",
@@ -233,6 +261,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "relay a file to room members",
         arg: SlashArg::FreeText("path/to/file.ext"),
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/upload-rate",
@@ -240,6 +269,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "throttle upload speed (bytes/s, K/M suffix, off)",
         arg: SlashArg::FreeText("200K|off"),
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/users",
@@ -247,6 +277,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show known room users",
         arg: SlashArg::None,
         web: false,
+        rpc: false,
     },
     SlashCommand {
         name: "/video",
@@ -254,6 +285,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show screen-share diagnostics",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/voice",
@@ -261,6 +293,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "join a room's voice call (default: the viewed room)",
         arg: SlashArg::Room,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/voice-leave",
@@ -268,6 +301,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "leave the voice call",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
     SlashCommand {
         name: "/whoami",
@@ -275,6 +309,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show the current authenticated user",
         arg: SlashArg::None,
         web: true,
+        rpc: true,
     },
 ];
 
@@ -288,9 +323,9 @@ pub(crate) fn web_commands() -> impl Iterator<Item = &'static SlashCommand> {
     SLASH_COMMANDS.iter().filter(|command| command.web)
 }
 
-/// The commands safe to expose to non-terminal frontends.
+/// The commands safe to expose to native renderers.
 pub(crate) fn frontend_commands() -> impl Iterator<Item = &'static SlashCommand> {
-    web_commands()
+    SLASH_COMMANDS.iter().filter(|command| command.rpc)
 }
 
 pub(crate) fn frontend_command_catalog() -> Vec<local_rpc::model::CommandInfo> {
@@ -312,7 +347,7 @@ pub(crate) fn frontend_command_gate(first_token: &str) -> Result<(), String> {
     let Some(command) = find_command(first_token) else {
         return Err(format!("unknown command: {first_token}"));
     };
-    if !command.web {
+    if !command.rpc {
         return Err(format!("{first_token} is not available from this frontend"));
     }
     Ok(())
@@ -732,8 +767,16 @@ mod tests {
     fn frontend_catalog_is_sorted_and_preserves_argument_metadata() {
         let catalog = frontend_command_catalog();
         assert!(catalog.windows(2).all(|pair| pair[0].name < pair[1].name));
-        assert_eq!(catalog.len(), web_commands().count());
+        assert_eq!(catalog.len(), frontend_commands().count());
         assert!(catalog.iter().all(|command| command.validate().is_ok()));
+        // Native renderers get everything the browser does, plus the commands
+        // that drive a daemon-projected surface the browser cannot render.
+        assert!(web_commands().all(|command| command.rpc), "{catalog:?}");
+        let identity = catalog
+            .iter()
+            .find(|command| command.name == "/identity")
+            .expect("renderers can open an identity review");
+        assert_eq!(identity.arg, local_rpc::model::CommandArgKind::User);
 
         let room = catalog
             .iter()

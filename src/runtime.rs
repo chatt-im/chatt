@@ -60,6 +60,7 @@ struct RemoteRpcClient {
     next_settings_audio_event_at: Instant,
     last_settings_audio_runtime: Option<local_rpc::settings::AudioRuntimeState>,
     appearance_generation: u64,
+    identity_generation: u64,
 }
 
 struct AttachmentStreamControl {
@@ -409,6 +410,7 @@ impl RpcClientSender {
             DaemonFrame::LiveShareOpened { request_id, .. } => Some(*request_id),
             DaemonFrame::AttachmentSourceOpened { request_id, .. } => Some(*request_id),
             DaemonFrame::SettingsResult(result) => Some(result.result.request_id),
+            DaemonFrame::IdentityResult(result) => Some(result.result.request_id),
             _ => None,
         };
         if let Some(request_id) = request_id {
@@ -435,6 +437,8 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::SettingsResult(_) => "settings_result",
         DaemonFrame::SettingsEvent(_) => "settings_event",
         DaemonFrame::Appearance(_) => "appearance",
+        DaemonFrame::IdentityResult(_) => "identity_result",
+        DaemonFrame::IdentityEvent(_) => "identity_event",
     }
 }
 
@@ -591,6 +595,7 @@ fn run_app_inner(
         dirty |= app.tick();
         broadcast_rpc_settings_events(&app, &mut rpc_clients, Instant::now());
         broadcast_rpc_appearance_events(&app, &mut rpc_clients);
+        broadcast_rpc_identity_events(&mut app, &mut rpc_clients);
 
         let quit = (!headless && app.take_quit_requested()) || polling::termination_requested();
         wait_timeout = app.next_tick_timeout(Instant::now());
@@ -975,6 +980,7 @@ fn spawn_rpc_client(
         next_settings_audio_event_at: Instant::now(),
         last_settings_audio_runtime: None,
         appearance_generation: 0,
+        identity_generation: 0,
     })
 }
 
@@ -1520,6 +1526,18 @@ fn handle_rpc_command(
             }
             return;
         }
+        local_rpc::frame::ClientFrame::Identity {
+            request_id,
+            command,
+        } => {
+            let result = app.handle_rpc_identity(id, request_id, command);
+            if let Some(client) = clients.get_mut(&id) {
+                client
+                    .sender
+                    .send_or_abort(&DaemonFrame::IdentityResult(result));
+            }
+            return;
+        }
         local_rpc::frame::ClientFrame::StartLiveShare {
             request_id,
             stream_id,
@@ -1839,6 +1857,24 @@ fn broadcast_rpc_appearance_events(app: &App, clients: &mut HashMap<ClientId, Re
         let event = app.rpc_appearance_event();
         if client.sender.send_or_abort(&DaemonFrame::Appearance(event)) {
             client.appearance_generation = generation;
+        }
+    }
+}
+
+/// Hands each renderer the identity review it has not seen yet. Opening a
+/// review needs a server round trip, so the document always arrives this way
+/// rather than as the reply to `Open`.
+fn broadcast_rpc_identity_events(app: &mut App, clients: &mut HashMap<ClientId, RemoteRpcClient>) {
+    for (id, client) in clients.iter_mut() {
+        let Some((generation, event)) = app.rpc_identity_event(*id, client.identity_generation)
+        else {
+            continue;
+        };
+        if client
+            .sender
+            .send_or_abort(&DaemonFrame::IdentityEvent(event))
+        {
+            client.identity_generation = generation;
         }
     }
 }

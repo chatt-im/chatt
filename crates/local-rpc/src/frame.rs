@@ -6,6 +6,7 @@ use crate::ids::{FileTransferId, MessageId, RoomId, StreamId};
 use super::{
     appearance::{AppearanceCommand, AppearanceEvent},
     bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished},
+    identity::{IdentityCommand, IdentityEvent, IdentityResult},
     model::{
         AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo,
         CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, Message, Participant,
@@ -176,6 +177,11 @@ pub enum Operation {
     PreviewAppearance,
     CommitAppearance,
     EndAppearancePreview,
+    OpenIdentity,
+    CheckIdentityText,
+    VerifyIdentity,
+    ForgetIdentity,
+    CloseIdentity,
 }
 
 impl Encode for Operation {
@@ -215,6 +221,11 @@ impl Encode for Operation {
             Self::PreviewAppearance => "preview-appearance",
             Self::CommitAppearance => "commit-appearance",
             Self::EndAppearancePreview => "end-appearance-preview",
+            Self::OpenIdentity => "open-identity",
+            Self::CheckIdentityText => "check-identity-text",
+            Self::VerifyIdentity => "verify-identity",
+            Self::ForgetIdentity => "forget-identity",
+            Self::CloseIdentity => "close-identity",
         };
         value.encode_log_value_into(output);
     }
@@ -447,6 +458,10 @@ pub enum ClientFrame {
         request_id: RequestId,
         command: AppearanceCommand,
     },
+    Identity {
+        request_id: RequestId,
+        command: IdentityCommand,
+    },
 }
 
 impl ClientFrame {
@@ -479,7 +494,8 @@ impl ClientFrame {
             | Self::RequestSnapshot { request_id }
             | Self::Disconnect { request_id }
             | Self::Settings { request_id, .. }
-            | Self::Appearance { request_id, .. } => Some(*request_id),
+            | Self::Appearance { request_id, .. }
+            | Self::Identity { request_id, .. } => Some(*request_id),
             Self::UploadChunk(_) => None,
         }
     }
@@ -536,6 +552,8 @@ pub enum DaemonFrame {
     SettingsResult(SettingsResult),
     SettingsEvent(SettingsEvent),
     Appearance(AppearanceEvent),
+    IdentityResult(IdentityResult),
+    IdentityEvent(IdentityEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -831,6 +849,7 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         }
         ClientFrame::Settings { command, .. } => command.validate()?,
         ClientFrame::Appearance { command, .. } => command.validate()?,
+        ClientFrame::Identity { command, .. } => command.validate()?,
         _ => {}
     }
     Ok(())
@@ -957,6 +976,8 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::SettingsResult(result) => result.validate(),
         DaemonFrame::SettingsEvent(event) => event.validate(),
         DaemonFrame::Appearance(event) => event.validate(),
+        DaemonFrame::IdentityResult(result) => result.validate(),
+        DaemonFrame::IdentityEvent(event) => event.validate(),
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
         | DaemonFrame::AttachmentSourceOpened { .. } => Ok(()),

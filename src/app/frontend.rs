@@ -75,8 +75,7 @@ impl App {
         let Some(fallback_room) = self.room.viewed_room else {
             return;
         };
-        let clients = self.rpc_clients.iter().copied().collect::<Vec<_>>();
-        for client_id in clients {
+        for &client_id in &self.rpc_clients {
             let selection_is_accessible = self
                 .room
                 .selected_room_for(client_id)
@@ -463,6 +462,15 @@ impl App {
                 command.operation(),
                 500,
                 "appearance command bypassed runtime dispatch",
+            )),
+            ClientFrame::Identity {
+                request_id,
+                command,
+            } => RpcCommandEffect::Reply(rejected(
+                request_id,
+                command.operation(),
+                500,
+                "identity command bypassed runtime dispatch",
             )),
             ClientFrame::RunCommand { request_id, body } => {
                 let room_id = self.room.selected_room_for(client_id);
