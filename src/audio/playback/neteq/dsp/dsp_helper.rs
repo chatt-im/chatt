@@ -212,11 +212,7 @@ pub(crate) fn peak_detection(
 
         let (min_index, max_index) = if i != num_peaks - 1 {
             (
-                if peak_index[i] > 2 {
-                    peak_index[i] - 2
-                } else {
-                    0
-                },
+                peak_index[i].saturating_sub(2),
                 (data_length - 1).min(peak_index[i] + 2),
             )
         } else {

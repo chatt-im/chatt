@@ -89,6 +89,9 @@ enum PairingState {
     },
 }
 
+// Inputs are consumed immediately by `handle`; boxing the large start job
+// would add an allocation without reducing retained state.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum PairingInput {
     StartDevicePrompt {
         owner: ClientId,
@@ -554,10 +557,9 @@ impl PairingCoordinator {
         let previous = app.config.servers.clone();
         let result = validate_server_entry(&pending.server).and_then(|()| {
             app.config.upsert_server(pending.server.clone());
-            app.config.save_runtime().map(|path| {
+            app.config.save_runtime().inspect(|path| {
                 app.config.config_path = Some(path.clone());
                 app.rebuild_server_items();
-                path
             })
         });
         if close_overlay {

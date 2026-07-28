@@ -1953,8 +1953,7 @@ fn live_playback_callback<T>(
         Some(resampler) => {
             let source_block = resampler.source_block_samples(output_frames);
             mixer.note_device_callback_frames(source_block);
-            let mut device_frame_index = 0usize;
-            for frame in output.chunks_mut(channels.get()) {
+            for (device_frame_index, frame) in output.chunks_mut(channels.get()).enumerate() {
                 let sample = resampler.next_sample(|block| {
                     let block_start = now + callback_period(device_frame_index, device_rate);
                     let block: &mut [f32; MIX_FRAME_SAMPLES] = block
@@ -1975,7 +1974,6 @@ fn live_playback_callback<T>(
                 for channel in frame {
                     *channel = output_sample;
                 }
-                device_frame_index += 1;
             }
         }
         None => {

@@ -1376,7 +1376,7 @@ impl NetEqCore {
                 // No history to extrapolate from: emit silence to make progress.
                 self.sync_buffer.push_back_zeros(OUTPUT_SIZE_SAMPLES);
             } else {
-                self.sync_buffer.push_back(&out);
+                self.sync_buffer.push_back(out);
             }
             self.last_mode = Mode::Expand;
             guard += 1;
@@ -1799,7 +1799,7 @@ mod tests {
         }
         // Resume the clip. The capture media timestamp advanced across silence,
         // so the new packet's timestamp leaps forward by the silence duration.
-        ts = ts.wrapping_add(30 * SAMPLE_RATE as u32);
+        ts = ts.wrapping_add(30 * SAMPLE_RATE);
         let mut max_resume = 0u64;
         for _ in 0..100u32 {
             let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);

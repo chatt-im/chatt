@@ -43,6 +43,9 @@ categories = [
 license = "MIT"
 repository = "https://gitlab.freedesktop.org/pipewire/pipewire-rs"
 
+[lints]
+workspace = true
+
 [package.metadata.system-deps.libspa]
 name = "libspa-0.2"
 version = "0.2"

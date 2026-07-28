@@ -11,7 +11,9 @@ use crate::audio::{
 /// Audio no longer crosses this channel at all: the consumer pulls each voice
 /// stream's NetEQ directly or drains its assisted render ring. Only stream
 /// lifecycle and mute/gain cross here.
+#[derive(Default)]
 pub(crate) enum LivePlaybackMixerEvent {
+    #[default]
     Empty,
     /// Registers a new stream and hands the consumer its audio source.
     EnsureStream {
@@ -58,12 +60,6 @@ pub(crate) enum MixerStreamSource {
 impl From<Arc<SampleRing>> for MixerStreamSource {
     fn from(ring: Arc<SampleRing>) -> Self {
         Self::Ring(ring)
-    }
-}
-
-impl Default for LivePlaybackMixerEvent {
-    fn default() -> Self {
-        Self::Empty
     }
 }
 

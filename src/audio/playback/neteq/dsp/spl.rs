@@ -305,13 +305,13 @@ pub(crate) fn levinson_durbin(r: &[i32], a: &mut [i16], k: &mut [i16], order: us
     let norm = norm_w32(r[0]);
 
     for i in 0..=order {
-        let temp1 = (r[i] as i32).wrapping_mul(1 << norm);
+        let temp1 = r[i].wrapping_mul(1 << norm);
         r_hi[i] = (temp1 >> 16) as i16;
         r_low[i] = ((temp1 - ((r_hi[i] as i32) * 65536)) >> 1) as i16;
     }
 
     // K = A[1] = -R[1] / R[0].
-    let temp2 = (r[1] as i32).wrapping_mul(1 << norm);
+    let temp2 = r[1].wrapping_mul(1 << norm);
     let temp3 = abs_w32(temp2);
     let mut temp1 = div_w32_hi_low(temp3, r_hi[0], r_low[0]);
     if temp2 > 0 {
@@ -422,10 +422,8 @@ pub(crate) fn levinson_durbin(r: &[i32], a: &mut [i16], k: &mut [i16], order: us
         alpha_low = ((temp1 - ((alpha_hi as i32) << 16)) >> 1) as i16;
         alpha_exp += norm;
 
-        for j in 1..=i {
-            a_hi[j] = a_upd_hi[j];
-            a_low[j] = a_upd_low[j];
-        }
+        a_hi[1..=i].copy_from_slice(&a_upd_hi[1..=i]);
+        a_low[1..=i].copy_from_slice(&a_upd_low[1..=i]);
     }
 
     a[0] = 4096;

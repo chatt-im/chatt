@@ -3,9 +3,11 @@ name = "darkhttp"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 libc = "0.2.186"
 
 [dev-dependencies]
 ureq = { version = "3.3.0", default-features = false }
-

@@ -145,8 +145,7 @@ fn video_frame_meta(frame: &[u8]) -> Option<(u32, bool)> {
         return None;
     }
     let size = u32::from_le_bytes(frame[0..4].try_into().ok()?) as usize;
-    if size < video::VIDEO_FRAME_HEADER_LEN
-        || size > video::MAX_VIDEO_FRAME_LEN
+    if !(video::VIDEO_FRAME_HEADER_LEN..=video::MAX_VIDEO_FRAME_LEN).contains(&size)
         || size != frame.len()
     {
         return None;
@@ -312,13 +311,13 @@ impl WebMessage {
         local_user: Option<UserId>,
         unverified: bool,
     ) -> Self {
-        let file_id = Some(transfer_id.0);
+        let file_id = transfer_id.0;
         // Rebuild the body from the served name rather than reusing the stored
         // announcement, which carries the sender's original name; the live view
         // does the same in `from_file` so a reload reads identically.
         let body = file_announcement_body(served_name, size);
         WebMessage {
-            id: file_id.unwrap_or(message.message_id.0),
+            id: file_id,
             sender: message.sender_name.clone(),
             body: body.clone(),
             local: Some(message.sender) == local_user,
@@ -332,7 +331,7 @@ impl WebMessage {
                 served_name,
                 dimensions,
             )),
-            file_id,
+            file_id: Some(file_id),
             message_id: message.message_id.0,
             ref_code: chat_ref_code(message),
         }
@@ -1923,9 +1922,8 @@ fn run(
         // without relying on another wake.
         let mut batch_full = true;
         for _ in 0..WEB_FEED_BATCH {
-            match rx.try_recv().map(|feed| {
-                release_queued_feed(&feed, &queued_video_bytes, &queued_history_bytes);
-                feed
+            match rx.try_recv().inspect(|feed| {
+                release_queued_feed(feed, &queued_video_bytes, &queued_history_bytes);
             }) {
                 Ok(WebFeed::Message {
                     room_id,

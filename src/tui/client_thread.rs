@@ -49,7 +49,7 @@ fn time_dirty_sections(
 }
 
 pub(crate) enum InitialMode {
-    Welcome(WelcomeMode),
+    Welcome(Box<WelcomeMode>),
     Room,
     Servers,
 }
@@ -108,7 +108,7 @@ impl ClientThread {
         let mut url_open_command = config.read().url_open.clone();
 
         let root: Box<dyn AppMode> = match initial_mode {
-            InitialMode::Welcome(mode) => Box::new(mode),
+            InitialMode::Welcome(mode) => mode,
             InitialMode::Room => Box::new(RoomMode::default()),
             InitialMode::Servers => Box::new(ServerListMode::new()),
         };

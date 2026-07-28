@@ -3530,10 +3530,10 @@ impl MessageLayout {
             style = style.patch(self.syntax.string);
         }
         if bold {
-            style = style | Modifier::BOLD;
+            style |= Modifier::BOLD;
         }
         if italic {
-            style = style | Modifier::ITALIC;
+            style |= Modifier::ITALIC;
         }
         style
     }

@@ -1,6 +1,5 @@
 use std::{
     cell::UnsafeCell,
-    mem,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -50,7 +49,7 @@ impl<T> SpscSwapQueue<T> {
         // SAFETY: only the producer writes `next_write_index`, and the acquire
         // load above proved this slot is not currently owned by the consumer.
         unsafe {
-            mem::swap(input, &mut *self.slots[index].get());
+            core::ptr::swap(input, self.slots[index].get());
         }
 
         self.num_elements.fetch_add(1, Ordering::Release);
@@ -68,7 +67,7 @@ impl<T> SpscSwapQueue<T> {
         // SAFETY: only the consumer writes `next_read_index`, and the acquire
         // load above proved this slot contains a producer-published value.
         unsafe {
-            mem::swap(output, &mut *self.slots[index].get());
+            core::ptr::swap(output, self.slots[index].get());
         }
 
         self.num_elements.fetch_sub(1, Ordering::Release);

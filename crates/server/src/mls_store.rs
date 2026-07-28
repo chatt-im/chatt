@@ -103,6 +103,9 @@ pub(super) struct LoadedState {
 }
 
 #[derive(Debug)]
+// Stored applications are the common path; boxing their room/event payload
+// would add an allocation to every accepted MLS message.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum AppendApplicationResult {
     Stored {
         sequence: u64,
@@ -1692,6 +1695,7 @@ impl Persistence {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
             .map_err(|error| format!("failed to open {}: {error}", lock_path.display()))?;
         lock_store(&lock, &lock_path)?;

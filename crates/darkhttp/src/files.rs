@@ -70,9 +70,8 @@ fn resolve_path(task: &FileTask) -> ResolveResult {
     }
 
     if task.kind == MountKind::StaticDir {
-        if task.relative_path.is_empty() || task.relative_path.ends_with('/') {
-            candidate.push("index.html");
-        } else if candidate.is_dir() {
+        if task.relative_path.is_empty() || task.relative_path.ends_with('/') || candidate.is_dir()
+        {
             candidate.push("index.html");
         }
     } else if task.relative_path.is_empty()

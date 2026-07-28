@@ -55,9 +55,9 @@ fn now_unix() -> libc::time_t {
 }
 
 fn format_http_date(when: libc::time_t) -> HttpDate {
-    let mut when_copy = when;
+    let when_copy = when;
     let mut tm: libc::tm = unsafe { mem::zeroed() };
-    let tm_ptr = unsafe { libc::gmtime_r(&mut when_copy, &mut tm) };
+    let tm_ptr = unsafe { libc::gmtime_r(&when_copy, &mut tm) };
     if tm_ptr.is_null() {
         return HttpDate {
             bytes: [0; 64],

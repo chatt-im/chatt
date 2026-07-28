@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 default-run = "benchmark"
 
+[lints]
+workspace = true
+
 [dependencies]
 aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
 jsony_bench = { rev = "04560c1f91ccbd3e2f3f21cfc9191142fbab5c7c", git = "https://github.com/exrok/jsony" }

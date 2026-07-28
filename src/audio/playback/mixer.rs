@@ -714,6 +714,9 @@ impl LivePlaybackMixer {
     }
 }
 
+// `then_some` would build a full diagnostic record on every callback even
+// when callback recording is disabled.
+#[allow(clippy::unnecessary_lazy_evaluations)]
 fn render_stream_10ms(
     stream: &mut ConsumerStream,
     now: Instant,
@@ -765,6 +768,9 @@ fn render_stream_10ms(
     }
 }
 
+// `then_some` would build a full diagnostic record on every callback even
+// when callback recording is disabled.
+#[allow(clippy::unnecessary_lazy_evaluations)]
 fn render_neteq_stream_10ms(
     source: &mut NetEqConsumerSource,
     now: Instant,
@@ -898,21 +904,22 @@ fn render_assisted_neteq_10ms(
     muted: bool,
     out: &mut [f32; MIX_FRAME_SAMPLES],
 ) -> Option<(bool, usize, usize)> {
-    let span = source.render_reader.readable_span();
-    let ring_depth_before = span.len();
-    if ring_depth_before < MIX_FRAME_SAMPLES {
-        drop(span);
-        return None;
-    }
+    let ring_depth_before = {
+        let span = source.render_reader.readable_span();
+        let ring_depth_before = span.len();
+        if ring_depth_before < MIX_FRAME_SAMPLES {
+            return None;
+        }
 
-    let (first, second) = span.slices();
-    let first_len = first.len().min(MIX_FRAME_SAMPLES);
-    out[..first_len].copy_from_slice(&first[..first_len]);
-    if first_len < MIX_FRAME_SAMPLES {
-        let remaining = MIX_FRAME_SAMPLES - first_len;
-        out[first_len..].copy_from_slice(&second[..remaining]);
-    }
-    drop(span);
+        let (first, second) = span.slices();
+        let first_len = first.len().min(MIX_FRAME_SAMPLES);
+        out[..first_len].copy_from_slice(&first[..first_len]);
+        if first_len < MIX_FRAME_SAMPLES {
+            let remaining = MIX_FRAME_SAMPLES - first_len;
+            out[first_len..].copy_from_slice(&second[..remaining]);
+        }
+        ring_depth_before
+    };
     source.render_reader.advance(MIX_FRAME_SAMPLES);
     source.source.assist.note_mixed_block();
     let ring_depth_after = source.source.render_ring.depth();
@@ -1020,32 +1027,33 @@ fn render_ring_stream_10ms(
 ) -> bool {
     out.fill(0.0);
     let declick_step = 1.0 / LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES as f32;
-    let span = reader.readable_span();
-    let covered = span.len().min(MIX_FRAME_SAMPLES);
-    let mut normal = false;
-    for (offset, dst) in out.iter_mut().enumerate() {
-        let sample = if offset < covered {
-            let sample = span.get(offset).unwrap_or(0.0);
-            *last_sample = sample;
-            sample
-        } else {
-            *last_sample
-        };
-        let target = if !muted && offset < covered { 1.0 } else { 0.0 };
-        if *declick_gain < target {
-            *declick_gain = (*declick_gain + declick_step).min(target);
-        } else if *declick_gain > target {
-            *declick_gain = (*declick_gain - declick_step).max(target);
+    // Keep the borrowed span inside this scope so it is gone before `advance`
+    // publishes the freed slots to the producer.
+    let (covered, normal) = {
+        let span = reader.readable_span();
+        let covered = span.len().min(MIX_FRAME_SAMPLES);
+        let mut normal = false;
+        for (offset, dst) in out.iter_mut().enumerate() {
+            let sample = if offset < covered {
+                let sample = span.get(offset).unwrap_or(0.0);
+                *last_sample = sample;
+                sample
+            } else {
+                *last_sample
+            };
+            let target = if !muted && offset < covered { 1.0 } else { 0.0 };
+            if *declick_gain < target {
+                *declick_gain = (*declick_gain + declick_step).min(target);
+            } else if *declick_gain > target {
+                *declick_gain = (*declick_gain - declick_step).max(target);
+            }
+            if *declick_gain > 0.0 {
+                *dst = sample * gain * smoothstep(*declick_gain);
+                normal = true;
+            }
         }
-        if *declick_gain > 0.0 {
-            *dst = sample * gain * smoothstep(*declick_gain);
-            normal = true;
-        }
-    }
-    // Drop the span before releasing samples: its `&[f32]` into the ring must die
-    // before `advance` publishes the freed read cursor, or the producer could
-    // overwrite still-borrowed slots.
-    drop(span);
+        (covered, normal)
+    };
     reader.advance(covered);
     normal
 }

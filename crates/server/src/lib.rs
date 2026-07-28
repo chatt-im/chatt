@@ -762,6 +762,17 @@ enum PendingIdentity {
     },
 }
 
+struct MlsCommitWriteSuccess {
+    outcome: rpc::mls::MlsCommitOutcome,
+    room: Option<mls_store::RoomRecord>,
+    push: Option<MlsCommitPush>,
+}
+
+struct MlsCommitPush {
+    batch: mls_store::EventBatch,
+    welcome_deliveries: Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>,
+}
+
 enum MlsReply {
     RosterStored {
         token: Token,
@@ -779,17 +790,7 @@ enum MlsReply {
     CommitSubmitted {
         token: Token,
         room_id: RoomId,
-        result: Result<
-            (
-                rpc::mls::MlsCommitOutcome,
-                Option<mls_store::RoomRecord>,
-                Option<(
-                    mls_store::EventBatch,
-                    Vec<(DeviceId, Vec<rpc::mls::MlsWelcome>, u64)>,
-                )>,
-            ),
-            String,
-        >,
+        result: Result<MlsCommitWriteSuccess, String>,
     },
     DeviceLinkRedeemed {
         token: Token,
@@ -1071,7 +1072,7 @@ impl MlsWorker {
                     Ok(RoomCreationReply::Created {
                         epoch,
                         room: service.cached_room(room_id).expect("created room cache"),
-                        deliveries: collect_latest_welcomes(&service, &welcome_devices)?,
+                        deliveries: collect_latest_welcomes(service, &welcome_devices)?,
                     })
                 })();
                 events.push(MlsReply::RoomCreated {
@@ -1105,15 +1106,26 @@ impl MlsWorker {
                             _ => None,
                         };
                         let room = accepted.and_then(|_| service.cached_room(room_id));
-                        let pushed = if let Some(sequence) = accepted {
-                            Some((
-                                service.event_batch(room_id, sequence.saturating_sub(1), 1)?,
-                                collect_latest_welcomes(&service, &welcome_devices)?,
-                            ))
+                        let push = if let Some(sequence) = accepted {
+                            Some(MlsCommitPush {
+                                batch: service.event_batch(
+                                    room_id,
+                                    sequence.saturating_sub(1),
+                                    1,
+                                )?,
+                                welcome_deliveries: collect_latest_welcomes(
+                                    service,
+                                    &welcome_devices,
+                                )?,
+                            })
                         } else {
                             None
                         };
-                        Ok((outcome, room, pushed))
+                        Ok(MlsCommitWriteSuccess {
+                            outcome,
+                            room,
+                            push,
+                        })
                     });
                 events.push(MlsReply::CommitSubmitted {
                     token,
@@ -1186,6 +1198,9 @@ impl MlsWorker {
             } => {
                 let result = (|| {
                     let status = service.storage_status()?;
+                    // The branch spells out the zero-allocation case more
+                    // directly than wrapping the division in an Option.
+                    #[allow(clippy::manual_checked_ops)]
                     let percent = if status.allocated_bytes == 0 {
                         0
                     } else {
@@ -2935,10 +2950,10 @@ impl Server {
         if owner_session == session_id {
             return Err("share owner does not need viewer access".to_string());
         }
-        if !self
+        if self
             .sessions
             .get(&session_id)
-            .is_some_and(|session| session.voice_room == Some(room_id))
+            .is_none_or(|session| session.voice_room != Some(room_id))
         {
             return Err("viewer is not in the share's voice room".to_string());
         }
@@ -5867,7 +5882,12 @@ impl Server {
                     room_id,
                     result,
                 } => {
-                    let result = result.and_then(|(outcome, room, pushed)| {
+                    let result = result.and_then(|success| {
+                        let MlsCommitWriteSuccess {
+                            outcome,
+                            room,
+                            push,
+                        } = success;
                         if let Some(room) = room {
                             self.mls.install_cached_room(room);
                         }
@@ -5878,8 +5898,12 @@ impl Server {
                                 outcome: outcome.clone(),
                             },
                         )?;
-                        if let Some((batch, deliveries)) = pushed {
-                            self.push_mls_welcome_deliveries(deliveries);
+                        if let Some(MlsCommitPush {
+                            batch,
+                            welcome_deliveries,
+                        }) = push
+                        {
+                            self.push_mls_welcome_deliveries(welcome_deliveries);
                             let tokens = self.mls_room_tokens(room_id);
                             self.send_control_to_tokens(
                                 &tokens,
@@ -8461,6 +8485,9 @@ enum Close {
 
 /// One inbound control-channel frame, parsed and decrypted in place in the
 /// connection's receive buffer by [`control_conn_step`].
+// Boxing `ClientControl` would add an allocation to every decoded control
+// frame on this hot path.
+#[allow(clippy::large_enum_variant)]
 enum ControlStep {
     Hello(control::ClientHello),
     Control(ClientControl),

@@ -147,3 +147,23 @@ debug = "full"
 [patch.crates-io]
 libspa-sys.path = "crates/libspa-sys"
 pipewire-sys.path = "crates/pipewire-sys"
+
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+collapsible_if = "allow" # Let-chains often obscure the staged checks in stateful code.
+field_reassign_with_default = "allow" # Defaults plus focused overrides are clearer for config and fixtures.
+items_after_test_module = "allow" # Inline tests should not dictate production item ordering.
+manual_is_multiple_of = "allow" # Modulo directly expresses protocol alignment, parity, and cadence checks.
+manual_range_patterns = "allow" # Protocol discriminants are clearer as explicit values.
+needless_return = "allow" # Explicit returns clarify exits from event and state-machine branches.
+question_mark = "allow" # Try expansion introduces code bloat.
+single_range_in_vec_init = "allow" # One range is a valid initial state for a mutable range collection.
+needless_range_loop = "allow" # Iterators can generate more code and perform worse in numeric loops.
+needless_borrows_for_generic_args = "allow" # Consistently borrowing can reduce monomorphization.
+manual_find = "allow" # A manual loop can be clearer and avoids iterator compile-time cost.
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mls_build_async)'] }

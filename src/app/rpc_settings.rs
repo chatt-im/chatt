@@ -378,6 +378,9 @@ impl App {
         )
     }
 
+    // A rejection is already the final wire response; boxing it here would
+    // allocate only for callers to immediately unpack it.
+    #[allow(clippy::result_large_err)]
     fn require_rpc_settings_owner(
         &self,
         owner: ClientId,

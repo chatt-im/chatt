@@ -9,6 +9,9 @@ license = "BSD-3-Clause"
 description = "Audio denoising derived from Xiph's RNNoise (vendored fork with tunable suppression)"
 publish = false
 
+[lints]
+workspace = true
+
 [features]
 default = []
 # Compile the bundled RNNoise objects with AVX2/FMA and skip runtime CPU

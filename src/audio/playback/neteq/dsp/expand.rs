@@ -480,7 +480,7 @@ impl Expand {
 
         let mut correlation_length = 51usize;
         let mut correlation_vector = [0i16; 54];
-        Self::correlation(&audio_history, SIGNAL_LENGTH, &mut correlation_vector);
+        Self::correlation(audio_history, SIGNAL_LENGTH, &mut correlation_vector);
 
         let mut best_correlation_index = [0usize; NUM_CORRELATION_CANDIDATES];
         let mut best_correlation = [0i16; NUM_CORRELATION_CANDIDATES];
@@ -504,7 +504,7 @@ impl Expand {
             let min_index = fs_mult_20.max(best_correlation_index[i] - fs_mult_4);
             let max_index = (fs_mult_120 - 1).min(best_correlation_index[i] + fs_mult_4);
             let (idx, dist) = dsp_helper::min_distortion(
-                &audio_history,
+                audio_history,
                 dist_base,
                 min_index,
                 max_index,
@@ -568,7 +568,7 @@ impl Expand {
         spl::cross_correlation_at(
             correlation_vector2,
             &audio_history[SIGNAL_LENGTH - correlation_length..],
-            &audio_history,
+            audio_history,
             (SIGNAL_LENGTH - correlation_length - start_index) as isize,
             correlation_length,
             correlation_lags,
@@ -665,7 +665,7 @@ impl Expand {
             self.expand_lags[2] = if distortion_lag > correlation_lag {
                 (distortion_lag + correlation_lag - 1) / 2
             } else {
-                (distortion_lag + correlation_lag + 1) / 2
+                (distortion_lag + correlation_lag).div_ceil(2)
             };
         }
 

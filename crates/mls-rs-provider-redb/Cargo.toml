@@ -9,6 +9,9 @@ repository = "https://github.com/awslabs/mls-rs"
 keywords = ["mls", "mls-rs", "redb"]
 license = "Apache-2.0 OR MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 mls-rs-core = { path = "../mls-rs-core", default-features = false, features = ["std"] }
 redb = "4.1"
@@ -23,6 +26,3 @@ mls-rs-crypto-awslc = { path = "../mls-rs-crypto-awslc", default-features = fals
     "curve25519-aes128-only",
 ] }
 tempfile = "3"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mls_build_async)'] }

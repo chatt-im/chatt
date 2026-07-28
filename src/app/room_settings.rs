@@ -363,7 +363,7 @@ fn room_settings_ui(
             "Limit",
             values.receive_limit,
             Some(values.inherited_receive_limit),
-            |value| mb_limit_error(value),
+            mb_limit_error,
         )
         .is_focus()
     {

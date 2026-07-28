@@ -318,7 +318,7 @@ impl ClientView {
 
         let final_grapheme = text
             .grapheme_indices(true)
-            .last()
+            .next_back()
             .map_or(0, |(offset, _)| offset as u32);
         self.composer
             .set_cursor_offset(insertion.saturating_add(final_grapheme));

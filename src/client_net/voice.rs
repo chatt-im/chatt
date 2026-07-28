@@ -405,7 +405,6 @@ fn voice_sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
 /// A `rate` of `0` disables pacing: [`budget`](Self::budget) is unbounded and the
 /// other operations are no-ops. Otherwise tokens accrue at `rate` bytes per
 /// second, capped at one second's worth so a poll loop that parked between
-
 pub(super) struct PeerConnection {
     pub(super) user_id: UserId,
     pub(super) agent: TraversalAgent,
@@ -824,6 +823,8 @@ impl VoiceCommandSubmission {
         }
     }
 
+    // Rejection returns the unsent command so the caller retains ownership.
+    #[allow(clippy::result_large_err)]
     fn submit(&self, command: VoiceCommand) -> Result<(), VoiceCommand> {
         if self.closed.load(Ordering::Acquire) {
             return Err(command);
@@ -1238,6 +1239,8 @@ impl VoiceControl {
             .map_err(|_| "client voice session is unavailable".to_string())
     }
 
+    // Preserve the mailbox API's recoverable unsent command.
+    #[allow(clippy::result_large_err)]
     pub(super) fn submit(&self, command: VoiceCommand) -> Result<(), VoiceCommand> {
         self.commands.submit(command)
     }

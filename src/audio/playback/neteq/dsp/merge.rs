@@ -229,11 +229,7 @@ fn downsample(
     );
 
     if input_length <= length_limit {
-        let temp_len = if input_length > signal_offset {
-            input_length - signal_offset
-        } else {
-            0
-        };
+        let temp_len = input_length.saturating_sub(signal_offset);
         let downsamp_temp_len = temp_len / decimation_factor;
         if downsamp_temp_len > 0 {
             spl::downsample_fast(
@@ -301,11 +297,7 @@ fn correlate_and_peak_search(
 
     let mut start_index = TIMESTAMPS_PER_CALL + OVERLAP_LENGTH;
     start_index = start_position.max(start_index);
-    start_index = if input_length > start_index {
-        0
-    } else {
-        start_index - input_length
-    };
+    start_index = start_index.saturating_sub(input_length);
     let start_index_downsamp = start_index / (FS_MULT * 2);
     let modified_stop_pos =
         stop_position_downsamp.min(MAX_CORRELATION_LENGTH + pad_length - start_index_downsamp);

@@ -985,9 +985,11 @@ pub(crate) fn run_live_audio_simulation_inner(
         scenario: config.scenario.as_name(),
         ..Default::default()
     };
-    let mut output_samples = collect_output
-        .then(|| Vec::with_capacity(total_callbacks.saturating_mul(output_block_samples)))
-        .unwrap_or_default();
+    let mut output_samples = if collect_output {
+        Vec::with_capacity(total_callbacks.saturating_mul(output_block_samples))
+    } else {
+        Vec::new()
+    };
 
     // Isolate steady-state queue depth from the startup transient by measuring
     // the output ring and NetEQ playout delay only over the final window.
@@ -1754,10 +1756,10 @@ mod tests {
     #[test]
     fn simulation_speech_split_keeps_contiguous_frames_after_first_active_frame() {
         let mut pcm = Vec::new();
-        pcm.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES));
-        pcm.extend(std::iter::repeat(0.01).take(FRAME_SAMPLES));
-        pcm.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES));
-        pcm.extend(std::iter::repeat(0.02).take(FRAME_SAMPLES));
+        pcm.extend(std::iter::repeat_n(0.0, FRAME_SAMPLES));
+        pcm.extend(std::iter::repeat_n(0.01, FRAME_SAMPLES));
+        pcm.extend(std::iter::repeat_n(0.0, FRAME_SAMPLES));
+        pcm.extend(std::iter::repeat_n(0.02, FRAME_SAMPLES));
 
         let frames = split_pcm_to_simulation_frames(&pcm, FRAME_SAMPLES * 3);
 

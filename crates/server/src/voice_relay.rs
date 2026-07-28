@@ -317,6 +317,9 @@ impl VoiceRelayHandle {
                     loop_events,
                     p2p_enabled,
                 );
+                // Preserve the failure detail in debug logs before falling
+                // back to ordinary scheduling.
+                #[allow(clippy::manual_unwrap_or_default)]
                 let promoted = match request_realtime_priority() {
                     Ok(promoted) => promoted,
                     Err(_error) => {

@@ -3,6 +3,9 @@ name = "chatt-mls"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 rpc.path = "../rpc"
 jsony = "0.1.10"

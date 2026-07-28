@@ -1203,7 +1203,7 @@ fn data_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
             .text(
                 "Memory Buffer Size",
                 &mut draft.download_memory_mb,
-                |value| crate::settings::download_memory_error(value),
+                crate::settings::download_memory_error,
             )
             .is_focus()
     {

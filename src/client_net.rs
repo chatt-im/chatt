@@ -6412,7 +6412,7 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 
 fn media_payload_kind(payload: &MediaPayload) -> &'static str {
     match payload {
-        MediaPayload::Bind { .. } => "bind",
+        MediaPayload::Bind => "bind",
         MediaPayload::NatProbe { .. } => "nat_probe",
         MediaPayload::Voice { .. } => "voice",
         MediaPayload::PeerVoice { .. } => "peer_voice",

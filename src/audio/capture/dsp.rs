@@ -1095,7 +1095,7 @@ mod tests {
         // ramp 0 keeps fade-in an identity so reused-buffer contents are exact.
         let mut gate = LongSilenceGate::with_limits(1, 2, 0);
         assert!(matches!(
-            gate.observe(&mut vec![1.0; 4], true),
+            gate.observe(&mut [1.0; 4], true),
             CaptureGateDecision::TransmitCurrent { silence_hint: true }
         ));
 
@@ -1103,12 +1103,12 @@ mod tests {
         // capacity path that recycles evicted buffers.
         for value in [2.0_f32, 3.0, 4.0, 5.0] {
             assert!(matches!(
-                gate.observe(&mut vec![value; 4], true),
+                gate.observe(&mut [value; 4], true),
                 CaptureGateDecision::SuppressCurrent
             ));
         }
 
-        let CaptureGateDecision::Resume(frames) = gate.observe(&mut vec![9.0; 4], false) else {
+        let CaptureGateDecision::Resume(frames) = gate.observe(&mut [9.0; 4], false) else {
             panic!("speech should resume transmission");
         };
 

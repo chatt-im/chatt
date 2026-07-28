@@ -238,7 +238,7 @@ impl IdentityCommand {
 #[jsony(Binary, version)]
 pub enum IdentityResultPayload {
     None,
-    Document(IdentityDocument),
+    Document(Box<IdentityDocument>),
     Check {
         session_id: IdentitySessionId,
         revision: u64,
@@ -332,7 +332,7 @@ impl IdentityResult {
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub enum IdentityEvent {
-    Document(IdentityDocument),
+    Document(Box<IdentityDocument>),
     Closed {
         session_id: IdentitySessionId,
         reason: String,
@@ -442,7 +442,7 @@ mod tests {
         let result = IdentityResult::accepted(
             RequestId(7),
             Operation::OpenIdentity,
-            IdentityResultPayload::Document(document()),
+            IdentityResultPayload::Document(Box::new(document())),
         );
         assert!(result.validate().is_ok());
         let frame = DaemonFrame::IdentityResult(result.clone());

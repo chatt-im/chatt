@@ -28,6 +28,9 @@ exclude = [
     "opus/dnn/nolace_data.h",
 ]
 
+[lints]
+workspace = true
+
 [dependencies]
 
 [build-dependencies]

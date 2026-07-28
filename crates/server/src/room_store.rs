@@ -934,12 +934,11 @@ impl RoomStore {
     }
 
     pub(crate) fn enable_async_state_writes(&mut self, notifier: Arc<EventNotifier>) {
-        if self.state_writer.is_some() && self.state_events.is_none() {
+        if let Some(state_writer) = &self.state_writer
+            && self.state_events.is_none()
+        {
             let events = Arc::new(EventQueue::new(notifier, ROOM_STATE_EVENTS, "room-state"));
-            self.state_writer
-                .as_ref()
-                .expect("state writer checked")
-                .set_events(Arc::clone(&events));
+            state_writer.set_events(Arc::clone(&events));
             self.state_events = Some(events);
         }
     }

@@ -237,6 +237,8 @@ impl Runtime {
         })
     }
 
+    // Backpressure returns ownership of the unsent input to the caller.
+    #[allow(clippy::result_large_err)]
     pub(super) fn try_send(&self, input: Input) -> Result<(), Input> {
         if self.outputs.stopped.load(Ordering::Acquire) {
             return Err(input);

@@ -47,7 +47,7 @@ impl MicLevelBallistics {
         };
         self.last = Some(now);
 
-        if !(dt < RESYNC_GAP_S) {
+        if dt >= RESYNC_GAP_S {
             self.rms = rms;
             self.peak = peak;
             return (rms, peak);
@@ -130,7 +130,7 @@ pub fn draw_settings_vu_row(
 
     let value_width = if row.w >= 28 { 11 } else { 0 };
     let value_area = if value_width > 0 {
-        Some(row.take_right(value_width as i32))
+        Some(row.take_right(value_width))
     } else {
         None
     };

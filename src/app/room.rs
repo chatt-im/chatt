@@ -181,9 +181,10 @@ impl SessionEpoch {
 }
 
 /// A stable key for a canonical room notice.
-pub(crate) type NoticeKey = u64;
+///
 /// Shared room notices are canonical history too, so they have an explicit
 /// retention bound independent of attached view count.
+pub(crate) type NoticeKey = u64;
 
 /// One change to a room's canonical entry sequence, in the terms a derived
 /// view needs to repair itself: which id moved, not that something did.
