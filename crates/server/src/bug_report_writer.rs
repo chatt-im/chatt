@@ -48,7 +48,7 @@ pub(super) struct BugReportWriter {
 }
 
 impl BugReportWriter {
-    pub(super) fn spawn(events: Arc<EventQueue<BugReportWriteReply>>) -> Self {
+    pub(super) fn spawn(events: Arc<EventQueue<BugReportWriteReply>>) -> io::Result<Self> {
         let (requests, request_rx) =
             mpsc::sync_channel::<BugReportWriteRequest>(WRITE_QUEUE_CAPACITY);
         let thread = thread::Builder::new()
@@ -74,11 +74,16 @@ impl BugReportWriter {
                     });
                 }
             })
-            .expect("failed to spawn bug report writer");
-        Self {
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to spawn bug report writer: {error}"),
+                )
+            })?;
+        Ok(Self {
             requests: Some(requests),
             thread: Some(thread),
-        }
+        })
     }
 
     pub(super) fn enqueue(&self, request: BugReportWriteRequest) -> Result<(), EnqueueError> {
@@ -96,7 +101,9 @@ impl Drop for BugReportWriter {
     fn drop(&mut self) {
         drop(self.requests.take());
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                kvlog::error!("bug report writer thread panicked");
+            }
         }
     }
 }
@@ -113,10 +120,16 @@ fn write_bug_report(
 ) -> Result<String, String> {
     fs::create_dir_all(dir).map_err(|error| format!("failed to create bug-report dir: {error}"))?;
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
+    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(since) => since.as_secs(),
+        Err(error) => {
+            kvlog::warn!(
+                "system clock is before unix epoch while naming bug report",
+                error = %error
+            );
+            0
+        }
+    };
     let user = super::sanitize_file_name(if username.trim().is_empty() {
         "anon"
     } else {
@@ -173,7 +186,7 @@ mod tests {
             crate::event_queue::BUG_REPORT_EVENTS,
             "bug-report-test",
         ));
-        let writer = BugReportWriter::spawn(Arc::clone(&events));
+        let writer = BugReportWriter::spawn(Arc::clone(&events)).unwrap();
         writer
             .enqueue(BugReportWriteRequest {
                 session_id: SessionId(3),

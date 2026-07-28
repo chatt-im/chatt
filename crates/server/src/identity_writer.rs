@@ -1,6 +1,7 @@
 //! Ordered background persistence for authentication-time identity changes.
 
 use std::{
+    io,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread::{self, JoinHandle},
@@ -45,7 +46,7 @@ pub(super) struct IdentityWriter {
 }
 
 impl IdentityWriter {
-    pub(super) fn spawn(events: Arc<EventQueue<IdentityWriteReply>>) -> Self {
+    pub(super) fn spawn(events: Arc<EventQueue<IdentityWriteReply>>) -> io::Result<Self> {
         // The control loop admits only one identity transaction at a time. A
         // capacity-one channel makes accidental future over-admission fail
         // without ever blocking that loop.
@@ -61,11 +62,16 @@ impl IdentityWriter {
                     });
                 }
             })
-            .expect("failed to spawn identity writer");
-        Self {
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to spawn identity writer: {error}"),
+                )
+            })?;
+        Ok(Self {
             requests: Some(requests),
             thread: Some(thread),
-        }
+        })
     }
 
     pub(super) fn enqueue(&self, request: IdentityWriteRequest) -> Result<(), EnqueueError> {
@@ -105,7 +111,9 @@ impl Drop for IdentityWriter {
     fn drop(&mut self) {
         drop(self.requests.take());
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                kvlog::error!("identity writer thread panicked");
+            }
         }
     }
 }

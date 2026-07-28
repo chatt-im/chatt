@@ -82,26 +82,29 @@ mod imp {
             let path = config.path;
             let shutdown = Arc::new(AtomicBool::new(false));
             let worker_shutdown = Arc::clone(&shutdown);
-            let worker = thread::spawn(move || {
-                loop {
-                    match listener.accept() {
-                        Ok((mut stream, _addr)) => {
-                            if worker_shutdown.load(Ordering::SeqCst) {
-                                break;
+            let worker = thread::Builder::new()
+                .name("chatt-server-control".to_string())
+                .spawn(move || {
+                    loop {
+                        match listener.accept() {
+                            Ok((mut stream, _addr)) => {
+                                if worker_shutdown.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                handle_connection(&mut stream, &commands);
                             }
-                            handle_connection(&mut stream, &commands);
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => {
-                            if worker_shutdown.load(Ordering::SeqCst) {
-                                break;
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(error) => {
+                                if worker_shutdown.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                kvlog::warn!("server control accept failed", error = %error);
+                                thread::sleep(ACCEPT_ERROR_BACKOFF);
                             }
-                            kvlog::warn!("server control accept failed", error = %error);
-                            thread::sleep(ACCEPT_ERROR_BACKOFF);
                         }
                     }
-                }
-            });
+                })
+                .map_err(|error| format!("failed to spawn server control worker: {error}"))?;
 
             kvlog::info!("server control socket listening", path = %path.display());
             Ok(Self {
@@ -125,15 +128,40 @@ mod imp {
             // avoid hanging shutdown.
             let wake = UnixStream::connect(&self.path);
             if let Some(worker) = self.worker.take() {
-                if wake.is_ok() {
-                    let _ = worker.join();
+                if wake.is_ok() || worker.is_finished() {
+                    if worker.join().is_err() {
+                        kvlog::error!("server control worker thread panicked");
+                    }
+                } else if let Err(error) = wake {
+                    kvlog::warn!(
+                        "server control worker could not be stopped; detaching",
+                        path = %self.path.display(),
+                        error = %error
+                    );
                 }
             }
             match fs::symlink_metadata(&self.path) {
                 Ok(metadata) if metadata.file_type().is_socket() => {
-                    let _ = fs::remove_file(&self.path);
+                    if let Err(error) = fs::remove_file(&self.path)
+                        && error.kind() != io::ErrorKind::NotFound
+                    {
+                        kvlog::warn!(
+                            "server control socket cleanup failed",
+                            path = %self.path.display(),
+                            error = %error
+                        );
+                    }
                 }
-                _ => {}
+                Ok(_) => kvlog::warn!(
+                    "server control socket path replaced; refusing cleanup",
+                    path = %self.path.display()
+                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => kvlog::warn!(
+                    "server control socket inspection failed during cleanup",
+                    path = %self.path.display(),
+                    error = %error
+                ),
             }
         }
     }
@@ -340,10 +368,18 @@ mod imp {
                                 status: STATUS_ERROR,
                                 message: error,
                             },
-                            Err(error) => Response {
-                                status: STATUS_ERROR,
-                                message: format!("server did not answer invite request: {error}"),
-                            },
+                            Err(error) => {
+                                kvlog::warn!(
+                                    "server control invite request was not answered",
+                                    error = %error
+                                );
+                                Response {
+                                    status: STATUS_ERROR,
+                                    message: format!(
+                                        "server did not answer invite request: {error}"
+                                    ),
+                                }
+                            }
                         },
                         Err(_) => Response {
                             status: STATUS_ERROR,
@@ -373,12 +409,18 @@ mod imp {
                             status: STATUS_ERROR,
                             message,
                         },
-                        Err(error) => Response {
-                            status: STATUS_ERROR,
-                            message: format!(
-                                "server did not answer MLS maintenance request: {error}"
-                            ),
-                        },
+                        Err(error) => {
+                            kvlog::warn!(
+                                "server control MLS maintenance request was not answered",
+                                error = %error
+                            );
+                            Response {
+                                status: STATUS_ERROR,
+                                message: format!(
+                                    "server did not answer MLS maintenance request: {error}"
+                                ),
+                            }
+                        }
                     },
                     Err(_) => Response {
                         status: STATUS_ERROR,
@@ -390,10 +432,13 @@ mod imp {
                 status: STATUS_ERROR,
                 message: format!("unknown server control opcode {opcode}"),
             },
-            Err(error) => Response {
-                status: STATUS_ERROR,
-                message: error,
-            },
+            Err(error) => {
+                kvlog::warn!("server control request failed", error = error.as_str());
+                Response {
+                    status: STATUS_ERROR,
+                    message: error,
+                }
+            }
         };
         if let Err(error) = write_frame(
             stream,

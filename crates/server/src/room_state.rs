@@ -51,7 +51,7 @@ pub(super) fn open(path: &Path) -> Result<(LoadedState, StateWriter), String> {
     let database = Database::create(path).map_err(|error| error.to_string())?;
     initialize_schema(&database)?;
     let state = load(&database)?;
-    Ok((state, StateWriter::spawn(database, path.to_path_buf())))
+    Ok((state, StateWriter::spawn(database, path.to_path_buf())?))
 }
 
 fn ensure_private_file(path: &Path) -> Result<(), String> {
@@ -308,7 +308,7 @@ pub(super) struct StateWriter {
 }
 
 impl StateWriter {
-    fn spawn(database: Database, path: PathBuf) -> Self {
+    fn spawn(database: Database, path: PathBuf) -> Result<Self, String> {
         let submission = Arc::new(StateWriteSubmission::default());
         let worker_submission = Arc::clone(&submission);
         let notifications = Arc::new(Mutex::new(StateWriteNotifications::default()));
@@ -397,14 +397,14 @@ impl StateWriter {
                     break;
                 }
             })
-            .expect("failed to spawn room state writer");
-        Self {
+            .map_err(|error| format!("failed to spawn room state writer: {error}"))?;
+        Ok(Self {
             submission,
             notifications,
             thread: Some(thread),
             #[cfg(test)]
             fail_next_write,
-        }
+        })
     }
 
     pub(super) fn set_events(&self, events: Arc<EventQueue<StateWriteEvent>>) {
@@ -465,7 +465,9 @@ impl Drop for StateWriter {
         let Some(thread) = self.thread.take() else {
             return;
         };
-        let _ = thread.join();
+        if thread.join().is_err() {
+            kvlog::error!("room state writer thread panicked");
+        }
     }
 }
 

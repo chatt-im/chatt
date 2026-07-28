@@ -228,16 +228,21 @@ impl RoomLogWriter {
     fn spawn(
         rooms: HashMap<RoomId, RoomLogWorkerState>,
         events: Arc<EventQueue<RoomLogEvent>>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let (requests, request_rx) = mpsc::sync_channel(LOG_WRITE_QUEUE_CAPACITY);
         let thread = thread::Builder::new()
             .name("chatt-room-log-writer".to_string())
             .spawn(move || room_log_worker(request_rx, rooms, events))
-            .expect("failed to spawn room log writer");
-        Self {
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("failed to spawn room log writer: {error}"),
+                )
+            })?;
+        Ok(Self {
             requests: Some(requests),
             thread: Some(thread),
-        }
+        })
     }
 
     fn enqueue(&self, write: RoomLogWrite) -> Result<(), &'static str> {
@@ -255,7 +260,9 @@ impl Drop for RoomLogWriter {
     fn drop(&mut self) {
         drop(self.requests.take());
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                kvlog::error!("room log writer thread panicked");
+            }
         }
     }
 }
@@ -819,7 +826,7 @@ impl RoomStore {
             next_room_id = next_room_id.max(entry.room_id.0.saturating_add(1));
         }
         if let Some(dir) = &data_dir {
-            next_room_id = next_room_id.max(next_room_id_above_existing_logs(dir));
+            next_room_id = next_room_id.max(next_room_id_above_existing_logs(dir)?);
         }
         let mut store = Self {
             data_dir,
@@ -868,9 +875,12 @@ impl RoomStore {
     /// Transfers regular-file appends and rotations to one ordered worker.
     /// Resident history is still published immediately; the worker completion
     /// advances only the disk-history mirror used by paging.
-    pub(crate) fn enable_async_log_writes(&mut self, notifier: Arc<EventNotifier>) {
+    pub(crate) fn enable_async_log_writes(
+        &mut self,
+        notifier: Arc<EventNotifier>,
+    ) -> std::io::Result<()> {
         if self.log_writer.is_some() {
-            return;
+            return Ok(());
         }
         let events = Arc::new(EventQueue::new(notifier, ROOM_LOG_EVENTS, "room-log"));
         let mut worker_rooms = HashMap::new();
@@ -918,8 +928,9 @@ impl RoomStore {
                 *file = ActiveLog::Disabled;
             }
         }
-        self.log_writer = Some(RoomLogWriter::spawn(worker_rooms, Arc::clone(&events)));
+        self.log_writer = Some(RoomLogWriter::spawn(worker_rooms, Arc::clone(&events))?);
         self.log_events = Some(events);
+        Ok(())
     }
 
     pub(crate) fn enable_async_state_writes(&mut self, notifier: Arc<EventNotifier>) {
@@ -1688,12 +1699,22 @@ impl RoomStore {
 /// The lowest dynamic room id above every room log already on disk. Guards id
 /// allocation when the state database is lost or corrupt: reusing an id whose log
 /// survives would seed the new room with the old room's private history.
-fn next_room_id_above_existing_logs(dir: &Path) -> u32 {
+fn next_room_id_above_existing_logs(dir: &Path) -> Result<u32, String> {
     let mut next = FIRST_DYNAMIC_ROOM_ID;
-    let Ok(entries) = fs::read_dir(dir.join("rooms")) else {
-        return next;
-    };
-    for entry in entries.flatten() {
+    let rooms_dir = dir.join("rooms");
+    let entries = fs::read_dir(&rooms_dir).map_err(|error| {
+        format!(
+            "failed to scan room logs in {}: {error}",
+            rooms_dir.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to inspect a room log entry in {}: {error}",
+                rooms_dir.display()
+            )
+        })?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -1708,7 +1729,7 @@ fn next_room_id_above_existing_logs(dir: &Path) -> u32 {
             next = next.max(room_id.saturating_add(1));
         }
     }
-    next
+    Ok(next)
 }
 
 /// Appends one `len:u32 | record` frame, rejecting records the loader would
@@ -1786,12 +1807,30 @@ impl<'a> LogRecords<'a> {
 }
 
 fn load_log(path: &Path, repair: LogRepair) -> LoadedLog {
-    let Ok(bytes) = fs::read(path) else {
-        return LoadedLog {
-            history: ResidentHistory::default(),
-            valid_bytes: 0,
-            tail_repair_failed: false,
-        };
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(repair, LogRepair::Truncate) =>
+        {
+            return LoadedLog {
+                history: ResidentHistory::default(),
+                valid_bytes: 0,
+                tail_repair_failed: false,
+            };
+        }
+        Err(error) => {
+            kvlog::error!(
+                "durable room log read failed; history unavailable",
+                path = path.display().to_string().as_str(),
+                error = error.to_string().as_str()
+            );
+            return LoadedLog {
+                history: ResidentHistory::default(),
+                valid_bytes: 0,
+                tail_repair_failed: matches!(repair, LogRepair::Truncate),
+            };
+        }
     };
     let mut history = ResidentHistory::default();
     let mut records = LogRecords::new(&bytes);
@@ -1914,11 +1953,30 @@ fn list_segments(active_path: &Path) -> Vec<Segment> {
         return Vec::new();
     };
     let prefix = format!("{name}.");
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            kvlog::error!(
+                "durable room log segment scan failed; older history unavailable",
+                path = dir.display().to_string().as_str(),
+                error = error.to_string().as_str()
+            );
+            return Vec::new();
+        }
     };
     let mut segments = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                kvlog::warn!(
+                    "durable room log segment entry unavailable",
+                    path = dir.display().to_string().as_str(),
+                    error = error.to_string().as_str()
+                );
+                continue;
+            }
+        };
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             continue;
@@ -2255,7 +2313,9 @@ mod tests {
         let notifier = Arc::new(EventNotifier::new(waker));
         let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
         store.enable_async_state_writes(Arc::clone(&notifier));
-        store.enable_async_log_writes(Arc::clone(&notifier));
+        store
+            .enable_async_log_writes(Arc::clone(&notifier))
+            .unwrap();
 
         let OpenDmResult::Pending { .. } =
             store.begin_open_dm(UserId(1), UserId(2), 1_000).unwrap()

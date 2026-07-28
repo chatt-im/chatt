@@ -463,7 +463,19 @@ pub fn run_cli() -> ExitCode {
         .and_then(|parsed| parsed.logfile.clone())
         .or_else(|| std::env::var("CHATT_LOGFILE").ok());
     let logger = match logfile {
-        Some(logfile) => kvlog::collector::init_file_logger(&logfile),
+        Some(logfile) => {
+            if let Err(error) = preflight_logfile(&logfile) {
+                let logger = kvlog::spawn_collector_from_env(Some("chatt-server"), false);
+                kvlog::error!(
+                    "server logfile unavailable",
+                    path = logfile.as_str(),
+                    error = %error
+                );
+                logger.flush();
+                return ExitCode::FAILURE;
+            }
+            kvlog::collector::init_file_logger(&logfile)
+        }
         None => kvlog::spawn_collector_from_env(Some("chatt-server"), false),
     };
 
@@ -930,7 +942,7 @@ enum MlsWriteRequest {
 }
 
 impl MlsWorker {
-    fn spawn(mut service: MlsService, events: Arc<MlsEventQueue>) -> Self {
+    fn spawn(mut service: MlsService, events: Arc<MlsEventQueue>) -> io::Result<Self> {
         let (requests, receiver) = mpsc::channel();
         let pending_acknowledgements = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let pending_welcome_acknowledgements = Arc::new(std::sync::Mutex::new(HashSet::new()));
@@ -949,13 +961,13 @@ impl MlsWorker {
                     );
                 }
             })
-            .expect("failed to spawn MLS durability worker");
-        Self {
+            .map_err(|error| io_context(error, "failed to spawn MLS durability worker"))?;
+        Ok(Self {
             requests: Some(requests),
             thread: Some(thread),
             pending_acknowledgements,
             pending_welcome_acknowledgements,
-        }
+        })
     }
 
     fn enqueue_typed(&self, request: MlsWriteRequest) -> bool {
@@ -1284,7 +1296,9 @@ impl Drop for MlsWorker {
     fn drop(&mut self) {
         self.requests.take();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                kvlog::error!("MLS durability worker thread panicked");
+            }
         }
     }
 }
@@ -1380,7 +1394,8 @@ impl Server {
         config.normalize();
         let udp_probe_addr = config.network.udp_probe_addr;
         let p2p_enabled = config.network.p2p;
-        let poll = Poll::new()?;
+        let poll =
+            Poll::new().map_err(|error| io_context(error, "failed to create server poller"))?;
         let mut listeners = Vec::with_capacity(config.network.bind.tcp.len());
         for (index, addr) in config.network.bind.tcp.iter().enumerate() {
             listeners.push(bind_transport("tcp", index, addr, TcpListener::bind)?);
@@ -1432,7 +1447,11 @@ impl Server {
         // proven it holds the server key — but only if the kernel withholds the
         // socket until that peer actually sends something. Without this a bare
         // connect scan still costs an fd, a token, and a pre-auth slot.
-        for (index, listener) in listeners.iter_mut().enumerate() {
+        for (index, (listener, addr)) in listeners
+            .iter_mut()
+            .zip(config.network.bind.tcp.iter())
+            .enumerate()
+        {
             if let Err(error) = set_defer_accept(listener, HANDSHAKE_TIMEOUT) {
                 kvlog::warn!(
                     "tcp defer-accept unavailable; bare connects will occupy a pre-auth slot",
@@ -1441,7 +1460,13 @@ impl Server {
                 );
             }
             poll.registry()
-                .register(listener, Token(index), Interest::READABLE)?;
+                .register(listener, Token(index), Interest::READABLE)
+                .map_err(|error| {
+                    io_context(
+                        error,
+                        format!("failed to register tcp bind {} ({addr})", index + 1),
+                    )
+                })?;
         }
 
         let users = UserStore::open(config.data_dir())
@@ -1524,37 +1549,41 @@ impl Server {
             );
         }
 
-        let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
+        let waker = Arc::new(
+            Waker::new(poll.registry(), WAKER)
+                .map_err(|error| io_context(error, "failed to create server event waker"))?,
+        );
         let event_notifier = Arc::new(EventNotifier::new(Arc::clone(&waker)));
         let admin_events = Arc::new(EventQueue::new(
             Arc::clone(&event_notifier),
             ADMIN_EVENTS,
             "admin",
         ));
-        store.enable_async_log_writes(Arc::clone(&event_notifier));
+        store.enable_async_log_writes(Arc::clone(&event_notifier))?;
         store.enable_async_state_writes(Arc::clone(&event_notifier));
         let voice_relay =
-            VoiceRelayHandle::spawn(udp, udp_probe, Arc::clone(&event_notifier), p2p_enabled)?;
+            VoiceRelayHandle::spawn(udp, udp_probe, Arc::clone(&event_notifier), p2p_enabled)
+                .map_err(|error| io_context(error, "failed to start voice relay"))?;
         let history_events = Arc::new(EventQueue::new(
             Arc::clone(&event_notifier),
             HISTORY_EVENTS,
             "history",
         ));
-        let history_reader = HistoryReader::spawn(Arc::clone(&history_events));
+        let history_reader = HistoryReader::spawn(Arc::clone(&history_events))?;
         let mls_events = Arc::new(MlsEventQueue::new(Arc::clone(&event_notifier)));
-        let mls_worker = MlsWorker::spawn(durable_mls, Arc::clone(&mls_events));
+        let mls_worker = MlsWorker::spawn(durable_mls, Arc::clone(&mls_events))?;
         let bug_report_events = Arc::new(EventQueue::new(
             Arc::clone(&event_notifier),
             BUG_REPORT_EVENTS,
             "bug-report",
         ));
-        let bug_report_writer = BugReportWriter::spawn(Arc::clone(&bug_report_events));
+        let bug_report_writer = BugReportWriter::spawn(Arc::clone(&bug_report_events))?;
         let identity_events = Arc::new(EventQueue::new(
             Arc::clone(&event_notifier),
             IDENTITY_EVENTS,
             "identity",
         ));
-        let identity_writer = IdentityWriter::spawn(Arc::clone(&identity_events));
+        let identity_writer = IdentityWriter::spawn(Arc::clone(&identity_events))?;
 
         kvlog::info!(
             "server identity loaded",
@@ -1696,7 +1725,7 @@ impl Server {
                     kvlog::warn!("server poll interrupted", error = %error);
                     continue;
                 }
-                return Err(error.into());
+                return Err(io_context(error, "server event poll failed").into());
             }
             let work_started = Instant::now();
             let event_count = events.iter().count();
@@ -1805,6 +1834,10 @@ impl Server {
         if queued {
             self.mls_cleanup_pending = true;
         } else {
+            kvlog::error!(
+                "scheduled MLS cleanup could not be queued; durability worker unavailable",
+                retry_seconds = interval.as_secs()
+            );
             self.next_mls_cleanup_at = now + interval;
         }
     }
@@ -1841,6 +1874,10 @@ impl Server {
         if queued {
             self.mls_compaction_pending = true;
         } else {
+            kvlog::error!(
+                "scheduled MLS compaction could not be queued; durability worker unavailable",
+                retry_seconds = retry.as_secs()
+            );
             self.next_mls_compaction_at = now + retry;
         }
     }
@@ -1970,7 +2007,20 @@ impl Server {
                         self.accept_retry_at = Some(Instant::now() + ACCEPT_ERROR_BACKOFF);
                         return Ok(());
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        let addr = self
+                            .config
+                            .network
+                            .bind
+                            .tcp
+                            .iter()
+                            .nth(listener_index)
+                            .expect("listener index has a configured bind");
+                        return Err(io_context(
+                            error,
+                            format!("tcp accept on bind {} ({addr}) failed", listener_index + 1),
+                        ));
+                    }
                 };
                 accepted += 1;
                 self.accept_client(socket, addr)?;
@@ -2036,7 +2086,10 @@ impl Server {
             // No `ClientConn` exists yet, so nothing else would ever
             // return the slot this connection was admitted into.
             self.pre_auth.release(addr.ip());
-            return Err(error);
+            return Err(io_context(
+                error,
+                format!("failed to register tcp client {token:?} from {addr}"),
+            ));
         }
         let now = Instant::now();
         self.clients.insert(
@@ -8091,9 +8144,7 @@ impl Server {
         while let Some(reply) = replies.pop_front() {
             self.pending_bug_reports
                 .remove(&(reply.session_id, reply.report_id));
-            let Some(token) = self.live_token_for_session(reply.session_id) else {
-                continue;
-            };
+            let token = self.live_token_for_session(reply.session_id);
             match reply.result {
                 Ok(saved) => {
                     kvlog::info!(
@@ -8103,22 +8154,38 @@ impl Server {
                         description = reply.description.as_str(),
                         logs = saved.as_str()
                     );
-                    if let Err(error) = self.send_control_to_token(
-                        token,
-                        &ServerControl::BugReportSaved {
-                            report_id: reply.report_id,
-                        },
-                    ) {
-                        kvlog::warn!(
-                            "bug report completion send failed",
-                            session_id = reply.session_id.0,
-                            report_id = reply.report_id.0,
-                            error = error.as_str()
-                        );
+                    if let Some(token) = token {
+                        if let Err(error) = self.send_control_to_token(
+                            token,
+                            &ServerControl::BugReportSaved {
+                                report_id: reply.report_id,
+                            },
+                        ) {
+                            kvlog::warn!(
+                                "bug report completion send failed",
+                                session_id = reply.session_id.0,
+                                report_id = reply.report_id.0,
+                                error = error.as_str()
+                            );
+                        }
                     }
                 }
                 Err(error) => {
-                    let _ = self.report_bug_outcome(token, Err(error));
+                    kvlog::error!(
+                        "bug report storage failed",
+                        session_id = reply.session_id.0,
+                        report_id = reply.report_id.0,
+                        error = error.as_str()
+                    );
+                    if let Some(token) = token {
+                        let _ = self.send_control_to_token(
+                            token,
+                            &ServerControl::Error {
+                                code: ERROR_BUG_REPORT_REJECTED,
+                                message: error,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -8934,6 +9001,18 @@ fn now_ms() -> u64 {
 
 fn invalid_config(error: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
+}
+
+fn preflight_logfile(path: &str) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map(drop)
+}
+
+fn io_context(error: io::Error, context: impl std::fmt::Display) -> io::Error {
+    io::Error::new(error.kind(), format!("{context}: {error}"))
 }
 
 fn is_fd_pressure_accept_error(error: &io::Error) -> bool {
@@ -10433,7 +10512,8 @@ mod tests {
             .unwrap()
             .unwrap();
         server.mls = service.in_memory_view().unwrap();
-        server.mls_worker = MlsWorker::spawn(service, Arc::clone(&server.mls_events));
+        server.mls_worker =
+            MlsWorker::spawn(service, Arc::clone(&server.mls_events)).expect("MLS worker");
 
         let room_id = RoomId(50);
         let mut accounts = vec![alice.bootstrap.account_id, bob.bootstrap.account_id];

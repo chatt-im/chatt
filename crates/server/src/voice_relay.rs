@@ -266,16 +266,42 @@ impl VoiceRelayHandle {
                 );
             }
         }
-        let poll = Poll::new()?;
+        let poll = Poll::new().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to create voice relay poller: {error}"),
+            )
+        })?;
         for (index, socket) in udp.iter_mut().enumerate() {
+            let addr = udp_local_addrs[index];
             poll.registry()
-                .register(socket, Token(index), Interest::READABLE)?;
+                .register(socket, Token(index), Interest::READABLE)
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to register voice udp bind {} ({addr}): {error}",
+                            index + 1
+                        ),
+                    )
+                })?;
         }
         if let Some(probe) = udp_probe.as_mut() {
             poll.registry()
-                .register(probe, UDP_PROBE, Interest::READABLE)?;
+                .register(probe, UDP_PROBE, Interest::READABLE)
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("failed to register voice udp probe: {error}"),
+                    )
+                })?;
         }
-        let command_waker = Arc::new(Waker::new(poll.registry(), COMMANDS)?);
+        let command_waker = Arc::new(Waker::new(poll.registry(), COMMANDS).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to create voice relay command waker: {error}"),
+            )
+        })?);
         let commands = Arc::new(EventSubmission::new(command_waker));
         let events = Arc::new(VoiceEventSubmission::new(control_notifier));
         let loop_commands = Arc::clone(&commands);
@@ -309,6 +335,12 @@ impl VoiceRelayHandle {
                     kvlog::error!("voice relay stopped", error = message.as_str());
                     relay.events.submit_failure(message);
                 }
+            })
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to spawn voice relay worker: {error}"),
+                )
             })?;
         Ok(Self {
             commands,
@@ -339,7 +371,9 @@ impl Drop for VoiceRelayHandle {
     fn drop(&mut self) {
         self.commands.submit(VoiceCommand::Shutdown);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                kvlog::error!("voice relay thread panicked");
+            }
         }
     }
 }

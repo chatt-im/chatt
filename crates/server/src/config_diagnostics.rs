@@ -51,18 +51,18 @@ pub fn render(path: &str, source: &str, diags: &[Diag]) {
     if diags.is_empty() {
         return;
     }
-    let renderer = if std::io::stderr().is_terminal() {
+    let renderer = if std::io::stdout().is_terminal() {
         Renderer::styled()
     } else {
         Renderer::plain()
     };
-    let mut stderr = std::io::stderr().lock();
+    let mut stdout = std::io::stdout().lock();
     let _ = writeln!(
-        stderr,
+        stdout,
         "{}",
         renderer.render(&build_groups(path, source, diags))
     );
-    let _ = stderr.flush();
+    let _ = stdout.flush();
 }
 
 pub fn render_to_string(path: &str, source: &str, diags: &[Diag]) -> String {

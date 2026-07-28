@@ -870,7 +870,7 @@ pub fn write_generated_template(path: &Path) -> Result<(), String> {
     file.sync_all()
         .map_err(|err| format!("failed to sync {}: {err}", path.display()))?;
     drop(file);
-    sync_parent_dir(path);
+    sync_parent_dir(path)?;
     Ok(())
 }
 
@@ -1380,14 +1380,23 @@ pub(crate) fn atomic_write_toml(path: &Path, content: &str) -> Result<(), String
     drop(file);
 
     fs::rename(&tmp, path).map_err(|err| {
-        let _ = fs::remove_file(&tmp);
+        let cleanup = match fs::remove_file(&tmp) {
+            Ok(()) => String::new(),
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
+                String::new()
+            }
+            Err(cleanup_error) => format!(
+                "; also failed to remove temporary file {}: {cleanup_error}",
+                tmp.display()
+            ),
+        };
         format!(
-            "failed to replace {} with {}: {err}",
+            "failed to replace {} with {}: {err}{cleanup}",
             path.display(),
             tmp.display()
         )
     })?;
-    sync_parent_dir(path);
+    sync_parent_dir(path)?;
     Ok(())
 }
 
@@ -1418,16 +1427,16 @@ fn extension_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_extension(extension)
 }
 
-fn sync_parent_dir(path: &Path) {
+fn sync_parent_dir(path: &Path) -> Result<(), String> {
     let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     else {
-        return;
+        return Ok(());
     };
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| format!("failed to sync directory {}: {error}", parent.display()))
 }
 
 pub fn hash_secret(secret: &str) -> String {

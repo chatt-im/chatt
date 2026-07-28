@@ -10,10 +10,11 @@
 
 use std::{
     fs::{self, File},
+    io,
     os::unix::fs::FileExt,
     path::PathBuf,
     sync::{Arc, mpsc},
-    thread,
+    thread::{self, JoinHandle},
 };
 
 use rpc::{
@@ -68,27 +69,52 @@ pub(crate) struct HistoryReadReply {
 
 /// Handle to the disk reader thread; dropping it stops the thread.
 pub(crate) struct HistoryReader {
-    requests: mpsc::SyncSender<HistoryReadRequest>,
+    requests: Option<mpsc::SyncSender<HistoryReadRequest>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl HistoryReader {
     /// Starts the reader thread; the event queue wakes the loop after each reply.
-    pub(crate) fn spawn(events: Arc<EventQueue<HistoryReadReply>>) -> Self {
+    pub(crate) fn spawn(events: Arc<EventQueue<HistoryReadReply>>) -> io::Result<Self> {
         let (requests, request_rx) =
             mpsc::sync_channel::<HistoryReadRequest>(REQUEST_QUEUE_CAPACITY);
-        thread::spawn(move || {
-            while let Ok(request) = request_rx.recv() {
-                let reply = execute(&request);
-                events.push(reply);
-            }
-        });
-        Self { requests }
+        let thread = thread::Builder::new()
+            .name("chatt-history-reader".to_string())
+            .spawn(move || {
+                while let Ok(request) = request_rx.recv() {
+                    let reply = execute(&request);
+                    events.push(reply);
+                }
+            })
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to spawn history reader: {error}"),
+                )
+            })?;
+        Ok(Self {
+            requests: Some(requests),
+            thread: Some(thread),
+        })
     }
 
     /// Queues a request, returning false when the worker thread is gone; the
     /// caller must then still answer the client with a terminal chunk.
     pub(crate) fn enqueue(&self, request: HistoryReadRequest) -> bool {
-        self.requests.try_send(request).is_ok()
+        self.requests
+            .as_ref()
+            .is_some_and(|requests| requests.try_send(request).is_ok())
+    }
+}
+
+impl Drop for HistoryReader {
+    fn drop(&mut self) {
+        self.requests.take();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            kvlog::error!("history reader thread panicked");
+        }
     }
 }
 

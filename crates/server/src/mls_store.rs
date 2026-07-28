@@ -339,7 +339,7 @@ impl SnapshotWriter {
         checkpoint_path: PathBuf,
         sealed_wal_path: PathBuf,
         state: Arc<RwLock<MemoryState>>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("chatt-mls-snapshot".to_string())
@@ -362,11 +362,11 @@ impl SnapshotWriter {
                     }
                 }
             })
-            .expect("failed to spawn MLS snapshot writer");
-        Self {
+            .map_err(|error| format!("failed to spawn MLS snapshot writer: {error}"))?;
+        Ok(Self {
             sender: Some(sender),
             thread: Some(thread),
-        }
+        })
     }
 
     fn request(&self) -> Result<(), String> {
@@ -398,7 +398,9 @@ impl Drop for SnapshotWriter {
     fn drop(&mut self) {
         self.sender.take();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                kvlog::error!("MLS snapshot writer thread panicked");
+            }
         }
     }
 }
@@ -470,17 +472,20 @@ impl MlsStore {
             None => None,
         };
         let state = Arc::new(RwLock::new(memory));
-        let snapshot_writer = paths.as_ref().map(|(checkpoint_path, wal_path)| {
-            let writer = Arc::new(SnapshotWriter::spawn(
-                checkpoint_path.clone(),
-                wal_path.with_extension("wal.sealed"),
-                Arc::clone(&state),
-            ));
-            if wal_path.with_extension("wal.sealed").exists() {
-                let _ = writer.request();
-            }
-            writer
-        });
+        let snapshot_writer = paths
+            .as_ref()
+            .map(|(checkpoint_path, wal_path)| {
+                let writer = Arc::new(SnapshotWriter::spawn(
+                    checkpoint_path.clone(),
+                    wal_path.with_extension("wal.sealed"),
+                    Arc::clone(&state),
+                )?);
+                if wal_path.with_extension("wal.sealed").exists() {
+                    writer.request()?;
+                }
+                Ok::<_, String>(writer)
+            })
+            .transpose()?;
         Ok(Self {
             state,
             persistence,
@@ -1742,13 +1747,16 @@ impl Persistence {
             }
         });
         if let Err(error) = result {
-            if self
+            if let Err(rollback_error) = self
                 .wal
                 .set_len(original_len)
                 .and_then(|()| self.wal.sync_data())
-                .is_err()
             {
                 self.poisoned = true;
+                return Err(format!(
+                    "failed to append {}: {error}; also failed to roll the WAL back to {original_len} bytes: {rollback_error}",
+                    self.wal_path.display()
+                ));
             }
             return Err(format!(
                 "failed to append {}: {error}",
@@ -1814,11 +1822,21 @@ impl Persistence {
         let replacement = match replacement {
             Ok(file) => file,
             Err(error) => {
-                let _ = fs::rename(&self.sealed_wal_path, &self.wal_path);
-                return Err(format!(
-                    "failed to create rotated {}: {error}",
-                    self.wal_path.display()
-                ));
+                return match fs::rename(&self.sealed_wal_path, &self.wal_path) {
+                    Ok(()) => Err(format!(
+                        "failed to create rotated {}: {error}",
+                        self.wal_path.display()
+                    )),
+                    Err(restore_error) => {
+                        self.poisoned = true;
+                        Err(format!(
+                            "failed to create rotated {}: {error}; also failed to restore {} from {}: {restore_error}",
+                            self.wal_path.display(),
+                            self.wal_path.display(),
+                            self.sealed_wal_path.display()
+                        ))
+                    }
+                };
             }
         };
         self.wal = replacement;
