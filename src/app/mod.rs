@@ -503,6 +503,9 @@ pub(crate) struct App {
     screencast: Option<crate::video::ScreencastHandle>,
     /// Monotonic identity allocated before spawning each screen-share capture.
     next_share_attempt_id: u64,
+    /// Daemon-local identity for each newly announced inbound or outbound
+    /// share, fencing reused remote stream ids across renderer requests.
+    next_live_share_generation: u64,
     /// The resolved capture command that last successfully launched an outbound
     /// screen share. Used by the top-bar `VIDEO OFF` badge to restart exactly
     /// what the user had running.
@@ -523,6 +526,7 @@ pub(crate) struct App {
 /// the codec metadata to configure the browser decoder.
 struct AvailableShare {
     room_id: RoomId,
+    generation: u64,
     view_secret: Vec<u8>,
     sender_name: String,
     codec: String,
@@ -883,6 +887,7 @@ pub(crate) enum AppEvent {
     /// looks exactly like one waiting for the next keyframe.
     ShareViewStatus {
         stream_id: StreamId,
+        generation: u64,
         state: ShareViewState,
     },
 }
@@ -892,16 +897,30 @@ pub(crate) enum AppEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShareViewState {
     Reconnecting,
-    Connected,
+    WaitingForKeyframe,
 }
 
 impl ShareViewState {
+    pub(crate) fn as_u8(self) -> u8 {
+        match self {
+            Self::WaitingForKeyframe => 0,
+            Self::Reconnecting => 1,
+        }
+    }
+
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Reconnecting,
+            _ => Self::WaitingForKeyframe,
+        }
+    }
+
     /// The wire label. The browser writes it straight into its per-share status,
     /// so these are part of the envelope contract with `web/src/App.tsx`.
     fn label(self) -> &'static str {
         match self {
             Self::Reconnecting => "reconnecting",
-            Self::Connected => "waiting-for-keyframe",
+            Self::WaitingForKeyframe => "waiting-for-keyframe",
         }
     }
 }
@@ -1484,6 +1503,7 @@ impl App {
             download_store,
             screencast: None,
             next_share_attempt_id: 0,
+            next_live_share_generation: 0,
             cached_screencast_start: None,
             screencast_stream_id: None,
             subscribers: HashMap::new(),
@@ -2009,9 +2029,11 @@ impl App {
                 message,
             } => self.handle_screencast_failed(attempt_id, message),
             AppEvent::ScreencastProgress(progress) => self.handle_screencast_progress(progress),
-            AppEvent::ShareViewStatus { stream_id, state } => {
-                self.handle_share_view_status(stream_id, state)
-            }
+            AppEvent::ShareViewStatus {
+                stream_id,
+                generation,
+                state,
+            } => self.handle_share_view_status(stream_id, generation, state),
         }
         history_change
     }
@@ -2281,12 +2303,36 @@ impl App {
         );
     }
 
+    fn allocate_live_share_generation(&mut self) -> u64 {
+        self.next_live_share_generation = self.next_live_share_generation.wrapping_add(1).max(1);
+        self.next_live_share_generation
+    }
+
+    fn replace_live_share_stream(&mut self, stream_id: StreamId) {
+        self.web_viewing_shares.remove(&stream_id);
+        if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
+            subscriber.stop();
+        }
+        self.video_fanout.close_stream(stream_id);
+    }
+
     /// Relays a viewer connection's state to every browser showing the share.
     /// Nothing else recovers this: the subscriber reconnects on its own, so a
     /// stalled viewer would otherwise sit on a black canvas with no explanation.
-    fn handle_share_view_status(&mut self, stream_id: StreamId, state: ShareViewState) {
+    fn handle_share_view_status(
+        &mut self,
+        stream_id: StreamId,
+        generation: u64,
+        state: ShareViewState,
+    ) {
         // The subscriber may outlive the share by one event.
-        if !self.subscribers.contains_key(&stream_id) {
+        if !self.subscribers.contains_key(&stream_id)
+            || self
+                .room
+                .available_shares
+                .get(&stream_id)
+                .is_none_or(|share| share.generation != generation)
+        {
             return;
         }
         if let Some(feed) = &self.web_feed {
@@ -3065,6 +3111,7 @@ impl App {
         }
         let config = share_config_envelope(stream_id, &share.codec, &share.extradata);
         let view_secret = share.view_secret.clone();
+        let generation = share.generation;
         self.web_viewing_shares.insert(stream_id);
         feed.send_share_config(client, stream_id.0, config);
 
@@ -3097,11 +3144,20 @@ impl App {
         let handle = crate::video::start_subscriber(
             session_id,
             stream_id,
+            generation,
             view_secret,
             video_transport,
             self.video_fanout.clone(),
             self.events.sender(),
         );
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.web_viewing_shares.remove(&stream_id);
+                feed.send_share_error(client, share_error_envelope(stream_id, &error));
+                return;
+            }
+        };
         self.subscribers.insert(stream_id, handle);
         self.set_status("viewing screen share");
     }
@@ -4770,6 +4826,8 @@ impl App {
                     return;
                 }
                 self.screencast_stream_id = Some(stream_id);
+                self.replace_live_share_stream(stream_id);
+                let generation = self.allocate_live_share_generation();
                 self.video_fanout.start_stream(stream_id);
                 self.room.screencast_status.live(
                     stream_id,
@@ -4788,6 +4846,7 @@ impl App {
                     stream_id,
                     AvailableShare {
                         room_id,
+                        generation,
                         view_secret: Vec::new(),
                         sender_name: sender.clone(),
                         codec: codec.clone(),
@@ -4832,11 +4891,24 @@ impl App {
                 if self.room.voice_room != Some(room_id) {
                     return;
                 }
+                let existing_generation = self
+                    .room
+                    .available_shares
+                    .get(&stream_id)
+                    .filter(|share| share.view_secret == view_secret)
+                    .map(|share| share.generation);
+                let generation = if let Some(generation) = existing_generation {
+                    generation
+                } else {
+                    self.replace_live_share_stream(stream_id);
+                    self.allocate_live_share_generation()
+                };
                 self.video_fanout.start_stream(stream_id);
                 self.room.available_shares.insert(
                     stream_id,
                     AvailableShare {
                         room_id,
+                        generation,
                         view_secret,
                         sender_name: sender_name.clone(),
                         codec: codec.clone(),
@@ -9587,7 +9659,7 @@ mod tests {
             "{\"type\":\"share_status\",\"stream_id\":7,\"state\":\"reconnecting\"}"
         );
         assert_eq!(
-            share_status_envelope(StreamId(7), ShareViewState::Connected),
+            share_status_envelope(StreamId(7), ShareViewState::WaitingForKeyframe),
             "{\"type\":\"share_status\",\"stream_id\":7,\"state\":\"waiting-for-keyframe\"}"
         );
     }
@@ -10668,6 +10740,26 @@ mod tests {
 
         app.handle_network_event(available(RoomId(1), StreamId(10)));
         assert!(app.room.available_shares.contains_key(&StreamId(10)));
+        let first_generation = app.room.available_shares[&StreamId(10)].generation;
+        app.handle_network_event(available(RoomId(1), StreamId(10)));
+        assert_eq!(
+            app.room.available_shares[&StreamId(10)].generation,
+            first_generation
+        );
+        app.handle_network_event(NetworkEvent::ShareAvailable {
+            room_id: RoomId(1),
+            stream_id: StreamId(10),
+            sender_name: "bob".to_string(),
+            codec: "avc1.42c01f".to_string(),
+            coded_width: 1280,
+            coded_height: 720,
+            extradata: Vec::new(),
+            view_secret: vec![8; 32],
+        });
+        assert_ne!(
+            app.room.available_shares[&StreamId(10)].generation,
+            first_generation
+        );
 
         app.handle_network_event(NetworkEvent::VoiceStopped {
             room_id: RoomId(1),

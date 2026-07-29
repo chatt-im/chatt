@@ -957,6 +957,8 @@ mod tests {
         let opened = super::super::frame::DaemonFrame::LiveShareOpened {
             request_id: super::super::model::RequestId(2),
             stream_id: crate::ids::StreamId(7),
+            generation: 3,
+            status: crate::model::LiveShareViewStatus::WaitingForKeyframe,
         };
         writer.send_daemon(&first).unwrap();
         writer

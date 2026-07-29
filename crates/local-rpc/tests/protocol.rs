@@ -7,22 +7,23 @@ use local_rpc::{
     frame::{ClientFrame, ClientHello, DaemonFrame, NegotiatedLimits, Welcome},
     ids::StreamId,
     model::{
-        BulkTransferId, ConnectionState, DaemonInstanceId, RequestId, ServerAvailability,
-        ServerSelectionState, ServerSummary, StateSnapshot, VoiceSessionState, VoiceState,
+        BulkTransferId, ConnectionState, DaemonInstanceId, LiveShareViewStatus, RequestId,
+        ServerAvailability, ServerSelectionState, ServerSummary, StateSnapshot, VoiceSessionState,
+        VoiceState,
     },
     unix::{FrameReader, FrameWriter},
 };
 
 #[test]
-fn renderer_and_daemon_exchange_protocol_v13_frames_and_live_share_fd() {
-    assert_eq!(PROTOCOL_MIN_VERSION, 13);
-    assert_eq!(PROTOCOL_MAX_VERSION, 13);
+fn renderer_and_daemon_exchange_protocol_v14_frames_and_live_share_fd() {
+    assert_eq!(PROTOCOL_MIN_VERSION, 14);
+    assert_eq!(PROTOCOL_MAX_VERSION, 14);
     assert_eq!(MAX_MESSAGE_BODY_BYTES, 8 * 1024);
     assert_eq!(DEFAULT_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
     assert_eq!(MAX_HISTORY_REQUEST_MESSAGES, 500);
 
     let hello = ClientHello::current("test-renderer");
-    assert_eq!(hello.negotiated_version(), Some(13));
+    assert_eq!(hello.negotiated_version(), Some(14));
 
     let (daemon_socket, renderer_socket) = UnixStream::pair().unwrap();
     let mut daemon_reader = FrameReader::new(daemon_socket.try_clone().unwrap());
@@ -115,6 +116,8 @@ fn renderer_and_daemon_exchange_protocol_v13_frames_and_live_share_fd() {
     let opened = DaemonFrame::LiveShareOpened {
         request_id: RequestId(2),
         stream_id: StreamId(8),
+        generation: 3,
+        status: LiveShareViewStatus::WaitingForKeyframe,
     };
     daemon_writer
         .send_daemon_with_fds(&opened, &[video.as_raw_fd()])

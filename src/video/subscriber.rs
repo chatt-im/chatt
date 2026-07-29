@@ -9,7 +9,7 @@
 //! from the server's fast-start cache each time.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -70,7 +70,9 @@ impl CopyStats {
 /// stays invisible and a real outage is reported once and then repeated.
 struct ReconnectNotice {
     stream_id: StreamId,
+    generation: u64,
     events: EventSender,
+    state: Arc<AtomicU8>,
     /// First failure of the current outage, not the most recent attempt: the
     /// viewer cares how long they have been without a picture.
     failing_since: Option<Instant>,
@@ -79,10 +81,17 @@ struct ReconnectNotice {
 }
 
 impl ReconnectNotice {
-    fn new(stream_id: StreamId, events: EventSender) -> Self {
+    fn new(
+        stream_id: StreamId,
+        generation: u64,
+        events: EventSender,
+        state: Arc<AtomicU8>,
+    ) -> Self {
         Self {
             stream_id,
+            generation,
             events,
+            state,
             failing_since: None,
             told_at: None,
         }
@@ -101,6 +110,8 @@ impl ReconnectNotice {
             return;
         }
         self.told_at = Some(now);
+        self.state
+            .store(ShareViewState::Reconnecting.as_u8(), Ordering::Release);
         self.send(ShareViewState::Reconnecting);
     }
 
@@ -110,14 +121,19 @@ impl ReconnectNotice {
     /// already moved on to playing.
     fn connected(&mut self) {
         self.failing_since = None;
+        self.state.store(
+            ShareViewState::WaitingForKeyframe.as_u8(),
+            Ordering::Release,
+        );
         if self.told_at.take().is_some() {
-            self.send(ShareViewState::Connected);
+            self.send(ShareViewState::WaitingForKeyframe);
         }
     }
 
     fn send(&self, state: ShareViewState) {
         let _ = self.events.send(AppEvent::ShareViewStatus {
             stream_id: self.stream_id,
+            generation: self.generation,
             state,
         });
     }
@@ -126,10 +142,15 @@ impl ReconnectNotice {
 /// Handle to an active viewer connection. Dropping it tears the connection down.
 pub struct SubscriberHandle {
     stop: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
     join: Option<JoinHandle<()>>,
 }
 
 impl SubscriberHandle {
+    pub fn view_state(&self) -> ShareViewState {
+        ShareViewState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(join) = self.join.take() {
@@ -148,17 +169,20 @@ impl Drop for SubscriberHandle {
 pub fn start(
     session_id: SessionId,
     stream_id: StreamId,
+    generation: u64,
     view_secret: Vec<u8>,
     video_transport: VideoTransport,
     fanout: VideoFrameFanout,
     events: EventSender,
-) -> SubscriberHandle {
+) -> Result<SubscriberHandle, String> {
     // Publish the state transition before the worker can connect so a native
     // viewer joining in the same interval also waits for the server's ordered
     // cached-GOP boundary.
     fanout.begin_upstream_bootstrap(stream_id);
     let stop = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(AtomicU8::new(ShareViewState::WaitingForKeyframe.as_u8()));
     let thread_stop = stop.clone();
+    let thread_state = state.clone();
     let join = thread::Builder::new()
         .name("chatt-subscribe".to_string())
         .spawn(move || {
@@ -169,11 +193,17 @@ pub fn start(
                 video_transport,
                 &fanout,
                 events,
+                generation,
+                thread_state,
                 &thread_stop,
             )
         })
-        .ok();
-    SubscriberHandle { stop, join }
+        .map_err(|error| format!("could not start video subscriber: {error}"))?;
+    Ok(SubscriberHandle {
+        stop,
+        state,
+        join: Some(join),
+    })
 }
 
 fn run(
@@ -183,9 +213,11 @@ fn run(
     video_transport: VideoTransport,
     fanout: &VideoFrameFanout,
     events: EventSender,
+    generation: u64,
+    state: Arc<AtomicU8>,
     stop: &AtomicBool,
 ) {
-    let mut notice = ReconnectNotice::new(stream_id, events);
+    let mut notice = ReconnectNotice::new(stream_id, generation, events, state);
     while !stop.load(Ordering::SeqCst) {
         match run_once(
             session_id,
