@@ -60,6 +60,16 @@ pub fn output_devices(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>, 
     with_audio_backend_stderr_suppressed(|| output_devices_inner(buffer_request))
 }
 
+/// Name of the cpal host the client opens streams through, e.g. `CoreAudio`,
+/// `ALSA`, `PipeWire`.
+///
+/// Unlike [`crate::audio::AudioDeviceInfo::backend`] this is available with no
+/// stream open, which is exactly the state a failed-to-start report is filed
+/// in. Enumerates nothing; it only resolves the host.
+pub fn default_host_name() -> &'static str {
+    with_audio_backend_stderr_suppressed(|| cpal::default_host().id().name())
+}
+
 pub fn stable_input_device_id(name: &str) -> String {
     stable_device_id(name)
 }
@@ -952,6 +962,49 @@ pub(crate) fn select_output_config(
     })
 }
 
+/// A [`ConfigSelection`] built from the device's *current* format instead of a
+/// fresh negotiation over its advertised ranges.
+///
+/// Opening at the rate a device already runs at means the backend never has to
+/// move the device clock. That matters on CoreAudio, where a Bluetooth endpoint
+/// held in HFP by an open capture stream advertises rates it will not actually
+/// switch to, so a negotiated config fails deterministically on every retry
+/// while its current format opens fine. Used only as a last resort, after the
+/// negotiated config and the host-default buffer have both failed.
+///
+/// Returns `None` when the current rate is not one the voice path can run,
+/// since [`crate::audio::resample`] blocks 10 ms at a time and needs a rate
+/// divisible by 100.
+pub(crate) fn current_output_config(device: &cpal::Device) -> Option<ConfigSelection> {
+    current_config(device.default_output_config().ok()?)
+}
+
+/// Capture counterpart to [`current_output_config`]. The same Bluetooth
+/// endpoint serves both directions, so the mic hits the same failure.
+pub(crate) fn current_input_config(device: &cpal::Device) -> Option<ConfigSelection> {
+    current_config(device.default_input_config().ok()?)
+}
+
+fn current_config(supported_config: SupportedStreamConfig) -> Option<ConfigSelection> {
+    let device_rate = supported_config.sample_rate();
+    if device_rate != SAMPLE_RATE && !RESAMPLE_FALLBACK_RATES.contains(&device_rate) {
+        return None;
+    }
+    let mut stream_config = supported_config.config();
+    stream_config.buffer_size = BufferSize::Default;
+    Some(ConfigSelection {
+        preview: StreamPreview {
+            channels: supported_config.channels(),
+            sample_format: supported_config.sample_format(),
+            buffer_size: BufferSize::Default,
+            buffer_note: "device current format".to_string(),
+        },
+        device_rate,
+        supported_config,
+        stream_config,
+    })
+}
+
 pub(crate) fn channel_rank(channels: u16) -> u16 {
     match channels {
         1 => 0,
@@ -1088,10 +1141,13 @@ fn log_audio_stream_config(
 struct CallbackChannelCount(NonZeroUsize);
 
 impl CallbackChannelCount {
-    fn new(channels: usize, direction: &'static str) -> Result<Self, String> {
-        NonZeroUsize::new(channels)
-            .map(Self)
-            .ok_or_else(|| format!("{direction} stream reported zero channels"))
+    fn new(channels: usize, direction: &'static str) -> Result<Self, AudioStartError> {
+        NonZeroUsize::new(channels).map(Self).ok_or_else(|| {
+            AudioStartError::new(
+                AudioErrorKind::ConfigInvalid,
+                format!("{direction} stream reported zero channels"),
+            )
+        })
     }
 
     fn get(self) -> usize {
@@ -1144,6 +1200,24 @@ impl AudioCallbackBufferObserver {
     }
 }
 
+/// Wraps a backend stream-build failure, keeping the backend's own taxonomy so
+/// the app-level supervisor can tell a vanished device from a rejected config.
+/// Collapsing this to a bare message is what previously made every build
+/// failure look transient and retry on the same timed backoff forever.
+fn stream_build_error(context: &'static str, error: cpal::Error) -> AudioStartError {
+    AudioStartError::new(
+        AudioErrorKind::from_cpal(error.kind()),
+        format!("{context}: {error}"),
+    )
+}
+
+fn unsupported_sample_format(direction: &'static str, format: SampleFormat) -> AudioStartError {
+    AudioStartError::new(
+        AudioErrorKind::ConfigInvalid,
+        format!("unsupported {direction} sample format: {format}"),
+    )
+}
+
 pub(crate) fn build_input_stream(
     device: &cpal::Device,
     sample_format: SampleFormat,
@@ -1153,7 +1227,7 @@ pub(crate) fn build_input_stream(
     recycle: Receiver<Vec<f32>>,
     stats: AudioStats,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
-) -> Result<Stream, String> {
+) -> Result<Stream, AudioStartError> {
     log_audio_stream_config("capture", device, sample_format, &stream_config);
     let channels = CallbackChannelCount::new(channels, "input")?;
     match sample_format {
@@ -1265,7 +1339,7 @@ pub(crate) fn build_input_stream(
             stats,
             callback_buffer_observer,
         ),
-        _ => Err(format!("unsupported sample format: {sample_format}")),
+        _ => Err(unsupported_sample_format("input", sample_format)),
     }
 }
 
@@ -1277,7 +1351,7 @@ fn build_typed_input_stream<T>(
     recycle: Receiver<Vec<f32>>,
     stats: AudioStats,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
-) -> Result<Stream, String>
+) -> Result<Stream, AudioStartError>
 where
     T: Sample + cpal::SizedSample + Send + 'static,
     f32: FromSample<T>,
@@ -1339,7 +1413,7 @@ where
             },
             None,
         )
-        .map_err(|error| format!("failed to build input stream: {error}"))
+        .map_err(|error| stream_build_error("failed to build input stream", error))
 }
 
 pub(crate) fn build_output_stream(
@@ -1349,7 +1423,7 @@ pub(crate) fn build_output_stream(
     channels: usize,
     samples: Arc<Vec<i16>>,
     stats: PlaybackStats,
-) -> Result<Stream, String> {
+) -> Result<Stream, AudioStartError> {
     log_audio_stream_config("playback", device, sample_format, &stream_config);
     let channels = CallbackChannelCount::new(channels, "output")?;
     match sample_format {
@@ -1389,7 +1463,7 @@ pub(crate) fn build_output_stream(
         SampleFormat::F64 => {
             build_typed_output_stream::<f64>(device, stream_config, channels, samples, stats)
         }
-        _ => Err(format!("unsupported output sample format: {sample_format}")),
+        _ => Err(unsupported_sample_format("output", sample_format)),
     }
 }
 
@@ -1406,7 +1480,7 @@ pub(crate) fn build_live_output_stream(
     device_rate: u32,
     playback_recorder: Option<LivePlaybackWavRecorderHandle>,
     output_volume_percent: Arc<AtomicU32>,
-) -> Result<Stream, String> {
+) -> Result<Stream, AudioStartError> {
     log_audio_stream_config("live playback", device, sample_format, &stream_config);
     let channels = CallbackChannelCount::new(channels, "live output")?;
     match sample_format {
@@ -1566,7 +1640,7 @@ pub(crate) fn build_live_output_stream(
             playback_recorder,
             output_volume_percent,
         ),
-        _ => Err(format!("unsupported output sample format: {sample_format}")),
+        _ => Err(unsupported_sample_format("live output", sample_format)),
     }
 }
 
@@ -1582,7 +1656,7 @@ fn build_typed_live_output_stream<T>(
     device_rate: u32,
     playback_recorder: Option<LivePlaybackWavRecorderHandle>,
     output_volume_percent: Arc<AtomicU32>,
-) -> Result<Stream, String>
+) -> Result<Stream, AudioStartError>
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
 {
@@ -1673,7 +1747,7 @@ where
             },
             None,
         )
-        .map_err(|error| format!("failed to build live output stream: {error}"))
+        .map_err(|error| stream_build_error("failed to build live output stream", error))
 }
 
 fn record_live_playback_stream_error(
@@ -1860,7 +1934,7 @@ fn build_typed_output_stream<T>(
     channels: CallbackChannelCount,
     samples: Arc<Vec<i16>>,
     stats: PlaybackStats,
-) -> Result<Stream, String>
+) -> Result<Stream, AudioStartError>
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
 {
@@ -1888,7 +1962,7 @@ where
             },
             None,
         )
-        .map_err(|error| format!("failed to build output stream: {error}"))
+        .map_err(|error| stream_build_error("failed to build output stream", error))
 }
 
 fn playback_callback<T>(
@@ -2030,6 +2104,37 @@ mod tests {
             SupportedBufferSize::Unknown,
             SampleFormat::F32,
         )
+    }
+
+    fn supported(rate: u32) -> SupportedStreamConfig {
+        SupportedStreamConfig::new(2, rate, SupportedBufferSize::Unknown, SampleFormat::F32)
+    }
+
+    #[test]
+    fn current_config_keeps_the_device_rate_and_drops_the_buffer_request() {
+        // The whole point of this rung is not to move the device clock, so the
+        // rate passes through untouched and the buffer stops being negotiated.
+        let selection = current_config(supported(24_000)).expect("24 kHz is a resampler rate");
+        assert_eq!(selection.device_rate, 24_000);
+        assert_eq!(selection.stream_config.sample_rate, 24_000);
+        assert!(matches!(
+            selection.stream_config.buffer_size,
+            BufferSize::Default
+        ));
+        assert_eq!(selection.preview.buffer_note, "device current format");
+    }
+
+    #[test]
+    fn current_config_rejects_rates_the_resampler_cannot_block() {
+        // 10 ms blocks must be a whole number of samples on both sides, so a
+        // device parked on a rate outside the supported set is skipped rather
+        // than opened into a resampler that cannot represent it.
+        assert!(current_config(supported(22_050)).is_none());
+        assert!(current_config(supported(37_800)).is_none());
+        assert!(current_config(supported(SAMPLE_RATE)).is_some());
+        for rate in RESAMPLE_FALLBACK_RATES {
+            assert!(current_config(supported(rate)).is_some(), "{rate}");
+        }
     }
 
     #[test]
