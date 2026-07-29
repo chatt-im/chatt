@@ -194,7 +194,13 @@ const MAX_ACTIVE_BUG_REPORTS: usize = 32;
 const MAX_ACTIVE_BUG_REPORTS_PER_SESSION: usize = 1;
 /// Cap on a stream's fast-start ring. Keyframes reset the ring, so this only
 /// bounds a pathologically long GOP rather than normal operation.
-const VIDEO_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
+///
+/// Charged against `SharedVideoFrame::retained_bytes`, which for a received
+/// frame is its whole record allocation, so the bound is one record and not one
+/// frame: a ring sized at [`video::MAX_VIDEO_FRAME_LEN`] could not hold a single
+/// frame at the cap.
+const VIDEO_RING_MAX_BYTES: usize = video::MAX_VIDEO_RECORD_LEN;
+const _: () = assert!(VIDEO_RING_MAX_BYTES >= video::MAX_VIDEO_RECORD_LEN);
 const VIDEO_RING_MAX_FRAMES: usize = video::FAST_START_MAX_FRAMES;
 /// How long a share may wait for its publisher connection or its first
 /// keyframe. Pending shares are not announced to viewers. The client allows
@@ -203,10 +209,21 @@ const VIDEO_RING_MAX_FRAMES: usize = video::FAST_START_MAX_FRAMES;
 const PUBLISHER_ATTACH_GRACE: Duration = Duration::from_secs(15);
 /// A subscriber whose queued bytes exceed this after a flush is too slow to keep
 /// up and is dropped. It reconnects and fast-starts from the latest keyframe.
-const VIDEO_SUBSCRIBER_HIGH_WATER: usize = 8 * 1024 * 1024;
+///
+/// Measured after the record is appended, so it has to admit one whole queued
+/// record with room to spare; sizing it at exactly one record would drop a
+/// subscriber for receiving a single frame at the cap.
+const VIDEO_SUBSCRIBER_HIGH_WATER: usize =
+    2 * (video::MAX_VIDEO_RECORD_LEN + video::VIDEO_LENGTH_PREFIX_LEN);
+const _: () = assert!(
+    VIDEO_SUBSCRIBER_HIGH_WATER > video::MAX_VIDEO_RECORD_LEN + video::VIDEO_LENGTH_PREFIX_LEN
+);
 const VIDEO_FANOUT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 const VIDEO_FANOUT_BUDGET_RECIPIENTS: usize = 8;
 const VIDEO_FANOUT_QUEUE_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// A queue that cannot admit one frame at the cap would reject every fan-out
+/// for it and disconnect its subscribers.
+const _: () = assert!(VIDEO_FANOUT_QUEUE_MAX_BYTES > video::MAX_VIDEO_RECORD_LEN);
 /// A control connection whose queued bytes exceed this after a flush is not
 /// draining its socket and is dropped, so a stalled file-relay recipient or a
 /// history-pipelining client cannot pin megabytes of server memory.
@@ -2781,24 +2798,25 @@ impl Server {
     }
 
     /// Seals one inner frame for a single subscriber directly into its write
-    /// queue (no intermediate frame allocation). Returns whether
-    /// the subscriber's queue stayed under the high-water mark.
-    fn seal_video_to_subscriber(&mut self, token: Token, data: &[u8]) -> Result<bool, String> {
+    /// queue (no intermediate frame allocation).
+    ///
+    /// Every non-[`VideoSealOutcome::Queued`] result ends the subscription, so
+    /// the outcome distinguishes the causes rather than collapsing them: they
+    /// mean very different things about the server's health.
+    fn seal_video_to_subscriber(&mut self, token: Token, data: &[u8]) -> VideoSealOutcome {
         {
-            let client = self
-                .clients
-                .get_mut(&token)
-                .ok_or_else(|| "unknown subscriber token".to_string())?;
-            let ConnKind::Video(video) = &mut client.kind else {
-                return Err("subscriber is not a video connection".to_string());
+            let Some(client) = self.clients.get_mut(&token) else {
+                return VideoSealOutcome::Gone;
             };
-            let record = video
-                .record
-                .as_mut()
-                .ok_or_else(|| "subscriber missing record protection".to_string())?;
+            let ConnKind::Video(video) = &mut client.kind else {
+                return VideoSealOutcome::Failed("subscriber is not a video connection");
+            };
+            let Some(record) = video.record.as_mut() else {
+                return VideoSealOutcome::Failed("subscriber missing record protection");
+            };
             let sealed_len = record.sealed_len(data.len());
-            if sealed_len > video::MAX_VIDEO_FRAME_LEN {
-                return Err("sealed video record exceeds maximum length".to_string());
+            if sealed_len > video::MAX_VIDEO_RECORD_LEN {
+                return VideoSealOutcome::Failed("sealed video record exceeds maximum length");
             }
             let queued_len = video::VIDEO_LENGTH_PREFIX_LEN + sealed_len;
             if self
@@ -2807,7 +2825,7 @@ impl Server {
                 .saturating_add(queued_len)
                 > OUTBOUND_GLOBAL_HIGH_WATER
             {
-                return Ok(false);
+                return VideoSealOutcome::GlobalSaturated;
             }
             let queued_before = client.write_buf.len();
             let out = client.write_buf.tail_mut();
@@ -2815,17 +2833,20 @@ impl Server {
             out.extend_from_slice(&(sealed_len as u32).to_le_bytes());
             if let Err(error) = record.seal_next_into(CHANNEL_VIDEO, data, out) {
                 out.truncate(tail_before);
-                return Err(error.to_string());
+                kvlog::warn!("video seal failed", token = token.0, error = %error);
+                return VideoSealOutcome::Failed("sealing the frame failed");
             }
             self.write_queue_total_bytes += client.write_buf.len() - queued_before;
         }
         self.loop_work.queue_client_write(token);
-        let within = self
-            .clients
-            .get(&token)
-            .map(|client| subscriber_within_limit(client.write_buf.len()))
-            .unwrap_or(false);
-        Ok(within)
+        let Some(client) = self.clients.get(&token) else {
+            return VideoSealOutcome::Gone;
+        };
+        if subscriber_within_limit(client.write_buf.len()) {
+            VideoSealOutcome::Queued
+        } else {
+            VideoSealOutcome::SubscriberBehind
+        }
     }
 
     /// Caches one published frame and fans it out to every subscriber. On a
@@ -2971,17 +2992,17 @@ impl Server {
             fanout.next_subscriber += 1;
             bytes = bytes.saturating_add(frame_bytes);
             recipients += 1;
-            let within = self
-                .seal_video_to_subscriber(token, fanout.data.as_slice())
-                .unwrap_or(false);
-            if !within {
+            let outcome = self.seal_video_to_subscriber(token, fanout.data.as_slice());
+            if let Some(reason) = outcome.drop_reason() {
                 if let Some(stream) = self.streams.get_mut(&fanout.stream_id) {
                     stream.subscribers.retain(|other| *other != token);
                 }
                 kvlog::warn!(
-                    "video subscriber dropped for backpressure",
+                    "video subscriber dropped",
                     token = token.0,
-                    stream_id = fanout.stream_id.0
+                    stream_id = fanout.stream_id.0,
+                    reason,
+                    frame_bytes
                 );
                 self.disconnect(token);
             }
@@ -3006,7 +3027,6 @@ impl Server {
         codec: String,
         coded_width: u32,
         coded_height: u32,
-        annexb: bool,
         extradata: Vec<u8>,
     ) -> Result<(), String> {
         let (user_id, sender_name, in_voice) = match self.sessions.get(&session_id) {
@@ -3040,7 +3060,6 @@ impl Server {
                 codec: codec.clone(),
                 coded_width,
                 coded_height,
-                annexb,
                 extradata: extradata.clone(),
                 publisher: VideoPublisherState::AwaitingConnection {
                     deadline: Instant::now() + PUBLISHER_ATTACH_GRACE,
@@ -3182,7 +3201,6 @@ impl Server {
             codec: stream.codec.clone(),
             coded_width: stream.coded_width,
             coded_height: stream.coded_height,
-            annexb: stream.annexb,
             extradata: stream.extradata.clone(),
             view_secret: view_secret.to_vec(),
         })
@@ -3592,7 +3610,6 @@ impl Server {
                     codec,
                     coded_width,
                     coded_height,
-                    annexb,
                     extradata,
                 },
             ) => {
@@ -3604,7 +3621,6 @@ impl Server {
                     codec,
                     coded_width,
                     coded_height,
-                    annexb,
                     extradata,
                 );
                 // Answered with its own control rather than a generic error so
@@ -9193,7 +9209,6 @@ struct VideoStream {
     codec: String,
     coded_width: u32,
     coded_height: u32,
-    annexb: bool,
     extradata: Vec<u8>,
     publisher: VideoPublisherState,
     /// Whether viewers were ever told this share exists, latched when the
@@ -9312,6 +9327,38 @@ fn dm_room_name(a: UserId, b: UserId) -> String {
 /// Whether a subscriber's queued bytes are still under the backpressure cap.
 fn subscriber_within_limit(write_buf_len: usize) -> bool {
     write_buf_len <= VIDEO_SUBSCRIBER_HIGH_WATER
+}
+
+/// What became of one frame sealed toward a subscriber.
+///
+/// Only [`Self::Queued`] keeps the subscription: dropping an arbitrary frame
+/// and carrying on would leave the viewer's decoder referencing a picture it
+/// never received, so every other outcome disconnects and lets the client
+/// fast-start from a coherent cached GOP.
+enum VideoSealOutcome {
+    Queued,
+    /// Aggregate server outbound is full, usually because of traffic that has
+    /// nothing to do with this stream.
+    GlobalSaturated,
+    /// This subscriber alone is not draining its socket.
+    SubscriberBehind,
+    /// The connection went away between fan-out and the write.
+    Gone,
+    Failed(&'static str),
+}
+
+impl VideoSealOutcome {
+    /// The reason to report and disconnect on, or `None` when the frame was
+    /// queued.
+    fn drop_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Queued => None,
+            Self::GlobalSaturated => Some("server outbound queue is saturated"),
+            Self::SubscriberBehind => Some("subscriber is above its write high-water mark"),
+            Self::Gone => Some("subscriber connection is already gone"),
+            Self::Failed(reason) => Some(reason),
+        }
+    }
 }
 
 fn identity_control_needs_ordering(control: &ClientControl) -> bool {
@@ -11517,7 +11564,6 @@ mod tests {
                 "avc1.42c01f".to_string(),
                 1280,
                 720,
-                true,
                 Vec::new(),
             )
             .unwrap();
@@ -11554,7 +11600,6 @@ mod tests {
                 codec: "avc1.42c01f".to_string(),
                 coded_width: 1280,
                 coded_height: 720,
-                annexb: true,
                 extradata: Vec::new(),
             },
         );
@@ -11606,7 +11651,6 @@ mod tests {
                 "avc1.42c01f".to_string(),
                 1280,
                 720,
-                true,
                 Vec::new(),
             )
             .unwrap();
@@ -11639,7 +11683,6 @@ mod tests {
                 "avc1.42c01f".to_string(),
                 1280,
                 720,
-                true,
                 Vec::new(),
             )
             .unwrap();
@@ -11672,7 +11715,6 @@ mod tests {
                 "avc1.42c01f".to_string(),
                 1280,
                 720,
-                true,
                 Vec::new(),
             )
             .unwrap();
@@ -11733,7 +11775,6 @@ mod tests {
                 "avc1.42c01f".to_string(),
                 1280,
                 720,
-                true,
                 Vec::new(),
             )
             .unwrap();
@@ -11924,7 +11965,6 @@ mod tests {
                 "avc1.42c01f".to_string(),
                 1280,
                 720,
-                true,
                 Vec::new(),
             )
             .unwrap();
@@ -12053,7 +12093,6 @@ mod tests {
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,
             coded_height: 720,
-            annexb: true,
             extradata: Vec::new(),
             publisher: VideoPublisherState::Live { token: Token(99) },
             announced: true,

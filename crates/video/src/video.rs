@@ -11,8 +11,27 @@ pub const VIDEO_FRAME_HEADER_LEN: usize = 17;
 const VIDEO_FRAME_FLAG_KEY: u8 = 1;
 const VIDEO_FRAME_FLAG_BOOTSTRAP_END: u8 = 2;
 
+/// Maximum size of one outer wire record: a sealed frame plus whatever the
+/// transport wraps around it.
+///
+/// Every memory budget in the pipeline is sized against this rather than
+/// against [`MAX_VIDEO_FRAME_LEN`], because a received frame is retained inside
+/// the record allocation it arrived in and charged through
+/// `SharedVideoFrame::retained_bytes`.
+pub const MAX_VIDEO_RECORD_LEN: usize = 8 * 1024 * 1024;
+
+/// Bytes a sealed record adds around the plaintext frame it carries. This crate
+/// cannot see the transport primitives, so `rpc::video` proves statically that
+/// its own header and tag fit here.
+pub const MAX_RECORD_OVERHEAD: usize = 32;
+
 /// Maximum size of one encoded video frame.
-pub const MAX_VIDEO_FRAME_LEN: usize = 8 * 1024 * 1024;
+///
+/// Deliberately smaller than [`MAX_VIDEO_RECORD_LEN`]: a frame that parses must
+/// always be sealable into one record and admissible to every cache along the
+/// way. Sizing the two equally left the largest legal frame unsendable, and
+/// left a cache bounded at one record unable to hold a single frame.
+pub const MAX_VIDEO_FRAME_LEN: usize = MAX_VIDEO_RECORD_LEN - MAX_RECORD_OVERHEAD;
 
 /// Cap on the frames a fast-start cache holds for a joining viewer.
 ///
@@ -200,6 +219,19 @@ mod tests {
         buffer.extend_from_slice(&((MAX_VIDEO_FRAME_LEN + 1) as u32).to_le_bytes());
         buffer.extend_from_slice(&[0u8; VIDEO_FRAME_HEADER_LEN]);
         assert_eq!(parse_video_frame(&buffer), Err(VideoFrameError::TooLarge));
+    }
+
+    #[test]
+    fn a_maximum_frame_leaves_room_for_its_record_overhead() {
+        // The invariant every budget in the pipeline depends on: the largest
+        // frame that parses still seals into one record, so a cache bounded at
+        // one record can always hold it.
+        let mut header = Vec::new();
+        header.extend_from_slice(&(MAX_VIDEO_FRAME_LEN as u32).to_le_bytes());
+        header.extend_from_slice(&[0u8; VIDEO_FRAME_HEADER_LEN - 4]);
+        let parsed = parse_video_frame_header(&header).unwrap().unwrap();
+        assert_eq!(parsed.size, MAX_VIDEO_FRAME_LEN);
+        assert!(MAX_VIDEO_FRAME_LEN + MAX_RECORD_OVERHEAD <= MAX_VIDEO_RECORD_LEN);
     }
 
     #[test]

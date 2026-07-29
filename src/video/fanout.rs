@@ -1,3 +1,29 @@
+//! Local delivery for one decrypted screen-share stream: the point where the
+//! publisher's self-view, a remote subscriber, the browser, and every native
+//! renderer converge.
+//!
+//! Three invariants hold here, and everything downstream depends on them:
+//!
+//! - **Active-stream fence.** A frame is delivered only while its stream id is
+//!   in `active_streams`. Servers restart stream ids at one, so this is what
+//!   stops a reused id from inheriting the previous stream's cache, queues, and
+//!   browser decoder state. [`VideoFrameFanout::close_stream`] drops all of it
+//!   at once.
+//! - **Keyframe-led caches.** The per-stream fast-start cache is empty or
+//!   begins with the keyframe every later frame references. A keyframe resets
+//!   it; overflow clears it wholesale, because a truncated GOP would hand a
+//!   joining viewer a reference gap.
+//! - **Bootstrap ordering.** A native viewer attaching while a subscriber is
+//!   coming up must not begin its shallow live queue until the server's cached
+//!   GOP has arrived. It is seeded from the local cache, then waits for the
+//!   upstream `bootstrap_end` marker before the boundary is written to its
+//!   socket. Frames the daemon already cached are suppressed during that replay
+//!   so no decoder rewinds through a GOP it has seen.
+//!
+//! Every path that drops a frame counts it and logs at a bounded rate: a
+//! picture that never reaches a renderer has to leave a trace somewhere, and a
+//! broken stream produces them at frame rate.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::Write,
@@ -16,8 +42,17 @@ const MAX_PENDING_FRAMES: usize = 2;
 /// reach while it drains one: [`NativeQueue::seed`] loads the whole cache, so
 /// the two have to move together.
 const MAX_BOOTSTRAP_FRAMES: usize = rpc::video::FAST_START_MAX_FRAMES;
-const MAX_PENDING_BYTES: usize = rpc::video::MAX_VIDEO_FRAME_LEN;
-const FAST_START_MAX_BYTES: usize = rpc::video::MAX_VIDEO_FRAME_LEN;
+/// Byte bounds on a viewer queue and on the cached GOP. Both charge
+/// `SharedVideoFrame::retained_bytes`, the whole record allocation a received
+/// frame arrived in, so they are sized by the record and not by the frame: a
+/// bound of one frame could not admit a single frame at the cap.
+const MAX_PENDING_BYTES: usize = rpc::video::MAX_VIDEO_RECORD_LEN;
+const FAST_START_MAX_BYTES: usize = rpc::video::MAX_VIDEO_RECORD_LEN;
+const _: () = assert!(MAX_PENDING_BYTES >= rpc::video::MAX_VIDEO_RECORD_LEN);
+const _: () = assert!(FAST_START_MAX_BYTES >= rpc::video::MAX_VIDEO_RECORD_LEN);
+/// One log line per this many drops on a given path, about one per second of
+/// video at 30 fps.
+const DROP_LOG_INTERVAL: u64 = 30;
 
 #[derive(Clone)]
 pub struct VideoFrameFanout {
@@ -39,6 +74,10 @@ struct FanoutState {
     /// that never appears has to leave a trace somewhere, but a broken stream
     /// produces them at frame rate, so only some are logged.
     malformed_frames: u64,
+    /// Frames dropped because the active-stream fence was closed. A worker can
+    /// outlive its share by a frame or two, but a steady count means one is
+    /// still delivering into a stream nobody is listening to.
+    inactive_frames: u64,
 }
 
 #[derive(Default)]
@@ -71,6 +110,13 @@ struct QueueState {
     closed: bool,
     received_frames: u64,
     written_frames: u64,
+    /// Frames this viewer never saw: deltas refused while waiting for a
+    /// keyframe, plus whatever an overflow discarded. Without this a renderer
+    /// that falls behind goes black leaving nothing behind but its absence.
+    dropped_frames: u64,
+    /// Times the queue gave up on the current GOP and waited for a fresh
+    /// keyframe.
+    overflows: u64,
 }
 
 pub struct NativeViewerHandle {
@@ -110,6 +156,15 @@ impl VideoFrameFanout {
         let (queues, replayed) = {
             let mut state = self.inner.state.lock().unwrap();
             if !state.active_streams.contains(&stream_id) {
+                state.inactive_frames += 1;
+                if state.inactive_frames == 1 || state.inactive_frames % DROP_LOG_INTERVAL == 0 {
+                    kvlog::warn!(
+                        "dropping video frame for an inactive stream",
+                        stream_id = stream_id.0,
+                        frame_bytes = frame.len(),
+                        dropped_frames = state.inactive_frames
+                    );
+                }
                 return;
             }
             let replayed = if let Some(bootstrap) = state.upstream_bootstrap.get_mut(&stream_id)
@@ -155,11 +210,11 @@ impl VideoFrameFanout {
     }
 
     /// Records a frame dropped for being unparseable, logging the first and
-    /// then every thirtieth, about one line per second of video.
+    /// then every [`DROP_LOG_INTERVAL`]th.
     fn count_malformed(&self, frame_bytes: usize, reason: &'static str) {
         let mut state = self.inner.state.lock().unwrap();
         state.malformed_frames += 1;
-        if state.malformed_frames == 1 || state.malformed_frames % 30 == 0 {
+        if state.malformed_frames == 1 || state.malformed_frames % DROP_LOG_INTERVAL == 0 {
             kvlog::warn!(
                 "dropping malformed video frame",
                 reason,
@@ -274,6 +329,17 @@ impl VideoFrameFanout {
             control,
             join: Some(join),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_frames(&self, stream_id: StreamId) -> usize {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .fast_start
+            .get(&stream_id)
+            .map_or(0, |cache| cache.frames.len())
     }
 
     pub fn has_native(&self, stream_id: StreamId) -> bool {
@@ -402,16 +468,25 @@ impl NativeQueue {
         }
         if !state.seen_keyframe {
             if !is_key {
+                state.dropped_frames += 1;
                 return;
             }
             state.seen_keyframe = true;
         }
         if state.awaiting_keyframe {
             if !is_key {
+                state.dropped_frames += 1;
                 return;
             }
-            state.clear_frames();
+            state.dropped_frames += state.clear_frames();
             state.awaiting_keyframe = false;
+            kvlog::info!(
+                "native video viewer recovered at a keyframe",
+                viewer_id = self.viewer_id,
+                stream_id = self.stream_id.0,
+                dropped_frames = state.dropped_frames,
+                overflows = state.overflows
+            );
         } else {
             let frame_limit = if state.bootstrapping {
                 MAX_BOOTSTRAP_FRAMES
@@ -422,22 +497,67 @@ impl NativeQueue {
                 || state.pending_bytes.saturating_add(frame.retained_bytes()) > MAX_PENDING_BYTES;
             if over_limit {
                 if is_key {
-                    state.clear_frames();
+                    state.dropped_frames += state.clear_frames();
                 } else {
-                    state.awaiting_keyframe = true;
-                    state.bootstrapping = false;
+                    self.begin_awaiting_keyframe(
+                        &mut state,
+                        "viewer is not draining its socket",
+                        frame.retained_bytes(),
+                    );
                     return;
                 }
             }
         }
+        // Unreachable for a frame that parsed: `MAX_VIDEO_FRAME_LEN` reserves
+        // room for the record overhead `retained_bytes` charges. Reaching it
+        // means the size invariant was violated upstream, so it is loud.
         if frame.retained_bytes() > MAX_PENDING_BYTES {
-            state.awaiting_keyframe = true;
-            state.bootstrapping = false;
+            kvlog::error!(
+                "native video frame exceeds the queue bound on its own",
+                viewer_id = self.viewer_id,
+                stream_id = self.stream_id.0,
+                frame_bytes = frame.len(),
+                retained_bytes = frame.retained_bytes(),
+                limit_bytes = MAX_PENDING_BYTES
+            );
+            self.begin_awaiting_keyframe(
+                &mut state,
+                "frame exceeds the queue bound",
+                frame.retained_bytes(),
+            );
             return;
         }
         state.pending_bytes += frame.retained_bytes();
         state.frames.push_back(frame);
         self.ready.notify_one();
+    }
+
+    /// Stops accepting deltas until a fresh keyframe arrives. Continuing with
+    /// the next delta would leave the renderer decoding against frames it never
+    /// received, so the queue waits for a self-contained restart point instead.
+    fn begin_awaiting_keyframe(
+        &self,
+        state: &mut QueueState,
+        reason: &'static str,
+        frame_bytes: usize,
+    ) {
+        state.awaiting_keyframe = true;
+        state.bootstrapping = false;
+        state.dropped_frames += 1;
+        state.overflows += 1;
+        if state.overflows == 1 || state.overflows % DROP_LOG_INTERVAL == 0 {
+            kvlog::warn!(
+                "native video queue overflowed; waiting for a keyframe",
+                viewer_id = self.viewer_id,
+                stream_id = self.stream_id.0,
+                reason,
+                queued_frames = state.frames.len(),
+                queued_bytes = state.pending_bytes,
+                frame_bytes,
+                dropped_frames = state.dropped_frames,
+                overflows = state.overflows
+            );
+        }
     }
 
     fn pop(&self) -> Option<SharedVideoFrame> {
@@ -462,6 +582,13 @@ impl NativeQueue {
         }
     }
 
+    /// Frames this viewer never received, and how many times the queue fell
+    /// back to waiting for a keyframe.
+    fn drop_counts(&self) -> (u64, u64) {
+        let state = self.state.lock().unwrap();
+        (state.dropped_frames, state.overflows)
+    }
+
     fn close(&self) {
         let mut state = self.state.lock().unwrap();
         state.closed = true;
@@ -473,7 +600,10 @@ impl NativeQueue {
 }
 
 impl QueueState {
-    fn clear_frames(&mut self) {
+    /// Drops every queued frame, preserving an unwritten bootstrap boundary so
+    /// the renderer still learns where the cached GOP ended. Returns how many
+    /// encoded frames the viewer lost.
+    fn clear_frames(&mut self) -> u64 {
         let boundary = self
             .bootstrap_boundary_pending
             .then(|| {
@@ -483,12 +613,18 @@ impl QueueState {
                     .cloned()
             })
             .flatten();
+        let discarded = self
+            .frames
+            .iter()
+            .filter(|frame| !is_bootstrap_boundary(frame))
+            .count() as u64;
         self.frames.clear();
         self.pending_bytes = 0;
         if let Some(boundary) = boundary {
             self.pending_bytes = boundary.retained_bytes();
             self.frames.push_back(boundary);
         }
+        discarded
     }
 
     fn push_bootstrap_boundary(&mut self, stream_id: StreamId) {
@@ -509,44 +645,56 @@ fn is_bootstrap_boundary(frame: &SharedVideoFrame) -> bool {
 
 fn native_writer_loop(mut stream: UnixStream, queue: Arc<NativeQueue>) {
     let mut written = 0u64;
+    let mut write_error = None;
     while let Some(frame) = queue.pop() {
-        match stream.write_all(frame.as_slice()) {
-            Ok(()) => {
-                let bootstrap_end = rpc::video::parse_video_frame_header(frame.as_slice())
-                    .ok()
-                    .flatten()
-                    .is_some_and(|header| header.bootstrap_end);
-                if bootstrap_end {
-                    kvlog::debug!(
-                        "native video bootstrap boundary written",
-                        viewer_id = queue.viewer_id,
-                        stream_id = queue.stream_id.0,
-                        cached_frames = written
-                    );
-                } else {
-                    written += 1;
-                }
-                if written == 1 && !bootstrap_end {
-                    kvlog::info!(
-                        "native video first frame written",
-                        viewer_id = queue.viewer_id,
-                        stream_id = queue.stream_id.0,
-                        keyframe = frame.as_slice().get(12) == Some(&1),
-                        frame_bytes = frame.len()
-                    );
-                }
-            }
-            Err(error) => {
-                kvlog::warn!(
-                    "native video writer stopped",
-                    viewer_id = queue.viewer_id,
-                    stream_id = queue.stream_id.0,
-                    written_frames = written,
-                    error = %error
-                );
-                break;
-            }
+        let header = rpc::video::parse_video_frame_header(frame.as_slice())
+            .ok()
+            .flatten();
+        if let Err(error) = stream.write_all(frame.as_slice()) {
+            write_error = Some(error);
+            break;
         }
+        if header.is_some_and(|header| header.bootstrap_end) {
+            kvlog::debug!(
+                "native video bootstrap boundary written",
+                viewer_id = queue.viewer_id,
+                stream_id = queue.stream_id.0,
+                cached_frames = written
+            );
+            continue;
+        }
+        written += 1;
+        if written == 1 {
+            kvlog::info!(
+                "native video first frame written",
+                viewer_id = queue.viewer_id,
+                stream_id = queue.stream_id.0,
+                keyframe = header.is_some_and(|header| header.is_key),
+                frame_bytes = frame.len()
+            );
+        }
+    }
+    // A viewer's whole session is accountable here: what it saw, and what the
+    // queue had to discard to keep its decoder on a coherent reference chain.
+    let (dropped_frames, overflows) = queue.drop_counts();
+    match write_error {
+        Some(error) => kvlog::warn!(
+            "native video writer stopped",
+            viewer_id = queue.viewer_id,
+            stream_id = queue.stream_id.0,
+            written_frames = written,
+            dropped_frames,
+            overflows,
+            error = %error
+        ),
+        None => kvlog::info!(
+            "native video writer finished",
+            viewer_id = queue.viewer_id,
+            stream_id = queue.stream_id.0,
+            written_frames = written,
+            dropped_frames,
+            overflows
+        ),
     }
     let _ = stream.shutdown(Shutdown::Both);
     queue.close();
@@ -801,6 +949,44 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn overflowing_queue_counts_what_the_viewer_lost_and_recovers_at_a_keyframe() {
+        let queue = NativeQueue {
+            viewer_id: 1,
+            stream_id: StreamId(1),
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        queue.push(frame(1, true, 1), true);
+        for marker in 0..MAX_PENDING_FRAMES + 2 {
+            queue.push(frame(1, false, marker as u8), false);
+        }
+        {
+            let state = queue.state.lock().unwrap();
+            assert!(state.awaiting_keyframe);
+            assert_eq!(state.overflows, 1);
+            assert!(state.dropped_frames >= 1);
+        }
+
+        queue.push(frame(1, true, 9), true);
+        let (dropped_frames, overflows) = queue.drop_counts();
+        assert_eq!(overflows, 1);
+        // The refused deltas plus the queued frames the reset discarded.
+        assert_eq!(dropped_frames, 5);
+        let state = queue.state.lock().unwrap();
+        assert!(!state.awaiting_keyframe);
+        assert_eq!(state.frames.len(), 1);
+    }
+
+    #[test]
+    fn frames_for_an_inactive_stream_are_counted() {
+        let fanout = VideoFrameFanout::new(None);
+        fanout.send(frame(7, true, 1));
+        fanout.send(frame(7, false, 2));
+        assert_eq!(fanout.inner.state.lock().unwrap().inactive_frames, 2);
+        assert_eq!(fanout.cached_frames(StreamId(7)), 0);
     }
 
     #[test]

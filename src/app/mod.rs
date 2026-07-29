@@ -3127,7 +3127,11 @@ impl App {
             return;
         }
 
+        // Every path that leaves without a viewer connection has to undo the
+        // subscription above, or `stop_rpc_live_share` later reads it as a
+        // browser still watching and declines to stop a real subscriber.
         let Some(session_id) = self.session_id else {
+            self.web_viewing_shares.remove(&stream_id);
             feed.send_share_error(
                 client,
                 share_error_envelope(stream_id, "the voice session is no longer active"),
@@ -3135,6 +3139,7 @@ impl App {
             return;
         };
         let Some(video_transport) = self.video_transport else {
+            self.web_viewing_shares.remove(&stream_id);
             feed.send_share_error(
                 client,
                 share_error_envelope(stream_id, "video transport is not ready"),

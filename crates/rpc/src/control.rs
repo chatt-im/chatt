@@ -198,7 +198,6 @@ pub enum ClientControl {
         codec: String,
         coded_width: u32,
         coded_height: u32,
-        annexb: bool,
         extradata: Vec<u8>,
     },
     StopShare {
@@ -454,7 +453,6 @@ pub enum ServerControl {
         codec: String,
         coded_width: u32,
         coded_height: u32,
-        annexb: bool,
         extradata: Vec<u8>,
         view_secret: Vec<u8>,
     },
@@ -1988,7 +1986,6 @@ mod tests {
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,
             coded_height: 720,
-            annexb: true,
             extradata: vec![],
         };
         let encoded = encode_client_control(&start).unwrap();
@@ -2015,7 +2012,6 @@ mod tests {
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,
             coded_height: 720,
-            annexb: true,
             extradata: vec![],
             view_secret: vec![9; 32],
         };
@@ -2031,7 +2027,6 @@ mod tests {
             codec: "  ".to_string(),
             coded_width: 0,
             coded_height: 0,
-            annexb: true,
             extradata: vec![],
         };
         assert!(encode_client_control(&start).is_err());

@@ -9,7 +9,7 @@
 //!
 //! Two framing layers ride the wire:
 //! - Outer: a u32 length prefix per record ([`write_record`]/[`parse_record`]),
-//!   capped at [`MAX_VIDEO_FRAME_LEN`].
+//!   capped at [`MAX_VIDEO_RECORD_LEN`].
 //! - Inner (a frame record's sealed plaintext): the [`write_video_frame`] bytes,
 //!   a 17-byte header (`[u32 size_incl_header][i64 ts_ms][u8 flags][u32
 //!   stream_id]`) followed by the length-prefixed video bitstream. Normal frame
@@ -34,6 +34,12 @@ use crate::evented::{ReadPumpOutcome, Readiness};
 use crate::ids::{SessionId, StreamId};
 
 pub use chatt_video::video::*;
+
+/// `chatt-video` sizes [`MAX_VIDEO_FRAME_LEN`] below [`MAX_VIDEO_RECORD_LEN`] by
+/// [`MAX_RECORD_OVERHEAD`] so a frame at the cap always seals into one record.
+/// This crate owns the transport primitives, so it is where that reservation is
+/// checked against the real overhead.
+const _: () = assert!(TRANSPORT_HEADER_LEN + TAG_LEN <= MAX_RECORD_OVERHEAD);
 
 /// Preamble that distinguishes a video connection from a control connection. Its
 /// first four bytes (`0x56544843`) read as a little-endian length far above
@@ -151,11 +157,22 @@ static COPY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// beyond the visible frame is copied to an exact allocation instead, which
 /// makes pinning a large reusable receive buffer through a small frame slice
 /// impossible by construction.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SharedVideoFrame {
     buf: Arc<Vec<u8>>,
     off: usize,
     len: usize,
+}
+
+/// Reports the window and its backing allocation. The derived form would print
+/// megabytes of encoded video into a log line.
+impl std::fmt::Debug for SharedVideoFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedVideoFrame")
+            .field("len", &self.len)
+            .field("retained_bytes", &self.retained_bytes())
+            .finish()
+    }
 }
 
 impl SharedVideoFrame {
@@ -330,7 +347,7 @@ impl VideoRecordReader {
 
     fn begin_body(&mut self) -> Result<(), VideoFrameError> {
         let len = u32::from_le_bytes(self.prefix) as usize;
-        if len > MAX_VIDEO_FRAME_LEN {
+        if len > MAX_VIDEO_RECORD_LEN {
             return Err(VideoFrameError::TooLarge);
         }
         debug_assert!(self.body.is_empty());
@@ -395,7 +412,7 @@ pub fn read_video_record(
 
 /// Writes one outer record: a u32 little-endian length prefix then `payload`.
 pub fn write_record(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), VideoFrameError> {
-    if payload.len() > MAX_VIDEO_FRAME_LEN {
+    if payload.len() > MAX_VIDEO_RECORD_LEN {
         return Err(VideoFrameError::TooLarge);
     }
     let len = u32::try_from(payload.len()).map_err(|_| VideoFrameError::LengthOverflow)?;
@@ -414,7 +431,7 @@ pub fn parse_record(buffer: &[u8]) -> Result<Option<(&[u8], usize)>, VideoFrameE
         return Ok(None);
     };
     let len = u32::from_le_bytes(prefix.try_into().unwrap()) as usize;
-    if len > MAX_VIDEO_FRAME_LEN {
+    if len > MAX_VIDEO_RECORD_LEN {
         return Err(VideoFrameError::TooLarge);
     }
     let total = VIDEO_LENGTH_PREFIX_LEN + len;
@@ -651,7 +668,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let (mut writer, reader_sock) = UnixStream::pair().unwrap();
-        let len = (MAX_VIDEO_FRAME_LEN + 1) as u32;
+        let len = (MAX_VIDEO_RECORD_LEN + 1) as u32;
         writer.write_all(&len.to_le_bytes()).unwrap();
         let mut reader = VideoRecordReader::new();
 
