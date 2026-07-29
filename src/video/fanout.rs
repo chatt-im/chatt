@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::Write,
     net::Shutdown,
     os::unix::net::UnixStream,
@@ -12,7 +12,10 @@ use rpc::{ids::StreamId, video::SharedVideoFrame};
 use crate::web_server::WebFeedSender;
 
 const MAX_PENDING_FRAMES: usize = 2;
-const MAX_BOOTSTRAP_FRAMES: usize = 90;
+/// Frames a cached GOP may hold, and so also the depth a viewer's queue may
+/// reach while it drains one: [`NativeQueue::seed`] loads the whole cache, so
+/// the two have to move together.
+const MAX_BOOTSTRAP_FRAMES: usize = rpc::video::FAST_START_MAX_FRAMES;
 const MAX_PENDING_BYTES: usize = rpc::video::MAX_VIDEO_FRAME_LEN;
 const FAST_START_MAX_BYTES: usize = rpc::video::MAX_VIDEO_FRAME_LEN;
 
@@ -28,9 +31,14 @@ struct FanoutInner {
 
 #[derive(Default)]
 struct FanoutState {
+    active_streams: HashSet<StreamId>,
     native: HashMap<(u64, StreamId), Arc<NativeQueue>>,
     fast_start: HashMap<StreamId, NativeFastStart>,
     upstream_bootstrap: HashMap<StreamId, UpstreamBootstrap>,
+    /// Frames dropped for not parsing as one whole plaintext frame. A picture
+    /// that never appears has to leave a trace somewhere, but a broken stream
+    /// produces them at frame rate, so only some are logged.
+    malformed_frames: u64,
 }
 
 #[derive(Default)]
@@ -86,9 +94,11 @@ impl VideoFrameFanout {
 
     pub fn send(&self, frame: SharedVideoFrame) {
         let Ok(Some((parsed, consumed))) = rpc::video::parse_video_frame(frame.as_slice()) else {
+            self.count_malformed(frame.len(), "frame does not parse");
             return;
         };
         if consumed != frame.len() {
+            self.count_malformed(frame.len(), "frame size does not match its record");
             return;
         }
         let stream_id = StreamId(parsed.stream_id);
@@ -99,6 +109,9 @@ impl VideoFrameFanout {
         let is_key = parsed.is_key;
         let (queues, replayed) = {
             let mut state = self.inner.state.lock().unwrap();
+            if !state.active_streams.contains(&stream_id) {
+                return;
+            }
             let replayed = if let Some(bootstrap) = state.upstream_bootstrap.get_mut(&stream_id)
                 && bootstrap
                     .replay_through_ts_ms
@@ -112,6 +125,13 @@ impl VideoFrameFanout {
             if replayed {
                 (Vec::new(), true)
             } else {
+                // Inside the lock, and only for frames that are not a replay of
+                // ones already delivered: the browser routes by stream id, so a
+                // frame must not reach it before the share is announced, and a
+                // re-sent GOP would rewind its decoder by the whole burst.
+                if let Some(web) = &self.inner.web {
+                    web.send_video_frame(frame.clone());
+                }
                 state.fast_start.entry(stream_id).or_default().push(
                     stream_id,
                     frame.clone(),
@@ -126,9 +146,6 @@ impl VideoFrameFanout {
                 (queues, false)
             }
         };
-        if let Some(web) = &self.inner.web {
-            web.send_video_frame(frame.clone());
-        }
         if replayed {
             return;
         }
@@ -137,10 +154,28 @@ impl VideoFrameFanout {
         }
     }
 
+    /// Records a frame dropped for being unparseable, logging the first and
+    /// then every thirtieth, about one line per second of video.
+    fn count_malformed(&self, frame_bytes: usize, reason: &'static str) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.malformed_frames += 1;
+        if state.malformed_frames == 1 || state.malformed_frames % 30 == 0 {
+            kvlog::warn!(
+                "dropping malformed video frame",
+                reason,
+                frame_bytes,
+                dropped_frames = state.malformed_frames
+            );
+        }
+    }
+
     /// Marks a new server subscription so an overlapping server-side cached
     /// GOP is not replayed after the daemon's own cached GOP.
     pub fn begin_upstream_bootstrap(&self, stream_id: StreamId) {
         let mut state = self.inner.state.lock().unwrap();
+        if !state.active_streams.contains(&stream_id) {
+            return;
+        }
         let replay_through_ts_ms = state
             .fast_start
             .get(&stream_id)
@@ -198,6 +233,9 @@ impl VideoFrameFanout {
         });
         {
             let mut state = self.inner.state.lock().unwrap();
+            if !state.active_streams.contains(&stream_id) {
+                return Err("screen share is no longer available".into());
+            }
             if state.native.contains_key(&key) {
                 return Err("screen share is already playing".into());
             }
@@ -248,9 +286,21 @@ impl VideoFrameFanout {
             .any(|(_, id)| *id == stream_id)
     }
 
+    /// Opens a stream id for frame delivery. Duplicate announcements are
+    /// idempotent and preserve the current keyframe-led cache.
+    pub fn start_stream(&self, stream_id: StreamId) {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .active_streams
+            .insert(stream_id);
+    }
+
     pub fn close_stream(&self, stream_id: StreamId) {
         let queues = {
             let mut state = self.inner.state.lock().unwrap();
+            state.active_streams.remove(&stream_id);
             state.fast_start.remove(&stream_id);
             state.upstream_bootstrap.remove(&stream_id);
             let keys = state
@@ -565,6 +615,7 @@ mod tests {
     #[test]
     fn late_native_viewer_is_seeded_from_latest_keyframe() {
         let fanout = VideoFrameFanout::new(None);
+        fanout.start_stream(StreamId(7));
         fanout.send(frame(7, false, 0));
         fanout.send(frame(7, true, 1));
         fanout.send(frame(7, false, 2));
@@ -596,6 +647,7 @@ mod tests {
     #[test]
     fn native_viewer_without_a_cached_gop_starts_with_a_bootstrap_boundary() {
         let fanout = VideoFrameFanout::new(None);
+        fanout.start_stream(StreamId(7));
         let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
         frontend_stream
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -613,6 +665,7 @@ mod tests {
     #[test]
     fn cold_native_viewer_waits_for_the_upstream_cached_gop_boundary() {
         let fanout = VideoFrameFanout::new(None);
+        fanout.start_stream(StreamId(7));
         let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
         frontend_stream
             .set_read_timeout(Some(std::time::Duration::from_millis(50)))
@@ -657,6 +710,7 @@ mod tests {
     #[test]
     fn upstream_fast_start_skips_frames_already_in_the_daemon_cache() {
         let fanout = VideoFrameFanout::new(None);
+        fanout.start_stream(StreamId(7));
         fanout.send(frame(7, true, 1));
         fanout.send(frame(7, false, 2));
 
@@ -688,6 +742,64 @@ mod tests {
                 .unwrap()
                 .0
                 .bootstrap_end
+        );
+    }
+
+    #[test]
+    fn closed_stream_ignores_late_frames_and_reopens_empty() {
+        let fanout = VideoFrameFanout::new(None);
+        let stream_id = StreamId(7);
+        fanout.start_stream(stream_id);
+        fanout.send(frame(7, true, 1));
+        assert_eq!(
+            fanout.inner.state.lock().unwrap().fast_start[&stream_id]
+                .frames
+                .len(),
+            1
+        );
+
+        fanout.close_stream(stream_id);
+        fanout.send(frame(7, true, 2));
+        assert!(
+            !fanout
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .fast_start
+                .contains_key(&stream_id)
+        );
+
+        fanout.start_stream(stream_id);
+        assert!(
+            !fanout
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .fast_start
+                .contains_key(&stream_id)
+        );
+        fanout.send(frame(7, true, 3));
+        let state = fanout.inner.state.lock().unwrap();
+        let cached = state.fast_start[&stream_id].frames.front().unwrap();
+        assert_eq!(cached.as_slice()[4], 3);
+    }
+
+    #[test]
+    fn duplicate_stream_start_preserves_the_live_cache() {
+        let fanout = VideoFrameFanout::new(None);
+        let stream_id = StreamId(7);
+        fanout.start_stream(stream_id);
+        fanout.send(frame(7, true, 1));
+
+        fanout.start_stream(stream_id);
+
+        assert_eq!(
+            fanout.inner.state.lock().unwrap().fast_start[&stream_id]
+                .frames
+                .len(),
+            1
         );
     }
 

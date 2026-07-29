@@ -13,7 +13,10 @@
 
 const VIDEO_FRAME_HEADER_LEN = 17;
 const MAX_DECODE_QUEUE = 2;
-const MAX_PENDING_FRAMES = 90;
+// Mirrors FAST_START_MAX_FRAMES in crates/video/src/video.rs: a fast-start
+// burst arrives faster than it decodes, so a smaller bound here would reset the
+// decoder partway through the burst and discard it.
+const MAX_PENDING_FRAMES = 300;
 
 export interface VideoFrame {
   tsMs: number;

@@ -48,7 +48,7 @@ use rpc::{
     frame, history,
     ids::{
         AccountId, BugReportId, DeviceId, EventId, FileTransferId, MessageId, RoomId, SessionId,
-        StreamId, UserId,
+        ShareAttemptId, StreamId, UserId,
     },
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
     recv::RecvBuffer,
@@ -487,6 +487,7 @@ pub enum NetworkCommand {
     PlaybackFeedback(LivePlaybackFeedback),
     SetVoiceState(VoiceState),
     StartShare {
+        attempt_id: ShareAttemptId,
         codec: String,
         coded_width: u32,
         coded_height: u32,
@@ -636,6 +637,10 @@ pub enum NetworkEvent {
         default_room: RoomId,
         /// Whether the server allows opening DM rooms that do not exist yet.
         dms_enabled: bool,
+        /// Concrete TCP peer selected by the control connection. Dedicated
+        /// video connections reuse it instead of resolving the configured
+        /// hostname independently.
+        video_addr: SocketAddr,
         video_transport_mode: TransportMode,
         video_auth_key: [u8; KEY_LEN],
     },
@@ -790,6 +795,7 @@ pub enum NetworkEvent {
     },
     EncoderProfileChanged(LiveEncoderProfile),
     ShareStarted {
+        attempt_id: ShareAttemptId,
         room_id: RoomId,
         stream_id: StreamId,
         publish_secret: Vec<u8>,
@@ -812,6 +818,7 @@ pub enum NetworkEvent {
         stream_id: StreamId,
     },
     ShareStartRejected {
+        attempt_id: ShareAttemptId,
         message: String,
     },
     Status(String),
@@ -1506,6 +1513,14 @@ fn run_worker_inner(
         Ok(value) => value,
         Err(error) => return SessionEnd::ConnectFailed(error),
     };
+    let video_addr = match std_tcp.peer_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            return SessionEnd::ConnectFailed(format!(
+                "failed to read connected server address: {error}"
+            ));
+        }
+    };
     let transport_mode = transport.mode;
     let server_public_key = match pinned_server_public_key(config, false) {
         Ok(Some(key)) => key,
@@ -1601,6 +1616,7 @@ fn run_worker_inner(
         write_buf: WriteQueue::new(),
         control,
         transport_mode,
+        video_addr,
         video_auth_key,
         server_public_key,
         session_id: None,
@@ -1608,7 +1624,6 @@ fn run_worker_inner(
         user_names: HashMap::new(),
         active_room: None,
         voice_room: None,
-        pending_share_start: false,
         next_file_transfer: 1,
         outgoing_uploads: VecDeque::new(),
         upload_throttle: UploadThrottle::new(config.upload_rate_bytes),
@@ -2227,6 +2242,8 @@ struct WorkerState<'a> {
     control: RecordProtection,
     /// The negotiated transport mode is retained for control/UI/video checks.
     transport_mode: TransportMode,
+    /// Concrete peer selected by the control connection, reused by video.
+    video_addr: SocketAddr,
     /// Session-authentication key for plaintext video connection setup.
     video_auth_key: [u8; KEY_LEN],
     /// Server identity is part of every AccountId and MLS store namespace,
@@ -2241,7 +2258,6 @@ struct WorkerState<'a> {
     /// The room whose voice call this client is in, target for screen shares
     /// and P2P publication.
     voice_room: Option<RoomId>,
-    pending_share_start: bool,
     next_file_transfer: u64,
     outgoing_uploads: VecDeque<OutgoingUpload>,
     upload_throttle: UploadThrottle,
@@ -3714,6 +3730,7 @@ impl WorkerState<'_> {
                 self.queue_control(ClientControl::SetVoiceState { state })?;
             }
             NetworkCommand::StartShare {
+                attempt_id,
                 codec,
                 coded_width,
                 coded_height,
@@ -3722,11 +3739,13 @@ impl WorkerState<'_> {
             } => {
                 let Some(room_id) = self.voice_room else {
                     let _ = self.events.send(NetworkEvent::ShareStartRejected {
+                        attempt_id,
                         message: "join a voice call before sharing".to_string(),
                     });
                     return Ok(());
                 };
                 self.queue_control(ClientControl::StartShare {
+                    attempt_id,
                     room_id,
                     codec,
                     coded_width,
@@ -3734,7 +3753,6 @@ impl WorkerState<'_> {
                     annexb,
                     extradata,
                 })?;
-                self.pending_share_start = true;
             }
             NetworkCommand::StopShare { stream_id } => {
                 self.queue_control(ClientControl::StopShare { stream_id })?;
@@ -5519,6 +5537,7 @@ impl WorkerState<'_> {
                 }
             }
             ServerControl::ShareStarted {
+                attempt_id,
                 room_id,
                 stream_id,
                 publish_secret,
@@ -5527,9 +5546,9 @@ impl WorkerState<'_> {
                 coded_height,
                 extradata,
             } => {
-                self.pending_share_start = false;
                 kvlog::info!("client share started", stream_id = stream_id.0);
                 let _ = self.events.send(NetworkEvent::ShareStarted {
+                    attempt_id,
                     room_id,
                     stream_id,
                     publish_secret,
@@ -5580,16 +5599,21 @@ impl WorkerState<'_> {
             ServerControl::BugReportSaved { report_id } => {
                 kvlog::info!("server saved bug report", report_id = report_id.0);
             }
+            ServerControl::ShareStartFailed {
+                attempt_id,
+                message,
+            } => {
+                kvlog::warn!("client share start failed", error = message.as_str());
+                let _ = self.events.send(NetworkEvent::ShareStartRejected {
+                    attempt_id,
+                    message,
+                });
+            }
             ServerControl::Error { code, message } => {
                 kvlog::warn!("server control error", error = message.as_str());
                 if self.session_id.is_none() && is_auth_failure_code(code) {
                     self.auth_failure = Some((code, message));
                     self.shutdown = true;
-                } else if self.pending_share_start {
-                    self.pending_share_start = false;
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::ShareStartRejected { message });
                 } else {
                     let _ = self.events.send(NetworkEvent::Error(message));
                 }
@@ -5703,6 +5727,7 @@ impl WorkerState<'_> {
             users,
             default_room,
             dms_enabled,
+            video_addr: self.video_addr,
             video_transport_mode: self.transport_mode,
             video_auth_key: self.video_auth_key,
         });
@@ -6198,6 +6223,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::ShareStarted { .. } => "share_started",
         ServerControl::ShareAvailable { .. } => "share_available",
         ServerControl::ShareEnded { .. } => "share_ended",
+        ServerControl::ShareStartFailed { .. } => "share_start_failed",
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
         ServerControl::BugReportSaved { .. } => "bug_report_saved",

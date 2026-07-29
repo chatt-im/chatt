@@ -228,7 +228,6 @@ impl App {
         }
         let view_secret = share.view_secret.clone();
         let own_share = self.screencast_stream_id == Some(stream_id);
-        let tcp_addr = self.active_tcp_addr.clone();
         let session_id = self.session_id;
         let video_transport = self.video_transport;
         let upstream_is_active = self.subscribers.contains_key(&stream_id);
@@ -242,9 +241,6 @@ impl App {
         if own_share || upstream_is_active {
             return Ok(handle);
         }
-        let Some(tcp_addr) = tcp_addr else {
-            return Err("not connected to a server".into());
-        };
         let Some(session_id) = session_id else {
             return Err("the voice session is no longer active".into());
         };
@@ -255,9 +251,9 @@ impl App {
             session_id,
             stream_id,
             view_secret,
-            tcp_addr,
             video_transport,
             self.video_fanout.clone(),
+            self.events.sender(),
         );
         self.subscribers.insert(stream_id, subscriber);
         Ok(handle)

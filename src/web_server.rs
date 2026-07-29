@@ -69,6 +69,7 @@ const MAX_HIGHLIGHT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// exceeds this bound, caching pauses until the next keyframe rather than
 /// retaining an undecodable delta suffix.
 const VIDEO_FAST_START_MAX_BYTES: usize = video::MAX_VIDEO_FRAME_LEN;
+const VIDEO_FAST_START_MAX_FRAMES: usize = video::FAST_START_MAX_FRAMES;
 /// Bounds video frames waiting on the app-to-web handoff.
 ///
 /// Sized so a frame at the protocol's own maximum always fits an empty queue
@@ -121,7 +122,9 @@ impl VideoFastStart {
             return;
         }
 
-        if self.bytes.saturating_add(frame.retained_bytes()) > VIDEO_FAST_START_MAX_BYTES {
+        if self.frames.len() >= VIDEO_FAST_START_MAX_FRAMES
+            || self.bytes.saturating_add(frame.retained_bytes()) > VIDEO_FAST_START_MAX_BYTES
+        {
             kvlog::warn!(
                 "video fast start cache overflowed, pausing until the next keyframe",
                 stream_id,
@@ -483,6 +486,10 @@ enum WebFeed {
     /// A `share_ended` envelope. Drops the retained `share_available` for its
     /// `stream_id`.
     ShareEnded { stream_id: u32, payload: String },
+    /// A `share_status` envelope reporting what a share's viewer connection is
+    /// doing. Broadcast, because every tab watching the share needs it, but
+    /// transient: the next one supersedes it and frames resuming moot it.
+    ShareStatus { payload: String },
     /// One plaintext video frame body (the 17-byte header plus the bitstream),
     /// forwarded to browsers as a binary WebSocket message without re-framing.
     /// Shared so the fast-start cache and the WebSocket writer never copy it.
@@ -518,7 +525,8 @@ impl WebFeed {
             | Self::ShareError { payload, .. }
             | Self::RequestResult { payload, .. }
             | Self::CommandReply { payload, .. }
-            | Self::ShareEnded { payload, .. } => payload.capacity(),
+            | Self::ShareEnded { payload, .. }
+            | Self::ShareStatus { payload, .. } => payload.capacity(),
         };
         let video = match self {
             Self::VideoFrame(frame) => frame.retained_bytes(),
@@ -555,6 +563,7 @@ impl WebFeed {
             | Self::FileTerminal(_)
             | Self::ShareConfig { .. }
             | Self::ShareError { .. }
+            | Self::ShareStatus { .. }
             | Self::RequestResult { .. }
             | Self::CommandReply { .. } => FeedBudget::Transient,
         }
@@ -977,6 +986,12 @@ impl WebFeedSender {
     /// Tells every browser a share ended and drops its retained announcement.
     pub fn send_share_ended(&self, stream_id: u32, payload: String) {
         self.queue(WebFeed::ShareEnded { stream_id, payload });
+    }
+
+    /// Tells every browser what a share's viewer connection is doing. The
+    /// envelope carries the stream id, and nothing here is keyed by it.
+    pub fn send_share_status(&self, payload: String) {
+        self.queue(WebFeed::ShareStatus { payload });
     }
 
     /// Sends one plaintext video frame body as a binary WebSocket message.
@@ -2073,6 +2088,7 @@ fn run(
                 }
                 Ok(WebFeed::DeleteError(payload))
                 | Ok(WebFeed::ActionError(payload))
+                | Ok(WebFeed::ShareStatus { payload })
                 | Ok(WebFeed::FileProgress(payload))
                 | Ok(WebFeed::FileTerminal(payload)) => {
                     for id in &clients {
@@ -2096,6 +2112,14 @@ fn run(
                         );
                         continue;
                     };
+                    if !active_shares.contains_key(&stream_id) {
+                        kvlog::debug!(
+                            "dropping browser video frame for inactive share",
+                            stream_id,
+                            frame_bytes = frame.len()
+                        );
+                        continue;
+                    }
                     for (id, subscribed) in &ready_share_subscriptions {
                         if *subscribed == stream_id {
                             if let Err(error) = server.send_websocket_binary(*id, frame.as_slice())
@@ -2584,6 +2608,29 @@ mod tests {
             cache.bytes,
             new_key.retained_bytes() + new_delta.retained_bytes()
         );
+    }
+
+    #[test]
+    fn video_fast_start_bounds_tiny_frames_by_count() {
+        let mut cache = VideoFastStart::default();
+        for index in 0..VIDEO_FAST_START_MAX_FRAMES {
+            let is_key = index == 0;
+            let frame = SharedVideoFrame::copy_from_slice(&video::encode_video_frame(
+                index as i64,
+                is_key,
+                7,
+                &[index as u8],
+            ));
+            cache.push(7, frame, is_key);
+        }
+        assert_eq!(cache.frames.len(), VIDEO_FAST_START_MAX_FRAMES);
+
+        let overflow =
+            SharedVideoFrame::copy_from_slice(&video::encode_video_frame(100, false, 7, &[1]));
+        cache.push(7, overflow, false);
+
+        assert!(cache.frames.is_empty());
+        assert_eq!(cache.bytes, 0);
     }
 
     #[test]
@@ -3465,6 +3512,11 @@ Sec-WebSocket-Version: 13\r\n\
         let (web_tx, web_rx) = mpsc::channel();
         let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
+        sender.send_share_available(
+            15,
+            "{\"type\":\"share_available\",\"stream_id\":15}".to_string(),
+        );
+        let _ = read_ws_frame(&mut stream);
 
         let old_key = video::encode_video_frame(1, true, 15, &[1]);
         let old_delta = video::encode_video_frame(2, false, 15, &[2]);
@@ -3494,6 +3546,93 @@ Sec-WebSocket-Version: 13\r\n\
         let (opcode, replayed_delta) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x2);
         assert_eq!(replayed_delta, delta);
+    }
+
+    /// The viewer connection reconnects on its own, so its status has to reach
+    /// every tab watching the share rather than one requesting client.
+    #[test]
+    fn share_status_is_broadcast_to_every_browser() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
+        let mut first = open_ready_ws(sender.local_addr(), &web_rx);
+        let mut second = open_ws(sender.local_addr());
+        drain_config(&mut second);
+
+        sender.send_share_status(
+            "{\"type\":\"share_status\",\"stream_id\":4,\"state\":\"reconnecting\"}".to_string(),
+        );
+
+        for stream in [&mut first, &mut second] {
+            let (opcode, payload) = read_ws_frame(stream);
+            assert_eq!(opcode, 0x1);
+            let text = String::from_utf8(payload).unwrap();
+            assert!(text.contains("\"share_status\""), "{text}");
+            assert!(text.contains("\"state\":\"reconnecting\""), "{text}");
+        }
+    }
+
+    /// The room server restarts its stream ids from 1, so a browser that
+    /// outlives a server restart can be offered a new share under an id it has
+    /// already seen. The client ends the old share on disconnect, which must
+    /// drop its cached GOP: replaying it would feed the previous capture's
+    /// frames to the new share's freshly configured decoder.
+    #[test]
+    fn share_ended_drops_the_cached_gop_before_the_id_is_reused() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, DownloadStore::new(64 * 1024 * 1024), web_tx, true).unwrap();
+        let mut stream = open_ready_ws(sender.local_addr(), &web_rx);
+
+        let announce = "{\"type\":\"share_available\",\"stream_id\":15}".to_string();
+        sender.send_share_available(15, announce.clone());
+        let stale = video::encode_video_frame(1, true, 15, &[1]);
+        sender.send_video_frame(SharedVideoFrame::copy_from_slice(&stale));
+        let (_, payload) = read_ws_frame(&mut stream);
+        assert!(String::from_utf8(payload).unwrap().contains("15"));
+
+        // The server went away and came back with a new share on the same id.
+        sender.send_share_ended(
+            15,
+            "{\"type\":\"share_ended\",\"stream_id\":15}".to_string(),
+        );
+        let (_, ended) = read_ws_frame(&mut stream);
+        assert!(String::from_utf8(ended).unwrap().contains("share_ended"));
+        let late = video::encode_video_frame(2, true, 15, &[9]);
+        sender.send_video_frame(SharedVideoFrame::copy_from_slice(&late));
+        sender.send_share_available(15, announce.clone());
+        let (_, payload) = read_ws_frame(&mut stream);
+        assert!(String::from_utf8(payload).unwrap().contains("15"));
+
+        write_ws_text(&mut stream, r#"{"type":"play_share","stream_id":15}"#);
+        let WebRequest::PlayShare { client, stream_id } =
+            web_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected play request");
+        };
+        assert_eq!(stream_id, 15);
+        let config = "{\"type\":\"share_config\",\"stream_id\":15}".to_string();
+        sender.send_share_config(client, 15, config.clone());
+        let fresh = video::encode_video_frame(3, true, 15, &[2]);
+        sender.send_video_frame(SharedVideoFrame::copy_from_slice(&fresh));
+
+        let (opcode, payload) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        assert_eq!(String::from_utf8(payload).unwrap(), config);
+        // The first frame after the decoder config belongs to the new share.
+        let (opcode, first) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x2);
+        assert_eq!(first, fresh, "a stale cached GOP was replayed");
     }
 
     #[test]

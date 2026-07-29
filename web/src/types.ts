@@ -134,6 +134,10 @@ export type ServerEnvelope =
   | { type: "share_ended"; stream_id: number }
   // A play request failed; show the message on the share's row.
   | { type: "share_error"; stream_id: number; message: string }
+  // What the client's viewer connection for a share is doing. The client
+  // reconnects on its own, so this is informational: `state` replaces the
+  // share's status label and the next decoded frame moves it on to "playing".
+  | { type: "share_status"; stream_id: number; state: string }
   // Live receive progress for an in-flight file, merged into the placeholder
   // message matched by `file_id` and `timestamp_ms`.
   | {

@@ -14,7 +14,7 @@ mod publisher;
 mod subscriber;
 
 use std::io::Write;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use rpc::{
@@ -36,15 +36,30 @@ const AUTH_PAYLOAD: &[u8] = b"chatt-video-auth-v1";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound on a single connect attempt. Every video thread is joined from the
+/// render loop when its share is torn down, and the teardown that matters most
+/// is the one a lost server triggers, so an unreachable address must fail in
+/// seconds rather than waiting out the kernel's SYN retries.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Clone, Copy, Debug)]
 pub struct VideoTransport {
+    peer_addr: SocketAddr,
     mode: TransportMode,
     auth_key: [u8; KEY_LEN],
 }
 
 impl VideoTransport {
-    pub fn new(mode: TransportMode, auth_key: [u8; KEY_LEN]) -> Self {
-        Self { mode, auth_key }
+    pub fn new(peer_addr: SocketAddr, mode: TransportMode, auth_key: [u8; KEY_LEN]) -> Self {
+        Self {
+            peer_addr,
+            mode,
+            auth_key,
+        }
+    }
+
+    pub(crate) fn peer_addr(self) -> SocketAddr {
+        self.peer_addr
     }
 
     fn record_protection(self, secret: &[u8]) -> Result<RecordProtection, String> {
@@ -81,11 +96,16 @@ impl VideoTransport {
     }
 }
 
+/// Connects to the concrete peer selected by the live control connection.
+fn connect_within_timeout(addr: SocketAddr) -> Result<TcpStream, String> {
+    TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .map_err(|error| format!("video connect failed: {error}"))
+}
+
 /// Brings up a dedicated video connection from the client side: connects, writes
 /// the magic, hello, and auth record, then reads the ack. Returns the stream,
 /// record protection, and any bytes already buffered past the ack.
 fn open_video_connection(
-    addr: &str,
     session_id: SessionId,
     stream_id: StreamId,
     role: VideoRole,
@@ -93,8 +113,7 @@ fn open_video_connection(
     transport: VideoTransport,
 ) -> Result<(TcpStream, RecordProtection, RecvBuffer), String> {
     let mut record = transport.record_protection(secret)?;
-    let mut stream =
-        TcpStream::connect(addr).map_err(|error| format!("video connect failed: {error}"))?;
+    let mut stream = connect_within_timeout(transport.peer_addr())?;
     stream
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
         .map_err(|error| error.to_string())?;

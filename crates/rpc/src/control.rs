@@ -1,7 +1,8 @@
 use jsony::Jsony;
 
 use crate::ids::{
-    BugReportId, DeviceId, EventId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId,
+    BugReportId, DeviceId, EventId, FileTransferId, MessageId, RoomId, SessionId, ShareAttemptId,
+    StreamId, UserId,
 };
 
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 224 * 1024;
@@ -192,6 +193,7 @@ pub enum ClientControl {
         reason: String,
     },
     StartShare {
+        attempt_id: ShareAttemptId,
         room_id: RoomId,
         codec: String,
         coded_width: u32,
@@ -435,6 +437,7 @@ pub enum ServerControl {
         reason: String,
     },
     ShareStarted {
+        attempt_id: ShareAttemptId,
         room_id: RoomId,
         stream_id: StreamId,
         publish_secret: Vec<u8>,
@@ -458,6 +461,14 @@ pub enum ServerControl {
     ShareEnded {
         room_id: RoomId,
         stream_id: StreamId,
+    },
+    /// Why a [`ClientControl::StartShare`] produced no share. Distinct from
+    /// [`ServerControl::Error`] so the client attributes it to its in-flight
+    /// share start by message type: a generic error arriving in the same round
+    /// trip belongs to some other request, and guessing kills a live share.
+    ShareStartFailed {
+        attempt_id: ShareAttemptId,
+        message: String,
     },
     Pong {
         nonce: u64,
@@ -1972,6 +1983,7 @@ mod tests {
     #[test]
     fn share_control_round_trips() {
         let start = ClientControl::StartShare {
+            attempt_id: ShareAttemptId(12),
             room_id: RoomId(3),
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,
@@ -1983,6 +1995,7 @@ mod tests {
         assert_eq!(decode_client_control(&encoded).unwrap(), start);
 
         let started = ServerControl::ShareStarted {
+            attempt_id: ShareAttemptId(12),
             room_id: RoomId(3),
             stream_id: StreamId(8),
             publish_secret: vec![7; 32],
@@ -2013,6 +2026,7 @@ mod tests {
     #[test]
     fn rejects_empty_share_codec() {
         let start = ClientControl::StartShare {
+            attempt_id: ShareAttemptId(12),
             room_id: RoomId(1),
             codec: "  ".to_string(),
             coded_width: 0,

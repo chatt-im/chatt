@@ -55,6 +55,14 @@ pub struct MessageId(pub u64);
 #[jsony(Binary)]
 pub struct StreamId(pub u32);
 
+/// Identifies one client-side attempt to start a screen share.
+///
+/// This is allocated before capture begins and echoed by the server so replies
+/// from a stopped attempt cannot be applied to a newer capture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
+#[jsony(Binary)]
+pub struct ShareAttemptId(pub u64);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
 pub struct FileTransferId(pub u64);
@@ -69,6 +77,7 @@ encode_integer_id!(
     SessionId,
     MessageId,
     StreamId,
+    ShareAttemptId,
     FileTransferId,
     BugReportId,
 );

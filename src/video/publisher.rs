@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use rpc::{
     bitstream::{self, Codec},
     crypto::{CHANNEL_VIDEO, RecordProtection},
-    ids::{SessionId, StreamId},
+    ids::{SessionId, ShareAttemptId, StreamId},
     video::{self, SharedVideoFrame, VideoRole},
 };
 
@@ -42,12 +42,17 @@ const PROGRESS_WINDOW: Duration = Duration::from_secs(5);
 /// Handle to an active outbound screen share. Dropping it stops capture and the
 /// publisher connection.
 pub struct ScreencastHandle {
+    attempt_id: ShareAttemptId,
     stop: Arc<AtomicBool>,
     secret_tx: Sender<(SessionId, StreamId, Vec<u8>)>,
     join: Option<JoinHandle<()>>,
 }
 
 impl ScreencastHandle {
+    pub fn attempt_id(&self) -> ShareAttemptId {
+        self.attempt_id
+    }
+
     /// Relays the per-stream publish secret (from `ShareStarted`) to the manager
     /// so it can bring up the dedicated connection.
     pub fn deliver_secret(&self, session_id: SessionId, stream_id: StreamId, secret: Vec<u8>) {
@@ -62,9 +67,10 @@ impl ScreencastHandle {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
+    pub(crate) fn for_test(attempt_id: ShareAttemptId) -> Self {
         let (secret_tx, _secret_rx) = mpsc::channel();
         Self {
+            attempt_id,
             stop: Arc::new(AtomicBool::new(false)),
             secret_tx,
             join: None,
@@ -81,10 +87,10 @@ impl Drop for ScreencastHandle {
 /// Spawns capture and the publisher manager. `StartShare` is sent over
 /// `commands` once the first keyframe is captured.
 pub fn start(
+    attempt_id: ShareAttemptId,
     argv: Vec<String>,
     codec: Codec,
     commands: CommandSender,
-    tcp_addr: String,
     video_transport: VideoTransport,
     fanout: VideoFrameFanout,
     events: EventSender,
@@ -99,11 +105,11 @@ pub fn start(
         .spawn(move || {
             run_manager(
                 capture,
+                attempt_id,
                 codec,
                 frame_rx,
                 secret_rx,
                 commands,
-                tcp_addr,
                 video_transport,
                 fanout,
                 events,
@@ -112,6 +118,7 @@ pub fn start(
         })
         .map_err(|error| format!("failed to spawn publisher: {error}"))?;
     Ok(ScreencastHandle {
+        attempt_id,
         stop,
         secret_tx,
         join: Some(join),
@@ -227,7 +234,13 @@ impl TransferStats {
         }
     }
 
-    fn record(&mut self, stream_id: StreamId, bytes: u64, events: &EventSender) {
+    fn record(
+        &mut self,
+        attempt_id: ShareAttemptId,
+        stream_id: StreamId,
+        bytes: u64,
+        events: &EventSender,
+    ) {
         let now = Instant::now();
         self.total_bytes = self.total_bytes.saturating_add(bytes);
         self.total_frames = self.total_frames.saturating_add(1);
@@ -257,6 +270,7 @@ impl TransferStats {
             .round()
             .max(0.0) as u64;
         let _ = events.send(AppEvent::ScreencastProgress(ScreencastProgress {
+            attempt_id,
             stream_id,
             total_bytes: self.total_bytes,
             total_frames: self.total_frames,
@@ -267,11 +281,11 @@ impl TransferStats {
 
 fn run_manager(
     mut capture: Capture,
+    attempt_id: ShareAttemptId,
     codec: Codec,
     frame_rx: Receiver<CapturedFrame>,
     secret_rx: Receiver<(SessionId, StreamId, Vec<u8>)>,
     commands: CommandSender,
-    tcp_addr: String,
     video_transport: VideoTransport,
     fanout: VideoFrameFanout,
     events: EventSender,
@@ -296,19 +310,12 @@ fn run_manager(
         if conn.is_none()
             && let Ok((session_id, stream_id, secret)) = secret_rx.try_recv()
         {
-            match connect(
-                &tcp_addr,
-                session_id,
-                stream_id,
-                &secret,
-                codec,
-                video_transport,
-            ) {
+            match connect(session_id, stream_id, &secret, codec, video_transport) {
                 Ok(mut publisher) => {
                     let mut failed = false;
                     for frame in buffered.drain(..) {
                         match publisher.send_frame(&frame, &fanout) {
-                            Ok(bytes) => stats.record(stream_id, bytes, &events),
+                            Ok(bytes) => stats.record(attempt_id, stream_id, bytes, &events),
                             Err(reason) => {
                                 error = Some(format!("screen publish failed: {reason}"));
                                 failed = true;
@@ -358,6 +365,7 @@ fn run_manager(
                     };
                     if commands
                         .send(NetworkCommand::StartShare {
+                            attempt_id,
                             codec: params.codec,
                             coded_width: params.width,
                             coded_height: params.height,
@@ -375,7 +383,7 @@ fn run_manager(
                 match &mut conn {
                     Some(publisher) => match publisher.send_frame(&frame, &fanout) {
                         Ok(bytes) => {
-                            stats.record(StreamId(publisher.stream_id), bytes, &events);
+                            stats.record(attempt_id, StreamId(publisher.stream_id), bytes, &events);
                         }
                         Err(reason) => {
                             error = Some(format!("screen publish failed: {reason}"));
@@ -420,7 +428,10 @@ fn run_manager(
     }
     let message = error.unwrap_or_else(|| exit.reason(start_share_sent));
     kvlog::warn!("screen share failed", message = message.as_str());
-    let _ = events.send(AppEvent::ScreencastFailed(message));
+    let _ = events.send(AppEvent::ScreencastFailed {
+        attempt_id,
+        message,
+    });
 }
 
 fn codec_label(codec: Codec) -> &'static str {
@@ -460,7 +471,6 @@ fn encode_publish_frame(frame: &CapturedFrame, stream_id: u32, codec: Codec) -> 
 }
 
 fn connect(
-    tcp_addr: &str,
     session_id: SessionId,
     stream_id: StreamId,
     secret: &[u8],
@@ -468,7 +478,6 @@ fn connect(
     video_transport: VideoTransport,
 ) -> Result<PublisherConn, String> {
     let (stream, record_protection, _residual) = super::open_video_connection(
-        tcp_addr,
         session_id,
         stream_id,
         VideoRole::Publisher,
@@ -558,11 +567,12 @@ mod tests {
         let events = EventSender(tx);
         let mut stats = TransferStats::new();
 
-        stats.record(StreamId(3), 2_048, &events);
+        stats.record(ShareAttemptId(9), StreamId(3), 2_048, &events);
 
         let AppEvent::ScreencastProgress(progress) = rx.try_recv().unwrap() else {
             panic!("expected screencast progress");
         };
+        assert_eq!(progress.attempt_id, ShareAttemptId(9));
         assert_eq!(progress.stream_id, StreamId(3));
         assert_eq!(progress.total_bytes, 2_048);
         assert_eq!(progress.total_frames, 1);

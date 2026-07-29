@@ -1890,6 +1890,9 @@ export default function App() {
     canvases.set(streamId, el);
   }
 
+  // Clearing `playing` here is what lets the `share_available` handler tell a
+  // brand-new share on a reused stream id from one already on screen, so it has
+  // to stay in step with that guard.
   function closeDecoder(streamId: number) {
     decoders.get(streamId)?.close();
     decoders.delete(streamId);
@@ -3655,9 +3658,14 @@ export default function App() {
       }
       const env: ServerEnvelope = JSON.parse(ev.data);
       if (env.type === "share_available") {
-        setShareStates((prev) =>
-          env.stream_id in prev ? prev : { ...prev, [env.stream_id]: "available" }
-        );
+        // Reset any state left by an earlier share: the server restarts its
+        // stream ids from 1, so a tab open across a restart would otherwise
+        // label a brand-new share with the previous one's outcome. A share
+        // already playing keeps its live decoder's state.
+        if (!playing().includes(env.stream_id)) {
+          clearShareError(env.stream_id);
+          setShareStates((prev) => ({ ...prev, [env.stream_id]: "available" }));
+        }
         setShares((prev) => {
           const share = {
             stream_id: env.stream_id,
@@ -3816,6 +3824,14 @@ export default function App() {
         setShareError(env.stream_id, env.message);
         setShareStates((prev) => ({ ...prev, [env.stream_id]: "failed" }));
         setPlaying((prev) => prev.filter((id) => id !== env.stream_id));
+      } else if (env.type === "share_status") {
+        // Only a share this tab is watching: a status must never overwrite the
+        // "available" label on a row nobody here has played. The decoder puts
+        // the state back to "playing" as soon as frames resume, so nothing has
+        // to clear this.
+        if (playing().includes(env.stream_id)) {
+          setShareStates((prev) => ({ ...prev, [env.stream_id]: env.state }));
+        }
       } else if (env.type === "delete_error") {
         if (pendingDelete()?.message_id === env.target) {
           closeDeleteConfirmation(false);

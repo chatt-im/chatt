@@ -543,7 +543,7 @@ body {
   margin: 0;
 }
 
-.message-body p + p,
+.message-body p+p,
 .message-body ul,
 .message-body ol {
   margin: 0.35em 0 0;
@@ -599,6 +599,7 @@ body {
   from {
     background: var(--accent);
   }
+
   to {
     background: transparent;
   }
@@ -627,7 +628,7 @@ body {
   min-width: 0;
 }
 
-.message-quote-content > .message-quote:first-child {
+.message-quote-content>.message-quote:first-child {
   margin-top: 0;
 }
 
@@ -647,10 +648,12 @@ body {
   display: contents;
 }
 
-.media-image, .media-video {
+.media-image,
+.media-video {
   border: 6px solid var(--border);
   border-radius: 2px;
 }
+
 .media-image:hover {
   border: 6px solid var(--accent);
 }
@@ -682,7 +685,7 @@ body {
 
 /* Revealed on decode (or error) so the image fades in rather than snapping. */
 .media-image.is-loaded {
-  opacity:1;
+  opacity: 1;
 }
 
 /* Video metadata loads async and its intrinsic size is unknown up front, so a
@@ -693,6 +696,9 @@ body {
   height: var(--media-video-height);
   max-width: 100%;
   background: var(--bg);
+  /* position: relative, here works around: https://issues.chromium.org/issues/532229489 */
+  /* We can remove in 2028. */
+  position: relative;
 }
 
 .media-audio {
@@ -922,32 +928,54 @@ body {
 }
 
 .hl-1,
-.hl-23 { color: var(--hl-keyword); }
-.hl-2 { color: var(--hl-type); }
+.hl-23 {
+  color: var(--hl-keyword);
+}
+
+.hl-2 {
+  color: var(--hl-type);
+}
+
 .hl-3,
 .hl-4,
 .hl-5,
 .hl-24,
 .hl-25,
-.hl-28 { color: var(--hl-function); }
+.hl-28 {
+  color: var(--hl-function);
+}
+
 .hl-7,
 .hl-8,
 .hl-9,
-.hl-13 { color: var(--hl-binding); }
+.hl-13 {
+  color: var(--hl-binding);
+}
+
 .hl-12,
 .hl-26,
 .hl-27,
 .hl-30,
-.hl-31 { color: var(--hl-namespace); }
+.hl-31 {
+  color: var(--hl-namespace);
+}
+
 .hl-14,
 .hl-15,
-.hl-16 { color: var(--hl-string); }
-.hl-17 { color: var(--hl-number); }
+.hl-16 {
+  color: var(--hl-string);
+}
+
+.hl-17 {
+  color: var(--hl-number);
+}
+
 .hl-18,
 .hl-19 {
   color: var(--hl-comment);
   font-style: italic;
 }
+
 .hl-6,
 .hl-10,
 .hl-11,
@@ -963,7 +991,9 @@ body {
 .hl-37,
 .hl-38,
 .hl-39,
-.hl-40 { color: var(--hl-fg); }
+.hl-40 {
+  color: var(--hl-fg);
+}
 
 /* A fenced code block in a message, rendered from Rust highlight spans. */
 .code-block-frame {
@@ -1079,7 +1109,9 @@ body {
   outline-offset: 1px;
 }
 
-@media (hover: none), (pointer: coarse) {
+@media (hover: none),
+(pointer: coarse) {
+
   .message-group-toggle,
   .message-action,
   .code-block-copy {
@@ -2256,7 +2288,9 @@ body {
   background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
-@media (hover: none), (pointer: coarse) {
+@media (hover: none),
+(pointer: coarse) {
+
   .composer-attach,
   .composer-chip-remove,
   .composer-edit-cancel {
