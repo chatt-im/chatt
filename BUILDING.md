@@ -33,7 +33,7 @@ weights, and the production web view are included in the repository.
 ## Build
 
 ```sh
-git clone https://gitlab.com/chatt-im/chatt.git
+git clone https://github.com/chatt-im/chatt.git
 cd chatt
 cargo build --release -p chatt -p server
 ```

@@ -56,7 +56,7 @@ Chatt currently supports macOS and Linux. There are no binary releases yet, so
 installation is from source:
 
 ```sh
-git clone https://gitlab.com/chatt-im/chatt.git
+git clone https://github.com/chatt-im/chatt.git
 cd chatt
 cargo build --release -p chatt -p server
 ```
