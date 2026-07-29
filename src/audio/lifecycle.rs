@@ -25,7 +25,8 @@ use crate::{
         },
         device::{
             AudioCallbackBufferObserver, ConfigSelection, audio_buffer_size_label,
-            build_input_stream, build_live_output_stream, build_output_stream, select_input_config,
+            build_input_stream, build_live_output_stream, build_output_stream,
+            current_input_config, current_output_config, select_input_config,
             select_input_device_by_id, select_output_config, select_output_device_by_id,
             stable_device_id,
         },
@@ -95,7 +96,8 @@ pub struct AudioDeviceInfo {
     /// Human-readable label for the buffer size that was *requested*, e.g.
     /// `256 frames`, `~10 ms target`, or `host default`.
     pub buffer_size: String,
-    /// Note describing why the buffer size was chosen.
+    /// Note describing why this config was chosen, e.g. `requested 256 frames`
+    /// or `device current format`.
     pub buffer_note: String,
     /// Device period the backend actually granted, in frames at
     /// [`Self::device_rate`], read back from the live stream via
@@ -103,8 +105,9 @@ pub struct AudioDeviceInfo {
     /// not report one. This is the *acquired* counterpart to the requested
     /// [`Self::buffer_size`]; a divergence flags a re-negotiated quantum.
     pub acquired_buffer_frames: Option<u32>,
-    /// True when the configured fixed buffer was unsupported and the host
-    /// default was used instead.
+    /// True when the requested config did not open and a fallback rung did:
+    /// the host-default buffer, or the device's own current format. See
+    /// [`Self::buffer_note`] for which.
     pub buffer_fallback: bool,
 }
 
@@ -180,9 +183,9 @@ pub struct LiveCapture {
     stats: AudioStats,
     max_amplification_bits: Arc<AtomicU32>,
     encoder_loss_percent: Arc<AtomicU32>,
-    /// True when the configured fixed buffer was unsupported and the host-default
-    /// buffer was used instead. Surfaced so the UI can warn that the requested
-    /// low-latency buffer did not take effect.
+    /// True when the requested config did not open and a fallback rung did.
+    /// Surfaced so the UI can warn that the requested low-latency buffer did
+    /// not take effect.
     buffer_fallback: bool,
     /// Resolved backend, device, and buffer the capture stream opened.
     device_info: AudioDeviceInfo,
@@ -198,8 +201,7 @@ pub struct LivePlayback {
     worker: Option<JoinHandle<()>>,
     sender: Option<SyncSender<LivePlaybackCommand>>,
     shared_snapshot: Arc<LivePlaybackSharedSnapshot>,
-    /// True when the configured fixed buffer was unsupported and the host-default
-    /// buffer was used instead. See [`LiveCapture::buffer_fallback`].
+    /// See [`LiveCapture::buffer_fallback`].
     buffer_fallback: bool,
     /// Resolved backend, device, and buffer the playback stream opened.
     device_info: AudioDeviceInfo,
@@ -248,8 +250,8 @@ impl LiveCapture {
         self.stats.clone()
     }
 
-    /// True when the configured fixed buffer was unsupported and capture fell back
-    /// to the host-default buffer.
+    /// True when capture opened on a fallback config rather than the requested
+    /// one.
     pub fn buffer_fallback(&self) -> bool {
         self.buffer_fallback
     }
@@ -311,8 +313,8 @@ impl LivePlayback {
         })
     }
 
-    /// True when the configured fixed buffer was unsupported and playback fell back
-    /// to the host-default buffer.
+    /// True when playback opened on a fallback config rather than the requested
+    /// one.
     pub fn buffer_fallback(&self) -> bool {
         self.buffer_fallback
     }
@@ -546,6 +548,144 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
     })
 }
 
+/// One rung of the stream-open fallback ladder, for logs.
+#[derive(Clone, Copy)]
+enum OpenAttempt {
+    Requested,
+    HostDefaultBuffer,
+    DeviceCurrentFormat,
+}
+
+impl OpenAttempt {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::HostDefaultBuffer => "host-default buffer",
+            Self::DeviceCurrentFormat => "device current format",
+        }
+    }
+}
+
+fn log_stream_build_failure(
+    direction: &'static str,
+    host: &'static str,
+    attempt: OpenAttempt,
+    device: &str,
+    selection: &ConfigSelection,
+    error: &AudioStartError,
+) {
+    kvlog::warn!(
+        "audio stream build failed",
+        direction,
+        host,
+        attempt = attempt.label(),
+        device,
+        channels = selection.stream_config.channels,
+        sample_rate = selection.stream_config.sample_rate,
+        buffer_size = audio_buffer_size_label(selection.preview.buffer_size).as_str(),
+        buffer_note = selection.preview.buffer_note.as_str(),
+        kind = error.kind.label(),
+        error = error.message.as_str()
+    );
+}
+
+/// Which of two failed open attempts to report to the supervisor.
+///
+/// The first rung describes the config that was actually asked for, so it wins
+/// by default. A later `DeviceGone` overrides it: that kind is what moves the
+/// supervisor onto the device-sighting fast path instead of a timed backoff,
+/// and reporting anything else there costs a real recovery.
+fn preferred_start_error(first: AudioStartError, later: AudioStartError) -> AudioStartError {
+    if first.kind != AudioErrorKind::DeviceGone && later.kind == AudioErrorKind::DeviceGone {
+        return later;
+    }
+    first
+}
+
+/// Opens a stream, walking a fallback ladder when the negotiated config does
+/// not open.
+///
+/// The rungs are: the requested config, the same device with the host-default
+/// buffer (a rejected buffer preference must never cost audio), then the
+/// device's *current* format. The last rung matters on CoreAudio, where a
+/// Bluetooth endpoint pinned in HFP by the other direction advertises rates it
+/// will not actually switch to; a negotiated config then fails identically on
+/// every retry while the device's own format opens fine.
+///
+/// Returns the opened stream, the config that opened it, and whether that was
+/// a fallback rather than the requested config. Both config closures are
+/// invoked only when a rung is reached, so a successful open costs no extra
+/// device queries.
+fn open_with_config_fallbacks<T>(
+    direction: &'static str,
+    host: &'static str,
+    device_name: &str,
+    buffer_request: BufferRequest,
+    selection: ConfigSelection,
+    build: impl Fn(&ConfigSelection) -> Result<T, AudioStartError>,
+    default_buffer_config: impl FnOnce() -> Result<ConfigSelection, String>,
+    current_config: impl FnOnce() -> Option<ConfigSelection>,
+) -> Result<(T, ConfigSelection, bool), AudioStartError> {
+    let mut error = match build(&selection) {
+        Ok(opened) => return Ok((opened, selection, false)),
+        Err(error) => {
+            log_stream_build_failure(
+                direction,
+                host,
+                OpenAttempt::Requested,
+                device_name,
+                &selection,
+                &error,
+            );
+            error
+        }
+    };
+
+    if !matches!(buffer_request, BufferRequest::Default) {
+        match default_buffer_config() {
+            Ok(fallback) => match build(&fallback) {
+                Ok(opened) => return Ok((opened, fallback, true)),
+                Err(failure) => {
+                    log_stream_build_failure(
+                        direction,
+                        host,
+                        OpenAttempt::HostDefaultBuffer,
+                        device_name,
+                        &fallback,
+                        &failure,
+                    );
+                    error = preferred_start_error(error, failure);
+                }
+            },
+            Err(failure) => kvlog::warn!(
+                "audio host-default buffer config unavailable",
+                direction,
+                host,
+                device = device_name,
+                error = failure.as_str()
+            ),
+        }
+    }
+
+    let Some(current) = current_config() else {
+        return Err(error);
+    };
+    match build(&current) {
+        Ok(opened) => Ok((opened, current, true)),
+        Err(failure) => {
+            log_stream_build_failure(
+                direction,
+                host,
+                OpenAttempt::DeviceCurrentFormat,
+                device_name,
+                &current,
+                &failure,
+            );
+            Err(preferred_start_error(error, failure))
+        }
+    }
+}
+
 pub fn start_live_capture<F>(
     config: LiveCaptureConfig,
     on_packet: F,
@@ -584,14 +724,12 @@ where
         LiveEncoderProfile::DRED_20.packet_loss_percent as u32,
     ));
 
-    // Build the input stream, falling back to the host-default buffer if the configured
-    // fixed buffer is unsupported on this device. The channel and worker are created only
-    // after a stream builds so a fallback attempt uses a fresh channel. Audio must never
-    // die because a buffer preference was rejected.
+    // The channel and worker are created only after a stream builds, so each rung
+    // of the fallback ladder uses a fresh channel.
     let observer = Arc::new(AudioCallbackBufferObserver::new("live_capture"));
     let build = |selection: &ConfigSelection| -> Result<
         (Stream, Receiver<CapturedAudioChunk>, SyncSender<Vec<f32>>),
-        String,
+        AudioStartError,
     > {
         let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
         let (recycle_tx, recycle_rx) = sync_channel(CALLBACK_QUEUE_CAPACITY);
@@ -609,25 +747,20 @@ where
         })?;
         Ok((stream, receiver, recycle_tx))
     };
-    let (stream, receiver, recycle_tx, selection, buffer_fallback) = match build(&selection) {
-        Ok((stream, receiver, recycle_tx)) => (stream, receiver, recycle_tx, selection, false),
-        Err(error) if !matches!(config.buffer_request, BufferRequest::Default) => {
-            kvlog::warn!(
-                "live capture buffer fallback",
-                device = device_name.as_str(),
-                requested = audio_buffer_size_label(selection.preview.buffer_size).as_str(),
-                error = error.as_str()
-            );
-            let fallback = with_audio_backend_stderr_suppressed(|| {
+    let ((stream, receiver, recycle_tx), selection, buffer_fallback) = open_with_config_fallbacks(
+        "capture",
+        backend,
+        &device_name,
+        config.buffer_request,
+        selection,
+        build,
+        || {
+            with_audio_backend_stderr_suppressed(|| {
                 select_input_config(&device, BufferRequest::Default)
             })
-            .map_err(AudioStartError::transient)?;
-            let (stream, receiver, recycle_tx) =
-                build(&fallback).map_err(AudioStartError::transient)?;
-            (stream, receiver, recycle_tx, fallback, true)
-        }
-        Err(error) => return Err(AudioStartError::transient(error)),
-    };
+        },
+        || with_audio_backend_stderr_suppressed(|| current_input_config(&device)),
+    )?;
 
     kvlog::info!(
         "live capture selected",
@@ -783,12 +916,9 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
         .as_ref()
         .map(|recording| recording.handle());
 
-    // Build the output stream, falling back to the host-default buffer if the configured
-    // fixed buffer is unsupported on this device, so playback never fails to start over a
-    // buffer preference.
     let echo_control = config.echo_control.clone();
     let observer = Arc::new(AudioCallbackBufferObserver::new("live_playback"));
-    let build = |selection: &ConfigSelection| -> Result<Stream, String> {
+    let build = |selection: &ConfigSelection| -> Result<Stream, AudioStartError> {
         let mut mixer = LivePlaybackMixer::with_live_capacity(config.tuning);
         mixer.set_playout_hints(Arc::clone(&playout_hints));
         with_audio_backend_stderr_suppressed(|| {
@@ -808,24 +938,20 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
             )
         })
     };
-    let (stream, selection, buffer_fallback) = match build(&selection) {
-        Ok(stream) => (stream, selection, false),
-        Err(error) if !matches!(config.buffer_request, BufferRequest::Default) => {
-            kvlog::warn!(
-                "live playback buffer fallback",
-                device = device_name.as_str(),
-                requested = audio_buffer_size_label(selection.preview.buffer_size).as_str(),
-                error = error.as_str()
-            );
-            let fallback = with_audio_backend_stderr_suppressed(|| {
+    let (stream, selection, buffer_fallback) = open_with_config_fallbacks(
+        "playback",
+        backend,
+        &device_name,
+        config.buffer_request,
+        selection,
+        build,
+        || {
+            with_audio_backend_stderr_suppressed(|| {
                 select_output_config(&device, BufferRequest::Default)
             })
-            .map_err(AudioStartError::transient)?;
-            let stream = build(&fallback).map_err(AudioStartError::transient)?;
-            (stream, fallback, true)
-        }
-        Err(error) => return Err(AudioStartError::transient(error)),
-    };
+        },
+        || with_audio_backend_stderr_suppressed(|| current_output_config(&device)),
+    )?;
 
     kvlog::info!(
         "live playback selected",
@@ -968,6 +1094,34 @@ mod tests {
             acquired_buffer_frames,
             buffer_fallback: false,
         }
+    }
+
+    #[test]
+    fn ladder_reports_the_requested_config_failure_by_default() {
+        let first = AudioStartError::new(AudioErrorKind::ConfigInvalid, "rate rejected");
+        let later = AudioStartError::transient("busy");
+        let reported = preferred_start_error(first, later);
+        assert_eq!(reported.kind, AudioErrorKind::ConfigInvalid);
+        assert_eq!(reported.message, "rate rejected");
+    }
+
+    #[test]
+    fn ladder_escalates_to_a_device_gone_seen_on_a_later_rung() {
+        // DeviceGone is what moves the supervisor onto the device-sighting fast
+        // path, so it must survive the ladder rather than be masked by the
+        // first rung's config complaint.
+        let first = AudioStartError::new(AudioErrorKind::ConfigInvalid, "rate rejected");
+        let later = AudioStartError::device_gone("device disconnected");
+        let reported = preferred_start_error(first, later);
+        assert_eq!(reported.kind, AudioErrorKind::DeviceGone);
+
+        let first = AudioStartError::device_gone("device disconnected");
+        let later = AudioStartError::device_gone("still gone");
+        assert_eq!(
+            preferred_start_error(first, later).message,
+            "device disconnected",
+            "the first sighting of a gone device wins"
+        );
     }
 
     #[test]

@@ -640,6 +640,11 @@ const DEVICE_PROBE_INTERVAL_HEALTHY: Duration = Duration::from_secs(5);
 /// Faster cadence while a stream is recovering or waiting to move back onto
 /// its configured device, so a (re)appearing device is noticed promptly.
 const DEVICE_PROBE_INTERVAL_RECOVERING: Duration = Duration::from_secs(2);
+/// Device events listed in the interactive `/audio` notice. A bug report ships
+/// the whole [`AudioEventLog`] instead: a report filed minutes into a failure
+/// still needs the transition that started it, and at the capped 30 s retry
+/// backoff a short list has already dropped it.
+const AUDIO_STATUS_EVENT_LIMIT: usize = 12;
 const LOBBY_TALKING_RELEASE: Duration = Duration::from_millis(200);
 /// The talking indicator is intentionally more sensitive than NetEQ's
 /// time-scaling VAD so quiet but audible decoded speech still registers.
@@ -751,6 +756,35 @@ fn audio_restart_flags(old: &config::AudioConfig, new: &config::AudioConfig) -> 
         || old.output_buffer != new.output_buffer
         || old.latency != new.latency;
     (capture, playback)
+}
+
+/// Kernel release from `uname`, e.g. `24.6.0` for macOS 15 or `6.11.0-rc4` on
+/// Linux.
+///
+/// The OS name alone does not identify a backend's behavior: CoreAudio device
+/// and Bluetooth-profile handling shifts between macOS releases, so a bug
+/// report that only says `macos` cannot be matched against a known regression.
+#[cfg(unix)]
+fn platform_release() -> Option<String> {
+    let mut info = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: `uname` fills the caller-provided `utsname` and returns 0 on
+    // success; `release` is only read after that check and is NUL-terminated.
+    unsafe {
+        if libc::uname(info.as_mut_ptr()) != 0 {
+            return None;
+        }
+        let info = info.assume_init();
+        Some(
+            std::ffi::CStr::from_ptr(info.release.as_ptr())
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+#[cfg(not(unix))]
+fn platform_release() -> Option<String> {
+    None
 }
 
 fn playback_backend_failure(
@@ -6827,6 +6861,12 @@ impl App {
                 }
             }
             Err(error) => {
+                kvlog::warn!(
+                    "capture stream rebuild failed",
+                    cause = cause.label(),
+                    kind = error.kind.label(),
+                    error = error.message.as_str()
+                );
                 self.mic_error = Some(error.message.clone());
                 self.audio_events.push(
                     now,
@@ -6868,6 +6908,11 @@ impl App {
     fn restart_capture_stream(&mut self) {
         self.supervisor.capture.reset();
         if let Err(error) = self.restart_capture_stream_inner() {
+            kvlog::warn!(
+                "capture stream start failed",
+                kind = error.kind.label(),
+                error = error.message.as_str()
+            );
             self.set_error(format!("failed to restart capture: {error}"));
             self.supervisor
                 .capture
@@ -7976,7 +8021,7 @@ impl App {
 
     /// Formatted `health` and `events` sections for `/audio`. Built even while
     /// streams are down: that is exactly when diagnostics matter.
-    fn audio_diagnostics_sections(&self) -> (Vec<String>, Vec<String>) {
+    fn audio_diagnostics_sections(&self, event_limit: usize) -> (Vec<String>, Vec<String>) {
         let now = Instant::now();
         let health_lines = vec![
             format!("mic: {}", self.supervisor.capture.health().describe(now)),
@@ -7985,7 +8030,7 @@ impl App {
         let recent_events = self
             .audio_events
             .iter_recent()
-            .take(12)
+            .take(event_limit)
             .map(|event| {
                 format!(
                     "{:>3}  {}: {}",
@@ -7999,7 +8044,8 @@ impl App {
     }
 
     fn show_audio_status(&mut self) {
-        let (health_lines, recent_events) = self.audio_diagnostics_sections();
+        let (health_lines, recent_events) =
+            self.audio_diagnostics_sections(AUDIO_STATUS_EVENT_LIMIT);
         let diagnostics = AudioDiagnostics::new(
             self.playback
                 .as_ref()
@@ -8056,7 +8102,7 @@ impl App {
     /// Builds the JSON metadata sidecar saved alongside the compressed logs:
     /// app version, the `/audio` snapshot, and the device/buffer configuration.
     fn bug_report_metadata(&self, description: &str) -> String {
-        let (health_lines, recent_events) = self.audio_diagnostics_sections();
+        let (health_lines, recent_events) = self.audio_diagnostics_sections(usize::MAX);
         let audio = AudioDiagnostics::new(
             self.playback
                 .as_ref()
@@ -8083,11 +8129,20 @@ impl App {
             version: env!("CARGO_PKG_VERSION"),
             description: description,
             unix_time_ms: unix_time_ms,
+            platform: {
+                os: std::env::consts::OS,
+                arch: std::env::consts::ARCH,
+                release: platform_release(),
+            },
             encoder_profile: self.encoder_profile.label(),
             voice_packets_received: self.voice_packets_received,
             voice_bytes_received: self.voice_bytes_received,
             audio: audio,
             device: {
+                // The host is also in the `audio` device lines, but only while a
+                // stream is open: a report filed for a stream that never started
+                // would otherwise not say which backend it failed on.
+                host: audio::default_host_name(),
                 input_device_id: self.config.audio.input_device_id.as_deref(),
                 output_device_id: self.config.audio.output_device_id.as_deref(),
                 input_buffer: format!("{:?}", self.config.audio.input_buffer),
@@ -8561,7 +8616,7 @@ impl App {
                         .is_some_and(LiveCapture::buffer_fallback)
                 {
                     self.set_error(
-                        "requested audio buffer unsupported; using device default (higher latency)"
+                        "requested audio config unsupported; opened on a device fallback (see /audio)"
                             .to_string(),
                     );
                 } else if capture_ok {
@@ -8576,6 +8631,12 @@ impl App {
                 }
             }
             Err(error) => {
+                kvlog::warn!(
+                    "playback stream start failed",
+                    device = resolved_output.as_deref().unwrap_or("<system default>"),
+                    kind = error.kind.label(),
+                    error = error.message.as_str()
+                );
                 self.set_network_playback_sink(None);
                 self.playback = None;
                 self.playback_error = Some(error.message.clone());
@@ -9088,6 +9149,57 @@ mod tests {
 
     fn test_app() -> TestApp {
         TestApp::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn bug_report_metadata_identifies_the_platform_and_audio_host() {
+        // A stream that never started leaves `devices` reading `inactive`, so
+        // these fields are the only record of where the report came from.
+        let app = test_app();
+        let metadata = app.bug_report_metadata("no sound after switching headphones");
+        assert!(
+            metadata.contains(&format!("\"os\":\"{}\"", std::env::consts::OS)),
+            "{metadata}"
+        );
+        assert!(
+            metadata.contains(&format!("\"arch\":\"{}\"", std::env::consts::ARCH)),
+            "{metadata}"
+        );
+        assert!(metadata.contains("\"host\":\""), "{metadata}");
+        assert!(metadata.contains("output: inactive"), "{metadata}");
+    }
+
+    #[test]
+    fn bug_report_ships_events_the_audio_notice_truncates_away() {
+        // The transition that started a failure ages past the interactive list
+        // long before a user gets around to filing, so the report must not
+        // inherit that cut.
+        let mut app = test_app();
+        let now = Instant::now();
+        app.audio_events.push(
+            now,
+            AudioDeviceEventKind::DefaultOutputChanged,
+            "headphones → airpods",
+        );
+        for index in 0..AUDIO_STATUS_EVENT_LIMIT {
+            app.audio_events.push(
+                now,
+                AudioDeviceEventKind::StreamError,
+                format!("spk rebuild failed: attempt {index}"),
+            );
+        }
+
+        let (_, shown) = app.audio_diagnostics_sections(AUDIO_STATUS_EVENT_LIMIT);
+        assert_eq!(shown.len(), AUDIO_STATUS_EVENT_LIMIT);
+        assert!(
+            !shown.iter().any(|event| event.contains("airpods")),
+            "the originating transition should have been truncated away"
+        );
+
+        assert!(
+            app.bug_report_metadata("no sound").contains("airpods"),
+            "the report keeps the originating transition"
+        );
     }
 
     fn open_test_input_picker(session: &mut SettingsSession) {

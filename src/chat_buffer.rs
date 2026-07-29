@@ -32,6 +32,18 @@ pub enum HistoryEntryId {
     LocalNotice(NoticeId),
 }
 
+impl HistoryEntryId {
+    /// Whether this entry is a system notice rather than a user message.
+    ///
+    /// Notices start expanded: their bodies are diagnostics (`/audio`, device
+    /// events, connection errors) whose useful part is usually past the
+    /// [`COLLAPSE_SHOW`] cut, and a reader who does not know to expand them
+    /// reports the truncation instead of the contents.
+    fn is_notice(self) -> bool {
+        matches!(self, Self::Notice(_) | Self::LocalNotice(_))
+    }
+}
+
 #[cfg(test)]
 mod viewport_tests {
     use super::*;
@@ -167,6 +179,31 @@ mod viewport_tests {
         second.visible_lines(&history.history(), 40, 40, 0);
         assert!(first.is_expanded(0));
         assert!(second.is_collapsed(0));
+    }
+
+    #[test]
+    fn notices_start_expanded_and_messages_start_collapsed() {
+        let mut history = TestHistory::new();
+        let body = "line\n".repeat(14);
+        history.push(1, "alice", &body);
+        history.notice(&body, false);
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 40, 0);
+        assert!(viewport.is_collapsed(0), "a long message still collapses");
+        assert!(viewport.is_expanded(1), "a long notice opens on arrival");
+    }
+
+    #[test]
+    fn an_expanded_notice_still_toggles_closed() {
+        let mut history = TestHistory::new();
+        history.notice(&"line\n".repeat(14), false);
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 40, 0);
+        assert!(viewport.toggle_expand(&history.history(), 0, 40));
+        viewport.visible_lines(&history.history(), 40, 40, 0);
+        assert!(viewport.is_collapsed(0));
     }
 
     #[test]
@@ -1202,7 +1239,7 @@ impl ChatViewport {
                     }
                     entries.push(ViewEntry {
                         id,
-                        expanded: false,
+                        expanded: id.is_notice(),
                         has_refs,
                         layout: None,
                     });
@@ -1404,7 +1441,7 @@ impl ChatViewport {
         }
         let entry = ViewEntry {
             id,
-            expanded: false,
+            expanded: id.is_notice(),
             has_refs,
             layout: None,
         };
@@ -1667,7 +1704,7 @@ impl ChatViewport {
         }
         self.entries.push(ViewEntry {
             id: HistoryEntryId::LocalNotice(id),
-            expanded: false,
+            expanded: true,
             has_refs,
             layout: None,
         });

@@ -14,8 +14,8 @@ mod sim;
 pub use capture::EchoCancellationControl;
 pub use device::{
     DeviceIdentity, DeviceIdentityProbe, DeviceInfo, StreamPreview, configured_output_is_default,
-    input_devices, looks_like_alsa_pcm_name, output_devices, probe_device_identities,
-    stable_input_device_id, stable_output_device_id,
+    default_host_name, input_devices, looks_like_alsa_pcm_name, output_devices,
+    probe_device_identities, stable_input_device_id, stable_output_device_id,
 };
 pub use errors::{AudioErrorKind, AudioStartError};
 pub use lifecycle::{

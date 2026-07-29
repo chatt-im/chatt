@@ -56,6 +56,18 @@ impl AudioErrorKind {
         }
     }
 
+    /// Short human-readable name, for log fields and `/audio` event lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DeviceGone => "device gone",
+            Self::Transient => "transient",
+            Self::Xrun => "xrun",
+            Self::RealtimeDenied => "realtime denied",
+            Self::Rerouted => "rerouted",
+            Self::ConfigInvalid => "config invalid",
+        }
+    }
+
     /// True when this error should count toward stream recovery. Xruns,
     /// refused realtime priority, and host-side reroutes leave the stream
     /// running, so restarting it would only make things worse.
