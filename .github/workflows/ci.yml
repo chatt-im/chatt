@@ -50,12 +50,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            clang \
             ffmpeg \
             libasound2-dev \
             libclang-dev \
-            libpipewire-0.3-dev \
-            pkg-config
+            libpipewire-0.3-dev
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
