@@ -4265,7 +4265,6 @@ impl App {
         event: NetworkEvent,
         history_change: &mut Option<HistoryChange>,
     ) {
-        kvlog::info!("app network event", kind = network_event_kind(&event));
         match event {
             NetworkEvent::Connected => {
                 self.last_network_notice = None;
@@ -9042,6 +9041,7 @@ fn video_rate_label(bytes_per_sec: u64) -> String {
     format!("{}/s", crate::client_net::format_bytes(bytes_per_sec))
 }
 
+#[allow(dead_code, reason = "used in debug only logging")]
 fn network_event_kind(event: &NetworkEvent) -> &'static str {
     match event {
         NetworkEvent::Connected => "connected",

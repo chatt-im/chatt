@@ -2626,16 +2626,6 @@ impl VoiceSession {
                     )) => {
                         let payload_size = payload.len();
                         let payload_kind = media_voice_payload_kind(&payload);
-                        kvlog::info!(
-                            "voice packet received",
-                            route = "server",
-                            stream_id = stream_id.0,
-                            sequence,
-                            media_timestamp = timestamp,
-                            flags,
-                            payload_size,
-                            payload_kind
-                        );
                         log_audio_pop_media_packet(
                             "rx",
                             "server",
@@ -2727,7 +2717,7 @@ impl VoiceSession {
         let payload_kind = voice_payload_kind(&packet.payload);
         match self.voice_dedup.observe(stream_id, sequence) {
             RecentVoiceSequenceResult::New => {
-                kvlog::info!(
+                kvlog::debug!(
                     "voice packet accepted",
                     route,
                     stream_id,
@@ -2786,15 +2776,6 @@ impl VoiceSession {
             None => allocate_local_voice_sequence(&mut self.local_sequence),
         };
         let timestamp = frame.timestamp;
-        kvlog::info!(
-            "voice packet sent",
-            stream_id = stream_id.0,
-            sequence,
-            media_timestamp = timestamp,
-            flags = frame.flags,
-            payload_size = frame.payload.len(),
-            payload_kind = voice_payload_kind(&frame.payload)
-        );
         log_audio_pop_media_packet(
             "tx",
             "local",
