@@ -14,6 +14,17 @@ const VIDEO_FRAME_FLAG_BOOTSTRAP_END: u8 = 2;
 /// Maximum size of one encoded video frame.
 pub const MAX_VIDEO_FRAME_LEN: usize = 8 * 1024 * 1024;
 
+/// Cap on the frames a fast-start cache holds for a joining viewer.
+///
+/// Every cache that replays a GOP charges this alongside a byte budget. Bytes
+/// are the real memory bound; this only stops a publisher of tiny frames from
+/// growing per-frame metadata and traversal without bound, so it sits well
+/// above any plausible group of pictures: 300 frames is ten seconds at 30 fps.
+/// A cache that hits it drops its whole GOP, because a fast-start burst has to
+/// run unbroken from a keyframe to the present — a truncated one would hand the
+/// viewer's decoder a reference gap.
+pub const FAST_START_MAX_FRAMES: usize = 300;
+
 /// Metadata decoded from the fixed portion of one plaintext video frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoFrameHeader {

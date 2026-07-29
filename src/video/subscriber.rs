@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rpc::{
     crypto::{CHANNEL_VIDEO, RecordProtection},
@@ -20,9 +20,15 @@ use rpc::{
 };
 
 use super::{VideoFrameFanout, VideoTransport};
+use crate::app::{AppEvent, EventSender, ShareViewState};
 
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
+/// How long the connection may keep failing before the viewer is told. Below
+/// this a reconnect is invisible, which is what a brief server blip deserves.
+const RECONNECT_NOTICE_AFTER: Duration = Duration::from_secs(3);
+/// Repeat interval for that notice while the failures continue.
+const RECONNECT_NOTICE_INTERVAL: Duration = Duration::from_secs(5);
 const COPY_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Rolling per-second counters for receive-path copy behaviour: frame bytes
@@ -60,6 +66,63 @@ impl CopyStats {
     }
 }
 
+/// Tracks how long this viewer connection has been failing, so a brief blip
+/// stays invisible and a real outage is reported once and then repeated.
+struct ReconnectNotice {
+    stream_id: StreamId,
+    events: EventSender,
+    /// First failure of the current outage, not the most recent attempt: the
+    /// viewer cares how long they have been without a picture.
+    failing_since: Option<Instant>,
+    /// When the viewer was last told, and so whether a notice is outstanding.
+    told_at: Option<Instant>,
+}
+
+impl ReconnectNotice {
+    fn new(stream_id: StreamId, events: EventSender) -> Self {
+        Self {
+            stream_id,
+            events,
+            failing_since: None,
+            told_at: None,
+        }
+    }
+
+    /// Records a failed attempt, telling the viewer once the outage has lasted
+    /// [`RECONNECT_NOTICE_AFTER`] and then every [`RECONNECT_NOTICE_INTERVAL`].
+    fn failed(&mut self) {
+        let now = Instant::now();
+        let since = *self.failing_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < RECONNECT_NOTICE_AFTER
+            || self
+                .told_at
+                .is_some_and(|last| now.saturating_duration_since(last) < RECONNECT_NOTICE_INTERVAL)
+        {
+            return;
+        }
+        self.told_at = Some(now);
+        self.send(ShareViewState::Reconnecting);
+    }
+
+    /// Records a connection that came up, clearing a notice the viewer is still
+    /// showing. A connection that never raised one stays silent: the ordinary
+    /// path costs no events, and nothing can relabel a row that frames have
+    /// already moved on to playing.
+    fn connected(&mut self) {
+        self.failing_since = None;
+        if self.told_at.take().is_some() {
+            self.send(ShareViewState::Connected);
+        }
+    }
+
+    fn send(&self, state: ShareViewState) {
+        let _ = self.events.send(AppEvent::ShareViewStatus {
+            stream_id: self.stream_id,
+            state,
+        });
+    }
+}
+
 /// Handle to an active viewer connection. Dropping it tears the connection down.
 pub struct SubscriberHandle {
     stop: Arc<AtomicBool>,
@@ -86,9 +149,9 @@ pub fn start(
     session_id: SessionId,
     stream_id: StreamId,
     view_secret: Vec<u8>,
-    tcp_addr: String,
     video_transport: VideoTransport,
     fanout: VideoFrameFanout,
+    events: EventSender,
 ) -> SubscriberHandle {
     // Publish the state transition before the worker can connect so a native
     // viewer joining in the same interval also waits for the server's ordered
@@ -103,9 +166,9 @@ pub fn start(
                 session_id,
                 stream_id,
                 &view_secret,
-                &tcp_addr,
                 video_transport,
                 &fanout,
+                events,
                 &thread_stop,
             )
         })
@@ -117,20 +180,21 @@ fn run(
     session_id: SessionId,
     stream_id: StreamId,
     secret: &[u8],
-    tcp_addr: &str,
     video_transport: VideoTransport,
     fanout: &VideoFrameFanout,
+    events: EventSender,
     stop: &AtomicBool,
 ) {
+    let mut notice = ReconnectNotice::new(stream_id, events);
     while !stop.load(Ordering::SeqCst) {
         match run_once(
             session_id,
             stream_id,
             secret,
-            tcp_addr,
             video_transport,
             fanout,
             stop,
+            &mut notice,
         ) {
             Ok(()) => break,
             Err(error) => {
@@ -139,6 +203,7 @@ fn run(
                     stream_id = stream_id.0,
                     error = error.as_str()
                 );
+                notice.failed();
                 thread::sleep(RECONNECT_BACKOFF);
             }
         }
@@ -146,17 +211,18 @@ fn run(
     kvlog::info!("video subscriber stopped", stream_id = stream_id.0);
 }
 
+/// Runs one connection to exhaustion, telling `notice` when it comes up so an
+/// outage that reached the viewer can be cleared.
 fn run_once(
     session_id: SessionId,
     stream_id: StreamId,
     secret: &[u8],
-    tcp_addr: &str,
     video_transport: VideoTransport,
     fanout: &VideoFrameFanout,
     stop: &AtomicBool,
+    notice: &mut ReconnectNotice,
 ) -> Result<(), String> {
     let (stream, mut record_protection, mut recv) = super::open_video_connection(
-        tcp_addr,
         session_id,
         stream_id,
         VideoRole::Subscriber,
@@ -167,6 +233,11 @@ fn run_once(
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|error| error.to_string())?;
+    // Status takes the app-event path while frames take the direct fanout path,
+    // so on recovery the browser may render one frame before seeing `Connected`.
+    // The next decoded frame restores `playing`; this cosmetic race is not a
+    // transport-ordering requirement.
+    notice.connected();
     kvlog::info!("video subscriber connected", stream_id = stream_id.0);
 
     let mut copy_stats = CopyStats::new();
