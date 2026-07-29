@@ -30,9 +30,12 @@ use crate::client_net::{CommandSender, NetworkCommand};
 use super::VideoTransport;
 use super::capture::{self, Capture, CapturedFrame};
 
-/// Cap on frames buffered while waiting for the publish secret, so a secret that
-/// never arrives cannot grow memory without bound.
+/// Bounds on the frames buffered while waiting for the publish secret, so a
+/// secret that never arrives cannot grow memory without bound. Both apply:
+/// trimming to the latest keyframe is best effort, because a capture that emits
+/// one keyframe and nothing but deltas has nothing to trim to.
 const MAX_BUFFERED_FRAMES: usize = 300;
+const MAX_BUFFERED_BYTES: usize = video::MAX_VIDEO_RECORD_LEN;
 const STARTUP_KEYFRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const PUBLISH_SECRET_TIMEOUT: Duration = Duration::from_secs(10);
 const VIDEO_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -168,9 +171,9 @@ impl CopyStats {
             "video publish copy stats",
             plaintext_bytes = self.plaintext_bytes,
             shared_bytes = self.shared_bytes,
-            fanout_copy_bytes = 0,
             sealed_bytes = self.sealed_bytes,
-            frames = self.frames
+            frames = self.frames,
+            copy_fallbacks = video::copy_fallbacks()
         );
         *self = Self::new();
     }
@@ -192,12 +195,24 @@ impl PublisherConn {
         // full-frame allocation and copy into `SharedVideoFrame`.
         let mut inner = Vec::with_capacity(video::VIDEO_FRAME_HEADER_LEN + frame.data.len());
         encode_publish_frame_into(frame, self.stream_id, self.codec, &mut inner);
+        // Checked before the local tee: the capture can hand up an access unit
+        // far larger than a frame, and a frame no viewer can receive must not
+        // reach the self-view caches either. Dropping it and continuing would
+        // leave every decoder referencing a picture that was never sent, so the
+        // share ends instead.
+        if inner.len() > video::MAX_VIDEO_FRAME_LEN {
+            return Err(format!(
+                "captured video frame is {} bytes, over the {} byte limit",
+                inner.len(),
+                video::MAX_VIDEO_FRAME_LEN
+            ));
+        }
         let shared = SharedVideoFrame::from_vec(inner);
         self.copy_stats.plaintext_bytes += shared.len() as u64;
         self.copy_stats.shared_bytes += shared.len() as u64;
         fanout.send(shared.clone());
         let sealed_len = self.record_protection.sealed_len(shared.len());
-        if sealed_len > video::MAX_VIDEO_FRAME_LEN {
+        if sealed_len > video::MAX_VIDEO_RECORD_LEN {
             return Err("sealed video record exceeds maximum length".to_string());
         }
         self.record.clear();
@@ -291,7 +306,7 @@ fn run_manager(
     events: EventSender,
     stop: Arc<AtomicBool>,
 ) {
-    let mut buffered: Vec<CapturedFrame> = Vec::new();
+    let mut buffered = StartupBuffer::default();
     let mut start_share_sent = false;
     let started_at = Instant::now();
     let mut startup_frames = 0usize;
@@ -307,13 +322,25 @@ fn run_manager(
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        // Evaluated every pass, not only when the capture goes idle: a capture
+        // delivering faster than the receive timeout would otherwise never
+        // reach a deadline, and neither startup wait would ever expire.
+        if let Some(expired) = startup_deadline(
+            codec,
+            started_at,
+            start_share_sent,
+            start_share_sent_at.filter(|_| conn.is_none()),
+        ) {
+            error = Some(expired);
+            break;
+        }
         if conn.is_none()
             && let Ok((session_id, stream_id, secret)) = secret_rx.try_recv()
         {
             match connect(session_id, stream_id, &secret, codec, video_transport) {
                 Ok(mut publisher) => {
                     let mut failed = false;
-                    for frame in buffered.drain(..) {
+                    for frame in buffered.drain() {
                         match publisher.send_frame(&frame, &fanout) {
                             Ok(bytes) => stats.record(attempt_id, stream_id, bytes, &events),
                             Err(reason) => {
@@ -369,7 +396,6 @@ fn run_manager(
                             codec: params.codec,
                             coded_width: params.width,
                             coded_height: params.height,
-                            annexb: false,
                             extradata: params.extra_data,
                         })
                         .is_err()
@@ -390,32 +416,12 @@ fn run_manager(
                             break;
                         }
                     },
-                    None => buffer_frame(&mut buffered, frame),
+                    None => buffered.push(frame),
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                let now = Instant::now();
-                if !start_share_sent
-                    && now.saturating_duration_since(started_at) >= STARTUP_KEYFRAME_TIMEOUT
-                {
-                    error = Some(format!(
-                        "screen capture did not produce a decodable {} keyframe within {}s",
-                        codec_label(codec),
-                        STARTUP_KEYFRAME_TIMEOUT.as_secs()
-                    ));
-                    break;
-                }
-                if conn.is_none()
-                    && let Some(sent_at) = start_share_sent_at
-                    && now.saturating_duration_since(sent_at) >= PUBLISH_SECRET_TIMEOUT
-                {
-                    error = Some(format!(
-                        "screen share publish secret timed out after {}s",
-                        PUBLISH_SECRET_TIMEOUT.as_secs()
-                    ));
-                    break;
-                }
-            }
+            // The deadlines are checked at the top of the loop, so an idle tick
+            // only exists to keep the loop responsive to `stop`.
+            Err(RecvTimeoutError::Timeout) => {}
             // The capture reader thread dropped its sender, so the capture process
             // closed its stdout. The exit diagnostics classify why.
             Err(RecvTimeoutError::Disconnected) => break,
@@ -432,6 +438,38 @@ fn run_manager(
         attempt_id,
         message,
     });
+}
+
+/// The startup wait that has expired, if any: the capture owes a decodable
+/// keyframe before [`STARTUP_KEYFRAME_TIMEOUT`], and the app owes the publish
+/// secret within [`PUBLISH_SECRET_TIMEOUT`] of `StartShare`.
+///
+/// `sent_at` is `Some` only while a share is still waiting for its secret, so a
+/// connected publisher never trips the second deadline.
+fn startup_deadline(
+    codec: Codec,
+    started_at: Instant,
+    start_share_sent: bool,
+    sent_at: Option<Instant>,
+) -> Option<String> {
+    let now = Instant::now();
+    if !start_share_sent && now.saturating_duration_since(started_at) >= STARTUP_KEYFRAME_TIMEOUT {
+        return Some(format!(
+            "screen capture did not produce a decodable {} keyframe within {}s",
+            codec_label(codec),
+            STARTUP_KEYFRAME_TIMEOUT.as_secs()
+        ));
+    }
+    if start_share_sent
+        && let Some(sent_at) = sent_at
+        && now.saturating_duration_since(sent_at) >= PUBLISH_SECRET_TIMEOUT
+    {
+        return Some(format!(
+            "screen share publish secret timed out after {}s",
+            PUBLISH_SECRET_TIMEOUT.as_secs()
+        ));
+    }
+    None
 }
 
 fn codec_label(codec: Codec) -> &'static str {
@@ -497,14 +535,63 @@ fn connect(
     })
 }
 
-/// Appends a frame to the pre-connection buffer, trimming to the most recent
-/// keyframe when it grows too large so a late secret still starts decodable.
-fn buffer_frame(buffered: &mut Vec<CapturedFrame>, frame: CapturedFrame) {
-    buffered.push(frame);
-    if buffered.len() > MAX_BUFFERED_FRAMES
-        && let Some(last_key) = buffered.iter().rposition(|frame| frame.is_key)
-    {
-        buffered.drain(..last_key);
+/// Holds captured frames until the publish secret arrives, keeping the buffer
+/// keyframe-led and bounded by both frames and bytes.
+#[derive(Default)]
+struct StartupBuffer {
+    frames: Vec<CapturedFrame>,
+    bytes: usize,
+}
+
+impl StartupBuffer {
+    /// Appends a frame, trimming to the most recent keyframe when either bound
+    /// is exceeded so a late secret still starts decodable. When trimming
+    /// cannot bring it back under — a capture whose only keyframe is already
+    /// first — the whole buffer goes and the burst restarts at the next
+    /// keyframe, because a truncated GOP would leave the server's first frame
+    /// referencing pictures it never received.
+    fn push(&mut self, frame: CapturedFrame) {
+        if self.frames.is_empty() && !frame.is_key {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(frame.data.capacity());
+        self.frames.push(frame);
+        if !self.over_limit() {
+            return;
+        }
+        if let Some(last_key) = self.frames.iter().rposition(|frame| frame.is_key)
+            && last_key > 0
+        {
+            self.frames.drain(..last_key);
+            self.recount();
+        }
+        if !self.over_limit() {
+            return;
+        }
+        kvlog::warn!(
+            "screen share startup buffer overflowed; waiting for the next keyframe",
+            buffered_frames = self.frames.len(),
+            buffered_bytes = self.bytes
+        );
+        self.frames.clear();
+        self.bytes = 0;
+    }
+
+    fn over_limit(&self) -> bool {
+        self.frames.len() > MAX_BUFFERED_FRAMES || self.bytes > MAX_BUFFERED_BYTES
+    }
+
+    fn recount(&mut self) {
+        self.bytes = self
+            .frames
+            .iter()
+            .map(|frame| frame.data.capacity())
+            .sum::<usize>();
+    }
+
+    fn drain(&mut self) -> std::vec::Drain<'_, CapturedFrame> {
+        self.bytes = 0;
+        self.frames.drain(..)
     }
 }
 
@@ -559,6 +646,101 @@ mod tests {
             let expected = video::encode_video_frame(frame.ts_ms, frame.is_key, 9, &body);
             assert_eq!(inner, expected);
         }
+    }
+
+    #[test]
+    fn startup_deadlines_do_not_depend_on_an_idle_capture() {
+        // Both waits used to be checked only when the frame channel timed out,
+        // so a capture delivering faster than that never reached either one.
+        let sent_at = Instant::now().checked_sub(PUBLISH_SECRET_TIMEOUT).unwrap();
+        let expired = startup_deadline(Codec::H264, Instant::now(), true, Some(sent_at)).unwrap();
+        assert!(expired.contains("publish secret timed out"));
+
+        let started_at = Instant::now()
+            .checked_sub(STARTUP_KEYFRAME_TIMEOUT)
+            .unwrap();
+        let expired = startup_deadline(Codec::Hevc, started_at, false, None).unwrap();
+        assert!(expired.contains("HEVC keyframe"));
+
+        // A connected publisher passes no secret deadline, and a fresh attempt
+        // is inside both.
+        assert!(startup_deadline(Codec::H264, Instant::now(), true, None).is_none());
+        assert!(startup_deadline(Codec::H264, Instant::now(), false, None).is_none());
+    }
+
+    fn capture_frame(ts_ms: i64, is_key: bool, bytes: usize) -> CapturedFrame {
+        CapturedFrame {
+            ts_ms,
+            is_key,
+            data: vec![0; bytes],
+        }
+    }
+
+    #[test]
+    fn startup_buffer_bounds_a_capture_whose_only_keyframe_is_first() {
+        // Trimming to the latest keyframe cannot help here, so the buffer has
+        // to drop the GOP rather than grow for as long as the secret is late.
+        let mut buffered = StartupBuffer::default();
+        buffered.push(capture_frame(0, true, 16));
+        for index in 0..MAX_BUFFERED_FRAMES + 10 {
+            buffered.push(capture_frame(index as i64, false, 16));
+        }
+        assert!(buffered.frames.is_empty());
+        assert_eq!(buffered.bytes, 0);
+        buffered.push(capture_frame(500, false, 16));
+        assert!(buffered.frames.is_empty());
+        buffered.push(capture_frame(501, true, 16));
+        assert!(buffered.frames[0].is_key);
+    }
+
+    #[test]
+    fn startup_buffer_trims_to_the_latest_keyframe() {
+        let mut buffered = StartupBuffer::default();
+        for index in 0..MAX_BUFFERED_FRAMES {
+            buffered.push(capture_frame(index as i64, index == 0, 8));
+        }
+        buffered.push(capture_frame(500, true, 8));
+        buffered.push(capture_frame(501, false, 8));
+        assert_eq!(buffered.frames.len(), 2);
+        assert_eq!(buffered.frames[0].ts_ms, 500);
+        assert_eq!(buffered.bytes, 16);
+    }
+
+    #[test]
+    fn an_oversized_captured_frame_fails_before_reaching_local_viewers() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+        let mut conn = PublisherConn {
+            stream,
+            record_protection: RecordProtection::clear(),
+            stream_id: 9,
+            codec: Codec::H264,
+            copy_stats: CopyStats::new(),
+            record: Vec::new(),
+        };
+        let fanout = VideoFrameFanout::new(None);
+        fanout.start_stream(StreamId(9));
+
+        let mut data = vec![0, 0, 0, 1, 0x65];
+        data.resize(video::MAX_VIDEO_FRAME_LEN + 64, 0xaa);
+        let error = conn
+            .send_frame(
+                &CapturedFrame {
+                    ts_ms: 0,
+                    is_key: true,
+                    data,
+                },
+                &fanout,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("over the"), "{error}");
+        // A frame no viewer can receive must not reach the self-view cache
+        // either, or the sharer's own browser decodes against it alone.
+        assert_eq!(fanout.cached_frames(StreamId(9)), 0);
     }
 
     #[test]

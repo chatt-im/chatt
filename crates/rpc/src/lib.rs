@@ -15,4 +15,4 @@ pub mod recv;
 pub mod username;
 pub mod video;
 
-pub const PROTOCOL_VERSION: u16 = 26;
+pub const PROTOCOL_VERSION: u16 = 27;

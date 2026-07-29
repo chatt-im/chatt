@@ -42,7 +42,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// seconds rather than waiting out the kernel's SYN retries.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy, Debug)]
+/// Deliberately not `Debug`: it carries the session's video auth key, and the
+/// derived form would print it into any log line that formatted a transport.
+#[derive(Clone, Copy)]
 pub struct VideoTransport {
     peer_addr: SocketAddr,
     mode: TransportMode,

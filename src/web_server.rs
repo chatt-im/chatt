@@ -68,14 +68,19 @@ const MAX_HIGHLIGHT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// Maximum encoded bytes retained per stream for browser fast-start. If one GOP
 /// exceeds this bound, caching pauses until the next keyframe rather than
 /// retaining an undecodable delta suffix.
-const VIDEO_FAST_START_MAX_BYTES: usize = video::MAX_VIDEO_FRAME_LEN;
+///
+/// Bounded by the record rather than the frame, because the cache charges
+/// `SharedVideoFrame::retained_bytes`: the whole allocation the frame arrived in.
+const VIDEO_FAST_START_MAX_BYTES: usize = video::MAX_VIDEO_RECORD_LEN;
+const _: () = assert!(VIDEO_FAST_START_MAX_BYTES >= video::MAX_VIDEO_RECORD_LEN);
 const VIDEO_FAST_START_MAX_FRAMES: usize = video::FAST_START_MAX_FRAMES;
 /// Bounds video frames waiting on the app-to-web handoff.
 ///
 /// Sized so a frame at the protocol's own maximum always fits an empty queue
 /// with room for the item's inline storage: charging that overhead against a
-/// bound of exactly one frame made the largest legal payload undeliverable.
-const WEB_FEED_VIDEO_MAX_BYTES: usize = 2 * video::MAX_VIDEO_FRAME_LEN;
+/// bound of exactly one record made the largest legal payload undeliverable.
+const WEB_FEED_VIDEO_MAX_BYTES: usize = 2 * video::MAX_VIDEO_RECORD_LEN;
+const _: () = assert!(WEB_FEED_VIDEO_MAX_BYTES > video::MAX_VIDEO_RECORD_LEN);
 /// Bounds chat projections waiting on the same handoff. Kept separate from the
 /// video bound so a keyframe burst cannot starve chat, or the reverse.
 const WEB_FEED_HISTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -143,23 +148,15 @@ impl VideoFastStart {
 
 /// Reads only the routing fields from an inner video frame after validating its
 /// declared length. The encoded payload remains untouched.
+///
+/// A bootstrap boundary is internal ordering state consumed by the fanout, so it
+/// never reaches the browser and is rejected here alongside malformed input.
 fn video_frame_meta(frame: &[u8]) -> Option<(u32, bool)> {
-    if frame.len() < video::VIDEO_FRAME_HEADER_LEN {
+    let header = video::parse_video_frame_header(frame).ok()??;
+    if header.size != frame.len() || header.bootstrap_end {
         return None;
     }
-    let size = u32::from_le_bytes(frame[0..4].try_into().ok()?) as usize;
-    if !(video::VIDEO_FRAME_HEADER_LEN..=video::MAX_VIDEO_FRAME_LEN).contains(&size)
-        || size != frame.len()
-    {
-        return None;
-    }
-    let is_key = match frame[12] {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    let stream_id = u32::from_le_bytes(frame[13..17].try_into().ok()?);
-    Some((stream_id, is_key))
+    Some((header.stream_id, header.is_key))
 }
 
 /// A single chat entry the frontend renders.
@@ -2637,9 +2634,9 @@ mod tests {
     fn a_maximum_size_video_frame_fits_an_empty_queue() {
         // A frame arrives in its whole received record, so the reservation is
         // charged the transport header and tag on top of the payload. Sizing
-        // the bound at exactly one frame made the largest legal payload
+        // the bound at exactly one record made the largest legal payload
         // permanently undeliverable, even against an idle queue.
-        let record = vec![0u8; video::MAX_VIDEO_FRAME_LEN + 64];
+        let record = vec![0u8; video::MAX_VIDEO_RECORD_LEN];
         let frame = SharedVideoFrame::from_vec(record);
         let item = WebFeed::VideoFrame(frame);
         assert_eq!(item.budget(), FeedBudget::Video);

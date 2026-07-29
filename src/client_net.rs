@@ -491,7 +491,6 @@ pub enum NetworkCommand {
         codec: String,
         coded_width: u32,
         coded_height: u32,
-        annexb: bool,
         extradata: Vec<u8>,
     },
     StopShare {
@@ -3734,7 +3733,6 @@ impl WorkerState<'_> {
                 codec,
                 coded_width,
                 coded_height,
-                annexb,
                 extradata,
             } => {
                 let Some(room_id) = self.voice_room else {
@@ -3750,7 +3748,6 @@ impl WorkerState<'_> {
                     codec,
                     coded_width,
                     coded_height,
-                    annexb,
                     extradata,
                 })?;
             }
@@ -5566,7 +5563,6 @@ impl WorkerState<'_> {
                 codec,
                 coded_width,
                 coded_height,
-                annexb: _,
                 extradata,
                 view_secret,
             } => {

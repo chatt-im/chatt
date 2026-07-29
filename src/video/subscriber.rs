@@ -60,7 +60,8 @@ impl CopyStats {
             "video subscribe copy stats",
             shipped_bytes = self.shipped_bytes,
             copied_bytes = self.copied_bytes,
-            frames = self.frames
+            frames = self.frames,
+            copy_fallbacks = rpc::video::copy_fallbacks()
         );
         *self = Self::new();
     }
@@ -282,14 +283,26 @@ fn run_once(
             .map_err(|error| error.to_string())?;
         copy_stats.copied_bytes += taken as u64;
         recv.consume(taken);
-        forward_ready_record(&mut reader, &mut record_protection, fanout, &mut copy_stats)?;
+        forward_ready_record(
+            &mut reader,
+            &mut record_protection,
+            stream_id,
+            fanout,
+            &mut copy_stats,
+        )?;
     }
 
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        forward_ready_record(&mut reader, &mut record_protection, fanout, &mut copy_stats)?;
+        forward_ready_record(
+            &mut reader,
+            &mut record_protection,
+            stream_id,
+            fanout,
+            &mut copy_stats,
+        )?;
         match reader.fill(&stream, super::VIDEO_READ_CHUNK_BYTES) {
             Ok(0) => return Err("video connection closed".to_string()),
             Ok(_) => {}
@@ -309,6 +322,7 @@ fn run_once(
 fn forward_ready_record(
     reader: &mut VideoRecordReader,
     record_protection: &mut RecordProtection,
+    stream_id: StreamId,
     fanout: &VideoFrameFanout,
     copy_stats: &mut CopyStats,
 ) -> Result<(), String> {
@@ -316,10 +330,31 @@ fn forward_ready_record(
         return Ok(());
     };
     let frame = open_record_frame(record, record_protection)?;
+    check_frame_stream(frame.as_slice(), stream_id)?;
     copy_stats.shipped_bytes += frame.len() as u64;
     copy_stats.frames += 1;
     copy_stats.maybe_log();
     fanout.send(frame);
+    Ok(())
+}
+
+/// Rejects a frame addressed to a stream other than the one this connection
+/// subscribed to.
+///
+/// The fanout routes by the id inside the header, so a misaddressed frame would
+/// land in another share's cache and viewer queues. The server validates the
+/// same field on ingest and `chatt-gui` validates it again on the far side of
+/// the local socket; this is the hop in between.
+fn check_frame_stream(frame: &[u8], stream_id: StreamId) -> Result<(), String> {
+    let header = rpc::video::parse_video_frame_header(frame)
+        .map_err(|error| format!("invalid video frame: {error}"))?
+        .ok_or_else(|| "video frame is shorter than its header".to_string())?;
+    if header.stream_id != stream_id.0 {
+        return Err(format!(
+            "video frame is addressed to stream {}, expected {}",
+            header.stream_id, stream_id.0
+        ));
+    }
     Ok(())
 }
 
@@ -389,6 +424,18 @@ mod tests {
                 inner.len() + TRANSPORT_HEADER_LEN + TAG_LEN
             );
         }
+    }
+
+    #[test]
+    fn a_frame_addressed_to_another_stream_is_rejected() {
+        // The fanout routes by the id inside the header, so accepting this
+        // would push one stream's pictures into another's cache and queues.
+        let mut inner = Vec::new();
+        video::write_video_frame(&mut inner, 1, true, 9, &[1, 2, 3]);
+        assert!(check_frame_stream(&inner, StreamId(9)).is_ok());
+        let error = check_frame_stream(&inner, StreamId(7)).unwrap_err();
+        assert!(error.contains("addressed to stream 9"), "{error}");
+        assert!(check_frame_stream(&inner[..4], StreamId(9)).is_err());
     }
 
     #[test]
