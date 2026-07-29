@@ -1252,6 +1252,8 @@ pub(crate) struct RoomLayout {
     pub composer_rect: Rect,
     /// Composer editor plus its optional half-block frame and side gutters.
     pub composer_frame_rect: Rect,
+    /// Rows the content-driven composer layout would use without an override.
+    pub composer_auto_rows: u16,
     pub composer_scrollbar: Option<ScrollbarLayout>,
     pub compose_bar_rect: Rect,
 }
@@ -1278,6 +1280,7 @@ impl Default for RoomLayout {
             identity_status_rect: Rect::EMPTY,
             composer_rect: Rect::EMPTY,
             composer_frame_rect: Rect::EMPTY,
+            composer_auto_rows: 1,
             composer_scrollbar: None,
             compose_bar_rect: Rect::EMPTY,
         }
@@ -1388,7 +1391,11 @@ enum DividerDrag {
         start_room_height: u16,
     },
     /// Dragging the Chat Log bar resizes the compose window below it.
-    ChatLogBar { anchor_row: u16, start_rows: u16 },
+    ChatLogBar {
+        anchor_row: u16,
+        start_rows: u16,
+        auto_rows: u16,
+    },
 }
 
 #[derive(Debug)]
@@ -1975,6 +1982,7 @@ impl RoomMode {
                 self.divider_drag = Some(DividerDrag::ChatLogBar {
                     anchor_row: mouse.row,
                     start_rows: self.layout.composer_rect.h,
+                    auto_rows: self.layout.composer_auto_rows,
                 });
             }
             extui::event::MouseEventKind::ScrollUp if in_chat => {
@@ -2290,14 +2298,16 @@ impl RoomMode {
             Some(DividerDrag::ChatLogBar {
                 anchor_row,
                 start_rows,
+                auto_rows,
             }) => {
                 // Dragging up grows the compose window; it and the chat log
                 // share their rows. The dragged height becomes the composer's
                 // fixed viewport and is allowed past `max_composer_height`.
+                // Returning to the content-driven height restores auto-grow.
                 let delta = i32::from(anchor_row) - i32::from(row);
                 let budget = i32::from(start_rows) + i32::from(self.layout.chat_rect.h);
                 let rows = (i32::from(start_rows) + delta).clamp(1, (budget - 1).max(1)) as u16;
-                cx.view.composer_rows = Some(rows);
+                cx.view.composer_rows = (rows != auto_rows).then_some(rows);
             }
             None => {}
         }
@@ -4741,6 +4751,75 @@ mod tests {
         assert_eq!(app.view.composer_rows, Some(target));
         render_room(&mut app, &mut room, &mut buffer);
         assert_eq!(room.layout().composer_rect.h, target);
+    }
+
+    #[test]
+    fn dragging_composer_back_to_automatic_height_restores_auto_grow() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let original_bar_row = room.layout().chat_log_bar_rect.y;
+        let column = room.layout().chat_log_bar_rect.x;
+        let target = 4;
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                original_bar_row,
+            ),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                original_bar_row - (target - 1),
+            ),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                column,
+                original_bar_row - (target - 1),
+            ),
+        );
+        assert_eq!(app.view.composer_rows, Some(target));
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let raised_bar_row = room.layout().chat_log_bar_rect.y;
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                raised_bar_row,
+            ),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                raised_bar_row + (target - 1),
+            ),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                column,
+                raised_bar_row + (target - 1),
+            ),
+        );
+
+        assert_eq!(app.view.composer_rows, None);
+        app.view.composer.set_lines("one\ntwo\nthree");
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(room.layout().composer_rect.h, 3);
     }
 
     #[test]
