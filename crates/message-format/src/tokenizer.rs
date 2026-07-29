@@ -320,6 +320,58 @@ fn scan_lines(bytes: &[u8]) -> (Vec<SourceLine>, Vec<usize>) {
     (lines, prefix_ends)
 }
 
+/// Returns the block-quote marker prefix `line` opens with, empty when the line
+/// is unquoted.
+///
+/// The prefix is scanned exactly as [`tokenize`] scans it: a run of `>`, each
+/// consuming at most one following space, anchored at the start of the line.
+/// Editors reproducing a line's quoting — continuing a quote across a pasted
+/// block, say — stay in lockstep with tokenization by copying this prefix.
+///
+/// # Examples
+///
+/// ```
+/// # use chatt_message_format::quote_prefix;
+/// assert_eq!(quote_prefix("> quoted"), "> ");
+/// assert_eq!(quote_prefix(">> nested"), ">> ");
+/// assert_eq!(quote_prefix(">no space"), ">");
+/// assert_eq!(quote_prefix("plain"), "");
+/// ```
+pub fn quote_prefix(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut end = 0usize;
+    while bytes.get(end) == Some(&b'>') {
+        end += 1;
+        if bytes.get(end) == Some(&b' ') {
+            end += 1;
+        }
+    }
+    &line[..end]
+}
+
+/// Returns whether `line` opens or closes a fenced code block.
+///
+/// `line` is one physical line with its [`quote_prefix`] already stripped and no
+/// line break of its own. Recognition matches [`tokenize`]: exactly three
+/// backticks with an empty or alphanumeric info string, which may follow prose
+/// on the same line.
+///
+/// # Examples
+///
+/// ```
+/// # use chatt_message_format::is_fence_line;
+/// assert!(is_fence_line("```"));
+/// assert!(is_fence_line("```rust"));
+/// assert!(!is_fence_line("``"));
+/// assert!(!is_fence_line("```not a language"));
+/// ```
+pub fn is_fence_line(line: &str) -> bool {
+    matches!(
+        classify_line(line.as_bytes(), 0, line.len()),
+        LineKind::Fence(_)
+    )
+}
+
 /// Matches every possible fence opener to the next standalone bare fence at the
 /// same quote depth, provided no intervening line leaves that quote. The reverse
 /// pass is linear: lowering the depth truncates candidates from quote scopes
@@ -1125,5 +1177,52 @@ mod tests {
                 .count(),
             8 * 1024 - 1
         );
+    }
+
+    #[test]
+    fn quote_prefix_matches_tokenized_quote_depth() {
+        for line in [
+            "plain",
+            "> quoted",
+            ">> nested",
+            "> > spaced",
+            ">tight",
+            ">",
+        ] {
+            let depth = kinds(line)
+                .iter()
+                .filter(|kind| matches!(kind, TokenKind::BlockQuoteStart))
+                .count();
+            let prefix = quote_prefix(line);
+            assert_eq!(
+                prefix.bytes().filter(|byte| *byte == b'>').count(),
+                depth,
+                "prefix {prefix:?} of {line:?} disagrees with the tokenized depth"
+            );
+            assert!(line.starts_with(prefix));
+        }
+    }
+
+    #[test]
+    fn fence_line_detection_matches_code_block_start() {
+        for (line, fence) in [
+            ("```", true),
+            ("```rust", true),
+            ("say ```rust", true),
+            ("``", false),
+            ("````", false),
+            ("```not a language", false),
+            ("plain", false),
+        ] {
+            assert_eq!(is_fence_line(line), fence, "{line:?}");
+            let source = format!("{line}\nbody\n```");
+            assert_eq!(
+                kinds(&source)
+                    .iter()
+                    .any(|kind| matches!(kind, TokenKind::CodeBlockStart { .. })),
+                fence,
+                "{line:?} disagrees with the tokenizer"
+            );
+        }
     }
 }

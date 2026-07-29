@@ -1817,10 +1817,10 @@ impl RoomMode {
                 let preserve_normal = self.focus == ChatPanelFocus::Compose
                     && cx.view.composer.mode() == EditorMode::Normal;
                 if preserve_normal {
-                    cx.view.put_paste_after_cursor(text);
+                    cx.view.put_paste_after_cursor(&text);
                 } else {
                     self.enter_compose_insert_mode(cx);
-                    cx.view.insert_paste(text);
+                    cx.view.insert_markdown_paste(&text);
                 }
             }
             Ok(PastePayload::Image(image)) => {
@@ -2713,7 +2713,7 @@ impl RoomMode {
 
     fn process_paste_cx(&mut self, cx: &mut ViewCx<'_>, text: String) {
         self.enter_compose_insert_mode(cx);
-        cx.view.insert_paste(text);
+        cx.view.insert_markdown_paste(&text);
     }
 }
 
@@ -2998,6 +2998,53 @@ mod tests {
 
         assert_eq!(app.view.composer.text(), "```");
         assert_eq!(app.view.composer.cursor_offset(), 3);
+    }
+
+    #[test]
+    fn paste_after_typed_fence_lands_inside_the_code_block() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+
+        type_text(&mut room, &mut app, "```");
+        room.process_paste(&mut app, "cargo build\ncargo test".to_string());
+
+        assert_eq!(
+            app.view.composer.text(),
+            "```\ncargo build\ncargo test\n```"
+        );
+        assert_eq!(
+            app.view.composer.cursor_offset(),
+            "```\ncargo build\ncargo test".len() as u32
+        );
+    }
+
+    #[test]
+    fn paste_on_quote_line_keeps_every_line_quoted() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+
+        type_text(&mut room, &mut app, "> ");
+        room.process_paste(&mut app, "first\nsecond".to_string());
+
+        assert_eq!(app.view.composer.text(), "> first\n> second");
+    }
+
+    #[test]
+    fn paste_command_in_vim_normal_mode_keeps_every_line_quoted() {
+        let mut app = test_app_vim();
+        let mut room = RoomMode::default();
+        app.view.composer.set_lines("> quoted");
+        app.view.composer.set_cursor_offset(8);
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
+
+        {
+            let mut cx = app.view_cx();
+            room.paste_from_clipboard(&mut cx, &TextClipboard("\nmore"));
+        }
+
+        assert_eq!(app.view.composer.text(), "> quoted\n> more");
+        assert_eq!(app.view.composer.mode(), EditorMode::Normal);
     }
 
     #[test]

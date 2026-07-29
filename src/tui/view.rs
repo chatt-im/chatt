@@ -23,7 +23,10 @@ use crate::{
     chat_buffer::NoticeKind,
     config::{Config, DefaultBindings},
     theme::Theme,
-    tui::{chrome::ChromeState, editor::EditorHighlighter},
+    tui::{
+        chrome::ChromeState,
+        editor::{EditorHighlighter, markdown_paste_insertion},
+    },
     ui::vu::MicLevelBallistics,
 };
 
@@ -298,10 +301,20 @@ impl ClientView {
         self.composer.replace_range(span, &text);
     }
 
+    /// Inserts pasted text, adapted to the Markdown block the cursor is in by
+    /// [`markdown_paste_insertion`].
+    pub(crate) fn insert_markdown_paste(&mut self, text: &str) {
+        let cursor = self.composer.cursor_offset();
+        let text = markdown_paste_insertion(&self.composer.text(), cursor as usize, text);
+        self.composer
+            .replace_range(EditorSpan::empty_at(cursor), &text);
+    }
+
     /// Applies Vim Normal-mode `p` placement for a host-provided paste: insert
     /// after the grapheme under the cursor and leave the cursor on the final
-    /// pasted grapheme.
-    pub(crate) fn put_paste_after_cursor(&mut self, text: String) {
+    /// pasted grapheme. The text is adapted to the surrounding Markdown block
+    /// exactly as [`Self::insert_markdown_paste`] adapts it.
+    pub(crate) fn put_paste_after_cursor(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -312,7 +325,9 @@ impl ClientView {
             .and_then(|tail| tail.graphemes(true).next())
             .filter(|grapheme| !grapheme.contains('\n'))
             .map_or(0, str::len);
-        let insertion = cursor.saturating_add(current_len) as u32;
+        let insertion = cursor.saturating_add(current_len);
+        let text = markdown_paste_insertion(&source, insertion, text);
+        let insertion = insertion as u32;
         self.composer
             .replace_range(EditorSpan::empty_at(insertion), &text);
 
