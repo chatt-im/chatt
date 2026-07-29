@@ -15,6 +15,11 @@ use crate::{client_channel::ClientId, client_net::NetworkCommand};
 
 use super::{App, room::ClientRoomKind};
 
+pub(crate) struct RpcLiveShareOpen {
+    pub(crate) handle: crate::video::NativeViewerHandle,
+    pub(crate) status: local_rpc::model::LiveShareViewStatus,
+}
+
 pub(crate) enum RpcCommandEffect {
     Reply(RequestResult),
     Snapshot(RequestId),
@@ -175,6 +180,7 @@ impl App {
             .map(|(stream_id, share)| local_rpc::model::LiveShare {
                 room_id: share.room_id,
                 stream_id: *stream_id,
+                generation: share.generation,
                 sender_name: share.sender_name.clone(),
                 codec: share.codec.clone(),
                 coded_width: share.coded_width,
@@ -216,13 +222,17 @@ impl App {
         &mut self,
         client_id: ClientId,
         stream_id: rpc::ids::StreamId,
+        generation: u64,
         stream: std::os::unix::net::UnixStream,
-    ) -> Result<crate::video::NativeViewerHandle, String> {
+    ) -> Result<RpcLiveShareOpen, String> {
         let share = self
             .room
             .available_shares
             .get(&stream_id)
             .ok_or_else(|| "that screen share is no longer available".to_string())?;
+        if share.generation != generation {
+            return Err("that screen share has been replaced".into());
+        }
         if self.room.voice_room != Some(share.room_id) {
             return Err("join the share's voice room before viewing".into());
         }
@@ -232,31 +242,47 @@ impl App {
         let video_transport = self.video_transport;
         let upstream_is_active = self.subscribers.contains_key(&stream_id);
         let wait_for_upstream_bootstrap = !own_share && !upstream_is_active;
+        if !own_share && !upstream_is_active {
+            if session_id.is_none() {
+                return Err("the voice session is no longer active".into());
+            }
+            if video_transport.is_none() {
+                return Err("video transport is not ready".into());
+            }
+        }
         let handle = self.video_fanout.add_native(
             client_id.0 as u64,
             stream_id,
             stream,
             wait_for_upstream_bootstrap,
         )?;
-        if own_share || upstream_is_active {
-            return Ok(handle);
+        if own_share {
+            return Ok(RpcLiveShareOpen {
+                handle,
+                status: local_rpc::model::LiveShareViewStatus::WaitingForKeyframe,
+            });
         }
-        let Some(session_id) = session_id else {
-            return Err("the voice session is no longer active".into());
-        };
-        let Some(video_transport) = video_transport else {
-            return Err("video transport is not ready".into());
-        };
+        if let Some(subscriber) = self.subscribers.get(&stream_id) {
+            return Ok(RpcLiveShareOpen {
+                handle,
+                status: rpc_live_share_status(subscriber.view_state()),
+            });
+        }
+        let session_id = session_id.expect("validated for a new remote live share subscriber");
+        let video_transport =
+            video_transport.expect("validated for a new remote live share subscriber");
         let subscriber = crate::video::start_subscriber(
             session_id,
             stream_id,
+            generation,
             view_secret,
             video_transport,
             self.video_fanout.clone(),
             self.events.sender(),
-        );
+        )?;
+        let status = rpc_live_share_status(subscriber.view_state());
         self.subscribers.insert(stream_id, subscriber);
-        Ok(handle)
+        Ok(RpcLiveShareOpen { handle, status })
     }
 
     pub(crate) fn stop_rpc_live_share(&mut self, stream_id: rpc::ids::StreamId) {
@@ -266,6 +292,17 @@ impl App {
         if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
             subscriber.stop();
         }
+    }
+
+    pub(crate) fn is_current_live_share(
+        &self,
+        stream_id: rpc::ids::StreamId,
+        generation: u64,
+    ) -> bool {
+        self.room
+            .available_shares
+            .get(&stream_id)
+            .is_some_and(|share| share.generation == generation)
     }
 
     pub(crate) fn rpc_room_snapshot(&self, room_id: RoomId) -> RoomSnapshot {
@@ -1088,6 +1125,17 @@ impl App {
     }
 }
 
+pub(crate) fn rpc_live_share_status(
+    state: super::ShareViewState,
+) -> local_rpc::model::LiveShareViewStatus {
+    match state {
+        super::ShareViewState::WaitingForKeyframe => {
+            local_rpc::model::LiveShareViewStatus::WaitingForKeyframe
+        }
+        super::ShareViewState::Reconnecting => local_rpc::model::LiveShareViewStatus::Reconnecting,
+    }
+}
+
 fn rpc_voice_state(state: rpc::control::VoiceState) -> VoiceState {
     match state {
         rpc::control::VoiceState::Live => VoiceState::Live,
@@ -1529,6 +1577,7 @@ mod tests {
             stream_id,
             crate::app::AvailableShare {
                 room_id: RoomId(7),
+                generation: 4,
                 view_secret: vec![9; 32],
                 sender_name: "alice".into(),
                 codec: "avc1.42C00D".into(),
@@ -1541,6 +1590,7 @@ mod tests {
         assert_eq!(snapshot.live_shares.len(), 1);
         let share = &snapshot.live_shares[0];
         assert_eq!(share.stream_id, stream_id);
+        assert_eq!(share.generation, 4);
         assert_eq!(share.sender_name, "alice");
         assert_eq!((share.coded_width, share.coded_height), (320, 240));
         assert_eq!(share.extradata, vec![1, 2, 3]);

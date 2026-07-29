@@ -2725,8 +2725,7 @@ impl Server {
         if stream.ring.is_empty() {
             return Err("video stream is waiting for a keyframe".to_string());
         }
-        let end =
-            SharedVideoFrame::from_vec(video::encode_video_bootstrap_end(stream_id.0));
+        let end = SharedVideoFrame::from_vec(video::encode_video_bootstrap_end(stream_id.0));
         let charged_bytes = stream
             .ring
             .iter()
@@ -12074,9 +12073,7 @@ mod tests {
         stream.ring.push_back(ring_frame(false));
         server.streams.insert(stream_id, stream);
 
-        let bootstrap = server
-            .prepare_subscriber_bootstrap(stream_id)
-            .unwrap();
+        let bootstrap = server.prepare_subscriber_bootstrap(stream_id).unwrap();
         server.attach_subscriber(Token(9), stream_id, bootstrap);
 
         assert_eq!(server.video_fanouts.len(), 3);

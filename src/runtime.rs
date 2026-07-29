@@ -54,13 +54,18 @@ struct RemoteRpcClient {
     uploads: Arc<Mutex<HashMap<local_rpc::model::BulkTransferId, RpcUpload>>>,
     pending_history: Option<RpcHistoryRequest>,
     last_snapshot: local_rpc::model::StateSnapshot,
-    live_viewers: HashMap<rpc::ids::StreamId, crate::video::NativeViewerHandle>,
+    live_viewers: HashMap<rpc::ids::StreamId, RpcLiveViewer>,
     attachment_streams: HashMap<local_rpc::model::RequestId, AttachmentStreamControl>,
     settings_device_generation: u64,
     next_settings_audio_event_at: Instant,
     last_settings_audio_runtime: Option<local_rpc::settings::AudioRuntimeState>,
     appearance_generation: u64,
     identity_generation: u64,
+}
+
+struct RpcLiveViewer {
+    generation: u64,
+    _handle: crate::video::NativeViewerHandle,
 }
 
 struct AttachmentStreamControl {
@@ -429,6 +434,7 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::CommandCandidates { .. } => "command_candidates",
         DaemonFrame::MessageReferenceResolved { .. } => "message_reference_resolved",
         DaemonFrame::LiveShareOpened { .. } => "live_share_opened",
+        DaemonFrame::LiveShareStatus { .. } => "live_share_status",
         DaemonFrame::AttachmentSourceOpened { .. } => "attachment_source_opened",
         DaemonFrame::Pong { .. } => "pong",
         DaemonFrame::BulkChunk(_) => "bulk_chunk",
@@ -827,6 +833,14 @@ fn handle_runtime_event(
             }
         }
         event => {
+            let live_share_status = match &event {
+                AppEvent::ShareViewStatus {
+                    stream_id,
+                    generation,
+                    state,
+                } => Some((*stream_id, *generation, *state)),
+                _ => None,
+            };
             let projects = affects_rpc_projection(&event);
             if let Some(change) = app.handle_app_event(event)
                 && !rpc_clients.is_empty()
@@ -835,6 +849,11 @@ fn handle_runtime_event(
             }
             if projects {
                 broadcast_rpc_snapshots(app, rpc_clients, daemon_instance);
+            }
+            if let Some((stream_id, generation, state)) = live_share_status
+                && app.is_current_live_share(stream_id, generation)
+            {
+                broadcast_rpc_live_share_status(rpc_clients, stream_id, generation, state);
             }
         }
     }
@@ -848,7 +867,10 @@ fn handle_runtime_event(
 /// event not named here still broadcasts.
 fn affects_rpc_projection(event: &AppEvent) -> bool {
     let (AppEvent::Network(event) | AppEvent::NetworkFor { event, .. }) = event else {
-        return !matches!(event, AppEvent::ScreencastProgress(_));
+        return !matches!(
+            event,
+            AppEvent::ScreencastProgress(_) | AppEvent::ShareViewStatus { .. }
+        );
     };
     !matches!(
         event,
@@ -1165,6 +1187,28 @@ fn broadcast_rpc_snapshots(
     }
 }
 
+fn broadcast_rpc_live_share_status(
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    stream_id: rpc::ids::StreamId,
+    generation: u64,
+    state: crate::app::ShareViewState,
+) {
+    let frame = DaemonFrame::LiveShareStatus {
+        stream_id,
+        generation,
+        status: crate::app::frontend::rpc_live_share_status(state),
+    };
+    for client in clients.values_mut() {
+        if client
+            .live_viewers
+            .get(&stream_id)
+            .is_some_and(|viewer| viewer.generation == generation)
+        {
+            client.sender.send_or_abort(&frame);
+        }
+    }
+}
+
 fn send_rpc_event(
     client: &mut RemoteRpcClient,
     instance_id: DaemonInstanceId,
@@ -1278,11 +1322,11 @@ fn sync_rpc_state(
         if let Some(room) = snapshot.room.as_mut() {
             room.messages.clear();
         }
-        client.live_viewers.retain(|stream_id, _| {
+        client.live_viewers.retain(|stream_id, viewer| {
             snapshot
                 .live_shares
                 .iter()
-                .any(|share| share.stream_id == *stream_id)
+                .any(|share| share.stream_id == *stream_id && share.generation == viewer.generation)
         });
         client.next_event_seq = seq.wrapping_add(1);
         client.last_snapshot = snapshot;
@@ -1294,10 +1338,10 @@ fn sync_rpc_state(
         next_room.older_cursor = previous.older_cursor;
         next_room.at_start = previous.at_start;
     }
-    client.live_viewers.retain(|stream_id, _| {
+    client.live_viewers.retain(|stream_id, viewer| {
         next.live_shares
             .iter()
-            .any(|share| share.stream_id == *stream_id)
+            .any(|share| share.stream_id == *stream_id && share.generation == viewer.generation)
     });
 
     let deltas = projection_deltas(&client.last_snapshot, &next);
@@ -1540,10 +1584,12 @@ fn handle_rpc_command(
         local_rpc::frame::ClientFrame::StartLiveShare {
             request_id,
             stream_id,
+            generation,
         } => {
             let already_playing = clients
                 .get(&id)
-                .is_some_and(|client| client.live_viewers.contains_key(&stream_id));
+                .and_then(|client| client.live_viewers.get(&stream_id))
+                .is_some_and(|viewer| viewer.generation == generation);
             if already_playing {
                 send_live_share_rejection(
                     clients,
@@ -1554,6 +1600,12 @@ fn handle_rpc_command(
                     "screen share is already playing",
                 );
                 return;
+            }
+            let replaced = clients
+                .get_mut(&id)
+                .and_then(|client| client.live_viewers.remove(&stream_id));
+            if replaced.is_some() {
+                app.stop_rpc_live_share(stream_id);
             }
             let (daemon_stream, frontend_stream) = match UnixStream::pair() {
                 Ok(pair) => pair,
@@ -1569,8 +1621,8 @@ fn handle_rpc_command(
                     return;
                 }
             };
-            let handle = match app.start_rpc_live_share(id, stream_id, daemon_stream) {
-                Ok(handle) => handle,
+            let open = match app.start_rpc_live_share(id, stream_id, generation, daemon_stream) {
+                Ok(open) => open,
                 Err(error) => {
                     send_live_share_rejection(
                         clients,
@@ -1587,13 +1639,21 @@ fn handle_rpc_command(
             let opened = DaemonFrame::LiveShareOpened {
                 request_id,
                 stream_id,
+                generation,
+                status: open.status,
             };
             let Some(client) = clients.get_mut(&id) else {
                 return;
             };
             match client.sender.send_with_fds(&opened, vec![frontend_fd]) {
                 Ok(()) => {
-                    client.live_viewers.insert(stream_id, handle);
+                    client.live_viewers.insert(
+                        stream_id,
+                        RpcLiveViewer {
+                            generation,
+                            _handle: open.handle,
+                        },
+                    );
                 }
                 Err(error) => {
                     kvlog::error!(
@@ -1629,10 +1689,17 @@ fn handle_rpc_command(
         local_rpc::frame::ClientFrame::StopLiveShare {
             request_id,
             stream_id,
+            generation,
         } => {
             if let Some(client) = clients.get_mut(&id) {
-                client.live_viewers.remove(&stream_id);
-                app.stop_rpc_live_share(stream_id);
+                let matches = client
+                    .live_viewers
+                    .get(&stream_id)
+                    .is_some_and(|viewer| viewer.generation == generation);
+                if matches {
+                    client.live_viewers.remove(&stream_id);
+                    app.stop_rpc_live_share(stream_id);
+                }
                 let result = local_rpc::frame::RequestResult {
                     request_id,
                     operation: local_rpc::frame::Operation::StopLiveShare,
@@ -2774,6 +2841,11 @@ mod tests {
         assert!(!affects_rpc_projection(&AppEvent::NetworkFor {
             generation: 1,
             event: NetworkEvent::ServerRtt { rtt_ms: Some(4) },
+        }));
+        assert!(!affects_rpc_projection(&AppEvent::ShareViewStatus {
+            stream_id: rpc::ids::StreamId(7),
+            generation: 3,
+            state: crate::app::ShareViewState::Reconnecting,
         }));
 
         // Anything not explicitly known to be inert still broadcasts.

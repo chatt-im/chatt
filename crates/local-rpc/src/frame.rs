@@ -9,9 +9,9 @@ use super::{
     identity::{IdentityCommand, IdentityEvent, IdentityResult},
     model::{
         AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo,
-        CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, Message, Participant,
-        RequestId, RoomSnapshot, RoomSummary, ServerSelectionState, StateSnapshot, TransferSummary,
-        TrustState, VoiceSessionState, VoiceState,
+        CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, LiveShareViewStatus,
+        Message, Participant, RequestId, RoomSnapshot, RoomSummary, ServerSelectionState,
+        StateSnapshot, TransferSummary, TrustState, VoiceSessionState, VoiceState,
     },
     settings::{SettingsCommand, SettingsEvent, SettingsResult},
 };
@@ -427,10 +427,12 @@ pub enum ClientFrame {
     StartLiveShare {
         request_id: RequestId,
         stream_id: StreamId,
+        generation: u64,
     },
     StopLiveShare {
         request_id: RequestId,
         stream_id: StreamId,
+        generation: u64,
     },
     RunCommand {
         request_id: RequestId,
@@ -531,6 +533,13 @@ pub enum DaemonFrame {
     LiveShareOpened {
         request_id: RequestId,
         stream_id: StreamId,
+        generation: u64,
+        status: LiveShareViewStatus,
+    },
+    LiveShareStatus {
+        stream_id: StreamId,
+        generation: u64,
+        status: LiveShareViewStatus,
     },
     AttachmentSourceOpened {
         request_id: RequestId,
@@ -847,6 +856,18 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         {
             return Err("attachment transfer id must be nonzero".into());
         }
+        ClientFrame::StartLiveShare {
+            stream_id,
+            generation,
+            ..
+        }
+        | ClientFrame::StopLiveShare {
+            stream_id,
+            generation,
+            ..
+        } if stream_id.0 == 0 || *generation == 0 => {
+            return Err("live share identity must be nonzero".into());
+        }
         ClientFrame::Settings { command, .. } => command.validate()?,
         ClientFrame::Appearance { command, .. } => command.validate()?,
         ClientFrame::Identity { command, .. } => command.validate()?,
@@ -949,8 +970,20 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
             }
             Ok(())
         }
-        DaemonFrame::LiveShareOpened { request_id, .. } if request_id.0 == 0 => {
-            Err("request id must be nonzero".into())
+        DaemonFrame::LiveShareOpened {
+            request_id,
+            stream_id,
+            generation,
+            ..
+        } if request_id.0 == 0 || stream_id.0 == 0 || *generation == 0 => {
+            Err("live share request or identity is invalid".into())
+        }
+        DaemonFrame::LiveShareStatus {
+            stream_id,
+            generation,
+            ..
+        } if stream_id.0 == 0 || *generation == 0 => {
+            Err("live share identity must be nonzero".into())
         }
         DaemonFrame::AttachmentSourceOpened {
             request_id,
@@ -980,6 +1013,7 @@ fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::IdentityEvent(event) => event.validate(),
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
+        | DaemonFrame::LiveShareStatus { .. }
         | DaemonFrame::AttachmentSourceOpened { .. } => Ok(()),
     }
 }
@@ -1301,10 +1335,12 @@ mod tests {
             ClientFrame::StartLiveShare {
                 request_id,
                 stream_id: StreamId(5),
+                generation: 6,
             },
             ClientFrame::StopLiveShare {
                 request_id,
                 stream_id: StreamId(5),
+                generation: 6,
             },
             ClientFrame::RunCommand {
                 request_id,
@@ -1509,6 +1545,13 @@ mod tests {
             DaemonFrame::LiveShareOpened {
                 request_id,
                 stream_id: StreamId(5),
+                generation: 6,
+                status: LiveShareViewStatus::WaitingForKeyframe,
+            },
+            DaemonFrame::LiveShareStatus {
+                stream_id: StreamId(5),
+                generation: 6,
+                status: LiveShareViewStatus::Reconnecting,
             },
             DaemonFrame::AttachmentSourceOpened {
                 request_id,
@@ -1557,5 +1600,44 @@ mod tests {
                 frame
             );
         }
+    }
+
+    #[test]
+    fn live_share_frames_require_a_generation() {
+        let request_id = RequestId(1);
+        let stream_id = StreamId(5);
+        assert!(
+            encode_client(&ClientFrame::StartLiveShare {
+                request_id,
+                stream_id,
+                generation: 0,
+            })
+            .is_err()
+        );
+        assert!(
+            encode_client(&ClientFrame::StopLiveShare {
+                request_id,
+                stream_id,
+                generation: 0,
+            })
+            .is_err()
+        );
+        assert!(
+            encode_daemon(&DaemonFrame::LiveShareOpened {
+                request_id,
+                stream_id,
+                generation: 0,
+                status: LiveShareViewStatus::WaitingForKeyframe,
+            })
+            .is_err()
+        );
+        assert!(
+            encode_daemon(&DaemonFrame::LiveShareStatus {
+                stream_id,
+                generation: 0,
+                status: LiveShareViewStatus::Reconnecting,
+            })
+            .is_err()
+        );
     }
 }
