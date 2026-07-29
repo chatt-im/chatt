@@ -344,18 +344,22 @@ pub(crate) fn draw_room_screen(
     }
     let max_bottom_rows = screen.h.saturating_sub(4 + frame_rows);
     let composer_layout = match history_search.as_deref() {
-        Some(search) => ComposerLayout {
-            height: (search.matches().len().saturating_add(1) as u16).clamp(
+        Some(search) => {
+            let height = (search.matches().len().saturating_add(1) as u16).clamp(
                 1,
                 app.config
                     .ui
                     .max_composer_height
                     .max(2)
                     .min(max_bottom_rows.max(1)),
-            ),
-            editor_width: composer_width,
-            overflow: false,
-        },
+            );
+            ComposerLayout {
+                height,
+                automatic_height: height,
+                editor_width: composer_width,
+                overflow: false,
+            }
+        }
         None => composer_layout(app, composer_width, max_bottom_rows, composer_padding),
     };
     let mut composer_frame = screen.take_bottom((composer_layout.height + frame_rows) as i32);
@@ -410,6 +414,7 @@ pub(crate) fn draw_room_screen(
     layout.compose_bar_rect = status_area;
     layout.composer_frame_rect = composer_frame_full;
     layout.composer_rect = composer_rect;
+    layout.composer_auto_rows = composer_layout.automatic_height;
     layout.chat_log_bar_rect = chat_log_bar_area;
     layout.workspace_rect = workspace_area;
     layout.workspace_room_height = workspace_room_height;
@@ -528,6 +533,7 @@ pub(crate) fn draw_room_screen(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ComposerLayout {
     height: u16,
+    automatic_height: u16,
     editor_width: u16,
     overflow: bool,
 }
@@ -538,9 +544,27 @@ fn composer_layout(
     max_rows: u16,
     padded: bool,
 ) -> ComposerLayout {
+    let automatic = composer_layout_with_rows(app, available_width, max_rows, padded, None);
+    let Some(rows) = app.view.composer_rows else {
+        return automatic;
+    };
+    let mut manual =
+        composer_layout_with_rows(app, available_width, max_rows, padded, Some(rows));
+    manual.automatic_height = automatic.height;
+    manual
+}
+
+fn composer_layout_with_rows(
+    app: &mut RenderState<'_>,
+    available_width: u16,
+    max_rows: u16,
+    padded: bool,
+    rows: Option<u16>,
+) -> ComposerLayout {
     if max_rows == 0 {
         return ComposerLayout {
             height: 0,
+            automatic_height: 0,
             editor_width: available_width,
             overflow: false,
         };
@@ -549,7 +573,8 @@ fn composer_layout(
     let mut editor_width = available_width;
     app.view.composer.resize(editor_width.max(1));
     let mut desired = app.view.composer.desired_height();
-    let mut height = composer_height(app, desired, max_rows);
+    let mut height =
+        composer_height(app.config.ui.max_composer_height, rows, desired, max_rows);
     let mut overflow = desired > height;
 
     // A padded composer already has a right gutter. In borderless mode, only
@@ -558,7 +583,7 @@ fn composer_layout(
         editor_width -= 1;
         app.view.composer.resize(editor_width);
         desired = app.view.composer.desired_height();
-        height = composer_height(app, desired, max_rows);
+        height = composer_height(app.config.ui.max_composer_height, rows, desired, max_rows);
         overflow = desired > height;
     } else if overflow && !padded {
         // Preserve the sole text column in degenerate terminal widths.
@@ -567,14 +592,20 @@ fn composer_layout(
 
     ComposerLayout {
         height,
+        automatic_height: height,
         editor_width,
         overflow,
     }
 }
 
-fn composer_height(app: &RenderState<'_>, desired: u16, max_rows: u16) -> u16 {
-    let config_cap = app.config.ui.max_composer_height.max(1);
-    let height = if let Some(rows) = app.view.composer_rows {
+fn composer_height(
+    configured_max: u16,
+    rows: Option<u16>,
+    desired: u16,
+    max_rows: u16,
+) -> u16 {
+    let config_cap = configured_max.max(1);
+    let height = if let Some(rows) = rows {
         rows.max(1)
     } else {
         desired.min(config_cap)

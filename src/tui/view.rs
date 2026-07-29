@@ -59,7 +59,8 @@ pub(crate) struct ClientView {
     /// A fixed composer height, in rows, set by dragging the Chat Log bar.
     /// In-memory only (never persisted to config); `None` restores the
     /// content-driven default. Survives sending so a dragged-taller composer
-    /// does not collapse back to one line once its message clears.
+    /// does not collapse back to one line once its message clears. Dragging
+    /// the divider back to the content-driven height clears the override.
     pub composer_rows: Option<u16>,
     command_completion: CommandCompletionState,
     ref_completion: RefCompletionState,
