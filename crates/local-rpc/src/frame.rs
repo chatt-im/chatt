@@ -58,6 +58,16 @@ impl ClientHello {
         let high = self.max_version.min(super::PROTOCOL_MAX_VERSION);
         (low <= high).then_some(high)
     }
+
+    pub fn unsupported_version_message(&self) -> String {
+        format!(
+            "unsupported daemon RPC protocol version: client supports {}..={}, daemon supports {}..={}",
+            self.min_version,
+            self.max_version,
+            super::PROTOCOL_MIN_VERSION,
+            super::PROTOCOL_MAX_VERSION
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Jsony)]

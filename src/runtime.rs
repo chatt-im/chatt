@@ -901,11 +901,12 @@ fn spawn_rpc_client(
     instance_id: DaemonInstanceId,
 ) -> Result<RemoteRpcClient, String> {
     let Some(version) = hello.negotiated_version() else {
+        let error = hello.unsupported_version_message();
         let _ = crate::local_control::write_rpc_ack(
             &mut stream,
-            Err("unsupported daemon RPC protocol version"),
+            Err(&error),
         );
-        return Err("unsupported daemon RPC protocol version".into());
+        return Err(error);
     };
     let reader_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let writer_stream = stream.try_clone().map_err(|error| error.to_string())?;

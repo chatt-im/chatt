@@ -3975,7 +3975,26 @@ impl App {
     /// selecting this provisional server entry.
     fn persist_provisional_open_pair(&mut self, server: &ServerEntry) -> Result<(), String> {
         let previous = self.config.servers.clone();
-        self.config.upsert_server(server.clone());
+        if self.config.servers.iter().any(|existing| {
+            existing.label == server.label && existing.token != server.token
+        }) {
+            return Err(format!("server label {} already exists", server.label));
+        }
+        let mut replaced = false;
+        self.config.servers.retain_mut(|existing| {
+            if existing.token != server.token {
+                return true;
+            }
+            if replaced {
+                return false;
+            }
+            *existing = server.clone();
+            replaced = true;
+            true
+        });
+        if !replaced {
+            self.config.upsert_server(server.clone());
+        }
         match self.config.save_runtime() {
             Ok(path) => {
                 self.config.config_path = Some(path);
@@ -4102,7 +4121,7 @@ impl App {
         let previous = self.config.servers.clone();
         self.config
             .servers
-            .retain(|server| server.label != pending.server.label);
+            .retain(|server| server.token != pending.server.token);
         if self.config.config_path.is_some()
             && let Err(error) = self.config.save_runtime()
         {
@@ -4159,12 +4178,21 @@ impl App {
 
     /// Re-runs a pairing attempt whose username was rejected, using the username
     /// (and any other fields) the user edited in the reopened form.
-    fn retry_username_pairing(&mut self, server: ServerEntry) -> bool {
+    fn retry_username_pairing(
+        &mut self,
+        server: ServerEntry,
+        join_after_save: bool,
+    ) -> bool {
         let client_config = server.client_config(&self.config, self.download_store.clone());
         self.apply_pairing_input(PairingInput::RetryUsername {
             owner: self.command_client,
             server,
             config: client_config,
+            completion: if join_after_save {
+                PairCompletion::Join
+            } else {
+                PairCompletion::Save
+            },
         });
         true
     }
@@ -5491,7 +5519,7 @@ impl App {
                     return false;
                 }
             };
-            return self.retry_username_pairing(server);
+            return self.retry_username_pairing(server, join_after_save);
         }
         let update = match draft.to_update() {
             Ok(update) => update,
@@ -12854,6 +12882,53 @@ mod tests {
                 .contains(&pending.server.token)
         );
         assert!(app.room.join_notice.is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn username_retry_renames_provisional_server_and_keeps_join_intent() {
+        let mut app = test_app();
+        let path = std::env::temp_dir().join(format!(
+            "chatt-username-retry-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        app.config.config_path = Some(path.clone());
+        let recovery_token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
+        let original = ServerEntry {
+            label: "public".to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "User".to_string(),
+            token: recovery_token.clone(),
+            ..ServerEntry::default()
+        };
+        app.config.servers.push(original.clone());
+        app.pairing.set_awaiting_username_for_test(
+            crate::client_channel::ClientId::PRIMARY,
+            PendingPair {
+                server: original,
+                open: Some(recovery_token),
+                open_password: String::new(),
+                pairing_code: None,
+                completion: PairCompletion::OpenEditor,
+            },
+        );
+        let renamed = ServerEntry {
+            label: "community".to_string(),
+            username: "Different User".to_string(),
+            ..app.config.servers[0].clone()
+        };
+
+        assert!(app.retry_username_pairing(renamed, true));
+
+        assert_eq!(app.config.servers.len(), 1);
+        assert_eq!(app.config.servers[0].label, "community");
+        assert_eq!(
+            app.pairing_pending().unwrap().completion,
+            PairCompletion::Join
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved.matches("[[servers]]").count(), 1);
         let _ = std::fs::remove_file(path);
     }
 

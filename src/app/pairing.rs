@@ -20,6 +20,8 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PairCompletion {
     OpenEditor,
+    Save,
+    Join,
     Reconnect,
 }
 
@@ -113,6 +115,7 @@ pub(super) enum PairingInput {
         owner: ClientId,
         server: ServerEntry,
         config: ClientConfig,
+        completion: PairCompletion,
     },
     Worker {
         attempt: u64,
@@ -147,6 +150,11 @@ impl PairingCoordinator {
     #[cfg(test)]
     pub(super) fn set_awaiting_password_for_test(&mut self, owner: ClientId, pending: PendingPair) {
         self.state = PairingState::AwaitingPassword { owner, pending };
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_awaiting_username_for_test(&mut self, owner: ClientId, pending: PendingPair) {
+        self.state = PairingState::AwaitingUsername { owner, pending };
     }
 
     #[cfg(test)]
@@ -282,6 +290,7 @@ impl PairingCoordinator {
                     owner,
                     server,
                     config,
+                    completion,
                 },
             ) if active == owner => {
                 let job = if let Some(pairing_code) = pending.pairing_code.clone() {
@@ -300,6 +309,7 @@ impl PairingCoordinator {
                 };
                 if let Some(job) = job {
                     pending.server = server;
+                    pending.completion = completion;
                     let persist_first = pending.is_provisional();
                     self.start(app, owner, pending, job, None, persist_first);
                 } else {
@@ -599,6 +609,40 @@ impl PairingCoordinator {
                         path.display()
                     )),
                 );
+            }
+            PairCompletion::Save => {
+                app.send_terminal_event(
+                    Audience::Client(owner),
+                    TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
+                        query: None,
+                    })),
+                );
+                app.send_terminal_event(
+                    Audience::Client(owner),
+                    TerminalEvent::Status(format!(
+                        "paired {alias}; config saved to {}",
+                        path.display()
+                    )),
+                );
+            }
+            PairCompletion::Join => {
+                app.send_terminal_event(
+                    Audience::Client(owner),
+                    TerminalEvent::Status(format!(
+                        "paired {alias}; config saved to {}",
+                        path.display()
+                    )),
+                );
+                let previous_owner = std::mem::replace(&mut app.command_client, owner);
+                if app.start_network(&alias) {
+                    app.send_terminal_event(
+                        Audience::Client(owner),
+                        TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Room)),
+                    );
+                } else {
+                    app.open_server_select();
+                }
+                app.command_client = previous_owner;
             }
             PairCompletion::Reconnect => {
                 app.send_terminal_event(
