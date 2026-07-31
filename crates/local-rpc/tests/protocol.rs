@@ -25,6 +25,16 @@ fn renderer_and_daemon_exchange_protocol_v14_frames_and_live_share_fd() {
     let hello = ClientHello::current("test-renderer");
     assert_eq!(hello.negotiated_version(), Some(14));
 
+    let incompatible = ClientHello {
+        min_version: 12,
+        max_version: 13,
+        build: "old-renderer".into(),
+    };
+    assert_eq!(
+        incompatible.unsupported_version_message(),
+        "unsupported daemon RPC protocol version: client supports 12..=13, daemon supports 14..=14"
+    );
+
     let (daemon_socket, renderer_socket) = UnixStream::pair().unwrap();
     let mut daemon_reader = FrameReader::new(daemon_socket.try_clone().unwrap());
     let mut daemon_writer = FrameWriter::new(daemon_socket);

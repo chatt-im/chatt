@@ -870,10 +870,11 @@ mod imp {
                 return;
             }
             if hello.negotiated_version().is_none() {
+                let error = hello.unsupported_version_message();
                 let _ = write_response(
                     &mut stream,
                     STATUS_ERROR,
-                    "unsupported daemon RPC protocol version",
+                    &error,
                 );
                 return;
             }
