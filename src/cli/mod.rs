@@ -342,7 +342,8 @@ subcommand the state is toggled.",
             about: "Share your screen to room members' web views.",
             long_about: "Starts or stops a live screen share. `start` captures the \
 X11 desktop with the built-in ffmpeg command, or pass your own capture command \
-after `start` to run any program writing H.264 Annex-B to stdout.",
+after `start` to run any program writing H.264 Annex-B to stdout. `toggle` stops \
+an active share or otherwise behaves like `start`.",
             args: &[],
             flags: &[],
             subs: &SCREENCAST_SUBS,
@@ -381,10 +382,10 @@ after `start` to run any program writing H.264 Annex-B to stdout.",
     ],
 };
 
-/// The `start`/`stop` subcommands of `screencast`. A custom capture command on
-/// `start` is intercepted in [`run`] before parsing, because its trailing argv
-/// cannot be modeled in the static tree.
-static SCREENCAST_SUBS: [Command; 2] = [
+/// The `start`/`toggle`/`stop` subcommands of `screencast`. A custom capture
+/// command on `start` or `toggle` is intercepted in [`run`] before parsing,
+/// because its trailing argv cannot be modeled in the static tree.
+static SCREENCAST_SUBS: [Command; 3] = [
     Command {
         name: "start",
         aliases: &[],
@@ -401,6 +402,25 @@ command when it emits H.265.",
             short: "",
             value_name: "",
             help: "Capture H.265/HEVC instead of H.264",
+            global: false,
+            possible: &[],
+        }],
+        subs: &[],
+        examples: &[],
+    },
+    Command {
+        name: "toggle",
+        aliases: &[],
+        about: "Stop an active screen share, or start one if none is active.",
+        long_about: "Stops the active screen share, ignoring any capture command. \
+If no share is active, accepts the same `--hevc` flag and optional custom capture \
+command as `start`.",
+        args: &[],
+        flags: &[Flag {
+            long: "hevc",
+            short: "",
+            value_name: "",
+            help: "Capture H.265/HEVC instead of H.264 when starting",
             global: false,
             possible: &[],
         }],
@@ -443,8 +463,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         config::value_arg(&args, "--logfile").or_else(|| std::env::var("CHATT_LOGFILE").ok());
     let _logger = crate::self_log::init_client_logging(logfile.as_deref());
 
-    // `screencast start <COMMAND...>` is handled before the structured parser,
-    // which cannot model the arbitrary trailing argv the passthrough captures.
+    // `screencast start|toggle <COMMAND...>` is handled before the structured
+    // parser, which cannot model the arbitrary trailing argv the passthrough captures.
     if let Some(result) = try_handle_screencast_passthrough(&args) {
         return result;
     }
@@ -539,6 +559,10 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
                 Some(("start", start)) => local_control::ScreencastCommand::Start {
                     argv: Vec::new(),
                     hevc: start.is_present("hevc"),
+                },
+                Some(("toggle", toggle)) => local_control::ScreencastCommand::Toggle {
+                    argv: Vec::new(),
+                    hevc: toggle.is_present("hevc"),
                 },
                 _ => local_control::ScreencastCommand::Start {
                     argv: Vec::new(),
@@ -762,20 +786,19 @@ fn file_signature(path: &Path) -> Option<(u64, std::time::SystemTime)> {
     Some((metadata.len(), metadata.modified().ok()?))
 }
 
-/// Intercepts `screencast start <COMMAND...>` before the structured parser.
+/// Intercepts `screencast start|toggle <COMMAND...>` before the structured parser.
 ///
-/// Every token after `screencast start` (past an optional leading `--hevc`) is
-/// the verbatim capture command argv, run directly with no shell. The static
-/// parser cannot model that trailing argv. Returns `None` when no command
-/// follows, so a plain `screencast start`/`stop` falls through to normal parsing
-/// and uses the built-in capture.
+/// Every token after the action (past an optional leading `--hevc`) is the
+/// verbatim capture command argv, run directly with no shell. The static parser
+/// cannot model that trailing argv. Returns `None` when no command follows, so a
+/// plain `screencast start`/`toggle`/`stop` falls through to normal parsing.
 fn try_handle_screencast_passthrough(
     args: &[String],
 ) -> Option<Result<(), Box<dyn std::error::Error>>> {
     let screencast = args.iter().position(|arg| arg == "screencast")?;
-    let (argv, hevc) = screencast_passthrough_command(&args[screencast + 1..])?;
+    let command = screencast_passthrough_command(&args[screencast + 1..])?;
     Some(
-        local_control::send_screencast(local_control::ScreencastCommand::Start { argv, hevc })
+        local_control::send_screencast(command)
             .map(|response| println!("{response}"))
             .map_err(Into::into),
     )
@@ -783,12 +806,12 @@ fn try_handle_screencast_passthrough(
 
 /// Extracts a custom capture command from the tokens after `screencast`.
 ///
-/// The tokens are `start`, an optional `--hevc`, then the verbatim command argv.
-/// `--hevc` selects the HEVC NAL classifier and precedes the command so it is not
-/// swallowed by the argv. Returns `None` when the tokens are not `start` or carry
-/// no command, leaving the built-in capture to the structured parser.
-fn screencast_passthrough_command(rest: &[String]) -> Option<(Vec<String>, bool)> {
-    if rest.first().map(String::as_str) != Some("start") {
+/// The tokens are `start` or `toggle`, an optional `--hevc`, then the verbatim
+/// command argv. `--hevc` precedes the command so it is not swallowed by argv.
+/// Returns `None` for other actions or when no command was supplied.
+fn screencast_passthrough_command(rest: &[String]) -> Option<local_control::ScreencastCommand> {
+    let action = rest.first().map(String::as_str)?;
+    if !matches!(action, "start" | "toggle") {
         return None;
     }
     let mut command = &rest[1..];
@@ -799,7 +822,12 @@ fn screencast_passthrough_command(rest: &[String]) -> Option<(Vec<String>, bool)
     if command.is_empty() {
         return None;
     }
-    Some((command.to_vec(), hevc))
+    let argv = command.to_vec();
+    Some(match action {
+        "start" => local_control::ScreencastCommand::Start { argv, hevc },
+        "toggle" => local_control::ScreencastCommand::Toggle { argv, hevc },
+        _ => unreachable!(),
+    })
 }
 
 /// Reads the `state` value of a `set` subcommand. The parser restricts it to
@@ -1453,26 +1481,54 @@ mod tests {
             screencast_passthrough_command(&argv(&["start", "--hevc"])),
             None
         );
+        assert_eq!(screencast_passthrough_command(&argv(&["toggle"])), None);
         assert_eq!(screencast_passthrough_command(&argv(&["stop"])), None);
+    }
+
+    #[test]
+    fn screencast_toggle_without_command_uses_structured_parser() {
+        let matches = run_matches(&["chatt", "screencast", "toggle", "--hevc"]);
+        let (name, screencast) = matches.subcommand().unwrap();
+        assert_eq!(name, "screencast");
+        let (action, toggle) = screencast.subcommand().unwrap();
+        assert_eq!(action, "toggle");
+        assert!(toggle.is_present("hevc"));
     }
 
     #[test]
     fn screencast_start_captures_verbatim_command() {
         let command = argv(&["start", "wl-screenrec", "-o", "HDMI-A-1", "-f", "-"]);
-        let (captured, hevc) = screencast_passthrough_command(&command).unwrap();
-        assert!(!hevc);
         assert_eq!(
-            captured,
-            argv(&["wl-screenrec", "-o", "HDMI-A-1", "-f", "-"])
+            screencast_passthrough_command(&command),
+            Some(local_control::ScreencastCommand::Start {
+                argv: argv(&["wl-screenrec", "-o", "HDMI-A-1", "-f", "-"]),
+                hevc: false,
+            })
         );
     }
 
     #[test]
     fn screencast_hevc_precedes_command() {
         let command = argv(&["start", "--hevc", "ffmpeg", "-f", "hevc"]);
-        let (captured, hevc) = screencast_passthrough_command(&command).unwrap();
-        assert!(hevc);
-        assert_eq!(captured, argv(&["ffmpeg", "-f", "hevc"]));
+        assert_eq!(
+            screencast_passthrough_command(&command),
+            Some(local_control::ScreencastCommand::Start {
+                argv: argv(&["ffmpeg", "-f", "hevc"]),
+                hevc: true,
+            })
+        );
+    }
+
+    #[test]
+    fn screencast_toggle_captures_verbatim_command() {
+        let command = argv(&["toggle", "capture", "--output", "-"]);
+        assert_eq!(
+            screencast_passthrough_command(&command),
+            Some(local_control::ScreencastCommand::Toggle {
+                argv: argv(&["capture", "--output", "-"]),
+                hevc: false,
+            })
+        );
     }
 
     #[test]

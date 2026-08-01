@@ -31,7 +31,10 @@ mod name_tests {
 
         assert_eq!(name, "message-2025-08-01T14-25-30Z.md");
         for ch in name.chars() {
-            assert!(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'), "{name}");
+            assert!(
+                ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'),
+                "{name}"
+            );
         }
     }
 
@@ -40,7 +43,11 @@ mod name_tests {
         let name = super::oversized_message_file_name();
 
         assert!(name.starts_with("message-2"), "{name}");
-        assert_eq!(name.len(), "message-2025-08-01T14-25-30Z.md".len(), "{name}");
+        assert_eq!(
+            name.len(),
+            "message-2025-08-01T14-25-30Z.md".len(),
+            "{name}"
+        );
     }
 }
 
@@ -89,6 +96,7 @@ mod imp {
     const OP_UPLOAD_BYTES: u8 = 12;
     const SCREENCAST_START: u8 = 0;
     const SCREENCAST_STOP: u8 = 1;
+    const SCREENCAST_TOGGLE: u8 = 2;
     const STATUS_OK: u8 = 0;
     const STATUS_ERROR: u8 = 1;
     const MAX_PATH_BYTES: u32 = 64 * 1024;
@@ -212,12 +220,13 @@ mod imp {
         }
     }
 
-    /// A screen-share intent forwarded from the CLI to the running client. `Start`
-    /// carries the capture command argv, empty for the built-in default, and
-    /// whether to capture H.265/HEVC instead of H.264.
+    /// A screen-share intent forwarded from the CLI to the running client.
+    /// Starting variants carry the capture command argv, empty for the built-in
+    /// default, and whether to capture H.265/HEVC instead of H.264.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum ScreencastCommand {
         Start { argv: Vec<String>, hevc: bool },
+        Toggle { argv: Vec<String>, hevc: bool },
         Stop,
     }
 
@@ -225,8 +234,13 @@ mod imp {
         fn encode(&self) -> Vec<u8> {
             let mut body = Vec::new();
             match self {
-                ScreencastCommand::Start { argv, hevc } => {
-                    body.push(SCREENCAST_START);
+                ScreencastCommand::Start { argv, hevc }
+                | ScreencastCommand::Toggle { argv, hevc } => {
+                    body.push(match self {
+                        ScreencastCommand::Start { .. } => SCREENCAST_START,
+                        ScreencastCommand::Toggle { .. } => SCREENCAST_TOGGLE,
+                        ScreencastCommand::Stop => unreachable!(),
+                    });
                     body.push(u8::from(*hevc));
                     body.extend_from_slice(&(argv.len() as u32).to_be_bytes());
                     for arg in argv {
@@ -245,7 +259,7 @@ mod imp {
                 .split_first()
                 .ok_or_else(|| "empty screencast payload".to_string())?;
             match *action {
-                SCREENCAST_START => {
+                SCREENCAST_START | SCREENCAST_TOGGLE => {
                     let (&hevc, tail) = cursor
                         .split_first()
                         .ok_or_else(|| "screencast payload is truncated".to_string())?;
@@ -264,10 +278,17 @@ mod imp {
                         );
                         cursor = tail;
                     }
-                    Ok(ScreencastCommand::Start {
-                        argv,
-                        hevc: hevc != 0,
-                    })
+                    if *action == SCREENCAST_START {
+                        Ok(ScreencastCommand::Start {
+                            argv,
+                            hevc: hevc != 0,
+                        })
+                    } else {
+                        Ok(ScreencastCommand::Toggle {
+                            argv,
+                            hevc: hevc != 0,
+                        })
+                    }
                 }
                 SCREENCAST_STOP => Ok(ScreencastCommand::Stop),
                 other => Err(format!("unknown screencast action {other}")),
@@ -277,6 +298,7 @@ mod imp {
         fn ack_message(&self) -> String {
             match self {
                 ScreencastCommand::Start { .. } => "screencast start requested".to_string(),
+                ScreencastCommand::Toggle { .. } => "screencast toggle requested".to_string(),
                 ScreencastCommand::Stop => "screencast stop requested".to_string(),
             }
         }
@@ -727,9 +749,13 @@ mod imp {
         Voice(VoiceCommand),
         Screencast(ScreencastCommand),
         OutputVolume(OutputVolumeCommand),
-        ReloadTheme { styled_diagnostics: bool },
+        ReloadTheme {
+            styled_diagnostics: bool,
+        },
         ConfigPath,
-        ClientLogs { follow: bool },
+        ClientLogs {
+            follow: bool,
+        },
         ReportBug(String),
         Attach(ClientHello),
         DaemonRpc(local_rpc::frame::ClientHello),
@@ -1442,9 +1468,9 @@ mod imp {
                 }
                 let room = control_room_selector(upload.room.as_deref())?;
                 Ok(Request::Upload {
-                    request: UploadFileRequest::new(PathBuf::from(
-                        std::ffi::OsString::from_vec(upload.path),
-                    )),
+                    request: UploadFileRequest::new(PathBuf::from(std::ffi::OsString::from_vec(
+                        upload.path,
+                    ))),
                     room,
                 })
             }
@@ -1891,18 +1917,16 @@ mod imp {
             };
             let (mut writer, mut reader) = UnixStream::pair().unwrap();
 
-            write_simple_request(
-                &mut writer,
-                OP_UPLOAD_BYTES,
-                &jsony::to_binary(&upload),
-            )
-            .unwrap();
+            write_simple_request(&mut writer, OP_UPLOAD_BYTES, &jsony::to_binary(&upload)).unwrap();
 
             match read_request(&mut reader).unwrap() {
                 Request::Upload { request, room } => {
                     assert!(request.path.as_os_str().is_empty());
                     assert_eq!(request.name_override.as_deref(), Some("message.md"));
-                    assert_eq!(request.inline_bytes.as_deref(), Some(upload.bytes.as_slice()));
+                    assert_eq!(
+                        request.inline_bytes.as_deref(),
+                        Some(upload.bytes.as_slice())
+                    );
                     assert_eq!(room.as_deref(), Some("lobby"));
                 }
                 other => panic!("unexpected request: {other:?}"),
@@ -2110,6 +2134,14 @@ mod imp {
                         "x11grab".to_string(),
                     ],
                     hevc: true,
+                },
+                ScreencastCommand::Toggle {
+                    argv: vec![
+                        "wl-screenrec".to_string(),
+                        "-f".to_string(),
+                        "-".to_string(),
+                    ],
+                    hevc: false,
                 },
                 ScreencastCommand::Stop,
             ];
@@ -2549,7 +2581,8 @@ mod imp {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum ScreencastCommand {
-        Start { argv: Vec<String> },
+        Start { argv: Vec<String>, hevc: bool },
+        Toggle { argv: Vec<String>, hevc: bool },
         Stop,
     }
 

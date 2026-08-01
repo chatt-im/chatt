@@ -2784,9 +2784,7 @@ impl PendingUploadSource {
                 requested_name,
             } => {
                 let reservation = store.reserve(bytes.len() as u64).ok_or_else(|| {
-                    format!(
-                        "could not reserve memory for local upload {requested_name}"
-                    )
+                    format!("could not reserve memory for local upload {requested_name}")
                 })?;
                 let name = store
                     .insert_reserved(reservation, &requested_name, bytes)
