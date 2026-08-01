@@ -2232,7 +2232,7 @@ impl App {
             },
             None => self.room.viewed_room,
         };
-        let message = format!("queued upload {}", request.path.display());
+        let message = format!("queued upload {}", request.queued_label());
         if !self.send_network_command(NetworkCommand::UploadFile { room_id, request }, true) {
             let _ = reply.send(Err("not connected to a server".to_string()));
         } else {
@@ -2251,7 +2251,14 @@ impl App {
             return;
         }
         if body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
-            let _ = reply.send(Err("chat message exceeds maximum length".to_string()));
+            self.handle_control_upload(
+                UploadFileRequest::from_bytes(
+                    local_control::OVERSIZED_MESSAGE_FILE_NAME.to_string(),
+                    body.into_bytes(),
+                ),
+                room,
+                reply,
+            );
             return;
         }
         if self.network.is_none() {
@@ -2823,6 +2830,7 @@ impl App {
                                 path,
                                 name_override: Some(name),
                                 delete_after_open: true,
+                                inline_bytes: None,
                             },
                         },
                         true,
@@ -8128,6 +8136,7 @@ impl App {
             path: source.path().clone(),
             name_override: Some(name.clone()),
             delete_after_open: source.is_staged(),
+            inline_bytes: None,
         };
         self.send_network_command(NetworkCommand::UploadFile { room_id, request }, true);
         self.set_status(format!("queued upload {name}"));
@@ -9858,6 +9867,52 @@ mod tests {
         assert!(matches!(
             network_rx.recv().unwrap(),
             NetworkCommand::SendChat { room_id: RoomId(1), body } if body == "hello"
+        ));
+    }
+
+    #[test]
+    fn control_send_uses_chat_at_cap_and_inline_markdown_upload_above_it() {
+        let mut app = test_app();
+        let (network_tx, network_rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(network_tx));
+        app.room.network_selected = true;
+        enter_test_room(&mut app);
+
+        let at_cap = "x".repeat(rpc::control::MAX_CHAT_BODY_BYTES);
+        let (send_reply, send_response) = mpsc::channel();
+        app.handle_app_event(AppEvent::SendMessage {
+            body: at_cap.clone(),
+            room: None,
+            reply: send_reply,
+        });
+        assert_eq!(
+            send_response.recv().unwrap().unwrap(),
+            "queued message to room-1"
+        );
+        assert!(matches!(
+            network_rx.recv().unwrap(),
+            NetworkCommand::SendChat { room_id: RoomId(1), body } if body == at_cap
+        ));
+
+        let over_cap = "y".repeat(rpc::control::MAX_CHAT_BODY_BYTES + 1);
+        let (upload_reply, upload_response) = mpsc::channel();
+        app.handle_app_event(AppEvent::SendMessage {
+            body: over_cap.clone(),
+            room: None,
+            reply: upload_reply,
+        });
+        assert_eq!(
+            upload_response.recv().unwrap().unwrap(),
+            "queued upload message.md"
+        );
+        assert!(matches!(
+            network_rx.recv().unwrap(),
+            NetworkCommand::UploadFile {
+                room_id: Some(RoomId(1)),
+                request,
+            } if request.path.as_os_str().is_empty()
+                && request.name_override.as_deref() == Some("message.md")
+                && request.inline_bytes.as_deref() == Some(over_cap.as_bytes())
         ));
     }
 

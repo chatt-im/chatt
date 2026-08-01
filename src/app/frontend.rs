@@ -1109,6 +1109,7 @@ impl App {
             path: path.clone(),
             name_override: Some(name),
             delete_after_open: true,
+            inline_bytes: None,
         };
         if self.send_network_command(
             NetworkCommand::UploadFile {

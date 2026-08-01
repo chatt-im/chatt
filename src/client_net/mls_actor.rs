@@ -59,6 +59,7 @@ pub(super) enum Command {
         announcement: rpc::mls::MlsFileAnnouncement,
         source_path: Vec<u8>,
         delete_after_upload: bool,
+        source_bytes: Option<Vec<u8>>,
     },
     FinishFile {
         room_id: RoomId,
@@ -1867,6 +1868,7 @@ impl Actor {
                 announcement,
                 source_path,
                 delete_after_upload,
+                source_bytes,
             } => {
                 let installation = self
                     .installation
@@ -1883,6 +1885,7 @@ impl Actor {
                     },
                     source_path,
                     delete_after_upload,
+                    source_bytes,
                 )?;
                 self.ready_file_uploads.insert((room_id, event_id));
                 if self.mls_bound {

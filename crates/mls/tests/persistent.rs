@@ -534,7 +534,30 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
         ..event
     };
     alice_client
-        .queue_file_outgoing(file.clone(), b"/tmp/resume.bin".to_vec(), true)
+        .queue_file_outgoing(file.clone(), b"/tmp/resume.bin".to_vec(), true, None)
+        .unwrap();
+    let inline_bytes = b"# oversized message\n".to_vec();
+    let inline_file = MlsChattEvent {
+        event_id: EventId([14; 16]),
+        timestamp_ms: 206,
+        content: ChattEventContent::File(MlsFileAnnouncement {
+            transfer_id: FileTransferId(10),
+            name: "message.md".to_string(),
+            size: inline_bytes.len() as u64,
+            chunk_size: 1024,
+            encoding: FileContentEncoding::Identity,
+            file_key: [9; 32],
+            digest: [10; 32],
+        }),
+        ..file.clone()
+    };
+    alice_client
+        .queue_file_outgoing(
+            inline_file.clone(),
+            Vec::new(),
+            false,
+            Some(inline_bytes.clone()),
+        )
         .unwrap();
     drop(alice_client);
 
@@ -546,16 +569,27 @@ fn sender_crash_boundaries_resume_plaintext_and_reuse_exact_ciphertext() {
             .iter()
             .any(|entry| entry.event == file)
     );
-    assert!(matches!(
-        alice_client.pending_file_uploads().unwrap().as_slice(),
-        [upload]
-            if upload.room_id == descriptor.room_id
-                && upload.event_id == file.event_id
-                && upload.source_path == b"/tmp/resume.bin"
-                && upload.delete_after_upload
-    ));
+    let uploads = alice_client.pending_file_uploads().unwrap();
+    assert_eq!(uploads.len(), 2);
+    assert!(uploads.iter().any(|upload| {
+        upload.room_id == descriptor.room_id
+            && upload.event_id == file.event_id
+            && upload.source_path == b"/tmp/resume.bin"
+            && upload.delete_after_upload
+            && upload.source_bytes.is_none()
+    }));
+    assert!(uploads.iter().any(|upload| {
+        upload.room_id == descriptor.room_id
+            && upload.event_id == inline_file.event_id
+            && upload.source_path.is_empty()
+            && !upload.delete_after_upload
+            && upload.source_bytes.as_deref() == Some(inline_bytes.as_slice())
+    }));
     alice_client
         .finish_file_upload(descriptor.room_id, file.event_id)
+        .unwrap();
+    alice_client
+        .finish_file_upload(descriptor.room_id, inline_file.event_id)
         .unwrap();
     assert!(alice_client.pending_file_uploads().unwrap().is_empty());
 }

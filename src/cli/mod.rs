@@ -1008,7 +1008,7 @@ fn message_body(argument: Option<&str>) -> Result<String, String> {
 }
 
 fn read_message_body(mut input: impl Read) -> Result<String, String> {
-    let limit = rpc::control::MAX_CHAT_BODY_BYTES;
+    let limit = local_control::MAX_INLINE_SEND_BYTES;
     // One trailing LF or CRLF is input framing rather than chat content. Read
     // enough beyond the body cap to distinguish that allowance from an
     // actually oversized message without buffering an unbounded pipe.
@@ -1035,7 +1035,7 @@ fn validate_message_body(body: String) -> Result<String, String> {
     if body.trim().is_empty() {
         return Err("chat message is empty".to_string());
     }
-    if body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
+    if body.len() > local_control::MAX_INLINE_SEND_BYTES {
         return Err(message_too_long_error(body.len()));
     }
     Ok(body)
@@ -1044,7 +1044,7 @@ fn validate_message_body(body: String) -> Result<String, String> {
 fn message_too_long_error(actual: usize) -> String {
     format!(
         "chat message is {actual} bytes; maximum is {} bytes",
-        rpc::control::MAX_CHAT_BODY_BYTES
+        local_control::MAX_INLINE_SEND_BYTES
     )
 }
 
@@ -1278,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_message_validation_enforces_utf8_byte_cap_and_nonempty_body() {
+    fn cli_message_validation_accepts_upload_fallback_and_rejects_invalid_text() {
         let limit = rpc::control::MAX_CHAT_BODY_BYTES;
         assert_eq!(
             read_message_body(format!("{}\r\n", "x".repeat(limit)).as_bytes())
@@ -1286,8 +1286,16 @@ mod tests {
                 .len(),
             limit
         );
-        assert!(read_message_body("x".repeat(limit + 1).as_bytes()).is_err());
-        assert!(message_body(Some(&"x".repeat(limit + 1))).is_err());
+        assert_eq!(
+            read_message_body("x".repeat(limit + 1).as_bytes())
+                .unwrap()
+                .len(),
+            limit + 1
+        );
+        assert_eq!(
+            message_body(Some(&"x".repeat(limit + 1))).unwrap().len(),
+            limit + 1
+        );
         assert!(read_message_body(&b" \n"[..]).is_err());
         assert!(read_message_body(&[0xff][..]).is_err());
     }
