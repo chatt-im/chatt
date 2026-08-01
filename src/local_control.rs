@@ -871,11 +871,7 @@ mod imp {
             }
             if hello.negotiated_version().is_none() {
                 let error = hello.unsupported_version_message();
-                let _ = write_response(
-                    &mut stream,
-                    STATUS_ERROR,
-                    &error,
-                );
+                let _ = write_response(&mut stream, STATUS_ERROR, &error);
                 return;
             }
             for result in [

@@ -23,6 +23,7 @@ pub(crate) struct TestApp {
     app: App,
     pub(crate) view: ClientView,
     channel: Arc<ClientChannel>,
+    pending_events: VecDeque<TerminalEvent>,
     commands: Vec<CoreCommand>,
     pub(crate) test_navigation: VecDeque<ModeTransition>,
     remote_views: HashMap<ClientId, Arc<parking_lot::Mutex<ClientView>>>,
@@ -38,6 +39,7 @@ impl TestApp {
             app,
             view,
             channel,
+            pending_events: VecDeque::new(),
             commands: Vec::new(),
             test_navigation: VecDeque::new(),
             remote_views: HashMap::new(),
@@ -158,8 +160,16 @@ impl TestApp {
         self.sync_terminal_events();
     }
 
+    /// The oldest terminal event still queued for the primary client.
+    ///
+    /// Draining the channel hands over every queued event at once, so the tail
+    /// is held here rather than dropped: a caller stepping through a sequence
+    /// must see the events that follow the one it takes.
     pub(crate) fn take_terminal_event(&mut self) -> Option<TerminalEvent> {
-        self.channel.drain_events().pop_front()
+        if self.pending_events.is_empty() {
+            self.pending_events = self.channel.drain_events();
+        }
+        self.pending_events.pop_front()
     }
 
     pub(crate) fn terminal_channel(&self) -> Arc<ClientChannel> {

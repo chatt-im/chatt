@@ -548,8 +548,7 @@ fn composer_layout(
     let Some(rows) = app.view.composer_rows else {
         return automatic;
     };
-    let mut manual =
-        composer_layout_with_rows(app, available_width, max_rows, padded, Some(rows));
+    let mut manual = composer_layout_with_rows(app, available_width, max_rows, padded, Some(rows));
     manual.automatic_height = automatic.height;
     manual
 }
@@ -573,8 +572,7 @@ fn composer_layout_with_rows(
     let mut editor_width = available_width;
     app.view.composer.resize(editor_width.max(1));
     let mut desired = app.view.composer.desired_height();
-    let mut height =
-        composer_height(app.config.ui.max_composer_height, rows, desired, max_rows);
+    let mut height = composer_height(app.config.ui.max_composer_height, rows, desired, max_rows);
     let mut overflow = desired > height;
 
     // A padded composer already has a right gutter. In borderless mode, only
@@ -598,12 +596,7 @@ fn composer_layout_with_rows(
     }
 }
 
-fn composer_height(
-    configured_max: u16,
-    rows: Option<u16>,
-    desired: u16,
-    max_rows: u16,
-) -> u16 {
+fn composer_height(configured_max: u16, rows: Option<u16>, desired: u16, max_rows: u16) -> u16 {
     let config_cap = configured_max.max(1);
     let height = if let Some(rows) = rows {
         rows.max(1)

@@ -3235,13 +3235,16 @@ impl App {
 
     /// Opens the server-edit form for `label` with the cursor on `field`, used to
     /// send a rejected connect straight back to the offending input.
-    pub(crate) fn replace_with_server_edit_focused(&mut self, label: &str, field: &str) {
+    ///
+    /// The caller resets the base screen first, so the form opens above the
+    /// server list rather than becoming an unpoppable root.
+    pub(crate) fn open_server_edit_focused(&mut self, label: &str, field: &str) {
         let Ok(server) = self.config.server(label).cloned() else {
             self.set_error(format!("server {label} is not configured"));
             return;
         };
         let draft = ServerEditDraft::from_server_focused(&server, &self.config, field);
-        self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
+        self.navigate_owner(NavigationEvent::OpenScreen(Box::new(
             ScreenSpec::ServerEditor(draft),
         )));
         self.set_status(format!("editing server {}", server.label));
@@ -3981,9 +3984,12 @@ impl App {
     /// selecting this provisional server entry.
     fn persist_provisional_open_pair(&mut self, server: &ServerEntry) -> Result<(), String> {
         let previous = self.config.servers.clone();
-        if self.config.servers.iter().any(|existing| {
-            existing.label == server.label && existing.token != server.token
-        }) {
+        if self
+            .config
+            .servers
+            .iter()
+            .any(|existing| existing.label == server.label && existing.token != server.token)
+        {
             return Err(format!("server label {} already exists", server.label));
         }
         let mut replaced = false;
@@ -4096,6 +4102,12 @@ impl App {
             .pending_server_for(self.command_client)
             .cloned()
         else {
+            // The prompt outlived the attempt; telling it so clears the
+            // submitting state it would otherwise wait on forever.
+            self.send_terminal_event(
+                Audience::Client(self.command_client),
+                TerminalEvent::PairingFailed("no pairing in progress".to_string()),
+            );
             return;
         };
         let config = server.client_config(&self.config, self.download_store.clone());
@@ -4184,14 +4196,15 @@ impl App {
 
     /// Re-runs a pairing attempt whose username was rejected, using the username
     /// (and any other fields) the user edited in the reopened form.
-    fn retry_username_pairing(
-        &mut self,
-        server: ServerEntry,
-        join_after_save: bool,
-    ) -> bool {
+    ///
+    /// Returns whether a worker took the retry. A retry that never started
+    /// leaves the coordinator parked on the rejected username, and the caller
+    /// re-presents the form with the failure.
+    fn retry_username_pairing(&mut self, server: ServerEntry, join_after_save: bool) -> bool {
+        let owner = self.command_client;
         let client_config = server.client_config(&self.config, self.download_store.clone());
         self.apply_pairing_input(PairingInput::RetryUsername {
-            owner: self.command_client,
+            owner,
             server,
             config: client_config,
             completion: if join_after_save {
@@ -4200,7 +4213,7 @@ impl App {
                 PairCompletion::Save
             },
         });
-        true
+        !self.pairing.awaiting_username(owner)
     }
 
     fn apply_pairing_input(&mut self, input: PairingInput) {
@@ -5052,10 +5065,7 @@ impl App {
                         } else {
                             let previous =
                                 std::mem::replace(&mut self.command_client, attempt.owner);
-                            self.replace_with_server_edit_focused(
-                                &attempt.server_label,
-                                "Username",
-                            );
+                            self.open_server_edit_focused(&attempt.server_label, "Username");
                             self.set_error("username already in use; choose another");
                             self.command_client = previous;
                         }
@@ -9166,6 +9176,8 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::command::CoreCommand;
+    use super::pairing::ResumeUi;
     use super::testing::TestApp;
     use super::*;
     use crate::{bindings::BindCommand, tui::Action};
@@ -9666,10 +9678,16 @@ mod tests {
             .into(),
         );
 
-        let events = channel.drain_events();
+        let mut events = channel.drain_events();
+        assert!(matches!(
+            events.pop_front(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ResetBase(
+                BaseScreen::Servers { query: None }
+            )))
+        ));
         assert!(events.into_iter().any(|event| matches!(
             event,
-            TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(screen))
+            TerminalEvent::Navigation(NavigationEvent::OpenScreen(screen))
                 if matches!(screen.as_ref(), ScreenSpec::ServerEditor(_))
         )));
         assert_eq!(
@@ -12898,10 +12916,8 @@ mod tests {
     #[test]
     fn username_retry_renames_provisional_server_and_keeps_join_intent() {
         let mut app = test_app();
-        let path = std::env::temp_dir().join(format!(
-            "chatt-username-retry-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("chatt-username-retry-{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
         app.config.config_path = Some(path.clone());
         let recovery_token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
@@ -12946,6 +12962,16 @@ mod tests {
     /// runs. The address is a closed port, so the worker that an accepted
     /// consent restarts fails at once instead of reaching a real server.
     fn running_open_pair(app: &mut TestApp, token: &str, server_public_key: &str) -> u64 {
+        running_open_pair_resuming(app, token, server_public_key, ResumeUi::None)
+    }
+
+    /// The same attempt, started from the pairing UI named by `resume`.
+    fn running_open_pair_resuming(
+        app: &mut TestApp,
+        token: &str,
+        server_public_key: &str,
+        resume: ResumeUi,
+    ) -> u64 {
         let server = ServerEntry {
             label: "public".to_string(),
             tcp_addr: "127.0.0.1:1".to_string(),
@@ -12959,7 +12985,11 @@ mod tests {
         let pending = PendingPair {
             server,
             open: Some(token.to_string()),
-            open_password: String::new(),
+            open_password: if resume == ResumeUi::PasswordPrompt {
+                "hunter2".to_string()
+            } else {
+                String::new()
+            },
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
         };
@@ -12972,6 +13002,7 @@ mod tests {
                 existing_token: token.to_string(),
             },
             None,
+            resume,
         )
     }
 
@@ -13098,6 +13129,409 @@ mod tests {
         assert!(app.pairing_idle());
         assert!(app.config.servers.is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A config path whose parent is a regular file, so every save fails.
+    fn unwritable_config_path(app: &mut TestApp, label: &str) -> crate::test_temp::TempPath {
+        let dir = crate::test_temp::TempDir::new(label);
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"").expect("blocking file");
+        let path = dir.with_path("blocked/chatt.toml");
+        app.config.config_path = Some(path.to_path_buf());
+        path
+    }
+
+    fn editor_on_top(h: &mut Harness) -> bool {
+        h.stack.depth() == 2 && h.top_theme_mode() == crate::theme::UiMode::ServerEdit
+    }
+
+    #[test]
+    fn invite_pairing_success_opens_the_editor_above_the_server_list() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "invite-editor");
+        let attempt = running_open_pair(&mut app, "invite-token", "");
+        let mut h = Harness::new(app);
+
+        h.app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::InviteSucceeded,
+        });
+        h.apply();
+
+        assert!(editor_on_top(&mut h));
+
+        h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        assert_eq!(h.stack.depth(), 1);
+        assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_pairing_success_opens_an_editor_that_saves_back_to_the_list() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "open-pair-editor");
+        let attempt = running_open_pair(&mut app, "provisional", "");
+        let mut h = Harness::new(app);
+
+        h.app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::OpenSucceeded {
+                token: "issued-token".to_string(),
+                server_public_key: "ab".repeat(32),
+            },
+        });
+        h.apply();
+
+        assert!(editor_on_top(&mut h));
+
+        let server = h
+            .app
+            .config
+            .server("public")
+            .expect("paired server")
+            .clone();
+        let draft = ServerEditDraft::from_server(&server, &h.app.config);
+        h.app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::SaveServerEdit {
+                draft,
+                join_after_save: false,
+            },
+        );
+        h.apply();
+
+        assert_eq!(h.stack.depth(), 1);
+        assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn password_protected_pairing_replaces_the_prompt_with_the_editor() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "password-pair-editor");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}password-secret");
+        let attempt = running_open_pair(&mut app, &token, "");
+        let mut h = Harness::new(app);
+
+        h.app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::OpenNeedsPassword {
+                retry: false,
+                server_public_key: "ab".repeat(32),
+            },
+        });
+        h.apply();
+
+        assert_eq!(h.stack.depth(), 2);
+        assert!(h.overlay_active());
+
+        h.app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::SubmitPairPassword("hunter2".to_string()),
+        );
+        let attempt = h
+            .app
+            .pairing
+            .running_attempt_for_test()
+            .expect("password retry running");
+        h.app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::OpenSucceeded {
+                token: "issued-token".to_string(),
+                server_public_key: "ab".repeat(32),
+            },
+        });
+        h.apply();
+
+        assert!(editor_on_top(&mut h));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn connection_username_rejection_opens_the_editor_above_the_server_list() {
+        let mut app = test_app();
+        app.config.servers.push(ServerEntry {
+            label: "public".to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "Zoe".to_string(),
+            token: "token".to_string(),
+            ..ServerEntry::default()
+        });
+        app.connection_attempt = Some(ConnectionAttempt {
+            generation: 1,
+            owner: crate::client_channel::ClientId::PRIMARY,
+            server_label: "public".to_string(),
+        });
+        let mut h = Harness::new(app);
+
+        h.app.handle_app_event(
+            NetworkEvent::AuthFailed {
+                code: ERROR_USERNAME_TAKEN,
+                message: "username already in use".to_string(),
+            }
+            .into(),
+        );
+        h.apply();
+
+        assert!(editor_on_top(&mut h));
+
+        h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        assert_eq!(h.stack.depth(), 1);
+        assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
+    }
+
+    /// The pending pair keeps its pre-retry server: the editor the caller
+    /// re-presents is the user's own draft, which still names the old label.
+    #[test]
+    fn username_retry_persist_failure_keeps_the_pre_retry_server() {
+        let mut app = test_app();
+        let _path = unwritable_config_path(&mut app, "username-retry-persist");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
+        let original = ServerEntry {
+            label: "public".to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "User".to_string(),
+            token: token.clone(),
+            ..ServerEntry::default()
+        };
+        app.config.servers.push(original.clone());
+        app.pairing.set_awaiting_username_for_test(
+            crate::client_channel::ClientId::PRIMARY,
+            PendingPair {
+                server: original.clone(),
+                open: Some(token),
+                open_password: String::new(),
+                pairing_code: None,
+                completion: PairCompletion::OpenEditor,
+            },
+        );
+        let renamed = ServerEntry {
+            label: "community".to_string(),
+            username: "Different User".to_string(),
+            ..original
+        };
+
+        assert!(!app.retry_username_pairing(renamed, false));
+
+        let pending = app.pairing_pending().expect("retry parked on the username");
+        assert_eq!(pending.server.label, "public");
+        assert_eq!(pending.server.username, "User");
+        assert!(
+            app.pairing
+                .awaiting_username(crate::client_channel::ClientId::PRIMARY)
+        );
+        assert!(matches!(
+            app.take_terminal_event(),
+            Some(TerminalEvent::Error(_))
+        ));
+    }
+
+    #[test]
+    fn username_retry_persist_failure_reopens_the_editor() {
+        let mut app = test_app();
+        let _path = unwritable_config_path(&mut app, "username-retry-reopen");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
+        let server = ServerEntry {
+            label: "public".to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "User".to_string(),
+            token: token.clone(),
+            ..ServerEntry::default()
+        };
+        app.config.servers.push(server.clone());
+        app.pairing.set_awaiting_username_for_test(
+            crate::client_channel::ClientId::PRIMARY,
+            PendingPair {
+                server: server.clone(),
+                open: Some(token),
+                open_password: String::new(),
+                pairing_code: None,
+                completion: PairCompletion::OpenEditor,
+            },
+        );
+        let draft = ServerEditDraft::from_server(&server, &app.config);
+
+        app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::SaveServerEdit {
+                draft,
+                join_after_save: false,
+            },
+        );
+
+        assert!(matches!(
+            app.take_terminal_event(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(screen)))
+                if matches!(screen.as_ref(), ScreenSpec::ServerEditor(_))
+        ));
+        assert!(
+            app.pairing
+                .awaiting_username(crate::client_channel::ClientId::PRIMARY)
+        );
+    }
+
+    #[test]
+    fn worker_failure_after_a_username_retry_reopens_the_editor() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "username-retry-failed");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
+        let attempt = running_open_pair_resuming(&mut app, &token, "", ResumeUi::Editor);
+        let mut h = Harness::new(app);
+
+        h.app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::Failed("pairing failed: connection refused".to_string()),
+        });
+        h.apply();
+
+        assert!(editor_on_top(&mut h));
+        assert!(
+            h.app
+                .pairing
+                .awaiting_username(crate::client_channel::ClientId::PRIMARY)
+        );
+        assert_eq!(h.app.view.status.kind(), StatusKind::Error);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn server_key_change_during_a_password_retry_closes_the_prompt() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "password-retry-key-change");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}pin-secret");
+        let attempt = running_open_pair_resuming(
+            &mut app,
+            &token,
+            &"ab".repeat(32),
+            ResumeUi::PasswordPrompt,
+        );
+
+        app.apply_pairing_input(PairingInput::Worker {
+            attempt,
+            event: PairingEvent::OpenNeedsPassword {
+                retry: true,
+                server_public_key: "cd".repeat(32),
+            },
+        });
+
+        assert!(app.pairing_idle());
+        assert!(app.config.servers.is_empty());
+        assert!(matches!(
+            app.take_terminal_event(),
+            Some(TerminalEvent::Navigation(NavigationEvent::CloseOverlay))
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn persist_failure_during_a_password_challenge_keeps_the_prompt() {
+        let mut app = test_app();
+        let _path = unwritable_config_path(&mut app, "password-challenge-persist");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}challenge-secret");
+        let attempt = running_open_pair(&mut app, &token, "");
+
+        app.apply_pairing_input(PairingInput::Worker {
+            attempt,
+            event: PairingEvent::OpenNeedsPassword {
+                retry: false,
+                server_public_key: "ab".repeat(32),
+            },
+        });
+
+        assert!(
+            app.pairing
+                .pending_server_for(crate::client_channel::ClientId::PRIMARY)
+                .is_some()
+        );
+        assert!(matches!(
+            app.take_terminal_event(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(overlay)))
+                if matches!(overlay.as_ref(), OverlaySpec::PairingPassword { retry: false })
+        ));
+        assert!(matches!(
+            app.take_terminal_event(),
+            Some(TerminalEvent::PairingFailed(_))
+        ));
+    }
+
+    /// A device job cannot spawn without its cancellation flag, which is the
+    /// one start failure reachable without a worker.
+    #[test]
+    fn device_pairing_start_failure_keeps_the_details_dialog() {
+        let mut app = test_app();
+        app.start_device_pairing_prompt(None);
+        let server = ServerEntry {
+            label: "device".to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "pairing".to_string(),
+            ..ServerEntry::default()
+        };
+        let config = server.client_config(&app.config, app.download_store.clone());
+        let ticket = DeviceLinkTicket {
+            version: 1,
+            pairing_secret: [7u8; rpc::crypto::KEY_LEN],
+            tcp_addr: "127.0.0.1:1".to_string(),
+            udp_addr: String::new(),
+            udp_probe_addr: None,
+            server_public_key: [0u8; rpc::crypto::ED25519_PUBLIC_KEY_LEN],
+        };
+
+        app.apply_pairing_input(PairingInput::Start {
+            owner: crate::client_channel::ClientId::PRIMARY,
+            pending: PendingPair {
+                server,
+                open: None,
+                open_password: String::new(),
+                pairing_code: None,
+                completion: PairCompletion::OpenEditor,
+            },
+            job: PairingJob::Device {
+                config,
+                ticket: RetainedTicket::new(ticket),
+                device_name: "laptop".to_string(),
+                overwrite_existing: false,
+            },
+            cancellation: None,
+            persist_first: false,
+        });
+
+        assert!(!app.pairing_idle());
+        let mut reported = false;
+        while let Some(event) = app.take_terminal_event() {
+            assert!(!matches!(
+                event,
+                TerminalEvent::Navigation(NavigationEvent::CloseOverlay)
+            ));
+            reported |= matches!(event, TerminalEvent::DevicePairingFailed { .. });
+        }
+        assert!(reported);
+    }
+
+    #[test]
+    fn canceling_with_no_pairing_closes_the_stale_prompt() {
+        let mut app = test_app();
+
+        app.cancel_open_pairing();
+
+        assert!(app.pairing_idle());
+        assert!(matches!(
+            app.take_terminal_event(),
+            Some(TerminalEvent::Navigation(NavigationEvent::CloseOverlay))
+        ));
+    }
+
+    #[test]
+    fn submitting_a_password_with_no_pairing_reports_the_missing_attempt() {
+        let mut app = test_app();
+
+        app.submit_open_pair_password("hunter2".to_string());
+
+        assert!(matches!(
+            app.take_terminal_event(),
+            Some(TerminalEvent::PairingFailed(message)) if message == "no pairing in progress"
+        ));
     }
 
     #[test]

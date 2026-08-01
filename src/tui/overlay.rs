@@ -3407,6 +3407,24 @@ mod tests {
     }
 
     #[test]
+    fn password_prompt_reports_a_pairing_failure_and_accepts_input_again() {
+        let mut prompt = PasswordPromptMode::new(false);
+        prompt.input = "bad".to_string();
+        prompt.submitting = true;
+
+        prompt.process_client_event(crate::client_channel::TerminalEvent::PairingFailed(
+            "no pairing in progress".to_string(),
+        ));
+
+        assert_eq!(
+            prompt.feedback,
+            PasswordFeedback::Error("no pairing in progress".to_string())
+        );
+        assert!(!prompt.submitting);
+        assert!(prompt.input.is_empty());
+    }
+
+    #[test]
     fn password_prompt_consumes_retry_as_local_feedback() {
         let mut prompt = PasswordPromptMode::new(false);
         prompt.input = "bad".to_string();

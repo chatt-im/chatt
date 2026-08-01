@@ -902,10 +902,7 @@ fn spawn_rpc_client(
 ) -> Result<RemoteRpcClient, String> {
     let Some(version) = hello.negotiated_version() else {
         let error = hello.unsupported_version_message();
-        let _ = crate::local_control::write_rpc_ack(
-            &mut stream,
-            Err(&error),
-        );
+        let _ = crate::local_control::write_rpc_ack(&mut stream, Err(&error));
         return Err(error);
     };
     let reader_stream = stream.try_clone().map_err(|error| error.to_string())?;
