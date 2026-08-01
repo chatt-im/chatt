@@ -64,6 +64,9 @@ mod imp {
         pub pid: u32,
         /// Reserved for per-terminal UI preferences in the attach protocol.
         pub ui_overrides: Option<Vec<u8>>,
+        /// What the attaching terminal's command line asked for, if anything.
+        #[jsony(version = 1)]
+        pub startup_intent: Option<crate::app::StartupIntent>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1436,15 +1439,17 @@ mod imp {
     pub(crate) fn connect_attach(
         stdin_fd: RawFd,
         stdout_fd: RawFd,
+        startup_intent: Option<&crate::app::StartupIntent>,
     ) -> Result<UnixStream, AttachConnectError> {
         let path = socket_path().map_err(AttachConnectError::Failed)?;
-        connect_attach_to_path(&path, stdin_fd, stdout_fd)
+        connect_attach_to_path(&path, stdin_fd, stdout_fd, startup_intent)
     }
 
     pub(crate) fn connect_attach_to_path(
         path: &Path,
         stdin_fd: RawFd,
         stdout_fd: RawFd,
+        startup_intent: Option<&crate::app::StartupIntent>,
     ) -> Result<UnixStream, AttachConnectError> {
         use sendfd::SendWithFd;
 
@@ -1475,6 +1480,7 @@ mod imp {
             version: 1,
             pid: std::process::id(),
             ui_overrides: None,
+            startup_intent: startup_intent.cloned(),
         };
         let body = jsony::to_binary(&hello);
         let mut frame = Vec::with_capacity(MAGIC.len() + 5 + body.len());
@@ -1603,6 +1609,9 @@ mod imp {
                 version: 1,
                 pid: std::process::id(),
                 ui_overrides: None,
+                startup_intent: Some(crate::app::StartupIntent::Named {
+                    specifier: "lab".to_string(),
+                }),
             };
             let body = jsony::to_binary(&hello);
             let mut frame = Vec::new();
@@ -1636,12 +1645,32 @@ mod imp {
             }
         }
 
+        /// The startup intent was added to an already-deployed hello, so a shim
+        /// that predates it still attaches, carrying no intent.
+        #[test]
+        fn attach_hello_without_a_startup_intent_still_decodes() {
+            let mut body = jsony::to_binary(&ClientHello {
+                version: 1,
+                pid: 7,
+                ui_overrides: None,
+                startup_intent: None,
+            });
+            body[0] = 0;
+            body.truncate(body.len() - 1);
+
+            let hello: ClientHello = jsony::from_binary(&body).expect("version 0 hello");
+
+            assert_eq!(hello.pid, 7);
+            assert_eq!(hello.startup_intent, None);
+        }
+
         #[test]
         fn attach_dispatch_makes_control_stream_blocking() {
             let hello = ClientHello {
                 version: 1,
                 pid: std::process::id(),
                 ui_overrides: None,
+                startup_intent: None,
             };
             let body = jsony::to_binary(&hello);
             let mut frame = Vec::new();
@@ -2092,6 +2121,7 @@ mod imp {
         pub version: u32,
         pub pid: u32,
         pub ui_overrides: Option<Vec<u8>>,
+        pub startup_intent: Option<crate::app::StartupIntent>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2172,6 +2202,7 @@ mod imp {
     pub(crate) fn connect_attach(
         _stdin_fd: i32,
         _stdout_fd: i32,
+        _startup_intent: Option<&crate::app::StartupIntent>,
     ) -> Result<(), AttachConnectError> {
         Err(AttachConnectError::NoMaster)
     }

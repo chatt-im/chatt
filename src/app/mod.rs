@@ -31,6 +31,7 @@ use std::{
 };
 
 use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use jsony::Jsony;
 use rpc::{
     control::{
         ChatMutationKind, DeviceLinkTicket, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN,
@@ -88,8 +89,8 @@ pub(crate) use room::{
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
     ServerEditDraft, ServerEditEvent, ServerEditSave, ServerSelectItem, alias_from_tcp_addr,
-    default_join_alias, default_join_username, random_open_pair_recovery_token, random_token,
-    server_entry_from_invite, unique_server_alias,
+    canonical_endpoint, default_join_alias, default_join_username, random_open_pair_recovery_token,
+    random_token, server_entry_from_invite, unique_server_alias,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1426,6 +1427,45 @@ pub(crate) enum PendingJoin {
     Named { specifier: String },
 }
 
+/// A [`PendingJoin`] as it travels to an already-running master over the attach
+/// socket, so a second `chatt join` or `chatt pair` acts on that session instead
+/// of failing.
+///
+/// Tickets stay in their encoded string form here: the socket is reachable only
+/// by the same user, and the master decodes them exactly as it would from argv.
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub(crate) enum StartupIntent {
+    Device { ticket: Option<String> },
+    Invite { ticket: String },
+    Open { addr: String },
+    Named { specifier: String },
+}
+
+impl PendingJoin {
+    /// Decodes what a command line asked for, from either this process's argv or
+    /// an attaching terminal's.
+    pub(crate) fn from_intent(intent: &StartupIntent) -> Result<Self, String> {
+        match intent {
+            StartupIntent::Device { ticket: None } => Ok(Self::Device { ticket: None }),
+            StartupIntent::Device {
+                ticket: Some(ticket),
+            } => Ok(Self::Device {
+                ticket: Some(rpc::control::decode_device_link_ticket(ticket)?),
+            }),
+            StartupIntent::Invite { ticket } => {
+                Ok(Self::Invite(rpc::control::decode_invite_ticket(ticket)?))
+            }
+            StartupIntent::Open { addr } => Ok(Self::Open {
+                addr: crate::cli::parse_pair_address(addr)?,
+            }),
+            StartupIntent::Named { specifier } => Ok(Self::Named {
+                specifier: specifier.clone(),
+            }),
+        }
+    }
+}
+
 /// The outcome of resolving a `chatt join` specifier against configured servers.
 #[derive(Debug, PartialEq, Eq)]
 enum JoinResolution {
@@ -1556,6 +1596,25 @@ impl App {
             PendingJoin::Open { addr } => self.start_open_pairing(addr),
             PendingJoin::Named { specifier } => self.start_named_join(specifier),
         }
+    }
+
+    /// Runs the join or pairing an attaching terminal asked for on its command
+    /// line, as if this master had been started with it.
+    ///
+    /// The attaching terminal owns the command for its duration, so the status,
+    /// errors, and screens the join produces land there rather than on whichever
+    /// terminal happened to start the session.
+    pub(crate) fn start_attach_intent(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+        intent: &StartupIntent,
+    ) {
+        let previous = std::mem::replace(&mut self.command_client, client_id);
+        match PendingJoin::from_intent(intent) {
+            Ok(pending) => self.start_pending_join(pending),
+            Err(error) => self.set_error(error),
+        }
+        self.command_client = previous;
     }
 
     pub(crate) fn finish_welcome(&mut self, pending_join: Option<PendingJoin>) {
@@ -3874,6 +3933,16 @@ impl App {
         overwrite_existing: bool,
     ) {
         let result = (|| -> Result<(), String> {
+            // The prompt is the private way to hand this client a secret, so it
+            // takes invite tickets too rather than forcing them onto argv.
+            if pairing_string
+                .trim()
+                .starts_with(rpc::control::JOIN_STRING_PREFIX)
+            {
+                let ticket = rpc::control::decode_invite_ticket(pairing_string.trim())?;
+                self.start_join_pairing(ticket);
+                return Ok(());
+            }
             let ticket = rpc::control::decode_device_link_ticket(pairing_string.trim())?;
             let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&ticket.tcp_addr));
             let server = ServerEntry {
@@ -4008,7 +4077,17 @@ impl App {
     fn start_named_join(&mut self, specifier: String) {
         match self.resolve_join(&specifier) {
             JoinResolution::Connect(label) => {
-                self.start_connection(&label, self.command_client);
+                // A join reaching a master already on that server only asks to
+                // see it. Connecting again would restart the network worker and
+                // drop the session out from under every other attached terminal.
+                if self.room.active_server_label.as_deref() == Some(label.as_str())
+                    && self.network.is_some()
+                {
+                    self.navigate_owner(NavigationEvent::ResetBase(BaseScreen::Room));
+                    self.set_status(format!("already connected to {label}"));
+                } else {
+                    self.start_connection(&label, self.command_client);
+                }
             }
             JoinResolution::Filter => {
                 self.open_filtered_server_select(&specifier);
@@ -4103,22 +4182,32 @@ impl App {
 
     /// Decides what a `chatt join` specifier means against the configured servers.
     ///
-    /// An exact match on a single server's `label` or `tcp_addr` connects. Several
-    /// matches, or a non-exact substring match, open the filtered picker. With no
-    /// match, a valid `host:port` pairs and anything else opens the empty picker.
+    /// An exact match on a single server's `label`, or on its address compared as
+    /// a [`canonical_endpoint`], connects. Several matches open the filtered
+    /// picker. Otherwise an address pairs, while a label falls back to a
+    /// substring search and then the empty picker.
+    ///
+    /// Substring matching stays behind the address fallback because an address is
+    /// an exact request: `host.example:4000` means that server, not the saved
+    /// `myhost.example:4000` it happens to be a substring of.
     fn resolve_join(&self, specifier: &str) -> JoinResolution {
-        let exact: Vec<&str> = self
-            .config
-            .servers
-            .iter()
-            .filter(|server| server.label == specifier || server.tcp_addr == specifier)
-            .map(|server| server.label.as_str())
-            .collect();
+        let canonical = canonical_endpoint(specifier);
+        let mut exact: Vec<&str> = Vec::new();
+        for server in &self.config.servers {
+            let matched = server.label == specifier
+                || (canonical.is_some() && canonical_endpoint(&server.tcp_addr) == canonical);
+            if matched {
+                exact.push(server.label.as_str());
+            }
+        }
         if exact.len() == 1 {
             return JoinResolution::Connect(exact[0].to_string());
         }
         if !exact.is_empty() {
             return JoinResolution::Filter;
+        }
+        if let Ok(addr) = crate::cli::parse_pair_address(specifier) {
+            return JoinResolution::Pair(addr);
         }
         let has_substring =
             self.config.servers.iter().any(|server| {
@@ -4127,10 +4216,7 @@ impl App {
         if has_substring {
             return JoinResolution::Filter;
         }
-        match crate::cli::parse_pair_address(specifier) {
-            Ok(addr) => JoinResolution::Pair(addr),
-            Err(_) => JoinResolution::NoMatch,
-        }
+        JoinResolution::NoMatch
     }
 
     /// Opens the server picker with `query` pre-applied so the list starts filtered
@@ -12983,6 +13069,90 @@ mod tests {
         assert_eq!(app.resolve_join("10.0.0.9:4000"), JoinResolution::Filter);
     }
 
+    /// A saved server spelled differently is still that server, so joining it
+    /// connects instead of pairing a duplicate entry.
+    #[test]
+    fn join_equivalent_address_spelling_connects_to_the_saved_server() {
+        let app = app_with_servers(&[
+            ("prod", "HOST.example:4000"),
+            ("six", "[0:0:0:0:0:0:0:1]:4"),
+        ]);
+        assert_eq!(
+            app.resolve_join("host.example.:4000"),
+            JoinResolution::Connect("prod".to_string())
+        );
+        assert_eq!(
+            app.resolve_join("[::1]:4"),
+            JoinResolution::Connect("six".to_string())
+        );
+    }
+
+    /// Two profiles against one server are both plausible targets, so the
+    /// address they share picks neither.
+    #[test]
+    fn join_address_shared_by_two_spellings_opens_filtered_picker() {
+        let app = app_with_servers(&[
+            ("work-a", "[::1]:4000"),
+            ("work-b", "[0:0:0:0:0:0:0:1]:4000"),
+        ]);
+        assert_eq!(app.resolve_join("[::0:1]:4000"), JoinResolution::Filter);
+    }
+
+    /// A `chatt join` that reaches a running master resolves exactly as it
+    /// would have at startup, and reports to the terminal that asked.
+    #[test]
+    fn attach_intent_runs_the_join_on_the_attaching_terminal() {
+        let mut app = app_with_servers(&[("lab", "10.0.0.1:4000")]);
+        let client = crate::client_channel::ClientId(7);
+        let view = attach_test_client(&mut app, client);
+
+        app.start_attach_intent(
+            client,
+            &StartupIntent::Named {
+                specifier: "does-not-exist".to_string(),
+            },
+        );
+        app.sync_terminal_events();
+
+        let view = view.lock();
+        assert_eq!(view.status.kind(), StatusKind::Error);
+        assert!(view.status.text().contains("does-not-exist"));
+        assert_eq!(
+            app.view.status.kind(),
+            StatusKind::Info,
+            "the primary terminal did not ask for this join: {}",
+            app.view.status.text()
+        );
+    }
+
+    /// A join naming the server this master already holds only wants to look at
+    /// it: reconnecting would drop the session for every other terminal.
+    #[test]
+    fn join_to_the_active_server_does_not_restart_the_connection() {
+        let mut app = app_with_servers(&[("lab", "10.0.0.1:4000")]);
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.room.active_server_label = Some("lab".to_string());
+
+        app.start_named_join("lab".to_string());
+
+        assert!(app.connection_attempt.is_none());
+        assert!(rx.try_recv().is_err(), "the live worker was left alone");
+        assert_eq!(app.view.status.kind(), StatusKind::Info);
+        assert!(app.view.status.text().contains("already connected"));
+    }
+
+    /// An address names one server exactly. Pairing with it must not be
+    /// diverted by a saved address it is merely a substring of.
+    #[test]
+    fn join_address_is_not_shadowed_by_a_longer_saved_address() {
+        let app = app_with_servers(&[("neighbor", "myexample.com:4000")]);
+        assert_eq!(
+            app.resolve_join("example.com:4000"),
+            JoinResolution::Pair("example.com:4000".to_string())
+        );
+    }
+
     #[test]
     fn join_substring_only_match_opens_filtered_picker() {
         let app = app_with_servers(&[
@@ -14052,6 +14222,33 @@ mod tests {
             app.take_terminal_event(),
             Some(TerminalEvent::PairingFailed(_))
         ));
+    }
+
+    /// The paste prompt is the private way to hand this client a secret, so an
+    /// invite ticket typed there pairs rather than being rejected as a
+    /// malformed device link.
+    #[test]
+    fn invite_ticket_pasted_into_the_device_prompt_starts_invite_pairing() {
+        let mut app = test_app();
+        app.start_device_pairing_prompt(None);
+        let ticket = rpc::control::encode_invite_ticket(&InviteTicket {
+            version: rpc::PROTOCOL_VERSION,
+            pairing_code: "pairing-code-long-enough".to_string(),
+            tcp_addr: "10.0.0.1:4000".to_string(),
+            udp_addr: "10.0.0.1:4001".to_string(),
+            udp_probe_addr: None,
+            server_public_key: "ab".repeat(32),
+        })
+        .expect("invite ticket");
+
+        app.submit_device_pairing(ticket, String::new(), false);
+
+        let pending = app.pairing_pending().expect("invite pairing started");
+        assert_eq!(pending.server.tcp_addr, "10.0.0.1:4000");
+        assert_eq!(
+            pending.pairing_code.as_deref(),
+            Some("pairing-code-long-enough")
+        );
     }
 
     /// A device job cannot spawn without its cancellation flag, which is the

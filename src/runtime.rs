@@ -698,7 +698,7 @@ fn handle_runtime_event(
             mut stream,
             stdin,
             stdout,
-            hello,
+            mut hello,
         } => {
             if hello.version != 1 {
                 let _ = crate::local_control::write_attach_ack(
@@ -716,6 +716,7 @@ fn handle_runtime_event(
             }
             let id = ClientId(*next_client_id as u32);
             *next_client_id += 1;
+            let intent = hello.startup_intent.take();
             match spawn_remote_client(app, id, stream, stdin, stdout, event_sender.clone()) {
                 Ok(client) => {
                     clients.insert(id, client);
@@ -725,7 +726,22 @@ fn handle_runtime_event(
                         pid = hello.pid
                     );
                 }
-                Err(error) => kvlog::warn!("terminal client attach failed", error = %error),
+                Err(error) => {
+                    kvlog::warn!("terminal client attach failed", error = %error);
+                    return;
+                }
+            }
+            // Dispatched after the renderer exists so the new terminal sees the
+            // screens the join puts up.
+            let Some(intent) = intent else {
+                return;
+            };
+            if matches!(intent, crate::app::StartupIntent::Named { .. })
+                && rpc_upload_staging_active(rpc_clients)
+            {
+                app.reject_server_switch_for_client(id);
+            } else {
+                app.start_attach_intent(id, &intent);
             }
         }
         AppEvent::RpcClientAttach {
@@ -3390,7 +3406,7 @@ mod tests {
         let _socket = ControlSocket::spawn_at_path(socket_path.clone(), sender.clone()).unwrap();
 
         let shim = thread::spawn(move || {
-            let mut stream = connect_attach_to_path(&socket_path, terminal_fd, terminal_fd)
+            let mut stream = connect_attach_to_path(&socket_path, terminal_fd, terminal_fd, None)
                 .map_err(|error| format!("attach failed: {error:?}"))?;
             let signals = SignalPipe::new()?;
             client_loop(&mut stream, &signals, [terminal_fd, terminal_fd])

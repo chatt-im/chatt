@@ -33,9 +33,11 @@ mod imp {
         MasterGone,
     }
 
-    pub(crate) fn run_thin_client() -> Result<AttachOutcome, String> {
+    pub(crate) fn run_thin_client(
+        startup_intent: Option<&crate::app::StartupIntent>,
+    ) -> Result<AttachOutcome, String> {
         capture_original_termios();
-        let mut stream = match local_control::connect_attach(0, 1) {
+        let mut stream = match local_control::connect_attach(0, 1, startup_intent) {
             Ok(stream) => stream,
             Err(AttachConnectError::NoMaster) => return Ok(AttachOutcome::NoMaster),
             Err(AttachConnectError::Rejected(error) | AttachConnectError::Failed(error)) => {
@@ -439,7 +441,9 @@ pub(crate) enum AttachOutcome {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn run_thin_client() -> Result<AttachOutcome, String> {
+pub(crate) fn run_thin_client(
+    _startup_intent: Option<&crate::app::StartupIntent>,
+) -> Result<AttachOutcome, String> {
     Ok(AttachOutcome::NoMaster)
 }
 

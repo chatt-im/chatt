@@ -65,7 +65,9 @@ UI. The daemon owns server, audio, web, and local-control state while other \
             name: "pair",
             aliases: &[],
             about: "Pair a new device or join a server.",
-            long_about: "With no argument, securely prompts in the TUI for a one-time device pairing string and device name.",
+            long_about: "With no argument, securely prompts in the TUI for a one-time device link \
+or invite ticket, keeping it out of shell history and process listings. A device link is \
+paired under a name for this installation.",
             args: &[Arg {
                 name: "join_string",
                 value_name: "TICKET_OR_ADDRESS",
@@ -422,23 +424,24 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         Some(("daemon", _)) => run_daemon_app(config_path),
         Some(("pair", sub)) => {
             let target = sub.value_of("join_string").unwrap_or_default().trim();
-            let pending = if target.is_empty() {
-                crate::app::PendingJoin::Device { ticket: None }
+            let intent = if target.is_empty() {
+                crate::app::StartupIntent::Device { ticket: None }
             } else if target.starts_with(rpc::control::DEVICE_LINK_STRING_PREFIX) {
-                eprintln!(
-                    "warning: passing a device pairing string as an argument may expose it in shell history or process listings"
-                );
-                crate::app::PendingJoin::Device {
-                    ticket: Some(rpc::control::decode_device_link_ticket(target)?),
+                eprintln!("{}", argv_exposure_warning("device pairing string"));
+                crate::app::StartupIntent::Device {
+                    ticket: Some(target.to_string()),
                 }
             } else if target.starts_with(rpc::control::JOIN_STRING_PREFIX) {
-                crate::app::PendingJoin::Invite(rpc::control::decode_invite_ticket(target)?)
+                eprintln!("{}", argv_exposure_warning("invite ticket"));
+                crate::app::StartupIntent::Invite {
+                    ticket: target.to_string(),
+                }
             } else {
-                crate::app::PendingJoin::Open {
+                crate::app::StartupIntent::Open {
                     addr: parse_pair_address(target)?,
                 }
             };
-            run_interactive_app(config_path, Some(pending))
+            run_interactive_app(config_path, Some(intent))
         }
         Some(("join", sub)) => {
             let target = sub.value_of("specifier").unwrap_or_default().trim();
@@ -450,7 +453,7 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             }
             run_interactive_app(
                 config_path,
-                Some(crate::app::PendingJoin::Named {
+                Some(crate::app::StartupIntent::Named {
                     specifier: target.to_string(),
                 }),
             )
@@ -589,31 +592,37 @@ fn run_daemon_app(config_path: Option<&str>) -> Result<(), Box<dyn std::error::E
     }
 }
 
+/// Runs `intent` against the chatt session, whether that means attaching to a
+/// master already running one or becoming that master.
 fn run_interactive_app(
     config_path: Option<&str>,
-    pending_join: Option<crate::app::PendingJoin>,
+    intent: Option<crate::app::StartupIntent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Decoding up front keeps a malformed ticket an error on stderr rather than
+    // a banner inside a terminal UI that had no reason to open.
+    let pending_join = match &intent {
+        Some(intent) => Some(crate::app::PendingJoin::from_intent(intent)?),
+        None => None,
+    };
     let mut retaking = false;
     loop {
-        if pending_join.is_none() {
-            match crate::attach::run_thin_client() {
-                Err(_error) if retaking => {
-                    // The old master may be draining between accept and ACK,
-                    // or another contender may still be publishing the new
-                    // socket. Treat transient attach transport failures during
-                    // handoff as election retries.
-                    takeover_jitter();
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-                Ok(crate::attach::AttachOutcome::UserQuit) => return Ok(()),
-                Ok(crate::attach::AttachOutcome::MasterGone) => {
-                    retaking = true;
-                    takeover_jitter();
-                    continue;
-                }
-                Ok(crate::attach::AttachOutcome::NoMaster) => {}
+        match crate::attach::run_thin_client(intent.as_ref()) {
+            Err(_error) if retaking => {
+                // The old master may be draining between accept and ACK,
+                // or another contender may still be publishing the new
+                // socket. Treat transient attach transport failures during
+                // handoff as election retries.
+                takeover_jitter();
+                continue;
             }
+            Err(error) => return Err(error.into()),
+            Ok(crate::attach::AttachOutcome::UserQuit) => return Ok(()),
+            Ok(crate::attach::AttachOutcome::MasterGone) => {
+                retaking = true;
+                takeover_jitter();
+                continue;
+            }
+            Ok(crate::attach::AttachOutcome::NoMaster) => {}
         }
 
         let retake_join = if retaking && pending_join.is_none() {
@@ -628,9 +637,8 @@ fn run_interactive_app(
         };
         match result {
             Err(error) if local_control::is_live_socket_error(&error.to_string()) => {
-                if pending_join.is_some() {
-                    return Err(error);
-                }
+                // A master published its socket between the attach attempt above
+                // and this bind, so go back and attach to it.
                 takeover_jitter();
             }
             result => {
@@ -849,17 +857,52 @@ fn parse_u64_cli_value(value: &str, name: &str) -> Result<u64, String> {
     }
 }
 
+/// Warns that a secret named on the command line outlives the command.
+fn argv_exposure_warning(kind: &str) -> String {
+    format!(
+        "warning: passing a {kind} as an argument may expose it in shell history or process \
+listings; run `chatt pair` with no argument to paste it privately"
+    )
+}
+
+/// Shortens a secret to something identifiable but unusable, for messages that
+/// have to name which one they mean.
+fn redacted_ticket(value: &str) -> String {
+    const KEPT_HEAD: usize = 5;
+    const KEPT_TAIL: usize = 4;
+
+    let hidden_from = value.chars().count().saturating_sub(KEPT_TAIL);
+    let head: String = value.chars().take(hidden_from.min(KEPT_HEAD)).collect();
+    let tail: String = value.chars().skip(hidden_from).collect();
+    format!("{head}…{tail}")
+}
+
 /// Builds the message shown when a pairing ticket is passed to `chatt join`.
 ///
 /// A ticket pairs a device once and is not a join target, so this redirects the
-/// user to `chatt pair` and explains the one-time nature of the ticket.
+/// user to `chatt pair` and explains the one-time nature of the ticket. The
+/// ticket itself is not repeated: a message telling the user their secret was
+/// mishandled should not put another copy of it on screen.
 fn join_ticket_redirect_message(ticket: &str) -> String {
     format!(
-        "'{ticket}' is a pairing ticket, not a join target. Run `chatt pair {ticket}` \
-instead.\nA pairing ticket is single-use: it pairs this device once and writes the \
-server to your config. If you lose your config you will need a fresh ticket.\nAfter \
-pairing, reconnect with `chatt join <label>` or just run `chatt`."
+        "'{}' is a pairing ticket, not a join target. Run `chatt pair` with no argument and \
+paste it at the prompt, or `chatt pair <TICKET>` to expose it to your shell history.\nA \
+pairing ticket is single-use: it pairs this device once and writes the server to your \
+config. If you lose your config you will need a fresh ticket.\nAfter pairing, reconnect \
+with `chatt join <label>` or just run `chatt`.",
+        redacted_ticket(ticket)
     )
+}
+
+/// Shortens an unparseable argument for an error message, so a near-miss ticket
+/// (a typo in the prefix, say) is not echoed whole.
+fn redacted_target(target: &str) -> String {
+    const KEPT: usize = 24;
+
+    if target.chars().count() <= KEPT {
+        return target.to_string();
+    }
+    format!("{}…", target.chars().take(KEPT).collect::<String>())
 }
 
 /// Validates a `chatt pair` argument that is not an invite ticket as a
@@ -871,7 +914,8 @@ pub(crate) fn parse_pair_address(target: &str) -> Result<String, String> {
     if let Ok(addr) = target.parse::<std::net::SocketAddr>() {
         if addr.ip().is_unspecified() {
             return Err(format!(
-                "invalid server address '{target}'; host must not be an unspecified address"
+                "invalid server address '{}'; host must not be an unspecified address",
+                redacted_target(target)
             ));
         }
         return Ok(target.to_string());
@@ -881,7 +925,8 @@ pub(crate) fn parse_pair_address(target: &str) -> Result<String, String> {
             Ok(target.to_string())
         }
         _ => Err(format!(
-            "invalid server address '{target}'; expected host:port or an invite ticket"
+            "invalid server address '{}'; expected host:port or an invite ticket",
+            redacted_target(target)
         )),
     }
 }
@@ -1050,11 +1095,37 @@ mod tests {
 
     #[test]
     fn join_with_ticket_redirects_to_pair_without_launching() {
-        let matches = run_matches(&["chatt", "join", "tcj1_example"]);
+        let ticket = "tcj1_examplesecret";
+        let matches = run_matches(&["chatt", "join", ticket]);
         let err = dispatch(&matches).expect_err("a ticket is not a join target");
         let message = err.to_string();
-        assert!(message.contains("chatt pair tcj1_example"));
+        assert!(message.contains("chatt pair"));
         assert!(message.contains("single-use"));
+        // A message about a mishandled secret must not repeat it, in a form
+        // usable or otherwise.
+        assert!(!message.contains(ticket), "{message}");
+        assert!(!message.contains("examplesecret"), "{message}");
+        assert!(message.contains("tcj1_…cret"), "{message}");
+    }
+
+    #[test]
+    fn unparseable_pair_address_is_not_echoed_whole() {
+        let near_miss = format!("tcj_{}", "s".repeat(120));
+
+        let error = parse_pair_address(&near_miss).unwrap_err();
+
+        assert!(!error.contains(&near_miss), "{error}");
+        assert!(error.contains('…'), "{error}");
+        assert!(error.contains("expected host:port"), "{error}");
+    }
+
+    #[test]
+    fn argv_exposure_warning_names_the_private_alternative() {
+        let warning = argv_exposure_warning("invite ticket");
+
+        assert!(warning.contains("invite ticket"));
+        assert!(warning.contains("shell history"));
+        assert!(warning.contains("`chatt pair` with no argument"));
     }
 
     #[test]
