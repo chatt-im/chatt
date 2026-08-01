@@ -1,6 +1,48 @@
 pub(crate) const MAX_INLINE_SEND_BYTES: usize =
     rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES as usize;
-pub(crate) const OVERSIZED_MESSAGE_FILE_NAME: &str = "message.md";
+
+/// File name for a chat message that outgrew [`rpc::control::MAX_CHAT_BODY_BYTES`]
+/// and is relayed as a markdown upload instead, such as
+/// `message-2025-08-01T14-25-30Z.md`.
+pub(crate) fn oversized_message_file_name() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64);
+    message_file_name(now)
+}
+
+/// Names the upload after `ms_timestamp`, a UTC millisecond unix timestamp.
+///
+/// The stamp keeps successive spills apart in the room's file list. Seconds are
+/// resolution enough, and `:` is written as `-` because the server's
+/// upload-name sanitizer would rewrite it to `_`.
+fn message_file_name(ms_timestamp: i64) -> String {
+    let mut buffer = [std::mem::MaybeUninit::uninit(); 25];
+    let stamp = kvlog::Timestamp::raw_millisecond_iso_in_buffer(ms_timestamp, &mut buffer);
+    let stamp = &stamp[..stamp.len() - ".000Z".len()];
+    format!("message-{}Z.md", stamp.replace(':', "-"))
+}
+
+#[cfg(test)]
+mod name_tests {
+    #[test]
+    fn message_file_name_stamps_utc_seconds_without_sanitized_characters() {
+        let name = super::message_file_name(1_754_058_330_123);
+
+        assert_eq!(name, "message-2025-08-01T14-25-30Z.md");
+        for ch in name.chars() {
+            assert!(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'), "{name}");
+        }
+    }
+
+    #[test]
+    fn oversized_message_file_name_uses_the_current_time() {
+        let name = super::oversized_message_file_name();
+
+        assert!(name.starts_with("message-2"), "{name}");
+        assert_eq!(name.len(), "message-2025-08-01T14-25-30Z.md".len(), "{name}");
+    }
+}
 
 #[cfg(unix)]
 mod imp {
@@ -468,7 +510,7 @@ mod imp {
             return send_upload_bytes_to_path(
                 socket_path,
                 &UploadBytesRequest {
-                    name: super::OVERSIZED_MESSAGE_FILE_NAME.to_string(),
+                    name: super::oversized_message_file_name(),
                     bytes: body.as_bytes().to_vec(),
                     room,
                 },
@@ -2259,16 +2301,22 @@ mod imp {
                     reply,
                 } => {
                     assert!(request.path.as_os_str().is_empty());
-                    assert_eq!(request.name_override.as_deref(), Some("message.md"));
+                    let name = request.name_override.clone().unwrap();
+                    assert!(name.starts_with("message-"), "{name}");
+                    assert!(name.ends_with("Z.md"), "{name}");
                     assert_eq!(request.inline_bytes.as_deref(), Some(body.as_bytes()));
                     assert_eq!(room.as_deref(), Some("lobby"));
-                    reply
-                        .send(Ok("queued upload message.md".to_string()))
-                        .unwrap();
+                    reply.send(Ok(format!("queued upload {name}"))).unwrap();
                 }
                 _ => panic!("unexpected event"),
             }
-            assert_eq!(handle.join().unwrap().unwrap(), "queued upload message.md");
+            assert!(
+                handle
+                    .join()
+                    .unwrap()
+                    .unwrap()
+                    .starts_with("queued upload message-")
+            );
 
             drop(socket);
             assert!(!socket_path.exists());

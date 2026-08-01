@@ -2253,7 +2253,7 @@ impl App {
         if body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
             self.handle_control_upload(
                 UploadFileRequest::from_bytes(
-                    local_control::OVERSIZED_MESSAGE_FILE_NAME.to_string(),
+                    local_control::oversized_message_file_name(),
                     body.into_bytes(),
                 ),
                 room,
@@ -9901,17 +9901,17 @@ mod tests {
             room: None,
             reply: upload_reply,
         });
-        assert_eq!(
-            upload_response.recv().unwrap().unwrap(),
-            "queued upload message.md"
-        );
+        let status = upload_response.recv().unwrap().unwrap();
+        assert!(status.starts_with("queued upload message-"), "{status}");
+        assert!(status.ends_with("Z.md"), "{status}");
         assert!(matches!(
             network_rx.recv().unwrap(),
             NetworkCommand::UploadFile {
                 room_id: Some(RoomId(1)),
                 request,
             } if request.path.as_os_str().is_empty()
-                && request.name_override.as_deref() == Some("message.md")
+                && request.name_override.as_deref()
+                    == Some(status.trim_start_matches("queued upload "))
                 && request.inline_bytes.as_deref() == Some(over_cap.as_bytes())
         ));
     }
