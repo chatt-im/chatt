@@ -786,13 +786,21 @@ impl AppMode for RoomSwitchMode {
     }
 }
 
+/// The server edit form, which owns its draft for as long as it is on screen.
+///
+/// A submit sends the core a copy of the values rather than the draft itself:
+/// the core answers asynchronously, and a save-and-join not until the session
+/// authenticates, so a form that gave its draft away would have nothing to draw
+/// or edit in the meantime. See [`ServerEditSave`] for what the wait covers.
+///
+/// [`ServerEditSave`]: crate::app::ServerEditSave
 pub(crate) struct ServerEditMode {
-    draft: Option<ServerEditDraft>,
+    draft: ServerEditDraft,
 }
 
 impl ServerEditMode {
     pub(crate) fn new(draft: ServerEditDraft) -> Self {
-        Self { draft: Some(draft) }
+        Self { draft }
     }
 
     fn handle_event(&mut self, cx: &mut ViewCx<'_>, event: ServerEditEvent) {
@@ -803,12 +811,10 @@ impl ServerEditMode {
                 cx.request_transition(ModeTransition::Pop);
             }
             ServerEditEvent::Save { join_after_save } => {
-                if let Some(draft) = self.draft.take() {
-                    cx.send(CoreCommand::SaveServerEdit {
-                        draft,
-                        join_after_save,
-                    });
-                }
+                cx.send(CoreCommand::SaveServerEdit {
+                    draft: self.draft.submission(),
+                    join_after_save,
+                });
             }
         }
     }
@@ -817,18 +823,18 @@ impl ServerEditMode {
         if is_quit_key(&key) {
             return Action::Quit;
         }
-        if let Some(draft) = self.draft.as_mut() {
-            let event = draft.handle_key(key, &cx.view.theme);
-            self.handle_event(cx, event);
-        }
+        let event = self
+            .draft
+            .handle_key(key, &cx.view.theme, cx.session.join_hold.as_deref());
+        self.handle_event(cx, event);
         Action::Continue
     }
 
     fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
-        if let Some(draft) = self.draft.as_mut() {
-            let event = draft.handle_mouse(mouse, &cx.view.theme);
-            self.handle_event(cx, event);
-        }
+        let event = self
+            .draft
+            .handle_mouse(mouse, &cx.view.theme, cx.session.join_hold.as_deref());
+        self.handle_event(cx, event);
         Action::Continue
     }
 }
@@ -841,10 +847,8 @@ impl AppMode for ServerEditMode {
         _now_ms: u64,
         _dirty: DirtySections,
     ) {
-        if let Some(draft) = self.draft.as_mut() {
-            let mut render = crate::tui::render::RenderState::new(cx);
-            crate::tui::render::draw_server_edit_overlay(&mut render, draft, buf);
-        }
+        let mut render = crate::tui::render::RenderState::new(cx);
+        crate::tui::render::draw_server_edit_overlay(&mut render, &mut self.draft, buf);
     }
 
     fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
@@ -856,15 +860,11 @@ impl AppMode for ServerEditMode {
     }
 
     fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
-        self.draft
-            .as_ref()
-            .and_then(ServerEditDraft::active_editor_mode)
+        self.draft.active_editor_mode()
     }
 
     fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
-        if let Some(draft) = self.draft.as_mut() {
-            draft.paste(&text, &cx.view.theme);
-        }
+        self.draft.paste(&text, &cx.view.theme);
     }
 
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
@@ -3096,11 +3096,61 @@ mod tests {
 
         let updated = mode
             .draft
-            .as_ref()
-            .expect("server draft remains open")
             .to_update()
             .expect("pasted server draft is valid");
         assert_eq!(updated.username, "pasted-user");
+    }
+
+    /// A submitted form is still the user's screen: the core answers
+    /// asynchronously, and for a save-and-join not until the session
+    /// authenticates, so the draft never leaves the mode that is drawing it.
+    #[test]
+    fn a_submitted_server_editor_keeps_its_draft_on_screen() {
+        let mut app = test_app();
+        let public = crate::config::ServerEntry {
+            label: "public".to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "User".to_string(),
+            token: "public-token".to_string(),
+            ..Default::default()
+        };
+        app.config.servers.push(crate::config::ServerEntry {
+            label: "community".to_string(),
+            token: "community-token".to_string(),
+            ..public.clone()
+        });
+        app.config.servers.push(public);
+        let mut draft = ServerEditDraft::from_server(&app.config.servers[1], &app.config);
+        // A label another entry already holds: the save is refused, which is
+        // the outcome the form has to survive to let the user fix it.
+        draft.active_editor_address().expect("the label field");
+        draft.set_active_editor_text("community");
+        let mut mode = ServerEditMode::new(draft);
+        let mut buffer = Buffer::new(80, 40);
+        mode.render(&mut app, &mut buffer, 0);
+
+        {
+            let mut cx = app.view_cx();
+            mode.handle_event(
+                &mut cx,
+                ServerEditEvent::Save {
+                    join_after_save: true,
+                },
+            );
+        }
+        app.drain_core_commands();
+
+        assert_eq!(app.view.status.kind(), crate::app::StatusKind::Error);
+        assert_eq!(
+            mode.draft.to_update().expect("draft still parses").label,
+            "community",
+            "the refused text is still there to be fixed"
+        );
+        mode.render(&mut app, &mut buffer, 0);
+        assert!(
+            (0..40).any(|row| row_text(&mut buffer, row).contains("Edit Server public")),
+            "the form is still drawn"
+        );
     }
 
     #[test]

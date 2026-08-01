@@ -3312,6 +3312,7 @@ mod tests {
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
+            from_editor: false,
         }
     }
 

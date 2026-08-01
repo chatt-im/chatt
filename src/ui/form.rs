@@ -184,7 +184,17 @@ impl<'a> DetailForm<'a> {
     }
 
     pub(crate) fn actions<T: Copy>(&mut self, specs: &[ActionButton<'_, T>]) -> ActionResponse<T> {
-        let response = self.form.actions(specs);
+        self.actions_where(specs, |_| true)
+    }
+
+    /// [`Self::actions`] with `enabled` deciding, per button, which ones can be
+    /// activated at all. See [`Form::actions_where`].
+    pub(crate) fn actions_where<T: Copy>(
+        &mut self,
+        specs: &[ActionButton<'_, T>],
+        enabled: impl Fn(T) -> bool,
+    ) -> ActionResponse<T> {
+        let response = self.form.actions_where(specs, enabled);
         if response.focused.is_some() {
             self.set_option_detail(String::new(), None);
             if let Some(help) = response.help {
@@ -647,6 +657,20 @@ impl<'a> Form<'a> {
     /// The trailing action-button row. Buttons share a virtual row so left/right
     /// moves between them.
     pub(crate) fn actions<T: Copy>(&mut self, specs: &[ActionButton<'_, T>]) -> ActionResponse<T> {
+        self.actions_where(specs, |_| true)
+    }
+
+    /// Lays out an action row in which only the buttons `enabled` accepts can
+    /// be activated.
+    ///
+    /// A refused button keeps its slot, its label and its focus stop, so the
+    /// row neither moves nor resizes as one comes and goes: it renders subdued
+    /// and reports focus, but never activation.
+    pub(crate) fn actions_where<T: Copy>(
+        &mut self,
+        specs: &[ActionButton<'_, T>],
+        enabled: impl Fn(T) -> bool,
+    ) -> ActionResponse<T> {
         let mut response = ActionResponse {
             focused: None,
             activated: None,
@@ -684,10 +708,11 @@ impl<'a> Form<'a> {
             self.state
                 .register_rect(row, rect, id, FormFieldKind::Action);
             let focused = self.state.focus() == id;
+            let live = self.enabled && enabled(spec.value);
             if focused {
                 response.focused = Some(spec.value);
                 response.help = Some(spec.help);
-                if matches!(self.intent, FieldIntent::Activate) {
+                if live && matches!(self.intent, FieldIntent::Activate) {
                     response.activated = Some(spec.value);
                 }
             }
@@ -699,6 +724,7 @@ impl<'a> Form<'a> {
                     spec.label,
                     focused,
                     matches!(self.surface, FormSurface::Dialog),
+                    live,
                 );
             }
         }

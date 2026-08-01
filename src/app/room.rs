@@ -1253,6 +1253,12 @@ pub(crate) struct RoomSession {
     /// no configured server matched. Cleared once the client connects,
     /// disconnects, or cancels the pairing.
     pub join_notice: Option<String>,
+    /// The server label whose join is holding a server editor open, projected
+    /// for the render threads. A save-and-join presents its whole outcome
+    /// inside the form, so the form has to know an attempt is outstanding: its
+    /// submit actions are inert until this clears. One connection means one
+    /// hold, so this is app-wide rather than per client.
+    pub join_hold: Option<String>,
     /// Smoothed round-trip time to the server relay media socket,
     /// milliseconds. The network leg of the latency estimate for relayed
     /// participants.
@@ -2106,6 +2112,7 @@ impl RoomSession {
             attached_views: HashMap::new(),
             voice_room: None,
             join_notice: None,
+            join_hold: None,
             server_rtt_ms: None,
             network_disconnected: false,
             network_selected: false,

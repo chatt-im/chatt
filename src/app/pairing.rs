@@ -6,7 +6,7 @@ use std::sync::{
 use rpc::control::DeviceLinkTicket;
 use zeroize::Zeroize;
 
-use super::{App, Audience, ServerEditDraft, device_pair};
+use super::{App, Audience, EditorPresentation, ServerEditDraft, device_pair};
 use crate::{
     client_channel::{
         BaseScreen, ClientId, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
@@ -33,6 +33,14 @@ pub(crate) struct PendingPair {
     pub(crate) open_password: String,
     pub(crate) pairing_code: Option<String>,
     pub(crate) completion: PairCompletion,
+    /// The owner submitted this attempt from the server editor and is still on
+    /// that form, wherever the attempt has got to since.
+    ///
+    /// Only the retry of a rejected username is submitted there, and it is the
+    /// one attempt whose outcome has somewhere of its own to land: failures
+    /// replace the form in place instead of stacking over it, and a join it
+    /// completes is held by the form until the session authenticates.
+    pub(crate) from_editor: bool,
 }
 
 impl PendingPair {
@@ -107,6 +115,9 @@ impl PairingJob {
 ///
 /// Only the coordinator knows which of these it put up, and only it may close
 /// one: a pop aimed at [`Self::None`] would take away a screen the user opened.
+/// [`Self::Editor`] is the user's screen too — it is where the attempt was
+/// submitted from and where the user still is — so it is restored in place and
+/// never popped.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResumeUi {
     None,
@@ -116,8 +127,13 @@ pub(super) enum ResumeUi {
 }
 
 impl ResumeUi {
-    fn is_coordinator_owned(self) -> bool {
-        self != Self::None
+    /// Whether the coordinator put up an overlay of its own, which it has to
+    /// take down when it abandons the attempt.
+    ///
+    /// The editor is not one of those: the owner submitted the attempt from it
+    /// and is still looking at it, so it stays up and takes the failure.
+    fn is_overlay(self) -> bool {
+        matches!(self, Self::PasswordPrompt | Self::DevicePrompt)
     }
 }
 
@@ -467,6 +483,7 @@ impl PairingCoordinator {
                     let restore = pending.server.clone();
                     pending.server = server;
                     pending.completion = completion;
+                    pending.from_editor = true;
                     let persist_first = pending.is_provisional();
                     if let Err(failure) = self.start(
                         app,
@@ -678,8 +695,9 @@ impl PairingCoordinator {
             ResumeUi::Editor => {
                 let draft =
                     ServerEditDraft::from_server_focused(&pending.server, &app.config, "Username");
+                let presentation = EditorPresentation::for_hold(pending.from_editor);
                 self.state = PairingState::AwaitingUsername { owner, pending };
-                open_server_editor(app, owner, draft);
+                open_server_editor(app, owner, draft, presentation);
             }
             ResumeUi::DevicePrompt => {
                 self.state = PairingState::AwaitingDeviceDetails { owner };
@@ -697,6 +715,9 @@ impl PairingCoordinator {
 
     /// Ends an attempt that cannot be retried, closing the pairing UI the
     /// coordinator put up and discarding any provisional credential.
+    ///
+    /// An editor the owner submitted from is not one of those: it is the user's
+    /// own screen for the whole attempt, and it stays up to take the failure.
     fn abandon(
         &mut self,
         app: &mut App,
@@ -708,7 +729,7 @@ impl PairingCoordinator {
         if pending.is_provisional() {
             let _ = app.discard_provisional_open_pair(&pending);
         }
-        if resume.is_coordinator_owned() {
+        if resume.is_overlay() {
             app.send_terminal_event(
                 Audience::Client(owner),
                 TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
@@ -819,8 +840,9 @@ impl PairingCoordinator {
                 }
                 let draft =
                     ServerEditDraft::from_server_focused(&pending.server, &app.config, "Username");
+                let presentation = EditorPresentation::for_hold(pending.from_editor);
                 self.state = PairingState::AwaitingUsername { owner, pending };
-                open_server_editor(app, owner, draft);
+                open_server_editor(app, owner, draft, presentation);
                 app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
             }
             PairingEvent::Failed(message) => {
@@ -914,10 +936,11 @@ impl PairingCoordinator {
             }
         };
         let alias = pending.server.label.clone();
+        let from_editor = pending.from_editor;
         match pending.completion {
             PairCompletion::OpenEditor => {
                 let draft = ServerEditDraft::from_server(&pending.server, &app.config);
-                open_server_editor(app, owner, draft);
+                open_server_editor(app, owner, draft, EditorPresentation::for_hold(from_editor));
                 app.send_terminal_event(
                     Audience::Client(owner),
                     TerminalEvent::Status(format!(
@@ -950,19 +973,36 @@ impl PairingCoordinator {
                     )),
                 );
                 let previous_owner = std::mem::replace(&mut app.command_client, owner);
+                // A join submitted from the server editor is still on it: a
+                // refusal is reported onto that form, and a started join is
+                // held by it until the session authenticates.
+                let held = from_editor;
                 // Pairing runs beside a live session, so the credential is kept
+                // and only the switch waits.
                 // but the switch waits for the transfers that session is running.
-                if app.connection_switch_blocked() {
+                let started = !app.connection_switch_blocked() && app.start_network(&alias);
+                if !started {
+                    // The credential is saved and only the join was refused. A
+                    // held editor keeps the refusal; anything else goes back to
+                    // the list the pairing was launched from, error intact.
+                    if !held {
+                        app.send_terminal_event(
+                            Audience::Client(owner),
+                            TerminalEvent::Navigation(NavigationEvent::ResetBase(
+                                BaseScreen::Servers { query: None },
+                            )),
+                        );
+                    }
                     app.command_client = previous_owner;
                     return;
                 }
-                if app.start_network(&alias) {
+                if held {
+                    app.hold_editor_for_join(&alias);
+                } else {
                     app.send_terminal_event(
                         Audience::Client(owner),
                         TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Room)),
                     );
-                } else {
-                    app.open_server_select();
                 }
                 app.command_client = previous_owner;
             }
@@ -975,12 +1015,17 @@ impl PairingCoordinator {
                     )),
                 );
                 let previous_owner = std::mem::replace(&mut app.command_client, owner);
+                // A repair of the credential a held join needed keeps that
+                // join, and the form presenting it, as they were.
+                let held = app.join_hold_owner() == Some(owner);
                 if app.start_network(&alias) {
-                    app.send_terminal_event(
-                        Audience::Client(owner),
-                        TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Room)),
-                    );
-                } else {
+                    if !held {
+                        app.send_terminal_event(
+                            Audience::Client(owner),
+                            TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Room)),
+                        );
+                    }
+                } else if !held {
                     app.open_server_select();
                 }
                 app.command_client = previous_owner;
@@ -1029,19 +1074,31 @@ impl PairingCoordinator {
 ///
 /// The list is reset first so the editor always has something to close back
 /// onto: replacing the owner's top mode would make the editor the root, where
-/// both its cancel and its save pop into nothing.
-fn open_server_editor(app: &mut App, owner: ClientId, draft: ServerEditDraft) {
+/// both its cancel and its save pop into nothing. An attempt the owner
+/// submitted from the editor skips that: it is still on the form, over the list
+/// it opened from, and only the form's contents are replaced.
+fn open_server_editor(
+    app: &mut App,
+    owner: ClientId,
+    draft: ServerEditDraft,
+    presentation: EditorPresentation,
+) {
+    let screen = Box::new(ScreenSpec::ServerEditor(draft));
+    let navigation = match presentation {
+        EditorPresentation::Open => {
+            app.send_terminal_event(
+                Audience::Client(owner),
+                TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
+                    query: None,
+                })),
+            );
+            NavigationEvent::OpenScreen(screen)
+        }
+        EditorPresentation::Replace => NavigationEvent::ReplaceScreen(screen),
+    };
     app.send_terminal_event(
         Audience::Client(owner),
-        TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
-            query: None,
-        })),
-    );
-    app.send_terminal_event(
-        Audience::Client(owner),
-        TerminalEvent::Navigation(NavigationEvent::OpenScreen(Box::new(
-            ScreenSpec::ServerEditor(draft),
-        ))),
+        TerminalEvent::Navigation(navigation),
     );
 }
 

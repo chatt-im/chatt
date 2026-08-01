@@ -224,7 +224,7 @@ pub(crate) fn draw_server_edit_overlay(
         return;
     };
     let body = draw_dialog_frame(panel, buf, &app.view.theme, &draft.title());
-    draft.render(body, buf, &app.view.theme);
+    draft.render(body, buf, &app.view.theme, app.room.join_hold.as_deref());
     draw_overlay_key_preview(app, bindings::FORM_LAYER, buf);
 }
 

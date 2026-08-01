@@ -1557,7 +1557,7 @@ const DATA_FIELDS: &[FieldSpec] = &[
         4,
         "web.enabled",
         "Enable browser view",
-        "Starts the optional local browser chat-log server.",
+        "Starts the optional local browser view.",
         web.enabled
     ),
     config_spec!(

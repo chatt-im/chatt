@@ -1819,7 +1819,7 @@ impl Config {
         }
         if let Err(error) = self.web.bind.parse::<std::net::SocketAddr>() {
             out.push(Diag::error(format!(
-                "web bind must be a socket address: {error}"
+                "browser view listen address must be a socket address: {error}"
             )));
         }
         for origin in &self.web.allowed_origins {
