@@ -7,8 +7,8 @@ use rpc::{
 
 use crate::{
     config::{
-        Config, DownloadMode, FileOverrides, FormBindings, HistoryOverrides, RoomOverrides,
-        ServerEntry, validate_server_entry,
+        Config, DownloadMode, FileOverrides, FormBindings, HistoryOverrides, ServerEntry,
+        validate_server_entry,
     },
     settings::{
         DownloadChoice, OverrideToggle, download_path_error, mb_limit_error, mb_limit_text,
@@ -80,10 +80,10 @@ pub(crate) enum ServerEditEvent {
 }
 
 pub(crate) struct ServerEditDraft {
-    original_label: String,
-    token: String,
-    server_public_key: String,
-    e2e_peer_pins: Vec<crate::config::E2ePeerPin>,
+    /// The entry this draft was opened over, as it was at that moment. The save
+    /// refuses to write when the configured entry no longer matches it, and
+    /// carries the fields the form does not edit.
+    original: ServerEntry,
     label: String,
     username: String,
     tcp_addr: String,
@@ -100,15 +100,22 @@ pub(crate) struct ServerEditDraft {
     inherited_download_mode: DownloadMode,
     inherited_receive_limit: String,
     inherited_history_on: bool,
-    /// Room overrides pass through an edit untouched; the room settings popup
-    /// owns them.
-    rooms: Vec<RoomOverrides>,
     form: UiFormState,
 }
 
-pub(crate) struct ServerEditUpdate {
-    pub(crate) original_label: String,
-    pub(crate) server: ServerEntry,
+/// What a submitted [`ServerEditDraft`] leaves the editor screen doing.
+pub(crate) enum ServerEditSave {
+    /// Persisted. The save already closed the editor or started the join.
+    Saved,
+    /// Refused with an error the same draft can still fix; re-present it.
+    Rejected,
+    /// The entry moved under the draft. Present this reload of it instead: the
+    /// stale draft can never be applied, so re-presenting it would strand the
+    /// user on a form that refuses every save.
+    Reloaded(Box<ServerEditDraft>),
+    /// The entry is gone and this draft may not re-create it, so there is
+    /// nothing to reopen.
+    Vanished,
 }
 
 impl ServerEditDraft {
@@ -116,10 +123,7 @@ impl ServerEditDraft {
         let download_choice = DownloadChoice::from_override(server.files.download);
         let download_path = server.files.download_dir.clone().unwrap_or_default();
         Self {
-            original_label: server.label.clone(),
-            token: server.token.clone(),
-            server_public_key: server.server_public_key.clone(),
-            e2e_peer_pins: server.e2e_peer_pins.clone(),
+            original: server.clone(),
             label: server.label.clone(),
             username: server.username.clone(),
             tcp_addr: server.tcp_addr.clone(),
@@ -135,7 +139,6 @@ impl ServerEditDraft {
             inherited_download_mode: config.files.download,
             inherited_receive_limit: mb_limit_text(Some(config.files.max_download_mb)),
             inherited_history_on: config.history.enabled,
-            rooms: server.rooms.clone(),
             form: form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, "Label"),
         }
     }
@@ -150,11 +153,16 @@ impl ServerEditDraft {
     }
 
     pub(crate) fn original_label(&self) -> &str {
-        &self.original_label
+        &self.original.label
+    }
+
+    /// The entry this draft was opened over, for the save's staleness check.
+    pub(crate) fn original(&self) -> &ServerEntry {
+        &self.original
     }
 
     pub(crate) fn title(&self) -> String {
-        format!("Edit Server {}", self.original_label)
+        format!("Edit Server {}", self.original.label)
     }
 
     /// The number of form rows the dialog body currently lays out.
@@ -244,8 +252,8 @@ impl ServerEditDraft {
             .with_surface(FormSurface::Dialog);
             let mut form = DetailForm::new(core);
             let values = ServerEditValues {
-                token: &self.token,
-                server_public_key: &self.server_public_key,
+                token: &self.original.token,
+                server_public_key: &self.original.server_public_key,
                 label: &mut self.label,
                 username: &mut self.username,
                 tcp_addr: &mut self.tcp_addr,
@@ -276,7 +284,14 @@ impl ServerEditDraft {
         self.drive(theme, FieldIntent::None, commit, None);
     }
 
-    pub(crate) fn to_update(&self) -> Result<ServerEditUpdate, String> {
+    /// The entry this draft would save, with the fields the form does not edit
+    /// carried over from [`Self::original`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the message to show when a field does not parse or the entry
+    /// fails [`validate_server_entry`].
+    pub(crate) fn to_update(&self) -> Result<ServerEntry, String> {
         let mut draft = self.clone_values();
         if let Some(field) = self.form.active_text() {
             draft.drive(
@@ -313,19 +328,16 @@ impl ServerEditDraft {
             udp_addr: draft.udp_addr.trim().to_string(),
             udp_probe_addr,
             username: draft.username.trim().to_string(),
-            token: self.token.clone(),
-            server_public_key: self.server_public_key.clone(),
-            e2e_peer_pins: self.e2e_peer_pins.clone(),
+            token: self.original.token.clone(),
+            server_public_key: self.original.server_public_key.clone(),
+            e2e_peer_pins: self.original.e2e_peer_pins.clone(),
             require_transport_encryption: draft.require_transport_encryption,
             files,
             history,
-            rooms: self.rooms.clone(),
+            rooms: self.original.rooms.clone(),
         };
         validate_server_entry(&server)?;
-        Ok(ServerEditUpdate {
-            original_label: self.original_label.clone(),
-            server,
-        })
+        Ok(server)
     }
 
     fn drive(
@@ -351,8 +363,8 @@ impl ServerEditDraft {
             .with_surface(FormSurface::Dialog);
             let mut form = DetailForm::new(core);
             let values = ServerEditValues {
-                token: &self.token,
-                server_public_key: &self.server_public_key,
+                token: &self.original.token,
+                server_public_key: &self.original.server_public_key,
                 label: &mut self.label,
                 username: &mut self.username,
                 tcp_addr: &mut self.tcp_addr,
@@ -403,10 +415,7 @@ impl ServerEditDraft {
 
     fn clone_values(&self) -> Self {
         Self {
-            original_label: self.original_label.clone(),
-            token: self.token.clone(),
-            server_public_key: self.server_public_key.clone(),
-            e2e_peer_pins: self.e2e_peer_pins.clone(),
+            original: self.original.clone(),
             label: self.label.clone(),
             username: self.username.clone(),
             tcp_addr: self.tcp_addr.clone(),
@@ -422,7 +431,6 @@ impl ServerEditDraft {
             inherited_download_mode: self.inherited_download_mode,
             inherited_receive_limit: self.inherited_receive_limit.clone(),
             inherited_history_on: self.inherited_history_on,
-            rooms: self.rooms.clone(),
             form: form::state_with_focus(FormBindings::Standard, SERVER_SECTION, "Label"),
         }
     }
@@ -740,6 +748,7 @@ pub(crate) fn default_join_username() -> String {
 mod tests {
     use super::*;
     use crate::app::{PairCompletion, PendingPair};
+    use crate::config::RoomOverrides;
     use rpc::ids::RoomId;
 
     fn overridden_entry() -> ServerEntry {
@@ -791,13 +800,13 @@ mod tests {
         let original = overridden_entry();
 
         let draft = ServerEditDraft::from_server(&original, &config);
-        let saved = draft.to_update().unwrap().server;
+        let saved = draft.to_update().unwrap();
         assert_eq!(saved.files, original.files);
         assert_eq!(saved.history, original.history);
 
         let plain = ServerEntry::default();
         let draft = ServerEditDraft::from_server(&plain, &config);
-        let saved = draft.to_update().unwrap().server;
+        let saved = draft.to_update().unwrap();
         assert_eq!(saved.files, FileOverrides::default());
         assert_eq!(saved.history, HistoryOverrides::default());
     }
@@ -824,10 +833,7 @@ mod tests {
 
         assert!(draft.receive_limit.is_empty());
         assert_eq!(draft.inherited_receive_limit, "125");
-        assert_eq!(
-            draft.to_update().unwrap().server.files.max_download_mb,
-            None
-        );
+        assert_eq!(draft.to_update().unwrap().files.max_download_mb, None);
     }
 
     #[test]
@@ -836,7 +842,7 @@ mod tests {
         let original = overridden_entry();
 
         let draft = ServerEditDraft::from_server(&original, &config);
-        let saved = draft.to_update().unwrap().server;
+        let saved = draft.to_update().unwrap();
 
         assert_eq!(saved.rooms, original.rooms);
     }

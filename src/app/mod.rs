@@ -87,9 +87,9 @@ pub(crate) use room::{
 };
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
-    ServerEditDraft, ServerEditEvent, ServerSelectItem, alias_from_tcp_addr, default_join_alias,
-    default_join_username, random_open_pair_recovery_token, random_token, server_entry_from_invite,
-    unique_server_alias,
+    ServerEditDraft, ServerEditEvent, ServerEditSave, ServerSelectItem, alias_from_tcp_addr,
+    default_join_alias, default_join_username, random_open_pair_recovery_token, random_token,
+    server_entry_from_invite, unique_server_alias,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1796,13 +1796,20 @@ impl App {
             CoreCommand::SaveServerEdit {
                 draft,
                 join_after_save,
-            } => {
-                if !self.save_server_edit_with(&draft, join_after_save) {
+            } => match self.save_server_edit_with(&draft, join_after_save) {
+                ServerEditSave::Saved => {}
+                ServerEditSave::Rejected => {
                     self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
                         ScreenSpec::ServerEditor(draft),
                     )));
                 }
-            }
+                ServerEditSave::Reloaded(draft) => {
+                    self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
+                        ScreenSpec::ServerEditor(*draft),
+                    )));
+                }
+                ServerEditSave::Vanished => self.navigate_owner(NavigationEvent::CloseScreen),
+            },
             CoreCommand::CancelServerEdit => self.cancel_server_edit(),
             CoreCommand::SaveRoomSettings(draft) => {
                 if !self.save_room_settings(&draft) {
@@ -5518,36 +5525,79 @@ impl App {
         self.set_status("connection canceled");
     }
 
+    /// Applies an edited server entry, or reports why it could not be applied.
+    ///
+    /// A draft outlives the entry it was opened over: another renderer can
+    /// rename, delete or edit that entry while the form is up. The save
+    /// therefore writes only over the entry the draft was derived from, and
+    /// never inserts one — an insert here would resurrect a deleted server or
+    /// duplicate a renamed one.
     pub(crate) fn save_server_edit_with(
         &mut self,
         draft: &ServerEditDraft,
         join_after_save: bool,
-    ) -> bool {
-        // A pairing the server rejected for a taken username is retried here.
-        // The provisional recovery entry is updated before the retry; the final
-        // bearer token replaces it only after pairing succeeds.
-        if self
-            .pairing
-            .username_retry_matches(self.command_client, draft.original_label())
-        {
-            let server = match draft.to_update() {
-                Ok(update) => update.server,
-                Err(error) => {
-                    self.set_error(error);
-                    return false;
-                }
-            };
-            return self.retry_username_pairing(server, join_after_save);
-        }
-        let update = match draft.to_update() {
-            Ok(update) => update,
+    ) -> ServerEditSave {
+        let mut server = match draft.to_update() {
+            Ok(server) => server,
             Err(error) => {
                 self.set_error(error);
-                return false;
+                return ServerEditSave::Rejected;
             }
         };
-        let original_label = update.original_label;
-        let server = update.server;
+        let original_label = draft.original_label().to_string();
+        // A pairing the server rejected for a taken username is retried here.
+        // The provisional recovery entry is updated before the retry; the final
+        // bearer token replaces it only after pairing succeeds. The attempt owns
+        // the entry holding its own token and no other.
+        if self
+            .pairing
+            .username_retry_matches(self.command_client, &original_label)
+        {
+            if self
+                .config
+                .servers
+                .iter()
+                .any(|existing| existing.label == server.label && existing.token != server.token)
+            {
+                self.set_error(format!("server label {} already exists", server.label));
+                return ServerEditSave::Rejected;
+            }
+            return if self.retry_username_pairing(server, join_after_save) {
+                ServerEditSave::Saved
+            } else {
+                ServerEditSave::Rejected
+            };
+        }
+        // The token identifies the entry first, so a rename elsewhere reads as a
+        // changed entry rather than a missing one; `to_update` has already
+        // refused a draft without a token. The label is the fallback for an
+        // entry whose credential a re-pair replaced while the form was up.
+        let snapshot = draft.original();
+        let Some(index) = self
+            .config
+            .servers
+            .iter()
+            .position(|existing| existing.token == snapshot.token)
+            .or_else(|| {
+                self.config
+                    .servers
+                    .iter()
+                    .position(|existing| existing.label == original_label)
+            })
+        else {
+            self.set_error(format!("server {original_label} is no longer configured"));
+            return ServerEditSave::Vanished;
+        };
+        let current = self.config.servers[index].clone();
+        if !current.edited_fields_eq(snapshot) {
+            self.set_error(format!(
+                "server {original_label} changed elsewhere; reloaded the current settings"
+            ));
+            return ServerEditSave::Reloaded(Box::new(ServerEditDraft::from_server(
+                &current,
+                &self.config,
+            )));
+        }
         if server.label != original_label
             && self
                 .config
@@ -5556,25 +5606,18 @@ impl App {
                 .any(|existing| existing.label == server.label)
         {
             self.set_error(format!("server label {} already exists", server.label));
-            return false;
+            return ServerEditSave::Rejected;
         }
+        // The form does not own these: DM pins and room overrides are written
+        // onto the live entry while the editor is open, and the token pair is
+        // replaced by pairing. Taking them from the draft would revert them.
+        server.token = current.token;
+        server.server_public_key = current.server_public_key;
+        server.e2e_peer_pins = current.e2e_peer_pins;
+        server.rooms = current.rooms;
         let label = server.label.clone();
-        let history_changed = self
-            .config
-            .servers
-            .iter()
-            .find(|existing| existing.label == original_label)
-            .is_some_and(|existing| existing.history != server.history);
-        if let Some(existing) = self
-            .config
-            .servers
-            .iter_mut()
-            .find(|existing| existing.label == original_label)
-        {
-            *existing = server;
-        } else {
-            self.config.upsert_server(server);
-        }
+        let history_changed = current.history != server.history;
+        self.config.servers[index] = server;
         if label != original_label {
             for preference in &mut self.config.user_audio {
                 if preference.server_alias == original_label {
@@ -5595,9 +5638,9 @@ impl App {
                 if join_after_save {
                     if self.start_network(&label) {
                         self.navigate_all(BaseScreen::Room);
-                        return true;
+                        return ServerEditSave::Saved;
                     }
-                    return false;
+                    return ServerEditSave::Rejected;
                 } else {
                     self.navigate_owner(NavigationEvent::CloseScreen);
                     if history_changed
@@ -5609,11 +5652,11 @@ impl App {
                         self.set_status(format!("server saved to {}", path.display()));
                     }
                 }
-                true
+                ServerEditSave::Saved
             }
             Err(error) => {
                 self.set_error(error);
-                false
+                ServerEditSave::Rejected
             }
         }
     }
@@ -11401,7 +11444,7 @@ mod tests {
         assert_eq!(first_editor, second_editor);
         draft.set_active_editor_text("Alice Dev");
 
-        let server = draft.to_update().unwrap().server;
+        let server = draft.to_update().unwrap();
         assert_eq!(server.label, "local-dev");
         assert_eq!(server.username, "Alice Dev");
     }
@@ -12958,6 +13001,253 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn saved_server(label: &str, token: &str) -> ServerEntry {
+        ServerEntry {
+            label: label.to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "User".to_string(),
+            token: token.to_string(),
+            ..ServerEntry::default()
+        }
+    }
+
+    /// Types `text` into the draft's text field `steps` rows below the label the
+    /// form opens on. The form has to be driven once before focus can move: a
+    /// draft that has never been laid out has no field order to walk.
+    fn type_into_draft(draft: &mut ServerEditDraft, steps: usize, text: &str) {
+        draft.active_editor_address().expect("a focused text field");
+        for _ in 0..steps {
+            draft.move_focus_for_test(1);
+        }
+        draft.active_editor_address().expect("a focused text field");
+        draft.set_active_editor_text(text);
+    }
+
+    fn save_draft(
+        app: &mut TestApp,
+        client: crate::client_channel::ClientId,
+        draft: ServerEditDraft,
+    ) {
+        app.handle_client_command(
+            client,
+            CoreCommand::SaveServerEdit {
+                draft,
+                join_after_save: false,
+            },
+        );
+    }
+
+    fn reopened_editor_label(events: &VecDeque<TerminalEvent>) -> Option<&str> {
+        events.iter().find_map(|event| match event {
+            TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(screen)) => {
+                match screen.as_ref() {
+                    ScreenSpec::ServerEditor(draft) => Some(draft.original_label()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn stale_server_edit_draft_cannot_resurrect_a_renamed_server() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "stale-server-edit");
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        let editor = crate::client_channel::ClientId(6);
+        let view = attach_test_client(&mut app, editor);
+        let channel = app.channel_for(editor).expect("attached channel");
+        let stale = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+
+        let mut rename = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        type_into_draft(&mut rename, 0, "community");
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, rename);
+        channel.drain_events();
+
+        save_draft(&mut app, editor, stale);
+
+        assert_eq!(app.config.servers.len(), 1);
+        assert_eq!(app.config.servers[0].label, "community");
+        assert_eq!(app.config.servers[0].token, "public-token");
+        assert_eq!(view.lock().status.kind(), StatusKind::Error);
+        assert_eq!(
+            reopened_editor_label(&channel.drain_events()),
+            Some("community")
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved.matches("[[servers]]").count(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_server_edit_draft_cannot_reinsert_a_deleted_server() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "deleted-server-edit");
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        let mut stale = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        type_into_draft(&mut stale, 1, "Renamed User");
+
+        app.delete_server("public");
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, stale);
+
+        assert!(app.config.servers.is_empty());
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert!(app.terminal_channel().drain_events().iter().any(|event| {
+            matches!(
+                event,
+                TerminalEvent::Navigation(NavigationEvent::CloseScreen)
+            )
+        }));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// DM pins land on the configured entry from the network path, so a draft
+    /// opened before one arrived must not carry its empty pin list back.
+    #[test]
+    fn server_edit_save_keeps_pins_added_while_the_editor_was_open() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "server-edit-pins");
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        let mut draft = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        type_into_draft(&mut draft, 1, "Renamed User");
+        app.config.servers[0]
+            .e2e_peer_pins
+            .push(crate::config::E2ePeerPin {
+                room_id: 0x8000_0001,
+                user_id: 2,
+                username: "bob".to_string(),
+                public_key: "11".repeat(32),
+                trust_level: crate::config::E2eTrustLevel::Accepted,
+                change_from: None,
+                previous: Vec::new(),
+            });
+
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, draft);
+
+        assert_eq!(app.config.servers[0].username, "Renamed User");
+        assert_eq!(app.config.servers[0].e2e_peer_pins.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A re-pair swaps the entry's credential while the form is up. The save
+    /// still lands on that entry and adopts the new token rather than writing
+    /// the draft's stale one back.
+    #[test]
+    fn server_edit_save_adopts_a_token_replaced_while_the_editor_was_open() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "server-edit-repair");
+        app.config.servers.push(saved_server("public", "old-token"));
+        let mut draft = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        type_into_draft(&mut draft, 1, "Renamed User");
+        app.config.servers[0].token = "new-token".to_string();
+
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, draft);
+
+        assert_eq!(app.config.servers.len(), 1);
+        assert_eq!(app.config.servers[0].token, "new-token");
+        assert_eq!(app.config.servers[0].username, "Renamed User");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An invite attempt holds a client-generated token that matches no saved
+    /// entry, so its retry may only claim a free label.
+    #[test]
+    fn username_retry_rejects_a_label_another_server_holds() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "retry-label-collision");
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        let pending = saved_server("public", "invite-token");
+        app.pairing.set_awaiting_username_for_test(
+            crate::client_channel::ClientId::PRIMARY,
+            PendingPair {
+                server: pending.clone(),
+                open: None,
+                open_password: String::new(),
+                pairing_code: Some("pair-code".to_string()),
+                completion: PairCompletion::OpenEditor,
+            },
+        );
+        let mut draft = ServerEditDraft::from_server(&pending, &app.config);
+        type_into_draft(&mut draft, 0, "community");
+
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, draft);
+
+        assert_eq!(app.config.servers.len(), 1);
+        assert_eq!(app.config.servers[0].token, "community-token");
+        assert!(
+            app.pairing
+                .awaiting_username(crate::client_channel::ClientId::PRIMARY)
+        );
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert_eq!(
+            reopened_editor_label(&app.terminal_channel().drain_events()),
+            Some("public")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An invite attempt parked in `Running`. It persists nothing before it
+    /// succeeds, so unlike open pairing its entry is not configured yet.
+    fn running_invite_pair(app: &mut TestApp, token: &str, completion: PairCompletion) -> u64 {
+        let server = saved_server("public", token);
+        let config = server.client_config(&app.config, app.download_store.clone());
+        app.pairing.set_running_for_test(
+            crate::client_channel::ClientId::PRIMARY,
+            PendingPair {
+                server,
+                open: None,
+                open_password: String::new(),
+                pairing_code: Some("pair-code".to_string()),
+                completion,
+            },
+            PairingJob::Invite {
+                config,
+                pairing_code: "pair-code".to_string(),
+            },
+            None,
+            ResumeUi::None,
+        )
+    }
+
+    /// The label an invite attempt dialed with can be taken while its worker
+    /// runs. Committing over the entry holding it would drop that server's
+    /// token, so the commit fails instead.
+    #[test]
+    fn invite_commit_refuses_a_label_claimed_while_pairing() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "invite-commit-race");
+        let attempt = running_invite_pair(&mut app, "invite-token", PairCompletion::Save);
+        app.config
+            .servers
+            .push(saved_server("public", "other-token"));
+
+        app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::InviteSucceeded,
+        });
+
+        assert_eq!(app.config.servers.len(), 1);
+        assert_eq!(app.config.servers[0].token, "other-token");
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert!(app.terminal_channel().drain_events().iter().any(|event| {
+            matches!(
+                event,
+                TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
+                    query: None
+                }))
+            )
+        }));
+        let _ = std::fs::remove_file(path);
+    }
+
     /// An open-pairing attempt parked in `Running`, as it is while its worker
     /// runs. The address is a closed port, so the worker that an accepted
     /// consent restarts fails at once instead of reaching a real server.
@@ -13149,7 +13439,7 @@ mod tests {
     fn invite_pairing_success_opens_the_editor_above_the_server_list() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "invite-editor");
-        let attempt = running_open_pair(&mut app, "invite-token", "");
+        let attempt = running_invite_pair(&mut app, "invite-token", PairCompletion::OpenEditor);
         let mut h = Harness::new(app);
 
         h.app.handle_app_event(AppEvent::Pairing {

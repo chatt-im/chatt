@@ -136,6 +136,24 @@ pub struct E2ePeerPin {
 }
 
 impl ServerEntry {
+    /// Whether `other` carries the same values for every field the server
+    /// editor writes.
+    ///
+    /// Pass-through state — the token, the pinned server key, DM identity pins
+    /// and room overrides — is excluded. The network path rewrites those under
+    /// an open editor, and a save takes them from the configured entry instead
+    /// of asserting the draft's copy of them.
+    pub fn edited_fields_eq(&self, other: &Self) -> bool {
+        self.label == other.label
+            && self.tcp_addr == other.tcp_addr
+            && self.udp_addr == other.udp_addr
+            && self.udp_probe_addr == other.udp_probe_addr
+            && self.username == other.username
+            && self.require_transport_encryption == other.require_transport_encryption
+            && self.files == other.files
+            && self.history == other.history
+    }
+
     pub fn client_config(
         &self,
         config: &Config,

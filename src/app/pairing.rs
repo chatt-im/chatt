@@ -731,7 +731,11 @@ impl PairingCoordinator {
         event: PairingEvent,
     ) {
         match event {
-            PairingEvent::InviteSucceeded => self.commit(app, attempt, owner, pending),
+            // An invite attempt persists nothing before it succeeds, so it owns
+            // no saved entry and has to find its label free.
+            PairingEvent::InviteSucceeded => {
+                self.commit(app, attempt, owner, pending, String::new())
+            }
             // Media endpoints are not taken from the server: it cannot know
             // which of its binds this client can route to, nor its own mapped
             // port behind NAT. `udp_addr` keeps whatever the entry already had
@@ -741,19 +745,19 @@ impl PairingCoordinator {
                 token,
                 server_public_key,
             } => {
-                pending.server.token = token;
+                let claimed = std::mem::replace(&mut pending.server.token, token);
                 pending.server.server_public_key = server_public_key;
-                self.commit(app, attempt, owner, pending);
+                self.commit(app, attempt, owner, pending, claimed);
             }
             PairingEvent::DeviceSucceeded {
                 token,
                 username,
                 server_public_key,
             } => {
-                pending.server.token = token;
+                let claimed = std::mem::replace(&mut pending.server.token, token);
                 pending.server.username = username;
                 pending.server.server_public_key = server_public_key;
-                self.commit(app, attempt, owner, pending);
+                self.commit(app, attempt, owner, pending, claimed);
             }
             PairingEvent::OpenNeedsPassword {
                 retry,
@@ -872,15 +876,27 @@ impl PairingCoordinator {
     /// Saves a paired server and routes the owner to whatever the attempt was
     /// started for. Every branch resets the owner's base screen, which drains
     /// any pairing overlay along with it.
-    fn commit(&mut self, app: &mut App, _attempt: u64, owner: ClientId, pending: PendingPair) {
+    ///
+    /// `claimed_token` is the token the attempt's own entry was saved under
+    /// before pairing issued a new one, and is empty for an attempt that saved
+    /// nothing. See [`claim_server_entry`].
+    fn commit(
+        &mut self,
+        app: &mut App,
+        _attempt: u64,
+        owner: ClientId,
+        pending: PendingPair,
+        claimed_token: String,
+    ) {
         let previous = app.config.servers.clone();
-        let result = validate_server_entry(&pending.server).and_then(|()| {
-            app.config.upsert_server(pending.server.clone());
-            app.config.save_runtime().inspect(|path| {
-                app.config.config_path = Some(path.clone());
-                app.rebuild_server_items();
-            })
-        });
+        let result = validate_server_entry(&pending.server)
+            .and_then(|()| claim_server_entry(app, pending.server.clone(), &claimed_token))
+            .and_then(|()| {
+                app.config.save_runtime().inspect(|path| {
+                    app.config.config_path = Some(path.clone());
+                    app.rebuild_server_items();
+                })
+            });
         let path = match result {
             Ok(path) => path,
             Err(message) => {
@@ -1019,6 +1035,52 @@ fn open_server_editor(app: &mut App, owner: ClientId, draft: ServerEditDraft) {
             ScreenSpec::ServerEditor(draft),
         ))),
     );
+}
+
+/// Writes a paired entry into the configuration, replacing only the entry the
+/// attempt owns.
+///
+/// The attempt owns whichever entry still holds `claimed_token`: the provisional
+/// recovery entry it wrote before dialing, or the entry it is re-pairing. Any
+/// other entry under the same label belongs to a server saved while the worker
+/// ran, and overwriting it would silently drop that server's credential.
+///
+/// # Errors
+///
+/// Returns the failure to report when the label is held by an entry this attempt
+/// does not own.
+fn claim_server_entry(
+    app: &mut App,
+    server: ServerEntry,
+    claimed_token: &str,
+) -> Result<(), String> {
+    let owned = (!claimed_token.is_empty())
+        .then(|| {
+            app.config
+                .servers
+                .iter()
+                .position(|existing| existing.token == claimed_token)
+        })
+        .flatten();
+    let holder = app
+        .config
+        .servers
+        .iter()
+        .position(|existing| existing.label == server.label);
+    match (owned, holder) {
+        (Some(owned), Some(holder)) if owned != holder => {
+            Err(format!("server label {} already exists", server.label))
+        }
+        (Some(owned), _) => {
+            app.config.servers[owned] = server;
+            Ok(())
+        }
+        (None, Some(_)) => Err(format!("server label {} already exists", server.label)),
+        (None, None) => {
+            app.config.servers.push(server);
+            Ok(())
+        }
+    }
 }
 
 /// Applies trust-on-first-use continuity to the key a worker just observed.
