@@ -1070,7 +1070,9 @@ pub(crate) fn web_bind_error(text: &str) -> Option<String> {
     let trimmed = text.trim();
     match trimmed.parse::<std::net::SocketAddr>() {
         Ok(_) => None,
-        Err(error) => Some(format!("web bind must be a socket address: {error}")),
+        Err(error) => Some(format!(
+            "browser view listen address must be a socket address: {error}"
+        )),
     }
 }
 

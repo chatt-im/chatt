@@ -312,6 +312,10 @@ pub(crate) fn draw_labeled_editor_frame(
     row
 }
 
+/// Draws one action-row button.
+///
+/// A button that is not `enabled` keeps its slot and its focus highlight but
+/// renders in the subdued tone the form uses for rows it will not act on.
 pub(crate) fn draw_action(
     area: Rect,
     buf: &mut Buffer,
@@ -319,7 +323,22 @@ pub(crate) fn draw_action(
     label: &str,
     focused: bool,
     dialog: bool,
+    enabled: bool,
 ) {
+    if !enabled {
+        let style = if dialog {
+            theme.dialog_panel.patch(theme.subtle)
+        } else {
+            theme.background.patch(theme.subtle)
+        };
+        let style = if focused {
+            style | Modifier::REVERSED
+        } else {
+            style
+        };
+        draw_button(area, buf, style, label);
+        return;
+    }
     let style = if dialog {
         let style = if focused {
             theme.selected_focused

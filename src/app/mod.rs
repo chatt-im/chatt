@@ -363,11 +363,41 @@ pub(crate) enum Audience {
     All,
 }
 
+/// How a server editor the core presents reaches the owner's screen stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditorPresentation {
+    /// Stack the form over the base screen the caller has just reset.
+    Open,
+    /// Replace the form the owner is already on: a held join failed, and the
+    /// user has been looking at that form the whole time.
+    Replace,
+}
+
+impl EditorPresentation {
+    fn for_hold(holds_editor: bool) -> Self {
+        if holds_editor {
+            Self::Replace
+        } else {
+            Self::Open
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ConnectionAttempt {
     generation: u64,
     owner: crate::client_channel::ClientId,
     server_label: String,
+    /// The owner submitted this attempt from the server editor and is holding
+    /// that form open over it.
+    ///
+    /// A save-and-join presents its whole outcome inside the form it was
+    /// submitted from: nothing may navigate the owner while this is set, and
+    /// every intermediate result — a refused plaintext transport, a taken
+    /// username, a reconnect backoff — is reported into the form instead. Only
+    /// [`NetworkEvent::Authenticated`] and the owner's own cancel clear it. See
+    /// [`ServerEditSave`] for the invariant this serves.
+    holds_editor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1692,6 +1722,21 @@ impl App {
         }
     }
 
+    /// Resets every client except `held`, which is presenting a join inside its
+    /// server editor and may not be navigated out of it.
+    fn broadcast_base_except(&mut self, held: crate::client_channel::ClientId, base: BaseScreen) {
+        for (client, handle) in &self.clients {
+            if *client == held {
+                continue;
+            }
+            handle
+                .channel
+                .push(TerminalEvent::Navigation(NavigationEvent::ResetBase(
+                    base.clone(),
+                )));
+        }
+    }
+
     fn broadcast_config_changed(&self) {
         for handle in self.clients.values() {
             handle.channel.push(TerminalEvent::ConfigChanged);
@@ -1862,12 +1907,9 @@ impl App {
                 draft,
                 join_after_save,
             } => match self.save_server_edit_with(&draft, join_after_save) {
-                ServerEditSave::Saved => {}
-                ServerEditSave::Rejected => {
-                    self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
-                        ScreenSpec::ServerEditor(draft),
-                    )));
-                }
+                // The editor the user submitted is still up, holding the draft
+                // it was submitted with: a refusal is only an error on it.
+                ServerEditSave::Saved | ServerEditSave::Rejected => {}
                 ServerEditSave::Reloaded(draft) => {
                     self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
                         ScreenSpec::ServerEditor(*draft),
@@ -3388,16 +3430,25 @@ impl App {
     /// send a rejected connect straight back to the offending input.
     ///
     /// The caller resets the base screen first, so the form opens above the
-    /// server list rather than becoming an unpoppable root.
-    pub(crate) fn open_server_edit_focused(&mut self, label: &str, field: &str) {
+    /// server list rather than becoming an unpoppable root — unless the owner
+    /// is still on the form this rejection came from, which is replaced where
+    /// it stands instead.
+    pub(crate) fn open_server_edit_focused(
+        &mut self,
+        label: &str,
+        field: &str,
+        presentation: EditorPresentation,
+    ) {
         let Ok(server) = self.config.server(label).cloned() else {
             self.set_error(format!("server {label} is not configured"));
             return;
         };
         let draft = ServerEditDraft::from_server_focused(&server, &self.config, field);
-        self.navigate_owner(NavigationEvent::OpenScreen(Box::new(
-            ScreenSpec::ServerEditor(draft),
-        )));
+        let screen = Box::new(ScreenSpec::ServerEditor(draft));
+        self.navigate_owner(match presentation {
+            EditorPresentation::Open => NavigationEvent::OpenScreen(screen),
+            EditorPresentation::Replace => NavigationEvent::ReplaceScreen(screen),
+        });
         self.set_status(format!("editing server {}", server.label));
     }
 
@@ -3425,6 +3476,12 @@ impl App {
         ) {
             Ok(network) => network,
             Err(error) => {
+                // The hold projection follows whichever attempt is current, so
+                // restoring the attempt has to restore it too.
+                self.room.join_hold = previous_attempt
+                    .as_ref()
+                    .filter(|attempt| attempt.holds_editor)
+                    .map(|attempt| attempt.server_label.clone());
                 self.connection_attempt = previous_attempt;
                 self.set_error(format!("failed to start network: {error}"));
                 return false;
@@ -3481,6 +3538,9 @@ impl App {
         {
             attempt.server_label = to.to_string();
         }
+        if self.room.join_hold.as_deref() == Some(from) {
+            self.room.join_hold = Some(to.to_string());
+        }
         if session && let Err(error) = local_control::write_last_server_hint(to) {
             kvlog::warn!("failed to update last-server hint", error = %error);
         }
@@ -3521,6 +3581,13 @@ impl App {
         true
     }
 
+    /// Opens a generation for `alias`, inheriting the editor hold of the
+    /// attempt it replaces.
+    ///
+    /// The same owner rejoining the same server is the plaintext-consent
+    /// restart, which is still the join the form submitted; anything else is a
+    /// different join and takes the hold away, since the attempt the form was
+    /// presenting no longer exists.
     fn begin_connection_attempt(
         &mut self,
         alias: &str,
@@ -3528,12 +3595,63 @@ impl App {
     ) -> u64 {
         self.next_connection_generation = self.next_connection_generation.wrapping_add(1).max(1);
         let generation = self.next_connection_generation;
+        let holds_editor = self.connection_attempt.as_ref().is_some_and(|attempt| {
+            attempt.holds_editor && attempt.owner == owner && attempt.server_label == alias
+        });
         self.connection_attempt = Some(ConnectionAttempt {
             generation,
             owner,
             server_label: alias.to_string(),
+            holds_editor,
         });
+        self.room.join_hold = holds_editor.then(|| alias.to_string());
         generation
+    }
+
+    /// Hands the running attempt to the server editor that submitted it, which
+    /// stays up until the session authenticates.
+    fn hold_editor_for_join(&mut self, label: &str) {
+        if let Some(attempt) = &mut self.connection_attempt {
+            attempt.holds_editor = true;
+        }
+        self.room.join_hold = Some(label.to_string());
+    }
+
+    /// The client presenting a connection attempt inside its server editor.
+    ///
+    /// Every outcome routed at that client has to leave the form up: it is
+    /// where the user is, and where the result has to be readable.
+    fn join_hold_owner(&self) -> Option<crate::client_channel::ClientId> {
+        self.connection_attempt
+            .as_ref()
+            .filter(|attempt| attempt.holds_editor)
+            .map(|attempt| attempt.owner)
+    }
+
+    /// Ends the hold, returning the client that had it. The form's submit
+    /// actions come back and later outcomes navigate normally; the form itself
+    /// stays up, since only a successful join or the user's cancel closes it.
+    fn release_join_hold(&mut self) -> Option<crate::client_channel::ClientId> {
+        self.room.join_hold = None;
+        let attempt = self.connection_attempt.as_mut()?;
+        std::mem::replace(&mut attempt.holds_editor, false).then_some(attempt.owner)
+    }
+
+    /// Sends every client back to the server list, except one presenting the
+    /// running attempt inside its editor: that form is where the user is, and
+    /// where whatever prompted this has to be readable.
+    fn navigate_all_to_server_list(&mut self) {
+        match self.join_hold_owner() {
+            Some(held) => self.broadcast_base_except(held, BaseScreen::Servers { query: None }),
+            None => self.navigate_all(BaseScreen::Servers { query: None }),
+        }
+    }
+
+    /// Clears the screens a failed attempt was presenting on and ends its hold,
+    /// leaving the holder's form up to take the error.
+    fn end_join_to_server_list(&mut self) {
+        self.navigate_all_to_server_list();
+        self.release_join_hold();
     }
 
     /// Refuses, and reports, a connection switch that would strand transfers the
@@ -3565,6 +3683,7 @@ impl App {
             generation: 0,
             owner,
             server_label: alias.to_string(),
+            holds_editor: false,
         });
         if self.start_network(alias) {
             self.navigate_all(BaseScreen::Room);
@@ -4048,6 +4167,7 @@ impl App {
                 open_password: String::new(),
                 pairing_code: None,
                 completion: PairCompletion::OpenEditor,
+                from_editor: false,
             };
             self.apply_pairing_input(PairingInput::Start {
                 owner: self.command_client,
@@ -4100,6 +4220,7 @@ impl App {
             open_password: String::new(),
             pairing_code: Some(pairing_code),
             completion: PairCompletion::OpenEditor,
+            from_editor: false,
         };
         self.apply_pairing_input(PairingInput::Start {
             owner: self.command_client,
@@ -4142,6 +4263,7 @@ impl App {
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
+            from_editor: false,
         };
         let existing_token = pending.open.clone().unwrap_or_default();
         self.apply_pairing_input(PairingInput::Start {
@@ -4246,6 +4368,7 @@ impl App {
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
+            from_editor: false,
         };
         let existing_token = pending.open.clone().unwrap_or_default();
         self.apply_pairing_input(PairingInput::Start {
@@ -4345,10 +4468,25 @@ impl App {
         });
     }
 
+    /// Closes the owner's server editor, abandoning whatever it was holding.
+    ///
+    /// The editor is the only thing presenting a save-and-join, so leaving it
+    /// would leave the attempt running with nowhere to report; the user asked
+    /// to be done with this server, and the connection goes with the form.
     fn cancel_server_edit(&mut self) {
         self.apply_pairing_input(PairingInput::OwnerClosed {
             owner: self.command_client,
         });
+        if self.join_hold_owner() != Some(self.command_client) {
+            return;
+        }
+        self.release_join_hold();
+        self.rpc_server_selection_issue = None;
+        self.connection_attempt = None;
+        self.disconnect_network();
+        self.room.reset_for_server_list();
+        self.broadcast_reset_rooms();
+        self.set_status("join canceled");
     }
 
     fn discard_provisional_open_pair(&mut self, pending: &PendingPair) -> Result<(), String> {
@@ -4396,6 +4534,7 @@ impl App {
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::Reconnect,
+            from_editor: false,
         };
         let token = pending.open.clone().unwrap_or_default();
         self.apply_pairing_input(PairingInput::Start {
@@ -4548,6 +4687,11 @@ impl App {
                 video_auth_key,
             } => {
                 self.rpc_server_selection_issue = None;
+                // The join a server editor was holding itself open for has
+                // landed: this is the one outcome that takes the form down.
+                if self.release_join_hold().is_some() {
+                    self.navigate_all(BaseScreen::Room);
+                }
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
                 self.server_dms_enabled = dms_enabled;
@@ -5274,7 +5418,7 @@ impl App {
                         false,
                     );
                     self.disconnect_network();
-                    self.navigate_all(BaseScreen::Servers { query: None });
+                    self.end_join_to_server_list();
                     if let Some(attempt) = attempt {
                         if self.rpc_clients.contains(&attempt.owner) {
                             self.set_rpc_server_selection_error(
@@ -5284,7 +5428,14 @@ impl App {
                         } else {
                             let previous =
                                 std::mem::replace(&mut self.command_client, attempt.owner);
-                            self.open_server_edit_focused(&attempt.server_label, "Username");
+                            // A held join is still on the form it was submitted
+                            // from, so the reload swaps that form's contents
+                            // rather than stacking a second one over it.
+                            self.open_server_edit_focused(
+                                &attempt.server_label,
+                                "Username",
+                                EditorPresentation::for_hold(attempt.holds_editor),
+                            );
                             self.set_error("username already in use; choose another");
                             self.command_client = previous;
                         }
@@ -5298,7 +5449,7 @@ impl App {
                     false,
                 );
                 self.disconnect_network();
-                self.navigate_all(BaseScreen::Servers { query: None });
+                self.end_join_to_server_list();
                 self.push_network_notice("auth", &message);
                 self.set_error(message.clone());
                 if let Some(attempt) = rpc_attempt {
@@ -5319,7 +5470,10 @@ impl App {
                     return;
                 };
                 self.disconnect_network();
-                self.navigate_all(BaseScreen::Servers { query: None });
+                // The hold survives the prompt: consent restarts this same
+                // join, and a refusal has to land back on the form that
+                // submitted it rather than somewhere the user never was.
+                self.navigate_all_to_server_list();
                 self.set_rpc_transport_encryption_prompt(&attempt);
                 self.send_terminal_event(
                     Audience::Client(attempt.owner),
@@ -5382,6 +5536,9 @@ impl App {
                 ));
             }
             NetworkEvent::LocalIdentityUnavailable { message } => {
+                // The worker stops on this one, so a held join is over: the
+                // form takes the error and its submit actions come back.
+                self.release_join_hold();
                 self.push_network_notice("e2e", &message);
                 self.set_error(message);
             }
@@ -5654,6 +5811,11 @@ impl App {
             self.room.reset_for_server_list();
             self.broadcast_reset_rooms();
         }
+        // A form joining an entry that has just been deleted is waiting on a
+        // session that will never authenticate.
+        if self.room.join_hold.as_deref() == Some(label) {
+            self.release_join_hold();
+        }
         self.config.config_path = Some(path.clone());
         self.rebuild_server_items();
         self.set_status(format!(
@@ -5690,7 +5852,8 @@ impl App {
             self.set_error(format!("server {label} is not configured"));
             self.room.reset_for_server_list();
             self.broadcast_reset_rooms();
-            self.navigate_all(BaseScreen::Servers { query: None });
+            self.navigate_owner(NavigationEvent::CloseOverlay);
+            self.end_join_to_server_list();
             return false;
         };
         let required = std::mem::replace(&mut server.require_transport_encryption, false);
@@ -5699,9 +5862,17 @@ impl App {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 self.rebuild_server_items();
+                // The warning is the coordinator's own overlay and outlives no
+                // outcome: the restarted attempt reports onto whatever is under
+                // it, which for a held join is the form that submitted it.
+                self.navigate_owner(NavigationEvent::CloseOverlay);
                 if self.start_network(&label) {
                     self.rpc_server_selection_issue = None;
-                    self.navigate_all(BaseScreen::Room);
+                    // A held join keeps holding across the restart and still
+                    // closes its form on `Authenticated`, not here.
+                    if self.join_hold_owner().is_none() {
+                        self.navigate_all(BaseScreen::Room);
+                    }
                     self.set_status(format!(
                         "transport encryption requirement disabled for {label}; config saved to {}",
                         path.display()
@@ -5714,7 +5885,7 @@ impl App {
                     );
                     self.room.reset_for_server_list();
                     self.broadcast_reset_rooms();
-                    self.navigate_all(BaseScreen::Servers { query: None });
+                    self.end_join_to_server_list();
                     false
                 }
             }
@@ -5744,12 +5915,16 @@ impl App {
             return;
         }
         self.rpc_server_selection_issue = None;
-        self.connection_attempt = None;
         self.disconnect_network();
         self.room.reset_for_server_list();
         self.broadcast_reset_rooms();
         self.rebuild_server_items();
-        self.navigate_all(BaseScreen::Servers { query: None });
+        // Closing the overlay is the whole navigation for a held join: it
+        // uncovers the form the user submitted from, with their draft and the
+        // server list under it exactly as they were when they clicked.
+        self.navigate_owner(NavigationEvent::CloseOverlay);
+        self.end_join_to_server_list();
+        self.connection_attempt = None;
         self.set_status("connection canceled");
     }
 
@@ -5887,7 +6062,9 @@ impl App {
                     &self.config,
                 )));
             }
-            self.navigate_all(BaseScreen::Room);
+            // The join is only started here. The editor presents the rest of it
+            // and closes on `Authenticated`, so nothing navigates yet.
+            self.hold_editor_for_join(&label);
             return ServerEditSave::Saved;
         }
         self.navigate_owner(NavigationEvent::CloseScreen);
@@ -6251,7 +6428,7 @@ impl App {
             self.pending_web_history.clear();
             if let Some(feed) = self.web_feed.take() {
                 feed.stop();
-                self.set_status("web log server stopped");
+                self.set_status("browser view stopped");
             }
             return;
         }
@@ -6292,12 +6469,12 @@ impl App {
                 Some(sender) => {
                     self.web_feed = Some(sender);
                     self.set_status(format!(
-                        "web log server listening on {}",
+                        "browser view listening on {}",
                         self.config.web.bind
                     ));
                 }
                 None => {
-                    self.set_error("web log server failed to start".to_string());
+                    self.set_error("browser view failed to start".to_string());
                 }
             }
         }
@@ -7088,6 +7265,9 @@ impl App {
                     network.stop();
                 }
                 self.reset_room_for_disconnect();
+                // Nothing will authenticate now, so a form still holding this
+                // join gets its submit actions back to try something else.
+                self.release_join_hold();
                 self.set_error(format!("network recovery exhausted: {reason}"));
                 true
             }
@@ -9693,6 +9873,7 @@ mod tests {
             generation: 9,
             owner: crate::client_channel::ClientId::PRIMARY,
             server_label: "legacy".to_string(),
+            holds_editor: false,
         });
 
         app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
@@ -9727,6 +9908,7 @@ mod tests {
             generation: 9,
             owner,
             server_label: "legacy".to_string(),
+            holds_editor: false,
         });
 
         app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
@@ -9748,6 +9930,7 @@ mod tests {
             generation: 2,
             owner: crate::client_channel::ClientId::PRIMARY,
             server_label: "new".to_string(),
+            holds_editor: false,
         });
         app.active_network_generation = Some(2);
 
@@ -10073,6 +10256,7 @@ mod tests {
             generation: 1,
             owner,
             server_label: "public".to_string(),
+            holds_editor: false,
         });
 
         app.handle_app_event(
@@ -13517,6 +13701,7 @@ mod tests {
                 open_password: String::new(),
                 pairing_code: None,
                 completion: PairCompletion::OpenEditor,
+                from_editor: false,
             },
         );
         let renamed = ServerEntry {
@@ -13706,6 +13891,7 @@ mod tests {
             generation: 7,
             owner: crate::client_channel::ClientId::PRIMARY,
             server_label: label.to_string(),
+            holds_editor: false,
         });
         enter_room_with_users(app, Vec::new());
         commands
@@ -13789,7 +13975,172 @@ mod tests {
         assert_eq!(app.room.active_server_label.as_deref(), Some("public"));
         assert!(app.network.is_some());
         assert!(app.room.has_active_transfers());
+        // Nothing was started, so nothing is holding the form open.
+        assert_eq!(app.room.join_hold, None);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The state a save-and-join leaves behind: the entry written, a worker
+    /// running, and the form that submitted it holding the outcome.
+    fn held_join(
+        app: &mut TestApp,
+        label: &str,
+        owner: crate::client_channel::ClientId,
+    ) -> mpsc::Receiver<crate::client_net::NetworkCommand> {
+        let (tx, commands) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.room.active_server_label = Some(label.to_string());
+        app.room.network_selected = true;
+        app.connection_attempt = Some(ConnectionAttempt {
+            generation: 11,
+            owner,
+            server_label: label.to_string(),
+            holds_editor: true,
+        });
+        app.room.join_hold = Some(label.to_string());
+        commands
+    }
+
+    fn navigations(events: &VecDeque<TerminalEvent>) -> Vec<&NavigationEvent> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TerminalEvent::Navigation(event) => Some(event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_authenticated_held_join_is_what_finally_opens_the_room() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
+        app.terminal_channel().drain_events();
+
+        app.handle_network_event(NetworkEvent::Authenticated {
+            session_id: SessionId(1),
+            user_id: UserId(1),
+            rooms: vec![test_room_info(1)],
+            users: vec![user_summary(UserId(1), "alice")],
+            default_room: RoomId(1),
+            dms_enabled: true,
+            video_addr: "127.0.0.1:41000".parse().unwrap(),
+            video_transport_mode: rpc::crypto::TransportMode::Encrypted,
+            video_auth_key: [0; rpc::crypto::KEY_LEN],
+        });
+
+        assert_eq!(app.room.join_hold, None);
+        assert!(matches!(
+            navigations(&app.terminal_channel().drain_events()).as_slice(),
+            [NavigationEvent::ResetBase(BaseScreen::Room)]
+        ));
+    }
+
+    /// The refusal the user is most likely to meet: the server turns out to
+    /// speak plaintext, and they decline it. The warning is the only thing that
+    /// closes, uncovering the form they submitted from.
+    #[test]
+    fn a_canceled_transport_encryption_warning_uncovers_the_held_editor() {
+        let mut app = test_app();
+        app.config.servers.push(saved_server("public", "token"));
+        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
+
+        app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
+        let prompted = app.terminal_channel().drain_events();
+        assert!(matches!(
+            navigations(&prompted).as_slice(),
+            [NavigationEvent::ShowOverlay(overlay)]
+                if matches!(
+                    overlay.as_ref(),
+                    OverlaySpec::TransportEncryptionWarning {
+                        target: TransportWarningTarget::Connection { generation: 11 },
+                        ..
+                    }
+                )
+        ));
+        assert_eq!(app.room.join_hold.as_deref(), Some("public"));
+
+        app.cancel_transport_encryption_warning(11);
+
+        assert_eq!(app.room.join_hold, None);
+        assert!(app.network.is_none());
+        assert!(matches!(
+            navigations(&app.terminal_channel().drain_events()).as_slice(),
+            [NavigationEvent::CloseOverlay]
+        ));
+    }
+
+    /// Consenting restarts the same join, which the same form goes on holding:
+    /// only authentication opens the room.
+    #[test]
+    fn accepted_transport_encryption_keeps_the_editor_holding_the_restart() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "held-plaintext-consent");
+        app.config.servers.push(ServerEntry {
+            require_transport_encryption: true,
+            ..saved_server("public", "token")
+        });
+        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
+        app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
+        app.terminal_channel().drain_events();
+
+        // The restart spawns a real worker, which a unit test may not do, so
+        // the entry is left unconfigured: the accept still has to unwind onto
+        // the form rather than navigate the holder anywhere.
+        app.config.servers.clear();
+        app.accept_transport_encryption_warning("public", 11);
+
+        assert_eq!(app.room.join_hold, None);
+        assert!(matches!(
+            navigations(&app.terminal_channel().drain_events()).as_slice(),
+            [NavigationEvent::CloseOverlay]
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_username_taken_by_a_held_join_reloads_that_form_in_place() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
+        app.terminal_channel().drain_events();
+
+        app.handle_network_event(NetworkEvent::AuthFailed {
+            code: ERROR_USERNAME_TAKEN,
+            message: "username already in use".to_string(),
+        });
+
+        assert_eq!(app.room.join_hold, None);
+        assert!(matches!(
+            navigations(&app.terminal_channel().drain_events()).as_slice(),
+            [NavigationEvent::ReplaceScreen(screen)]
+                if matches!(screen.as_ref(), ScreenSpec::ServerEditor(_))
+        ));
+    }
+
+    #[test]
+    fn canceling_a_held_editor_calls_the_join_off() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
+
+        app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::CancelServerEdit,
+        );
+
+        assert_eq!(app.room.join_hold, None);
+        assert!(app.connection_attempt.is_none());
+        assert!(app.network.is_none());
+        // The form pops itself; nothing else moves the user.
+        assert!(navigations(&app.terminal_channel().drain_events()).is_empty());
     }
 
     /// Pairing runs beside a live session rather than replacing it, so a paired
@@ -13993,6 +14344,7 @@ mod tests {
             generation: 4,
             owner: crate::client_channel::ClientId::PRIMARY,
             server_label: "public".to_string(),
+            holds_editor: false,
         });
         let _dir = unwritable_config_path(&mut app, "refused-plaintext-consent");
 
@@ -14022,6 +14374,7 @@ mod tests {
                 open_password: String::new(),
                 pairing_code: Some("pair-code".to_string()),
                 completion: PairCompletion::OpenEditor,
+                from_editor: false,
             },
         );
         let mut draft = ServerEditDraft::from_server(&pending, &app.config);
@@ -14036,9 +14389,11 @@ mod tests {
                 .awaiting_username(crate::client_channel::ClientId::PRIMARY)
         );
         assert_eq!(app.view.status.kind(), StatusKind::Error);
+        // The form the user submitted still holds their draft, so a refusal it
+        // can fix is only an error on it.
         assert_eq!(
             reopened_editor_label(&app.terminal_channel().drain_events()),
-            Some("public")
+            None
         );
         let _ = std::fs::remove_file(path);
     }
@@ -14046,6 +14401,17 @@ mod tests {
     /// An invite attempt parked in `Running`. It persists nothing before it
     /// succeeds, so unlike open pairing its entry is not configured yet.
     fn running_invite_pair(app: &mut TestApp, token: &str, completion: PairCompletion) -> u64 {
+        running_invite_pair_from(app, token, completion, false)
+    }
+
+    /// The same attempt, `from_editor` naming the retry a user submitted from
+    /// the server editor — the one whose outcome that form presents.
+    fn running_invite_pair_from(
+        app: &mut TestApp,
+        token: &str,
+        completion: PairCompletion,
+        from_editor: bool,
+    ) -> u64 {
         let server = saved_server("public", token);
         let config = server.client_config(&app.config, app.download_store.clone());
         app.pairing.set_running_for_test(
@@ -14056,14 +14422,92 @@ mod tests {
                 open_password: String::new(),
                 pairing_code: Some("pair-code".to_string()),
                 completion,
+                from_editor,
             },
             PairingJob::Invite {
                 config,
                 pairing_code: "pair-code".to_string(),
             },
             None,
-            ResumeUi::None,
+            if from_editor {
+                ResumeUi::Editor
+            } else {
+                ResumeUi::None
+            },
         )
+    }
+
+    /// The join a paired retry starts can still be refused, and the form that
+    /// submitted it is where the user is: it keeps the refusal, and nothing
+    /// navigates them off it.
+    #[test]
+    fn a_paired_join_blocked_by_transfers_leaves_the_owner_on_the_editor() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "held-pairing-join-transfer");
+        let attempt =
+            running_invite_pair_from(&mut app, "invite-token", PairCompletion::Join, true);
+        let _commands = connected_with_active_transfer(&mut app, "lab");
+        app.terminal_channel().drain_events();
+
+        app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::InviteSucceeded,
+        });
+
+        assert_eq!(
+            app.config.server("public").expect("paired entry").token,
+            "invite-token"
+        );
+        assert_eq!(app.view.status.text(), SERVER_SWITCH_TRANSFER_BLOCKED);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert_eq!(app.room.join_hold, None);
+        assert!(navigations(&app.terminal_channel().drain_events()).is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A retry that reaches a worker leaves the form up over the pairing: it
+    /// has not joined anything yet, and the user has nowhere else to be.
+    #[test]
+    fn a_username_retry_submitted_from_the_editor_leaves_it_up() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "held-username-retry");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
+        let server = ServerEntry {
+            label: "public".to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "User".to_string(),
+            token: token.clone(),
+            ..ServerEntry::default()
+        };
+        app.config.servers.push(server.clone());
+        app.pairing.set_awaiting_username_for_test(
+            crate::client_channel::ClientId::PRIMARY,
+            PendingPair {
+                server: server.clone(),
+                open: Some(token),
+                open_password: String::new(),
+                pairing_code: None,
+                completion: PairCompletion::OpenEditor,
+                from_editor: false,
+            },
+        );
+        let mut draft = ServerEditDraft::from_server(&server, &app.config);
+        type_into_draft(&mut draft, 1, "Different User");
+
+        app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::SaveServerEdit {
+                draft,
+                join_after_save: true,
+            },
+        );
+
+        assert_eq!(
+            app.pairing_pending().expect("retry pending").completion,
+            PairCompletion::Join
+        );
+        assert!(navigations(&app.terminal_channel().drain_events()).is_empty());
+        let _ = std::fs::remove_file(path);
     }
 
     /// The label an invite attempt dialed with can be taken while its worker
@@ -14131,6 +14575,7 @@ mod tests {
             },
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
+            from_editor: false,
         };
         app.pairing.set_running_for_test(
             crate::client_channel::ClientId::PRIMARY,
@@ -14401,6 +14846,7 @@ mod tests {
             generation: 1,
             owner: crate::client_channel::ClientId::PRIMARY,
             server_label: "public".to_string(),
+            holds_editor: false,
         });
         let mut h = Harness::new(app);
 
@@ -14444,6 +14890,7 @@ mod tests {
                 open_password: String::new(),
                 pairing_code: None,
                 completion: PairCompletion::OpenEditor,
+                from_editor: false,
             },
         );
         let renamed = ServerEntry {
@@ -14467,8 +14914,10 @@ mod tests {
         ));
     }
 
+    /// The retry never reaches a worker, so the form the user submitted is
+    /// where the failure has to land — and it is still up, holding their draft.
     #[test]
-    fn username_retry_persist_failure_reopens_the_editor() {
+    fn username_retry_persist_failure_keeps_the_editor() {
         let mut app = test_app();
         let _path = unwritable_config_path(&mut app, "username-retry-reopen");
         let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
@@ -14488,6 +14937,7 @@ mod tests {
                 open_password: String::new(),
                 pairing_code: None,
                 completion: PairCompletion::OpenEditor,
+                from_editor: false,
             },
         );
         let draft = ServerEditDraft::from_server(&server, &app.config);
@@ -14500,11 +14950,14 @@ mod tests {
             },
         );
 
-        assert!(matches!(
-            app.take_terminal_event(),
-            Some(TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(screen)))
-                if matches!(screen.as_ref(), ScreenSpec::ServerEditor(_))
-        ));
+        assert!(
+            !app.terminal_channel()
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::Navigation(_))),
+            "the submitted form stays up untouched"
+        );
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
         assert!(
             app.pairing
                 .awaiting_username(crate::client_channel::ClientId::PRIMARY)
@@ -14652,6 +15105,7 @@ mod tests {
                 open_password: String::new(),
                 pairing_code: None,
                 completion: PairCompletion::OpenEditor,
+                from_editor: false,
             },
             job: PairingJob::Device {
                 config,

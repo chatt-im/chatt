@@ -1292,6 +1292,7 @@ mod tests {
             generation: 11,
             owner,
             server_label: "legacy".into(),
+            holds_editor: false,
         });
         app.rpc_server_selection_issue = Some(super::super::OwnedRpcServerSelectionIssue {
             owner,

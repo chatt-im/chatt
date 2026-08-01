@@ -1091,18 +1091,24 @@ fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
         form.set_default(default_url_open_label());
     }
 
-    form.section("Web Log Server");
-    if form.checkbox("Web Log", &mut draft.web_enabled).is_focus() {
-        form.set_help("Starts the browser chat-log server. Bind is saved even while disabled.");
-        form.set_default("off");
-    }
+    form.section("Browser View");
     if form
-        .text("Web Bind", &mut draft.web_bind, web_bind_error)
+        .choice_value(
+            "Enabled",
+            &mut draft.web_enabled,
+            &[false, true],
+            |enabled| enabled.to_string(),
+        )
         .is_focus()
     {
-        form.set_help(
-            "Loopback socket address for the browser chat-log server, for example 127.0.0.1:8080.",
-        );
+        form.set_help("Starts the local browser view. The listen address is saved while disabled.");
+        form.set_default("false");
+    }
+    if form
+        .text("Listen Address", &mut draft.web_bind, web_bind_error)
+        .is_focus()
+    {
+        form.set_help("Loopback socket address for the browser view, for example 127.0.0.1:8080.");
         form.set_default(WebConfig::default().bind);
     }
     if form
@@ -1174,9 +1180,9 @@ fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
         .is_focus()
     {
         form.set_help(
-            "Browser origins allowed to open the web log WebSocket, one per row. Empty derives origins from the bind address. Changes restart the web server.",
+            "Browser origins allowed to open the browser view WebSocket, one per row. Empty derives origins from the listen address. Changes restart the browser view.",
         );
-        form.set_default("derived from Web Bind");
+        form.set_default("derived from Listen Address");
     }
 }
 
@@ -1192,7 +1198,7 @@ fn data_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
         .is_focus()
     {
         form.set_help(
-            "How received files are handled: off rejects them, memory keeps them in a RAM buffer (lost on restart, viewable in the web log), persistent saves them to disk.",
+            "How received files are handled: off rejects them, memory keeps them in a RAM buffer (lost on restart, viewable in the browser view), persistent saves them to disk.",
         );
         form.set_default(crate::config::DownloadMode::Memory.label());
     }
@@ -1875,7 +1881,7 @@ mod tests {
     #[test]
     fn web_readonly_is_available_without_advanced_settings() {
         let config = crate::config::Config::default();
-        let field = field_id_for("Web Log Server", "Readonly");
+        let field = field_id_for("Browser View", "Readonly");
         let mut draft = test_draft();
         assert!(!draft.show_advanced);
         assert!(draft.web_readonly);
