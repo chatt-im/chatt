@@ -17,17 +17,17 @@
 //!   client takes ownership.
 //!
 //! To support both without leaking zombies, [`Clipboard`] keeps the most recent
-//! helper in a single slot. The next copy kills and waits on the previous
-//! occupant before spawning a replacement, so a long-lived owner is reaped
-//! exactly when it is superseded and a short-lived one is reaped at the latest
-//! by the following copy.
+//! helper for each selection. The next copy to that selection kills and waits
+//! on its previous owner before spawning a replacement, so a long-lived owner
+//! is reaped exactly when it is superseded and a short-lived one is reaped at
+//! the latest by the following copy.
 //!
-//! On drop the final owner is deliberately *not* killed: an X11 selection lives
-//! only as long as its owner, so killing `xclip` on exit would wipe whatever the
-//! user just copied. Detaching it instead lets the selection survive (the
-//! process is reparented to init, which reaps it when it eventually exits).
-//! Waiting is not an option either — a selection owner never exits on its own,
-//! so it would hang quit.
+//! On drop the final owners are deliberately *not* killed: an X11 selection
+//! lives only as long as its owner, so killing `xclip` on exit would wipe
+//! whatever the user just copied. Detaching it instead lets the selection
+//! survive (the process is reparented to init, which reaps it when it eventually
+//! exits). Waiting is not an option either — a selection owner never exits on
+//! its own, so it would hang quit.
 
 use std::{
     io::Write,
@@ -41,70 +41,105 @@ use extui::{
 
 /// Owns the background clipboard helper so it can be reaped deterministically.
 pub(crate) struct Clipboard {
-    /// The most recent CLI helper that may still be running to own the
-    /// selection. Killed and waited on before the next spawn.
-    owner: Option<Child>,
+    /// The most recent CLI helpers that may still be running to own the two
+    /// selections. They must be retained separately on X11: replacing the
+    /// primary selection must not discard an explicit clipboard copy.
+    clipboard_owner: Option<Child>,
+    primary_owner: Option<Child>,
 }
 
 impl Clipboard {
     pub(crate) fn new() -> Self {
-        Self { owner: None }
+        Self {
+            clipboard_owner: None,
+            primary_owner: None,
+        }
     }
 
     /// Copies `text` to the system clipboard via OSC 52 and a CLI helper.
     pub(crate) fn copy(&mut self, term: &mut Terminal, text: &str) {
+        self.copy_to(term, ClipboardSelection::Clipboard, text);
+    }
+
+    /// Copies `text` to the primary selection via OSC 52 and a CLI helper.
+    pub(crate) fn copy_primary(&mut self, term: &mut Terminal, text: &str) {
+        self.copy_to(term, ClipboardSelection::Primary, text);
+    }
+
+    fn copy_to(&mut self, term: &mut Terminal, selection: ClipboardSelection, text: &str) {
         let mut out = Vec::new();
-        SetClipboard {
-            selection: ClipboardSelection::Clipboard,
-            text,
-        }
-        .write_to_buffer(&mut out);
+        SetClipboard { selection, text }.write_to_buffer(&mut out);
         let _ = term.write_all(&out);
 
         // Replace any previous owner before spawning a new helper.
-        self.reap_owner();
+        self.reap_owner(selection);
         for command in CLIPBOARD_COMMANDS {
-            if let Some(child) = spawn_clipboard_command(command, text) {
-                self.owner = retain_if_running(child);
+            let Some(args) = command.args(selection) else {
+                continue;
+            };
+            if let Some(child) = spawn_clipboard_command(command.program, args, text) {
+                *self.owner_mut(selection) = retain_if_running(child);
                 return;
             }
         }
     }
 
-    /// Kills and waits on the current owner, clearing the slot. Killing an
-    /// already-exited process is harmless; the `wait` reaps it either way.
-    fn reap_owner(&mut self) {
-        if let Some(mut child) = self.owner.take() {
+    /// Kills and waits on the selection's current owner, clearing its slot.
+    /// Killing an already-exited process is harmless; `wait` reaps it either
+    /// way.
+    fn reap_owner(&mut self, selection: ClipboardSelection) {
+        if let Some(mut child) = self.owner_mut(selection).take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+
+    fn owner_mut(&mut self, selection: ClipboardSelection) -> &mut Option<Child> {
+        match selection {
+            ClipboardSelection::Clipboard => &mut self.clipboard_owner,
+            ClipboardSelection::Primary => &mut self.primary_owner,
         }
     }
 }
 
 struct ClipboardCommand {
     program: &'static str,
-    args: &'static [&'static str],
+    clipboard_args: &'static [&'static str],
+    primary_args: Option<&'static [&'static str]>,
+}
+
+impl ClipboardCommand {
+    fn args(&self, selection: ClipboardSelection) -> Option<&'static [&'static str]> {
+        match selection {
+            ClipboardSelection::Clipboard => Some(self.clipboard_args),
+            ClipboardSelection::Primary => self.primary_args,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 const CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[ClipboardCommand {
     program: "pbcopy",
-    args: &[],
+    clipboard_args: &[],
+    primary_args: None,
 }];
 
 #[cfg(target_os = "linux")]
 const CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[
     ClipboardCommand {
         program: "wl-copy",
-        args: &[],
+        clipboard_args: &[],
+        primary_args: Some(&["--primary"]),
     },
     ClipboardCommand {
         program: "xclip",
-        args: &["-selection", "clipboard"],
+        clipboard_args: &["-selection", "clipboard"],
+        primary_args: Some(&["-selection", "primary"]),
     },
     ClipboardCommand {
         program: "xsel",
-        args: &["--clipboard", "--input"],
+        clipboard_args: &["--clipboard", "--input"],
+        primary_args: Some(&["--primary", "--input"]),
     },
 ];
 
@@ -114,9 +149,9 @@ const CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[];
 /// Spawns `command`, writes `text` to its stdin, and closes the pipe. Returns
 /// the child on success, or `None` if the program could not be launched or
 /// would not accept the text (e.g. it is not installed).
-fn spawn_clipboard_command(command: &ClipboardCommand, text: &str) -> Option<Child> {
-    let mut child = Command::new(command.program)
-        .args(command.args)
+fn spawn_clipboard_command(program: &str, args: &[&str], text: &str) -> Option<Child> {
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

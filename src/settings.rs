@@ -101,6 +101,7 @@ pub struct SettingsDraft {
     pub(crate) ui_room_height: String,
     pub(crate) ui_max_composer_height: String,
     pub(crate) ui_composer_padding: bool,
+    pub(crate) ui_copy_on_select: bool,
     pub(crate) ui_max_messages: String,
     pub(crate) ui_overscan: String,
     /// The URL opener command, one argument per row; the clicked URL is
@@ -275,6 +276,7 @@ impl SettingsDraft {
             ui_room_height: UiConfig::default().room_height.to_string(),
             ui_max_composer_height: UiConfig::default().max_composer_height.to_string(),
             ui_composer_padding: UiConfig::default().composer_padding,
+            ui_copy_on_select: UiConfig::default().copy_on_select,
             ui_max_messages: UiConfig::default().max_messages.to_string(),
             ui_overscan: UiConfig::default().overscan.to_string(),
             url_open: Vec::new(),
@@ -342,6 +344,7 @@ impl SettingsDraft {
         self.ui_room_height = ui.room_height.to_string();
         self.ui_max_composer_height = ui.max_composer_height.to_string();
         self.ui_composer_padding = ui.composer_padding;
+        self.ui_copy_on_select = ui.copy_on_select;
         self.ui_max_messages = ui.max_messages.to_string();
         self.ui_overscan = ui.overscan.to_string();
     }
@@ -451,6 +454,7 @@ impl SettingsDraft {
             ui.max_composer_height = value;
         }
         ui.composer_padding = self.ui_composer_padding;
+        ui.copy_on_select = self.ui_copy_on_select;
         if let Ok(value) = self.ui_max_messages.trim().parse::<u32>() {
             ui.max_messages = value;
         }
@@ -1741,6 +1745,7 @@ mod tests {
             room_height: 7,
             max_composer_height: 12,
             composer_padding: false,
+            copy_on_select: true,
             max_messages: 12_345,
             overscan: 48,
             ..UiConfig::default()
@@ -1752,6 +1757,7 @@ mod tests {
         assert_eq!(produced.room_height, 7);
         assert_eq!(produced.max_composer_height, 12);
         assert!(!produced.composer_padding);
+        assert!(produced.copy_on_select);
         assert_eq!(produced.max_messages, 12_345);
         assert_eq!(produced.overscan, 48);
     }

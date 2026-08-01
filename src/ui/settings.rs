@@ -1065,6 +1065,15 @@ fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
         form.set_help("Draws a padded frame around the message composer.");
         form.set_default("on");
     }
+    if form
+        .checkbox("Copy on Select", &mut draft.ui_copy_on_select)
+        .is_focus()
+    {
+        form.set_help(
+            "Copies clicked or drag-selected message rows to the primary selection on mouse release.",
+        );
+        form.set_default("off");
+    }
 
     form.section("Links");
     if form
