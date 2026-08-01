@@ -9,7 +9,10 @@ mod command;
 mod help;
 mod term;
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::{self, Read},
+    path::{Path, PathBuf},
+};
 
 use crate::audio::{
     self, BufferRequest, DeviceInfo, LiveAudioFilePlaybackTestConfig,
@@ -110,9 +113,57 @@ open pairing starts instead.",
                 required: true,
                 possible: &[],
             }],
-            flags: &[],
+            flags: &[Flag {
+                long: "room",
+                short: "",
+                value_name: "ROOM",
+                help: "Room name, @user DM, or id:NUMBER (default: current room)",
+                global: false,
+                possible: &[],
+            }],
             subs: &[],
             examples: &[],
+        },
+        Command {
+            name: "send",
+            aliases: &[],
+            about: "Send a chat message into a running client session.",
+            long_about: "Sends MESSAGE to the running client's current room, or to the room \
+selected by `--room`. With no MESSAGE argument, reads UTF-8 text from standard input.",
+            args: &[Arg {
+                name: "message",
+                value_name: "MESSAGE",
+                help: "Message text; omit to read from standard input",
+                required: false,
+                possible: &[],
+            }],
+            flags: &[Flag {
+                long: "room",
+                short: "",
+                value_name: "ROOM",
+                help: "Room name, @user DM, or id:NUMBER (default: current room)",
+                global: false,
+                possible: &[],
+            }],
+            subs: &[],
+            examples: &[
+                Example {
+                    cmd: "send \"hello\"",
+                    help: "Send a message to the current room.",
+                },
+                Example {
+                    cmd: "send --room lobby \"hello\"",
+                    help: "Send a message to a named room.",
+                },
+                Example {
+                    cmd: "send --room @alice \"hello\"",
+                    help: "Send a message to an existing direct-message room.",
+                },
+                Example {
+                    cmd: "echo \"hello\" | chatt send",
+                    help: "Read a message from standard input.",
+                },
+            ],
         },
         Command {
             name: "client-logs",
@@ -460,7 +511,13 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(("upload", sub)) => {
             let path = absolute_upload_path(Path::new(sub.value_of("path").unwrap_or_default()))?;
-            let response = local_control::send_upload(&path)?;
+            let response = local_control::send_upload(&path, sub.value_of("room"))?;
+            println!("{response}");
+            Ok(())
+        }
+        Some(("send", sub)) => {
+            let body = message_body(sub.value_of("message"))?;
+            let response = local_control::send_message(&body, sub.value_of("room"))?;
             println!("{response}");
             Ok(())
         }
@@ -943,6 +1000,54 @@ fn absolute_upload_path(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to read current directory: {error}"))
 }
 
+fn message_body(argument: Option<&str>) -> Result<String, String> {
+    match argument {
+        Some(body) => validate_message_body(body.to_string()),
+        None => read_message_body(io::stdin().lock()),
+    }
+}
+
+fn read_message_body(mut input: impl Read) -> Result<String, String> {
+    let limit = rpc::control::MAX_CHAT_BODY_BYTES;
+    // One trailing LF or CRLF is input framing rather than chat content. Read
+    // enough beyond the body cap to distinguish that allowance from an
+    // actually oversized message without buffering an unbounded pipe.
+    let mut bytes = Vec::with_capacity(limit + 2);
+    input
+        .by_ref()
+        .take((limit + 3) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read message from standard input: {error}"))?;
+    if bytes.ends_with(b"\r\n") {
+        bytes.truncate(bytes.len() - 2);
+    } else if bytes.ends_with(b"\n") {
+        bytes.truncate(bytes.len() - 1);
+    }
+    if bytes.len() > limit {
+        return Err(message_too_long_error(bytes.len()));
+    }
+    let body = String::from_utf8(bytes)
+        .map_err(|_| "message from standard input is not valid UTF-8".to_string())?;
+    validate_message_body(body)
+}
+
+fn validate_message_body(body: String) -> Result<String, String> {
+    if body.trim().is_empty() {
+        return Err("chat message is empty".to_string());
+    }
+    if body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
+        return Err(message_too_long_error(body.len()));
+    }
+    Ok(body)
+}
+
+fn message_too_long_error(actual: usize) -> String {
+    format!(
+        "chat message is {actual} bytes; maximum is {} bytes",
+        rpc::control::MAX_CHAT_BODY_BYTES
+    )
+}
+
 fn print_debug_audio_inputs(buffer_request: BufferRequest) -> Result<(), String> {
     let devices = audio::input_devices(buffer_request)?;
     let ranked_items = settings::audio_input_items(&devices);
@@ -1135,12 +1240,56 @@ mod tests {
             "--config",
             "dev.toml",
             "upload",
+            "--room",
+            "id:20",
             "some_file/foo.md",
         ]);
         assert_eq!(matches.value_of("config"), Some("dev.toml"));
         let (name, sub) = matches.subcommand().unwrap();
         assert_eq!(name, "upload");
         assert_eq!(sub.value_of("path"), Some("some_file/foo.md"));
+        assert_eq!(sub.value_of("room"), Some("id:20"));
+    }
+
+    #[test]
+    fn parses_send_argument_or_stdin_form_with_room() {
+        let matches = run_matches(&["chatt", "send", "--room", "@alice", "hello"]);
+        let (name, sub) = matches.subcommand().unwrap();
+        assert_eq!(name, "send");
+        assert_eq!(sub.value_of("room"), Some("@alice"));
+        assert_eq!(sub.value_of("message"), Some("hello"));
+
+        let matches = run_matches(&["chatt", "send"]);
+        let (_, sub) = matches.subcommand().unwrap();
+        assert_eq!(sub.value_of("room"), None);
+        assert_eq!(sub.value_of("message"), None);
+    }
+
+    #[test]
+    fn stdin_message_strips_one_line_ending_and_preserves_multiline_text() {
+        assert_eq!(read_message_body(&b"hello\n"[..]).unwrap(), "hello");
+        assert_eq!(read_message_body(&b"hello\r\n"[..]).unwrap(), "hello");
+        assert_eq!(
+            read_message_body(&b"Hey check out this code:\n```rust\ncool_function();\n```\n"[..])
+                .unwrap(),
+            "Hey check out this code:\n```rust\ncool_function();\n```"
+        );
+        assert_eq!(read_message_body(&b"hello\n\n"[..]).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn cli_message_validation_enforces_utf8_byte_cap_and_nonempty_body() {
+        let limit = rpc::control::MAX_CHAT_BODY_BYTES;
+        assert_eq!(
+            read_message_body(format!("{}\r\n", "x".repeat(limit)).as_bytes())
+                .unwrap()
+                .len(),
+            limit
+        );
+        assert!(read_message_body("x".repeat(limit + 1).as_bytes()).is_err());
+        assert!(message_body(Some(&"x".repeat(limit + 1))).is_err());
+        assert!(read_message_body(&b" \n"[..]).is_err());
+        assert!(read_message_body(&[0xff][..]).is_err());
     }
 
     #[test]

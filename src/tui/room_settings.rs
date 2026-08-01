@@ -90,6 +90,18 @@ impl AppMode for RoomSettingsMode {
         self.process_mouse_cx(cx, mouse)
     }
 
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<extui_editor::Mode> {
+        self.draft
+            .as_ref()
+            .and_then(RoomSettingsDraft::active_editor_mode)
+    }
+
+    fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        if let Some(draft) = self.draft.as_mut() {
+            draft.paste(&text, &cx.view.theme);
+        }
+    }
+
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,

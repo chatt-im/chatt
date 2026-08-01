@@ -46,6 +46,14 @@ impl FuzzySelect {
         self.query.push_str(query);
     }
 
+    pub fn append_query(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        self.query.push_str(text);
+        true
+    }
+
     pub fn clear_query(&mut self) -> bool {
         if self.query.is_empty() {
             return false;
