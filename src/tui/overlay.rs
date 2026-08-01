@@ -5,7 +5,9 @@ use crate::{
         device_pair::{DeviceLinkButton, DeviceLinkDialog, DevicePairDialog, DevicePairEvent},
     },
     bindings::{self, BindCommand, Resolved},
-    client_channel::{DirtySections, E2eIdentityOverlay, E2eIdentityTarget},
+    client_channel::{
+        DirtySections, E2eIdentityOverlay, E2eIdentityTarget, TransportWarningTarget,
+    },
     clipboard_paste::{
         ClipboardPasteProvider, HelperClipboard, ImagePaste, ImagePasteOrigin, ImagePasteSource,
         PastePayload,
@@ -264,20 +266,21 @@ impl AppMode for ConfirmMode {
     }
 }
 
-/// Safety gate for connecting to a server that disabled transport encryption.
+/// Safety gate for talking to a server that disabled transport encryption,
+/// shown before either a connection or a pairing attempt sends anything secret.
 pub(crate) struct TransportEncryptionWarningMode {
     label: String,
-    generation: u64,
+    target: TransportWarningTarget,
     selected_connect: bool,
     cancel_button: Rect,
     connect_button: Rect,
 }
 
 impl TransportEncryptionWarningMode {
-    pub(crate) fn new(label: String, generation: u64) -> Self {
+    pub(crate) fn new(label: String, target: TransportWarningTarget) -> Self {
         Self {
             label,
-            generation,
+            target,
             selected_connect: false,
             cancel_button: Rect::EMPTY,
             connect_button: Rect::EMPTY,
@@ -285,16 +288,26 @@ impl TransportEncryptionWarningMode {
     }
 
     fn accept(&mut self, cx: &mut ViewCx<'_>) {
-        cx.send(CoreCommand::AcceptTransportEncryption {
-            label: self.label.clone(),
-            generation: self.generation,
-        });
+        let command = match self.target {
+            TransportWarningTarget::Connection { generation } => {
+                CoreCommand::AcceptTransportEncryption {
+                    label: self.label.clone(),
+                    generation,
+                }
+            }
+            TransportWarningTarget::Pairing => CoreCommand::AcceptPairingPlaintext,
+        };
+        cx.send(command);
     }
 
     fn cancel(&mut self, cx: &mut ViewCx<'_>) {
-        cx.send(CoreCommand::CancelTransportEncryption {
-            generation: self.generation,
-        });
+        let command = match self.target {
+            TransportWarningTarget::Connection { generation } => {
+                CoreCommand::CancelTransportEncryption { generation }
+            }
+            TransportWarningTarget::Pairing => CoreCommand::CancelPairing,
+        };
+        cx.send(command);
     }
 
     fn process_command(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
@@ -390,7 +403,13 @@ impl TransportEncryptionWarningMode {
         self.connect_button = row;
 
         let cancel = button_label("Cancel", Some("n".to_string()));
-        let connect = button_label("Connect", Some("y".to_string()));
+        let connect = button_label(
+            match self.target {
+                TransportWarningTarget::Connection { .. } => "Connect",
+                TransportWarningTarget::Pairing => "Pair",
+            },
+            Some("y".to_string()),
+        );
         let (cancel_style, connect_style) = if self.selected_connect {
             (
                 theme.dialog_panel.patch(theme.muted),

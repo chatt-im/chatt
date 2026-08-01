@@ -43,6 +43,7 @@ use rpc::{
 use crate::{
     client_channel::{
         BaseScreen, DirtySections, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
+        TransportWarningTarget,
     },
     client_net::{
         NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE, PairingEvent,
@@ -76,7 +77,7 @@ use audio_supervisor::{
 };
 use commands::slash_command_help;
 pub(crate) use pairing::{PairCompletion, PendingPair};
-use pairing::{PairingCoordinator, PairingInput, PairingJob};
+use pairing::{PairingCoordinator, PairingInput, PairingJob, RetainedTicket};
 use shared::CoreRw;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
@@ -1845,6 +1846,11 @@ impl App {
                     },
                     true,
                 );
+            }
+            CoreCommand::AcceptPairingPlaintext => {
+                self.apply_pairing_input(PairingInput::AcceptPlaintext {
+                    owner: self.command_client,
+                })
             }
             CoreCommand::CancelPairing => self.cancel_open_pairing(),
             CoreCommand::ClosePairing => self.apply_pairing_input(PairingInput::OwnerClosed {
@@ -3843,7 +3849,7 @@ impl App {
                 pending,
                 job: PairingJob::Device {
                     config: client_config,
-                    ticket,
+                    ticket: RetainedTicket::new(ticket),
                     device_name,
                     overwrite_existing,
                 },
@@ -5091,7 +5097,9 @@ impl App {
                     TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                         OverlaySpec::TransportEncryptionWarning {
                             label: attempt.server_label,
-                            generation: attempt.generation,
+                            target: TransportWarningTarget::Connection {
+                                generation: attempt.generation,
+                            },
                         },
                     ))),
                 );
@@ -9406,8 +9414,10 @@ mod tests {
             Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(overlay)))
                 if matches!(
                     overlay.as_ref(),
-                    OverlaySpec::TransportEncryptionWarning { label, generation: 9 }
-                        if label == "legacy"
+                    OverlaySpec::TransportEncryptionWarning {
+                        label,
+                        target: TransportWarningTarget::Connection { generation: 9 },
+                    } if label == "legacy"
                 )
         ));
         assert!(events.is_empty());
@@ -12929,6 +12939,164 @@ mod tests {
         );
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(saved.matches("[[servers]]").count(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An open-pairing attempt parked in `Running`, as it is while its worker
+    /// runs. The address is a closed port, so the worker that an accepted
+    /// consent restarts fails at once instead of reaching a real server.
+    fn running_open_pair(app: &mut TestApp, token: &str, server_public_key: &str) -> u64 {
+        let server = ServerEntry {
+            label: "public".to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "User".to_string(),
+            token: token.to_string(),
+            server_public_key: server_public_key.to_string(),
+            ..ServerEntry::default()
+        };
+        app.config.servers.push(server.clone());
+        let config = server.client_config(&app.config, app.download_store.clone());
+        let pending = PendingPair {
+            server,
+            open: Some(token.to_string()),
+            open_password: String::new(),
+            pairing_code: None,
+            completion: PairCompletion::OpenEditor,
+        };
+        app.pairing.set_running_for_test(
+            crate::client_channel::ClientId::PRIMARY,
+            pending,
+            PairingJob::Open {
+                config,
+                password: String::new(),
+                existing_token: token.to_string(),
+            },
+            None,
+        )
+    }
+
+    fn temp_config_path(app: &mut TestApp, label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("chatt-{label}-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        app.config.config_path = Some(path.clone());
+        path
+    }
+
+    #[test]
+    fn plaintext_pairing_refusal_prompts_for_consent_and_keeps_the_attempt() {
+        let mut app = test_app();
+        let channel = app.terminal_channel();
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}consent-secret");
+        let attempt = running_open_pair(&mut app, &token, "");
+
+        app.apply_pairing_input(PairingInput::Worker {
+            attempt,
+            event: PairingEvent::TransportEncryptionRequired,
+        });
+
+        assert!(
+            app.pairing
+                .awaiting_plaintext_consent(crate::client_channel::ClientId::PRIMARY)
+        );
+        let mut events = channel.drain_events();
+        assert!(matches!(
+            events.pop_front(),
+            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(overlay)))
+                if matches!(
+                    overlay.as_ref(),
+                    OverlaySpec::TransportEncryptionWarning {
+                        label,
+                        target: TransportWarningTarget::Pairing,
+                    } if label == "public"
+                )
+        ));
+    }
+
+    #[test]
+    fn accepting_plaintext_pairing_consent_saves_the_cleared_requirement() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "plaintext-consent");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}consent-secret");
+        let attempt = running_open_pair(&mut app, &token, "");
+        app.apply_pairing_input(PairingInput::Worker {
+            attempt,
+            event: PairingEvent::TransportEncryptionRequired,
+        });
+
+        app.apply_pairing_input(PairingInput::AcceptPlaintext {
+            owner: crate::client_channel::ClientId::PRIMARY,
+        });
+
+        // The retry is running again, this time against a config that no longer
+        // makes the worker refuse the server's plaintext transport.
+        assert!(!app.pairing_idle());
+        let pending = app.pairing_pending().expect("attempt restarted");
+        assert!(!pending.server.require_transport_encryption);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("require-transport-encryption = false"),
+            "{saved}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn canceling_plaintext_pairing_consent_discards_the_provisional_entry() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "plaintext-consent-cancel");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}consent-secret");
+        let attempt = running_open_pair(&mut app, &token, "");
+        app.apply_pairing_input(PairingInput::Worker {
+            attempt,
+            event: PairingEvent::TransportEncryptionRequired,
+        });
+
+        app.cancel_open_pairing();
+
+        assert!(app.pairing_idle());
+        assert!(app.config.servers.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn username_taken_pins_the_observed_server_key_for_the_retry() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "username-taken-pin");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}pin-secret");
+        let key = "ab".repeat(32);
+        let attempt = running_open_pair(&mut app, &token, "");
+
+        app.apply_pairing_input(PairingInput::Worker {
+            attempt,
+            event: PairingEvent::UsernameTaken {
+                message: "username taken".to_string(),
+                server_public_key: key.clone(),
+            },
+        });
+
+        assert_eq!(app.pairing_pending().unwrap().server.server_public_key, key);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(&key), "{saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn username_taken_with_a_changed_server_key_fails_the_pairing() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "username-taken-key-change");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}pin-secret");
+        let attempt = running_open_pair(&mut app, &token, &"ab".repeat(32));
+
+        app.apply_pairing_input(PairingInput::Worker {
+            attempt,
+            event: PairingEvent::UsernameTaken {
+                message: "username taken".to_string(),
+                server_public_key: "cd".repeat(32),
+            },
+        });
+
+        assert!(app.pairing_idle());
+        assert!(app.config.servers.is_empty());
         let _ = std::fs::remove_file(path);
     }
 

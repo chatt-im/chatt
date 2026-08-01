@@ -856,7 +856,13 @@ pub enum NetworkEvent {
 pub(crate) enum PairingEvent {
     InviteSucceeded,
     Failed(String),
-    UsernameTaken(String),
+    UsernameTaken {
+        message: String,
+        server_public_key: String,
+    },
+    /// The server selected plaintext transport before any credential was
+    /// written. The attempt is abandoned until the user consents.
+    TransportEncryptionRequired,
     OpenSucceeded {
         token: String,
         server_public_key: String,
@@ -1041,7 +1047,16 @@ pub fn spawn_pair_once(
         .spawn(move || {
             let event = match pair_once(&config, pairing_code) {
                 Ok(()) => PairingEvent::InviteSucceeded,
-                Err(PairFailure::UsernameTaken(message)) => PairingEvent::UsernameTaken(message),
+                Err(PairFailure::UsernameTaken {
+                    message,
+                    server_public_key,
+                }) => PairingEvent::UsernameTaken {
+                    message,
+                    server_public_key,
+                },
+                Err(PairFailure::TransportEncryptionRequired) => {
+                    PairingEvent::TransportEncryptionRequired
+                }
                 Err(PairFailure::Other(error)) => PairingEvent::Failed(error),
             };
             let _ = events.send(event);
@@ -1080,6 +1095,9 @@ pub fn spawn_device_pair_once(
                 },
                 Err(DevicePairFailure::IdentityExists { message }) => {
                     PairingEvent::DeviceIdentityExists { message }
+                }
+                Err(DevicePairFailure::TransportEncryptionRequired) => {
+                    PairingEvent::TransportEncryptionRequired
                 }
                 Err(DevicePairFailure::Other(message)) => PairingEvent::DeviceFailed { message },
             };
@@ -1293,7 +1311,11 @@ enum OpenPairOutcome {
         retry: bool,
         server_public_key: String,
     },
-    UsernameTaken(String),
+    UsernameTaken {
+        message: String,
+        server_public_key: String,
+    },
+    TransportEncryptionRequired,
     Failed(String),
 }
 
@@ -1307,7 +1329,10 @@ fn open_pair_once(
 ) -> OpenPairOutcome {
     let (mut stream, transport, trusted) = match connect_and_handshake(config, true) {
         Ok(value) => value,
-        Err(error) => return OpenPairOutcome::Failed(error),
+        Err(HandshakeFailure::TransportEncryptionRequired) => {
+            return OpenPairOutcome::TransportEncryptionRequired;
+        }
+        Err(HandshakeFailure::Other(error)) => return OpenPairOutcome::Failed(error),
     };
     let mut control = transport.control_record();
     let request = ClientControl::OpenPair {
@@ -1350,7 +1375,10 @@ fn open_pair_once(
                         retry: true,
                         server_public_key: encode_hex(&trusted),
                     },
-                    ERROR_USERNAME_TAKEN => OpenPairOutcome::UsernameTaken(message),
+                    ERROR_USERNAME_TAKEN => OpenPairOutcome::UsernameTaken {
+                        message,
+                        server_public_key: encode_hex(&trusted),
+                    },
                     _ => OpenPairOutcome::Failed(message),
                 };
             }
@@ -1385,7 +1413,16 @@ pub fn spawn_open_pair_once(
                     retry,
                     server_public_key,
                 },
-                OpenPairOutcome::UsernameTaken(message) => PairingEvent::UsernameTaken(message),
+                OpenPairOutcome::UsernameTaken {
+                    message,
+                    server_public_key,
+                } => PairingEvent::UsernameTaken {
+                    message,
+                    server_public_key,
+                },
+                OpenPairOutcome::TransportEncryptionRequired => {
+                    PairingEvent::TransportEncryptionRequired
+                }
                 OpenPairOutcome::Failed(error) => PairingEvent::Failed(error),
             };
             let _ = events.send(event);
@@ -1510,7 +1547,11 @@ fn run_worker_inner(
 ) -> SessionEnd {
     let (std_tcp, transport, _trusted) = match connect_and_handshake(config, false) {
         Ok(value) => value,
-        Err(error) => return SessionEnd::ConnectFailed(error),
+        Err(HandshakeFailure::TransportEncryptionRequired) => {
+            let _ = events.send(NetworkEvent::TransportEncryptionRequired);
+            return SessionEnd::Shutdown;
+        }
+        Err(HandshakeFailure::Other(error)) => return SessionEnd::ConnectFailed(error),
     };
     let video_addr = match std_tcp.peer_addr() {
         Ok(addr) => addr,
@@ -1526,10 +1567,6 @@ fn run_worker_inner(
         Ok(None) => unreachable!("ordinary connections always pin a server key"),
         Err(error) => return SessionEnd::ConnectFailed(error),
     };
-    if transport_mode == TransportMode::Plaintext && config.require_transport_encryption {
-        let _ = events.send(NetworkEvent::TransportEncryptionRequired);
-        return SessionEnd::Shutdown;
-    }
     let video_auth_key = transport.video_auth_key;
     let control = transport.control_record();
     let media = media::MediaProtection::from_transport(&transport);
@@ -1983,7 +2020,40 @@ fn wait_for_reconnect(
     }
 }
 
+/// Why a client handshake did not produce a usable session.
+enum HandshakeFailure {
+    /// The signed handshake selected plaintext transport while this server
+    /// entry still requires encryption. Only public handshake material reached
+    /// the wire, so the caller may prompt for consent and retry.
+    TransportEncryptionRequired,
+    Other(String),
+}
+
+impl From<String> for HandshakeFailure {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+/// Dials the server, completes the signed handshake, and refuses the session
+/// when the server chose plaintext against a config that requires encryption.
+///
+/// The refusal happens here rather than in each caller because this is the only
+/// client-side handshake in the tree: no caller can obtain a plaintext
+/// [`SessionTransport`] — and therefore a cleartext [`RecordProtection`] — for a
+/// config that forbids one.
 fn connect_and_handshake(
+    config: &ClientConfig,
+    allow_tofu: bool,
+) -> Result<(StdTcpStream, SessionTransport, [u8; 32]), HandshakeFailure> {
+    let (stream, transport, trusted) = dial_and_handshake(config, allow_tofu)?;
+    if transport.mode == TransportMode::Plaintext && config.require_transport_encryption {
+        return Err(HandshakeFailure::TransportEncryptionRequired);
+    }
+    Ok((stream, transport, trusted))
+}
+
+fn dial_and_handshake(
     config: &ClientConfig,
     allow_tofu: bool,
 ) -> Result<(StdTcpStream, SessionTransport, [u8; 32]), String> {
@@ -2069,14 +2139,30 @@ fn connect_and_handshake(
 }
 
 /// Why an invite pairing attempt failed. `UsernameTaken` is separated so the app
-/// can send the user back to the username field; everything else is `Other`.
+/// can send the user back to the username field, and
+/// `TransportEncryptionRequired` because the attempt is resumable rather than
+/// failed; everything else is `Other`.
 enum PairFailure {
-    UsernameTaken(String),
+    UsernameTaken {
+        message: String,
+        server_public_key: String,
+    },
+    TransportEncryptionRequired,
     Other(String),
+}
+
+impl From<HandshakeFailure> for PairFailure {
+    fn from(failure: HandshakeFailure) -> Self {
+        match failure {
+            HandshakeFailure::TransportEncryptionRequired => Self::TransportEncryptionRequired,
+            HandshakeFailure::Other(error) => Self::Other(error),
+        }
+    }
 }
 
 enum DevicePairFailure {
     IdentityExists { message: String },
+    TransportEncryptionRequired,
     Other(String),
 }
 
@@ -2086,9 +2172,17 @@ impl From<String> for DevicePairFailure {
     }
 }
 
+impl From<HandshakeFailure> for DevicePairFailure {
+    fn from(failure: HandshakeFailure) -> Self {
+        match failure {
+            HandshakeFailure::TransportEncryptionRequired => Self::TransportEncryptionRequired,
+            HandshakeFailure::Other(error) => Self::Other(error),
+        }
+    }
+}
+
 fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), PairFailure> {
-    let (mut stream, transport, _trusted) =
-        connect_and_handshake(config, false).map_err(PairFailure::Other)?;
+    let (mut stream, transport, trusted) = connect_and_handshake(config, false)?;
     let mut control = transport.control_record();
     write_blocking_control(
         &mut stream,
@@ -2115,7 +2209,12 @@ fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), PairFail
             ServerControl::Error {
                 code: ERROR_USERNAME_TAKEN,
                 message,
-            } => return Err(PairFailure::UsernameTaken(message)),
+            } => {
+                return Err(PairFailure::UsernameTaken {
+                    message,
+                    server_public_key: encode_hex(&trusted),
+                });
+            }
             ServerControl::Error { message, .. } => return Err(PairFailure::Other(message)),
             _ => {}
         }

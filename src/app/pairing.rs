@@ -4,11 +4,13 @@ use std::sync::{
 };
 
 use rpc::control::DeviceLinkTicket;
+use zeroize::Zeroize;
 
 use super::{App, Audience, ServerEditDraft, device_pair};
 use crate::{
     client_channel::{
         BaseScreen, ClientId, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
+        TransportWarningTarget,
     },
     client_net::{
         ClientConfig, PAIRING_CANCELABLE, PAIRING_CANCELED, PAIRING_COMMITTING, PairingEvent,
@@ -52,6 +54,26 @@ impl PendingPair {
     }
 }
 
+/// A device-link ticket the coordinator keeps across a worker run so a refused
+/// attempt can be restarted after consent.
+///
+/// The worker zeroizes the copy it was handed once it is done with it; this
+/// wrapper exists so the retained copy of the one-time pairing secret is wiped
+/// with the coordinator state rather than outliving the attempt in cleartext.
+pub(super) struct RetainedTicket(DeviceLinkTicket);
+
+impl RetainedTicket {
+    pub(super) fn new(ticket: DeviceLinkTicket) -> Self {
+        Self(ticket)
+    }
+}
+
+impl Drop for RetainedTicket {
+    fn drop(&mut self) {
+        self.0.pairing_secret.zeroize();
+    }
+}
+
 pub(super) enum PairingJob {
     Invite {
         config: ClientConfig,
@@ -64,10 +86,20 @@ pub(super) enum PairingJob {
     },
     Device {
         config: ClientConfig,
-        ticket: DeviceLinkTicket,
+        ticket: RetainedTicket,
         device_name: String,
         overwrite_existing: bool,
     },
+}
+
+impl PairingJob {
+    fn config_mut(&mut self) -> &mut ClientConfig {
+        match self {
+            Self::Invite { config, .. }
+            | Self::Open { config, .. }
+            | Self::Device { config, .. } => config,
+        }
+    }
 }
 
 enum PairingState {
@@ -79,6 +111,7 @@ enum PairingState {
         attempt: u64,
         owner: ClientId,
         pending: PendingPair,
+        job: PairingJob,
         cancellation: Option<Arc<AtomicU8>>,
     },
     AwaitingPassword {
@@ -88,6 +121,15 @@ enum PairingState {
     AwaitingUsername {
         owner: ClientId,
         pending: PendingPair,
+    },
+    /// The server chose plaintext transport and the attempt was abandoned
+    /// before any credential was written. The job is held so the user's consent
+    /// can restart it.
+    AwaitingPlaintextConsent {
+        owner: ClientId,
+        pending: PendingPair,
+        job: PairingJob,
+        cancellation: Option<Arc<AtomicU8>>,
     },
 }
 
@@ -120,6 +162,10 @@ pub(super) enum PairingInput {
     Worker {
         attempt: u64,
         event: PairingEvent,
+    },
+    /// The user accepted an unencrypted transport for the refused attempt.
+    AcceptPlaintext {
+        owner: ClientId,
     },
     Cancel {
         owner: ClientId,
@@ -157,12 +203,42 @@ impl PairingCoordinator {
         self.state = PairingState::AwaitingUsername { owner, pending };
     }
 
+    /// Places the coordinator in the state a spawned worker runs under and
+    /// returns the attempt id its [`PairingInput::Worker`] events must carry.
+    #[cfg(test)]
+    pub(super) fn set_running_for_test(
+        &mut self,
+        owner: ClientId,
+        pending: PendingPair,
+        job: PairingJob,
+        cancellation: Option<Arc<AtomicU8>>,
+    ) -> u64 {
+        let attempt = self.next_attempt();
+        self.state = PairingState::Running {
+            attempt,
+            owner,
+            pending,
+            job,
+            cancellation,
+        };
+        attempt
+    }
+
+    #[cfg(test)]
+    pub(super) fn awaiting_plaintext_consent(&self, owner: ClientId) -> bool {
+        matches!(
+            &self.state,
+            PairingState::AwaitingPlaintextConsent { owner: active, .. } if *active == owner
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn pending_for_test(&self) -> Option<&PendingPair> {
         match &self.state {
             PairingState::Running { pending, .. }
             | PairingState::AwaitingPassword { pending, .. }
-            | PairingState::AwaitingUsername { pending, .. } => Some(pending),
+            | PairingState::AwaitingUsername { pending, .. }
+            | PairingState::AwaitingPlaintextConsent { pending, .. } => Some(pending),
             PairingState::Idle | PairingState::AwaitingDeviceDetails { .. } => None,
         }
     }
@@ -325,11 +401,30 @@ impl PairingCoordinator {
                     attempt: active,
                     owner,
                     pending,
+                    job,
                     cancellation,
                 },
                 PairingInput::Worker { attempt, event },
             ) if active == attempt => {
-                self.worker_result(app, attempt, owner, pending, cancellation, event)
+                self.worker_result(app, attempt, owner, pending, job, cancellation, event)
+            }
+            (
+                PairingState::AwaitingPlaintextConsent {
+                    owner: active,
+                    mut pending,
+                    mut job,
+                    cancellation,
+                },
+                PairingInput::AcceptPlaintext { owner },
+            ) if active == owner => {
+                pending.server.require_transport_encryption = false;
+                job.config_mut().require_transport_encryption = false;
+                let persist_first = pending.is_provisional();
+                app.send_terminal_event(
+                    Audience::Client(owner),
+                    TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
+                );
+                self.start(app, owner, pending, job, cancellation, persist_first);
             }
             (state, PairingInput::Cancel { owner }) if state.owner() == Some(owner) => {
                 self.cancel(app, state, owner, true);
@@ -378,43 +473,43 @@ impl PairingCoordinator {
         }
         let attempt = self.next_attempt();
         let alias = pending.server.label.clone();
-        self.state = PairingState::Running {
-            attempt,
-            owner,
-            pending,
-            cancellation: cancellation.clone(),
-        };
         let events = app.events.sender().for_pairing(attempt);
-        let result = match job {
+        // The job is spawned from a borrow so the coordinator can retain it:
+        // a plaintext refusal restarts the very same job after consent.
+        let result = match &job {
             PairingJob::Invite {
                 config,
                 pairing_code,
-            } => spawn_pair_once(config, pairing_code, events),
+            } => spawn_pair_once(config.clone(), pairing_code.clone(), events),
             PairingJob::Open {
                 config,
                 password,
                 existing_token,
-            } => spawn_open_pair_once(config, password, existing_token, events),
+            } => spawn_open_pair_once(
+                config.clone(),
+                password.clone(),
+                existing_token.clone(),
+                events,
+            ),
             PairingJob::Device {
                 config,
                 ticket,
                 device_name,
                 overwrite_existing,
-            } => match cancellation {
+            } => match &cancellation {
                 Some(cancellation) => spawn_device_pair_once(
-                    config,
-                    ticket,
-                    device_name,
-                    overwrite_existing,
-                    cancellation,
+                    config.clone(),
+                    ticket.0.clone(),
+                    device_name.clone(),
+                    *overwrite_existing,
+                    cancellation.clone(),
                     events,
                 ),
                 None => Err("device pairing cancellation state is unavailable".to_string()),
             },
         };
         if let Err(message) = result {
-            let state = std::mem::replace(&mut self.state, PairingState::Idle);
-            if let Some(pending) = state.into_pending().filter(PendingPair::is_provisional) {
+            if pending.is_provisional() {
                 let _ = app.discard_provisional_open_pair(&pending);
             }
             app.send_terminal_event(
@@ -424,6 +519,13 @@ impl PairingCoordinator {
             app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
             return;
         }
+        self.state = PairingState::Running {
+            attempt,
+            owner,
+            pending,
+            job,
+            cancellation,
+        };
         app.send_terminal_event(
             Audience::Client(owner),
             TerminalEvent::Status(format!("pairing {alias}")),
@@ -436,6 +538,7 @@ impl PairingCoordinator {
         attempt: u64,
         owner: ClientId,
         mut pending: PendingPair,
+        job: PairingJob,
         cancellation: Option<Arc<AtomicU8>>,
         event: PairingEvent,
     ) {
@@ -468,19 +571,7 @@ impl PairingCoordinator {
                 retry,
                 server_public_key,
             } => {
-                if pending.server.server_public_key.is_empty() {
-                    pending.server.server_public_key = server_public_key;
-                } else if pending.server.server_public_key != server_public_key {
-                    if pending.is_provisional() {
-                        let _ = app.discard_provisional_open_pair(&pending);
-                    }
-                    let message =
-                        "pairing failed: server key changed during password retry".to_string();
-                    app.send_terminal_event(
-                        Audience::Client(owner),
-                        TerminalEvent::PairingFailed(message.clone()),
-                    );
-                    app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
+                if !pin_server_key(app, owner, &mut pending, server_public_key) {
                     return;
                 }
                 if pending.is_provisional()
@@ -505,7 +596,22 @@ impl PairingCoordinator {
                     );
                 }
             }
-            PairingEvent::UsernameTaken(message) => {
+            PairingEvent::UsernameTaken {
+                message,
+                server_public_key,
+            } => {
+                // The key is pinned before the editor draft is built: the retry
+                // reconnects with the key this attempt saw rather than running
+                // trust-on-first-use a second time.
+                if !pin_server_key(app, owner, &mut pending, server_public_key) {
+                    return;
+                }
+                if pending.is_provisional()
+                    && let Err(error) = app.persist_provisional_open_pair(&pending.server)
+                {
+                    app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(error));
+                    return;
+                }
                 let draft =
                     ServerEditDraft::from_server_focused(&pending.server, &app.config, "Username");
                 self.state = PairingState::AwaitingUsername { owner, pending };
@@ -552,8 +658,29 @@ impl PairingCoordinator {
                 );
                 app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
             }
+            PairingEvent::TransportEncryptionRequired => {
+                let label = pending.server.label.clone();
+                self.state = PairingState::AwaitingPlaintextConsent {
+                    owner,
+                    pending,
+                    job,
+                    cancellation,
+                };
+                app.send_terminal_event(
+                    Audience::Client(owner),
+                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
+                        OverlaySpec::TransportEncryptionWarning {
+                            label,
+                            target: TransportWarningTarget::Pairing,
+                        },
+                    ))),
+                );
+                app.send_terminal_event(
+                    Audience::Client(owner),
+                    TerminalEvent::Error("server transport encryption is disabled".to_string()),
+                );
+            }
         }
-        let _ = cancellation;
     }
 
     fn commit(
@@ -703,6 +830,43 @@ impl PairingCoordinator {
     }
 }
 
+/// Applies trust-on-first-use continuity to the key a worker just observed.
+///
+/// The first key an attempt sees is pinned into the pending entry so later
+/// rounds of the same attempt — a password prompt or a username retry — dial the
+/// same identity instead of trusting whatever answers next. A key that
+/// disagrees with the pinned one ends the attempt.
+///
+/// Returns whether the attempt may continue.
+fn pin_server_key(
+    app: &mut App,
+    owner: ClientId,
+    pending: &mut PendingPair,
+    server_public_key: String,
+) -> bool {
+    if pending.server.server_public_key.is_empty() {
+        pending.server.server_public_key = server_public_key;
+        return true;
+    }
+    if pending
+        .server
+        .server_public_key
+        .eq_ignore_ascii_case(&server_public_key)
+    {
+        return true;
+    }
+    if pending.is_provisional() {
+        let _ = app.discard_provisional_open_pair(pending);
+    }
+    let message = "pairing failed: server key changed during the pairing attempt".to_string();
+    app.send_terminal_event(
+        Audience::Client(owner),
+        TerminalEvent::PairingFailed(message.clone()),
+    );
+    app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
+    false
+}
+
 impl PairingState {
     fn owner(&self) -> Option<ClientId> {
         match self {
@@ -710,13 +874,15 @@ impl PairingState {
             Self::AwaitingDeviceDetails { owner }
             | Self::Running { owner, .. }
             | Self::AwaitingPassword { owner, .. }
-            | Self::AwaitingUsername { owner, .. } => Some(*owner),
+            | Self::AwaitingUsername { owner, .. }
+            | Self::AwaitingPlaintextConsent { owner, .. } => Some(*owner),
         }
     }
 
     fn cancellation(&self) -> Option<Arc<AtomicU8>> {
         match self {
-            Self::Running { cancellation, .. } => cancellation.clone(),
+            Self::Running { cancellation, .. }
+            | Self::AwaitingPlaintextConsent { cancellation, .. } => cancellation.clone(),
             _ => None,
         }
     }
@@ -725,7 +891,8 @@ impl PairingState {
         match self {
             Self::Running { pending, .. }
             | Self::AwaitingPassword { pending, .. }
-            | Self::AwaitingUsername { pending, .. } => Some(pending),
+            | Self::AwaitingUsername { pending, .. }
+            | Self::AwaitingPlaintextConsent { pending, .. } => Some(pending),
             Self::Idle | Self::AwaitingDeviceDetails { .. } => None,
         }
     }

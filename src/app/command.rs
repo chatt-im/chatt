@@ -133,6 +133,9 @@ pub(crate) enum CoreCommand {
     },
     GenerateDeviceLink,
     CancelDeviceLink(Vec<u8>),
+    /// Resumes a pairing attempt the worker abandoned because the server chose
+    /// plaintext transport.
+    AcceptPairingPlaintext,
     CancelPairing,
     ClosePairing,
     AudioManualReset,

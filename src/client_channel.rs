@@ -58,11 +58,25 @@ pub(crate) enum ScreenSpec {
     RoomSettings(RoomSettingsDraft),
 }
 
+/// What an accepted plaintext-transport warning resumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransportWarningTarget {
+    /// The connection attempt of this generation, restarted by `start_network`.
+    Connection { generation: u64 },
+    /// The pairing attempt the coordinator is holding.
+    Pairing,
+}
+
 pub(crate) enum OverlaySpec {
     UserVolume(UserVolumeDialog),
-    TransportEncryptionWarning { label: String, generation: u64 },
+    TransportEncryptionWarning {
+        label: String,
+        target: TransportWarningTarget,
+    },
     E2eIdentity(E2eIdentityOverlay),
-    PairingPassword { retry: bool },
+    PairingPassword {
+        retry: bool,
+    },
     DevicePair(DevicePairDialog),
     DeviceLink(DeviceLinkDialog),
     PasteUpload(ImagePaste),
