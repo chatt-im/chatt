@@ -452,8 +452,8 @@ impl OverlaySpec {
         };
         match self {
             Self::UserVolume(dialog) => Box::new(DialogMode::new(dialog)),
-            Self::TransportEncryptionWarning { label, generation } => {
-                Box::new(TransportEncryptionWarningMode::new(label, generation))
+            Self::TransportEncryptionWarning { label, target } => {
+                Box::new(TransportEncryptionWarningMode::new(label, target))
             }
             Self::E2eIdentity(dialog) => Box::new(E2eIdentityMode::new(dialog, theme)),
             Self::PairingPassword { retry } => Box::new(PasswordPromptMode::new(retry)),
@@ -471,7 +471,10 @@ mod tests {
     use extui::event::{KeyEvent, MouseEvent};
 
     use super::*;
-    use crate::{bindings, config::Config, tui::modes::ServerListMode};
+    use crate::{
+        bindings, client_channel::TransportWarningTarget, config::Config,
+        tui::modes::ServerListMode,
+    };
 
     struct OverlayMode;
 
@@ -620,7 +623,7 @@ mod tests {
                 TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                     OverlaySpec::TransportEncryptionWarning {
                         label: "legacy".to_string(),
-                        generation: 17,
+                        target: TransportWarningTarget::Connection { generation: 17 },
                     },
                 ))),
             );

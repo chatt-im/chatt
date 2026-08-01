@@ -27,6 +27,8 @@ mod mls_e2e_test;
 mod mls_scenario_test;
 pub mod network;
 pub mod packet_log;
+#[cfg(test)]
+mod pairing_test;
 mod paths;
 mod receive_store;
 mod room_catalog;
