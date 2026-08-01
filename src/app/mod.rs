@@ -2342,72 +2342,82 @@ impl App {
         value
     }
 
-    /// Applies a CLI-driven screencast command: spawns capture and the publisher
-    /// for `Start`, or tears the active share down for `Stop`.
+    /// Applies a CLI-driven screencast command. `Start` replaces any active
+    /// share, while `Toggle` stops an active share or otherwise starts one.
     fn handle_screencast_command(&mut self, command: local_control::ScreencastCommand) {
         match command {
             local_control::ScreencastCommand::Start { argv, hevc } => {
+                self.start_screencast(argv, hevc);
+            }
+            local_control::ScreencastCommand::Toggle { argv, hevc } => {
                 if self.screencast.is_some() {
-                    self.set_error("a screen share is already active");
+                    self.stop_screencast_to_off();
                     return;
                 }
-                if self.room.voice_room.is_none() {
-                    self.fail_screencast_start("join a voice call before sharing");
-                    return;
-                }
-                let Some(network) = &self.network else {
-                    self.fail_screencast_start("connect before sharing your screen");
-                    return;
-                };
-                let codec = if hevc {
-                    rpc::bitstream::Codec::Hevc
-                } else {
-                    rpc::bitstream::Codec::H264
-                };
-                let argv = if !argv.is_empty() {
-                    argv
-                } else if hevc {
-                    crate::video::capture::hevc_ffmpeg_argv()
-                } else {
-                    crate::video::capture::default_ffmpeg_argv()
-                };
-                let cached_start = CachedScreencastStart {
-                    argv: argv.clone(),
-                    hevc,
-                };
-                let video_fanout = self.video_fanout.clone();
-                let events = self.events.sender();
-                let Some(video_transport) = self.video_transport else {
-                    self.fail_screencast_start(
-                        "screen share failed: video transport is not ready".to_string(),
-                    );
-                    return;
-                };
-                self.next_share_attempt_id = self.next_share_attempt_id.wrapping_add(1).max(1);
-                let attempt_id = ShareAttemptId(self.next_share_attempt_id);
-                match crate::video::start_screencast(
-                    attempt_id,
-                    argv,
-                    codec,
-                    network.sender(),
-                    video_transport,
-                    video_fanout,
-                    events,
-                ) {
-                    Ok(handle) => {
-                        self.room.screencast_status.start();
-                        self.screencast = Some(handle);
-                        self.cached_screencast_start = Some(cached_start);
-                        self.set_status("starting screen share");
-                    }
-                    Err(error) => {
-                        self.fail_screencast_start(format!("screen share failed: {error}"))
-                    }
-                }
+                self.start_screencast(argv, hevc);
             }
             local_control::ScreencastCommand::Stop => {
                 self.stop_screencast_to_off();
             }
+        }
+    }
+
+    fn start_screencast(&mut self, argv: Vec<String>, hevc: bool) {
+        if self.screencast.is_some() {
+            self.teardown_own_share(true);
+        }
+        if self.room.voice_room.is_none() {
+            self.fail_screencast_start("join a voice call before sharing");
+            return;
+        }
+        let Some(network) = &self.network else {
+            self.fail_screencast_start("connect before sharing your screen");
+            return;
+        };
+        let network_sender = network.sender();
+        let Some(video_transport) = self.video_transport else {
+            self.fail_screencast_start(
+                "screen share failed: video transport is not ready".to_string(),
+            );
+            return;
+        };
+        let codec = if hevc {
+            rpc::bitstream::Codec::Hevc
+        } else {
+            rpc::bitstream::Codec::H264
+        };
+        let argv = if !argv.is_empty() {
+            argv
+        } else if hevc {
+            crate::video::capture::hevc_ffmpeg_argv()
+        } else {
+            crate::video::capture::default_ffmpeg_argv()
+        };
+        let cached_start = CachedScreencastStart {
+            argv: argv.clone(),
+            hevc,
+        };
+        let video_fanout = self.video_fanout.clone();
+        let events = self.events.sender();
+
+        self.next_share_attempt_id = self.next_share_attempt_id.wrapping_add(1).max(1);
+        let attempt_id = ShareAttemptId(self.next_share_attempt_id);
+        match crate::video::start_screencast(
+            attempt_id,
+            argv,
+            codec,
+            network_sender,
+            video_transport,
+            video_fanout,
+            events,
+        ) {
+            Ok(handle) => {
+                self.room.screencast_status.start();
+                self.screencast = Some(handle);
+                self.cached_screencast_start = Some(cached_start);
+                self.set_status("starting screen share");
+            }
+            Err(error) => self.fail_screencast_start(format!("screen share failed: {error}")),
         }
     }
 
@@ -12321,6 +12331,97 @@ mod tests {
             Some("join a voice call before sharing")
         );
         assert_eq!(app.view.status.kind(), StatusKind::Error);
+    }
+
+    #[test]
+    fn screencast_start_replaces_the_active_share() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.room.voice_room = Some(RoomId(1));
+        app.video_transport = Some(crate::video::VideoTransport::new(
+            "127.0.0.1:1".parse().unwrap(),
+            rpc::crypto::TransportMode::Encrypted,
+            [0u8; rpc::crypto::KEY_LEN],
+        ));
+        app.screencast = Some(crate::video::ScreencastHandle::for_test(ShareAttemptId(1)));
+        let old_stream_id = StreamId(7);
+        app.screencast_stream_id = Some(old_stream_id);
+        app.room
+            .screencast_status
+            .live(old_stream_id, "h264".to_string(), 1280, 720);
+        let missing = format!(
+            "/tmp/chatt-missing-replacement-video-command-{}",
+            std::process::id()
+        );
+
+        app.handle_screencast_command(local_control::ScreencastCommand::Start {
+            argv: vec![missing.clone()],
+            hevc: false,
+        });
+
+        assert!(app.screencast.is_none());
+        assert_eq!(app.screencast_stream_id, None);
+        assert_eq!(app.room.screencast_status.phase, ScreencastPhase::Failed);
+        assert!(
+            app.room
+                .screencast_status
+                .last_issue
+                .as_ref()
+                .is_some_and(|issue| issue.reason.contains(&missing)),
+            "the replacement capture command should have been attempted"
+        );
+        match rx.try_recv().expect("old share stop command") {
+            NetworkCommand::StopShare { stream_id } => assert_eq!(stream_id, old_stream_id),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn screencast_toggle_stops_an_active_share_and_ignores_the_command() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.screencast = Some(crate::video::ScreencastHandle::for_test(ShareAttemptId(1)));
+        let stream_id = StreamId(8);
+        app.screencast_stream_id = Some(stream_id);
+        app.room
+            .screencast_status
+            .live(stream_id, "h264".to_string(), 1280, 720);
+
+        app.handle_screencast_command(local_control::ScreencastCommand::Toggle {
+            argv: vec!["/command/must/not/run".to_string()],
+            hevc: true,
+        });
+
+        assert!(app.screencast.is_none());
+        assert_eq!(app.screencast_stream_id, None);
+        assert_eq!(app.room.screencast_status.phase, ScreencastPhase::Off);
+        assert_eq!(app.view.status.text(), "video off");
+        match rx.try_recv().expect("share stop command") {
+            NetworkCommand::StopShare { stream_id: stopped } => assert_eq!(stopped, stream_id),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn screencast_toggle_without_an_active_share_behaves_like_start() {
+        let mut app = test_app();
+
+        app.handle_screencast_command(local_control::ScreencastCommand::Toggle {
+            argv: Vec::new(),
+            hevc: false,
+        });
+
+        assert_eq!(app.room.screencast_status.phase, ScreencastPhase::Failed);
+        assert_eq!(
+            app.room
+                .screencast_status
+                .last_issue
+                .as_ref()
+                .map(|issue| issue.reason.as_str()),
+            Some("join a voice call before sharing")
+        );
     }
 
     #[test]
