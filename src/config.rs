@@ -154,6 +154,24 @@ impl ServerEntry {
             && self.history == other.history
     }
 
+    /// Whether `other` carries the same values for every field the live session
+    /// was established with.
+    ///
+    /// These reach the network worker once, at connect: it holds the credential,
+    /// the addresses and the transport requirement it started with, and the
+    /// history store was opened from this entry. Editing any of them on the
+    /// connected server changes nothing until the next connect. The download
+    /// overrides are excluded because a save pushes those to the running worker.
+    pub fn connection_fields_eq(&self, other: &Self) -> bool {
+        self.username == other.username
+            && self.tcp_addr == other.tcp_addr
+            && self.udp_addr == other.udp_addr
+            && self.udp_probe_addr == other.udp_probe_addr
+            && self.token == other.token
+            && self.require_transport_encryption == other.require_transport_encryption
+            && self.history == other.history
+    }
+
     pub fn client_config(
         &self,
         config: &Config,
@@ -1830,7 +1848,10 @@ impl Config {
             if let Err(error) = validate_server_label(label) {
                 out.push(Diag::error(format!("server {label}: {error}")));
             }
-            if let Err(error) = validate_non_empty(&server.token, "token") {
+            if let Err(error) = validate_token(&server.token) {
+                out.push(Diag::error(format!("server {label}: {error}")));
+            }
+            if let Err(error) = validate_server_public_key(&server.server_public_key) {
                 out.push(Diag::error(format!("server {label}: {error}")));
             }
             if let Err(error) = validate_non_empty(&server.username, "username") {
@@ -2446,7 +2467,8 @@ pub fn validate_username(username: &str) -> Result<(), String> {
 
 pub fn validate_server_entry(server: &ServerEntry) -> Result<(), String> {
     validate_server_label(&server.label)?;
-    validate_non_empty(&server.token, "token")?;
+    validate_token(&server.token)?;
+    validate_server_public_key(&server.server_public_key)?;
     validate_username(&server.username)?;
     validate_endpoint(&server.tcp_addr, "tcp-addr")?;
     validate_endpoint(&server.effective_udp_addr(), "udp-addr")?;
@@ -2454,6 +2476,56 @@ pub fn validate_server_entry(server: &ServerEntry) -> Result<(), String> {
         validate_endpoint(addr, "udp-probe-addr")?;
     }
     Ok(())
+}
+
+/// Checks a stored bearer token.
+///
+/// The token is opaque to the client — the server only ever compares its hash —
+/// but every form one takes is a single printable ASCII word: the hex
+/// `random_token` an invite pairing generates, a `tct1_`/`tcr1_` prefixed server
+/// credential, or an operator's plaintext user token. Whitespace or non-ASCII in
+/// a stored token is a paste accident that would otherwise surface as an
+/// authentication failure after a full handshake.
+///
+/// The control protocol refuses to send more than
+/// [`MAX_AUTH_FIELD_BYTES`](rpc::control::MAX_AUTH_FIELD_BYTES), so a longer
+/// token can never reach a server at all.
+fn validate_token(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("token is empty".to_string());
+    }
+    if value.len() > rpc::control::MAX_AUTH_FIELD_BYTES {
+        return Err(format!(
+            "token exceeds {} bytes",
+            rpc::control::MAX_AUTH_FIELD_BYTES
+        ));
+    }
+    if !value.chars().all(|ch| ch.is_ascii_graphic()) {
+        return Err(
+            "token must be printable ASCII without spaces; re-pair to replace it".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Checks a pinned server identity.
+///
+/// Empty means unpinned, which leaves the connect path trusting the presented
+/// key on first use or falling back to the dev identity. Anything else is
+/// decoded there as a hex Ed25519 key, so a value that cannot decode pins
+/// nothing and only fails once a connection is already underway.
+fn validate_server_public_key(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    rpc::crypto::ed25519_public_key_from_hex(value)
+        .map(|_| ())
+        .map_err(|_| {
+            format!(
+                "server-public-key must be {} hex characters",
+                2 * rpc::crypto::ED25519_PUBLIC_KEY_LEN
+            )
+        })
 }
 
 fn validate_endpoint(value: &str, name: &str) -> Result<(), String> {
@@ -2657,6 +2729,62 @@ server-public-key = ""
         assert_eq!(
             server.udp_probe_addr.as_deref(),
             Some("probe.example.com:54101")
+        );
+    }
+
+    /// Neither credential is editable in the app, so a malformed one can only
+    /// arrive by hand-editing the file. Both are refused where that is visible,
+    /// rather than at a handshake or in the middle of an editor frame.
+    #[test]
+    fn server_credentials_are_rejected_when_they_cannot_be_what_they_encode() {
+        let arena = Arena::new();
+        let mut doc = toml_spanner::parse(
+            r#"
+active-server = "lab"
+
+[[servers]]
+label = "lab"
+username = "Alice"
+token = "påsted tøken"
+tcp-addr = "127.0.0.1:42000"
+server-public-key = "not-a-key"
+"#,
+            &arena,
+        )
+        .unwrap();
+        let mut config: Config = doc.to().unwrap();
+        config.normalize();
+
+        let error = validation_errors(&config);
+
+        assert!(error.contains("token must be printable ASCII"), "{error}");
+        assert!(
+            error.contains("server-public-key must be 64 hex characters"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn server_credentials_accept_every_form_pairing_writes() {
+        let mut server = ServerEntry::default();
+        server.server_public_key = rpc::crypto::encode_hex(&rpc::crypto::dev_server_public_key());
+        for token in [
+            "alice-dev-token".to_string(),
+            "ab".repeat(32),
+            format!(
+                "{}{}",
+                rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX,
+                "cd".repeat(32)
+            ),
+            format!("{}{}", rpc::crypto::DYNAMIC_TOKEN_PREFIX, "ef".repeat(48)),
+        ] {
+            server.token = token.clone();
+            assert!(validate_server_entry(&server).is_ok(), "{token}");
+        }
+        server.server_public_key = String::new();
+        assert!(
+            validate_server_entry(&server).is_ok(),
+            "an unpinned key stays valid"
         );
     }
 
