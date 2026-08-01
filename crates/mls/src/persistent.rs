@@ -105,6 +105,9 @@ pub struct DurableFileUpload {
     pub event_id: EventId,
     pub source_path: Vec<u8>,
     pub delete_after_upload: bool,
+    /// Inline upload bytes for sources that never touched the filesystem.
+    #[jsony(version = 1)]
+    pub source_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -718,6 +721,7 @@ impl PersistentClient {
         event: MlsChattEvent,
         source_path: Vec<u8>,
         delete_after_upload: bool,
+        source_bytes: Option<Vec<u8>>,
     ) -> Result<(), String> {
         if !matches!(event.content, rpc::mls::ChattEventContent::File(_)) {
             return Err("durable file upload requires an MLS file event".to_string());
@@ -727,6 +731,7 @@ impl PersistentClient {
             event_id: event.event_id,
             source_path,
             delete_after_upload,
+            source_bytes,
         };
         self.queue_outgoing_with(event, Some(upload))
     }

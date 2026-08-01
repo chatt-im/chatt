@@ -18,7 +18,7 @@ use local_rpc::{
 fn renderer_and_daemon_exchange_protocol_v14_frames_and_live_share_fd() {
     assert_eq!(PROTOCOL_MIN_VERSION, 14);
     assert_eq!(PROTOCOL_MAX_VERSION, 14);
-    assert_eq!(MAX_MESSAGE_BODY_BYTES, 8 * 1024);
+    assert_eq!(MAX_MESSAGE_BODY_BYTES, 16 * 1024);
     assert_eq!(DEFAULT_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
     assert_eq!(MAX_HISTORY_REQUEST_MESSAGES, 500);
 

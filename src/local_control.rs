@@ -1,3 +1,7 @@
+pub(crate) const MAX_INLINE_SEND_BYTES: usize =
+    rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES as usize;
+pub(crate) const OVERSIZED_MESSAGE_FILE_NAME: &str = "message.md";
+
 #[cfg(unix)]
 mod imp {
     use std::{
@@ -40,11 +44,14 @@ mod imp {
     const OP_CONFIG_PATH: u8 = 8;
     const OP_ATTACH: u8 = 9;
     const OP_SEND_MESSAGE: u8 = 11;
+    const OP_UPLOAD_BYTES: u8 = 12;
     const SCREENCAST_START: u8 = 0;
     const SCREENCAST_STOP: u8 = 1;
     const STATUS_OK: u8 = 0;
     const STATUS_ERROR: u8 = 1;
     const MAX_PATH_BYTES: u32 = 64 * 1024;
+    const MAX_CONTROL_REQUEST_BYTES: u32 =
+        super::MAX_INLINE_SEND_BYTES as u32 + local_rpc::MAX_STRING_BYTES as u32;
     const MAX_RESPONSE_BYTES: u32 = 256 * 1024;
     const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
     /// Poll interval for `client-logs --follow` streaming.
@@ -440,19 +447,38 @@ mod imp {
         if body.trim().is_empty() {
             return Err("chat message is empty".to_string());
         }
-        if body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
+        if body.len() > super::MAX_INLINE_SEND_BYTES {
             return Err(format!(
-                "chat message is {} bytes; maximum is {} bytes",
+                "message input is {} bytes; maximum inline upload is {} bytes",
                 body.len(),
-                rpc::control::MAX_CHAT_BODY_BYTES
+                super::MAX_INLINE_SEND_BYTES
             ));
+        }
+        let socket_path = socket_path()?;
+        send_message_or_upload_to_path(&socket_path, body, room)
+    }
+
+    fn send_message_or_upload_to_path(
+        socket_path: &Path,
+        body: &str,
+        room: Option<&str>,
+    ) -> Result<String, String> {
+        let room = control_room_selector(room)?;
+        if body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
+            return send_upload_bytes_to_path(
+                socket_path,
+                &UploadBytesRequest {
+                    name: super::OVERSIZED_MESSAGE_FILE_NAME.to_string(),
+                    bytes: body.as_bytes().to_vec(),
+                    room,
+                },
+            );
         }
         let request = SendMessageRequest {
             body: body.to_string(),
-            room: control_room_selector(room)?,
+            room,
         };
-        let socket_path = socket_path()?;
-        send_message_to_path(&socket_path, &request)
+        send_message_to_path(socket_path, &request)
     }
 
     fn send_message_to_path(
@@ -636,6 +662,14 @@ mod imp {
 
     #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
     #[jsony(Binary, version)]
+    struct UploadBytesRequest {
+        name: String,
+        bytes: Vec<u8>,
+        room: Option<String>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+    #[jsony(Binary, version)]
     struct SendMessageRequest {
         body: String,
         room: Option<String>,
@@ -643,7 +677,10 @@ mod imp {
 
     #[derive(Debug)]
     enum Request {
-        Upload { path: PathBuf, room: Option<String> },
+        Upload {
+            request: UploadFileRequest,
+            room: Option<String>,
+        },
         SendMessage(SendMessageRequest),
         Voice(VoiceCommand),
         Screencast(ScreencastCommand),
@@ -1003,10 +1040,10 @@ mod imp {
                     },
                 }
             }
-            Ok((Request::Upload { path, room }, _)) => {
+            Ok((Request::Upload { request, room }, _)) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
                 match events.send(crate::app::AppEvent::Upload {
-                    request: UploadFileRequest::new(path),
+                    request,
                     room,
                     reply: reply_tx,
                 }) {
@@ -1289,8 +1326,10 @@ mod imp {
     ) -> Result<(), String> {
         let len = u32::try_from(body.len())
             .map_err(|_| "control request is too long for control socket".to_string())?;
-        if len > MAX_PATH_BYTES {
-            return Err(format!("control request exceeds {MAX_PATH_BYTES} bytes"));
+        if len > MAX_CONTROL_REQUEST_BYTES {
+            return Err(format!(
+                "control request exceeds {MAX_CONTROL_REQUEST_BYTES} bytes"
+            ));
         }
         let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + body.len());
         frame.extend_from_slice(MAGIC);
@@ -1341,9 +1380,9 @@ mod imp {
             .try_into()
             .expect("fixed control prefix has five-byte header");
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-        if len > MAX_PATH_BYTES {
+        if len > MAX_CONTROL_REQUEST_BYTES {
             return Err(format!(
-                "control request path exceeds {MAX_PATH_BYTES} bytes"
+                "control request exceeds {MAX_CONTROL_REQUEST_BYTES} bytes"
             ));
         }
 
@@ -1356,9 +1395,26 @@ mod imp {
             OP_UPLOAD => {
                 let upload: UploadRequest = jsony::from_binary(&body)
                     .map_err(|error| format!("invalid upload request: {error}"))?;
+                if upload.path.len() > MAX_PATH_BYTES as usize {
+                    return Err(format!("upload path exceeds {MAX_PATH_BYTES} bytes"));
+                }
                 let room = control_room_selector(upload.room.as_deref())?;
                 Ok(Request::Upload {
-                    path: PathBuf::from(std::ffi::OsString::from_vec(upload.path)),
+                    request: UploadFileRequest::new(PathBuf::from(
+                        std::ffi::OsString::from_vec(upload.path),
+                    )),
+                    room,
+                })
+            }
+            OP_UPLOAD_BYTES => {
+                let upload: UploadBytesRequest = jsony::from_binary(&body)
+                    .map_err(|error| format!("invalid inline upload request: {error}"))?;
+                if upload.bytes.len() > super::MAX_INLINE_SEND_BYTES {
+                    return Err("inline upload exceeds file size limit".to_string());
+                }
+                let room = control_room_selector(upload.room.as_deref())?;
+                Ok(Request::Upload {
+                    request: UploadFileRequest::from_bytes(upload.name, upload.bytes),
                     room,
                 })
             }
@@ -1369,7 +1425,7 @@ mod imp {
                     return Err("chat message is empty".to_string());
                 }
                 if message.body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
-                    return Err("chat message exceeds maximum length".to_string());
+                    return Err("chat message exceeds message size limit".to_string());
                 }
                 let room = control_room_selector(message.room.as_deref())?;
                 Ok(Request::SendMessage(SendMessageRequest {
@@ -1415,7 +1471,43 @@ mod imp {
         stream: &mut UnixStream,
         request: &SendMessageRequest,
     ) -> Result<(), String> {
+        if request.body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
+            return Err("chat message exceeds message size limit".to_string());
+        }
         write_simple_request(stream, OP_SEND_MESSAGE, &jsony::to_binary(request))
+    }
+
+    fn send_upload_bytes_to_path(
+        socket_path: &Path,
+        request: &UploadBytesRequest,
+    ) -> Result<String, String> {
+        if request.bytes.len() > super::MAX_INLINE_SEND_BYTES {
+            return Err(format!(
+                "inline upload is {} bytes; maximum is {} bytes",
+                request.bytes.len(),
+                super::MAX_INLINE_SEND_BYTES
+            ));
+        }
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+
+        write_simple_request(&mut stream, OP_UPLOAD_BYTES, &jsony::to_binary(request))?;
+        let response = read_response(&mut stream)?;
+        match response.status {
+            STATUS_OK => Ok(response.message),
+            STATUS_ERROR => Err(response.message),
+            status => Err(format!("control socket returned unknown status {status}")),
+        }
     }
 
     fn write_voice_request(stream: &mut UnixStream, command: VoiceCommand) -> Result<(), String> {
@@ -1739,9 +1831,37 @@ mod imp {
             let request = read_request(&mut reader).unwrap();
 
             match request {
-                Request::Upload { path: actual, room } => {
-                    assert_eq!(actual, path);
+                Request::Upload { request, room } => {
+                    assert_eq!(request.path, path);
+                    assert!(request.inline_bytes.is_none());
                     assert_eq!(room.as_deref(), Some("@alice"));
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn inline_upload_request_round_trips_bytes_without_a_path() {
+            let upload = UploadBytesRequest {
+                name: "message.md".to_string(),
+                bytes: b"oversized markdown body".to_vec(),
+                room: Some("lobby".to_string()),
+            };
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+
+            write_simple_request(
+                &mut writer,
+                OP_UPLOAD_BYTES,
+                &jsony::to_binary(&upload),
+            )
+            .unwrap();
+
+            match read_request(&mut reader).unwrap() {
+                Request::Upload { request, room } => {
+                    assert!(request.path.as_os_str().is_empty());
+                    assert_eq!(request.name_override.as_deref(), Some("message.md"));
+                    assert_eq!(request.inline_bytes.as_deref(), Some(upload.bytes.as_slice()));
+                    assert_eq!(room.as_deref(), Some("lobby"));
                 }
                 other => panic!("unexpected request: {other:?}"),
             }
@@ -1761,6 +1881,17 @@ mod imp {
                 read_request(&mut reader).unwrap(),
                 Request::SendMessage(actual) if actual == message
             ));
+        }
+
+        #[test]
+        fn send_message_rpc_rejects_body_over_chat_cap() {
+            let message = SendMessageRequest {
+                body: "x".repeat(rpc::control::MAX_CHAT_BODY_BYTES + 1),
+                room: None,
+            };
+            let (mut writer, _reader) = UnixStream::pair().unwrap();
+
+            assert!(write_send_message_request(&mut writer, &message).is_err());
         }
 
         #[test]
@@ -2100,6 +2231,44 @@ mod imp {
                 _ => panic!("unexpected event"),
             }
             assert_eq!(handle.join().unwrap().unwrap(), "queued message to @alice");
+
+            drop(socket);
+            assert!(!socket_path.exists());
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn oversized_send_uses_inline_markdown_upload_rpc() {
+            let dir = temp_test_dir("send-message-upload");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let (events_tx, events_rx) = mpsc::channel();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(events_tx)).unwrap();
+            let body = "x".repeat(rpc::control::MAX_CHAT_BODY_BYTES + 1);
+
+            let send_path = socket_path.clone();
+            let sent_body = body.clone();
+            let handle = thread::spawn(move || {
+                send_message_or_upload_to_path(&send_path, &sent_body, Some("lobby"))
+            });
+            match events_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                crate::app::AppEvent::Upload {
+                    request,
+                    room,
+                    reply,
+                } => {
+                    assert!(request.path.as_os_str().is_empty());
+                    assert_eq!(request.name_override.as_deref(), Some("message.md"));
+                    assert_eq!(request.inline_bytes.as_deref(), Some(body.as_bytes()));
+                    assert_eq!(room.as_deref(), Some("lobby"));
+                    reply
+                        .send(Ok("queued upload message.md".to_string()))
+                        .unwrap();
+                }
+                _ => panic!("unexpected event"),
+            }
+            assert_eq!(handle.join().unwrap().unwrap(), "queued upload message.md");
 
             drop(socket);
             assert!(!socket_path.exists());

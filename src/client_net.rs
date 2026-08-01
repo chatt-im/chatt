@@ -378,17 +378,20 @@ impl FilePolicy {
     }
 }
 
-/// A request to upload a file to the current room.
+/// A request to upload a file or caller-owned in-memory bytes to a room.
 ///
 /// `name_override` supplies the uploaded name when the source path name is not
-/// what the user wants shown (e.g. a staged clipboard temp file). `path` is
-/// still validated and streamed as-is. `delete_after_open` removes the source
-/// after the upload handle is opened, used to clean up staged temp files.
+/// what the user wants shown (e.g. a staged clipboard temp file). When
+/// `inline_bytes` is present, `path` is unused and the bytes remain in memory
+/// through the upload pipeline. Otherwise `path` is validated and streamed
+/// as-is. `delete_after_open` removes a path source after its upload handle is
+/// opened, used to clean up staged temp files.
 #[derive(Debug)]
 pub struct UploadFileRequest {
     pub path: PathBuf,
     pub name_override: Option<String>,
     pub delete_after_open: bool,
+    pub inline_bytes: Option<Vec<u8>>,
 }
 
 impl UploadFileRequest {
@@ -399,7 +402,23 @@ impl UploadFileRequest {
             path,
             name_override: None,
             delete_after_open: false,
+            inline_bytes: None,
         }
+    }
+
+    pub fn from_bytes(name: String, bytes: Vec<u8>) -> Self {
+        Self {
+            path: PathBuf::new(),
+            name_override: Some(name),
+            delete_after_open: false,
+            inline_bytes: Some(bytes),
+        }
+    }
+
+    pub(crate) fn queued_label(&self) -> String {
+        self.name_override
+            .clone()
+            .unwrap_or_else(|| self.path.display().to_string())
     }
 }
 
@@ -2570,7 +2589,9 @@ struct OutgoingUpload {
     room_id: RoomId,
     name: String,
     size: u64,
-    file: File,
+    file: Option<File>,
+    /// Caller-owned bytes for an upload that never touched the filesystem.
+    source_bytes: Option<Vec<u8>>,
     /// Source path retained for durable encrypted-upload recovery. A staged
     /// source is deleted with its durable intent unless it becomes the local
     /// frontend fallback.
@@ -2731,10 +2752,21 @@ impl UploadBody {
     }
 }
 
-/// A sender-owned source reserved for local frontend access after its upload
-/// completes. Staged sources are deleted if the upload fails before commit and
-/// become store-owned after commit; ordinary user files are never deleted.
-struct PendingUploadSource {
+/// A sender-owned source retained for local frontend access after its upload
+/// completes. It may be a user/staged path or bytes that never touched disk.
+enum PendingUploadSource {
+    Disk(PendingDiskUploadSource),
+    Memory {
+        store: crate::receive_store::DownloadStore,
+        bytes: Vec<u8>,
+        requested_name: String,
+    },
+}
+
+/// Path-backed fallback ownership. Staged sources are deleted if the upload
+/// fails before commit and become store-owned after commit; ordinary user files
+/// are never deleted.
+struct PendingDiskUploadSource {
     store: crate::receive_store::DownloadStore,
     path: PathBuf,
     requested_name: String,
@@ -2743,6 +2775,38 @@ struct PendingUploadSource {
 }
 
 impl PendingUploadSource {
+    fn commit(self) -> Result<LocalFileLocation, String> {
+        match self {
+            Self::Disk(source) => source.commit().map(LocalFileLocation::Disk),
+            Self::Memory {
+                store,
+                bytes,
+                requested_name,
+            } => {
+                let reservation = store.reserve(bytes.len() as u64).ok_or_else(|| {
+                    format!(
+                        "could not reserve memory for local upload {requested_name}"
+                    )
+                })?;
+                let name = store
+                    .insert_reserved(reservation, &requested_name, bytes)
+                    .ok_or_else(|| {
+                        format!("could not keep {requested_name} in the in-memory download buffer")
+                    })?;
+                Ok(LocalFileLocation::Memory(name))
+            }
+        }
+    }
+
+    fn retain_for_durable_restore(&mut self) {
+        if let Self::Disk(source) = self {
+            source.remove_on_drop = false;
+            source.owned_on_commit = true;
+        }
+    }
+}
+
+impl PendingDiskUploadSource {
     fn commit(mut self) -> Result<String, String> {
         let reservation = crate::receive_store::allocate_name(&self.requested_name, |candidate| {
             self.store.reserve_disk_name(candidate.to_string())
@@ -2763,7 +2827,7 @@ impl PendingUploadSource {
     }
 }
 
-impl Drop for PendingUploadSource {
+impl Drop for PendingDiskUploadSource {
     fn drop(&mut self) {
         if self.remove_on_drop {
             let _ = fs::remove_file(&self.path);
@@ -2792,13 +2856,13 @@ fn reserve_upload_source(
     remove_on_drop: bool,
     owned_on_commit: bool,
 ) -> PendingUploadSource {
-    PendingUploadSource {
+    PendingUploadSource::Disk(PendingDiskUploadSource {
         store: store.clone(),
         path,
         requested_name: requested_name.to_string(),
         remove_on_drop,
         owned_on_commit,
-    }
+    })
 }
 
 /// Where a completed local upload copy lives, so it can be surfaced as a
@@ -3266,11 +3330,14 @@ impl WorkerState<'_> {
                 "cannot resume encrypted upload: durable announcement is not a file".to_string(),
             );
         };
-        let path = PathBuf::from(std::ffi::OsString::from_vec(intent.source_path.clone()));
-        let request = UploadFileRequest {
-            path,
-            name_override: Some(announcement.name.clone()),
-            delete_after_open: false,
+        let request = match intent.source_bytes.clone() {
+            Some(bytes) => UploadFileRequest::from_bytes(announcement.name.clone(), bytes),
+            None => UploadFileRequest {
+                path: PathBuf::from(std::ffi::OsString::from_vec(intent.source_path.clone())),
+                name_override: Some(announcement.name.clone()),
+                delete_after_open: false,
+                inline_bytes: None,
+            },
         };
         let mut upload = self.prepare_file_upload(Some(intent.room_id), request)?;
         let Some(seal) = upload.seal.as_mut() else {
@@ -3298,8 +3365,7 @@ impl WorkerState<'_> {
         if intent.delete_after_upload
             && let Some(source) = upload.fallback_source.as_mut()
         {
-            source.remove_on_drop = false;
-            source.owned_on_commit = true;
+            source.retain_for_durable_restore();
         }
         self.next_file_transfer = self
             .next_file_transfer
@@ -3908,14 +3974,27 @@ impl WorkerState<'_> {
             path,
             name_override,
             delete_after_open,
+            inline_bytes,
         } = request;
-        let metadata = fs::metadata(&path)
-            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-        if !metadata.is_file() {
-            return Err(format!("upload path is not a file: {}", path.display()));
-        }
         let limit = self.config.max_upload_bytes;
-        let size = metadata.len();
+        let (size, name, mut file, source_bytes) = match inline_bytes {
+            Some(bytes) => {
+                let size = bytes.len() as u64;
+                let name = upload_username(name_override, &path)?;
+                (size, name, None, Some(bytes))
+            }
+            None => {
+                let metadata = fs::metadata(&path)
+                    .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+                if !metadata.is_file() {
+                    return Err(format!("upload path is not a file: {}", path.display()));
+                }
+                let name = upload_username(name_override, &path)?;
+                let file = open_upload_source(&path, false)
+                    .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+                (metadata.len(), name, Some(file), None)
+            }
+        };
         if size > limit {
             return Err(format!(
                 "file is {}; limit is {}",
@@ -3923,9 +4002,6 @@ impl WorkerState<'_> {
                 format_bytes(limit)
             ));
         }
-        let name = upload_username(name_override, &path)?;
-        let mut file = open_upload_source(&path, false)
-            .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
         let mut source_prefix = Vec::new();
         let mut _probe_encoded_len = None;
         let (body, _decision) = match file_compression::fast_compression_decision(&name, size) {
@@ -3940,13 +4016,21 @@ impl WorkerState<'_> {
             FastCompressionDecision::Probe => {
                 let probe_len = usize::try_from(size.min(COMPRESSION_PROBE_BYTES as u64))
                     .expect("compression probe length fits usize");
-                source_prefix.resize(probe_len, 0);
-                file.read_exact(&mut source_prefix).map_err(|error| {
-                    format!(
-                        "failed to read compression probe for {}: {error}",
-                        path.display()
-                    )
-                })?;
+                match source_bytes.as_ref() {
+                    Some(bytes) => source_prefix.extend_from_slice(&bytes[..probe_len]),
+                    None => {
+                        source_prefix.resize(probe_len, 0);
+                        file.as_mut()
+                            .expect("path upload has an open file")
+                            .read_exact(&mut source_prefix)
+                            .map_err(|error| {
+                                format!(
+                                    "failed to read compression probe for {}: {error}",
+                                    path.display()
+                                )
+                            })?;
+                    }
+                }
                 match file_compression::compressed_probe_len(&source_prefix) {
                     Ok(encoded_len) => {
                         _probe_encoded_len = Some(encoded_len);
@@ -3994,18 +4078,28 @@ impl WorkerState<'_> {
             .or(self.active_room)
             .ok_or_else(|| "no active room for upload".to_string())?;
         let seal = if self.room_requires_mls(room_id) {
-            let digest = file_sha256(&path)?;
+            let digest = match source_bytes.as_ref() {
+                Some(bytes) => bytes_sha256(bytes),
+                None => file_sha256(&path)?,
+            };
             self.prepare_upload_seal(room_id, body.encoding(), digest)?
         } else {
             None
         };
-        let fallback_source = reserve_upload_source(
-            &self.config.download_store,
-            path.clone(),
-            &name,
-            delete_after_open && seal.is_none(),
-            delete_after_open,
-        );
+        let fallback_source = match source_bytes.as_ref() {
+            Some(bytes) => PendingUploadSource::Memory {
+                store: self.config.download_store.clone(),
+                bytes: bytes.clone(),
+                requested_name: name.clone(),
+            },
+            None => reserve_upload_source(
+                &self.config.download_store,
+                path.clone(),
+                &name,
+                delete_after_open && seal.is_none(),
+                delete_after_open,
+            ),
+        };
         Ok(OutgoingUpload {
             transfer_id,
             server_metadata: None,
@@ -4013,6 +4107,7 @@ impl WorkerState<'_> {
             name,
             size,
             file,
+            source_bytes,
             source_path: path.clone(),
             delete_source_when_done: delete_after_open && seal.is_some(),
             source_offset: 0,
@@ -4093,6 +4188,7 @@ impl WorkerState<'_> {
             announcement,
             source_path: upload.source_path.as_os_str().as_bytes().to_vec(),
             delete_after_upload: upload.delete_source_when_done,
+            source_bytes: upload.source_bytes.clone(),
         }))
     }
 
@@ -4696,8 +4792,8 @@ impl WorkerState<'_> {
                 let Some(source) = upload.fallback_source.take() else {
                     return;
                 };
-                let name = match source.commit() {
-                    Ok(name) => name,
+                let location = match source.commit() {
+                    Ok(location) => location,
                     Err(error) => {
                         let _ = self.events.send(NetworkEvent::Error(error));
                         return;
@@ -4706,7 +4802,7 @@ impl WorkerState<'_> {
                 // A durable staged source has become store-owned, so the MLS
                 // completion record must no longer delete it.
                 upload.delete_source_when_done = false;
-                LocalFileLocation::Disk(name)
+                location
             }
         };
         if let Some(metadata) = upload.server_metadata.take() {
@@ -6117,8 +6213,20 @@ fn read_upload_source(upload: &mut OutgoingUpload, limit: usize) -> io::Result<V
         return Ok(data);
     }
 
+    if let Some(bytes) = upload.source_bytes.as_ref() {
+        let start = usize::try_from(upload.source_offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let end = start.saturating_add(limit).min(bytes.len());
+        return Ok(bytes[start..end].to_vec());
+    }
+
     let mut data = vec![0; limit];
-    let read = upload.file.read(&mut data)?;
+    let read = upload
+        .file
+        .as_mut()
+        .expect("path upload has an open file")
+        .read(&mut data)?;
     data.truncate(read);
     Ok(data)
 }
@@ -6499,6 +6607,13 @@ fn file_sha256(path: &Path) -> Result<[u8; 32], String> {
         context.update(&buffer[..read]);
     }
     Ok(context.finish().as_ref().try_into().unwrap())
+}
+
+fn bytes_sha256(bytes: &[u8]) -> [u8; 32] {
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 length")
 }
 
 pub(crate) fn sanitize_file_name(name: &str) -> String {
@@ -8118,7 +8233,8 @@ mod tests {
             room_id: RoomId(1),
             name: "sealed.bin".to_string(),
             size: 0,
-            file: source,
+            file: Some(source),
+            source_bytes: None,
             source_path: PathBuf::new(),
             delete_source_when_done: false,
             source_offset: 0,
@@ -8174,7 +8290,8 @@ mod tests {
             room_id: RoomId(1),
             name: "source.bin".to_string(),
             size: data.len() as u64,
-            file,
+            file: Some(file),
+            source_bytes: None,
             source_path: PathBuf::new(),
             delete_source_when_done: false,
             source_offset: 0,
@@ -8202,6 +8319,50 @@ mod tests {
     }
 
     #[test]
+    fn inline_upload_source_reads_from_memory_after_retained_probe() {
+        let data = b"# oversized message\n\nmarkdown body\n".repeat(1_000);
+        let prefix_len = 4096;
+        let mut upload = OutgoingUpload {
+            seal: None,
+            transfer_id: FileTransferId(1),
+            server_metadata: None,
+            room_id: RoomId(1),
+            name: "message.md".to_string(),
+            size: data.len() as u64,
+            file: None,
+            source_bytes: Some(data.clone()),
+            source_path: PathBuf::new(),
+            delete_source_when_done: false,
+            source_offset: 0,
+            source_read_ahead: 0,
+            wire_offset: 0,
+            source_prefix: data[..prefix_len].to_vec(),
+            source_prefix_offset: 0,
+            body: UploadBody::Identity(PendingWire::default()),
+            source_finished: false,
+            encoder_finished: false,
+            started: false,
+            next_status_at: FILE_PROGRESS_STEP_BYTES,
+            local_copy: None,
+            fallback_source: None,
+            dimensions: None,
+            image_prefix: Vec::new(),
+        };
+
+        let mut read_back = Vec::new();
+        while read_back.len() < data.len() {
+            let chunk = read_upload_source(&mut upload, 997).unwrap();
+            assert!(!chunk.is_empty());
+            upload.source_offset += chunk.len() as u64;
+            read_back.extend_from_slice(&chunk);
+        }
+
+        assert!(upload.file.is_none());
+        assert!(upload.source_path.as_os_str().is_empty());
+        assert_eq!(read_back, data);
+    }
+
+    #[test]
     fn compressed_upload_local_copy_stays_uncompressed() {
         let raw = b"local raw upload bytes".repeat(10_000);
         let dir = tempfile::tempdir().unwrap();
@@ -8215,7 +8376,8 @@ mod tests {
             room_id: RoomId(1),
             name: "source.bin".to_string(),
             size: raw.len() as u64,
-            file: File::open(source_path).unwrap(),
+            file: Some(File::open(source_path).unwrap()),
+            source_bytes: None,
             source_path: PathBuf::new(),
             delete_source_when_done: false,
             source_offset: 0,
@@ -8268,7 +8430,8 @@ mod tests {
             room_id: RoomId(1),
             name: "source.bin".to_string(),
             size: 16 * 1024 * 1024,
-            file: File::open(source_path).unwrap(),
+            file: Some(File::open(source_path).unwrap()),
+            source_bytes: None,
             source_path: PathBuf::new(),
             delete_source_when_done: false,
             source_offset: 0,
@@ -8360,7 +8523,8 @@ mod tests {
             room_id: RoomId(1),
             name: "report.pdf".to_string(),
             size: 10,
-            file,
+            file: Some(file),
+            source_bytes: None,
             source_path: PathBuf::new(),
             delete_source_when_done: false,
             source_offset: 0,
@@ -8454,7 +8618,11 @@ mod tests {
         assert!(store.reserve(path.metadata().unwrap().len()).is_none());
 
         let source = reserve_upload_source(&store, path.clone(), "clip.mp4", false, false);
-        let served_name = source.commit().expect("register original upload source");
+        let LocalFileLocation::Disk(served_name) =
+            source.commit().expect("register original upload source")
+        else {
+            panic!("path fallback should remain disk-backed")
+        };
 
         let metadata = store
             .attachment_metadata(&served_name)

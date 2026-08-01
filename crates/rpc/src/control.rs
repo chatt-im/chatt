@@ -6,7 +6,7 @@ use crate::ids::{
 };
 
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 224 * 1024;
-pub const MAX_CHAT_BODY_BYTES: usize = 8 * 1024;
+pub const MAX_CHAT_BODY_BYTES: usize = 16 * 1024;
 pub const DEFAULT_FILE_SIZE_LIMIT_BYTES: u64 = 50 * 1024 * 1024; // default file size limit when unconfigured
 /// Payload bytes carried by one `UploadFileChunk`/`BugReportChunk`. Sized so the
 /// encoded control message plus transport header, AEAD tag, and length prefix
