@@ -5,6 +5,7 @@ use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::{
     app::room::{HistoryDelta, Revision, RoomHistoryRef},
     chat_buffer::{ChatViewport, HistoryEntryId},
+    tui::editor::single_line_paste,
 };
 
 #[derive(Debug)]
@@ -420,6 +421,25 @@ impl HistorySearch {
         }
         self.follow_selection(chat, history, width, height);
         SearchAction::Continue
+    }
+
+    pub(crate) fn paste(
+        &mut self,
+        chat: &mut ChatViewport,
+        history: &RoomHistoryRef<'_>,
+        text: &str,
+        width: u16,
+        height: u16,
+    ) {
+        let text = single_line_paste(text);
+        if text.is_empty() {
+            return;
+        }
+        self.sync(chat, history);
+        let nearest = self.selected_entry().or(self.anchor);
+        self.query.push_str(&text);
+        self.refresh(nearest);
+        self.follow_selection(chat, history, width, height);
     }
 
     pub(crate) fn follow_selection(

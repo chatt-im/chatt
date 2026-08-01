@@ -1,5 +1,6 @@
 use extui::event::{KeyEvent, MouseEvent};
 use extui::{Buffer, Rect};
+use extui_editor::Mode as EditorMode;
 use unicode_width::UnicodeWidthStr;
 use zeroize::Zeroize;
 
@@ -173,6 +174,10 @@ impl DevicePairDialog {
             FormMouseIntent::PickerItem(_, _) => {}
         }
         DevicePairEvent::Consumed
+    }
+
+    pub(crate) fn active_editor_mode(&self) -> Option<EditorMode> {
+        self.form.active_editor_mode()
     }
 
     pub(crate) fn paste(&mut self, text: &str, theme: &Theme) {

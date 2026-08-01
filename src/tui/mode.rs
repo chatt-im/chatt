@@ -5,12 +5,14 @@ use extui::{
     event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent},
 };
 use extui_bindings::LayerId;
+use extui_editor::Mode as EditorMode;
 
 use crate::{
     app::{RoomSession, command::CoreCommand},
     client_channel::{
         BaseScreen, DirtySections, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
     },
+    clipboard_paste::{ClipboardPasteProvider, PastePayload},
     config::Config,
     theme,
     tui::{Action, view::ClientView},
@@ -147,8 +149,36 @@ pub(crate) trait AppMode: Send {
         Action::Continue
     }
 
+    /// The active text editor, when the mode wants the shared helper-backed
+    /// clipboard bindings resolved before its ordinary key handling.
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        None
+    }
+
     fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
         let _ = (cx, text);
+    }
+
+    /// Reads a helper-backed clipboard paste for a text-only control. Room
+    /// compose handles image payloads separately; every other editor rejects
+    /// them and cleans up clipboard images staged in a temporary file.
+    fn process_clipboard_paste(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        provider: &dyn ClipboardPasteProvider,
+    ) {
+        match provider.read_paste() {
+            Ok(PastePayload::Text(text)) => self.process_paste(cx, text),
+            Ok(PastePayload::Image(image)) => {
+                if image.source.is_staged() {
+                    let _ = std::fs::remove_file(image.source.path());
+                }
+                cx.set_status("clipboard does not contain text");
+            }
+            Ok(PastePayload::Empty) => cx.set_status("clipboard is empty"),
+            Ok(PastePayload::Unsupported(reason)) => cx.set_status(reason),
+            Err(error) => cx.set_error(error.to_string()),
+        }
     }
 
     fn process_client_event(&mut self, event: TerminalEvent) {
@@ -160,6 +190,83 @@ pub(crate) trait AppMode: Send {
     fn on_exit(&mut self, _cx: &mut ViewCx<'_>, _reason: ExitReason) {}
 
     fn presentation(&self, cx: &ViewCx<'_>) -> ModePresentation;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PasteBindingResolution {
+    Paste,
+    Consumed,
+    Unmatched,
+}
+
+/// Resolves the clipboard command through the same binding layer the composer
+/// uses for the editor's current mode. Other actions remain available to the
+/// owning form or dialog.
+fn resolve_paste_binding(
+    cx: &mut ViewCx<'_>,
+    key: &KeyEvent,
+    editor_mode: EditorMode,
+) -> PasteBindingResolution {
+    use crate::bindings::{self, BindCommand, Resolved};
+    use extui_bindings::InputKey;
+
+    let Some(input) = InputKey::from_event(key) else {
+        return PasteBindingResolution::Unmatched;
+    };
+    let layer = if editor_mode == EditorMode::Insert {
+        bindings::INSERT_LAYER
+    } else {
+        bindings::COMPOSE_NORMAL_LAYER
+    };
+    match bindings::resolve(
+        &cx.config.bindings.router,
+        layer,
+        &mut cx.view.chrome.binding.pending_chord,
+        input,
+    ) {
+        Resolved::Action(id)
+            if matches!(
+                cx.config.bindings.actions.get(id),
+                BindCommand::PasteClipboard
+            ) =>
+        {
+            PasteBindingResolution::Paste
+        }
+        Resolved::Consumed => PasteBindingResolution::Consumed,
+        Resolved::Action(_) | Resolved::Unmatched => PasteBindingResolution::Unmatched,
+    }
+}
+
+fn process_paste_binding(
+    mode: &mut dyn AppMode,
+    cx: &mut ViewCx<'_>,
+    key: &KeyEvent,
+    editor_mode: EditorMode,
+) -> bool {
+    process_paste_binding_with_provider(
+        mode,
+        cx,
+        key,
+        editor_mode,
+        &crate::clipboard_paste::HelperClipboard,
+    )
+}
+
+pub(crate) fn process_paste_binding_with_provider(
+    mode: &mut dyn AppMode,
+    cx: &mut ViewCx<'_>,
+    key: &KeyEvent,
+    editor_mode: EditorMode,
+    provider: &dyn ClipboardPasteProvider,
+) -> bool {
+    match resolve_paste_binding(cx, key, editor_mode) {
+        PasteBindingResolution::Paste => {
+            mode.process_clipboard_paste(cx, provider);
+            true
+        }
+        PasteBindingResolution::Consumed => true,
+        PasteBindingResolution::Unmatched => false,
+    }
 }
 
 pub(crate) enum ModeTransition {
@@ -293,7 +400,13 @@ impl ModeStack {
     }
 
     pub(crate) fn process_input_cx(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
-        self.active_mut().process_input(cx, key)
+        let active = self.active_mut();
+        if let Some(editor_mode) = active.paste_editor_mode(cx)
+            && process_paste_binding(active, cx, &key, editor_mode)
+        {
+            return Action::Continue;
+        }
+        active.process_input(cx, key)
     }
 
     pub(crate) fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
@@ -554,6 +667,105 @@ mod tests {
 
     fn app() -> TestApp {
         TestApp::new(Config::default(), None).expect("test app")
+    }
+
+    struct PasteMode(Arc<Mutex<String>>);
+
+    impl AppMode for PasteMode {
+        fn render(
+            &mut self,
+            _cx: &mut ViewCx<'_>,
+            _buf: &mut Buffer,
+            _now_ms: u64,
+            _dirty: DirtySections,
+        ) {
+        }
+
+        fn process_input(&mut self, _cx: &mut ViewCx<'_>, _key: KeyEvent) -> Action {
+            Action::Continue
+        }
+
+        fn process_paste(&mut self, _cx: &mut ViewCx<'_>, text: String) {
+            self.0.lock().unwrap().push_str(&text);
+        }
+
+        fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
+            ModePresentation::OVERLAY
+        }
+    }
+
+    struct TextClipboard(&'static str);
+
+    impl ClipboardPasteProvider for TextClipboard {
+        fn read_paste(&self) -> Result<PastePayload, crate::clipboard_paste::ClipboardPasteError> {
+            Ok(PastePayload::Text(self.0.to_string()))
+        }
+    }
+
+    struct ImageClipboard(Mutex<Option<crate::clipboard_paste::ImagePaste>>);
+
+    impl ClipboardPasteProvider for ImageClipboard {
+        fn read_paste(&self) -> Result<PastePayload, crate::clipboard_paste::ClipboardPasteError> {
+            Ok(PastePayload::Image(
+                self.0.lock().unwrap().take().expect("one clipboard read"),
+            ))
+        }
+    }
+
+    #[test]
+    fn configured_insert_paste_binding_uses_shared_clipboard_flow() {
+        let mut app = app();
+        let pasted = Arc::new(Mutex::new(String::new()));
+        let mut mode = PasteMode(pasted.clone());
+        let cases = [
+            (
+                EditorMode::Insert,
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            ),
+            (
+                EditorMode::Normal,
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::empty()),
+            ),
+        ];
+
+        for (editor_mode, key) in cases {
+            let handled = {
+                let mut cx = app.view_cx();
+                process_paste_binding_with_provider(
+                    &mut mode,
+                    &mut cx,
+                    &key,
+                    editor_mode,
+                    &TextClipboard("paste"),
+                )
+            };
+            assert!(handled);
+        }
+
+        assert_eq!(*pasted.lock().unwrap(), "pastepaste");
+    }
+
+    #[test]
+    fn text_only_clipboard_flow_removes_staged_images() {
+        let mut app = app();
+        let mut mode = PasteMode(Arc::new(Mutex::new(String::new())));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipboard.png");
+        std::fs::write(&path, b"staged image").unwrap();
+        let provider = ImageClipboard(Mutex::new(Some(crate::clipboard_paste::ImagePaste {
+            source: crate::clipboard_paste::ImagePasteSource::StagedFile(path.clone()),
+            default_name: "clipboard.png".to_string(),
+            dimensions: None,
+            origin: crate::clipboard_paste::ImagePasteOrigin::ClipboardImageData,
+        })));
+
+        {
+            let mut cx = app.view_cx();
+            mode.process_clipboard_paste(&mut cx, &provider);
+        }
+
+        assert!(!path.exists());
+        assert_eq!(app.view.status.text(), "clipboard does not contain text");
     }
 
     #[test]

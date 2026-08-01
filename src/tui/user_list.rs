@@ -22,6 +22,7 @@ use crate::{
     theme,
     tui::{
         Action,
+        editor::single_line_paste,
         form::rect_contains,
         mode::{
             AppMode, ChromeSpec, Coverage, ModePresentation, ModeTransition, ViewCx, is_quit_key,
@@ -477,6 +478,16 @@ impl AppMode for UserListMode {
         self.process_mouse_cx(cx, mouse)
     }
 
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<extui_editor::Mode> {
+        self.searching.then_some(extui_editor::Mode::Insert)
+    }
+
+    fn process_paste(&mut self, _cx: &mut ViewCx<'_>, text: String) {
+        if self.searching {
+            self.filter.push_str(&single_line_paste(&text));
+        }
+    }
+
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,
@@ -498,6 +509,14 @@ impl UserListMode {
         };
         app.drain_core_commands();
         action
+    }
+
+    fn process_paste(&mut self, app: &mut TestApp, text: String) {
+        {
+            let mut cx = app.view_cx();
+            AppMode::process_paste(self, &mut cx, text);
+        }
+        app.drain_core_commands();
     }
 }
 
@@ -695,5 +714,16 @@ mod tests {
 
         assert_eq!(mode.filter, "j");
         assert_eq!(mode.selected_row().unwrap().name, "ann");
+    }
+
+    #[test]
+    fn bracketed_paste_updates_active_user_search() {
+        let mut app = app();
+        let mut mode = UserListMode::new();
+        mode.searching = true;
+
+        mode.process_paste(&mut app, "alice\r\nsmith".to_string());
+
+        assert_eq!(mode.filter, "alicesmith");
     }
 }

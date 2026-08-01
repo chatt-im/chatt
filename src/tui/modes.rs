@@ -16,7 +16,7 @@ use crate::{
     settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft},
     theme,
     tui::{
-        editor::{composer_offset_at_visual_row, composer_visual_position},
+        editor::{composer_offset_at_visual_row, composer_visual_position, single_line_paste},
         form::{FormAction, FormFieldKind, FormMouseIntent, FormState},
         history_search::{HistorySearch, SearchAction},
         mode::{
@@ -252,6 +252,14 @@ impl AppMode for WelcomeMode {
 
     fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
         self.process_mouse_cx(cx, mouse)
+    }
+
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        self.form.active_editor_mode()
+    }
+
+    fn process_paste(&mut self, _cx: &mut ViewCx<'_>, text: String) {
+        let _ = self.form.insert_paste(&text);
     }
 
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
@@ -608,6 +616,16 @@ impl AppMode for ServerListMode {
         self.process_input_cx(cx, key)
     }
 
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        self.searching.then_some(EditorMode::Insert)
+    }
+
+    fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        if self.searching && self.select.append_query(&single_line_paste(&text)) {
+            self.select.refresh(cx.view.server_catalog.items());
+        }
+    }
+
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation::full_screen(ChromeSpec {
             theme_mode: theme::UiMode::ServerSelect,
@@ -749,6 +767,16 @@ impl AppMode for RoomSwitchMode {
         self.process_input_cx(cx, key)
     }
 
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        self.searching.then_some(EditorMode::Insert)
+    }
+
+    fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        if self.searching && self.select.append_query(&single_line_paste(&text)) {
+            self.refresh_cx(cx);
+        }
+    }
+
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation::full_screen(ChromeSpec {
             theme_mode: theme::UiMode::ServerSelect,
@@ -825,6 +853,18 @@ impl AppMode for ServerEditMode {
 
     fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
         self.process_mouse_cx(cx, mouse)
+    }
+
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        self.draft
+            .as_ref()
+            .and_then(ServerEditDraft::active_editor_mode)
+    }
+
+    fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        if let Some(draft) = self.draft.as_mut() {
+            draft.paste(&text, &cx.view.theme);
+        }
     }
 
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
@@ -1163,6 +1203,33 @@ impl SettingsMode {
         }
         Action::Continue
     }
+
+    fn process_paste_cx(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        let Some(settings) = cx.session.settings.clone() else {
+            cx.set_error("settings session is no longer active");
+            return;
+        };
+        let mut session = settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if session.active_audio_picker_open() {
+            return;
+        }
+        let Some(commit) = session.form.insert_paste(&text) else {
+            return;
+        };
+        let live_list_edit = crate::ui::settings::is_list_add_field(&session.draft, commit.0);
+        drop(session);
+        if live_list_edit {
+            cx.send(CoreCommand::Settings(SettingsOp::Drive {
+                intent: FieldIntent::None,
+                commit: Some(commit),
+                focus_column: None,
+            }));
+        } else {
+            cx.send(CoreCommand::Settings(SettingsOp::MarkDirty));
+        }
+    }
 }
 
 impl AppMode for SettingsMode {
@@ -1198,6 +1265,20 @@ impl AppMode for SettingsMode {
 
     fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
         self.process_mouse_cx(cx, mouse)
+    }
+
+    fn paste_editor_mode(&self, cx: &ViewCx<'_>) -> Option<EditorMode> {
+        let settings = cx.session.settings.as_ref()?;
+        let session = settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!session.active_audio_picker_open())
+            .then(|| session.form.active_editor_mode())
+            .flatten()
+    }
+
+    fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        self.process_paste_cx(cx, text);
     }
 
     fn on_exit(&mut self, cx: &mut ViewCx<'_>, _reason: ExitReason) {
@@ -2722,6 +2803,19 @@ impl RoomMode {
     }
 
     fn process_paste_cx(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        if let Some(search) = &mut self.history_search {
+            let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+                return;
+            };
+            search.paste(
+                &mut cx.view.active.chat,
+                &history,
+                &text,
+                self.layout.chat_width,
+                self.layout.chat_height,
+            );
+            return;
+        }
         self.enter_compose_insert_mode(cx);
         cx.view.insert_markdown_paste(&text);
     }
@@ -2758,6 +2852,10 @@ impl AppMode for RoomMode {
 
     fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
         self.process_mouse_cx(cx, mouse)
+    }
+
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        self.history_search.is_some().then_some(EditorMode::Insert)
     }
 
     fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
@@ -2947,6 +3045,55 @@ mod tests {
                 "focus {focus:?} did not receive paste"
             );
         }
+    }
+
+    #[test]
+    fn bracketed_paste_updates_active_server_search() {
+        let mut app = test_app();
+        let mut servers = ServerListMode::new();
+        servers.searching = true;
+
+        servers.process_paste(&mut app, "local\r\nserver".to_string());
+
+        assert_eq!(servers.select.query(), "localserver");
+    }
+
+    #[test]
+    fn server_username_field_accepts_bracketed_paste() {
+        let mut app = test_app();
+        let mut server = crate::config::ServerEntry::default();
+        server.username.clear();
+        let draft = ServerEditDraft::from_server(&server, &app.config);
+        let mut mode = ServerEditMode::new(draft);
+        let mut buffer = Buffer::new(80, 24);
+        mode.render(&mut app, &mut buffer, 0);
+        mode.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+
+        mode.process_paste(&mut app, "pasted-user".to_string());
+
+        let updated = mode
+            .draft
+            .as_ref()
+            .expect("server draft remains open")
+            .to_update()
+            .expect("pasted server draft is valid");
+        assert_eq!(updated.username, "pasted-user");
+    }
+
+    #[test]
+    fn settings_text_field_accepts_bracketed_paste_and_marks_dirty() {
+        let mut app = test_app();
+        let field = crate::ui::settings::field_id_for("Interface Settings", "Room Height");
+        let mut form = FormState::new(field, crate::config::FormBindings::Standard);
+        form.focus_text(field, "3", false);
+        let mut mode = SettingsMode::with_form_for_test(form, &mut app);
+        let settings = app.room.settings.clone().expect("settings session");
+
+        mode.process_paste(&mut app, "0".to_string());
+
+        let session = settings.lock().unwrap();
+        assert_eq!(session.form.text(), "30");
+        assert!(session.dirty);
     }
 
     #[test]
@@ -3944,9 +4091,8 @@ mod tests {
 
         room.process_input(&mut app, key('/'));
         assert!(room.history_search.is_some());
-        for ch in ['b', ' ', 't'] {
-            room.process_input(&mut app, key(ch));
-        }
+        room.process_input(&mut app, key('b'));
+        room.process_paste(&mut app, " \r\nt".to_string());
 
         let search = room.history_search.as_ref().expect("search open");
         assert_eq!(search.query(), "b t");

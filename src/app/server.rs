@@ -1,5 +1,6 @@
 use aws_lc_rs::rand::SecureRandom;
 use extui::{Buffer, Rect, event::KeyEvent, event::MouseEvent};
+use extui_editor::Mode as EditorMode;
 use rpc::{
     control::InviteTicket,
     crypto::{OPEN_PAIR_RECOVERY_PREFIX, encode_hex},
@@ -233,6 +234,16 @@ impl ServerEditDraft {
                 ServerEditEvent::Consumed
             }
             FormMouseIntent::PickerItem(_, _) => ServerEditEvent::Consumed,
+        }
+    }
+
+    pub(crate) fn active_editor_mode(&self) -> Option<EditorMode> {
+        self.form.active_editor_mode()
+    }
+
+    pub(crate) fn paste(&mut self, text: &str, theme: &Theme) {
+        if let Some(commit) = self.form.insert_paste(text) {
+            self.drive(theme, FieldIntent::None, Some(commit), None);
         }
     }
 

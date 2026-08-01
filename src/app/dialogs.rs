@@ -1,5 +1,5 @@
 use extui::{Buffer, Ellipsis, Rect};
-use extui_editor::Editor;
+use extui_editor::{Editor, Mode as EditorMode};
 use rpc::ids::UserId;
 use unicode_width::UnicodeWidthStr;
 
@@ -7,6 +7,7 @@ use super::volume_db_label;
 use crate::{
     config::{MAX_USER_VOLUME_DB, MIN_USER_VOLUME_DB, USER_VOLUME_DB_STEP, snap_user_volume_db},
     theme::Theme,
+    tui::editor::insert_editor_paste,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +87,26 @@ impl UserVolumeDialog {
                 }
             },
             _ => UserVolumeEvent::Consumed,
+        }
+    }
+
+    pub(crate) fn editor_mode(&self) -> EditorMode {
+        self.editor.mode()
+    }
+
+    pub(crate) fn paste(&mut self, text: &str) -> UserVolumeEvent {
+        if !insert_editor_paste(&mut self.editor, text) {
+            return UserVolumeEvent::Consumed;
+        }
+        match self.commit_editor() {
+            Ok(value_db) => UserVolumeEvent::Preview {
+                user_id: self.user_id,
+                value_db,
+            },
+            Err(error) => {
+                self.error = Some(error.clone());
+                UserVolumeEvent::Invalid(error)
+            }
         }
     }
 
@@ -260,4 +281,27 @@ fn volume_slider(value_db: f32, width: u16) -> String {
     }
     out.push(']');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pasted_volume_text_runs_live_validation() {
+        let mut dialog = UserVolumeDialog::new(
+            UserId(7),
+            "alice".to_string(),
+            0.0,
+            &Theme::tomorrow_night(),
+        );
+
+        assert!(matches!(
+            dialog.paste("-"),
+            UserVolumeEvent::Preview {
+                user_id: UserId(7),
+                ..
+            }
+        ));
+    }
 }

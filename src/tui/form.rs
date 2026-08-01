@@ -5,7 +5,7 @@ use extui::{
 use extui_editor::{Editor, Mode, bindings as editor_bindings};
 use unicode_width::UnicodeWidthChar;
 
-use crate::{config::FormBindings, theme::Theme};
+use crate::{config::FormBindings, theme::Theme, tui::editor::insert_editor_paste};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FormFieldKind {
@@ -170,6 +170,10 @@ impl<F: Copy + Eq> FormState<F> {
 
     pub(crate) fn active_text(&self) -> Option<F> {
         self.active_text
+    }
+
+    pub(crate) fn active_editor_mode(&self) -> Option<Mode> {
+        self.active_text.map(|_| self.editor.mode())
     }
 
     /// Keeps Vim editing continuous after a commit-and-advance operation.
@@ -431,10 +435,20 @@ impl<F: Copy + Eq> FormState<F> {
         self.editor.text()
     }
 
+    /// Replaces the active field for controls whose paste payload represents
+    /// the complete value (for example a one-time pairing ticket).
     pub(crate) fn replace_active_text(&mut self, text: &str) -> Option<(F, String)> {
         let active = self.active_text?;
         self.replace_editor_text(text);
         Some((active, self.editor.text()))
+    }
+
+    /// Inserts a host paste into the active text field and returns the same
+    /// commit shape as a key-driven text edit. Non-text rows have no active
+    /// editor and therefore ignore paste.
+    pub(crate) fn insert_paste(&mut self, text: &str) -> Option<(F, String)> {
+        let active = self.active_text?;
+        insert_editor_paste(&mut self.editor, text).then(|| (active, self.editor.text()))
     }
 
     fn replace_editor_text(&mut self, text: &str) {
@@ -1093,18 +1107,16 @@ mod tests {
     }
 
     #[test]
-    fn replacing_active_text_preserves_vim_insert_mode() {
+    fn paste_inserts_at_cursor_and_enters_vim_insert_mode() {
         let mut form = FormState::with_order(Field::One, FormBindings::Vim, [Field::One]);
-        form.focus_text(Field::One, "", true);
+        form.focus_text(Field::One, "front-tail", false);
+        form.editor_mut().set_cursor_offset(6);
 
-        let commit = form.replace_active_text("photo-host-stadium-narrow-video-frost");
+        let commit = form.insert_paste("middle\r\nvalue");
 
         assert_eq!(
             commit,
-            Some((
-                Field::One,
-                "photo-host-stadium-narrow-video-frost".to_string()
-            ))
+            Some((Field::One, "front-middlevaluetail".to_string()))
         );
         assert_eq!(form.editor_mut().mode(), Mode::Insert);
     }

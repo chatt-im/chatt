@@ -3486,6 +3486,57 @@ impl RoomSession {
         matches.next().is_none().then_some(*first.0)
     }
 
+    /// Resolves the room syntax accepted by one-shot CLI control requests.
+    /// Numeric ids are explicit (`id:20`); every other selector follows the
+    /// same exact-then-unique-prefix display-name matching as `/room`.
+    pub(crate) fn resolve_room_selector(&self, selector: &str) -> Result<RoomId, String> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err("room selector must not be empty".to_string());
+        }
+        if let Some(raw_id) = selector.strip_prefix("id:") {
+            let value = raw_id
+                .parse::<u32>()
+                .map_err(|_| format!("invalid room selector {selector}; expected id:NUMBER"))?;
+            let room_id = RoomId(value);
+            return self
+                .metas
+                .contains_key(&room_id)
+                .then_some(room_id)
+                .ok_or_else(|| format!("room id {value} is not available"));
+        }
+
+        let lowered = selector.to_lowercase();
+        if let Some((room_id, _)) = self
+            .metas
+            .iter()
+            .find(|(_, meta)| meta.name.to_lowercase() == lowered)
+        {
+            return Ok(*room_id);
+        }
+
+        let mut found = None;
+        let mut count = 0usize;
+        let mut examples = Vec::new();
+        for (room_id, meta) in &self.metas {
+            if meta.name.to_lowercase().starts_with(&lowered) {
+                found = Some(*room_id);
+                count += 1;
+                if examples.len() < 3 {
+                    examples.push(meta.name.as_str());
+                }
+            }
+        }
+        match (found, count) {
+            (Some(room_id), 1) => Ok(room_id),
+            (_, 0) => Err(format!("no room named {selector}")),
+            _ => Err(format!(
+                "room selector {selector} is ambiguous: {}",
+                examples.join(", ")
+            )),
+        }
+    }
+
     /// The display name for a room: DM rooms are labeled after the other
     /// endpoint, everything else keeps the server-provided name.
     fn display_room_name(&self, wire_name: &str, kind: &ClientRoomKind) -> String {
@@ -4858,6 +4909,61 @@ mod tests {
 
         assert_eq!(client.session.room_name_of(RoomId(1)), Some("room-1"));
         assert_eq!(client.session.room_name_of(RoomId(9)), None);
+    }
+
+    #[test]
+    fn control_room_selector_resolves_names_ids_and_existing_dms() {
+        let mut client = test_room();
+        let mut lobby = room_info(1);
+        lobby.name = "Lobby".to_string();
+        let mut lounge = room_info(20);
+        lounge.name = "Lounge".to_string();
+        let mut lobster = room_info(21);
+        lobster.name = "Lobster".to_string();
+        client.session.authenticated(
+            &[
+                lobby,
+                lounge,
+                lobster,
+                dm_room_info(30, UserId(1), UserId(2)),
+            ],
+            vec![user(UserId(1), "me"), user(UserId(2), "alice")],
+            RoomId(1),
+            None,
+            Some(UserId(1)),
+        );
+
+        assert_eq!(client.session.resolve_room_selector("lobby"), Ok(RoomId(1)));
+        assert_eq!(client.session.resolve_room_selector("LOUN"), Ok(RoomId(20)));
+        assert_eq!(
+            client.session.resolve_room_selector("id:20"),
+            Ok(RoomId(20))
+        );
+        assert_eq!(
+            client.session.resolve_room_selector("@alice"),
+            Ok(RoomId(30))
+        );
+        assert!(
+            client
+                .session
+                .resolve_room_selector("lo")
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        assert!(
+            client
+                .session
+                .resolve_room_selector("id:99")
+                .unwrap_err()
+                .contains("not available")
+        );
+        assert!(
+            client
+                .session
+                .resolve_room_selector("@nobody")
+                .unwrap_err()
+                .contains("no room named")
+        );
     }
 
     #[test]

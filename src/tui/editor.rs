@@ -2,12 +2,35 @@ use std::borrow::Cow;
 
 use chatt_message_format::{is_fence_line, quote_prefix};
 use extui::{Buffer, Rect};
-use extui_editor::{Editor, Replacement, StyleRun, TextBuffer, TrackedChange};
+use extui_editor::{Editor, Replacement, Span, StyleRun, TextBuffer, TrackedChange};
 use tinyhl::{Highlighter, Source};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
+
+/// Inserts host-provided paste text at the editor cursor and leaves the editor
+/// ready for continued typing. Single-line editors apply their own newline
+/// filtering through [`Editor::replace_range`].
+pub(crate) fn insert_editor_paste(editor: &mut Editor, text: &str) -> bool {
+    let before = editor.text();
+    editor.enter_insert_mode();
+    editor.replace_range(Span::empty_at(editor.cursor_offset()), text);
+    editor.text() != before
+}
+
+/// Normalizes paste text for controls backed by a plain [`String`] rather
+/// than a single-line [`Editor`].
+pub(crate) fn single_line_paste(text: &str) -> Cow<'_, str> {
+    if !text.contains(['\n', '\r']) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(
+        text.chars()
+            .filter(|ch| !matches!(ch, '\n' | '\r'))
+            .collect(),
+    )
+}
 
 /// Maps a byte offset in wrapped composer text to its visual row and column.
 ///

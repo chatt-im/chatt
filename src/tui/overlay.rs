@@ -9,14 +9,14 @@ use crate::{
         DirtySections, E2eIdentityOverlay, E2eIdentityTarget, TransportWarningTarget,
     },
     clipboard_paste::{
-        ClipboardPasteProvider, HelperClipboard, ImagePaste, ImagePasteOrigin, ImagePasteSource,
-        PastePayload,
+        ClipboardPasteProvider, ImagePaste, ImagePasteOrigin, ImagePasteSource, PastePayload,
     },
     e2e_identity::{IdentityVerdictSeverity, KEY_GROUP_LEN, displayed_identity_name},
     theme,
     theme::Theme,
     tui::{
         Action,
+        editor::{insert_editor_paste, single_line_paste},
         form::rect_contains,
         mode::{
             AppMode, ChromeSpec, Coverage, ModePresentation, ModeTransition, ViewCx, is_quit_key,
@@ -43,6 +43,8 @@ use crate::e2e_identity::E2ePublicIdentity;
 
 #[cfg(test)]
 use crate::app::testing::TestApp;
+#[cfg(test)]
+use crate::tui::mode::process_paste_binding_with_provider;
 /// Overlay hosting the per-user local volume dialog.
 ///
 /// The mode owns the [`UserVolumeDialog`]; event handling lives on [`App`] so it
@@ -83,6 +85,18 @@ impl AppMode for DialogMode {
         let event = dialog.handle_key(key);
         cx.send(CoreCommand::ApplyVolume { event, dialog });
         Action::Continue
+    }
+
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        self.dialog.as_ref().map(UserVolumeDialog::editor_mode)
+    }
+
+    fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
+        let Some(mut dialog) = self.dialog.take() else {
+            return;
+        };
+        let event = dialog.paste(&text);
+        cx.send(CoreCommand::ApplyVolume { event, dialog });
     }
 
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
@@ -914,43 +928,6 @@ impl E2eIdentityMode {
         }
     }
 
-    fn process_clipboard_binding(
-        &mut self,
-        cx: &mut ViewCx<'_>,
-        key: &KeyEvent,
-        provider: &dyn ClipboardPasteProvider,
-    ) -> bool {
-        if !self.can_verify() {
-            return false;
-        }
-        let Some(input) = InputKey::from_event(key) else {
-            return false;
-        };
-        let layer = if self.editor.mode() == EditorMode::Insert {
-            bindings::INSERT_LAYER
-        } else {
-            bindings::COMPOSE_NORMAL_LAYER
-        };
-        match bindings::resolve(
-            &cx.config.bindings.router,
-            layer,
-            &mut cx.view.chrome.binding.pending_chord,
-            input,
-        ) {
-            Resolved::Action(id)
-                if matches!(
-                    cx.config.bindings.actions.get(id),
-                    BindCommand::PasteClipboard
-                ) =>
-            {
-                self.paste_from_clipboard(cx, provider);
-                true
-            }
-            Resolved::Consumed => true,
-            Resolved::Action(_) | Resolved::Unmatched => false,
-        }
-    }
-
     fn activate_primary(&mut self, cx: &mut ViewCx<'_>) {
         if self.verification_passed() {
             self.confirm(cx);
@@ -1423,9 +1400,6 @@ impl AppMode for E2eIdentityMode {
             self.editor.send_key(&key);
             return Action::Continue;
         }
-        if self.process_clipboard_binding(cx, &key, &HelperClipboard) {
-            return Action::Continue;
-        }
         match key.code {
             KeyCode::Esc => self.close(cx),
             KeyCode::Char('c') if key.modifiers == KeyModifiers::ALT => {
@@ -1481,6 +1455,18 @@ impl AppMode for E2eIdentityMode {
         if self.can_verify() {
             self.replace_verification_text(&text);
         }
+    }
+
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        self.can_verify().then(|| self.editor.mode())
+    }
+
+    fn process_clipboard_paste(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        provider: &dyn ClipboardPasteProvider,
+    ) {
+        self.paste_from_clipboard(cx, provider);
     }
 
     fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
@@ -1636,6 +1622,10 @@ impl AppMode for DevicePairMode {
         let event = self.dialog.handle_mouse(mouse, &cx.view.theme);
         self.handle_event(cx, event);
         Action::Continue
+    }
+
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        self.dialog.active_editor_mode()
     }
 
     fn process_paste(&mut self, cx: &mut ViewCx<'_>, text: String) {
@@ -1950,6 +1940,16 @@ impl AppMode for PasswordPromptMode {
             self.submit(cx);
         }
         Action::Continue
+    }
+
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        (!self.submitting).then_some(EditorMode::Insert)
+    }
+
+    fn process_paste(&mut self, _cx: &mut ViewCx<'_>, text: String) {
+        if !self.submitting {
+            self.input.push_str(&single_line_paste(&text));
+        }
     }
 
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
@@ -2326,8 +2326,13 @@ impl AppMode for PasteImageUploadMode {
     }
 
     fn process_paste(&mut self, _cx: &mut ViewCx<'_>, text: String) {
-        let span = EditorSpan::empty_at(self.editor.cursor_offset());
-        self.editor.replace_range(span, text.trim());
+        if insert_editor_paste(&mut self.editor, &text) {
+            self.error = None;
+        }
+    }
+
+    fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
+        Some(self.editor.mode())
     }
 
     fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
@@ -2993,10 +2998,17 @@ mod tests {
         );
         mode.focus = IdentityFocus::Cancel;
         let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        let editor_mode = mode.editor.mode();
 
         let handled = {
             let mut cx = app.view_cx();
-            mode.process_clipboard_binding(&mut cx, &ctrl_v, &TextClipboard(matching.clone()))
+            process_paste_binding_with_provider(
+                &mut mode,
+                &mut cx,
+                &ctrl_v,
+                editor_mode,
+                &TextClipboard(matching.clone()),
+            )
         };
 
         assert!(handled);
@@ -3332,6 +3344,16 @@ mod tests {
         );
 
         assert_eq!(prompt.input, "q/");
+    }
+
+    #[test]
+    fn password_prompt_accepts_single_line_bracketed_paste() {
+        let mut app = test_app();
+        let mut prompt = PasswordPromptMode::new(false);
+
+        prompt.process_paste(&mut app, "correct\r\nhorse".to_string());
+
+        assert_eq!(prompt.input, "correcthorse");
     }
 
     #[test]

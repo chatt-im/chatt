@@ -858,6 +858,12 @@ pub(crate) enum AppEvent {
     Screencast(local_control::ScreencastCommand),
     Upload {
         request: UploadFileRequest,
+        room: Option<String>,
+        reply: Sender<Result<String, String>>,
+    },
+    SendMessage {
+        body: String,
+        room: Option<String>,
         reply: Sender<Result<String, String>>,
     },
     #[cfg(unix)]
@@ -2105,7 +2111,14 @@ impl App {
             AppEvent::Soundboard(event) => self.handle_soundboard_event(event),
             AppEvent::Voice(command) => self.apply_voice_command(command),
             AppEvent::Screencast(command) => self.handle_screencast_command(command),
-            AppEvent::Upload { request, reply } => self.handle_control_upload(request, reply),
+            AppEvent::Upload {
+                request,
+                room,
+                reply,
+            } => self.handle_control_upload(request, room.as_deref(), reply),
+            AppEvent::SendMessage { body, room, reply } => {
+                self.handle_control_send_message(body, room.as_deref(), reply)
+            }
             #[cfg(unix)]
             AppEvent::ClientAttach { .. } => {
                 unreachable!("client attach events are owned by the daemon runtime")
@@ -2202,21 +2215,75 @@ impl App {
     fn handle_control_upload(
         &mut self,
         request: UploadFileRequest,
+        room: Option<&str>,
         reply: Sender<Result<String, String>>,
     ) {
         if self.network.is_none() {
             let _ = reply.send(Err("not connected to a server".to_string()));
             return;
         }
-        let message = format!("queued upload {}", request.path.display());
-        self.send_network_command(
-            NetworkCommand::UploadFile {
-                room_id: self.room.viewed_room,
-                request,
+        let room_id = match room {
+            Some(selector) => match self.room.resolve_room_selector(selector) {
+                Ok(room_id) => Some(room_id),
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
             },
-            true,
-        );
-        let _ = reply.send(Ok(message));
+            None => self.room.viewed_room,
+        };
+        let message = format!("queued upload {}", request.path.display());
+        if !self.send_network_command(NetworkCommand::UploadFile { room_id, request }, true) {
+            let _ = reply.send(Err("not connected to a server".to_string()));
+        } else {
+            let _ = reply.send(Ok(message));
+        }
+    }
+
+    fn handle_control_send_message(
+        &mut self,
+        body: String,
+        room: Option<&str>,
+        reply: Sender<Result<String, String>>,
+    ) {
+        if body.trim().is_empty() {
+            let _ = reply.send(Err("chat message is empty".to_string()));
+            return;
+        }
+        if body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
+            let _ = reply.send(Err("chat message exceeds maximum length".to_string()));
+            return;
+        }
+        if self.network.is_none() {
+            let _ = reply.send(Err("not connected to a server".to_string()));
+            return;
+        }
+        let room_id = match room {
+            Some(selector) => match self.room.resolve_room_selector(selector) {
+                Ok(room_id) => room_id,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            },
+            None => match self.room.viewed_room {
+                Some(room_id) => room_id,
+                None => {
+                    let _ = reply.send(Err("no room selected".to_string()));
+                    return;
+                }
+            },
+        };
+        let room_name = self
+            .room
+            .room_name_of(room_id)
+            .unwrap_or("selected room")
+            .to_string();
+        if !self.send_network_command(NetworkCommand::SendChat { room_id, body }, true) {
+            let _ = reply.send(Err("not connected to a server".to_string()));
+        } else {
+            let _ = reply.send(Ok(format!("queued message to {room_name}")));
+        }
     }
 
     /// Re-reads the config file and re-resolves the theme, replying with a status
@@ -9734,6 +9801,7 @@ mod tests {
 
         app.handle_app_event(AppEvent::Upload {
             request: UploadFileRequest::new("/tmp/offline.txt".into()),
+            room: None,
             reply,
         });
 
@@ -9754,6 +9822,7 @@ mod tests {
 
         app.handle_app_event(AppEvent::Upload {
             request: UploadFileRequest::new(path.clone()),
+            room: None,
             reply,
         });
 
@@ -9765,6 +9834,80 @@ mod tests {
             network_rx.recv().unwrap(),
             NetworkCommand::UploadFile { request, .. } if request.path == path
         ));
+    }
+
+    #[test]
+    fn control_send_uses_viewed_room() {
+        let mut app = test_app();
+        let (network_tx, network_rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(network_tx));
+        app.room.network_selected = true;
+        enter_test_room(&mut app);
+        let (reply, response) = mpsc::channel();
+
+        app.handle_app_event(AppEvent::SendMessage {
+            body: "hello".to_string(),
+            room: None,
+            reply,
+        });
+
+        assert_eq!(
+            response.recv().unwrap().unwrap(),
+            "queued message to room-1"
+        );
+        assert!(matches!(
+            network_rx.recv().unwrap(),
+            NetworkCommand::SendChat { room_id: RoomId(1), body } if body == "hello"
+        ));
+    }
+
+    #[test]
+    fn control_send_and_upload_resolve_explicit_room_without_switching_view() {
+        let mut app = test_app();
+        let (network_tx, network_rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(network_tx));
+        app.room.network_selected = true;
+        app.room.authenticated(
+            &[test_room_info(1), test_room_info(20)],
+            Vec::new(),
+            RoomId(1),
+            Some(RoomId(1)),
+            None,
+        );
+
+        let (send_reply, send_response) = mpsc::channel();
+        app.handle_app_event(AppEvent::SendMessage {
+            body: "hello elsewhere".to_string(),
+            room: Some("id:20".to_string()),
+            reply: send_reply,
+        });
+        assert_eq!(
+            send_response.recv().unwrap().unwrap(),
+            "queued message to room-20"
+        );
+        assert!(matches!(
+            network_rx.recv().unwrap(),
+            NetworkCommand::SendChat { room_id: RoomId(20), body }
+                if body == "hello elsewhere"
+        ));
+
+        let path = std::path::PathBuf::from("/tmp/elsewhere.txt");
+        let (upload_reply, upload_response) = mpsc::channel();
+        app.handle_app_event(AppEvent::Upload {
+            request: UploadFileRequest::new(path.clone()),
+            room: Some("room-20".to_string()),
+            reply: upload_reply,
+        });
+        assert_eq!(
+            upload_response.recv().unwrap().unwrap(),
+            format!("queued upload {}", path.display())
+        );
+        assert!(matches!(
+            network_rx.recv().unwrap(),
+            NetworkCommand::UploadFile { room_id: Some(RoomId(20)), request }
+                if request.path == path
+        ));
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
     }
 
     #[test]

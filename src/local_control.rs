@@ -39,6 +39,7 @@ mod imp {
     const OP_RELOAD_THEME: u8 = 7;
     const OP_CONFIG_PATH: u8 = 8;
     const OP_ATTACH: u8 = 9;
+    const OP_SEND_MESSAGE: u8 = 11;
     const SCREENCAST_START: u8 = 0;
     const SCREENCAST_STOP: u8 = 1;
     const STATUS_OK: u8 = 0;
@@ -399,12 +400,20 @@ mod imp {
         }
     }
 
-    pub fn send_upload(path: &Path) -> Result<String, String> {
+    pub fn send_upload(path: &Path, room: Option<&str>) -> Result<String, String> {
         let socket_path = socket_path()?;
-        send_upload_to_path(&socket_path, path)
+        send_upload_to_path(&socket_path, path, room)
     }
 
-    fn send_upload_to_path(socket_path: &Path, path: &Path) -> Result<String, String> {
+    fn send_upload_to_path(
+        socket_path: &Path,
+        path: &Path,
+        room: Option<&str>,
+    ) -> Result<String, String> {
+        let request = UploadRequest {
+            path: path.as_os_str().as_bytes().to_vec(),
+            room: control_room_selector(room)?,
+        };
         let mut stream = UnixStream::connect(socket_path).map_err(|error| {
             format!(
                 "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
@@ -418,13 +427,72 @@ mod imp {
             .set_write_timeout(Some(STREAM_TIMEOUT))
             .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
 
-        write_upload_request(&mut stream, path)?;
+        write_upload_request(&mut stream, &request)?;
         let response = read_response(&mut stream)?;
         match response.status {
             STATUS_OK => Ok(response.message),
             STATUS_ERROR => Err(response.message),
             status => Err(format!("control socket returned unknown status {status}")),
         }
+    }
+
+    pub fn send_message(body: &str, room: Option<&str>) -> Result<String, String> {
+        if body.trim().is_empty() {
+            return Err("chat message is empty".to_string());
+        }
+        if body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
+            return Err(format!(
+                "chat message is {} bytes; maximum is {} bytes",
+                body.len(),
+                rpc::control::MAX_CHAT_BODY_BYTES
+            ));
+        }
+        let request = SendMessageRequest {
+            body: body.to_string(),
+            room: control_room_selector(room)?,
+        };
+        let socket_path = socket_path()?;
+        send_message_to_path(&socket_path, &request)
+    }
+
+    fn send_message_to_path(
+        socket_path: &Path,
+        request: &SendMessageRequest,
+    ) -> Result<String, String> {
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+
+        write_send_message_request(&mut stream, request)?;
+        let response = read_response(&mut stream)?;
+        match response.status {
+            STATUS_OK => Ok(response.message),
+            STATUS_ERROR => Err(response.message),
+            status => Err(format!("control socket returned unknown status {status}")),
+        }
+    }
+
+    fn control_room_selector(room: Option<&str>) -> Result<Option<String>, String> {
+        room.map(|room| {
+            let room = room.trim();
+            if room.is_empty() {
+                return Err("room selector must not be empty".to_string());
+            }
+            if room.len() > local_rpc::MAX_STRING_BYTES {
+                return Err("room selector exceeds maximum length".to_string());
+            }
+            Ok(room.to_string())
+        })
+        .transpose()
     }
 
     pub fn send_voice(command: VoiceCommand) -> Result<String, String> {
@@ -559,9 +627,24 @@ mod imp {
         private_dir: Option<PathBuf>,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+    #[jsony(Binary, version)]
+    struct UploadRequest {
+        path: Vec<u8>,
+        room: Option<String>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+    #[jsony(Binary, version)]
+    struct SendMessageRequest {
+        body: String,
+        room: Option<String>,
+    }
+
     #[derive(Debug)]
     enum Request {
-        Upload(PathBuf),
+        Upload { path: PathBuf, room: Option<String> },
+        SendMessage(SendMessageRequest),
         Voice(VoiceCommand),
         Screencast(ScreencastCommand),
         OutputVolume(OutputVolumeCommand),
@@ -920,10 +1003,11 @@ mod imp {
                     },
                 }
             }
-            Ok((Request::Upload(path), _)) => {
+            Ok((Request::Upload { path, room }, _)) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
                 match events.send(crate::app::AppEvent::Upload {
                     request: UploadFileRequest::new(path),
+                    room,
                     reply: reply_tx,
                 }) {
                     Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
@@ -942,6 +1026,38 @@ mod imp {
                         Err(mpsc::RecvTimeoutError::Disconnected) => Response {
                             status: STATUS_ERROR,
                             message: "chatt client stopped before answering upload request"
+                                .to_string(),
+                        },
+                    },
+                    Err(_) => Response {
+                        status: STATUS_ERROR,
+                        message: "chatt client is not running".to_string(),
+                    },
+                }
+            }
+            Ok((Request::SendMessage(request), _)) => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                match events.send(crate::app::AppEvent::SendMessage {
+                    body: request.body,
+                    room: request.room,
+                    reply: reply_tx,
+                }) {
+                    Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
+                        Ok(Ok(message)) => Response {
+                            status: STATUS_OK,
+                            message,
+                        },
+                        Ok(Err(error)) => Response {
+                            status: STATUS_ERROR,
+                            message: error,
+                        },
+                        Err(mpsc::RecvTimeoutError::Timeout) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client did not answer send request".to_string(),
+                        },
+                        Err(mpsc::RecvTimeoutError::Disconnected) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client stopped before answering send request"
                                 .to_string(),
                         },
                     },
@@ -1237,9 +1353,30 @@ mod imp {
             .map_err(|error| format!("failed to read control request body: {error}"))?;
 
         let request = match header[0] {
-            OP_UPLOAD => Ok(Request::Upload(PathBuf::from(
-                std::ffi::OsString::from_vec(body),
-            ))),
+            OP_UPLOAD => {
+                let upload: UploadRequest = jsony::from_binary(&body)
+                    .map_err(|error| format!("invalid upload request: {error}"))?;
+                let room = control_room_selector(upload.room.as_deref())?;
+                Ok(Request::Upload {
+                    path: PathBuf::from(std::ffi::OsString::from_vec(upload.path)),
+                    room,
+                })
+            }
+            OP_SEND_MESSAGE => {
+                let message: SendMessageRequest = jsony::from_binary(&body)
+                    .map_err(|error| format!("invalid send request: {error}"))?;
+                if message.body.trim().is_empty() {
+                    return Err("chat message is empty".to_string());
+                }
+                if message.body.len() > rpc::control::MAX_CHAT_BODY_BYTES {
+                    return Err("chat message exceeds maximum length".to_string());
+                }
+                let room = control_room_selector(message.room.as_deref())?;
+                Ok(Request::SendMessage(SendMessageRequest {
+                    body: message.body,
+                    room,
+                }))
+            }
             OP_VOICE => Ok(Request::Voice(VoiceCommand::decode(&body)?)),
             OP_SCREENCAST => Ok(Request::Screencast(ScreencastCommand::decode(&body)?)),
             OP_OUTPUT_VOLUME => Ok(Request::OutputVolume(OutputVolumeCommand::decode(&body)?)),
@@ -1264,21 +1401,21 @@ mod imp {
         Ok((request, fds))
     }
 
-    fn write_upload_request(stream: &mut UnixStream, path: &Path) -> Result<(), String> {
-        let bytes = path.as_os_str().as_bytes();
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| "upload path is too long for control socket".to_string())?;
-        if len > MAX_PATH_BYTES {
+    fn write_upload_request(
+        stream: &mut UnixStream,
+        request: &UploadRequest,
+    ) -> Result<(), String> {
+        if request.path.len() > MAX_PATH_BYTES as usize {
             return Err(format!("upload path exceeds {MAX_PATH_BYTES} bytes"));
         }
-        let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + bytes.len());
-        frame.extend_from_slice(MAGIC);
-        frame.push(OP_UPLOAD);
-        frame.extend_from_slice(&len.to_be_bytes());
-        frame.extend_from_slice(bytes);
-        stream
-            .write_all(&frame)
-            .map_err(|error| format!("failed to write control request: {error}"))
+        write_simple_request(stream, OP_UPLOAD, &jsony::to_binary(request))
+    }
+
+    fn write_send_message_request(
+        stream: &mut UnixStream,
+        request: &SendMessageRequest,
+    ) -> Result<(), String> {
+        write_simple_request(stream, OP_SEND_MESSAGE, &jsony::to_binary(request))
     }
 
     fn write_voice_request(stream: &mut UnixStream, command: VoiceCommand) -> Result<(), String> {
@@ -1590,17 +1727,40 @@ mod imp {
         };
 
         #[test]
-        fn upload_request_round_trips_path() {
+        fn upload_request_round_trips_path_and_room() {
             let path = PathBuf::from("/tmp/some_file/foo.md");
+            let upload = UploadRequest {
+                path: path.as_os_str().as_bytes().to_vec(),
+                room: Some("@alice".to_string()),
+            };
             let (mut writer, mut reader) = UnixStream::pair().unwrap();
 
-            write_upload_request(&mut writer, &path).unwrap();
+            write_upload_request(&mut writer, &upload).unwrap();
             let request = read_request(&mut reader).unwrap();
 
             match request {
-                Request::Upload(actual) => assert_eq!(actual, path),
+                Request::Upload { path: actual, room } => {
+                    assert_eq!(actual, path);
+                    assert_eq!(room.as_deref(), Some("@alice"));
+                }
                 other => panic!("unexpected request: {other:?}"),
             }
+        }
+
+        #[test]
+        fn send_message_request_round_trips_multiline_body_and_room() {
+            let message = SendMessageRequest {
+                body: "code:\n```rust\ncool_function();\n```".to_string(),
+                room: Some("id:20".to_string()),
+            };
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+
+            write_send_message_request(&mut writer, &message).unwrap();
+
+            assert!(matches!(
+                read_request(&mut reader).unwrap(),
+                Request::SendMessage(actual) if actual == message
+            ));
         }
 
         #[test]
@@ -1887,10 +2047,17 @@ mod imp {
 
             let send_path = socket_path.clone();
             let expected_path = upload_path.clone();
-            let handle = thread::spawn(move || send_upload_to_path(&send_path, &expected_path));
+            let handle = thread::spawn(move || {
+                send_upload_to_path(&send_path, &expected_path, Some("lobby"))
+            });
             match events_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
-                crate::app::AppEvent::Upload { request, reply } => {
+                crate::app::AppEvent::Upload {
+                    request,
+                    room,
+                    reply,
+                } => {
                     assert_eq!(request.path, upload_path);
+                    assert_eq!(room.as_deref(), Some("lobby"));
                     reply
                         .send(Ok(format!("queued upload {}", request.path.display())))
                         .unwrap();
@@ -1901,6 +2068,38 @@ mod imp {
                 handle.join().unwrap().unwrap(),
                 format!("queued upload {}", upload_path.display())
             );
+
+            drop(socket);
+            assert!(!socket_path.exists());
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn control_socket_send_waits_for_app_reply() {
+            let dir = temp_test_dir("send-message");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let (events_tx, events_rx) = mpsc::channel();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(events_tx)).unwrap();
+            let request = SendMessageRequest {
+                body: "hello".to_string(),
+                room: Some("@alice".to_string()),
+            };
+
+            let send_path = socket_path.clone();
+            let handle = thread::spawn(move || send_message_to_path(&send_path, &request));
+            match events_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                crate::app::AppEvent::SendMessage { body, room, reply } => {
+                    assert_eq!(body, "hello");
+                    assert_eq!(room.as_deref(), Some("@alice"));
+                    reply
+                        .send(Ok("queued message to @alice".to_string()))
+                        .unwrap();
+                }
+                _ => panic!("unexpected event"),
+            }
+            assert_eq!(handle.join().unwrap().unwrap(), "queued message to @alice");
 
             drop(socket);
             assert!(!socket_path.exists());
@@ -2167,8 +2366,12 @@ mod imp {
         }
     }
 
-    pub fn send_upload(_path: &Path) -> Result<String, String> {
+    pub fn send_upload(_path: &Path, _room: Option<&str>) -> Result<String, String> {
         Err("chatt upload is only supported on Unix".to_string())
+    }
+
+    pub fn send_message(_body: &str, _room: Option<&str>) -> Result<String, String> {
+        Err("chatt send is only supported on Unix".to_string())
     }
 
     pub fn send_voice(_command: VoiceCommand) -> Result<String, String> {
@@ -2228,8 +2431,8 @@ pub(crate) use imp::{
 };
 pub use imp::{
     ClientHello, ControlSocket, OutputVolumeCommand, ScreencastCommand, VoiceCommand,
-    send_client_logs, send_config_path, send_output_volume, send_reload_theme, send_report_bug,
-    send_screencast, send_upload, send_voice,
+    send_client_logs, send_config_path, send_message, send_output_volume, send_reload_theme,
+    send_report_bug, send_screencast, send_upload, send_voice,
 };
 #[cfg(unix)]
 pub(crate) use imp::{RpcPeer, write_attach_ack, write_rpc_ack};

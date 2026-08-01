@@ -1,4 +1,5 @@
 use extui::{Buffer, Rect, event::KeyEvent, event::MouseEvent};
+use extui_editor::Mode as EditorMode;
 use rpc::ids::RoomId;
 
 use crate::{
@@ -217,6 +218,16 @@ impl RoomSettingsDraft {
                 RoomSettingsEvent::Consumed
             }
             FormMouseIntent::PickerItem(_, _) => RoomSettingsEvent::Consumed,
+        }
+    }
+
+    pub(crate) fn active_editor_mode(&self) -> Option<EditorMode> {
+        self.form.active_editor_mode()
+    }
+
+    pub(crate) fn paste(&mut self, text: &str, theme: &Theme) {
+        if let Some(commit) = self.form.insert_paste(text) {
+            self.drive(theme, FieldIntent::None, Some(commit), None);
         }
     }
 
