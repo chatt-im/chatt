@@ -657,6 +657,31 @@ pub(crate) fn alias_from_tcp_addr(tcp_addr: &str) -> String {
     alias
 }
 
+/// The comparison form of a `host:port` server address, or `None` when `spec`
+/// is not an endpoint at all.
+///
+/// A server entry stores the address exactly as the user spelled it, so two
+/// entries naming one server, or an entry and a `chatt join` specifier, rarely
+/// compare equal as strings. Every such comparison goes through this instead.
+pub(crate) fn canonical_endpoint(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    // Parsing settles IPv6 zero compression, bracket placement, and zero
+    // padding in one step, for both address families.
+    if let Ok(addr) = spec.parse::<std::net::SocketAddr>() {
+        return Some(addr.to_string());
+    }
+    let (host, port) = spec.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    let host = host.trim();
+    // A hostname is case insensitive and its root label is implied, so
+    // `HOST.example.` and `host.example` name the same server.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{}:{port}", host.to_ascii_lowercase()))
+}
+
 pub(crate) fn unique_server_alias(config: &Config, base: &str) -> String {
     let base = sanitize_server_alias(base);
     if !config.servers.iter().any(|server| server.label == base) {
@@ -772,6 +797,67 @@ mod tests {
             history: HistoryOverrides::default(),
         }];
         server
+    }
+
+    #[test]
+    fn canonical_endpoint_folds_equivalent_spellings_of_one_address() {
+        for (left, right) in [
+            ("HOST.example:4000", "host.example:4000"),
+            ("host.example.:4000", "host.example:4000"),
+            ("[0:0:0:0:0:0:0:1]:4000", "[::1]:4000"),
+            ("[::ffff:0:0]:4000", "[::ffff:0.0.0.0]:4000"),
+            (" 10.0.0.1:4000 ", "10.0.0.1:4000"),
+        ] {
+            assert_eq!(
+                canonical_endpoint(left),
+                canonical_endpoint(right),
+                "{left} and {right} name one server"
+            );
+            assert!(canonical_endpoint(left).is_some());
+        }
+    }
+
+    #[test]
+    fn canonical_endpoint_keeps_distinct_addresses_apart() {
+        assert_ne!(
+            canonical_endpoint("host.example:4000"),
+            canonical_endpoint("myhost.example:4000")
+        );
+        assert_ne!(
+            canonical_endpoint("host.example:4000"),
+            canonical_endpoint("host.example:4001")
+        );
+    }
+
+    #[test]
+    fn canonical_endpoint_rejects_non_endpoints() {
+        for spec in [
+            "",
+            "home",
+            "host.example",
+            "host.example:",
+            ":4000",
+            ".:4000",
+            "host.example:70000",
+            "host.example:http",
+        ] {
+            assert_eq!(canonical_endpoint(spec), None, "{spec} is not an endpoint");
+        }
+    }
+
+    /// Every specifier `chatt join` treats as pairable must have a comparison
+    /// form, or `resolve_join` would pair with an address it already has saved.
+    #[test]
+    fn canonical_endpoint_accepts_everything_parse_pair_address_does() {
+        for spec in [
+            "10.0.0.1:4000",
+            "[::1]:4000",
+            "host.example:4000",
+            "HOST.example.:4000",
+        ] {
+            assert!(crate::cli::parse_pair_address(spec).is_ok());
+            assert!(canonical_endpoint(spec).is_some(), "{spec}");
+        }
     }
 
     #[test]

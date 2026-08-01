@@ -380,7 +380,9 @@ impl PairingCoordinator {
                     cancellation,
                     persist_first,
                 },
-            ) if active == owner && matches!(&job, PairingJob::Device { .. }) => {
+            ) if active == owner
+                && matches!(&job, PairingJob::Device { .. } | PairingJob::Invite { .. }) =>
+            {
                 if let Err(failure) = self.start(
                     app,
                     owner,

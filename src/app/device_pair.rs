@@ -13,8 +13,18 @@ use crate::{
 const PAIR_SECTION: &str = "Device pairing";
 const LINK_SECTION: &str = "Device link";
 const LABEL_WIDTH: u16 = 19;
-const PAIR_DESCRIPTION: &str =
-    "Paste the one-time link from an existing device, then name this installation.";
+const PAIR_DESCRIPTION: &str = "Paste a one-time device link from an existing device, then name \
+this installation, or paste a server invite ticket.";
+
+/// Whether a pasted string is a server invite rather than a device link.
+///
+/// An invite enrolls no device, so the name this installation would be known by
+/// is not part of that form.
+fn is_invite(pairing_string: &str) -> bool {
+    pairing_string
+        .trim()
+        .starts_with(rpc::control::JOIN_STRING_PREFIX)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DevicePairButton {
@@ -66,9 +76,14 @@ impl DevicePairDialog {
 
     pub(crate) fn form_height(&self, terminal_width: u16) -> u16 {
         let width = dialog_body_width(terminal_width);
+        let rows = if is_invite(&self.pairing_string) {
+            5
+        } else {
+            6
+        };
         form::wrapped_line_count(PAIR_DESCRIPTION, width)
             .saturating_add(form::wrapped_line_count(&self.feedback, width))
-            .saturating_add(6)
+            .saturating_add(rows)
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
@@ -276,7 +291,9 @@ fn device_pair_form(
     } else {
         form.secret_text("Pairing string", pairing_string, required);
     }
-    form.text("Device name", device_name, device_name_error);
+    if !is_invite(pairing_string) {
+        form.text("Device name", device_name, device_name_error);
+    }
     form.checkbox("Show secrets", show_secrets);
     form.description_with_error(feedback, feedback_error);
     form.spacer(1);
@@ -326,6 +343,8 @@ fn device_name_error(value: &str) -> Option<String> {
 fn pair_validation(ticket: &str, name: &str) -> Option<String> {
     if ticket.trim().is_empty() {
         Some("Pairing string is required".to_string())
+    } else if is_invite(ticket) {
+        None
     } else {
         device_name_error(name)
     }
@@ -722,6 +741,32 @@ mod tests {
 
         assert!(dialog.show_secrets);
         assert_eq!(dialog.pairing_string, "tcd1_ticket");
+    }
+
+    /// An invite enrolls no device, so the prompt drops the name field instead
+    /// of demanding one that is never used.
+    #[test]
+    fn invite_ticket_submits_without_a_device_name() {
+        let theme = Theme::tomorrow_night();
+        let mut dialog = DevicePairDialog::new(String::new(), FormBindings::Standard);
+        render_pair(&mut dialog, &theme);
+        let device_link_height = dialog.form_height(80);
+
+        dialog.paste("tcj1_ticket", &theme);
+        render_pair(&mut dialog, &theme);
+
+        assert_eq!(dialog.form_height(80), device_link_height - 1);
+        match dialog.activate(DevicePairButton::Pair) {
+            DevicePairEvent::Submit {
+                pairing_string,
+                device_name,
+                ..
+            } => {
+                assert_eq!(pairing_string, "tcj1_ticket");
+                assert!(device_name.is_empty());
+            }
+            _ => panic!("an invite ticket did not submit without a device name"),
+        }
     }
 
     #[test]
