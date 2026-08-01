@@ -365,7 +365,7 @@ where
                 )
             });
         match client.events.recv_timeout(remaining) {
-            Ok(AppEvent::Network(event)) => {
+            Ok(AppEvent::NetworkFor { event, .. }) => {
                 client.observe_network_event(&event);
                 match &event {
                     NetworkEvent::AuthFailed { message, .. }
@@ -521,7 +521,7 @@ fn wait_revoked(client: &Client, label: &str) {
             .checked_duration_since(Instant::now())
             .unwrap_or_else(|| panic!("{label}: revoked device remained usable"));
         match client.events.recv_timeout(remaining) {
-            Ok(AppEvent::Network(event)) => {
+            Ok(AppEvent::NetworkFor { event, .. }) => {
                 client.observe_network_event(&event);
                 match event {
                     NetworkEvent::LocalIdentityUnavailable { message }
@@ -729,7 +729,7 @@ fn relay_voice(sender: &Client, receiver: &Client, stream_id: StreamId, payload:
             .unwrap_or_else(|| panic!("voice stream {} was not relayed", stream_id.0))
             .min(Duration::from_millis(100));
         match receiver.events.recv_timeout(slice) {
-            Ok(AppEvent::Network(event)) => {
+            Ok(AppEvent::NetworkFor { event, .. }) => {
                 receiver.observe_network_event(&event);
                 match event {
                     NetworkEvent::VoicePacketObserved {

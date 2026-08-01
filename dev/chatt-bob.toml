@@ -1,4 +1,5 @@
 [[servers]]
+id = "b0b0000000000000000000000000b002"
 label = "local"
 username = "Bob"
 token = "bob-dev-token"

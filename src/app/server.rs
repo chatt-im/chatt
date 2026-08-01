@@ -4,12 +4,13 @@ use extui_editor::Mode as EditorMode;
 use rpc::{
     control::InviteTicket,
     crypto::{OPEN_PAIR_RECOVERY_PREFIX, encode_hex},
+    ids::ServerId,
 };
 
 use crate::{
     config::{
         Config, DownloadMode, FileOverrides, FormBindings, HistoryOverrides, ServerEntry,
-        validate_server_entry,
+        validate_server_label, validate_username,
     },
     settings::{
         DownloadChoice, OverrideToggle, download_path_error, mb_limit_error, mb_limit_text,
@@ -62,6 +63,7 @@ const ACTIONS: [ActionButton<'static, ServerEditButton>; 3] = [
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServerSelectItem {
+    pub(crate) id: ServerId,
     pub(crate) label: String,
     pub(crate) username: String,
     pub(crate) tcp_addr: String,
@@ -82,11 +84,66 @@ pub(crate) enum ServerEditEvent {
     Save { join_after_save: bool },
 }
 
+/// The projection of a [`ServerEntry`] the edit form owns. Everything else on
+/// the entry — identity, credentials, DM pins, room overrides — stays on the
+/// configured record and survives a commit untouched.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ServerEditFields {
+    pub(crate) label: String,
+    pub(crate) username: String,
+    pub(crate) tcp_addr: String,
+    pub(crate) udp_addr: String,
+    pub(crate) udp_probe_addr: Option<String>,
+    pub(crate) require_transport_encryption: bool,
+    pub(crate) files: FileOverrides,
+    pub(crate) history: HistoryOverrides,
+}
+
+impl ServerEditFields {
+    pub(crate) fn of(entry: &ServerEntry) -> Self {
+        Self {
+            label: entry.label.clone(),
+            username: entry.username.clone(),
+            tcp_addr: entry.tcp_addr.clone(),
+            udp_addr: entry.udp_addr.clone(),
+            udp_probe_addr: entry.udp_probe_addr.clone(),
+            require_transport_encryption: entry.require_transport_encryption,
+            files: entry.files.clone(),
+            history: entry.history.clone(),
+        }
+    }
+
+    pub(crate) fn apply_to(&self, entry: &mut ServerEntry) {
+        entry.label = self.label.clone();
+        entry.username = self.username.clone();
+        entry.tcp_addr = self.tcp_addr.clone();
+        entry.udp_addr = self.udp_addr.clone();
+        entry.udp_probe_addr = self.udp_probe_addr.clone();
+        entry.require_transport_encryption = self.require_transport_encryption;
+        entry.files = self.files.clone();
+        entry.history = self.history.clone();
+    }
+}
+
+#[derive(Clone)]
+enum ServerEditOrigin {
+    /// The editable projection as the form opened it. The commit refuses to
+    /// write when the configured entry no longer matches, so an edit made
+    /// elsewhere reloads instead of being silently overwritten.
+    Existing {
+        id: ServerId,
+        fields: ServerEditFields,
+    },
+    /// A paired server which has not been accepted into the user's config.
+    /// Its identity and credentials stay with the form until Save.
+    New(ServerEntry),
+}
+
 pub(crate) struct ServerEditDraft {
-    /// The entry this draft was opened over, as it was at that moment. The save
-    /// refuses to write when the configured entry no longer matches it, and
-    /// carries the fields the form does not edit.
-    original: ServerEntry,
+    origin: ServerEditOrigin,
+    /// Read-only credential rows the form displays.
+    token: String,
+    server_public_key: String,
     label: String,
     username: String,
     tcp_addr: String,
@@ -106,48 +163,17 @@ pub(crate) struct ServerEditDraft {
     form: UiFormState,
 }
 
-/// What a submitted [`ServerEditDraft`] leaves the editor screen doing.
-///
-/// # The save-and-join invariant
-///
-/// A save-and-join persists the entry and starts a join, but the editor stays
-/// mounted over the server list it was opened from until the session
-/// authenticates. The form is the presentation surface for the whole
-/// save → pair → connect → authenticate sequence: a refused write, a blocked
-/// connection switch, a pairing failure, a re-taken username, a refused
-/// plaintext transport and a reconnect backoff are all reported into the still
-/// open form, with the user's draft, focus and the list underneath exactly as
-/// they were at the click. The submitting client keeps its draft rather than
-/// handing it to the core, so nothing here can leave a form on screen that has
-/// nothing to render.
-///
-/// Exactly three things end it: `NetworkEvent::Authenticated`, which moves
-/// every client to the room; the user's own cancel, which aborts the attempt
-/// and returns to the list; and [`Self::Vanished`], an entry no draft can ever
-/// apply. Nothing else may navigate the holder. A plain save is unaffected: it
-/// closes the editor as soon as the write lands.
-pub(crate) enum ServerEditSave {
-    /// Persisted. The save already closed the editor, or started a join the
-    /// editor is now holding itself open for.
-    Saved,
-    /// Refused with an error the same draft can still fix. The submitting
-    /// editor still holds that draft, so this only carries the error.
-    Rejected,
-    /// The entry moved under the draft. Present this reload of it instead: the
-    /// stale draft can never be applied, so keeping it would strand the user on
-    /// a form that refuses every save.
-    Reloaded(Box<ServerEditDraft>),
-    /// The entry is gone and this draft may not re-create it, so there is
-    /// nothing to reopen.
-    Vanished,
-}
-
 impl ServerEditDraft {
     pub(crate) fn from_server(server: &ServerEntry, config: &Config) -> Self {
         let download_choice = DownloadChoice::from_override(server.files.download);
         let download_path = server.files.download_dir.clone().unwrap_or_default();
         Self {
-            original: server.clone(),
+            origin: ServerEditOrigin::Existing {
+                id: server.id,
+                fields: ServerEditFields::of(server),
+            },
+            token: server.token.clone(),
+            server_public_key: server.server_public_key.clone(),
             label: server.label.clone(),
             username: server.username.clone(),
             tcp_addr: server.tcp_addr.clone(),
@@ -167,6 +193,27 @@ impl ServerEditDraft {
         }
     }
 
+    /// Opens a paired candidate which does not exist in [`Config`] yet.
+    /// Saving this draft inserts the candidate with the id pairing assigned;
+    /// canceling it drops the only retained copy.
+    pub(crate) fn from_new_server(server: ServerEntry, config: &Config) -> Self {
+        let mut draft = Self::from_server(&server, config);
+        draft.origin = ServerEditOrigin::New(server);
+        draft
+    }
+
+    /// Opens a transient paired candidate focused on the field which must be
+    /// corrected before pairing can be retried.
+    pub(crate) fn from_new_server_focused(
+        server: ServerEntry,
+        config: &Config,
+        field: &str,
+    ) -> Self {
+        let mut draft = Self::from_new_server(server, config);
+        draft.form = form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, field);
+        draft
+    }
+
     /// Like [`Self::from_server`] but opens the form with the cursor on `field`
     /// (a label inside [`SERVER_SECTION`]), used to send a rejected connect back
     /// to the offending field.
@@ -177,16 +224,43 @@ impl ServerEditDraft {
     }
 
     pub(crate) fn original_label(&self) -> &str {
-        &self.original.label
+        match &self.origin {
+            ServerEditOrigin::Existing { fields, .. } => &fields.label,
+            ServerEditOrigin::New(server) => &server.label,
+        }
     }
 
-    /// The entry this draft was opened over, for the save's staleness check.
-    pub(crate) fn original(&self) -> &ServerEntry {
-        &self.original
+    pub(crate) fn server_id(&self) -> ServerId {
+        match &self.origin {
+            ServerEditOrigin::Existing { id, .. } => *id,
+            ServerEditOrigin::New(server) => server.id,
+        }
+    }
+
+    /// The editable projection as it was when the form opened, for the
+    /// commit's staleness check.
+    pub(crate) fn original_fields(&self) -> Option<&ServerEditFields> {
+        match &self.origin {
+            ServerEditOrigin::Existing { fields, .. } => Some(fields),
+            ServerEditOrigin::New(_) => None,
+        }
+    }
+
+    /// The complete uncommitted record behind a new-server form.
+    pub(crate) fn new_server(&self) -> Option<&ServerEntry> {
+        match &self.origin {
+            ServerEditOrigin::Existing { .. } => None,
+            ServerEditOrigin::New(server) => Some(server),
+        }
     }
 
     pub(crate) fn title(&self) -> String {
-        format!("Edit Server {}", self.original.label)
+        match &self.origin {
+            ServerEditOrigin::Existing { fields, .. } => {
+                format!("Edit Server {}", fields.label)
+            }
+            ServerEditOrigin::New(server) => format!("Add Server {}", server.label),
+        }
     }
 
     /// The number of form rows the dialog body currently lays out.
@@ -195,25 +269,25 @@ impl ServerEditDraft {
             + u16::from(self.download_choice.shows_path())
     }
 
-    /// Applies `key`. `joining` is the label of the join this form is holding
-    /// open, which stands its submit actions down for as long as it lasts.
+    /// Applies `key`. `submitting` stands the submit actions down while an
+    /// earlier submission is still being answered.
     pub(crate) fn handle_key(
         &mut self,
         key: KeyEvent,
         theme: &Theme,
-        joining: Option<&str>,
+        submitting: bool,
     ) -> ServerEditEvent {
         let kind = self.form.focused_kind();
         let text_focused = kind == FormFieldKind::Text;
         let event = self.form.handle_key(key, kind);
         match event.action {
             FormAction::None | FormAction::TextChanged | FormAction::Scrolled => {
-                self.drive(theme, FieldIntent::None, event.commit, None, joining);
+                self.drive(theme, FieldIntent::None, event.commit, None, submitting);
                 ServerEditEvent::Consumed
             }
             FormAction::Cancel => ServerEditEvent::Cancel,
             FormAction::FocusMoved => {
-                self.drive(theme, FieldIntent::None, event.commit, None, joining);
+                self.drive(theme, FieldIntent::None, event.commit, None, submitting);
                 ServerEditEvent::Consumed
             }
             FormAction::Adjust(delta) => {
@@ -222,12 +296,12 @@ impl ServerEditDraft {
                     FieldIntent::Adjust(delta),
                     event.commit,
                     None,
-                    joining,
+                    submitting,
                 );
                 ServerEditEvent::Consumed
             }
             FormAction::ActivateNextInsert => {
-                self.drive(theme, FieldIntent::None, event.commit, None, joining);
+                self.drive(theme, FieldIntent::None, event.commit, None, submitting);
                 self.move_focus(theme, 1);
                 self.form.enter_insert_mode();
                 ServerEditEvent::Consumed
@@ -237,32 +311,32 @@ impl ServerEditDraft {
                 ServerEditEvent::Consumed
             }
             FormAction::Activate if text_focused => {
-                self.drive(theme, FieldIntent::None, event.commit, None, joining);
+                self.drive(theme, FieldIntent::None, event.commit, None, submitting);
                 self.move_focus(theme, 1);
                 ServerEditEvent::Consumed
             }
             FormAction::Activate => self
-                .drive(theme, FieldIntent::Activate, event.commit, None, joining)
+                .drive(theme, FieldIntent::Activate, event.commit, None, submitting)
                 .map(server_edit_button_event)
                 .unwrap_or(ServerEditEvent::Consumed),
         }
     }
 
-    /// Applies `mouse`, with `joining` as in [`Self::handle_key`].
+    /// Applies `mouse`, with `submitting` as in [`Self::handle_key`].
     pub(crate) fn handle_mouse(
         &mut self,
         mouse: MouseEvent,
         theme: &Theme,
-        joining: Option<&str>,
+        submitting: bool,
     ) -> ServerEditEvent {
         let event = self.form.handle_mouse(mouse);
         match event.intent {
             FormMouseIntent::None => {
-                self.drive(theme, FieldIntent::None, event.commit, None, joining);
+                self.drive(theme, FieldIntent::None, event.commit, None, submitting);
                 ServerEditEvent::Consumed
             }
             FormMouseIntent::Activate(_) => self
-                .drive(theme, FieldIntent::Activate, event.commit, None, joining)
+                .drive(theme, FieldIntent::Activate, event.commit, None, submitting)
                 .map(server_edit_button_event)
                 .unwrap_or(ServerEditEvent::Consumed),
             FormMouseIntent::Adjust(_, delta) => {
@@ -271,7 +345,7 @@ impl ServerEditDraft {
                     FieldIntent::Adjust(delta),
                     event.commit,
                     None,
-                    joining,
+                    submitting,
                 );
                 ServerEditEvent::Consumed
             }
@@ -281,7 +355,7 @@ impl ServerEditDraft {
                     FieldIntent::None,
                     event.commit,
                     Some(column),
-                    joining,
+                    submitting,
                 );
                 ServerEditEvent::Consumed
             }
@@ -295,20 +369,14 @@ impl ServerEditDraft {
 
     pub(crate) fn paste(&mut self, text: &str, theme: &Theme) {
         if let Some(commit) = self.form.insert_paste(text) {
-            self.drive(theme, FieldIntent::None, Some(commit), None, None);
+            self.drive(theme, FieldIntent::None, Some(commit), None, false);
         }
     }
 
-    /// Draws the form. `joining` is the label of the join this form is holding
-    /// itself open for, which stands its submit actions down without moving or
-    /// resizing anything: the same rows, in the same panel, until it resolves.
-    pub(crate) fn render(
-        &mut self,
-        area: Rect,
-        buf: &mut Buffer,
-        theme: &Theme,
-        joining: Option<&str>,
-    ) {
+    /// Draws the form. `submitting` stands the submit actions down without
+    /// moving or resizing anything: the same rows, in the same panel, until
+    /// the outstanding submission resolves.
+    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme, submitting: bool) {
         let mut body = area;
         let detail_area = form::take_detail_area(&mut body, buf, theme, FormSurface::Dialog);
         self.form.begin_frame(body);
@@ -326,8 +394,8 @@ impl ServerEditDraft {
             .with_surface(FormSurface::Dialog);
             let mut form = DetailForm::new(core);
             let values = ServerEditValues {
-                token: &self.original.token,
-                server_public_key: &self.original.server_public_key,
+                token: &self.token,
+                server_public_key: &self.server_public_key,
                 label: &mut self.label,
                 username: &mut self.username,
                 tcp_addr: &mut self.tcp_addr,
@@ -343,7 +411,7 @@ impl ServerEditDraft {
                 inherited_download_mode: self.inherited_download_mode,
                 inherited_receive_limit: &self.inherited_receive_limit,
                 inherited_history_on: self.inherited_history_on,
-                joining,
+                submitting,
             };
             server_edit_ui(&mut form, values);
             form.detail().cloned()
@@ -356,17 +424,17 @@ impl ServerEditDraft {
 
     fn move_focus(&mut self, theme: &Theme, delta: isize) {
         let commit = self.form.move_focus(delta);
-        self.drive(theme, FieldIntent::None, commit, None, None);
+        self.drive(theme, FieldIntent::None, commit, None, false);
     }
 
-    /// The entry this draft would save, with the fields the form does not edit
-    /// carried over from [`Self::original`].
+    /// The editable projection this draft would commit. The catalog applies it
+    /// onto the configured entry, so credentials, pins and room overrides are
+    /// preserved structurally rather than carried by the form.
     ///
     /// # Errors
     ///
-    /// Returns the message to show when a field does not parse or the entry
-    /// fails [`validate_server_entry`].
-    pub(crate) fn to_update(&self) -> Result<ServerEntry, String> {
+    /// Returns the message to show when a field does not parse.
+    pub(crate) fn fields(&self) -> Result<ServerEditFields, String> {
         let draft = self.submission();
         let udp_probe_addr = non_empty_text(&draft.udp_probe_addr);
         let download_dir = if draft.download_choice == DownloadChoice::Persistent {
@@ -389,28 +457,39 @@ impl ServerEditDraft {
             enabled: draft.history_choice.to_option(),
             location: non_empty_text(&draft.history_location),
         };
-        let server = ServerEntry {
+        Ok(ServerEditFields {
             label: draft.label.trim().to_string(),
+            username: draft.username.trim().to_string(),
             tcp_addr: draft.tcp_addr.trim().to_string(),
             udp_addr: draft.udp_addr.trim().to_string(),
             udp_probe_addr,
-            username: draft.username.trim().to_string(),
-            token: self.original.token.clone(),
-            server_public_key: self.original.server_public_key.clone(),
-            e2e_peer_pins: self.original.e2e_peer_pins.clone(),
             require_transport_encryption: draft.require_transport_encryption,
             files,
             history,
-            rooms: self.original.rooms.clone(),
-        };
-        validate_server_entry(&server)?;
-        Ok(server)
+        })
+    }
+
+    /// Moves focus to the first locally-invalid identity field so a rejected
+    /// submit is corrected in place instead of being reported only in the
+    /// status line.
+    pub(crate) fn focus_invalid_identity_field(&mut self) -> Option<String> {
+        let (field, value, error) = validate_server_label(&self.label)
+            .err()
+            .map(|error| ("Label", self.label.clone(), error))
+            .or_else(|| {
+                validate_username(&self.username)
+                    .err()
+                    .map(|error| ("Username", self.username.clone(), error))
+            })?;
+        self.form
+            .focus_text(form::FieldId::new(SERVER_SECTION, field), &value, false);
+        Some(error)
     }
 
     /// Runs one layout pass with no buffer, applying `intent` to the focused
     /// field and returning the action button it activated.
     ///
-    /// `joining` gates the submit actions exactly as the drawn pass renders
+    /// `submitting` gates the submit actions exactly as the drawn pass renders
     /// them, so a button the user can see is stood down cannot be activated.
     fn drive(
         &mut self,
@@ -418,7 +497,7 @@ impl ServerEditDraft {
         intent: FieldIntent,
         commit: Option<Commit>,
         focus_column: Option<u16>,
-        joining: Option<&str>,
+        submitting: bool,
     ) -> Option<ServerEditButton> {
         let viewport = self.form.viewport();
         self.form.begin_frame(viewport);
@@ -436,8 +515,8 @@ impl ServerEditDraft {
             .with_surface(FormSurface::Dialog);
             let mut form = DetailForm::new(core);
             let values = ServerEditValues {
-                token: &self.original.token,
-                server_public_key: &self.original.server_public_key,
+                token: &self.token,
+                server_public_key: &self.server_public_key,
                 label: &mut self.label,
                 username: &mut self.username,
                 tcp_addr: &mut self.tcp_addr,
@@ -453,7 +532,7 @@ impl ServerEditDraft {
                 inherited_download_mode: self.inherited_download_mode,
                 inherited_receive_limit: &self.inherited_receive_limit,
                 inherited_history_on: self.inherited_history_on,
-                joining,
+                submitting,
             };
             server_edit_ui(&mut form, values)
         };
@@ -468,7 +547,7 @@ impl ServerEditDraft {
             FieldIntent::None,
             None,
             None,
-            None,
+            false,
         );
         if !self.focused_text_field() {
             return None;
@@ -486,6 +565,11 @@ impl ServerEditDraft {
     #[cfg(test)]
     pub(crate) fn move_focus_for_test(&mut self, delta: isize) {
         self.move_focus(&Theme::tomorrow_night(), delta);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn field_focused_for_test(&self, field: &str) -> bool {
+        self.form.focus() == form::FieldId::new(SERVER_SECTION, field)
     }
 
     #[cfg(test)]
@@ -508,7 +592,7 @@ impl ServerEditDraft {
                 FieldIntent::None,
                 Some((field, self.form.text())),
                 None,
-                None,
+                false,
             );
         }
         draft
@@ -516,7 +600,9 @@ impl ServerEditDraft {
 
     fn clone_values(&self) -> Self {
         Self {
-            original: self.original.clone(),
+            origin: self.origin.clone(),
+            token: self.token.clone(),
+            server_public_key: self.server_public_key.clone(),
             label: self.label.clone(),
             username: self.username.clone(),
             tcp_addr: self.tcp_addr.clone(),
@@ -555,8 +641,8 @@ struct ServerEditValues<'a> {
     inherited_download_mode: DownloadMode,
     inherited_receive_limit: &'a str,
     inherited_history_on: bool,
-    /// The server this form is holding a join open for, if any.
-    joining: Option<&'a str>,
+    /// Whether an outstanding submission stands the submit actions down.
+    submitting: bool,
 }
 
 fn server_edit_ui(
@@ -569,10 +655,20 @@ fn server_edit_ui(
     form.static_row("Token", &token);
     form.static_row("Key", &server_public_key);
     form.spacer(1);
-    if form.text("Label", values.label, |_| None).is_focus() {
+    if form
+        .text("Label", values.label, |value| {
+            validate_server_label(value).err()
+        })
+        .is_focus()
+    {
         form.set_help("Local alias for this server in the server list and commands.");
     }
-    if form.text("Username", values.username, |_| None).is_focus() {
+    if form
+        .text("Username", values.username, |value| {
+            validate_username(value).err()
+        })
+        .is_focus()
+    {
         form.set_help("Display name sent to this server when connecting.");
     }
     if form.text("TCP", values.tcp_addr, |_| None).is_focus() {
@@ -659,13 +755,12 @@ fn server_edit_ui(
         form.set_help("Base directory for this server's persisted room catalogs and chat logs. Empty inherits the global location.");
     }
     form.spacer(1);
-    // A form holding a join open has already saved: submitting again would
-    // start a second connection over the one it is waiting on. Cancel stays
-    // live — it is how the user calls the join off. Both passes are gated the
-    // same way, so a button drawn stood down cannot be activated either.
-    let joining = values.joining.is_some();
+    // A submitted form is waiting on its result: submitting again would race
+    // the answer. Cancel stays live. Both passes are gated the same way, so a
+    // button drawn stood down cannot be activated either.
+    let submitting = values.submitting;
     form.actions_where(&ACTIONS, |button| {
-        !joining || button == ServerEditButton::Cancel
+        !submitting || button == ServerEditButton::Cancel
     })
     .activated
 }
@@ -714,6 +809,7 @@ pub(crate) fn server_entry_from_invite(
     token: String,
 ) -> Result<ServerEntry, String> {
     Ok(ServerEntry {
+        id: generate_server_id()?,
         label,
         tcp_addr: ticket.tcp_addr.clone(),
         udp_addr: ticket.udp_addr.clone(),
@@ -731,6 +827,14 @@ pub(crate) fn random_token() -> Result<String, String> {
         .fill(&mut bytes)
         .map_err(|_| "failed to generate pairing token".to_string())?;
     Ok(encode_hex(&bytes))
+}
+
+pub(crate) fn generate_server_id() -> Result<ServerId, String> {
+    let mut bytes = [0u8; 16];
+    aws_lc_rs::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "failed to generate server id".to_string())?;
+    Ok(ServerId(bytes))
 }
 
 pub(crate) fn random_open_pair_recovery_token() -> Result<String, String> {
@@ -888,7 +992,7 @@ pub(crate) fn default_join_username() -> String {
 mod tests {
     use super::*;
     use crate::app::{PairCompletion, PendingPair};
-    use crate::config::RoomOverrides;
+    use crate::config::{RoomOverrides, validate_server_entry};
     use rpc::ids::RoomId;
 
     fn overridden_entry() -> ServerEntry {
@@ -983,7 +1087,6 @@ mod tests {
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
-            from_editor: false,
         };
 
         assert_eq!(
@@ -1002,13 +1105,13 @@ mod tests {
         let original = overridden_entry();
 
         let draft = ServerEditDraft::from_server(&original, &config);
-        let saved = draft.to_update().unwrap();
+        let saved = draft.fields().unwrap();
         assert_eq!(saved.files, original.files);
         assert_eq!(saved.history, original.history);
 
         let plain = ServerEntry::default();
         let draft = ServerEditDraft::from_server(&plain, &config);
-        let saved = draft.to_update().unwrap();
+        let saved = draft.fields().unwrap();
         assert_eq!(saved.files, FileOverrides::default());
         assert_eq!(saved.history, HistoryOverrides::default());
     }
@@ -1035,17 +1138,22 @@ mod tests {
 
         assert!(draft.receive_limit.is_empty());
         assert_eq!(draft.inherited_receive_limit, "125");
-        assert_eq!(draft.to_update().unwrap().files.max_download_mb, None);
+        assert_eq!(draft.fields().unwrap().files.max_download_mb, None);
     }
 
     #[test]
-    fn save_preserves_untouched_room_overrides() {
+    fn applied_fields_preserve_identity_credentials_and_room_overrides() {
         let config = Config::default();
         let original = overridden_entry();
 
         let draft = ServerEditDraft::from_server(&original, &config);
-        let saved = draft.to_update().unwrap();
+        let mut saved = original.clone();
+        draft.fields().unwrap().apply_to(&mut saved);
 
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.token, original.token);
+        assert_eq!(saved.server_public_key, original.server_public_key);
+        assert_eq!(saved.e2e_peer_pins, original.e2e_peer_pins);
         assert_eq!(saved.rooms, original.rooms);
     }
 
@@ -1080,7 +1188,7 @@ mod tests {
 
         let mut draft = ServerEditDraft::from_server(&server, &config);
         let mut buf = Buffer::new(80, 40);
-        draft.render(buf.rect(), &mut buf, &Theme::tomorrow_night(), None);
+        draft.render(buf.rect(), &mut buf, &Theme::tomorrow_night(), false);
 
         assert!(validate_server_entry(&server).is_err(), "and it is refused");
     }
@@ -1095,18 +1203,18 @@ mod tests {
         let mut draft = ServerEditDraft::from_server(&server, &config);
         draft.download_path.clear();
 
-        assert!(draft.to_update().is_err());
+        assert!(draft.fields().is_err());
     }
 
-    /// One connection means one join, so a form already holding one will not
-    /// start another — while cancel, the way to call that join off, stays live.
+    /// One submission is answered at a time, so a submitting form will not
+    /// start another — while cancel, the way to leave the form, stays live.
     #[test]
-    fn a_form_holding_a_join_stands_its_submit_actions_down() {
+    fn a_submitting_form_stands_its_submit_actions_down() {
         let config = Config::default();
         let theme = Theme::tomorrow_night();
         let mut draft = ServerEditDraft::from_server(&ServerEntry::default(), &config);
         let mut buf = Buffer::new(80, 40);
-        draft.render(buf.rect(), &mut buf, &theme, None);
+        draft.render(buf.rect(), &mut buf, &theme, false);
         // The action row is registered last, in ACTIONS order, so the focus
         // wraps back into it: Cancel, then Save and join.
         draft.move_focus_for_test(-2);
@@ -1118,11 +1226,11 @@ mod tests {
         };
 
         assert_eq!(
-            draft.handle_key(enter(), &theme, Some("public")),
+            draft.handle_key(enter(), &theme, true),
             ServerEditEvent::Consumed
         );
         assert_eq!(
-            draft.handle_key(enter(), &theme, None),
+            draft.handle_key(enter(), &theme, false),
             ServerEditEvent::Save {
                 join_after_save: true
             }
@@ -1130,9 +1238,9 @@ mod tests {
 
         draft.move_focus_for_test(1);
         assert_eq!(
-            draft.handle_key(enter(), &theme, Some("public")),
+            draft.handle_key(enter(), &theme, true),
             ServerEditEvent::Cancel,
-            "cancel is how the user calls the join off"
+            "cancel stays live while a submission is outstanding"
         );
     }
 }

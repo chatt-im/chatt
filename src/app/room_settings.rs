@@ -1,6 +1,6 @@
 use extui::{Buffer, Rect, event::KeyEvent, event::MouseEvent};
 use extui_editor::Mode as EditorMode;
-use rpc::ids::RoomId;
+use rpc::ids::{RoomId, ServerId};
 
 use crate::{
     config::{Config, DownloadMode, FileOverrides, HistoryOverrides, RoomOverrides, ServerEntry},
@@ -51,7 +51,7 @@ pub(crate) enum RoomSettingsEvent {
 /// server, shown in the room settings popup. Unset (`inherit`) fields resolve
 /// through the server overrides to the global config.
 pub(crate) struct RoomSettingsDraft {
-    server_label: String,
+    server_id: ServerId,
     room_id: RoomId,
     room_name: String,
     download_choice: DownloadChoice,
@@ -86,7 +86,7 @@ impl RoomSettingsDraft {
         let download_path = overrides.files.download_dir.clone().unwrap_or_default();
         let inherited_files = config.effective_files(server, None);
         Self {
-            server_label: server.label.clone(),
+            server_id: server.id,
             room_id,
             room_name,
             download_choice,
@@ -107,8 +107,8 @@ impl RoomSettingsDraft {
         }
     }
 
-    pub(crate) fn server_label(&self) -> &str {
-        &self.server_label
+    pub(crate) fn server_id(&self) -> ServerId {
+        self.server_id
     }
 
     pub(crate) fn title(&self) -> String {
@@ -312,7 +312,7 @@ impl RoomSettingsDraft {
 
     fn clone_values(&self) -> Self {
         Self {
-            server_label: self.server_label.clone(),
+            server_id: self.server_id,
             room_id: self.room_id,
             room_name: self.room_name.clone(),
             download_choice: self.download_choice,

@@ -1,6 +1,6 @@
 use extui::{AnsiColor, Color, Rgb};
 use hashbrown::HashSet;
-use rpc::ids::{RoomId, UserId};
+use rpc::ids::{RoomId, ServerId, UserId};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -49,6 +49,8 @@ pub const NOTIFICATION_VOLUME_DB_STEP: f32 = 0.5;
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct ServerEntry {
+    /// Immutable identity of this record; every other field is a value.
+    pub id: ServerId,
     pub label: String,
     pub tcp_addr: String,
     #[toml(default, ToToml skip_if = String::is_empty)]
@@ -75,6 +77,7 @@ pub struct ServerEntry {
 impl Default for ServerEntry {
     fn default() -> Self {
         Self {
+            id: ServerId(*b"default-serverid"),
             label: default_server_alias(),
             tcp_addr: "127.0.0.1:41000".to_string(),
             udp_addr: String::new(),
@@ -136,22 +139,18 @@ pub struct E2ePeerPin {
 }
 
 impl ServerEntry {
-    /// Whether `other` carries the same values for every field the server
-    /// editor writes.
-    ///
-    /// Pass-through state — the token, the pinned server key, DM identity pins
-    /// and room overrides — is excluded. The network path rewrites those under
-    /// an open editor, and a save takes them from the configured entry instead
-    /// of asserting the draft's copy of them.
-    pub fn edited_fields_eq(&self, other: &Self) -> bool {
-        self.label == other.label
+    /// Whether `other` carries the same values baked into a network worker at
+    /// spawn. A candidate authenticated with different values must never be
+    /// presented as a session for the current record.
+    pub(crate) fn worker_fields_eq(&self, other: &Self) -> bool {
+        self.username == other.username
             && self.tcp_addr == other.tcp_addr
             && self.udp_addr == other.udp_addr
             && self.udp_probe_addr == other.udp_probe_addr
-            && self.username == other.username
+            && self.token == other.token
+            && self.server_public_key == other.server_public_key
+            && self.e2e_peer_pins == other.e2e_peer_pins
             && self.require_transport_encryption == other.require_transport_encryption
-            && self.files == other.files
-            && self.history == other.history
     }
 
     /// Whether `other` carries the same values for every field the live session
@@ -163,13 +162,7 @@ impl ServerEntry {
     /// connected server changes nothing until the next connect. The download
     /// overrides are excluded because a save pushes those to the running worker.
     pub fn connection_fields_eq(&self, other: &Self) -> bool {
-        self.username == other.username
-            && self.tcp_addr == other.tcp_addr
-            && self.udp_addr == other.udp_addr
-            && self.udp_probe_addr == other.udp_probe_addr
-            && self.token == other.token
-            && self.require_transport_encryption == other.require_transport_encryption
-            && self.history == other.history
+        self.worker_fields_eq(other) && self.history == other.history
     }
 
     pub fn client_config(
@@ -977,7 +970,7 @@ impl NotificationConfig {
 #[derive(Clone, Debug, PartialEq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct UserAudioPreference {
-    pub server_alias: String,
+    pub server_id: ServerId,
     pub user_id: UserId,
     pub volume_db: f32,
 }
@@ -1770,7 +1763,6 @@ impl Config {
             .take()
             .and_then(|location| non_empty_string(&location));
         for preference in &mut self.user_audio {
-            preference.server_alias = preference.server_alias.trim().to_string();
             preference.volume_db = snap_user_volume_db(preference.volume_db);
         }
         self.user_audio
@@ -1848,8 +1840,17 @@ impl Config {
             }
         }
         let mut labels = HashSet::new();
+        let mut server_ids = HashSet::new();
         for server in &self.servers {
             let label = &server.label;
+            if server.id.is_zero() {
+                out.push(Diag::error(format!("server {label}: id must be non-zero")));
+            } else if !server_ids.insert(server.id) {
+                out.push(Diag::error(format!(
+                    "duplicate server id {} on {label}",
+                    server.id
+                )));
+            }
             if let Err(error) = validate_server_label(label) {
                 out.push(Diag::error(format!("server {label}: {error}")));
             }
@@ -1888,27 +1889,27 @@ impl Config {
         }
         let mut user_audio_keys = HashSet::new();
         for preference in &self.user_audio {
-            let label = &preference.server_alias;
+            let server_id = preference.server_id;
             let user_id = preference.user_id;
-            if let Err(error) = validate_server_label(label) {
+            if server_id.is_zero() {
                 out.push(Diag::error(format!(
-                    "user-audio {label}:{user_id}: {error}"
+                    "user-audio {server_id}:{user_id}: server-id must be non-zero"
                 )));
             }
             if user_id.0 == 0 {
                 out.push(Diag::error(format!(
-                    "user-audio {label}: user-id must be non-zero"
+                    "user-audio {server_id}: user-id must be non-zero"
                 )));
             }
             if !(MIN_USER_VOLUME_DB..=MAX_USER_VOLUME_DB).contains(&preference.volume_db) {
                 out.push(Diag::error(format!(
-                    "user-audio {label}:{user_id} volume-db must be between {:.1} and {:.1}",
+                    "user-audio {server_id}:{user_id} volume-db must be between {:.1} and {:.1}",
                     MIN_USER_VOLUME_DB, MAX_USER_VOLUME_DB
                 )));
             }
-            if !user_audio_keys.insert((label.as_str(), user_id)) {
+            if !user_audio_keys.insert((server_id, user_id)) {
                 out.push(Diag::error(format!(
-                    "duplicate user-audio entry for {label}:{user_id}"
+                    "duplicate user-audio entry for {server_id}:{user_id}"
                 )));
             }
         }
@@ -2080,43 +2081,39 @@ impl Config {
             .ok_or_else(|| format!("server {alias} is not configured"))
     }
 
-    pub fn upsert_server(&mut self, server: ServerEntry) {
-        if let Some(existing) = self
-            .servers
-            .iter_mut()
-            .find(|existing| existing.label == server.label)
-        {
-            *existing = server;
-        } else {
-            self.servers.push(server);
-        }
+    pub fn server_by_id(&self, id: ServerId) -> Option<&ServerEntry> {
+        self.servers.iter().find(|server| server.id == id)
     }
 
-    pub fn user_volume_db(&self, server_alias: &str, user_id: UserId) -> f32 {
+    pub fn server_by_id_mut(&mut self, id: ServerId) -> Option<&mut ServerEntry> {
+        self.servers.iter_mut().find(|server| server.id == id)
+    }
+
+    pub fn user_volume_db(&self, server_id: ServerId, user_id: UserId) -> f32 {
         self.user_audio
             .iter()
-            .find(|preference| {
-                preference.server_alias == server_alias && preference.user_id == user_id
-            })
+            .find(|preference| preference.server_id == server_id && preference.user_id == user_id)
             .map_or(0.0, |preference| preference.volume_db)
     }
 
-    pub fn set_user_volume_db(&mut self, server_alias: &str, user_id: UserId, volume_db: f32) {
+    pub fn set_user_volume_db(&mut self, server_id: ServerId, user_id: UserId, volume_db: f32) {
         let volume_db = snap_user_volume_db(volume_db);
         if volume_db == 0.0 {
             self.user_audio.retain(|preference| {
-                !(preference.server_alias == server_alias && preference.user_id == user_id)
+                !(preference.server_id == server_id && preference.user_id == user_id)
             });
             return;
         }
 
-        if let Some(preference) = self.user_audio.iter_mut().find(|preference| {
-            preference.server_alias == server_alias && preference.user_id == user_id
-        }) {
+        if let Some(preference) = self
+            .user_audio
+            .iter_mut()
+            .find(|preference| preference.server_id == server_id && preference.user_id == user_id)
+        {
             preference.volume_db = volume_db;
         } else {
             self.user_audio.push(UserAudioPreference {
-                server_alias: server_alias.to_string(),
+                server_id,
                 user_id,
                 volume_db,
             });
@@ -2126,8 +2123,8 @@ impl Config {
 
     fn sort_user_audio(&mut self) {
         self.user_audio.sort_by(|a, b| {
-            a.server_alias
-                .cmp(&b.server_alias)
+            a.server_id
+                .cmp(&b.server_id)
                 .then_with(|| a.user_id.cmp(&b.user_id))
         });
     }
@@ -2656,6 +2653,7 @@ allowed-origins = ["https://chat.example.test", "http://localhost:5173"]
 active-server = "lab"
 
 [[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
 label = "lab"
 username = "Alice"
 token = "alice-dev-token"
@@ -2681,6 +2679,7 @@ server-public-key = ""
 active-server = "lab"
 
 [[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
 label = "lab"
 username = "Alice"
 token = "alice-dev-token"
@@ -2711,6 +2710,7 @@ server-public-key = ""
 active-server = "prod"
 
 [[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
 label = "prod"
 username = "Alice"
 token = "client-generated-token-with-at-least-32-bytes"
@@ -2748,6 +2748,7 @@ server-public-key = ""
 active-server = "lab"
 
 [[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
 label = "lab"
 username = "Alice"
 token = "påsted tøken"
@@ -2801,6 +2802,7 @@ server-public-key = "not-a-key"
 active-server = "lab"
 
 [[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
 label = "lab"
 username = "Alice"
 token = "alice-dev-token"
@@ -2829,6 +2831,7 @@ server-public-key = ""
 active-server = "lab"
 
 [[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
 label = "lab"
 username = "Carol"
 token = "carol-dev-token"
@@ -2931,6 +2934,7 @@ path = "assets/sample-001.opus"
 active-server = "lab"
 
 [[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
 label = "lab"
 username = "Alice"
 token = "alice-dev-token"
@@ -2961,6 +2965,7 @@ server-public-key = ""
 active-server = "lab"
 
 [[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
 label = "lab"
 username = "Alice"
 token = "alice-dev-token"
@@ -3907,31 +3912,53 @@ server-public-key = ""
     }
 
     #[test]
+    fn zero_and_duplicate_server_ids_are_rejected() {
+        let mut config = Config::default();
+        let mut zeroed = ServerEntry::default();
+        zeroed.id = ServerId([0; 16]);
+        config.servers.push(zeroed);
+        let error = validation_errors(&config);
+        assert!(error.contains("id must be non-zero"), "{error}");
+
+        let mut config = Config::default();
+        let first = ServerEntry::default();
+        let mut second = ServerEntry::default();
+        second.label = "other".to_string();
+        second.token = "other-token".to_string();
+        config.servers.push(first);
+        config.servers.push(second);
+        let error = validation_errors(&config);
+        assert!(error.contains("duplicate server id"), "{error}");
+    }
+
+    #[test]
     fn user_volume_preferences_snap_sort_and_remove_zero() {
         let mut config = Config::default();
+        let server_id = ServerEntry::default().id;
 
-        config.set_user_volume_db("local", UserId(3), -5.4);
-        config.set_user_volume_db("local", UserId(2), 7.6);
+        config.set_user_volume_db(server_id, UserId(3), -5.4);
+        config.set_user_volume_db(server_id, UserId(2), 7.6);
 
-        assert_eq!(config.user_volume_db("local", UserId(3)), -5.5);
-        assert_eq!(config.user_volume_db("local", UserId(2)), 7.5);
+        assert_eq!(config.user_volume_db(server_id, UserId(3)), -5.5);
+        assert_eq!(config.user_volume_db(server_id, UserId(2)), 7.5);
         assert_eq!(config.user_audio[0].user_id, UserId(2));
         assert_eq!(config.user_audio[1].user_id, UserId(3));
 
-        config.set_user_volume_db("local", UserId(2), 0.0);
+        config.set_user_volume_db(server_id, UserId(2), 0.0);
 
-        assert_eq!(config.user_volume_db("local", UserId(2)), 0.0);
+        assert_eq!(config.user_volume_db(server_id, UserId(2)), 0.0);
         assert_eq!(config.user_audio.len(), 1);
     }
 
     #[test]
     fn runtime_config_writes_user_audio_as_array_of_tables() {
         let mut config = Config::default();
-        config.set_user_volume_db("local", UserId(2), -5.5);
+        let server_id = ServerEntry::default().id;
+        config.set_user_volume_db(server_id, UserId(2), -5.5);
         let content = render_runtime(&config);
 
         assert!(content.contains("[[user-audio]]"));
-        assert!(content.contains("server-alias = \"local\""));
+        assert!(content.contains(&format!("server-id = \"{server_id}\"")));
         assert!(content.contains("user-id = 2"));
         assert!(content.contains("volume-db = -5.5"));
     }

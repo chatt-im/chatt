@@ -8,7 +8,7 @@ use hashbrown::{HashMap, HashSet};
 
 use rpc::{
     control::{ChatMessage, RoomInfo, RoomKind, UserSummary, VoiceState},
-    ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
+    ids::{FileTransferId, MessageId, RoomId, ServerId, SessionId, StreamId, UserId},
 };
 
 use crate::audio::{LivePlaybackFeedback, PlaybackStreamControl};
@@ -1253,12 +1253,6 @@ pub(crate) struct RoomSession {
     /// no configured server matched. Cleared once the client connects,
     /// disconnects, or cancels the pairing.
     pub join_notice: Option<String>,
-    /// The server label whose join is holding a server editor open, projected
-    /// for the render threads. A save-and-join presents its whole outcome
-    /// inside the form, so the form has to know an attempt is outstanding: its
-    /// submit actions are inert until this clears. One connection means one
-    /// hold, so this is app-wide rather than per client.
-    pub join_hold: Option<String>,
     /// Smoothed round-trip time to the server relay media socket,
     /// milliseconds. The network leg of the latency estimate for relayed
     /// participants.
@@ -1275,7 +1269,10 @@ pub(crate) struct RoomSession {
     /// Shares this client can view, keyed by stream id, learned from
     /// `ShareAvailable`. Holds the per-stream view secret and codec metadata.
     pub(super) available_shares: HashMap<StreamId, super::AvailableShare>,
-    pub active_server_label: Option<String>,
+    /// Identity of the configured entry the network selection points at. This
+    /// is the session's server ownership; `server_alias` is only its display
+    /// name.
+    pub active_server_id: Option<ServerId>,
     /// Health of each audio side plus its opened device name, projected by
     /// the core tick for the lobby-bar widget and top-bar indicators.
     pub capture_health: super::AudioSideHealth,
@@ -2112,14 +2109,13 @@ impl RoomSession {
             attached_views: HashMap::new(),
             voice_room: None,
             join_notice: None,
-            join_hold: None,
             server_rtt_ms: None,
             network_disconnected: false,
             network_selected: false,
             udp_unreachable: false,
             screencast_status: super::ScreencastStatus::default(),
             available_shares: HashMap::new(),
-            active_server_label: None,
+            active_server_id: None,
             capture_health: super::AudioSideHealth::default(),
             playback_health: super::AudioSideHealth::default(),
             capture_stats: None,
@@ -4569,7 +4565,7 @@ impl RoomSession {
         {
             return value_db;
         }
-        config.user_volume_db(&self.server_alias, user_id)
+        config.user_volume_db(self.active_server_id.unwrap_or_default(), user_id)
     }
 
     pub(super) fn playback_control_for_volume(
@@ -8203,8 +8199,9 @@ mod tests {
     fn volume_preview_overrides_persisted_config_and_clears() {
         let mut config = Config::default();
         let mut room = test_room();
-        room.server_alias = "local".to_string();
-        config.set_user_volume_db("local", UserId(2), -6.0);
+        let server_id = crate::config::ServerEntry::default().id;
+        room.active_server_id = Some(server_id);
+        config.set_user_volume_db(server_id, UserId(2), -6.0);
 
         assert_eq!(room.effective_user_volume_db(&config, UserId(2)), -6.0);
         room.begin_volume_preview(UserId(2), 3.0);
