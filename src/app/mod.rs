@@ -3265,12 +3265,15 @@ impl App {
                 return false;
             }
         };
-        self.disconnect_network();
         let owner = self
             .connection_attempt
             .as_ref()
             .filter(|attempt| attempt.server_label == alias)
             .map_or(self.command_client, |attempt| attempt.owner);
+        // The replacement worker is spawned before the live one is torn down so
+        // a spawn failure leaves the existing connection serving; the old
+        // worker's events are already dropped by the generation gate.
+        let previous_attempt = self.connection_attempt.clone();
         let generation = self.begin_connection_attempt(alias, owner);
         let network = match NetworkClient::spawn(
             server.client_config(&self.config, self.download_store.clone()),
@@ -3278,10 +3281,12 @@ impl App {
         ) {
             Ok(network) => network,
             Err(error) => {
+                self.connection_attempt = previous_attempt;
                 self.set_error(format!("failed to start network: {error}"));
                 return false;
             }
         };
+        self.disconnect_network();
         let storage = crate::room_history::HistoryStorage::resolve(&self.config, &server);
         let continuity =
             self.room
@@ -3310,6 +3315,31 @@ impl App {
             kvlog::warn!("failed to update last-server hint", error = %error);
         }
         true
+    }
+
+    /// Moves the live references to a renamed server entry onto its new label.
+    ///
+    /// The session alias, the active label, the in-flight connection attempt and
+    /// the last-server hint all name the entry by label, so a rename that misses
+    /// one of them leaves the session pointing at an entry that is no longer
+    /// configured: DM pin persistence, room settings, identity verification and
+    /// stale-token repair all resolve `config.server(active_server_label)`.
+    fn rename_live_server_label(&mut self, from: &str, to: &str) {
+        let session = self.room.server_alias == from;
+        if session {
+            self.room.server_alias = to.to_string();
+        }
+        if self.room.active_server_label.as_deref() == Some(from) {
+            self.room.active_server_label = Some(to.to_string());
+        }
+        if let Some(attempt) = &mut self.connection_attempt
+            && attempt.server_label == from
+        {
+            attempt.server_label = to.to_string();
+        }
+        if session && let Err(error) = local_control::write_last_server_hint(to) {
+            kvlog::warn!("failed to update last-server hint", error = %error);
+        }
     }
 
     /// Persists a complete DM identity snapshot. The network worker activates
@@ -3362,9 +3392,20 @@ impl App {
         generation
     }
 
+    /// Refuses, and reports, a connection switch that would strand transfers the
+    /// current worker is still running. Every path that replaces the connection
+    /// with a *different* server asks first; re-establishing the same server
+    /// does not, since its transfers are already gone.
+    fn connection_switch_blocked(&mut self) -> bool {
+        if !self.room.has_active_transfers() {
+            return false;
+        }
+        self.set_error(SERVER_SWITCH_TRANSFER_BLOCKED);
+        true
+    }
+
     fn start_connection(&mut self, alias: &str, owner: crate::client_channel::ClientId) -> bool {
-        if self.room.has_active_transfers() {
-            self.set_error(SERVER_SWITCH_TRANSFER_BLOCKED);
+        if self.connection_switch_blocked() {
             return false;
         }
         self.rpc_server_selection_issue = None;
@@ -3376,7 +3417,7 @@ impl App {
         }
         // Seed ownership before spawning; `start_network` assigns the fresh
         // generation for this particular worker.
-        self.connection_attempt = Some(ConnectionAttempt {
+        let previous_attempt = self.connection_attempt.replace(ConnectionAttempt {
             generation: 0,
             owner,
             server_label: alias.to_string(),
@@ -3385,7 +3426,7 @@ impl App {
             self.navigate_all(BaseScreen::Room);
             true
         } else {
-            self.connection_attempt = None;
+            self.connection_attempt = previous_attempt;
             false
         }
     }
@@ -5420,26 +5461,34 @@ impl App {
     }
 
     pub(crate) fn delete_server(&mut self, label: &str) {
+        let servers = self.config.servers.clone();
+        let user_audio = self.config.user_audio.clone();
         self.config.servers.retain(|server| server.label != label);
         self.config
             .user_audio
             .retain(|preference| preference.server_alias != label);
+        // The session is dropped only once the deletion is durable: a refused
+        // write leaves the entry configured, so the connection it names stays.
+        let path = match self.config.save_runtime() {
+            Ok(path) => path,
+            Err(error) => {
+                self.config.servers = servers;
+                self.config.user_audio = user_audio;
+                self.set_error(error);
+                return;
+            }
+        };
         if self.room.server_alias == label {
             self.disconnect_network();
             self.room.reset_for_server_list();
             self.broadcast_reset_rooms();
         }
-        match self.config.save_runtime() {
-            Ok(path) => {
-                self.config.config_path = Some(path.clone());
-                self.rebuild_server_items();
-                self.set_status(format!(
-                    "deleted {label}; config saved to {}",
-                    path.display()
-                ));
-            }
-            Err(error) => self.set_error(error),
-        }
+        self.config.config_path = Some(path.clone());
+        self.rebuild_server_items();
+        self.set_status(format!(
+            "deleted {label}; config saved to {}",
+            path.display()
+        ));
     }
 
     pub(crate) fn accept_transport_encryption_warning(&mut self, label: &str, generation: u64) {
@@ -5473,7 +5522,7 @@ impl App {
             self.navigate_all(BaseScreen::Servers { query: None });
             return false;
         };
-        server.require_transport_encryption = false;
+        let required = std::mem::replace(&mut server.require_transport_encryption, false);
 
         match self.config.save_runtime() {
             Ok(path) => {
@@ -5499,6 +5548,14 @@ impl App {
                 }
             }
             Err(error) => {
+                if let Some(server) = self
+                    .config
+                    .servers
+                    .iter_mut()
+                    .find(|server| server.label == label.as_str())
+                {
+                    server.require_transport_encryption = required;
+                }
                 self.set_error(error);
                 false
             }
@@ -5617,6 +5674,8 @@ impl App {
         server.rooms = current.rooms;
         let label = server.label.clone();
         let history_changed = current.history != server.history;
+        let servers = self.config.servers.clone();
+        let user_audio = self.config.user_audio.clone();
         self.config.servers[index] = server;
         if label != original_label {
             for preference in &mut self.config.user_audio {
@@ -5624,41 +5683,46 @@ impl App {
                     preference.server_alias = label.clone();
                 }
             }
-            if self.room.server_alias == original_label {
-                self.room.server_alias = label.clone();
-            }
         }
-        match self.config.save_runtime() {
-            Ok(path) => {
-                self.config.config_path = Some(path.clone());
-                self.rebuild_server_items();
-                if self.room.active_server_label.as_deref() == Some(label.as_str()) {
-                    self.push_file_policy();
-                }
-                if join_after_save {
-                    if self.start_network(&label) {
-                        self.navigate_all(BaseScreen::Room);
-                        return ServerEditSave::Saved;
-                    }
-                    return ServerEditSave::Rejected;
-                } else {
-                    self.navigate_owner(NavigationEvent::CloseScreen);
-                    if history_changed
-                        && self.network.is_some()
-                        && self.room.active_server_label.as_deref() == Some(label.as_str())
-                    {
-                        self.set_status("server saved; persistence changes apply on reconnect");
-                    } else {
-                        self.set_status(format!("server saved to {}", path.display()));
-                    }
-                }
-                ServerEditSave::Saved
-            }
+        // Nothing outlives a refused write: the configuration goes back to what
+        // is still on disk, so a later unrelated save cannot carry this edit.
+        let path = match self.config.save_runtime() {
+            Ok(path) => path,
             Err(error) => {
+                self.config.servers = servers;
+                self.config.user_audio = user_audio;
                 self.set_error(error);
-                ServerEditSave::Rejected
+                return ServerEditSave::Rejected;
             }
+        };
+        self.config.config_path = Some(path.clone());
+        self.rebuild_server_items();
+        if label != original_label {
+            self.rename_live_server_label(&original_label, &label);
         }
+        let active = self.room.active_server_label.as_deref() == Some(label.as_str());
+        if active {
+            self.push_file_policy();
+        }
+        if join_after_save {
+            if self.connection_switch_blocked() || !self.start_network(&label) {
+                // The entry is durable and only the join was refused, so the
+                // editor stays up over a draft rebuilt from what was written.
+                return ServerEditSave::Reloaded(Box::new(ServerEditDraft::from_server(
+                    &self.config.servers[index],
+                    &self.config,
+                )));
+            }
+            self.navigate_all(BaseScreen::Room);
+            return ServerEditSave::Saved;
+        }
+        self.navigate_owner(NavigationEvent::CloseScreen);
+        if history_changed && self.network.is_some() && active {
+            self.set_status("server saved; persistence changes apply on reconnect");
+        } else {
+            self.set_status(format!("server saved to {}", path.display()));
+        }
+        ServerEditSave::Saved
     }
 
     pub(crate) fn cancel_open_audio_picker(&mut self, session: &mut SettingsSession) -> bool {
@@ -13153,6 +13217,250 @@ mod tests {
         assert_eq!(app.config.servers[0].token, "new-token");
         assert_eq!(app.config.servers[0].username, "Renamed User");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A live session on `label`, as a completed connect leaves it. The command
+    /// receiver is returned because dropping it would close the worker channel.
+    fn connected_session(
+        app: &mut TestApp,
+        label: &str,
+    ) -> mpsc::Receiver<crate::client_net::NetworkCommand> {
+        let (tx, commands) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.room.server_alias = label.to_string();
+        app.room.active_server_label = Some(label.to_string());
+        app.connection_attempt = Some(ConnectionAttempt {
+            generation: 7,
+            owner: crate::client_channel::ClientId::PRIMARY,
+            server_label: label.to_string(),
+        });
+        enter_room_with_users(app, Vec::new());
+        commands
+    }
+
+    /// The same session with one transfer in flight: the state a switch to
+    /// another server must refuse to tear down.
+    fn connected_with_active_transfer(
+        app: &mut TestApp,
+        label: &str,
+    ) -> mpsc::Receiver<crate::client_net::NetworkCommand> {
+        let commands = connected_session(app, label);
+        app.room.transfer_progress(
+            RoomId(1),
+            rpc::ids::FileTransferId(9),
+            10,
+            100,
+            TransferDirection::Outgoing,
+        );
+        assert!(app.room.has_active_transfers());
+        commands
+    }
+
+    fn server_labels(app: &TestApp) -> Vec<(String, String)> {
+        app.config
+            .servers
+            .iter()
+            .map(|server| (server.label.clone(), server.username.clone()))
+            .collect()
+    }
+
+    /// Every live label names a configured entry. The session resolves servers
+    /// by label for DM pins, room settings, identity verification and stale-token
+    /// repair, so a label the configuration no longer holds breaks all of them.
+    fn assert_live_server_labels_resolve(app: &TestApp) {
+        if let Some(label) = app.room.active_server_label.as_deref() {
+            assert!(
+                app.config.server(label).is_ok(),
+                "active label {label} is not configured"
+            );
+        }
+        if let Some(attempt) = &app.connection_attempt {
+            assert!(
+                app.config.server(&attempt.server_label).is_ok(),
+                "attempt label {} is not configured",
+                attempt.server_label
+            );
+        }
+    }
+
+    #[test]
+    fn save_and_join_persists_the_edit_but_refuses_to_strand_active_transfers() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "save-and-join-transfer");
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        let _commands = connected_with_active_transfer(&mut app, "public");
+        let mut draft = ServerEditDraft::from_server(&app.config.servers[1], &app.config);
+        type_into_draft(&mut draft, 1, "Renamed User");
+
+        app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::SaveServerEdit {
+                draft,
+                join_after_save: true,
+            },
+        );
+
+        assert_eq!(app.config.servers[1].username, "Renamed User");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("Renamed User")
+        );
+        assert_eq!(app.view.status.text(), SERVER_SWITCH_TRANSFER_BLOCKED);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert_eq!(app.room.active_server_label.as_deref(), Some("public"));
+        assert!(app.network.is_some());
+        assert!(app.room.has_active_transfers());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Pairing runs beside a live session rather than replacing it, so a paired
+    /// join arrives with that session's transfers still running.
+    #[test]
+    fn pairing_join_keeps_the_credential_and_the_running_transfers() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "pairing-join-transfer");
+        let attempt = running_invite_pair(&mut app, "invite-token", PairCompletion::Join);
+        let _commands = connected_with_active_transfer(&mut app, "lab");
+
+        app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::InviteSucceeded,
+        });
+
+        assert_eq!(
+            app.config.server("public").expect("paired entry").token,
+            "invite-token"
+        );
+        assert_eq!(app.view.status.text(), SERVER_SWITCH_TRANSFER_BLOCKED);
+        assert_eq!(app.room.active_server_label.as_deref(), Some("lab"));
+        assert!(app.network.is_some());
+        assert!(app.room.has_active_transfers());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn renaming_the_active_server_moves_every_live_label_with_it() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "rename-active-server");
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        let commands = connected_session(&mut app, "public");
+        let mut rename = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        type_into_draft(&mut rename, 0, "community");
+
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, rename);
+
+        assert_eq!(app.config.servers[0].label, "community");
+        assert_eq!(app.room.active_server_label.as_deref(), Some("community"));
+        assert_eq!(app.room.server_alias, "community");
+        assert_eq!(
+            app.connection_attempt.as_ref().unwrap().server_label,
+            "community"
+        );
+        assert_live_server_labels_resolve(&app);
+        // The push gate compares the active label against the saved entry, so
+        // before the rename reached it this policy never left the client.
+        assert!(
+            commands
+                .try_iter()
+                .any(|command| matches!(command, NetworkCommand::SetFilePolicy(_)))
+        );
+        assert!(app.persist_e2e_pin(crate::config::E2ePeerPin {
+            room_id: 0x8000_0001,
+            user_id: 2,
+            username: "bob".to_string(),
+            public_key: "11".repeat(32),
+            trust_level: crate::config::E2eTrustLevel::Accepted,
+            change_from: None,
+            previous: Vec::new(),
+        }));
+        assert_eq!(app.config.servers[0].e2e_peer_pins.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn refused_config_write_keeps_the_server_edit_out_of_memory() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        app.config
+            .user_audio
+            .push(crate::config::UserAudioPreference {
+                server_alias: "public".to_string(),
+                user_id: UserId(2),
+                volume_db: -3.0,
+            });
+        let _commands = connected_session(&mut app, "public");
+        let _dir = unwritable_config_path(&mut app, "refused-server-edit");
+        let servers = server_labels(&app);
+        let mut rename = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        type_into_draft(&mut rename, 0, "community");
+
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, rename);
+
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert_eq!(server_labels(&app), servers);
+        assert_eq!(app.config.user_audio[0].server_alias, "public");
+        assert_eq!(app.room.server_alias, "public");
+        assert_eq!(app.room.active_server_label.as_deref(), Some("public"));
+        assert_live_server_labels_resolve(&app);
+
+        // A later save over a writable path must not carry the refused edit.
+        let path = temp_config_path(&mut app, "refused-server-edit-later");
+        app.config.save_runtime().expect("later save");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("community"), "{saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn refused_config_write_keeps_the_deleted_server_and_its_session() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        let _commands = connected_session(&mut app, "public");
+        let _dir = unwritable_config_path(&mut app, "refused-server-delete");
+        let servers = server_labels(&app);
+
+        app.delete_server("public");
+        app.sync_terminal_events();
+
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert_eq!(server_labels(&app), servers);
+        assert_eq!(app.room.active_server_label.as_deref(), Some("public"));
+        assert!(app.network.is_some());
+        assert_live_server_labels_resolve(&app);
+    }
+
+    #[test]
+    fn refused_config_write_restores_the_transport_encryption_requirement() {
+        let mut app = test_app();
+        app.config.servers.push(ServerEntry {
+            require_transport_encryption: true,
+            ..saved_server("public", "public-token")
+        });
+        app.connection_attempt = Some(ConnectionAttempt {
+            generation: 4,
+            owner: crate::client_channel::ClientId::PRIMARY,
+            server_label: "public".to_string(),
+        });
+        let _dir = unwritable_config_path(&mut app, "refused-plaintext-consent");
+
+        assert!(!app.accept_transport_encryption_warning_for(4));
+        app.sync_terminal_events();
+
+        assert!(app.config.servers[0].require_transport_encryption);
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert!(app.network.is_none());
     }
 
     /// An invite attempt holds a client-generated token that matches no saved

@@ -948,6 +948,12 @@ impl PairingCoordinator {
                     )),
                 );
                 let previous_owner = std::mem::replace(&mut app.command_client, owner);
+                // Pairing runs beside a live session, so the credential is kept
+                // but the switch waits for the transfers that session is running.
+                if app.connection_switch_blocked() {
+                    app.command_client = previous_owner;
+                    return;
+                }
                 if app.start_network(&alias) {
                     app.send_terminal_event(
                         Audience::Client(owner),
