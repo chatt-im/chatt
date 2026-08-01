@@ -27,6 +27,8 @@ use crate::{
 
 const LABEL_WIDTH: u16 = 12;
 const SERVER_SECTION: &str = "Server";
+/// Characters of a token or key the read-only rows show before eliding.
+const SHORT_KEY_CHARS: usize = 18;
 const TRANSPORT_ENCRYPTION_CHOICES: [bool; 2] = [true, false];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,11 +581,15 @@ fn transport_encryption_choice_label(required: bool) -> String {
     }
 }
 
+/// The head of a credential, elided when it does not fit the static row.
+///
+/// The cut counts characters rather than bytes: a token or key that is not the
+/// ASCII its formats call for still reaches this on every frame of the edit
+/// form, and a byte cut through a character would take the form down.
 fn short_key(value: &str) -> String {
-    if value.len() <= 18 {
-        value.to_string()
-    } else {
-        format!("{}...", &value[..18])
+    match value.char_indices().nth(SHORT_KEY_CHARS) {
+        Some((offset, _)) => format!("{}...", &value[..offset]),
+        None => value.to_string(),
     }
 }
 
@@ -931,6 +937,42 @@ mod tests {
         let saved = draft.to_update().unwrap();
 
         assert_eq!(saved.rooms, original.rooms);
+    }
+
+    #[test]
+    fn short_key_elides_on_a_character_boundary() {
+        assert_eq!(short_key("abcd"), "abcd");
+        let exact = "0".repeat(SHORT_KEY_CHARS);
+        assert_eq!(short_key(&exact), exact);
+        assert_eq!(short_key(&format!("{exact}0")), format!("{exact}..."));
+        // The head is the same number of characters whatever they encode to: a
+        // byte cut would have kept half of these.
+        let multibyte = "é".repeat(SHORT_KEY_CHARS + 1);
+        assert_eq!(
+            short_key(&multibyte),
+            format!("{}...", "é".repeat(SHORT_KEY_CHARS))
+        );
+    }
+
+    /// A credential the config holds is shown on every frame of the edit form,
+    /// and nothing between the file and this render enforces its encoding.
+    #[test]
+    fn multibyte_credentials_render_instead_of_taking_the_form_down() {
+        let config = Config::default();
+        let mut server = ServerEntry::default();
+        server.token = format!("{}{}", "a".repeat(17), "é".repeat(10));
+        server.server_public_key = "🔑".repeat(20);
+        // Both put a character across byte SHORT_KEY_CHARS, where the elision
+        // used to slice, so a byte cut cannot pass this.
+        for value in [&server.token, &server.server_public_key] {
+            assert!(!value.is_char_boundary(SHORT_KEY_CHARS), "{value}");
+        }
+
+        let mut draft = ServerEditDraft::from_server(&server, &config);
+        let mut buf = Buffer::new(80, 40);
+        draft.render(buf.rect(), &mut buf, &Theme::tomorrow_night());
+
+        assert!(validate_server_entry(&server).is_err(), "and it is refused");
     }
 
     #[test]

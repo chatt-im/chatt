@@ -5754,12 +5754,15 @@ impl App {
         // The form does not own these: DM pins and room overrides are written
         // onto the live entry while the editor is open, and the token pair is
         // replaced by pairing. Taking them from the draft would revert them.
-        server.token = current.token;
-        server.server_public_key = current.server_public_key;
-        server.e2e_peer_pins = current.e2e_peer_pins;
-        server.rooms = current.rooms;
+        server.token = current.token.clone();
+        server.server_public_key = current.server_public_key.clone();
+        server.e2e_peer_pins = current.e2e_peer_pins.clone();
+        server.rooms = current.rooms.clone();
         let label = server.label.clone();
-        let history_changed = current.history != server.history;
+        // A plain save never reconnects — save and join is the explicit path for
+        // that — so a change the running session took at connect only lands on
+        // the next one, and the status has to say so.
+        let connection_changed = !current.connection_fields_eq(&server);
         let servers = self.config.servers.clone();
         let user_audio = self.config.user_audio.clone();
         self.config.servers[index] = server;
@@ -5803,8 +5806,8 @@ impl App {
             return ServerEditSave::Saved;
         }
         self.navigate_owner(NavigationEvent::CloseScreen);
-        if history_changed && self.network.is_some() && active {
-            self.set_status("server saved; persistence changes apply on reconnect");
+        if connection_changed && self.network.is_some() && active {
+            self.set_status("server saved; changes apply on reconnect");
         } else {
             self.set_status(format!("server saved to {}", path.display()));
         }
@@ -13552,6 +13555,74 @@ mod tests {
             previous: Vec::new(),
         }));
         assert_eq!(app.config.servers[0].e2e_peer_pins.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A plain save is deliberately not a reconnect, so an edit the running
+    /// session already took at connect has to be reported as pending rather
+    /// than read as applied.
+    #[test]
+    fn saving_the_active_server_reports_what_waits_for_the_next_connect() {
+        // The display name and every address reach the worker once, at connect.
+        for (field, value) in [(1, "Renamed User"), (2, "10.0.0.9:42000")] {
+            let mut app = test_app();
+            let path = temp_config_path(&mut app, "active-connection-change");
+            app.config
+                .servers
+                .push(saved_server("public", "public-token"));
+            let _commands = connected_session(&mut app, "public");
+            let mut edit = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+            type_into_draft(&mut edit, field, value);
+
+            save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, edit);
+
+            assert_eq!(
+                app.view.status.text(),
+                "server saved; changes apply on reconnect",
+                "field {field}"
+            );
+            assert_eq!(app.view.status.kind(), StatusKind::Info);
+            assert!(app.network.is_some(), "the save must not reconnect");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn saves_that_leave_the_live_session_alone_stay_quiet() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "quiet-server-save");
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        let _commands = connected_session(&mut app, "public");
+        let mut inactive = ServerEditDraft::from_server(&app.config.servers[1], &app.config);
+        type_into_draft(&mut inactive, 1, "Renamed User");
+
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, inactive);
+
+        assert_eq!(app.config.servers[1].username, "Renamed User");
+        assert!(
+            app.view.status.text().starts_with("server saved to"),
+            "another server's connection settings say nothing about this one: {}",
+            app.view.status.text()
+        );
+
+        // A rename of the active server moves with the live session instead of
+        // waiting for a reconnect.
+        let mut rename = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        type_into_draft(&mut rename, 0, "renamed");
+
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, rename);
+
+        assert_eq!(app.room.active_server_label.as_deref(), Some("renamed"));
+        assert!(
+            app.view.status.text().starts_with("server saved to"),
+            "{}",
+            app.view.status.text()
+        );
         let _ = std::fs::remove_file(path);
     }
 
