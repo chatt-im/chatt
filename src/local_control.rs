@@ -1829,30 +1829,27 @@ mod imp {
         Ok(parent.join("last-server"))
     }
 
-    pub(crate) fn write_last_server_hint(alias: &str) -> Result<(), String> {
+    pub(crate) fn write_last_server_hint(server_id: rpc::ids::ServerId) -> Result<(), String> {
         let path = last_server_hint_path()?;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_secs();
-        fs::write(&path, format!("{timestamp}\n{alias}\n"))
+        fs::write(&path, format!("{timestamp}\n{server_id}\n"))
             .map_err(|error| format!("failed to write {}: {error}", path.display()))
     }
 
-    pub(crate) fn read_last_server_hint(max_age: Duration) -> Option<String> {
+    pub(crate) fn read_last_server_hint(max_age: Duration) -> Option<rpc::ids::ServerId> {
         let path = last_server_hint_path().ok()?;
         let text = fs::read_to_string(path).ok()?;
         let mut lines = text.lines();
         let timestamp = lines.next()?.parse::<u64>().ok()?;
-        let alias = lines.next()?.trim();
-        if alias.is_empty() {
-            return None;
-        }
+        let server_id = rpc::ids::ServerId::from_hex(lines.next()?.trim())?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_secs();
-        (now.saturating_sub(timestamp) <= max_age.as_secs()).then(|| alias.to_string())
+        (now.saturating_sub(timestamp) <= max_age.as_secs()).then_some(server_id)
     }
 
     fn response_message_within_limit(message: &str) -> Cow<'_, str> {
@@ -2664,11 +2661,13 @@ mod imp {
         false
     }
 
-    pub(crate) fn write_last_server_hint(_alias: &str) -> Result<(), String> {
+    pub(crate) fn write_last_server_hint(_server_id: rpc::ids::ServerId) -> Result<(), String> {
         Ok(())
     }
 
-    pub(crate) fn read_last_server_hint(_max_age: std::time::Duration) -> Option<String> {
+    pub(crate) fn read_last_server_hint(
+        _max_age: std::time::Duration,
+    ) -> Option<rpc::ids::ServerId> {
         None
     }
 }

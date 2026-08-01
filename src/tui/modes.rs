@@ -12,7 +12,7 @@ use crate::{
     },
     bindings::{self, BindCommand, Resolved},
     chat_buffer::{LineKind, ViewCursor as ChatCursor, VisibleLine},
-    client_channel::DirtySections,
+    client_channel::{DirtySections, JoinPhaseView, JoinView, ServerEditOutcome, TerminalEvent},
     settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft},
     theme,
     tui::{
@@ -520,17 +520,22 @@ impl ServerListMode {
                 cx.set_status(format!("editing server {label}"));
             }
             DeleteServer => {
-                let Some(label) = self.selected_label(cx) else {
+                let Some(item) = self
+                    .select
+                    .current_item_index()
+                    .and_then(|index| cx.view.server_catalog.items().get(index))
+                else {
                     cx.set_error("no server selected");
                     return Action::Continue;
                 };
-                let prompt = format!("Delete server '{label}'?");
+                let server_id = item.id;
+                let prompt = format!("Delete server '{}'?", item.label);
                 cx.request_transition(ModeTransition::Push(Box::new(ConfirmMode::new(
                     prompt,
                     "Delete",
                     "Cancel",
                     move |cx| {
-                        cx.send(CoreCommand::DeleteServer { label });
+                        cx.send(CoreCommand::DeleteServer { server_id });
                         ConfirmDisposition::Transition(ModeTransition::Pop)
                     },
                 ))));
@@ -540,7 +545,7 @@ impl ServerListMode {
                 self.select.clear_query();
                 self.select.refresh(cx.view.server_catalog.items());
             }
-            Cancel if cx.session.active_server_label.is_some() => {
+            Cancel if cx.session.active_server_id.is_some() => {
                 cx.request_transition(ModeTransition::Push(Box::new(RoomMode::default())));
             }
             _ => return process_global_command_cx(cx, command),
@@ -789,31 +794,57 @@ impl AppMode for RoomSwitchMode {
 /// The server edit form, which owns its draft for as long as it is on screen.
 ///
 /// A submit sends the core a copy of the values rather than the draft itself:
-/// the core answers asynchronously, and a save-and-join not until the session
-/// authenticates, so a form that gave its draft away would have nothing to draw
-/// or edit in the meantime. See [`ServerEditSave`] for what the wait covers.
-///
-/// [`ServerEditSave`]: crate::app::ServerEditSave
+/// the core answers asynchronously with a [`ServerEditOutcome`], so a form
+/// that gave its draft away would have nothing to draw or edit in the
+/// meantime.
 pub(crate) struct ServerEditMode {
     draft: ServerEditDraft,
+    next_request_id: u64,
+    /// The outstanding submission, whose matching result is the only one this
+    /// form applies. While set, the submit actions stand down locally.
+    submitting: Option<u64>,
+    /// The candidate connection started by the outstanding Save and Join.
+    /// Canceling the editor calls off that candidate before leaving the form.
+    joining_attempt: Option<u64>,
 }
 
 impl ServerEditMode {
     pub(crate) fn new(draft: ServerEditDraft) -> Self {
-        Self { draft }
+        Self {
+            draft,
+            next_request_id: 0,
+            submitting: None,
+            joining_attempt: None,
+        }
     }
 
     fn handle_event(&mut self, cx: &mut ViewCx<'_>, event: ServerEditEvent) {
         match event {
             ServerEditEvent::Consumed => {}
             ServerEditEvent::Cancel => {
-                cx.send(CoreCommand::CancelServerEdit);
+                if let Some(attempt_id) = self.joining_attempt.take() {
+                    cx.send(CoreCommand::CancelJoin { attempt_id });
+                }
+                if self.draft.new_server().is_some() {
+                    cx.send(CoreCommand::ClosePairing);
+                }
                 cx.request_transition(ModeTransition::Pop);
             }
             ServerEditEvent::Save { join_after_save } => {
-                cx.send(CoreCommand::SaveServerEdit {
+                if self.submitting.is_some() {
+                    return;
+                }
+                if let Some(error) = self.draft.focus_invalid_identity_field() {
+                    cx.set_error(error);
+                    return;
+                }
+                self.next_request_id += 1;
+                let request_id = self.next_request_id;
+                self.submitting = Some(request_id);
+                cx.send(CoreCommand::SubmitServerEdit {
+                    request_id,
                     draft: self.draft.submission(),
-                    join_after_save,
+                    join: join_after_save,
                 });
             }
         }
@@ -825,7 +856,7 @@ impl ServerEditMode {
         }
         let event = self
             .draft
-            .handle_key(key, &cx.view.theme, cx.session.join_hold.as_deref());
+            .handle_key(key, &cx.view.theme, self.submitting.is_some());
         self.handle_event(cx, event);
         Action::Continue
     }
@@ -833,7 +864,7 @@ impl ServerEditMode {
     fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
         let event = self
             .draft
-            .handle_mouse(mouse, &cx.view.theme, cx.session.join_hold.as_deref());
+            .handle_mouse(mouse, &cx.view.theme, self.submitting.is_some());
         self.handle_event(cx, event);
         Action::Continue
     }
@@ -847,8 +878,9 @@ impl AppMode for ServerEditMode {
         _now_ms: u64,
         _dirty: DirtySections,
     ) {
+        let submitting = self.submitting.is_some();
         let mut render = crate::tui::render::RenderState::new(cx);
-        crate::tui::render::draw_server_edit_overlay(&mut render, &mut self.draft, buf);
+        crate::tui::render::draw_server_edit_overlay(&mut render, &mut self.draft, submitting, buf);
     }
 
     fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
@@ -867,6 +899,40 @@ impl AppMode for ServerEditMode {
         self.draft.paste(&text, &cx.view.theme);
     }
 
+    fn process_client_event(&mut self, cx: &mut ViewCx<'_>, event: TerminalEvent) {
+        let TerminalEvent::ServerEditResult {
+            request_id,
+            outcome,
+        } = event
+        else {
+            return;
+        };
+        if self.submitting != Some(request_id) {
+            return;
+        }
+        match outcome {
+            ServerEditOutcome::Rejected => {
+                self.submitting = None;
+                self.joining_attempt = None;
+            }
+            ServerEditOutcome::Retry(draft)
+            | ServerEditOutcome::Conflict(draft)
+            | ServerEditOutcome::SavedButJoinFailed(draft) => {
+                self.submitting = None;
+                self.joining_attempt = None;
+                self.draft = *draft;
+            }
+            ServerEditOutcome::Missing | ServerEditOutcome::Saved => {
+                self.submitting = None;
+                self.joining_attempt = None;
+                cx.request_transition(ModeTransition::Pop);
+            }
+            ServerEditOutcome::JoinStarted(view) => {
+                self.joining_attempt = Some(view.attempt_id);
+            }
+        }
+    }
+
     fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
         ModePresentation {
             coverage: Coverage::Overlay,
@@ -876,6 +942,125 @@ impl AppMode for ServerEditMode {
                 layer: bindings::FORM_LAYER,
             }),
         }
+    }
+}
+
+/// The progress screen of one pending join: the attempt's phase, a retry when
+/// it failed retryably, and the cancel that calls it off. Authentication never
+/// lands here — promotion resets every terminal to the room.
+pub(crate) struct JoinMode {
+    view: JoinView,
+}
+
+impl JoinMode {
+    pub(crate) fn new(view: JoinView) -> Self {
+        Self { view }
+    }
+
+    fn retryable(&self) -> bool {
+        matches!(
+            self.view.phase,
+            JoinPhaseView::Failed {
+                retryable: true,
+                ..
+            }
+        )
+    }
+
+    fn phase_text(&self) -> String {
+        match &self.view.phase {
+            JoinPhaseView::Connecting => "connecting...".to_string(),
+            JoinPhaseView::Authenticating => "connected; authenticating...".to_string(),
+            JoinPhaseView::RepairingCredentials => "refreshing saved credentials...".to_string(),
+            JoinPhaseView::AwaitingConsent => "waiting for transport consent".to_string(),
+            JoinPhaseView::Failed { message, .. } => message.clone(),
+        }
+    }
+
+    fn cancel(&self, cx: &mut ViewCx<'_>) {
+        cx.send(CoreCommand::CancelJoin {
+            attempt_id: self.view.attempt_id,
+        });
+        cx.request_transition(ModeTransition::Pop);
+    }
+
+    fn retry(&self, cx: &mut ViewCx<'_>) {
+        if self.retryable() {
+            cx.send(CoreCommand::RetryJoin {
+                attempt_id: self.view.attempt_id,
+            });
+        }
+    }
+}
+
+impl AppMode for JoinMode {
+    fn render(
+        &mut self,
+        cx: &mut ViewCx<'_>,
+        buf: &mut Buffer,
+        _now_ms: u64,
+        _dirty: DirtySections,
+    ) {
+        let app = crate::tui::render::RenderState::new(cx);
+        let theme = &app.view.theme;
+        let area = buf.rect();
+        if area.w < 24 || area.h < 5 {
+            return;
+        }
+        let width = area.w.clamp(24, 60);
+        let height = area.h.min(6);
+        let panel = Rect {
+            x: area.x + area.w.saturating_sub(width) / 2,
+            y: area.y + area.h.saturating_sub(height) / 2,
+            w: width,
+            h: height,
+        };
+        let title = format!("Joining {}", self.view.server_label);
+        let mut body = crate::tui::render::draw_dialog_frame(panel, buf, theme, &title);
+        body.take_top(1);
+        let style = if matches!(self.view.phase, JoinPhaseView::Failed { .. }) {
+            theme.dialog_panel.patch(theme.error)
+        } else {
+            theme.dialog_panel
+        };
+        body.take_top(1).with(style).text(buf, &self.phase_text());
+        let hint = if self.retryable() {
+            "r retries; esc cancels"
+        } else {
+            "esc cancels"
+        };
+        body.take_top(1)
+            .with(theme.dialog_panel.patch(theme.muted))
+            .text(buf, hint);
+    }
+
+    fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        match key.code {
+            KeyCode::Esc => self.cancel(cx),
+            KeyCode::Char('r') | KeyCode::Char('R') => self.retry(cx),
+            KeyCode::Enter if self.retryable() => self.retry(cx),
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    fn process_client_event(&mut self, _cx: &mut ViewCx<'_>, event: TerminalEvent) {
+        let TerminalEvent::JoinUpdate(view) = event else {
+            return;
+        };
+        if view.attempt_id == self.view.attempt_id {
+            self.view = view;
+        }
+    }
+
+    fn presentation(&self, _cx: &ViewCx<'_>) -> ModePresentation {
+        ModePresentation::OVERLAY
     }
 }
 
@@ -1657,7 +1842,7 @@ impl RoomMode {
             }
             "/clear" => cx.view.clear_chat(),
             "/config" | "/settings" => cx.send(CoreCommand::OpenSettings),
-            "/servers" if cx.session.active_server_label.is_some() => {
+            "/servers" if cx.session.active_server_id.is_some() => {
                 cx.request_transition(ModeTransition::Pop);
             }
             "/servers" => {
@@ -1679,7 +1864,7 @@ impl RoomMode {
     }
 
     fn open_room_settings(&self, cx: &mut ViewCx<'_>) {
-        let Some(alias) = cx.session.active_server_label.as_ref() else {
+        let Some(server_id) = cx.session.active_server_id else {
             cx.set_error("connect to a server first");
             return;
         };
@@ -1687,12 +1872,9 @@ impl RoomMode {
             cx.set_error("view a room first");
             return;
         };
-        let server = match cx.config.server(alias) {
-            Ok(server) => server,
-            Err(error) => {
-                cx.set_error(error);
-                return;
-            }
+        let Some(server) = cx.config.server_by_id(server_id) else {
+            cx.set_error("the connected server is no longer configured");
+            return;
         };
         let draft = RoomSettingsDraft::from_config(
             cx.config,
@@ -1718,7 +1900,9 @@ impl RoomMode {
         }
         let user_id = selected.user_id;
         let username = selected.username().to_string();
-        let value_db = cx.config.user_volume_db(&cx.session.server_alias, user_id);
+        let value_db = cx
+            .config
+            .user_volume_db(cx.session.active_server_id.unwrap_or_default(), user_id);
         cx.send(CoreCommand::BeginVolumePreview { user_id, value_db });
         let dialog = UserVolumeDialog::new(user_id, username.clone(), value_db, &cx.view.theme);
         cx.request_transition(ModeTransition::Push(Box::new(DialogMode::new(dialog))));
@@ -3094,10 +3278,7 @@ mod tests {
 
         mode.process_paste(&mut app, "pasted-user".to_string());
 
-        let updated = mode
-            .draft
-            .to_update()
-            .expect("pasted server draft is valid");
+        let updated = mode.draft.fields().expect("pasted server draft is valid");
         assert_eq!(updated.username, "pasted-user");
     }
 
@@ -3115,6 +3296,7 @@ mod tests {
             ..Default::default()
         };
         app.config.servers.push(crate::config::ServerEntry {
+            id: rpc::ids::ServerId(*b"community-server"),
             label: "community".to_string(),
             token: "community-token".to_string(),
             ..public.clone()
@@ -3142,7 +3324,7 @@ mod tests {
 
         assert_eq!(app.view.status.kind(), crate::app::StatusKind::Error);
         assert_eq!(
-            mode.draft.to_update().expect("draft still parses").label,
+            mode.draft.fields().expect("draft still parses").label,
             "community",
             "the refused text is still there to be fixed"
         );
@@ -3151,6 +3333,142 @@ mod tests {
             (0..40).any(|row| row_text(&mut buffer, row).contains("Edit Server public")),
             "the form is still drawn"
         );
+    }
+
+    #[test]
+    fn invalid_username_is_focused_without_submitting_the_editor() {
+        let mut app = test_app();
+        let server = crate::config::ServerEntry {
+            username: "bad\u{1}name".to_string(),
+            ..Default::default()
+        };
+        let draft = ServerEditDraft::from_server(&server, &app.config);
+        let mut mode = ServerEditMode::new(draft);
+
+        {
+            let mut cx = app.view_cx();
+            mode.handle_event(
+                &mut cx,
+                ServerEditEvent::Save {
+                    join_after_save: true,
+                },
+            );
+        }
+
+        assert!(mode.draft.field_focused_for_test("Username"));
+        assert!(mode.submitting.is_none());
+        assert_eq!(app.view.status.kind(), crate::app::StatusKind::Error);
+    }
+
+    /// Feeds every queued terminal event to `mode`, as the stack would.
+    fn pump_client_events(app: &mut TestApp, mode: &mut dyn AppMode) {
+        while let Some(event) = app.take_terminal_event() {
+            let mut cx = app.view_cx();
+            mode.process_client_event(&mut cx, event);
+        }
+    }
+
+    fn submit_editor(app: &mut TestApp, mode: &mut ServerEditMode, join: bool) {
+        {
+            let mut cx = app.view_cx();
+            mode.handle_event(
+                &mut cx,
+                ServerEditEvent::Save {
+                    join_after_save: join,
+                },
+            );
+        }
+        app.drain_core_commands();
+    }
+
+    #[test]
+    fn a_successful_save_closes_the_editor() {
+        let mut app = test_app();
+        app.config.config_path =
+            Some(std::env::temp_dir().join(format!("chatt-mode-save-{}.toml", std::process::id())));
+        app.config.servers.push(crate::config::ServerEntry {
+            tcp_addr: "127.0.0.1:1".to_string(),
+            ..Default::default()
+        });
+        let draft = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        let mut mode = ServerEditMode::new(draft);
+
+        submit_editor(&mut app, &mut mode, false);
+        pump_client_events(&mut app, &mut mode);
+
+        assert!(matches!(
+            app.test_navigation.pop_front(),
+            Some(ModeTransition::Pop)
+        ));
+        let _ = std::fs::remove_file(app.config.config_path.as_ref().unwrap());
+    }
+
+    #[test]
+    fn a_save_and_join_keeps_the_editor_until_connected() {
+        let mut app = test_app();
+        app.config.config_path =
+            Some(std::env::temp_dir().join(format!("chatt-mode-join-{}.toml", std::process::id())));
+        app.config.servers.push(crate::config::ServerEntry {
+            tcp_addr: "127.0.0.1:1".to_string(),
+            ..Default::default()
+        });
+        let draft = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        let mut mode = ServerEditMode::new(draft);
+
+        submit_editor(&mut app, &mut mode, true);
+        pump_client_events(&mut app, &mut mode);
+
+        assert!(app.test_navigation.is_empty());
+        assert_eq!(mode.submitting, Some(1));
+        assert!(mode.joining_attempt.is_some());
+        let _ = std::fs::remove_file(app.config.config_path.as_ref().unwrap());
+    }
+
+    /// A leftover join screen must not present a newer attempt's progress, and
+    /// a stale editor result must not close a form that did not submit it.
+    #[test]
+    fn join_and_editor_updates_are_gated_by_their_ids() {
+        let mut app = test_app();
+        let mut join = JoinMode::new(JoinView {
+            attempt_id: 3,
+            server_label: "public".to_string(),
+            phase: JoinPhaseView::Connecting,
+        });
+        {
+            let mut cx = app.view_cx();
+            join.process_client_event(
+                &mut cx,
+                TerminalEvent::JoinUpdate(JoinView {
+                    attempt_id: 4,
+                    server_label: "public".to_string(),
+                    phase: JoinPhaseView::Failed {
+                        message: "nope".to_string(),
+                        retryable: true,
+                    },
+                }),
+            );
+        }
+        assert!(
+            matches!(join.view.phase, JoinPhaseView::Connecting),
+            "another attempt's update was ignored"
+        );
+
+        let draft =
+            ServerEditDraft::from_server(&crate::config::ServerEntry::default(), &app.config);
+        let mut editor = ServerEditMode::new(draft);
+        editor.submitting = Some(2);
+        {
+            let mut cx = app.view_cx();
+            editor.process_client_event(
+                &mut cx,
+                TerminalEvent::ServerEditResult {
+                    request_id: 1,
+                    outcome: ServerEditOutcome::Saved,
+                },
+            );
+        }
+        assert_eq!(editor.submitting, Some(2), "a stale result was ignored");
+        assert!(app.test_navigation.is_empty());
     }
 
     #[test]

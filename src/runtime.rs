@@ -787,8 +787,12 @@ fn handle_runtime_event(
         }
         AppEvent::RpcClientFrame { client_id, frame } => {
             if let local_rpc::frame::ClientFrame::SelectServer { request_id, label } = &frame
-                && !(app.room.active_server_label.as_deref() == Some(label.as_str())
-                    && app.network.is_some())
+                && !(app.network.is_some()
+                    && app
+                        .config
+                        .server(label)
+                        .ok()
+                        .is_some_and(|server| Some(server.id) == app.room.active_server_id))
                 && rpc_upload_staging_active(rpc_clients)
             {
                 send_rpc_rejection(
@@ -882,7 +886,7 @@ fn handle_runtime_event(
 /// skips it. The list is deliberately a deny-list of known-inert events: an
 /// event not named here still broadcasts.
 fn affects_rpc_projection(event: &AppEvent) -> bool {
-    let (AppEvent::Network(event) | AppEvent::NetworkFor { event, .. }) = event else {
+    let AppEvent::NetworkFor { event, .. } = event else {
         return !matches!(
             event,
             AppEvent::ScreencastProgress(_) | AppEvent::ShareViewStatus { .. }
@@ -2850,7 +2854,10 @@ mod tests {
                 rtt_ms: Some(4),
             },
         ] {
-            assert!(!affects_rpc_projection(&AppEvent::Network(event)));
+            assert!(!affects_rpc_projection(&AppEvent::NetworkFor {
+                generation: 1,
+                event,
+            }));
         }
         assert!(!affects_rpc_projection(&AppEvent::NetworkFor {
             generation: 1,
@@ -2863,12 +2870,14 @@ mod tests {
         }));
 
         // Anything not explicitly known to be inert still broadcasts.
-        assert!(affects_rpc_projection(&AppEvent::Network(
-            NetworkEvent::Connected
-        )));
-        assert!(affects_rpc_projection(&AppEvent::Network(
-            NetworkEvent::DeviceLinkCanceled
-        )));
+        assert!(affects_rpc_projection(&AppEvent::NetworkFor {
+            generation: 1,
+            event: NetworkEvent::Connected,
+        }));
+        assert!(affects_rpc_projection(&AppEvent::NetworkFor {
+            generation: 1,
+            event: NetworkEvent::DeviceLinkCanceled,
+        }));
     }
 
     fn remote_client() -> (RemoteClient, UnixStream, Arc<ClientChannel>) {

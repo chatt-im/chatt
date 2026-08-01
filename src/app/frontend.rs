@@ -115,14 +115,7 @@ impl App {
                     username: server.username.clone(),
                     tcp_addr: server.tcp_addr.clone(),
                     require_transport_encryption: server.require_transport_encryption,
-                    availability: if server
-                        .token
-                        .starts_with(rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX)
-                    {
-                        ServerAvailability::PairingIncomplete
-                    } else {
-                        ServerAvailability::Ready
-                    },
+                    availability: ServerAvailability::Ready,
                 })
                 .collect(),
             error: issue.as_ref().and_then(|issue| match issue {
@@ -192,14 +185,20 @@ impl App {
         StateSnapshot {
             connection: if self.user_id.is_some() {
                 ConnectionState::Online
-            } else if self.network.is_some() {
+            } else if self.network.is_some() || self.has_pending_join() {
                 ConnectionState::Connecting
             } else {
                 ConnectionState::Offline
             },
-            active_server: self.room.active_server_label.clone().or_else(|| {
-                (!self.room.server_alias.is_empty()).then(|| self.room.server_alias.clone())
-            }),
+            active_server: self
+                .room
+                .active_server_id
+                .and_then(|server_id| self.config.server_by_id(server_id))
+                .map(|server| server.label.clone())
+                .or_else(|| self.pending_join_server_label())
+                .or_else(|| {
+                    (!self.room.server_alias.is_empty()).then(|| self.room.server_alias.clone())
+                }),
             server_selection,
             local_identity: (!self.room.local_username.is_empty())
                 .then(|| self.room.local_username.clone()),
@@ -922,39 +921,19 @@ impl App {
                 "server is not configured",
             );
         };
-        if server
-            .token
-            .starts_with(rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX)
-        {
-            return rejected(
-                request_id,
-                Operation::SelectServer,
-                409,
-                "server pairing is incomplete; finish pairing in the terminal client",
-            );
-        }
-        if self.room.active_server_label.as_deref() == Some(label.as_str())
-            && self.network.is_some()
-        {
-            return accepted(request_id, Operation::SelectServer);
-        }
-        if self.room.has_active_transfers() {
-            return rejected(
-                request_id,
-                Operation::SelectServer,
-                409,
-                super::SERVER_SWITCH_TRANSFER_BLOCKED,
-            );
-        }
-        if self.start_connection(&label, client_id) {
-            accepted(request_id, Operation::SelectServer)
-        } else {
-            rejected(
-                request_id,
-                Operation::SelectServer,
-                503,
-                "failed to start the server connection",
-            )
+        let server_id = server.id;
+        match self.start_join(server_id, super::JoinOwner::Rpc(client_id)) {
+            super::JoinStart::Started(_) | super::JoinStart::AlreadyActive => {
+                accepted(request_id, Operation::SelectServer)
+            }
+            super::JoinStart::Refused(message) => {
+                let code = if message == super::SERVER_SWITCH_TRANSFER_BLOCKED {
+                    409
+                } else {
+                    503
+                };
+                rejected(request_id, Operation::SelectServer, code, &message)
+            }
         }
     }
 
@@ -978,7 +957,7 @@ impl App {
                 ) => Some(*attempt_id),
                 super::RpcServerSelectionIssue::Error(_) => None,
             });
-        if current != Some(attempt_id) {
+        if current != Some(attempt_id) || !self.rpc_owns_join_consent(client_id, attempt_id) {
             return rejected(
                 request_id,
                 Operation::ResolveServerPrompt,
@@ -987,24 +966,14 @@ impl App {
             );
         }
 
-        let previous = std::mem::replace(&mut self.command_client, client_id);
-        let resolved = if accept_prompt {
-            self.accept_transport_encryption_warning_for(attempt_id)
+        if accept_prompt {
+            if let Err(error) = self.accept_join_plaintext(attempt_id) {
+                return rejected(request_id, Operation::ResolveServerPrompt, 500, &error);
+            }
         } else {
-            self.cancel_transport_encryption_warning_for(attempt_id);
-            true
-        };
-        self.command_client = previous;
-        if resolved {
-            accepted(request_id, Operation::ResolveServerPrompt)
-        } else {
-            rejected(
-                request_id,
-                Operation::ResolveServerPrompt,
-                500,
-                "could not apply the server security preference",
-            )
+            self.decline_join_plaintext(attempt_id);
         }
+        accepted(request_id, Operation::ResolveServerPrompt)
     }
 
     fn rpc_owns_message(&self, room_id: RoomId, target: rpc::ids::MessageId) -> bool {
@@ -1213,48 +1182,23 @@ mod tests {
     }
 
     #[test]
-    fn rpc_snapshot_projects_safe_server_catalog_and_pairing_state() {
-        let app = app_with_server(
-            "work",
-            &format!("{}pending", rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX),
-            false,
-        );
+    fn rpc_rejects_unknown_server_selection() {
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
 
-        let snapshot = app.rpc_snapshot(ClientId(7));
-
-        assert_eq!(snapshot.server_selection.servers.len(), 1);
-        let server = &snapshot.server_selection.servers[0];
-        assert_eq!(server.label, "work");
-        assert_eq!(server.username, "alice");
-        assert_eq!(server.tcp_addr, "127.0.0.1:4000");
-        assert!(!server.require_transport_encryption);
-        assert_eq!(server.availability, ServerAvailability::PairingIncomplete);
-    }
-
-    #[test]
-    fn rpc_rejects_unknown_and_incomplete_server_selection() {
-        let mut app = app_with_server(
-            "work",
-            &format!("{}pending", rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX),
-            true,
-        );
-
-        for (request_id, label, expected_code) in [(1, "missing", 404), (2, "work", 409)] {
-            let RpcCommandEffect::Reply(result) = app.handle_rpc_frame(
-                ClientId(7),
-                ClientFrame::SelectServer {
-                    request_id: RequestId(request_id),
-                    label: label.into(),
-                },
-            ) else {
-                panic!("expected request result");
-            };
-            assert_eq!(result.operation, Operation::SelectServer);
-            assert!(matches!(
-                result.outcome,
-                RequestOutcome::Rejected { code, .. } if code == expected_code
-            ));
-        }
+        let RpcCommandEffect::Reply(result) = app.handle_rpc_frame(
+            ClientId(7),
+            ClientFrame::SelectServer {
+                request_id: RequestId(1),
+                label: "missing".into(),
+            },
+        ) else {
+            panic!("expected request result");
+        };
+        assert_eq!(result.operation, Operation::SelectServer);
+        assert!(matches!(
+            result.outcome,
+            RequestOutcome::Rejected { code: 404, .. }
+        ));
         assert!(app.network.is_none());
     }
 
@@ -1278,7 +1222,10 @@ mod tests {
         let snapshot = app.rpc_snapshot(client_id);
         assert_eq!(snapshot.active_server.as_deref(), Some("work"));
         assert_eq!(snapshot.connection, ConnectionState::Connecting);
-        assert!(app.network.is_some());
+        // The candidate is pending; the active session slot stays untouched
+        // until it authenticates.
+        assert!(app.network.is_none());
+        assert!(app.has_pending_join());
     }
 
     #[test]
@@ -1288,36 +1235,123 @@ mod tests {
         let observer = ClientId(8);
         app.register_rpc_client(owner);
         app.register_rpc_client(observer);
-        app.connection_attempt = Some(super::super::ConnectionAttempt {
-            generation: 11,
-            owner,
-            server_label: "legacy".into(),
-            holds_editor: false,
-        });
-        app.rpc_server_selection_issue = Some(super::super::OwnedRpcServerSelectionIssue {
-            owner,
-            issue: super::super::RpcServerSelectionIssue::Prompt(
-                local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
-                    label: "legacy".into(),
-                    attempt_id: 11,
-                },
-            ),
+        let server_id = app.config.servers[0].id;
+        assert!(matches!(
+            app.start_join(server_id, super::super::JoinOwner::Rpc(owner)),
+            super::super::JoinStart::Started(_)
+        ));
+        let generation = app.join_attempt_generation().expect("pending join");
+        app.handle_app_event(crate::app::AppEvent::NetworkFor {
+            generation,
+            event: crate::client_net::NetworkEvent::TransportEncryptionRequired,
         });
 
-        assert!(app.rpc_snapshot(owner).server_selection.prompt.is_some());
+        let prompt = app.rpc_snapshot(owner).server_selection.prompt;
+        let Some(local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
+            attempt_id,
+            ..
+        }) = prompt
+        else {
+            panic!("expected a transport prompt for the owner");
+        };
         assert!(app.rpc_snapshot(observer).server_selection.prompt.is_none());
 
-        let stale = app.rpc_resolve_server_prompt(owner, RequestId(1), 10, false);
+        let stale = app.rpc_resolve_server_prompt(owner, RequestId(1), attempt_id + 1, false);
         assert!(matches!(
             stale.outcome,
             RequestOutcome::Rejected { code: 409, .. }
         ));
-        assert!(app.connection_attempt.is_some());
+        assert!(app.rpc_snapshot(owner).server_selection.prompt.is_some());
 
-        let canceled = app.rpc_resolve_server_prompt(owner, RequestId(2), 11, false);
+        let canceled = app.rpc_resolve_server_prompt(owner, RequestId(2), attempt_id, false);
         assert_eq!(canceled.outcome, RequestOutcome::Accepted);
-        assert!(app.connection_attempt.is_none());
         assert!(app.rpc_snapshot(owner).server_selection.prompt.is_none());
+    }
+
+    #[test]
+    fn rpc_plaintext_consent_rejects_a_refused_save_and_keeps_the_prompt() {
+        let mut app = app_with_server("legacy", "token", true);
+        let owner = ClientId(7);
+        app.register_rpc_client(owner);
+        let server_id = app.config.servers[0].id;
+        assert!(matches!(
+            app.start_join(server_id, super::super::JoinOwner::Rpc(owner)),
+            super::super::JoinStart::Started(_)
+        ));
+        let generation = app.join_attempt_generation().expect("pending join");
+        app.handle_app_event(crate::app::AppEvent::NetworkFor {
+            generation,
+            event: crate::client_net::NetworkEvent::TransportEncryptionRequired,
+        });
+        let prompt = app.rpc_snapshot(owner).server_selection.prompt;
+        let Some(local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
+            attempt_id,
+            ..
+        }) = prompt
+        else {
+            panic!("expected a transport prompt");
+        };
+        let directory =
+            std::env::temp_dir().join(format!("chatt-rpc-consent-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        app.config.config_path = Some(directory.clone());
+
+        let result = app.rpc_resolve_server_prompt(owner, RequestId(9), attempt_id, true);
+
+        assert!(matches!(
+            result.outcome,
+            RequestOutcome::Rejected { code: 500, .. }
+        ));
+        assert!(app.config.servers[0].require_transport_encryption);
+        assert!(app.rpc_owns_join_consent(owner, attempt_id));
+        assert!(app.rpc_snapshot(owner).server_selection.prompt.is_some());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn superseding_an_rpc_join_invalidates_its_prompt() {
+        let mut app = app_with_server("legacy", "token", true);
+        let owner = ClientId(7);
+        let replacement_owner = ClientId(8);
+        app.register_rpc_client(owner);
+        app.register_rpc_client(replacement_owner);
+        let first_id = app.config.servers[0].id;
+        let mut replacement = app.config.servers[0].clone();
+        replacement.id = rpc::ids::ServerId(*b"another-serverid");
+        replacement.label = "current".to_string();
+        app.config.servers.push(replacement);
+        assert!(matches!(
+            app.start_join(first_id, super::super::JoinOwner::Rpc(owner)),
+            super::super::JoinStart::Started(_)
+        ));
+        let generation = app.join_attempt_generation().expect("pending join");
+        app.handle_app_event(crate::app::AppEvent::NetworkFor {
+            generation,
+            event: crate::client_net::NetworkEvent::TransportEncryptionRequired,
+        });
+        let prompt = app.rpc_snapshot(owner).server_selection.prompt;
+        let Some(local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
+            attempt_id,
+            ..
+        }) = prompt
+        else {
+            panic!("expected a transport prompt");
+        };
+
+        assert!(matches!(
+            app.start_join(
+                rpc::ids::ServerId(*b"another-serverid"),
+                super::super::JoinOwner::Rpc(replacement_owner),
+            ),
+            super::super::JoinStart::Started(_)
+        ));
+
+        assert!(app.rpc_snapshot(owner).server_selection.prompt.is_none());
+        let stale = app.rpc_resolve_server_prompt(owner, RequestId(11), attempt_id, true);
+        assert!(matches!(
+            stale.outcome,
+            RequestOutcome::Rejected { code: 409, .. }
+        ));
     }
 
     #[test]

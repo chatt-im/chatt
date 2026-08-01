@@ -217,6 +217,7 @@ pub(crate) fn draw_dialog_frame_with_header(
 pub(crate) fn draw_server_edit_overlay(
     app: &mut RenderState<'_>,
     draft: &mut ServerEditDraft,
+    submitting: bool,
     buf: &mut Buffer,
 ) {
     let area = buf.rect();
@@ -224,7 +225,7 @@ pub(crate) fn draw_server_edit_overlay(
         return;
     };
     let body = draw_dialog_frame(panel, buf, &app.view.theme, &draft.title());
-    draft.render(body, buf, &app.view.theme, app.room.join_hold.as_deref());
+    draft.render(body, buf, &app.view.theme, submitting);
     draw_overlay_key_preview(app, bindings::FORM_LAYER, buf);
 }
 

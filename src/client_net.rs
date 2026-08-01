@@ -6990,7 +6990,7 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().unwrap(),
-            crate::app::AppEvent::Network(NetworkEvent::Error(message))
+            crate::app::AppEvent::NetworkFor { event: NetworkEvent::Error(message), .. }
                 if message.contains("test backpressure")
         ));
     }
@@ -7858,12 +7858,13 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(crate::app::AppEvent::Network(
-                NetworkEvent::VoicePacketObserved {
+            Ok(crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::VoicePacketObserved {
                     stream_id: 7,
                     payload_size: 4,
-                }
-            ))
+                },
+                ..
+            })
         ));
         assert!(rx.try_recv().is_err());
         assert_eq!(pending.len(), 1);
@@ -7889,12 +7890,13 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(crate::app::AppEvent::Network(
-                NetworkEvent::VoicePacketObserved {
+            Ok(crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::VoicePacketObserved {
                     stream_id: 9,
                     payload_size: 3,
-                }
-            ))
+                },
+                ..
+            })
         ));
         assert!(rx.try_recv().is_err());
         assert!(pending.is_empty());

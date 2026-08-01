@@ -181,8 +181,8 @@ pub(crate) trait AppMode: Send {
         }
     }
 
-    fn process_client_event(&mut self, event: TerminalEvent) {
-        let _ = event;
+    fn process_client_event(&mut self, cx: &mut ViewCx<'_>, event: TerminalEvent) {
+        let _ = (cx, event);
     }
 
     fn on_enter(&mut self, _cx: &mut ViewCx<'_>) {}
@@ -385,7 +385,10 @@ impl ModeStack {
                 self.apply_transition(cx, transition);
                 self.apply_pending_cx(cx);
             }
-            event => self.active_mut().process_client_event(event),
+            event => {
+                self.active_mut().process_client_event(cx, event);
+                self.apply_pending_cx(cx);
+            }
         }
     }
 
@@ -543,7 +546,7 @@ impl BaseScreen {
 impl ScreenSpec {
     pub(crate) fn into_mode(self) -> Box<dyn AppMode> {
         use crate::tui::{
-            modes::{RoomSwitchMode, ServerEditMode, SettingsMode},
+            modes::{JoinMode, RoomSwitchMode, ServerEditMode, SettingsMode},
             room_settings::RoomSettingsMode,
             user_list::UserListMode,
         };
@@ -553,6 +556,7 @@ impl ScreenSpec {
             Self::RoomSwitcher => Box::new(RoomSwitchMode::new()),
             Self::UserList => Box::new(UserListMode::new()),
             Self::RoomSettings(draft) => Box::new(RoomSettingsMode::new(draft)),
+            Self::Joining(view) => Box::new(JoinMode::new(view)),
         }
     }
 }
@@ -835,7 +839,7 @@ mod tests {
                 TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                     OverlaySpec::TransportEncryptionWarning {
                         label: "legacy".to_string(),
-                        target: TransportWarningTarget::Connection { generation: 17 },
+                        target: TransportWarningTarget::Join { attempt_id: 17 },
                     },
                 ))),
             );
@@ -853,7 +857,7 @@ mod tests {
         }
         assert!(matches!(
             app.take_queued_core_command(),
-            Some(CoreCommand::CancelTransportEncryption { generation: 17 })
+            Some(CoreCommand::CancelTransportEncryption { attempt_id: 17 })
         ));
     }
 

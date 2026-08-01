@@ -303,11 +303,8 @@ impl TransportEncryptionWarningMode {
 
     fn accept(&mut self, cx: &mut ViewCx<'_>) {
         let command = match self.target {
-            TransportWarningTarget::Connection { generation } => {
-                CoreCommand::AcceptTransportEncryption {
-                    label: self.label.clone(),
-                    generation,
-                }
+            TransportWarningTarget::Join { attempt_id } => {
+                CoreCommand::AcceptTransportEncryption { attempt_id }
             }
             TransportWarningTarget::Pairing => CoreCommand::AcceptPairingPlaintext,
         };
@@ -316,8 +313,8 @@ impl TransportEncryptionWarningMode {
 
     fn cancel(&mut self, cx: &mut ViewCx<'_>) {
         let command = match self.target {
-            TransportWarningTarget::Connection { generation } => {
-                CoreCommand::CancelTransportEncryption { generation }
+            TransportWarningTarget::Join { attempt_id } => {
+                CoreCommand::CancelTransportEncryption { attempt_id }
             }
             TransportWarningTarget::Pairing => CoreCommand::CancelPairing,
         };
@@ -419,7 +416,7 @@ impl TransportEncryptionWarningMode {
         let cancel = button_label("Cancel", Some("n".to_string()));
         let connect = button_label(
             match self.target {
-                TransportWarningTarget::Connection { .. } => "Connect",
+                TransportWarningTarget::Join { .. } => "Connect",
                 TransportWarningTarget::Pairing => "Pair",
             },
             Some("y".to_string()),
@@ -1632,7 +1629,11 @@ impl AppMode for DevicePairMode {
         self.dialog.paste(&text, &cx.view.theme);
     }
 
-    fn process_client_event(&mut self, event: crate::client_channel::TerminalEvent) {
+    fn process_client_event(
+        &mut self,
+        _cx: &mut ViewCx<'_>,
+        event: crate::client_channel::TerminalEvent,
+    ) {
         match event {
             crate::client_channel::TerminalEvent::PairingFailed(error) => {
                 self.dialog.pairing_failed(error);
@@ -1758,6 +1759,52 @@ pub(crate) struct PasswordPromptMode {
 enum PasswordFeedback {
     Info(String),
     Error(String),
+}
+
+/// Lays out and draws the shared cancel/submit row of a pairing prompt,
+/// returning the two hit boxes.
+fn draw_pairing_prompt_buttons(
+    area: Rect,
+    app: &crate::tui::render::RenderState<'_>,
+    buf: &mut Buffer,
+    theme: &Theme,
+    submit_label: &str,
+) -> (Rect, Rect) {
+    if area.is_empty() {
+        return (Rect::EMPTY, Rect::EMPTY);
+    }
+    let mut row = area;
+    let gap = u16::from(row.w > 20);
+    let button_width = row.w.saturating_sub(gap) / 2;
+    let cancel_button = row.take_left(button_width as i32);
+    if gap > 0 {
+        row.take_left(gap as i32).with(theme.dialog_panel).fill(buf);
+    }
+    let submit_button = row;
+    let cancel = button_label(
+        "Cancel",
+        bindings::command_key_hint(
+            &app.config.bindings,
+            bindings::PASSWORD_LAYER,
+            BindCommand::Cancel,
+        ),
+    );
+    let submit = button_label(
+        submit_label,
+        bindings::command_key_hint(
+            &app.config.bindings,
+            bindings::PASSWORD_LAYER,
+            BindCommand::SubmitPassword,
+        ),
+    );
+    draw_button(
+        cancel_button,
+        buf,
+        theme.dialog_panel.patch(theme.muted),
+        &cancel,
+    );
+    draw_button(submit_button, buf, theme.selected_focused, &submit);
+    (cancel_button, submit_button)
 }
 
 impl PasswordPromptMode {
@@ -1889,7 +1936,11 @@ impl AppMode for PasswordPromptMode {
         crate::tui::render::draw_overlay_key_preview(&mut app, bindings::PASSWORD_LAYER, buf);
     }
 
-    fn process_client_event(&mut self, event: crate::client_channel::TerminalEvent) {
+    fn process_client_event(
+        &mut self,
+        _cx: &mut ViewCx<'_>,
+        event: crate::client_channel::TerminalEvent,
+    ) {
         use crate::client_channel::TerminalEvent;
 
         match event {
@@ -1996,44 +2047,8 @@ impl PasswordPromptMode {
         buf: &mut Buffer,
         theme: &Theme,
     ) {
-        if area.is_empty() {
-            self.cancel_button = Rect::EMPTY;
-            self.submit_button = Rect::EMPTY;
-            return;
-        }
-
-        let mut row = area;
-        let gap = u16::from(row.w > 20);
-        let button_width = row.w.saturating_sub(gap) / 2;
-        self.cancel_button = row.take_left(button_width as i32);
-        if gap > 0 {
-            row.take_left(gap as i32).with(theme.dialog_panel).fill(buf);
-        }
-        self.submit_button = row;
-
-        let cancel = button_label(
-            "Cancel",
-            bindings::command_key_hint(
-                &app.config.bindings,
-                bindings::PASSWORD_LAYER,
-                BindCommand::Cancel,
-            ),
-        );
-        let submit = button_label(
-            "Submit",
-            bindings::command_key_hint(
-                &app.config.bindings,
-                bindings::PASSWORD_LAYER,
-                BindCommand::SubmitPassword,
-            ),
-        );
-        draw_button(
-            self.cancel_button,
-            buf,
-            theme.dialog_panel.patch(theme.muted),
-            &cancel,
-        );
-        draw_button(self.submit_button, buf, theme.selected_focused, &submit);
+        (self.cancel_button, self.submit_button) =
+            draw_pairing_prompt_buttons(area, app, buf, theme, "Submit");
     }
 }
 
@@ -2115,7 +2130,7 @@ impl PasteImageUploadMode {
     }
 
     fn submit(&mut self, cx: &mut ViewCx<'_>) {
-        if cx.session.active_server_label.is_none() {
+        if cx.session.active_server_id.is_none() {
             self.error = Some("select a server before uploading files".to_string());
             return;
         }
@@ -3312,7 +3327,6 @@ mod tests {
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
-            from_editor: false,
         }
     }
 
@@ -3431,13 +3445,17 @@ mod tests {
 
     #[test]
     fn password_prompt_reports_a_pairing_failure_and_accepts_input_again() {
+        let mut app = test_app();
         let mut prompt = PasswordPromptMode::new(false);
         prompt.input = "bad".to_string();
         prompt.submitting = true;
 
-        prompt.process_client_event(crate::client_channel::TerminalEvent::PairingFailed(
-            "no pairing in progress".to_string(),
-        ));
+        prompt.process_client_event(
+            &mut app.view_cx(),
+            crate::client_channel::TerminalEvent::PairingFailed(
+                "no pairing in progress".to_string(),
+            ),
+        );
 
         assert_eq!(
             prompt.feedback,
@@ -3449,11 +3467,13 @@ mod tests {
 
     #[test]
     fn password_prompt_consumes_retry_as_local_feedback() {
+        let mut app = test_app();
         let mut prompt = PasswordPromptMode::new(false);
         prompt.input = "bad".to_string();
         prompt.submitting = true;
 
         prompt.process_client_event(
+            &mut app.view_cx(),
             crate::client_channel::TerminalEvent::PairingPasswordChallenge { retry: true },
         );
 

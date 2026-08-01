@@ -708,7 +708,7 @@ fn run_interactive_app(
 
         let retake_join = if retaking && pending_join.is_none() {
             local_control::read_last_server_hint(std::time::Duration::from_secs(60 * 60))
-                .map(|specifier| crate::app::PendingJoin::Named { specifier })
+                .map(|server_id| crate::app::PendingJoin::ById(server_id))
         } else {
             pending_join.clone()
         };

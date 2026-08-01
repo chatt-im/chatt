@@ -7,7 +7,7 @@
 
 use extui::event::{KeyEvent, MouseEvent};
 use rpc::{
-    ids::{FileTransferId, MessageId, RoomId, UserId},
+    ids::{FileTransferId, MessageId, RoomId, ServerId, UserId},
     msgref::MessageRef,
 };
 
@@ -95,11 +95,10 @@ pub(crate) enum CoreCommand {
     PlaySoundboard(usize),
     ToggleVideo,
     AcceptTransportEncryption {
-        label: String,
-        generation: u64,
+        attempt_id: u64,
     },
     CancelTransportEncryption {
-        generation: u64,
+        attempt_id: u64,
     },
     CloseE2eIdentity,
     ForgetE2eIdentity(AcceptedPeerIdentity),
@@ -108,13 +107,19 @@ pub(crate) enum CoreCommand {
         alias: String,
     },
     DeleteServer {
-        label: String,
+        server_id: ServerId,
     },
-    SaveServerEdit {
+    SubmitServerEdit {
+        request_id: u64,
         draft: ServerEditDraft,
-        join_after_save: bool,
+        join: bool,
     },
-    CancelServerEdit,
+    RetryJoin {
+        attempt_id: u64,
+    },
+    CancelJoin {
+        attempt_id: u64,
+    },
     SaveRoomSettings(RoomSettingsDraft),
     SaveWelcome {
         draft: WelcomeDraft,

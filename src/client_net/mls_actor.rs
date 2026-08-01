@@ -3084,15 +3084,16 @@ mod tests {
         );
         assert!(matches!(
             receiver.try_recv(),
-            Ok(crate::app::AppEvent::Network(
-                NetworkEvent::HistoryChunk {
+            Ok(crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::HistoryChunk {
                     room_id: RoomId(9),
                     before: None,
                     messages,
                     at_start: true,
                     complete: true,
-                }
-            )) if messages.is_empty()
+                },
+                ..
+            }) if messages.is_empty()
         ));
     }
 

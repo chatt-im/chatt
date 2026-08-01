@@ -1196,7 +1196,7 @@ impl ScenarioRunner {
                 runtime.events.recv_timeout(remaining)
             };
             match received {
-                Ok(AppEvent::Network(event)) => {
+                Ok(AppEvent::NetworkFor { event, .. }) => {
                     self.observe_event(device, &event)?;
                     if predicate(&event) {
                         return Ok(event);

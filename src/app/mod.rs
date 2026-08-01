@@ -6,6 +6,7 @@ pub(crate) mod commands;
 pub(crate) mod device_pair;
 pub(crate) mod dialogs;
 pub(crate) mod frontend;
+mod join;
 mod pairing;
 pub(crate) mod participants;
 pub(crate) mod room;
@@ -13,6 +14,7 @@ pub(crate) mod room_settings;
 mod rpc_identity;
 mod rpc_settings;
 pub(crate) mod server;
+mod server_catalog;
 mod shared;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -34,17 +36,17 @@ use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, Mo
 use jsony::Jsony;
 use rpc::{
     control::{
-        ChatMutationKind, DeviceLinkTicket, ERROR_TOKEN_STALE_EPOCH, ERROR_USERNAME_TAKEN,
-        InviteTicket, VoiceState,
+        ChatMutationKind, DeviceLinkTicket, ERROR_TOKEN_STALE_EPOCH, InviteTicket, VoiceState,
     },
-    crypto::OPEN_PAIR_RECOVERY_PREFIX,
-    ids::{FileTransferId, MessageId, RoomId, SessionId, ShareAttemptId, StreamId, UserId},
+    ids::{
+        FileTransferId, MessageId, RoomId, ServerId, SessionId, ShareAttemptId, StreamId, UserId,
+    },
 };
 
 use crate::{
     client_channel::{
-        BaseScreen, DirtySections, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
-        TransportWarningTarget,
+        BaseScreen, DirtySections, NavigationEvent, OverlaySpec, ScreenSpec, ServerEditOutcome,
+        TerminalEvent,
     },
     client_net::{
         NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE, PairingEvent,
@@ -77,6 +79,7 @@ use audio_supervisor::{
     AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, RebuildCause,
 };
 use commands::slash_command_help;
+pub(crate) use join::{JoinOwner, JoinStart};
 pub(crate) use pairing::{PairCompletion, PendingPair};
 use pairing::{PairingCoordinator, PairingInput, PairingJob, RetainedTicket};
 use shared::CoreRw;
@@ -88,9 +91,9 @@ pub(crate) use room::{
 };
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
-    ServerEditDraft, ServerEditEvent, ServerEditSave, ServerSelectItem, alias_from_tcp_addr,
-    canonical_endpoint, default_join_alias, default_join_username, random_open_pair_recovery_token,
-    random_token, server_entry_from_invite, unique_server_alias,
+    ServerEditDraft, ServerEditEvent, ServerSelectItem, alias_from_tcp_addr, canonical_endpoint,
+    default_join_alias, default_join_username, random_open_pair_recovery_token, random_token,
+    server_entry_from_invite, unique_server_alias,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +306,7 @@ impl ServerCatalog {
             .servers
             .iter()
             .map(|server| ServerSelectItem {
+                id: server.id,
                 label: server.label.clone(),
                 username: server.username.clone(),
                 tcp_addr: server.tcp_addr.clone(),
@@ -357,49 +361,6 @@ pub(crate) struct ClientHandle {
     pub(crate) channel: Arc<crate::client_channel::ClientChannel>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Audience {
-    Client(crate::client_channel::ClientId),
-    All,
-}
-
-/// How a server editor the core presents reaches the owner's screen stack.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EditorPresentation {
-    /// Stack the form over the base screen the caller has just reset.
-    Open,
-    /// Replace the form the owner is already on: a held join failed, and the
-    /// user has been looking at that form the whole time.
-    Replace,
-}
-
-impl EditorPresentation {
-    fn for_hold(holds_editor: bool) -> Self {
-        if holds_editor {
-            Self::Replace
-        } else {
-            Self::Open
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ConnectionAttempt {
-    generation: u64,
-    owner: crate::client_channel::ClientId,
-    server_label: String,
-    /// The owner submitted this attempt from the server editor and is holding
-    /// that form open over it.
-    ///
-    /// A save-and-join presents its whole outcome inside the form it was
-    /// submitted from: nothing may navigate the owner while this is set, and
-    /// every intermediate result — a refused plaintext transport, a taken
-    /// username, a reconnect backoff — is reported into the form instead. Only
-    /// [`NetworkEvent::Authenticated`] and the owner's own cancel clear it. See
-    /// [`ServerEditSave`] for the invariant this serves.
-    holds_editor: bool,
-}
-
 #[derive(Clone, Debug)]
 enum RpcServerSelectionIssue {
     Error(local_rpc::model::ServerSelectionError),
@@ -409,6 +370,7 @@ enum RpcServerSelectionIssue {
 #[derive(Clone, Debug)]
 struct OwnedRpcServerSelectionIssue {
     owner: crate::client_channel::ClientId,
+    attempt_id: u64,
     issue: RpcServerSelectionIssue,
 }
 
@@ -418,6 +380,24 @@ struct PendingWebHistoryRequest {
     room_generation: u64,
     before: MessageId,
     limit: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CredentialRepairContinuation {
+    ActiveSession,
+    Join { attempt_id: u64 },
+}
+
+/// One in-flight silent repair of a stale saved credential. Only the expected
+/// credential is retained: a successful repair patches the current record so
+/// edits made while the worker ran cannot be overwritten.
+struct CredentialRepair {
+    attempt: u64,
+    server_id: ServerId,
+    expected_token: String,
+    expected_server_public_key: String,
+    owner: crate::client_channel::ClientId,
+    continuation: CredentialRepairContinuation,
 }
 
 pub(crate) struct App {
@@ -432,7 +412,9 @@ pub(crate) struct App {
     /// Last generation copied into every currently attached terminal view.
     synced_daemon_config_generation: u64,
     pairing: PairingCoordinator,
-    connection_attempt: Option<ConnectionAttempt>,
+    credential_repair: Option<CredentialRepair>,
+    join_attempt: Option<join::JoinAttempt>,
+    next_join_attempt_id: u64,
     rpc_server_selection_issue: Option<OwnedRpcServerSelectionIssue>,
     next_connection_generation: u64,
     active_network_generation: Option<u64>,
@@ -872,7 +854,6 @@ pub(crate) enum AppEvent {
         client_id: crate::client_channel::ClientId,
         command: Box<command::CoreCommand>,
     },
-    Network(NetworkEvent),
     NetworkFor {
         generation: u64,
         event: NetworkEvent,
@@ -994,12 +975,6 @@ impl ShareViewState {
             Self::Reconnecting => "reconnecting",
             Self::WaitingForKeyframe => "waiting-for-keyframe",
         }
-    }
-}
-
-impl From<NetworkEvent> for AppEvent {
-    fn from(event: NetworkEvent) -> Self {
-        AppEvent::Network(event)
     }
 }
 
@@ -1347,7 +1322,7 @@ pub(crate) struct EventSender(pub(crate) Sender<AppEvent>);
 #[derive(Clone)]
 pub(crate) struct NetworkEventSender {
     tx: Sender<AppEvent>,
-    generation: Option<u64>,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -1370,7 +1345,7 @@ impl EventSender {
     fn for_network(&self, generation: u64) -> NetworkEventSender {
         NetworkEventSender {
             tx: self.0.clone(),
-            generation: Some(generation),
+            generation,
         }
     }
 
@@ -1385,19 +1360,16 @@ impl EventSender {
 impl NetworkEventSender {
     #[cfg(test)]
     pub(crate) fn for_test(tx: Sender<AppEvent>) -> Self {
-        Self {
-            tx,
-            generation: None,
-        }
+        Self { tx, generation: 0 }
     }
 
     // Preserve the channel's native error and its recoverable unsent event.
     #[allow(clippy::result_large_err)]
     pub(crate) fn send(&self, event: NetworkEvent) -> Result<(), mpsc::SendError<AppEvent>> {
-        match self.generation {
-            Some(generation) => self.tx.send(AppEvent::NetworkFor { generation, event }),
-            None => self.tx.send(AppEvent::Network(event)),
-        }
+        self.tx.send(AppEvent::NetworkFor {
+            generation: self.generation,
+            event,
+        })
     }
 }
 
@@ -1461,6 +1433,9 @@ pub(crate) enum PendingJoin {
     /// A `chatt join` request naming a server by label or `host:port`. Resolved
     /// against the configured servers once the app is constructed.
     Named { specifier: String },
+    /// A rejoin of a known server record, from the last-server hint a retaken
+    /// master left behind.
+    ById(ServerId),
 }
 
 /// A [`PendingJoin`] as it travels to an already-running master over the attach
@@ -1554,7 +1529,9 @@ impl App {
             daemon_config_generation: 0,
             synced_daemon_config_generation: 0,
             pairing: PairingCoordinator::default(),
-            connection_attempt: None,
+            credential_repair: None,
+            join_attempt: None,
+            next_join_attempt_id: 0,
             rpc_server_selection_issue: None,
             next_connection_generation: 0,
             active_network_generation: None,
@@ -1631,6 +1608,13 @@ impl App {
             PendingJoin::Invite(ticket) => self.start_join_pairing(ticket),
             PendingJoin::Open { addr } => self.start_open_pairing(addr),
             PendingJoin::Named { specifier } => self.start_named_join(specifier),
+            PendingJoin::ById(server_id) => {
+                if self.config.server_by_id(server_id).is_none() {
+                    self.set_error("the last used server is no longer configured");
+                    return;
+                }
+                self.start_join_with_screen(server_id, self.command_client);
+            }
         }
     }
 
@@ -1656,8 +1640,8 @@ impl App {
     pub(crate) fn finish_welcome(&mut self, pending_join: Option<PendingJoin>) {
         self.pending_after_welcome = pending_join;
         let base = self.base_screen();
-        self.send_terminal_event(
-            Audience::Client(self.command_client),
+        self.send_to(
+            self.command_client,
             TerminalEvent::Navigation(NavigationEvent::ResetBase(base)),
         );
     }
@@ -1695,40 +1679,19 @@ impl App {
             .map(|handle| handle.channel.clone())
     }
 
-    pub(crate) fn send_terminal_event(&mut self, audience: Audience, event: TerminalEvent) {
-        match audience {
-            Audience::Client(client_id) => {
-                if let Some(channel) = self.channel_for(client_id) {
-                    channel.push(event);
-                }
-            }
-            Audience::All => {
-                if let TerminalEvent::Navigation(NavigationEvent::ResetBase(base)) = event {
-                    self.broadcast_base(base);
-                } else {
-                    panic!("only base-route events may currently be broadcast")
-                }
-            }
+    /// Sends one event to a single client.
+    pub(crate) fn send_to(
+        &mut self,
+        client_id: crate::client_channel::ClientId,
+        event: TerminalEvent,
+    ) {
+        if let Some(channel) = self.channel_for(client_id) {
+            channel.push(event);
         }
     }
 
     fn broadcast_base(&mut self, base: BaseScreen) {
         for handle in self.clients.values() {
-            handle
-                .channel
-                .push(TerminalEvent::Navigation(NavigationEvent::ResetBase(
-                    base.clone(),
-                )));
-        }
-    }
-
-    /// Resets every client except `held`, which is presenting a join inside its
-    /// server editor and may not be navigated out of it.
-    fn broadcast_base_except(&mut self, held: crate::client_channel::ClientId, base: BaseScreen) {
-        for (client, handle) in &self.clients {
-            if *client == held {
-                continue;
-            }
             handle
                 .channel
                 .push(TerminalEvent::Navigation(NavigationEvent::ResetBase(
@@ -1756,10 +1719,7 @@ impl App {
     }
 
     fn navigate_all(&mut self, base: BaseScreen) {
-        self.send_terminal_event(
-            Audience::All,
-            TerminalEvent::Navigation(NavigationEvent::ResetBase(base)),
-        );
+        self.broadcast_base(base);
     }
 
     fn pop_mutation_owner(
@@ -1816,10 +1776,7 @@ impl App {
             } => {
                 let _ = skipped;
                 if self.delete_chat_messages(room_id, targets) {
-                    self.send_terminal_event(
-                        Audience::Client(self.command_client),
-                        TerminalEvent::ClearVisualSelection,
-                    );
+                    self.send_to(self.command_client, TerminalEvent::ClearVisualSelection);
                 }
             }
             CoreCommand::SetViewedRoom(room_id) => {
@@ -1833,8 +1790,8 @@ impl App {
                 height,
             } => {
                 if self.set_viewed_room(target.room_id) {
-                    self.send_terminal_event(
-                        Audience::Client(self.command_client),
+                    self.send_to(
+                        self.command_client,
                         TerminalEvent::OpenMessageRef {
                             target,
                             width,
@@ -1879,11 +1836,13 @@ impl App {
             CoreCommand::Settings(operation) => self.handle_settings_op(operation),
             CoreCommand::PlaySoundboard(slot) => self.trigger_soundboard_slot(slot),
             CoreCommand::ToggleVideo => self.activate_top_bar_video(),
-            CoreCommand::AcceptTransportEncryption { label, generation } => {
-                self.accept_transport_encryption_warning(&label, generation);
+            CoreCommand::AcceptTransportEncryption { attempt_id } => {
+                if let Err(error) = self.accept_join_plaintext(attempt_id) {
+                    self.set_error(error);
+                }
             }
-            CoreCommand::CancelTransportEncryption { generation } => {
-                self.cancel_transport_encryption_warning(generation)
+            CoreCommand::CancelTransportEncryption { attempt_id } => {
+                self.decline_join_plaintext(attempt_id);
             }
             CoreCommand::CloseE2eIdentity => {
                 self.open_e2e_reviews.remove(&self.command_client);
@@ -1899,25 +1858,15 @@ impl App {
                     self.set_error(error);
                 }
             }
-            CoreCommand::Connect { alias } => {
-                self.start_connection(&alias, self.command_client);
-            }
-            CoreCommand::DeleteServer { label } => self.delete_server(&label),
-            CoreCommand::SaveServerEdit {
+            CoreCommand::Connect { alias } => self.connect_by_label(&alias),
+            CoreCommand::DeleteServer { server_id } => self.delete_server(server_id),
+            CoreCommand::SubmitServerEdit {
+                request_id,
                 draft,
-                join_after_save,
-            } => match self.save_server_edit_with(&draft, join_after_save) {
-                // The editor the user submitted is still up, holding the draft
-                // it was submitted with: a refusal is only an error on it.
-                ServerEditSave::Saved | ServerEditSave::Rejected => {}
-                ServerEditSave::Reloaded(draft) => {
-                    self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
-                        ScreenSpec::ServerEditor(*draft),
-                    )));
-                }
-                ServerEditSave::Vanished => self.navigate_owner(NavigationEvent::CloseScreen),
-            },
-            CoreCommand::CancelServerEdit => self.cancel_server_edit(),
+                join,
+            } => self.submit_server_edit(request_id, &draft, join),
+            CoreCommand::RetryJoin { attempt_id } => self.retry_join(attempt_id),
+            CoreCommand::CancelJoin { attempt_id } => self.cancel_join(attempt_id),
             CoreCommand::SaveRoomSettings(draft) => {
                 if !self.save_room_settings(&draft) {
                     self.navigate_owner(NavigationEvent::ReplaceScreen(Box::new(
@@ -2132,21 +2081,28 @@ impl App {
     pub(crate) fn handle_app_event(&mut self, event: AppEvent) -> Option<HistoryChange> {
         let mut history_change = None;
         match event {
-            AppEvent::Network(event) => {
-                history_change = self.handle_network_event_change(event);
-            }
             AppEvent::ClientCommand { .. } => {
                 unreachable!("client commands are handled by the runtime")
             }
             AppEvent::NetworkFor { generation, event } => {
                 if self.active_network_generation == Some(generation) {
                     history_change = self.handle_network_event_change(event);
+                } else if self.join_attempt_generation() == Some(generation) {
+                    self.handle_join_network_event(event);
                 } else {
                     kvlog::debug!("ignored stale network event", generation);
                 }
             }
             AppEvent::Pairing { attempt, event } => {
-                self.apply_pairing_input(PairingInput::Worker { attempt, event })
+                if self
+                    .credential_repair
+                    .as_ref()
+                    .is_some_and(|repair| repair.attempt == attempt)
+                {
+                    self.handle_repair_event(event);
+                } else {
+                    self.apply_pairing_input(PairingInput::Worker { attempt, event })
+                }
             }
             AppEvent::AudioDeviceRefresh(refresh) => self.handle_audio_device_refresh(refresh),
             AppEvent::AudioDeviceProbe(probe) => self.handle_audio_device_probe(probe.result),
@@ -3426,67 +3382,16 @@ impl App {
         }
     }
 
-    /// Opens the server-edit form for `label` with the cursor on `field`, used to
-    /// send a rejected connect straight back to the offending input.
+    /// Installs `network` as the active session for `server`, tearing down
+    /// whatever session came before.
     ///
-    /// The caller resets the base screen first, so the form opens above the
-    /// server list rather than becoming an unpoppable root — unless the owner
-    /// is still on the form this rejection came from, which is replaced where
-    /// it stands instead.
-    pub(crate) fn open_server_edit_focused(
-        &mut self,
-        label: &str,
-        field: &str,
-        presentation: EditorPresentation,
-    ) {
-        let Ok(server) = self.config.server(label).cloned() else {
-            self.set_error(format!("server {label} is not configured"));
-            return;
-        };
-        let draft = ServerEditDraft::from_server_focused(&server, &self.config, field);
-        let screen = Box::new(ScreenSpec::ServerEditor(draft));
-        self.navigate_owner(match presentation {
-            EditorPresentation::Open => NavigationEvent::OpenScreen(screen),
-            EditorPresentation::Replace => NavigationEvent::ReplaceScreen(screen),
-        });
-        self.set_status(format!("editing server {}", server.label));
-    }
-
-    pub(crate) fn start_network(&mut self, alias: &str) -> bool {
-        let server = match self.config.server(alias) {
-            Ok(server) => server.clone(),
-            Err(error) => {
-                self.set_error(error);
-                return false;
-            }
-        };
-        let owner = self
-            .connection_attempt
-            .as_ref()
-            .filter(|attempt| attempt.server_label == alias)
-            .map_or(self.command_client, |attempt| attempt.owner);
-        // The replacement worker is spawned before the live one is torn down so
-        // a spawn failure leaves the existing connection serving; the old
-        // worker's events are already dropped by the generation gate.
-        let previous_attempt = self.connection_attempt.clone();
-        let generation = self.begin_connection_attempt(alias, owner);
-        let network = match NetworkClient::spawn(
-            server.client_config(&self.config, self.download_store.clone()),
-            self.events.sender().for_network(generation),
-        ) {
-            Ok(network) => network,
-            Err(error) => {
-                // The hold projection follows whichever attempt is current, so
-                // restoring the attempt has to restore it too.
-                self.room.join_hold = previous_attempt
-                    .as_ref()
-                    .filter(|attempt| attempt.holds_editor)
-                    .map(|attempt| attempt.server_label.clone());
-                self.connection_attempt = previous_attempt;
-                self.set_error(format!("failed to start network: {error}"));
-                return false;
-            }
-        };
+    /// This is the single boundary where a worker becomes the session: join
+    /// promotion runs it on the candidate's `Authenticated`, and an active
+    /// session restart runs it at spawn. The ordering is load-bearing — the
+    /// room connects before any authentication payload is applied, and the
+    /// worker is installed (with `network_disconnected` cleared) before
+    /// anything tries to send on it.
+    fn promote_worker(&mut self, server: ServerEntry, network: NetworkClient, generation: u64) {
         self.disconnect_network();
         let storage = crate::room_history::HistoryStorage::resolve(&self.config, &server);
         let continuity =
@@ -3504,44 +3409,14 @@ impl App {
             feed.set_room_name(self.room.room_name.clone());
             self.send_web_history_snapshot(crate::web_server::WebAudience::All);
         }
-        self.room.active_server_label = Some(server.label.clone());
+        self.room.active_server_id = Some(server.id);
         self.network = Some(network);
         self.active_network_generation = Some(generation);
         self.room.network_selected = true;
         self.room.network_disconnected = false;
         self.supervisor.network.reset();
         self.room.join_notice = None;
-        self.set_status("connecting");
-        if let Err(error) = local_control::write_last_server_hint(&server.label) {
-            kvlog::warn!("failed to update last-server hint", error = %error);
-        }
-        true
-    }
-
-    /// Moves the live references to a renamed server entry onto its new label.
-    ///
-    /// The session alias, the active label, the in-flight connection attempt and
-    /// the last-server hint all name the entry by label, so a rename that misses
-    /// one of them leaves the session pointing at an entry that is no longer
-    /// configured: DM pin persistence, room settings, identity verification and
-    /// stale-token repair all resolve `config.server(active_server_label)`.
-    fn rename_live_server_label(&mut self, from: &str, to: &str) {
-        let session = self.room.server_alias == from;
-        if session {
-            self.room.server_alias = to.to_string();
-        }
-        if self.room.active_server_label.as_deref() == Some(from) {
-            self.room.active_server_label = Some(to.to_string());
-        }
-        if let Some(attempt) = &mut self.connection_attempt
-            && attempt.server_label == from
-        {
-            attempt.server_label = to.to_string();
-        }
-        if self.room.join_hold.as_deref() == Some(from) {
-            self.room.join_hold = Some(to.to_string());
-        }
-        if session && let Err(error) = local_control::write_last_server_hint(to) {
+        if let Err(error) = local_control::write_last_server_hint(server.id) {
             kvlog::warn!("failed to update last-server hint", error = %error);
         }
     }
@@ -3549,31 +3424,10 @@ impl App {
     /// Persists a complete DM identity snapshot. The network worker activates
     /// it only after the acknowledgement sent by the event handler.
     fn persist_e2e_pin(&mut self, pin: crate::config::E2ePeerPin) -> bool {
-        let Some(label) = self.room.active_server_label.clone() else {
+        let Some(server_id) = self.room.active_server_id else {
             return false;
         };
-        let Some(entry) = self
-            .config
-            .servers
-            .iter_mut()
-            .find(|entry| entry.label == label)
-        else {
-            return false;
-        };
-        let previous = entry.e2e_peer_pins.clone();
-        entry
-            .e2e_peer_pins
-            .retain(|stored| stored.room_id != pin.room_id && stored.user_id != pin.user_id);
-        entry.e2e_peer_pins.push(pin);
-        if let Err(error) = self.config.save_runtime() {
-            if let Some(entry) = self
-                .config
-                .servers
-                .iter_mut()
-                .find(|entry| entry.label == label)
-            {
-                entry.e2e_peer_pins = previous;
-            }
+        if let Err(error) = server_catalog::commit_e2e_pin(&mut self.config, server_id, pin) {
             kvlog::warn!("failed to persist e2e pin", error = error.as_str());
             self.set_error(format!("failed to persist encryption pin: {error}"));
             return false;
@@ -3581,162 +3435,95 @@ impl App {
         true
     }
 
-    /// Opens a generation for `alias`, inheriting the editor hold of the
-    /// attempt it replaces.
+    /// Restarts the network worker of the already-active session in place.
     ///
-    /// The same owner rejoining the same server is the plaintext-consent
-    /// restart, which is still the join the form submitted; anything else is a
-    /// different join and takes the hold away, since the attempt the form was
-    /// presenting no longer exists.
-    fn begin_connection_attempt(
-        &mut self,
-        alias: &str,
-        owner: crate::client_channel::ClientId,
-    ) -> u64 {
+    /// This is supervision of an established connection, not a join: the
+    /// session keeps its server, its queued commands, and its recovery budget.
+    fn restart_active_session(&mut self) -> bool {
+        let Some(server) = self
+            .room
+            .active_server_id
+            .and_then(|server_id| self.config.server_by_id(server_id))
+            .cloned()
+        else {
+            return false;
+        };
         self.next_connection_generation = self.next_connection_generation.wrapping_add(1).max(1);
         let generation = self.next_connection_generation;
-        let holds_editor = self.connection_attempt.as_ref().is_some_and(|attempt| {
-            attempt.holds_editor && attempt.owner == owner && attempt.server_label == alias
-        });
-        self.connection_attempt = Some(ConnectionAttempt {
-            generation,
-            owner,
-            server_label: alias.to_string(),
-            holds_editor,
-        });
-        self.room.join_hold = holds_editor.then(|| alias.to_string());
-        generation
-    }
-
-    /// Hands the running attempt to the server editor that submitted it, which
-    /// stays up until the session authenticates.
-    fn hold_editor_for_join(&mut self, label: &str) {
-        if let Some(attempt) = &mut self.connection_attempt {
-            attempt.holds_editor = true;
-        }
-        self.room.join_hold = Some(label.to_string());
-    }
-
-    /// The client presenting a connection attempt inside its server editor.
-    ///
-    /// Every outcome routed at that client has to leave the form up: it is
-    /// where the user is, and where the result has to be readable.
-    fn join_hold_owner(&self) -> Option<crate::client_channel::ClientId> {
-        self.connection_attempt
-            .as_ref()
-            .filter(|attempt| attempt.holds_editor)
-            .map(|attempt| attempt.owner)
-    }
-
-    /// Ends the hold, returning the client that had it. The form's submit
-    /// actions come back and later outcomes navigate normally; the form itself
-    /// stays up, since only a successful join or the user's cancel closes it.
-    fn release_join_hold(&mut self) -> Option<crate::client_channel::ClientId> {
-        self.room.join_hold = None;
-        let attempt = self.connection_attempt.as_mut()?;
-        std::mem::replace(&mut attempt.holds_editor, false).then_some(attempt.owner)
-    }
-
-    /// Sends every client back to the server list, except one presenting the
-    /// running attempt inside its editor: that form is where the user is, and
-    /// where whatever prompted this has to be readable.
-    fn navigate_all_to_server_list(&mut self) {
-        match self.join_hold_owner() {
-            Some(held) => self.broadcast_base_except(held, BaseScreen::Servers { query: None }),
-            None => self.navigate_all(BaseScreen::Servers { query: None }),
-        }
-    }
-
-    /// Clears the screens a failed attempt was presenting on and ends its hold,
-    /// leaving the holder's form up to take the error.
-    fn end_join_to_server_list(&mut self) {
-        self.navigate_all_to_server_list();
-        self.release_join_hold();
-    }
-
-    /// Refuses, and reports, a connection switch that would strand transfers the
-    /// current worker is still running. Every path that replaces the connection
-    /// with a *different* server asks first; re-establishing the same server
-    /// does not, since its transfers are already gone.
-    fn connection_switch_blocked(&mut self) -> bool {
-        if !self.room.has_active_transfers() {
-            return false;
-        }
-        self.set_error(SERVER_SWITCH_TRANSFER_BLOCKED);
+        // The replacement worker is spawned before the live one is torn down so
+        // a spawn failure leaves the existing connection serving; the old
+        // worker's events are already dropped by the generation gate.
+        let network = match NetworkClient::spawn(
+            server.client_config(&self.config, self.download_store.clone()),
+            self.events.sender().for_network(generation),
+        ) {
+            Ok(network) => network,
+            Err(error) => {
+                self.set_error(format!("failed to start network: {error}"));
+                return false;
+            }
+        };
+        self.promote_worker(server, network, generation);
+        self.set_status("connecting");
         true
     }
 
-    fn start_connection(&mut self, alias: &str, owner: crate::client_channel::ClientId) -> bool {
-        if self.connection_switch_blocked() {
-            return false;
-        }
-        self.rpc_server_selection_issue = None;
-        if let Ok(server) = self.config.server(alias).cloned()
-            && server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX)
-        {
-            self.resume_provisional_open_pairing(server, owner);
-            return true;
-        }
-        // Seed ownership before spawning; `start_network` assigns the fresh
-        // generation for this particular worker.
-        let previous_attempt = self.connection_attempt.replace(ConnectionAttempt {
-            generation: 0,
-            owner,
-            server_label: alias.to_string(),
-            holds_editor: false,
-        });
-        if self.start_network(alias) {
-            self.navigate_all(BaseScreen::Room);
-            true
-        } else {
-            self.connection_attempt = previous_attempt;
-            false
-        }
-    }
-
-    fn rpc_connection_attempt(&self) -> Option<&ConnectionAttempt> {
-        self.connection_attempt
-            .as_ref()
-            .filter(|attempt| self.rpc_clients.contains(&attempt.owner))
-    }
-
-    fn set_rpc_server_selection_error(
+    fn set_rpc_server_selection_error_for(
         &mut self,
-        attempt: &ConnectionAttempt,
+        owner: crate::client_channel::ClientId,
+        attempt_id: u64,
+        label: &str,
         message: impl Into<String>,
     ) {
-        if !self.rpc_clients.contains(&attempt.owner) {
+        if !self.rpc_clients.contains(&owner) {
             return;
         }
         self.rpc_server_selection_issue = Some(OwnedRpcServerSelectionIssue {
-            owner: attempt.owner,
+            owner,
+            attempt_id,
             issue: RpcServerSelectionIssue::Error(local_rpc::model::ServerSelectionError {
-                label: Some(attempt.server_label.clone()),
+                label: Some(label.to_string()),
                 message: message.into(),
             }),
         });
     }
 
-    fn set_rpc_transport_encryption_prompt(&mut self, attempt: &ConnectionAttempt) {
-        if !self.rpc_clients.contains(&attempt.owner) {
+    fn set_rpc_transport_encryption_prompt_for(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+        label: String,
+        attempt_id: u64,
+    ) {
+        if !self.rpc_clients.contains(&owner) {
             return;
         }
         self.rpc_server_selection_issue = Some(OwnedRpcServerSelectionIssue {
-            owner: attempt.owner,
+            owner,
+            attempt_id,
             issue: RpcServerSelectionIssue::Prompt(
                 local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
-                    label: attempt.server_label.clone(),
-                    attempt_id: attempt.generation,
+                    label,
+                    attempt_id,
                 },
             ),
         });
+    }
+
+    fn clear_rpc_server_selection_issue_for(&mut self, attempt_id: u64) {
+        if self
+            .rpc_server_selection_issue
+            .as_ref()
+            .is_some_and(|issue| issue.attempt_id == attempt_id)
+        {
+            self.rpc_server_selection_issue = None;
+        }
     }
 
     fn disconnect_network(&mut self) {
         self.active_network_generation = None;
         self.stop_audio();
         self.stop_all_shares();
-        self.room.active_server_label = None;
+        self.room.active_server_id = None;
         self.video_transport = None;
         if let Some(network) = self.network.take() {
             network.stop();
@@ -3846,10 +3633,7 @@ impl App {
         if !self.room.set_viewed_room(room_id) {
             return false;
         }
-        self.send_terminal_event(
-            Audience::Client(self.command_client),
-            TerminalEvent::SelectRoom(room_id),
-        );
+        self.send_to(self.command_client, TerminalEvent::SelectRoom(room_id));
         self.after_view_switch();
         true
     }
@@ -3858,10 +3642,7 @@ impl App {
         if !self.room.prepare_client_view(self.command_client, room_id) {
             return false;
         }
-        self.send_terminal_event(
-            Audience::Client(self.command_client),
-            TerminalEvent::SelectRoom(room_id),
-        );
+        self.send_to(self.command_client, TerminalEvent::SelectRoom(room_id));
         self.room.ensure_e2e_security_notice(room_id);
         if self.room.begin_history_fetch(room_id) {
             let limit = self.room.initial_history_limit(room_id);
@@ -3913,7 +3694,7 @@ impl App {
     }
 
     pub(crate) fn open_room_settings(&mut self) {
-        let Some(alias) = self.room.active_server_label.clone() else {
+        let Some(server_id) = self.room.active_server_id else {
             self.set_error("connect to a server first");
             return;
         };
@@ -3921,12 +3702,9 @@ impl App {
             self.set_error("view a room first");
             return;
         };
-        let server = match self.config.server(&alias) {
-            Ok(server) => server,
-            Err(error) => {
-                self.set_error(error);
-                return;
-            }
+        let Some(server) = self.config.server_by_id(server_id) else {
+            self.set_error("the connected server is no longer configured");
+            return;
         };
         let draft = RoomSettingsDraft::from_config(
             &self.config,
@@ -3947,32 +3725,10 @@ impl App {
                 return false;
             }
         };
-        let Some(server) = self
-            .config
-            .servers
-            .iter_mut()
-            .find(|server| server.label == draft.server_label())
-        else {
-            self.set_error(format!("server {} is not configured", draft.server_label()));
-            return false;
-        };
-        let previous_history = server
-            .rooms
-            .iter()
-            .find(|room| room.room_id == overrides.room_id)
-            .map(|room| room.history.clone())
-            .unwrap_or_default();
-        let history_changed = previous_history != overrides.history;
-        server
-            .rooms
-            .retain(|room| room.room_id != overrides.room_id);
-        if !overrides.is_empty() {
-            server.rooms.push(overrides);
-            server.rooms.sort_by_key(|room| room.room_id);
-        }
-        match self.config.save_runtime() {
-            Ok(path) => {
-                self.config.config_path = Some(path.clone());
+        let committed =
+            server_catalog::commit_room_overrides(&mut self.config, draft.server_id(), overrides);
+        match committed {
+            Ok((history_changed, path)) => {
                 self.push_file_policy();
                 self.navigate_owner(NavigationEvent::CloseScreen);
                 if history_changed && self.network.is_some() {
@@ -4150,6 +3906,7 @@ impl App {
             let ticket = rpc::control::decode_device_link_ticket(pairing_string.trim())?;
             let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&ticket.tcp_addr));
             let server = ServerEntry {
+                id: server::generate_server_id()?,
                 label: alias.clone(),
                 tcp_addr: ticket.tcp_addr.clone(),
                 udp_addr: ticket.udp_addr.clone(),
@@ -4167,7 +3924,6 @@ impl App {
                 open_password: String::new(),
                 pairing_code: None,
                 completion: PairCompletion::OpenEditor,
-                from_editor: false,
             };
             self.apply_pairing_input(PairingInput::Start {
                 owner: self.command_client,
@@ -4179,7 +3935,6 @@ impl App {
                     overwrite_existing,
                 },
                 cancellation: Some(cancellation),
-                persist_first: false,
             });
             Ok(())
         })();
@@ -4220,7 +3975,6 @@ impl App {
             open_password: String::new(),
             pairing_code: Some(pairing_code),
             completion: PairCompletion::OpenEditor,
-            from_editor: false,
         };
         self.apply_pairing_input(PairingInput::Start {
             owner: self.command_client,
@@ -4230,7 +3984,6 @@ impl App {
                 pairing_code: ticket.pairing_code,
             },
             cancellation: None,
-            persist_first: false,
         });
     }
 
@@ -4246,7 +3999,15 @@ impl App {
                 return;
             }
         };
+        let id = match server::generate_server_id() {
+            Ok(id) => id,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
         let server = ServerEntry {
+            id,
             label: alias.clone(),
             tcp_addr: addr,
             udp_addr: String::new(),
@@ -4263,7 +4024,6 @@ impl App {
             open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
-            from_editor: false,
         };
         let existing_token = pending.open.clone().unwrap_or_default();
         self.apply_pairing_input(PairingInput::Start {
@@ -4275,27 +4035,25 @@ impl App {
                 existing_token,
             },
             cancellation: None,
-            persist_first: true,
         });
+    }
+
+    /// Joins the ready server holding `label`.
+    fn connect_by_label(&mut self, label: &str) {
+        match self.config.server(label) {
+            Ok(server) => {
+                let server_id = server.id;
+                self.start_join_with_screen(server_id, self.command_client);
+            }
+            Err(error) => self.set_error(error),
+        }
     }
 
     /// Resolves and acts on a `chatt join` specifier: connect directly, open the
     /// filtered picker, or fall back to open pairing behind a warn banner.
     fn start_named_join(&mut self, specifier: String) {
         match self.resolve_join(&specifier) {
-            JoinResolution::Connect(label) => {
-                // A join reaching a master already on that server only asks to
-                // see it. Connecting again would restart the network worker and
-                // drop the session out from under every other attached terminal.
-                if self.room.active_server_label.as_deref() == Some(label.as_str())
-                    && self.network.is_some()
-                {
-                    self.navigate_owner(NavigationEvent::ResetBase(BaseScreen::Room));
-                    self.set_status(format!("already connected to {label}"));
-                } else {
-                    self.start_connection(&label, self.command_client);
-                }
-            }
+            JoinResolution::Connect(label) => self.connect_by_label(&label),
             JoinResolution::Filter => {
                 self.open_filtered_server_select(&specifier);
                 self.set_status(format!("servers matching '{specifier}'"));
@@ -4313,81 +4071,6 @@ impl App {
         }
     }
 
-    /// Saves the client-generated recovery secret before the server can commit
-    /// its corresponding username claim. A later process can resume pairing by
-    /// selecting this provisional server entry.
-    fn persist_provisional_open_pair(&mut self, server: &ServerEntry) -> Result<(), String> {
-        let previous = self.config.servers.clone();
-        if self
-            .config
-            .servers
-            .iter()
-            .any(|existing| existing.label == server.label && existing.token != server.token)
-        {
-            return Err(format!("server label {} already exists", server.label));
-        }
-        let mut replaced = false;
-        self.config.servers.retain_mut(|existing| {
-            if existing.token != server.token {
-                return true;
-            }
-            if replaced {
-                return false;
-            }
-            *existing = server.clone();
-            replaced = true;
-            true
-        });
-        if !replaced {
-            self.config.upsert_server(server.clone());
-        }
-        match self.config.save_runtime() {
-            Ok(path) => {
-                self.config.config_path = Some(path);
-                self.rebuild_server_items();
-                Ok(())
-            }
-            Err(error) => {
-                self.config.servers = previous;
-                Err(error)
-            }
-        }
-    }
-
-    fn resume_provisional_open_pairing(
-        &mut self,
-        server: ServerEntry,
-        owner: crate::client_channel::ClientId,
-    ) {
-        let recovery_token = server.token.clone();
-        let alias = server.label.clone();
-        let config = server.client_config(&self.config, self.download_store.clone());
-        let pending = PendingPair {
-            server,
-            open: Some(recovery_token),
-            open_password: String::new(),
-            pairing_code: None,
-            completion: PairCompletion::OpenEditor,
-            from_editor: false,
-        };
-        let existing_token = pending.open.clone().unwrap_or_default();
-        self.apply_pairing_input(PairingInput::Start {
-            owner,
-            pending,
-            job: PairingJob::Open {
-                config,
-                password: String::new(),
-                existing_token,
-            },
-            cancellation: None,
-            persist_first: false,
-        });
-        self.send_terminal_event(
-            Audience::Client(owner),
-            TerminalEvent::Status(format!("resuming pairing {alias}")),
-        );
-    }
-
     /// Decides what a `chatt join` specifier means against the configured servers.
     ///
     /// An exact match on a single server's `label`, or on its address compared as
@@ -4401,11 +4084,16 @@ impl App {
     fn resolve_join(&self, specifier: &str) -> JoinResolution {
         let canonical = canonical_endpoint(specifier);
         let mut exact: Vec<&str> = Vec::new();
-        for server in &self.config.servers {
-            let matched = server.label == specifier
-                || (canonical.is_some() && canonical_endpoint(&server.tcp_addr) == canonical);
+        let addresses = self
+            .config
+            .servers
+            .iter()
+            .map(|server| (server.label.as_str(), server.tcp_addr.as_str()));
+        for (label, tcp_addr) in addresses {
+            let matched = label == specifier
+                || (canonical.is_some() && canonical_endpoint(tcp_addr) == canonical);
             if matched {
-                exact.push(server.label.as_str());
+                exact.push(label);
             }
         }
         if exact.len() == 1 {
@@ -4446,8 +4134,8 @@ impl App {
         else {
             // The prompt outlived the attempt; telling it so clears the
             // submitting state it would otherwise wait on forever.
-            self.send_terminal_event(
-                Audience::Client(self.command_client),
+            self.send_to(
+                self.command_client,
                 TerminalEvent::PairingFailed("no pairing in progress".to_string()),
             );
             return;
@@ -4468,110 +4156,170 @@ impl App {
         });
     }
 
-    /// Closes the owner's server editor, abandoning whatever it was holding.
-    ///
-    /// The editor is the only thing presenting a save-and-join, so leaving it
-    /// would leave the attempt running with nowhere to report; the user asked
-    /// to be done with this server, and the connection goes with the form.
-    fn cancel_server_edit(&mut self) {
-        self.apply_pairing_input(PairingInput::OwnerClosed {
-            owner: self.command_client,
-        });
-        if self.join_hold_owner() != Some(self.command_client) {
-            return;
-        }
-        self.release_join_hold();
-        self.rpc_server_selection_issue = None;
-        self.connection_attempt = None;
-        self.disconnect_network();
-        self.room.reset_for_server_list();
-        self.broadcast_reset_rooms();
-        self.set_status("join canceled");
-    }
-
-    fn discard_provisional_open_pair(&mut self, pending: &PendingPair) -> Result<(), String> {
-        if !pending.server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX) {
-            return Ok(());
-        }
-        let previous = self.config.servers.clone();
-        self.config
-            .servers
-            .retain(|server| server.token != pending.server.token);
-        if self.config.config_path.is_some()
-            && let Err(error) = self.config.save_runtime()
-        {
-            self.config.servers = previous;
-            return Err(error);
-        }
-        self.rebuild_server_items();
-        Ok(())
-    }
-
+    /// Repairs the active session's stale credential: the session comes down,
+    /// pairing silently re-pairs with the saved token as recovery material,
+    /// and a successful commit rejoins by id.
     fn start_stale_token_repair(&mut self, reason: &str) -> bool {
-        if self.pairing.is_busy() {
+        let Some(server_id) = self.room.active_server_id else {
+            return false;
+        };
+        let Some(server) = self.config.server_by_id(server_id).cloned() else {
+            self.push_network_notice("auth", "the connected server is no longer configured");
+            return false;
+        };
+        let owner = self.command_client;
+        if !self.pairing.is_busy() && !server.token.trim().is_empty() {
+            self.disconnect_network();
+            self.start_token_repair(
+                server,
+                owner,
+                reason,
+                CredentialRepairContinuation::ActiveSession,
+            )
+        } else {
+            false
+        }
+    }
+
+    /// Hands `server`'s stale credential to a silent open-pairing repair
+    /// worker of its own, outside the interactive pairing coordinator; a
+    /// successful commit starts a fresh join for the same id.
+    pub(super) fn start_token_repair(
+        &mut self,
+        server: ServerEntry,
+        owner: crate::client_channel::ClientId,
+        reason: &str,
+        continuation: CredentialRepairContinuation,
+    ) -> bool {
+        if self.pairing.is_busy() || self.credential_repair.is_some() {
             return false;
         }
-        let Some(label) = self.room.active_server_label.clone() else {
-            return false;
-        };
-        let server = match self.config.server(&label).cloned() {
-            Ok(server) => server,
-            Err(error) => {
-                self.push_network_notice("auth", &error);
-                return false;
-            }
-        };
         let existing_token = server.token.clone();
         if existing_token.trim().is_empty() {
             return false;
         }
-        let client_config = server.client_config(&self.config, self.download_store.clone());
-        self.disconnect_network();
+        let attempt = self.pairing.allocate_attempt();
+        let events = self.events.sender().for_pairing(attempt);
+        let spawned = crate::client_net::spawn_open_pair_once(
+            server.client_config(&self.config, self.download_store.clone()),
+            String::new(),
+            existing_token,
+            events,
+        );
+        if let Err(error) = spawned {
+            self.set_error(error);
+            return false;
+        }
         self.push_network_notice("auth", reason);
-        let pending = PendingPair {
-            server,
-            open: Some(existing_token),
-            open_password: String::new(),
-            pairing_code: None,
-            completion: PairCompletion::Reconnect,
-            from_editor: false,
-        };
-        let token = pending.open.clone().unwrap_or_default();
-        self.apply_pairing_input(PairingInput::Start {
-            owner: self.command_client,
-            pending,
-            job: PairingJob::Open {
-                config: client_config,
-                password: String::new(),
-                existing_token: token,
-            },
-            cancellation: None,
-            persist_first: false,
+        self.set_status(format!("refreshing {}", server.label));
+        self.credential_repair = Some(CredentialRepair {
+            attempt,
+            server_id: server.id,
+            expected_token: server.token,
+            expected_server_public_key: server.server_public_key,
+            owner,
+            continuation,
         });
-        self.set_status(format!("refreshing {label}"));
         true
     }
 
-    /// Re-runs a pairing attempt whose username was rejected, using the username
-    /// (and any other fields) the user edited in the reopened form.
-    ///
-    /// Returns whether a worker took the retry. A retry that never started
-    /// leaves the coordinator parked on the rejected username, and the caller
-    /// re-presents the form with the failure.
-    fn retry_username_pairing(&mut self, server: ServerEntry, join_after_save: bool) -> bool {
-        let owner = self.command_client;
-        let client_config = server.client_config(&self.config, self.download_store.clone());
-        self.apply_pairing_input(PairingInput::RetryUsername {
-            owner,
-            server,
-            config: client_config,
-            completion: if join_after_save {
-                PairCompletion::Join
-            } else {
-                PairCompletion::Save
-            },
-        });
-        !self.pairing.awaiting_username(owner)
+    /// Applies the outcome of a credential-repair worker: a reissued token is
+    /// committed by id and rejoined; anything else ends the repair readably.
+    fn handle_repair_event(&mut self, event: PairingEvent) {
+        let Some(repair) = self.credential_repair.take() else {
+            return;
+        };
+        let owner = repair.owner;
+        if let CredentialRepairContinuation::Join { attempt_id } = repair.continuation
+            && !self.join_repair_is_current(attempt_id)
+        {
+            return;
+        }
+        match event {
+            PairingEvent::OpenSucceeded {
+                token,
+                server_public_key,
+            } => {
+                match server_catalog::commit_repaired_credentials(
+                    &mut self.config,
+                    repair.server_id,
+                    &repair.expected_token,
+                    &repair.expected_server_public_key,
+                    token,
+                    server_public_key,
+                ) {
+                    Ok((server, path)) => {
+                        self.rebuild_server_items();
+                        self.send_to(
+                            owner,
+                            TerminalEvent::Status(format!(
+                                "refreshed {}; config saved to {}",
+                                server.label,
+                                path.display()
+                            )),
+                        );
+                        match repair.continuation {
+                            CredentialRepairContinuation::ActiveSession => {
+                                if let JoinStart::Refused(message) =
+                                    self.start_join(server.id, JoinOwner::Terminal(owner))
+                                {
+                                    self.send_to(owner, TerminalEvent::Error(message));
+                                }
+                            }
+                            CredentialRepairContinuation::Join { attempt_id } => {
+                                self.restart_join_after_repair(attempt_id, server);
+                            }
+                        }
+                    }
+                    Err(error) => match repair.continuation {
+                        CredentialRepairContinuation::ActiveSession => {
+                            self.send_to(owner, TerminalEvent::Error(error));
+                        }
+                        CredentialRepairContinuation::Join { attempt_id } => {
+                            self.fail_join_repair(attempt_id, error);
+                        }
+                    },
+                }
+            }
+            PairingEvent::Failed(message)
+            | PairingEvent::UsernameTaken { message, .. }
+            | PairingEvent::DeviceFailed { message }
+            | PairingEvent::DeviceIdentityExists { message } => {
+                self.push_network_notice("auth", &message);
+                match repair.continuation {
+                    CredentialRepairContinuation::ActiveSession => {
+                        self.send_to(owner, TerminalEvent::Error(message));
+                    }
+                    CredentialRepairContinuation::Join { attempt_id } => {
+                        self.fail_join_repair(attempt_id, message);
+                    }
+                }
+            }
+            PairingEvent::OpenNeedsPassword { .. } => {
+                let message =
+                    "saved credentials need repair; re-pair with the server password".to_string();
+                match repair.continuation {
+                    CredentialRepairContinuation::ActiveSession => {
+                        self.send_to(owner, TerminalEvent::Error(message));
+                    }
+                    CredentialRepairContinuation::Join { attempt_id } => {
+                        self.fail_join_repair(attempt_id, message);
+                    }
+                }
+            }
+            PairingEvent::TransportEncryptionRequired => {
+                let message = "server transport encryption is disabled".to_string();
+                match repair.continuation {
+                    CredentialRepairContinuation::ActiveSession => {
+                        self.send_to(owner, TerminalEvent::Error(message));
+                    }
+                    CredentialRepairContinuation::Join { attempt_id } => {
+                        self.fail_join_repair(attempt_id, message);
+                    }
+                }
+            }
+            PairingEvent::InviteSucceeded | PairingEvent::DeviceSucceeded { .. } => {}
+        }
     }
 
     fn apply_pairing_input(&mut self, input: PairingInput) {
@@ -4687,11 +4435,6 @@ impl App {
                 video_auth_key,
             } => {
                 self.rpc_server_selection_issue = None;
-                // The join a server editor was holding itself open for has
-                // landed: this is the one outcome that takes the form down.
-                if self.release_join_hold().is_some() {
-                    self.navigate_all(BaseScreen::Room);
-                }
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
                 self.server_dms_enabled = dms_enabled;
@@ -4830,10 +4573,7 @@ impl App {
                     self.pop_mutation_owner(room_id, target, kind == ChatMutationKind::Delete);
                 if let Some(owner) = owner {
                     if self.channel_for(owner).is_some() {
-                        self.send_terminal_event(
-                            Audience::Client(owner),
-                            TerminalEvent::Error(message.clone()),
-                        );
+                        self.send_to(owner, TerminalEvent::Error(message.clone()));
                     } else {
                         kvlog::warn!(
                             "mutation rejection owner is no longer connected",
@@ -5115,8 +4855,8 @@ impl App {
                         self.rpc_identity.close(client_id, &reason);
                         continue;
                     }
-                    self.send_terminal_event(
-                        Audience::Client(client_id),
+                    self.send_to(
+                        client_id,
                         TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
                     );
                 }
@@ -5403,45 +5143,11 @@ impl App {
                 self.set_error(format!("error: {error}"));
             }
             NetworkEvent::AuthFailed { code, message } => {
+                // The active session's reconnect re-authenticated and was
+                // refused: a stale credential is silently repaired, anything
+                // else takes the session down with the error readable.
                 kvlog::warn!("app auth failed", code, error = message.as_str());
-                let rpc_attempt = self.rpc_connection_attempt().cloned();
-                if code == ERROR_TOKEN_STALE_EPOCH
-                    && rpc_attempt.is_none()
-                    && self.start_stale_token_repair(&message)
-                {
-                    return;
-                }
-                if code == ERROR_USERNAME_TAKEN {
-                    let attempt = self.connection_attempt.clone();
-                    self.fail_screencast_if_running(
-                        format!("screen share stopped: {message}"),
-                        false,
-                    );
-                    self.disconnect_network();
-                    self.end_join_to_server_list();
-                    if let Some(attempt) = attempt {
-                        if self.rpc_clients.contains(&attempt.owner) {
-                            self.set_rpc_server_selection_error(
-                                &attempt,
-                                "username already in use; edit this saved server in the terminal client",
-                            );
-                        } else {
-                            let previous =
-                                std::mem::replace(&mut self.command_client, attempt.owner);
-                            // A held join is still on the form it was submitted
-                            // from, so the reload swaps that form's contents
-                            // rather than stacking a second one over it.
-                            self.open_server_edit_focused(
-                                &attempt.server_label,
-                                "Username",
-                                EditorPresentation::for_hold(attempt.holds_editor),
-                            );
-                            self.set_error("username already in use; choose another");
-                            self.command_client = previous;
-                        }
-                    } else {
-                        self.set_error("username already in use; choose another");
-                    }
+                if code == ERROR_TOKEN_STALE_EPOCH && self.start_stale_token_repair(&message) {
                     return;
                 }
                 self.fail_screencast_if_running(
@@ -5449,43 +5155,15 @@ impl App {
                     false,
                 );
                 self.disconnect_network();
-                self.end_join_to_server_list();
+                self.navigate_all(BaseScreen::Servers { query: None });
                 self.push_network_notice("auth", &message);
-                self.set_error(message.clone());
-                if let Some(attempt) = rpc_attempt {
-                    let guidance = if code == ERROR_TOKEN_STALE_EPOCH {
-                        "saved credentials need repair; finish pairing in the terminal client"
-                            .to_string()
-                    } else {
-                        format!("authentication failed: {message}")
-                    };
-                    self.set_rpc_server_selection_error(&attempt, guidance);
-                }
+                self.set_error(message);
             }
             NetworkEvent::TransportEncryptionRequired => {
-                let Some(attempt) = self.connection_attempt.clone() else {
-                    self.disconnect_network();
-                    self.navigate_all(BaseScreen::Servers { query: None });
-                    self.set_error("server transport encryption is disabled");
-                    return;
-                };
+                // Only a join negotiates transport policy; an established
+                // session refusing it mid-flight is a plain failure.
                 self.disconnect_network();
-                // The hold survives the prompt: consent restarts this same
-                // join, and a refusal has to land back on the form that
-                // submitted it rather than somewhere the user never was.
-                self.navigate_all_to_server_list();
-                self.set_rpc_transport_encryption_prompt(&attempt);
-                self.send_terminal_event(
-                    Audience::Client(attempt.owner),
-                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
-                        OverlaySpec::TransportEncryptionWarning {
-                            label: attempt.server_label,
-                            target: TransportWarningTarget::Connection {
-                                generation: attempt.generation,
-                            },
-                        },
-                    ))),
-                );
+                self.navigate_all(BaseScreen::Servers { query: None });
                 self.set_error("server transport encryption is disabled");
             }
             NetworkEvent::DeviceLinkCreated {
@@ -5536,9 +5214,6 @@ impl App {
                 ));
             }
             NetworkEvent::LocalIdentityUnavailable { message } => {
-                // The worker stops on this one, so a held join is over: the
-                // form takes the error and its submit actions come back.
-                self.release_join_hold();
                 self.push_network_notice("e2e", &message);
                 self.set_error(message);
             }
@@ -5733,8 +5408,8 @@ impl App {
         let body = body.into();
         self.capture_frontend_command_line(false, &body);
         if !self.room.push_notice(sender.clone(), body.clone()) {
-            self.send_terminal_event(
-                Audience::Client(self.command_client),
+            self.send_to(
+                self.command_client,
                 TerminalEvent::LocalNotice {
                     sender,
                     body,
@@ -5749,8 +5424,8 @@ impl App {
         let body = body.into();
         self.capture_frontend_command_line(true, &body);
         if !self.room.push_error_notice(sender.clone(), body.clone()) {
-            self.send_terminal_event(
-                Audience::Client(self.command_client),
+            self.send_to(
+                self.command_client,
                 TerminalEvent::LocalNotice {
                     sender,
                     body,
@@ -5769,10 +5444,7 @@ impl App {
     }
 
     fn navigate_owner(&mut self, event: NavigationEvent) {
-        self.send_terminal_event(
-            Audience::Client(self.command_client),
-            TerminalEvent::Navigation(event),
-        );
+        self.send_to(self.command_client, TerminalEvent::Navigation(event));
     }
 
     #[cfg(test)]
@@ -5788,35 +5460,32 @@ impl App {
         }
     }
 
-    pub(crate) fn delete_server(&mut self, label: &str) {
-        let servers = self.config.servers.clone();
-        let user_audio = self.config.user_audio.clone();
-        self.config.servers.retain(|server| server.label != label);
-        self.config
-            .user_audio
-            .retain(|preference| preference.server_alias != label);
+    pub(crate) fn delete_server(&mut self, server_id: ServerId) {
+        let Some(label) = self
+            .config
+            .server_by_id(server_id)
+            .map(|server| server.label.clone())
+        else {
+            self.set_error("server is no longer configured");
+            return;
+        };
         // The session is dropped only once the deletion is durable: a refused
         // write leaves the entry configured, so the connection it names stays.
-        let path = match self.config.save_runtime() {
+        let path = match server_catalog::delete(&mut self.config, server_id) {
             Ok(path) => path,
             Err(error) => {
-                self.config.servers = servers;
-                self.config.user_audio = user_audio;
                 self.set_error(error);
                 return;
             }
         };
-        if self.room.server_alias == label {
+        if self.room.active_server_id == Some(server_id) {
             self.disconnect_network();
             self.room.reset_for_server_list();
             self.broadcast_reset_rooms();
         }
-        // A form joining an entry that has just been deleted is waiting on a
-        // session that will never authenticate.
-        if self.room.join_hold.as_deref() == Some(label) {
-            self.release_join_hold();
-        }
-        self.config.config_path = Some(path.clone());
+        // A join pending on the deleted entry waits on a session that can
+        // never be promoted, so it is called off with the record.
+        self.cancel_join_for_server(server_id);
         self.rebuild_server_items();
         self.set_status(format!(
             "deleted {label}; config saved to {}",
@@ -5824,256 +5493,170 @@ impl App {
         ));
     }
 
-    pub(crate) fn accept_transport_encryption_warning(&mut self, label: &str, generation: u64) {
-        if self
-            .connection_attempt
-            .as_ref()
-            .is_none_or(|attempt| attempt.server_label != label)
-        {
+    /// Commits one editor submission and answers the submitting editor with a
+    /// typed result. Every navigation belongs to that mode; the core's only
+    /// side effects here are the durable commit and, on request, a join.
+    fn submit_server_edit(&mut self, request_id: u64, draft: &ServerEditDraft, join: bool) {
+        let owner = self.command_client;
+        if self.retry_pairing_edit(owner, request_id, draft, join) {
             return;
         }
-        let _ = self.accept_transport_encryption_warning_for(generation);
+        let outcome = self.server_edit_outcome(owner, request_id, draft, join);
+        self.send_to(
+            owner,
+            TerminalEvent::ServerEditResult {
+                request_id,
+                outcome,
+            },
+        );
     }
 
-    fn accept_transport_encryption_warning_for(&mut self, generation: u64) -> bool {
-        let Some(attempt) = self.connection_attempt.clone() else {
-            return false;
-        };
-        if attempt.generation != generation || attempt.owner != self.command_client {
-            return false;
-        }
-        let label = attempt.server_label.clone();
-        let Some(server) = self
-            .config
-            .servers
-            .iter_mut()
-            .find(|server| server.label == label.as_str())
-        else {
-            self.set_error(format!("server {label} is not configured"));
-            self.room.reset_for_server_list();
-            self.broadcast_reset_rooms();
-            self.navigate_owner(NavigationEvent::CloseOverlay);
-            self.end_join_to_server_list();
-            return false;
-        };
-        let required = std::mem::replace(&mut server.require_transport_encryption, false);
-
-        match self.config.save_runtime() {
-            Ok(path) => {
-                self.config.config_path = Some(path.clone());
-                self.rebuild_server_items();
-                // The warning is the coordinator's own overlay and outlives no
-                // outcome: the restarted attempt reports onto whatever is under
-                // it, which for a held join is the form that submitted it.
-                self.navigate_owner(NavigationEvent::CloseOverlay);
-                if self.start_network(&label) {
-                    self.rpc_server_selection_issue = None;
-                    // A held join keeps holding across the restart and still
-                    // closes its form on `Authenticated`, not here.
-                    if self.join_hold_owner().is_none() {
-                        self.navigate_all(BaseScreen::Room);
-                    }
-                    self.set_status(format!(
-                        "transport encryption requirement disabled for {label}; config saved to {}",
-                        path.display()
-                    ));
-                    true
-                } else {
-                    self.set_rpc_server_selection_error(
-                        &attempt,
-                        "failed to restart the server connection",
-                    );
-                    self.room.reset_for_server_list();
-                    self.broadcast_reset_rooms();
-                    self.end_join_to_server_list();
-                    false
-                }
-            }
-            Err(error) => {
-                if let Some(server) = self
-                    .config
-                    .servers
-                    .iter_mut()
-                    .find(|server| server.label == label.as_str())
-                {
-                    server.require_transport_encryption = required;
-                }
-                self.set_error(error);
-                false
-            }
-        }
-    }
-
-    pub(crate) fn cancel_transport_encryption_warning(&mut self, generation: u64) {
-        self.cancel_transport_encryption_warning_for(generation);
-    }
-
-    fn cancel_transport_encryption_warning_for(&mut self, generation: u64) {
-        if !self.connection_attempt.as_ref().is_some_and(|attempt| {
-            attempt.generation == generation && attempt.owner == self.command_client
-        }) {
-            return;
-        }
-        self.rpc_server_selection_issue = None;
-        self.disconnect_network();
-        self.room.reset_for_server_list();
-        self.broadcast_reset_rooms();
-        self.rebuild_server_items();
-        // Closing the overlay is the whole navigation for a held join: it
-        // uncovers the form the user submitted from, with their draft and the
-        // server list under it exactly as they were when they clicked.
-        self.navigate_owner(NavigationEvent::CloseOverlay);
-        self.end_join_to_server_list();
-        self.connection_attempt = None;
-        self.set_status("connection canceled");
-    }
-
-    /// Applies an edited server entry, or reports why it could not be applied.
-    ///
-    /// A draft outlives the entry it was opened over: another renderer can
-    /// rename, delete or edit that entry while the form is up. The save
-    /// therefore writes only over the entry the draft was derived from, and
-    /// never inserts one — an insert here would resurrect a deleted server or
-    /// duplicate a renamed one.
-    pub(crate) fn save_server_edit_with(
+    /// Submits the full editor back into a username-rejected pairing. The
+    /// candidate remains transient; only a successful retry completes this
+    /// editor request and reaches the catalog commit path.
+    fn retry_pairing_edit(
         &mut self,
+        owner: crate::client_channel::ClientId,
+        request_id: u64,
         draft: &ServerEditDraft,
-        join_after_save: bool,
-    ) -> ServerEditSave {
-        let mut server = match draft.to_update() {
-            Ok(server) => server,
+        join: bool,
+    ) -> bool {
+        if !self.pairing.awaiting_editor_for(owner, draft.server_id()) {
+            return false;
+        }
+        let candidate = (|| -> Result<ServerEntry, String> {
+            let mut candidate = draft
+                .new_server()
+                .cloned()
+                .ok_or_else(|| "pairing editor lost its transient server".to_string())?;
+            draft.fields()?.apply_to(&mut candidate);
+            validate_server_entry(&candidate)?;
+            Ok(candidate)
+        })();
+        let candidate = match candidate {
+            Ok(candidate) => candidate,
             Err(error) => {
                 self.set_error(error);
-                return ServerEditSave::Rejected;
+                self.send_to(
+                    owner,
+                    TerminalEvent::ServerEditResult {
+                        request_id,
+                        outcome: ServerEditOutcome::Rejected,
+                    },
+                );
+                return true;
             }
         };
+        self.apply_pairing_input(PairingInput::RetryServer {
+            owner,
+            server: candidate,
+            request_id,
+            join,
+        });
+        true
+    }
+
+    /// Completes a save request which had to retry pairing for the username
+    /// selected in the editor.
+    fn complete_pairing_edit(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+        request_id: u64,
+        server: ServerEntry,
+        join: bool,
+    ) {
+        let draft = ServerEditDraft::from_new_server(server, &self.config);
+        let outcome = self.server_edit_outcome(owner, request_id, &draft, join);
+        self.send_to(
+            owner,
+            TerminalEvent::ServerEditResult {
+                request_id,
+                outcome,
+            },
+        );
+    }
+
+    fn server_edit_outcome(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+        request_id: u64,
+        draft: &ServerEditDraft,
+        join: bool,
+    ) -> ServerEditOutcome {
         let original_label = draft.original_label().to_string();
-        // A pairing the server rejected for a taken username is retried here.
-        // The provisional recovery entry is updated before the retry; the final
-        // bearer token replaces it only after pairing succeeds. The attempt owns
-        // the entry holding its own token and no other.
-        if self
-            .pairing
-            .username_retry_matches(self.command_client, &original_label)
-        {
-            if self
-                .config
-                .servers
-                .iter()
-                .any(|existing| existing.label == server.label && existing.token != server.token)
-            {
-                self.set_error(format!("server label {} already exists", server.label));
-                return ServerEditSave::Rejected;
+        let commit = match server_catalog::commit_edit(&mut self.config, draft) {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.set_error(error);
+                return ServerEditOutcome::Rejected;
             }
-            return if self.retry_username_pairing(server, join_after_save) {
-                ServerEditSave::Saved
-            } else {
-                ServerEditSave::Rejected
+        };
+        let (server, path, connection_changed) = match commit {
+            server_catalog::EditCommit::Saved {
+                server,
+                path,
+                connection_fields_changed,
+            } => (server, path, connection_fields_changed),
+            server_catalog::EditCommit::Conflict(reload) => {
+                self.set_error(format!(
+                    "server {original_label} changed elsewhere; reloaded the current settings"
+                ));
+                return ServerEditOutcome::Conflict(reload);
+            }
+            server_catalog::EditCommit::Missing => {
+                self.set_error(format!("server {original_label} is no longer configured"));
+                return ServerEditOutcome::Missing;
+            }
+        };
+        self.rebuild_server_items();
+        let active = self.room.active_server_id == Some(server.id);
+        if active {
+            // The session names its server by id, so a rename needs only the
+            // display alias refreshed.
+            self.room.server_alias = server.label.clone();
+            self.push_file_policy();
+        }
+        if join {
+            return match self.start_join(
+                server.id,
+                JoinOwner::ServerEditor {
+                    client: owner,
+                    request_id,
+                },
+            ) {
+                JoinStart::Started(view) => {
+                    self.set_status(format!("connecting to {}", view.server_label));
+                    ServerEditOutcome::JoinStarted(view)
+                }
+                JoinStart::AlreadyActive => {
+                    self.send_to(
+                        owner,
+                        TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Room)),
+                    );
+                    self.set_status(format!("already connected to {}", server.label));
+                    ServerEditOutcome::Saved
+                }
+                JoinStart::Refused(message) => {
+                    self.set_error(message);
+                    // The entry is durable and only the join was refused, so
+                    // the editor stays up over a draft rebuilt from what was
+                    // written.
+                    ServerEditOutcome::SavedButJoinFailed(Box::new(ServerEditDraft::from_server(
+                        &server,
+                        &self.config,
+                    )))
+                }
             };
         }
-        // The token identifies the entry first, so a rename elsewhere reads as a
-        // changed entry rather than a missing one; `to_update` has already
-        // refused a draft without a token. The label is the fallback for an
-        // entry whose credential a re-pair replaced while the form was up.
-        let snapshot = draft.original();
-        let Some(index) = self
-            .config
-            .servers
-            .iter()
-            .position(|existing| existing.token == snapshot.token)
-            .or_else(|| {
-                self.config
-                    .servers
-                    .iter()
-                    .position(|existing| existing.label == original_label)
-            })
-        else {
-            self.set_error(format!("server {original_label} is no longer configured"));
-            return ServerEditSave::Vanished;
-        };
-        let current = self.config.servers[index].clone();
-        if !current.edited_fields_eq(snapshot) {
-            self.set_error(format!(
-                "server {original_label} changed elsewhere; reloaded the current settings"
-            ));
-            return ServerEditSave::Reloaded(Box::new(ServerEditDraft::from_server(
-                &current,
-                &self.config,
-            )));
-        }
-        if server.label != original_label
-            && self
-                .config
-                .servers
-                .iter()
-                .any(|existing| existing.label == server.label)
-        {
-            self.set_error(format!("server label {} already exists", server.label));
-            return ServerEditSave::Rejected;
-        }
-        // The form does not own these: DM pins and room overrides are written
-        // onto the live entry while the editor is open, and the token pair is
-        // replaced by pairing. Taking them from the draft would revert them.
-        server.token = current.token.clone();
-        server.server_public_key = current.server_public_key.clone();
-        server.e2e_peer_pins = current.e2e_peer_pins.clone();
-        server.rooms = current.rooms.clone();
-        let label = server.label.clone();
         // A plain save never reconnects — save and join is the explicit path for
         // that — so a change the running session took at connect only lands on
         // the next one, and the status has to say so.
-        let connection_changed = !current.connection_fields_eq(&server);
-        let servers = self.config.servers.clone();
-        let user_audio = self.config.user_audio.clone();
-        self.config.servers[index] = server;
-        if label != original_label {
-            for preference in &mut self.config.user_audio {
-                if preference.server_alias == original_label {
-                    preference.server_alias = label.clone();
-                }
-            }
-        }
-        // Nothing outlives a refused write: the configuration goes back to what
-        // is still on disk, so a later unrelated save cannot carry this edit.
-        let path = match self.config.save_runtime() {
-            Ok(path) => path,
-            Err(error) => {
-                self.config.servers = servers;
-                self.config.user_audio = user_audio;
-                self.set_error(error);
-                return ServerEditSave::Rejected;
-            }
-        };
-        self.config.config_path = Some(path.clone());
-        self.rebuild_server_items();
-        if label != original_label {
-            self.rename_live_server_label(&original_label, &label);
-        }
-        let active = self.room.active_server_label.as_deref() == Some(label.as_str());
-        if active {
-            self.push_file_policy();
-        }
-        if join_after_save {
-            if self.connection_switch_blocked() || !self.start_network(&label) {
-                // The entry is durable and only the join was refused, so the
-                // editor stays up over a draft rebuilt from what was written.
-                return ServerEditSave::Reloaded(Box::new(ServerEditDraft::from_server(
-                    &self.config.servers[index],
-                    &self.config,
-                )));
-            }
-            // The join is only started here. The editor presents the rest of it
-            // and closes on `Authenticated`, so nothing navigates yet.
-            self.hold_editor_for_join(&label);
-            return ServerEditSave::Saved;
-        }
-        self.navigate_owner(NavigationEvent::CloseScreen);
         if connection_changed && self.network.is_some() && active {
             self.set_status("server saved; changes apply on reconnect");
         } else {
             self.set_status(format!("server saved to {}", path.display()));
         }
-        ServerEditSave::Saved
+        ServerEditOutcome::Saved
     }
 
     pub(crate) fn cancel_open_audio_picker(&mut self, session: &mut SettingsSession) -> bool {
@@ -7265,9 +6848,6 @@ impl App {
                     network.stop();
                 }
                 self.reset_room_for_disconnect();
-                // Nothing will authenticate now, so a form still holding this
-                // join gets its submit actions back to try something else.
-                self.release_join_hold();
                 self.set_error(format!("network recovery exhausted: {reason}"));
                 true
             }
@@ -7300,8 +6880,7 @@ impl App {
     }
 
     fn restart_network_worker(&mut self, reason: &str) {
-        let alias = self.room.server_alias.clone();
-        if alias.is_empty() {
+        if self.room.active_server_id.is_none() {
             self.set_error(format!("network worker stopped: {reason}"));
             return;
         }
@@ -7312,7 +6891,7 @@ impl App {
         );
         let queued = std::mem::take(&mut self.pending_network_commands);
         let network_recovery = std::mem::take(&mut self.supervisor.network);
-        self.start_network(&alias);
+        self.restart_active_session();
         self.pending_network_commands = queued;
         if self.network.is_some() {
             self.supervisor.network.reset();
@@ -7586,7 +7165,9 @@ impl App {
         };
         let user_id = selected.user_id;
         let name = selected.username;
-        let value_db = self.config.user_volume_db(&self.room.server_alias, user_id);
+        let value_db = self
+            .config
+            .user_volume_db(self.room.active_server_id.unwrap_or_default(), user_id);
         self.room.begin_volume_preview(user_id, value_db);
         let dialog = UserVolumeDialog::new(
             user_id,
@@ -7635,8 +7216,11 @@ impl App {
                 username,
                 original_db,
             } => {
-                self.config
-                    .set_user_volume_db(&self.room.server_alias, user_id, original_db);
+                self.config.set_user_volume_db(
+                    self.room.active_server_id.unwrap_or_default(),
+                    user_id,
+                    original_db,
+                );
                 self.apply_user_audio_control_with_volume(user_id, original_db);
                 self.room.clear_volume_preview();
                 self.set_status(format!("canceled local volume for {username}"));
@@ -7647,8 +7231,11 @@ impl App {
                 username,
                 value_db,
             } => {
-                self.config
-                    .set_user_volume_db(&self.room.server_alias, user_id, value_db);
+                self.config.set_user_volume_db(
+                    self.room.active_server_id.unwrap_or_default(),
+                    user_id,
+                    value_db,
+                );
                 self.apply_user_audio_control_with_volume(user_id, value_db);
                 match self.config.save_runtime() {
                     Ok(path) => {
@@ -7755,10 +7342,11 @@ impl App {
         if self.network.is_none() {
             return;
         }
-        let Some(alias) = self.room.active_server_label.clone() else {
-            return;
-        };
-        let Ok(server) = self.config.server(&alias) else {
+        let Some(server) = self
+            .room
+            .active_server_id
+            .and_then(|server_id| self.config.server_by_id(server_id))
+        else {
             return;
         };
         let policy = self.config.file_policy(server);
@@ -7992,15 +7580,14 @@ impl App {
     }
 
     fn active_server_identity_key(&self) -> Result<[u8; 32], String> {
-        let label = self
+        let server_id = self
             .room
-            .active_server_label
-            .as_deref()
+            .active_server_id
             .ok_or_else(|| "select a server before verifying identities".to_string())?;
         let server = self
             .config
-            .server(label)
-            .map_err(|error| error.to_string())?;
+            .server_by_id(server_id)
+            .ok_or_else(|| "the connected server is no longer configured".to_string())?;
         if server.server_public_key.trim().is_empty() {
             return Ok(rpc::crypto::dev_server_public_key());
         }
@@ -8337,8 +7924,8 @@ impl App {
     fn show_command_help(&mut self, room_id: Option<RoomId>) {
         let body = slash_command_help();
         if !room_id.is_some_and(|room_id| self.room.push_notice_to(room_id, "help", body.clone())) {
-            self.send_terminal_event(
-                Audience::Client(self.command_client),
+            self.send_to(
+                self.command_client,
                 TerminalEvent::LocalNotice {
                     sender: "help".to_string(),
                     body,
@@ -8778,6 +8365,10 @@ impl App {
         };
         let network_tx = network.sender();
         let events = self.events.sender();
+        let network_events = self
+            .events
+            .sender()
+            .for_network(self.active_network_generation.unwrap_or(0));
         let send_failed = Arc::new(AtomicBool::new(false));
         let busy = Arc::clone(&self.soundboard_busy);
         let voice_tx_enabled = Arc::clone(&self.voice_tx_enabled);
@@ -8816,7 +8407,7 @@ impl App {
                         .is_err()
                         && !send_failed.swap(true, Ordering::AcqRel)
                     {
-                        let _ = events.send(NetworkEvent::WorkerStopped {
+                        let _ = network_events.send(NetworkEvent::WorkerStopped {
                             reason: "network command channel closed while sending soundboard audio"
                                 .to_string(),
                         });
@@ -8859,7 +8450,13 @@ impl App {
 
     fn capture_packet_handler(&self) -> impl FnMut(LocalVoiceFrame) + Send + 'static {
         let tx = self.network.as_ref().map(|network| network.sender());
-        let event_tx = self.events.sender();
+        // Failures are reported under the generation of the session the
+        // capture was started for, so a preview capture or a stale worker's
+        // report can never take down a newer session.
+        let event_tx = self
+            .events
+            .sender()
+            .for_network(self.active_network_generation.unwrap_or(0));
         let send_failed = Arc::new(AtomicBool::new(false));
         let voice_tx_enabled = Arc::clone(&self.voice_tx_enabled);
         let loopback_tap = self.loopback_tap.clone();
@@ -9043,7 +8640,10 @@ impl App {
             return;
         };
         let network_tx = network.sender();
-        let event_tx = self.events.sender();
+        let event_tx = self
+            .events
+            .sender()
+            .for_network(self.active_network_generation.unwrap_or(0));
         let send_failed = Arc::new(AtomicBool::new(false));
         thread::Builder::new()
             .name("chatt-fb-router".to_string())
@@ -9428,27 +9028,18 @@ impl App {
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
         let status = status.into();
         self.capture_frontend_command_line(false, &status);
-        self.send_terminal_event(
-            Audience::Client(self.command_client),
-            TerminalEvent::Status(status),
-        );
+        self.send_to(self.command_client, TerminalEvent::Status(status));
     }
 
     pub(crate) fn set_transient_status(&mut self, status: impl Into<String>) {
         let status = status.into();
-        self.send_terminal_event(
-            Audience::Client(self.command_client),
-            TerminalEvent::TransientStatus(status),
-        );
+        self.send_to(self.command_client, TerminalEvent::TransientStatus(status));
     }
 
     pub(crate) fn set_error(&mut self, status: impl Into<String>) {
         let status = status.into();
         self.capture_frontend_command_line(true, &status);
-        self.send_terminal_event(
-            Audience::Client(self.command_client),
-            TerminalEvent::Error(status),
-        );
+        self.send_to(self.command_client, TerminalEvent::Error(status));
     }
 
     fn capture_frontend_command_line(&mut self, error: bool, text: &str) {
@@ -9640,9 +9231,9 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::command::CoreCommand;
-    use super::pairing::ResumeUi;
     use super::testing::TestApp;
     use super::*;
+    use crate::client_channel::TransportWarningTarget;
     use crate::{bindings::BindCommand, tui::Action};
     use crate::{
         settings::SettingsDraft,
@@ -9657,6 +9248,8 @@ mod tests {
         event::{KeyModifiers, MouseButton},
     };
     use extui_editor::Mode as EditorMode;
+    use rpc::control::ERROR_USERNAME_TAKEN;
+    use rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX;
 
     fn test_app() -> TestApp {
         TestApp::new(Config::default(), None).expect("test app")
@@ -9865,82 +9458,103 @@ mod tests {
         assert!(app.notification_playback_idle_at.is_none());
     }
 
+    /// A pending candidate join for `label`, as `start_join` leaves it. The
+    /// worker dials a closed port, so nothing arrives unless the test injects
+    /// events under [`join_generation`].
+    fn pending_join(app: &mut TestApp, label: &str, owner: JoinOwner) -> u64 {
+        let server_id = app.config.server(label).expect("configured server").id;
+        let JoinStart::Started(view) = app.start_join(server_id, owner) else {
+            panic!("join did not start");
+        };
+        view.attempt_id
+    }
+
+    fn join_generation(app: &TestApp) -> u64 {
+        app.join_attempt_generation().expect("pending join")
+    }
+
     #[test]
-    fn transport_encryption_rejection_orders_base_reset_before_owner_warning() {
+    fn transport_encryption_rejection_prompts_only_the_join_owner() {
         let mut app = test_app();
+        app.config.servers.push(saved_server("legacy", "token"));
         let channel = app.terminal_channel();
-        app.connection_attempt = Some(ConnectionAttempt {
-            generation: 9,
-            owner: crate::client_channel::ClientId::PRIMARY,
-            server_label: "legacy".to_string(),
-            holds_editor: false,
+        let attempt_id = pending_join(
+            &mut app,
+            "legacy",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        channel.drain_events();
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::TransportEncryptionRequired,
         });
 
-        app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
-
-        let mut events = channel.drain_events();
-        assert!(matches!(
-            events.pop_front(),
-            Some(TerminalEvent::Navigation(NavigationEvent::ResetBase(
-                BaseScreen::Servers { query: None }
-            )))
-        ));
-        assert!(matches!(
-            events.pop_front(),
-            Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(overlay)))
+        let events = channel.drain_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::Navigation(NavigationEvent::ShowOverlay(overlay))
                 if matches!(
                     overlay.as_ref(),
                     OverlaySpec::TransportEncryptionWarning {
                         label,
-                        target: TransportWarningTarget::Connection { generation: 9 },
-                    } if label == "legacy"
+                        target: TransportWarningTarget::Join { attempt_id: prompted },
+                    } if label == "legacy" && *prompted == attempt_id
                 )
-        ));
-        assert!(events.is_empty());
+        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                TerminalEvent::Navigation(NavigationEvent::ResetBase(_))
+            )),
+            "a pending join prompts its owner without navigating anyone"
+        );
     }
 
     #[test]
     fn transport_encryption_rejection_projects_prompt_to_rpc_owner() {
         let mut app = test_app();
+        app.config.servers.push(saved_server("legacy", "token"));
         let owner = crate::client_channel::ClientId(7);
         app.register_rpc_client(owner);
-        app.connection_attempt = Some(ConnectionAttempt {
-            generation: 9,
-            owner,
-            server_label: "legacy".to_string(),
-            holds_editor: false,
-        });
+        let attempt_id = pending_join(&mut app, "legacy", JoinOwner::Rpc(owner));
+        let generation = join_generation(&app);
 
-        app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::TransportEncryptionRequired,
+        });
 
         assert!(matches!(
             app.rpc_snapshot(owner).server_selection.prompt,
             Some(local_rpc::model::ServerSelectionPrompt::AllowUnencryptedTransport {
                 label,
-                attempt_id: 9,
-            }) if label == "legacy"
+                attempt_id: prompted,
+            }) if label == "legacy" && prompted == attempt_id
         ));
     }
 
     #[test]
     fn stale_connection_generation_cannot_publish_navigation() {
         let mut app = test_app();
+        app.config.servers.push(saved_server("new", "token"));
         let channel = app.terminal_channel();
-        app.connection_attempt = Some(ConnectionAttempt {
-            generation: 2,
-            owner: crate::client_channel::ClientId::PRIMARY,
-            server_label: "new".to_string(),
-            holds_editor: false,
-        });
-        app.active_network_generation = Some(2);
+        pending_join(
+            &mut app,
+            "new",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        channel.drain_events();
 
         app.handle_app_event(AppEvent::NetworkFor {
-            generation: 1,
+            generation: generation.wrapping_add(1),
             event: NetworkEvent::TransportEncryptionRequired,
         });
 
         assert!(channel.drain_events().is_empty());
-        assert_eq!(app.connection_attempt.as_ref().unwrap().generation, 2);
+        assert_eq!(join_generation(&app), generation);
     }
 
     fn attach_test_client(
@@ -10227,13 +9841,10 @@ mod tests {
         let mut h = Harness::new(app);
         let message = "authentication failed: invalid public bearer token";
 
-        h.app.handle_app_event(
-            NetworkEvent::AuthFailed {
-                code: 1,
-                message: message.to_string(),
-            }
-            .into(),
-        );
+        h.app.handle_network_event(NetworkEvent::AuthFailed {
+            code: 1,
+            message: message.to_string(),
+        });
         h.apply();
 
         assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
@@ -10248,35 +9859,24 @@ mod tests {
         let view = attach_test_client(&mut app, owner);
         let channel = app.channel_for(owner).expect("attached channel");
         app.config.servers.push(ServerEntry {
-            label: "public".to_string(),
             username: "Zoe".to_string(),
-            ..ServerEntry::default()
+            ..saved_server("public", "public-token")
         });
-        app.connection_attempt = Some(ConnectionAttempt {
-            generation: 1,
-            owner,
-            server_label: "public".to_string(),
-            holds_editor: false,
-        });
+        pending_join(&mut app, "public", JoinOwner::Terminal(owner));
+        let generation = join_generation(&app);
+        channel.drain_events();
 
-        app.handle_app_event(
-            NetworkEvent::AuthFailed {
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::AuthFailed {
                 code: ERROR_USERNAME_TAKEN,
                 message: "username already in use".to_string(),
-            }
-            .into(),
-        );
+            },
+        });
 
-        let mut events = channel.drain_events();
-        assert!(matches!(
-            events.pop_front(),
-            Some(TerminalEvent::Navigation(NavigationEvent::ResetBase(
-                BaseScreen::Servers { query: None }
-            )))
-        ));
-        assert!(events.into_iter().any(|event| matches!(
+        assert!(channel.drain_events().into_iter().any(|event| matches!(
             event,
-            TerminalEvent::Navigation(NavigationEvent::OpenScreen(screen))
+            TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(screen))
                 if matches!(screen.as_ref(), ScreenSpec::ServerEditor(_))
         )));
         assert_eq!(
@@ -10287,6 +9887,7 @@ mod tests {
             app.view.status.text(),
             "username already in use; choose another"
         );
+        assert!(!app.has_pending_join(), "the failed candidate is gone");
     }
 
     fn test_room_info(id: u32) -> rpc::control::RoomInfo {
@@ -10954,11 +10555,12 @@ mod tests {
     fn local_verification_text_uses_development_server_key_fallback() {
         let mut app = test_app();
         app.config.servers.push(ServerEntry {
+            id: test_server_id("development"),
             label: "development".to_string(),
             server_public_key: String::new(),
             ..ServerEntry::default()
         });
-        app.room.active_server_label = Some("development".to_string());
+        app.room.active_server_id = Some(test_server_id("development"));
         app.user_id = Some(UserId(42));
         app.e2e_account_id = Some(rpc::ids::AccountId([0x11; 32]));
 
@@ -10982,7 +10584,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("chatt-forget-identity-{}.toml", std::process::id()));
         app.config.config_path = Some(path.clone());
-        app.room.active_server_label = Some("test".to_string());
+        app.room.active_server_id = Some(test_server_id("test"));
         let mut pin = crate::config::E2ePeerPin {
             room_id: 0x8000_0001,
             user_id: 2,
@@ -10993,6 +10595,7 @@ mod tests {
             previous: Vec::new(),
         };
         app.config.servers.push(ServerEntry {
+            id: test_server_id("test"),
             label: "test".to_string(),
             e2e_peer_pins: vec![pin.clone()],
             ..ServerEntry::default()
@@ -11990,7 +11593,7 @@ mod tests {
         assert_eq!(first_editor, second_editor);
         draft.set_active_editor_text("Alice Dev");
 
-        let server = draft.to_update().unwrap();
+        let server = draft.fields().unwrap();
         assert_eq!(server.label, "local-dev");
         assert_eq!(server.username, "Alice Dev");
     }
@@ -13528,6 +13131,7 @@ mod tests {
         app.config.servers.clear();
         for (label, tcp_addr) in entries {
             app.config.servers.push(ServerEntry {
+                id: test_server_id(label),
                 label: label.to_string(),
                 tcp_addr: tcp_addr.to_string(),
                 udp_addr: String::new(),
@@ -13619,11 +13223,11 @@ mod tests {
         let mut app = app_with_servers(&[("lab", "10.0.0.1:4000")]);
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
-        app.room.active_server_label = Some("lab".to_string());
+        app.room.active_server_id = Some(test_server_id("lab"));
 
         app.start_named_join("lab".to_string());
 
-        assert!(app.connection_attempt.is_none());
+        assert!(!app.has_pending_join());
         assert!(rx.try_recv().is_err(), "the live worker was left alone");
         assert_eq!(app.view.status.kind(), StatusKind::Info);
         assert!(app.view.status.text().contains("already connected"));
@@ -13663,68 +13267,129 @@ mod tests {
         );
         app.start_named_join("192.168.0.1:4000".to_string());
         let pending = app.pairing_pending().expect("pairing started");
-        assert!(pending.server.token.starts_with(OPEN_PAIR_RECOVERY_PREFIX));
-        assert_eq!(
-            app.config.server(&pending.server.label).unwrap().token,
-            pending.server.token
-        );
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains(&pending.server.token)
-        );
+        assert_eq!(pending.completion, PairCompletion::OpenEditor);
+        let recovery_token = pending.open.clone().expect("recovery secret");
+        assert!(recovery_token.starts_with(rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX));
+        assert!(app.config.server(&pending.server.label).is_err());
+        assert!(!path.exists(), "pairing state was not written to config");
         assert!(app.room.join_notice.is_some());
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn username_retry_renames_provisional_server_and_keeps_join_intent() {
-        let mut app = test_app();
-        let path =
-            std::env::temp_dir().join(format!("chatt-username-retry-{}.toml", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        app.config.config_path = Some(path.clone());
-        let recovery_token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
-        let original = ServerEntry {
-            label: "public".to_string(),
+    /// An awaiting-username pending pair, as the coordinator parks it when the
+    /// server rejects the paired name.
+    fn awaiting_username_pair(app: &mut TestApp, label: &str) -> ServerEntry {
+        let recovery_token = format!("{}retry-secret", rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX);
+        let server = ServerEntry {
+            id: test_server_id(label),
+            label: label.to_string(),
             tcp_addr: "127.0.0.1:1".to_string(),
             username: "User".to_string(),
             token: recovery_token.clone(),
             ..ServerEntry::default()
         };
-        app.config.servers.push(original.clone());
         app.pairing.set_awaiting_username_for_test(
             crate::client_channel::ClientId::PRIMARY,
             PendingPair {
-                server: original,
+                server: server.clone(),
                 open: Some(recovery_token),
                 open_password: String::new(),
                 pairing_code: None,
                 completion: PairCompletion::OpenEditor,
-                from_editor: false,
             },
         );
-        let renamed = ServerEntry {
-            label: "community".to_string(),
-            username: "Different User".to_string(),
-            ..app.config.servers[0].clone()
-        };
+        server
+    }
 
-        assert!(app.retry_username_pairing(renamed, true));
+    #[test]
+    fn username_retry_uses_the_full_editor_without_persisting_the_candidate() {
+        let mut app = test_app();
+        let path =
+            std::env::temp_dir().join(format!("chatt-username-retry-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        app.config.config_path = Some(path.clone());
+        let server = awaiting_username_pair(&mut app, "public");
+        let mut draft = ServerEditDraft::from_new_server(server, &app.config);
+        type_into_draft(&mut draft, 1, "Different User");
 
-        assert_eq!(app.config.servers.len(), 1);
-        assert_eq!(app.config.servers[0].label, "community");
-        assert_eq!(
-            app.pairing_pending().unwrap().completion,
-            PairCompletion::Join
+        app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::SubmitServerEdit {
+                request_id: 1,
+                draft,
+                join: true,
+            },
         );
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(saved.matches("[[servers]]").count(), 1);
+
+        let pending = app.pairing_pending().expect("retry running");
+        assert_eq!(pending.server.username, "Different User");
+        assert_eq!(
+            pending.completion,
+            PairCompletion::Submit {
+                request_id: 1,
+                join: true,
+            }
+        );
+        assert!(app.config.servers.is_empty(), "no ready entry yet");
+        assert!(!path.exists(), "retry state was not written to config");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn repeated_pairing_username_rejection_stays_in_the_focused_editor() {
+        let mut app = test_app();
+        let server = awaiting_username_pair(&mut app, "public");
+        let draft = ServerEditDraft::from_new_server(server, &app.config);
+        app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::SubmitServerEdit {
+                request_id: 9,
+                draft,
+                join: true,
+            },
+        );
+        let attempt = app
+            .pairing
+            .running_attempt_for_test()
+            .expect("pairing retry running");
+        app.terminal_channel().drain_events();
+
+        app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::UsernameTaken {
+                message: "username already in use".to_string(),
+                server_public_key: "ab".repeat(32),
+            },
+        });
+
+        let events = app.terminal_channel().drain_events();
+        assert!(navigations(&events).is_empty());
+        let draft = events
+            .iter()
+            .find_map(|event| match event {
+                TerminalEvent::ServerEditResult {
+                    request_id: 9,
+                    outcome: ServerEditOutcome::Retry(draft),
+                } => Some(draft),
+                _ => None,
+            })
+            .expect("the pairing retry returned to its editor");
+        assert!(draft.field_focused_for_test("Username"));
+    }
+
+    /// Deterministic per-label id, so fixtures pushing several entries never
+    /// collide on the identity that config validation now enforces.
+    fn test_server_id(label: &str) -> ServerId {
+        let mut bytes = [0x5a; 16];
+        for (slot, byte) in bytes.iter_mut().zip(label.bytes()) {
+            *slot = byte;
+        }
+        ServerId(bytes)
     }
 
     fn saved_server(label: &str, token: &str) -> ServerEntry {
         ServerEntry {
+            id: test_server_id(label),
             label: label.to_string(),
             tcp_addr: "127.0.0.1:1".to_string(),
             username: "User".to_string(),
@@ -13752,21 +13417,23 @@ mod tests {
     ) {
         app.handle_client_command(
             client,
-            CoreCommand::SaveServerEdit {
+            CoreCommand::SubmitServerEdit {
+                request_id: 1,
                 draft,
-                join_after_save: false,
+                join: false,
             },
         );
     }
 
+    /// The label of the reloaded draft a conflicted or join-refused submit
+    /// answered with, which the submitting editor presents in place.
     fn reopened_editor_label(events: &VecDeque<TerminalEvent>) -> Option<&str> {
         events.iter().find_map(|event| match event {
-            TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(screen)) => {
-                match screen.as_ref() {
-                    ScreenSpec::ServerEditor(draft) => Some(draft.original_label()),
-                    _ => None,
-                }
-            }
+            TerminalEvent::ServerEditResult {
+                outcome:
+                    ServerEditOutcome::Conflict(draft) | ServerEditOutcome::SavedButJoinFailed(draft),
+                ..
+            } => Some(draft.original_label()),
             _ => None,
         })
     }
@@ -13813,7 +13480,7 @@ mod tests {
         let mut stale = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
         type_into_draft(&mut stale, 1, "Renamed User");
 
-        app.delete_server("public");
+        app.delete_server(test_server_id("public"));
         save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, stale);
 
         assert!(app.config.servers.is_empty());
@@ -13821,9 +13488,34 @@ mod tests {
         assert!(app.terminal_channel().drain_events().iter().any(|event| {
             matches!(
                 event,
-                TerminalEvent::Navigation(NavigationEvent::CloseScreen)
+                TerminalEvent::ServerEditResult {
+                    outcome: ServerEditOutcome::Missing,
+                    ..
+                }
             )
         }));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two entries may hold the same credential — the token is a value, not an
+    /// identity — so an edit of one must land on that one alone.
+    #[test]
+    fn duplicate_tokens_on_two_servers_remain_independently_editable() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "duplicate-token-edit");
+        app.config
+            .servers
+            .push(saved_server("public", "shared-token"));
+        app.config
+            .servers
+            .push(saved_server("community", "shared-token"));
+        let mut draft = ServerEditDraft::from_server(&app.config.servers[1], &app.config);
+        type_into_draft(&mut draft, 1, "Renamed User");
+
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, draft);
+
+        assert_eq!(app.config.servers[0].username, "User");
+        assert_eq!(app.config.servers[1].username, "Renamed User");
         let _ = std::fs::remove_file(path);
     }
 
@@ -13886,13 +13578,14 @@ mod tests {
         let (tx, commands) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.room.server_alias = label.to_string();
-        app.room.active_server_label = Some(label.to_string());
-        app.connection_attempt = Some(ConnectionAttempt {
-            generation: 7,
-            owner: crate::client_channel::ClientId::PRIMARY,
-            server_label: label.to_string(),
-            holds_editor: false,
-        });
+        app.room.active_server_id = Some(
+            app.config
+                .server(label)
+                .map(|server| server.id)
+                .unwrap_or_else(|_| test_server_id(label)),
+        );
+        app.active_network_generation = Some(7);
+        app.room.network_selected = true;
         enter_room_with_users(app, Vec::new());
         commands
     }
@@ -13923,21 +13616,15 @@ mod tests {
             .collect()
     }
 
-    /// Every live label names a configured entry. The session resolves servers
-    /// by label for DM pins, room settings, identity verification and stale-token
-    /// repair, so a label the configuration no longer holds breaks all of them.
+    /// Every live reference names a configured entry. The session resolves
+    /// servers by id for DM pins, room settings, identity verification and
+    /// stale-token repair, so an id the configuration no longer holds breaks
+    /// all of them.
     fn assert_live_server_labels_resolve(app: &TestApp) {
-        if let Some(label) = app.room.active_server_label.as_deref() {
+        if let Some(server_id) = app.room.active_server_id {
             assert!(
-                app.config.server(label).is_ok(),
-                "active label {label} is not configured"
-            );
-        }
-        if let Some(attempt) = &app.connection_attempt {
-            assert!(
-                app.config.server(&attempt.server_label).is_ok(),
-                "attempt label {} is not configured",
-                attempt.server_label
+                app.config.server_by_id(server_id).is_some(),
+                "active id {server_id} is not configured"
             );
         }
     }
@@ -13958,9 +13645,10 @@ mod tests {
 
         app.handle_client_command(
             crate::client_channel::ClientId::PRIMARY,
-            CoreCommand::SaveServerEdit {
+            CoreCommand::SubmitServerEdit {
+                request_id: 1,
                 draft,
-                join_after_save: true,
+                join: true,
             },
         );
 
@@ -13972,33 +13660,20 @@ mod tests {
         );
         assert_eq!(app.view.status.text(), SERVER_SWITCH_TRANSFER_BLOCKED);
         assert_eq!(app.view.status.kind(), StatusKind::Error);
-        assert_eq!(app.room.active_server_label.as_deref(), Some("public"));
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
         assert!(app.network.is_some());
         assert!(app.room.has_active_transfers());
-        // Nothing was started, so nothing is holding the form open.
-        assert_eq!(app.room.join_hold, None);
+        assert!(!app.has_pending_join(), "nothing was started");
+        assert!(app.terminal_channel().drain_events().iter().any(|event| {
+            matches!(
+                event,
+                TerminalEvent::ServerEditResult {
+                    outcome: ServerEditOutcome::SavedButJoinFailed(_),
+                    ..
+                }
+            )
+        }));
         let _ = std::fs::remove_file(path);
-    }
-
-    /// The state a save-and-join leaves behind: the entry written, a worker
-    /// running, and the form that submitted it holding the outcome.
-    fn held_join(
-        app: &mut TestApp,
-        label: &str,
-        owner: crate::client_channel::ClientId,
-    ) -> mpsc::Receiver<crate::client_net::NetworkCommand> {
-        let (tx, commands) = mpsc::channel();
-        app.network = Some(NetworkClient::from_parts_for_test(tx));
-        app.room.active_server_label = Some(label.to_string());
-        app.room.network_selected = true;
-        app.connection_attempt = Some(ConnectionAttempt {
-            generation: 11,
-            owner,
-            server_label: label.to_string(),
-            holds_editor: true,
-        });
-        app.room.join_hold = Some(label.to_string());
-        commands
     }
 
     fn navigations(events: &VecDeque<TerminalEvent>) -> Vec<&NavigationEvent> {
@@ -14011,16 +13686,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn an_authenticated_held_join_is_what_finally_opens_the_room() {
-        let mut app = test_app();
-        app.config
-            .servers
-            .push(saved_server("public", "public-token"));
-        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
-        app.terminal_channel().drain_events();
-
-        app.handle_network_event(NetworkEvent::Authenticated {
+    fn authenticated_event() -> NetworkEvent {
+        NetworkEvent::Authenticated {
             session_id: SessionId(1),
             user_id: UserId(1),
             rooms: vec![test_room_info(1)],
@@ -14030,70 +13697,492 @@ mod tests {
             video_addr: "127.0.0.1:41000".parse().unwrap(),
             video_transport_mode: rpc::crypto::TransportMode::Encrypted,
             video_auth_key: [0; rpc::crypto::KEY_LEN],
+        }
+    }
+
+    #[test]
+    fn authentication_is_the_only_pending_join_transition_to_room() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        app.terminal_channel().drain_events();
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::Connected,
+        });
+        assert!(
+            navigations(&app.terminal_channel().drain_events()).is_empty(),
+            "connecting and authenticating navigate no one"
+        );
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: authenticated_event(),
         });
 
-        assert_eq!(app.room.join_hold, None);
-        assert!(matches!(
-            navigations(&app.terminal_channel().drain_events()).as_slice(),
-            [NavigationEvent::ResetBase(BaseScreen::Room)]
-        ));
+        assert!(!app.has_pending_join());
+        assert!(app.network.is_some(), "the candidate was promoted");
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
+        assert!(
+            navigations(&app.terminal_channel().drain_events())
+                .iter()
+                .any(|event| matches!(event, NavigationEvent::ResetBase(BaseScreen::Room)))
+        );
     }
 
-    /// The refusal the user is most likely to meet: the server turns out to
-    /// speak plaintext, and they decline it. The warning is the only thing that
-    /// closes, uncovering the form they submitted from.
     #[test]
-    fn a_canceled_transport_encryption_warning_uncovers_the_held_editor() {
+    fn editor_join_failure_returns_to_the_same_form_without_navigation() {
         let mut app = test_app();
-        app.config.servers.push(saved_server("public", "token"));
-        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        pending_join(
+            &mut app,
+            "public",
+            JoinOwner::ServerEditor {
+                client: crate::client_channel::ClientId::PRIMARY,
+                request_id: 17,
+            },
+        );
+        let generation = join_generation(&app);
+        app.terminal_channel().drain_events();
 
-        app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
-        let prompted = app.terminal_channel().drain_events();
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::WorkerStopped {
+                reason: "connection refused".to_string(),
+            },
+        });
+
+        assert!(!app.has_pending_join());
+        let events = app.terminal_channel().drain_events();
+        assert!(navigations(&events).is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::ServerEditResult {
+                request_id: 17,
+                outcome: ServerEditOutcome::SavedButJoinFailed(_),
+            }
+        )));
+    }
+
+    #[test]
+    fn editor_join_username_rejection_focuses_username_without_navigation() {
+        let mut app = test_app();
+        app.config.servers.push(ServerEntry {
+            username: "Taken Name".to_string(),
+            ..saved_server("public", "public-token")
+        });
+        pending_join(
+            &mut app,
+            "public",
+            JoinOwner::ServerEditor {
+                client: crate::client_channel::ClientId::PRIMARY,
+                request_id: 23,
+            },
+        );
+        let generation = join_generation(&app);
+        app.terminal_channel().drain_events();
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::AuthFailed {
+                code: ERROR_USERNAME_TAKEN,
+                message: "username already in use".to_string(),
+            },
+        });
+
+        assert!(!app.has_pending_join());
+        let events = app.terminal_channel().drain_events();
+        assert!(navigations(&events).is_empty());
+        let draft = events
+            .iter()
+            .find_map(|event| match event {
+                TerminalEvent::ServerEditResult {
+                    request_id: 23,
+                    outcome: ServerEditOutcome::Retry(draft),
+                } => Some(draft),
+                _ => None,
+            })
+            .expect("the editor received the rejected server");
+        assert!(draft.field_focused_for_test("Username"));
+    }
+
+    #[test]
+    fn stale_candidate_events_cannot_promote() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        app.terminal_channel().drain_events();
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation: generation.wrapping_add(1),
+            event: authenticated_event(),
+        });
+
+        assert!(app.has_pending_join(), "the pending join is untouched");
+        assert!(app.network.is_none(), "nothing was promoted");
+        assert!(navigations(&app.terminal_channel().drain_events()).is_empty());
+    }
+
+    #[test]
+    fn starting_a_candidate_leaves_the_active_session_unchanged() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        let _commands = connected_session(&mut app, "public");
+        app.terminal_channel().drain_events();
+
+        pending_join(
+            &mut app,
+            "community",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+
+        assert!(app.network.is_some(), "the active worker is untouched");
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
+        assert_eq!(app.room.server_alias, "public");
+        assert!(navigations(&app.terminal_channel().drain_events()).is_empty());
+    }
+
+    #[test]
+    fn selecting_the_active_server_cancels_a_pending_switch() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        let _commands = connected_session(&mut app, "public");
+        pending_join(
+            &mut app,
+            "community",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let stale_generation = join_generation(&app);
+        app.terminal_channel().drain_events();
+
         assert!(matches!(
-            navigations(&prompted).as_slice(),
-            [NavigationEvent::ShowOverlay(overlay)]
-                if matches!(
-                    overlay.as_ref(),
-                    OverlaySpec::TransportEncryptionWarning {
-                        target: TransportWarningTarget::Connection { generation: 11 },
-                        ..
+            app.start_join(
+                test_server_id("public"),
+                JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+            ),
+            JoinStart::AlreadyActive
+        ));
+        assert!(!app.has_pending_join());
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation: stale_generation,
+            event: authenticated_event(),
+        });
+
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
+        assert!(app.network.is_some());
+        assert!(
+            navigations(&app.terminal_channel().drain_events())
+                .iter()
+                .any(|event| matches!(event, NavigationEvent::CloseScreen))
+        );
+    }
+
+    #[test]
+    fn superseding_an_editor_consent_closes_the_overlay_before_answering() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        pending_join(
+            &mut app,
+            "public",
+            JoinOwner::ServerEditor {
+                client: crate::client_channel::ClientId::PRIMARY,
+                request_id: 17,
+            },
+        );
+        let generation = join_generation(&app);
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::TransportEncryptionRequired,
+        });
+        app.terminal_channel().drain_events();
+
+        pending_join(
+            &mut app,
+            "community",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+
+        let events = app.terminal_channel().drain_events();
+        let close = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    TerminalEvent::Navigation(NavigationEvent::CloseOverlay)
+                )
+            })
+            .expect("the consent overlay closes");
+        let result = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    TerminalEvent::ServerEditResult {
+                        request_id: 17,
+                        outcome: ServerEditOutcome::SavedButJoinFailed(_),
                     }
                 )
-        ));
-        assert_eq!(app.room.join_hold.as_deref(), Some("public"));
-
-        app.cancel_transport_encryption_warning(11);
-
-        assert_eq!(app.room.join_hold, None);
-        assert!(app.network.is_none());
-        assert!(matches!(
-            navigations(&app.terminal_channel().drain_events()).as_slice(),
-            [NavigationEvent::CloseOverlay]
-        ));
+            })
+            .expect("the editor submission is answered");
+        assert!(
+            close < result,
+            "the editor must be active before its result arrives"
+        );
     }
 
-    /// Consenting restarts the same join, which the same form goes on holding:
-    /// only authentication opens the room.
     #[test]
-    fn accepted_transport_encryption_keeps_the_editor_holding_the_restart() {
+    fn deleting_a_server_closes_its_join_consent_surface() {
         let mut app = test_app();
-        let path = temp_config_path(&mut app, "held-plaintext-consent");
+        let path = temp_config_path(&mut app, "delete-join-consent");
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::TransportEncryptionRequired,
+        });
+        app.terminal_channel().drain_events();
+
+        app.delete_server(test_server_id("public"));
+
+        assert!(!app.has_pending_join());
+        let events = app.terminal_channel().drain_events();
+        assert!(matches!(
+            navigations(&events).as_slice(),
+            [NavigationEvent::CloseOverlay, NavigationEvent::CloseScreen]
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn authentication_restarts_when_the_saved_worker_fields_changed() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "join-edit-restart");
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        let attempt_id = pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let stale_generation = join_generation(&app);
+        let mut edit = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        type_into_draft(&mut edit, 1, "Current User");
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, edit);
+        app.terminal_channel().drain_events();
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation: stale_generation,
+            event: authenticated_event(),
+        });
+
+        let current_generation = join_generation(&app);
+        assert_ne!(current_generation, stale_generation);
+        assert!(
+            app.network.is_none(),
+            "the stale candidate was not promoted"
+        );
+        assert!(app.terminal_channel().drain_events().iter().any(|event| {
+            matches!(
+                event,
+                TerminalEvent::JoinUpdate(crate::client_channel::JoinView {
+                    attempt_id: current,
+                    phase: crate::client_channel::JoinPhaseView::Connecting,
+                    ..
+                }) if *current == attempt_id
+            )
+        }));
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation: current_generation,
+            event: authenticated_event(),
+        });
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn promotion_uses_current_non_worker_server_fields() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        app.config.servers[0].label = "renamed".to_string();
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: authenticated_event(),
+        });
+
+        assert_eq!(app.room.server_alias, "renamed");
+        assert_eq!(app.active_network_generation, Some(generation));
+    }
+
+    /// A transfer that appears while the candidate authenticates refuses the
+    /// promotion: the active session and its transfers stay, and the join owner
+    /// reads a retryable failure.
+    #[test]
+    fn transfer_appearing_before_promotion_refuses_promotion() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "public-token"));
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        pending_join(
+            &mut app,
+            "community",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        let _commands = connected_with_active_transfer(&mut app, "public");
+        app.terminal_channel().drain_events();
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: authenticated_event(),
+        });
+
+        assert!(app.network.is_some(), "the active session stays");
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
+        assert!(app.room.has_active_transfers());
+        assert!(app.terminal_channel().drain_events().iter().any(|event| {
+            matches!(
+                event,
+                TerminalEvent::JoinUpdate(crate::client_channel::JoinView {
+                    phase: crate::client_channel::JoinPhaseView::Failed {
+                        retryable: true,
+                        ..
+                    },
+                    ..
+                })
+            )
+        }));
+    }
+
+    /// Declining plaintext ends the attempt with a readable failure; only the
+    /// warning overlay closes, and the candidate is the only casualty.
+    #[test]
+    fn declined_transport_encryption_fails_only_the_candidate() {
+        let mut app = test_app();
+        app.config.servers.push(saved_server("public", "token"));
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        let _commands = connected_session(&mut app, "community");
+        let attempt_id = pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::TransportEncryptionRequired,
+        });
+        app.terminal_channel().drain_events();
+
+        app.decline_join_plaintext(attempt_id);
+
+        assert!(app.network.is_some(), "the active session stays");
+        let events = app.terminal_channel().drain_events();
+        assert!(matches!(
+            navigations(&events).as_slice(),
+            [NavigationEvent::CloseOverlay]
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::JoinUpdate(crate::client_channel::JoinView {
+                phase: crate::client_channel::JoinPhaseView::Failed { .. },
+                ..
+            })
+        )));
+    }
+
+    /// Consent commits the relaxed policy durably, then restarts the same
+    /// attempt under a fresh worker generation.
+    #[test]
+    fn accepted_transport_encryption_commits_before_the_restart() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "candidate-plaintext-consent");
         app.config.servers.push(ServerEntry {
             require_transport_encryption: true,
             ..saved_server("public", "token")
         });
-        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
-        app.handle_network_event(NetworkEvent::TransportEncryptionRequired);
+        let attempt_id = pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::TransportEncryptionRequired,
+        });
         app.terminal_channel().drain_events();
 
-        // The restart spawns a real worker, which a unit test may not do, so
-        // the entry is left unconfigured: the accept still has to unwind onto
-        // the form rather than navigate the holder anywhere.
-        app.config.servers.clear();
-        app.accept_transport_encryption_warning("public", 11);
+        app.accept_join_plaintext(attempt_id)
+            .expect("consent is persisted");
 
-        assert_eq!(app.room.join_hold, None);
+        assert!(
+            !app.config.servers[0].require_transport_encryption,
+            "the policy was committed"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("require-transport-encryption = false")
+        );
+        assert!(app.has_pending_join(), "the same attempt is running again");
+        assert_ne!(join_generation(&app), generation, "under a fresh worker");
         assert!(matches!(
             navigations(&app.terminal_channel().drain_events()).as_slice(),
             [NavigationEvent::CloseOverlay]
@@ -14101,55 +14190,227 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A rejected username replaces the join screen with an editor loaded from
+    /// the committed record, focused on the offending field. The old draft is
+    /// never resurrected.
     #[test]
-    fn a_username_taken_by_a_held_join_reloads_that_form_in_place() {
+    fn a_username_taken_by_a_pending_join_opens_a_fresh_committed_draft() {
         let mut app = test_app();
-        app.config
-            .servers
-            .push(saved_server("public", "public-token"));
-        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
+        app.config.servers.push(ServerEntry {
+            username: "Taken Name".to_string(),
+            ..saved_server("public", "public-token")
+        });
+        pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
         app.terminal_channel().drain_events();
 
-        app.handle_network_event(NetworkEvent::AuthFailed {
-            code: ERROR_USERNAME_TAKEN,
-            message: "username already in use".to_string(),
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::AuthFailed {
+                code: ERROR_USERNAME_TAKEN,
+                message: "username already in use".to_string(),
+            },
         });
 
-        assert_eq!(app.room.join_hold, None);
+        assert!(!app.has_pending_join());
         assert!(matches!(
             navigations(&app.terminal_channel().drain_events()).as_slice(),
             [NavigationEvent::ReplaceScreen(screen)]
-                if matches!(screen.as_ref(), ScreenSpec::ServerEditor(_))
+                if matches!(
+                    screen.as_ref(),
+                    ScreenSpec::ServerEditor(draft) if draft.original_label() == "public"
+                )
         ));
     }
 
     #[test]
-    fn canceling_a_held_editor_calls_the_join_off() {
+    fn join_credential_repair_preserves_edits_and_restarts_the_same_attempt() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "join-credential-repair");
+        app.config
+            .servers
+            .push(saved_server("public", "stale-token"));
+        let attempt_id = pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::AuthFailed {
+                code: ERROR_TOKEN_STALE_EPOCH,
+                message: "stale credential".to_string(),
+            },
+        });
+        let repair_attempt = app
+            .credential_repair
+            .as_ref()
+            .expect("repair is running")
+            .attempt;
+        assert!(app.join_repair_is_current(attempt_id));
+
+        let mut edit = ServerEditDraft::from_server(&app.config.servers[0], &app.config);
+        type_into_draft(&mut edit, 1, "Current User");
+        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, edit);
+        app.terminal_channel().drain_events();
+
+        app.handle_app_event(AppEvent::Pairing {
+            attempt: repair_attempt,
+            event: PairingEvent::OpenSucceeded {
+                token: "fresh-token".to_string(),
+                server_public_key: "ab".repeat(32),
+            },
+        });
+
+        let server = &app.config.servers[0];
+        assert_eq!(server.username, "Current User");
+        assert_eq!(server.token, "fresh-token");
+        assert_eq!(server.server_public_key, "ab".repeat(32));
+        assert!(app.has_pending_join());
+        assert!(!app.join_repair_is_current(attempt_id));
+        assert_ne!(join_generation(&app), generation);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn superseded_join_repair_cannot_commit_or_rejoin() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "stale-token"));
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::AuthFailed {
+                code: ERROR_TOKEN_STALE_EPOCH,
+                message: "stale credential".to_string(),
+            },
+        });
+        let repair_attempt = app
+            .credential_repair
+            .as_ref()
+            .expect("repair is running")
+            .attempt;
+
+        pending_join(
+            &mut app,
+            "community",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let community_generation = join_generation(&app);
+        assert!(app.credential_repair.is_none());
+
+        app.handle_app_event(AppEvent::Pairing {
+            attempt: repair_attempt,
+            event: PairingEvent::OpenSucceeded {
+                token: "late-token".to_string(),
+                server_public_key: "ab".repeat(32),
+            },
+        });
+
+        assert_eq!(app.config.servers[0].token, "stale-token");
+        assert_eq!(join_generation(&app), community_generation);
+    }
+
+    #[test]
+    fn join_repair_refuses_to_overwrite_newer_credentials() {
+        let mut app = test_app();
+        app.config
+            .servers
+            .push(saved_server("public", "stale-token"));
+        let attempt_id = pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::AuthFailed {
+                code: ERROR_TOKEN_STALE_EPOCH,
+                message: "stale credential".to_string(),
+            },
+        });
+        let repair_attempt = app
+            .credential_repair
+            .as_ref()
+            .expect("repair is running")
+            .attempt;
+        app.config.servers[0].token = "newer-token".to_string();
+
+        app.handle_app_event(AppEvent::Pairing {
+            attempt: repair_attempt,
+            event: PairingEvent::OpenSucceeded {
+                token: "repair-token".to_string(),
+                server_public_key: "ab".repeat(32),
+            },
+        });
+
+        assert_eq!(app.config.servers[0].token, "newer-token");
+        assert!(!app.join_repair_is_current(attempt_id));
+        assert!(app.terminal_channel().drain_events().iter().any(|event| {
+            matches!(
+                event,
+                TerminalEvent::JoinUpdate(crate::client_channel::JoinView {
+                    phase: crate::client_channel::JoinPhaseView::Failed {
+                        retryable: true,
+                        ..
+                    },
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn canceling_a_pending_join_does_not_touch_the_active_session() {
         let mut app = test_app();
         app.config
             .servers
             .push(saved_server("public", "public-token"));
-        let _commands = held_join(&mut app, "public", crate::client_channel::ClientId::PRIMARY);
+        app.config
+            .servers
+            .push(saved_server("community", "community-token"));
+        let _commands = connected_session(&mut app, "public");
+        let attempt_id = pending_join(
+            &mut app,
+            "community",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        app.terminal_channel().drain_events();
 
         app.handle_client_command(
             crate::client_channel::ClientId::PRIMARY,
-            CoreCommand::CancelServerEdit,
+            CoreCommand::CancelJoin { attempt_id },
         );
 
-        assert_eq!(app.room.join_hold, None);
-        assert!(app.connection_attempt.is_none());
-        assert!(app.network.is_none());
-        // The form pops itself; nothing else moves the user.
+        assert!(!app.has_pending_join());
+        assert!(app.network.is_some(), "the active session is untouched");
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
+        // The join screen pops itself; nothing else moves the user.
         assert!(navigations(&app.terminal_channel().drain_events()).is_empty());
     }
 
-    /// Pairing runs beside a live session rather than replacing it, so a paired
-    /// join arrives with that session's transfers still running.
+    /// Pairing runs beside a live session, durably commits its completed
+    /// credential, and presents the editor without touching active transfers.
     #[test]
-    fn pairing_join_keeps_the_credential_and_the_running_transfers() {
+    fn pairing_success_opens_editor_and_keeps_the_running_transfers() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "pairing-join-transfer");
-        let attempt = running_invite_pair(&mut app, "invite-token", PairCompletion::Join);
+        let attempt = running_invite_pair(&mut app, "invite-token");
         let _commands = connected_with_active_transfer(&mut app, "lab");
 
         app.handle_app_event(AppEvent::Pairing {
@@ -14158,18 +14419,32 @@ mod tests {
         });
 
         assert_eq!(
-            app.config.server("public").expect("paired entry").token,
+            app.config.server("public").expect("paired server").token,
             "invite-token"
         );
-        assert_eq!(app.view.status.text(), SERVER_SWITCH_TRANSFER_BLOCKED);
-        assert_eq!(app.room.active_server_label.as_deref(), Some("lab"));
+        assert!(app.terminal_channel().drain_events().iter().any(|event| {
+            matches!(
+                event,
+                TerminalEvent::Navigation(NavigationEvent::OpenScreen(screen))
+                    if matches!(
+                        screen.as_ref(),
+                        ScreenSpec::ServerEditor(draft)
+                            if draft.server_id() == test_server_id("invite-pending")
+                    )
+            )
+        }));
+        assert!(app.view.status.text().contains("review server settings"));
+        assert_eq!(app.room.active_server_id, Some(test_server_id("lab")));
         assert!(app.network.is_some());
         assert!(app.room.has_active_transfers());
         let _ = std::fs::remove_file(path);
     }
 
+    /// The session owns its server by id, so a rename needs no live-reference
+    /// fixups: everything resolving through the id keeps working, and only the
+    /// display alias is refreshed.
     #[test]
-    fn renaming_the_active_server_moves_every_live_label_with_it() {
+    fn renaming_the_active_server_retains_ownership_by_id() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "rename-active-server");
         app.config
@@ -14182,15 +14457,12 @@ mod tests {
         save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, rename);
 
         assert_eq!(app.config.servers[0].label, "community");
-        assert_eq!(app.room.active_server_label.as_deref(), Some("community"));
+        assert_eq!(app.config.servers[0].id, test_server_id("public"));
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
         assert_eq!(app.room.server_alias, "community");
-        assert_eq!(
-            app.connection_attempt.as_ref().unwrap().server_label,
-            "community"
-        );
         assert_live_server_labels_resolve(&app);
-        // The push gate compares the active label against the saved entry, so
-        // before the rename reached it this policy never left the client.
+        // The push gate compares the active id against the saved entry, so a
+        // rename must not stop the policy from reaching the worker.
         assert!(
             commands
                 .try_iter()
@@ -14268,7 +14540,7 @@ mod tests {
 
         save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, rename);
 
-        assert_eq!(app.room.active_server_label.as_deref(), Some("renamed"));
+        assert_eq!(app.room.server_alias, "renamed");
         assert!(
             app.view.status.text().starts_with("server saved to"),
             "{}",
@@ -14286,7 +14558,7 @@ mod tests {
         app.config
             .user_audio
             .push(crate::config::UserAudioPreference {
-                server_alias: "public".to_string(),
+                server_id: test_server_id("public"),
                 user_id: UserId(2),
                 volume_db: -3.0,
             });
@@ -14300,9 +14572,9 @@ mod tests {
 
         assert_eq!(app.view.status.kind(), StatusKind::Error);
         assert_eq!(server_labels(&app), servers);
-        assert_eq!(app.config.user_audio[0].server_alias, "public");
+        assert_eq!(app.config.user_audio[0].server_id, test_server_id("public"));
         assert_eq!(app.room.server_alias, "public");
-        assert_eq!(app.room.active_server_label.as_deref(), Some("public"));
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
         assert_live_server_labels_resolve(&app);
 
         // A later save over a writable path must not carry the refused edit.
@@ -14323,12 +14595,12 @@ mod tests {
         let _dir = unwritable_config_path(&mut app, "refused-server-delete");
         let servers = server_labels(&app);
 
-        app.delete_server("public");
+        app.delete_server(test_server_id("public"));
         app.sync_terminal_events();
 
         assert_eq!(app.view.status.kind(), StatusKind::Error);
         assert_eq!(server_labels(&app), servers);
-        assert_eq!(app.room.active_server_label.as_deref(), Some("public"));
+        assert_eq!(app.room.active_server_id, Some(test_server_id("public")));
         assert!(app.network.is_some());
         assert_live_server_labels_resolve(&app);
     }
@@ -14340,79 +14612,42 @@ mod tests {
             require_transport_encryption: true,
             ..saved_server("public", "public-token")
         });
-        app.connection_attempt = Some(ConnectionAttempt {
-            generation: 4,
-            owner: crate::client_channel::ClientId::PRIMARY,
-            server_label: "public".to_string(),
-            holds_editor: false,
+        let attempt_id = pending_join(
+            &mut app,
+            "public",
+            JoinOwner::Terminal(crate::client_channel::ClientId::PRIMARY),
+        );
+        let generation = join_generation(&app);
+        app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::TransportEncryptionRequired,
         });
         let _dir = unwritable_config_path(&mut app, "refused-plaintext-consent");
 
-        assert!(!app.accept_transport_encryption_warning_for(4));
+        app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::AcceptTransportEncryption { attempt_id },
+        );
         app.sync_terminal_events();
 
         assert!(app.config.servers[0].require_transport_encryption);
         assert_eq!(app.view.status.kind(), StatusKind::Error);
         assert!(app.network.is_none());
-    }
-
-    /// An invite attempt holds a client-generated token that matches no saved
-    /// entry, so its retry may only claim a free label.
-    #[test]
-    fn username_retry_rejects_a_label_another_server_holds() {
-        let mut app = test_app();
-        let path = temp_config_path(&mut app, "retry-label-collision");
-        app.config
-            .servers
-            .push(saved_server("community", "community-token"));
-        let pending = saved_server("public", "invite-token");
-        app.pairing.set_awaiting_username_for_test(
-            crate::client_channel::ClientId::PRIMARY,
-            PendingPair {
-                server: pending.clone(),
-                open: None,
-                open_password: String::new(),
-                pairing_code: Some("pair-code".to_string()),
-                completion: PairCompletion::OpenEditor,
-                from_editor: false,
-            },
-        );
-        let mut draft = ServerEditDraft::from_server(&pending, &app.config);
-        type_into_draft(&mut draft, 0, "community");
-
-        save_draft(&mut app, crate::client_channel::ClientId::PRIMARY, draft);
-
-        assert_eq!(app.config.servers.len(), 1);
-        assert_eq!(app.config.servers[0].token, "community-token");
         assert!(
-            app.pairing
-                .awaiting_username(crate::client_channel::ClientId::PRIMARY)
+            app.has_pending_join(),
+            "the attempt stays parked on consent for a retry"
         );
-        assert_eq!(app.view.status.kind(), StatusKind::Error);
-        // The form the user submitted still holds their draft, so a refusal it
-        // can fix is only an error on it.
-        assert_eq!(
-            reopened_editor_label(&app.terminal_channel().drain_events()),
-            None
-        );
-        let _ = std::fs::remove_file(path);
     }
 
     /// An invite attempt parked in `Running`. It persists nothing before it
-    /// succeeds, so unlike open pairing its entry is not configured yet.
-    fn running_invite_pair(app: &mut TestApp, token: &str, completion: PairCompletion) -> u64 {
-        running_invite_pair_from(app, token, completion, false)
-    }
-
-    /// The same attempt, `from_editor` naming the retry a user submitted from
-    /// the server editor — the one whose outcome that form presents.
-    fn running_invite_pair_from(
-        app: &mut TestApp,
-        token: &str,
-        completion: PairCompletion,
-        from_editor: bool,
-    ) -> u64 {
-        let server = saved_server("public", token);
+    /// succeeds, so unlike open pairing there is no durable record yet.
+    fn running_invite_pair(app: &mut TestApp, token: &str) -> u64 {
+        // A live invite attempt carries a freshly generated id, so the pending
+        // entry never shares one with a server saved while the worker ran.
+        let server = ServerEntry {
+            id: test_server_id("invite-pending"),
+            ..saved_server("public", token)
+        };
         let config = server.client_config(&app.config, app.download_store.clone());
         app.pairing.set_running_for_test(
             crate::client_channel::ClientId::PRIMARY,
@@ -14421,103 +14656,24 @@ mod tests {
                 open: None,
                 open_password: String::new(),
                 pairing_code: Some("pair-code".to_string()),
-                completion,
-                from_editor,
+                completion: PairCompletion::OpenEditor,
             },
             PairingJob::Invite {
                 config,
                 pairing_code: "pair-code".to_string(),
             },
             None,
-            if from_editor {
-                ResumeUi::Editor
-            } else {
-                ResumeUi::None
-            },
         )
     }
 
-    /// The join a paired retry starts can still be refused, and the form that
-    /// submitted it is where the user is: it keeps the refusal, and nothing
-    /// navigates them off it.
-    #[test]
-    fn a_paired_join_blocked_by_transfers_leaves_the_owner_on_the_editor() {
-        let mut app = test_app();
-        let path = temp_config_path(&mut app, "held-pairing-join-transfer");
-        let attempt =
-            running_invite_pair_from(&mut app, "invite-token", PairCompletion::Join, true);
-        let _commands = connected_with_active_transfer(&mut app, "lab");
-        app.terminal_channel().drain_events();
-
-        app.handle_app_event(AppEvent::Pairing {
-            attempt,
-            event: PairingEvent::InviteSucceeded,
-        });
-
-        assert_eq!(
-            app.config.server("public").expect("paired entry").token,
-            "invite-token"
-        );
-        assert_eq!(app.view.status.text(), SERVER_SWITCH_TRANSFER_BLOCKED);
-        assert_eq!(app.view.status.kind(), StatusKind::Error);
-        assert_eq!(app.room.join_hold, None);
-        assert!(navigations(&app.terminal_channel().drain_events()).is_empty());
-        let _ = std::fs::remove_file(path);
-    }
-
-    /// A retry that reaches a worker leaves the form up over the pairing: it
-    /// has not joined anything yet, and the user has nowhere else to be.
-    #[test]
-    fn a_username_retry_submitted_from_the_editor_leaves_it_up() {
-        let mut app = test_app();
-        let path = temp_config_path(&mut app, "held-username-retry");
-        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
-        let server = ServerEntry {
-            label: "public".to_string(),
-            tcp_addr: "127.0.0.1:1".to_string(),
-            username: "User".to_string(),
-            token: token.clone(),
-            ..ServerEntry::default()
-        };
-        app.config.servers.push(server.clone());
-        app.pairing.set_awaiting_username_for_test(
-            crate::client_channel::ClientId::PRIMARY,
-            PendingPair {
-                server: server.clone(),
-                open: Some(token),
-                open_password: String::new(),
-                pairing_code: None,
-                completion: PairCompletion::OpenEditor,
-                from_editor: false,
-            },
-        );
-        let mut draft = ServerEditDraft::from_server(&server, &app.config);
-        type_into_draft(&mut draft, 1, "Different User");
-
-        app.handle_client_command(
-            crate::client_channel::ClientId::PRIMARY,
-            CoreCommand::SaveServerEdit {
-                draft,
-                join_after_save: true,
-            },
-        );
-
-        assert_eq!(
-            app.pairing_pending().expect("retry pending").completion,
-            PairCompletion::Join
-        );
-        assert!(navigations(&app.terminal_channel().drain_events()).is_empty());
-        let _ = std::fs::remove_file(path);
-    }
-
     /// The label an invite attempt dialed with can be taken while its worker
-    /// runs. Committing over the entry holding it would drop that server's
-    /// token, so the commit fails instead.
+    /// runs. Committing over the configured record would lose its credential,
+    /// so pairing fails before opening an editor.
     #[test]
     fn invite_commit_refuses_a_label_claimed_while_pairing() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "invite-commit-race");
-        let attempt = running_invite_pair(&mut app, "invite-token", PairCompletion::Save);
+        let attempt = running_invite_pair(&mut app, "invite-token");
         app.config
             .servers
             .push(saved_server("public", "other-token"));
@@ -14530,32 +14686,26 @@ mod tests {
         assert_eq!(app.config.servers.len(), 1);
         assert_eq!(app.config.servers[0].token, "other-token");
         assert_eq!(app.view.status.kind(), StatusKind::Error);
-        assert!(app.terminal_channel().drain_events().iter().any(|event| {
-            matches!(
-                event,
-                TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
-                    query: None
-                }))
-            )
-        }));
+        assert!(
+            !app.terminal_channel()
+                .drain_events()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    TerminalEvent::Navigation(NavigationEvent::OpenScreen(screen))
+                        if matches!(screen.as_ref(), ScreenSpec::ServerEditor(_))
+                ))
+        );
         let _ = std::fs::remove_file(path);
     }
 
     /// An open-pairing attempt parked in `Running`, as it is while its worker
-    /// runs. The address is a closed port, so the worker that an accepted
-    /// consent restarts fails at once instead of reaching a real server.
+    /// runs: all recovery state is retained by the coordinator alone.
+    /// The address is a closed port, so the worker that an accepted consent
+    /// restarts fails at once instead of reaching a real server.
     fn running_open_pair(app: &mut TestApp, token: &str, server_public_key: &str) -> u64 {
-        running_open_pair_resuming(app, token, server_public_key, ResumeUi::None)
-    }
-
-    /// The same attempt, started from the pairing UI named by `resume`.
-    fn running_open_pair_resuming(
-        app: &mut TestApp,
-        token: &str,
-        server_public_key: &str,
-        resume: ResumeUi,
-    ) -> u64 {
         let server = ServerEntry {
+            id: test_server_id("open-pending"),
             label: "public".to_string(),
             tcp_addr: "127.0.0.1:1".to_string(),
             username: "User".to_string(),
@@ -14563,19 +14713,13 @@ mod tests {
             server_public_key: server_public_key.to_string(),
             ..ServerEntry::default()
         };
-        app.config.servers.push(server.clone());
         let config = server.client_config(&app.config, app.download_store.clone());
         let pending = PendingPair {
             server,
             open: Some(token.to_string()),
-            open_password: if resume == ResumeUi::PasswordPrompt {
-                "hunter2".to_string()
-            } else {
-                String::new()
-            },
+            open_password: String::new(),
             pairing_code: None,
             completion: PairCompletion::OpenEditor,
-            from_editor: false,
         };
         app.pairing.set_running_for_test(
             crate::client_channel::ClientId::PRIMARY,
@@ -14586,7 +14730,6 @@ mod tests {
                 existing_token: token.to_string(),
             },
             None,
-            resume,
         )
     }
 
@@ -14628,7 +14771,7 @@ mod tests {
     }
 
     #[test]
-    fn accepting_plaintext_pairing_consent_saves_the_cleared_requirement() {
+    fn accepting_plaintext_pairing_consent_keeps_the_cleared_requirement_in_memory() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "plaintext-consent");
         let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}consent-secret");
@@ -14647,16 +14790,15 @@ mod tests {
         assert!(!app.pairing_idle());
         let pending = app.pairing_pending().expect("attempt restarted");
         assert!(!pending.server.require_transport_encryption);
-        let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
-            saved.contains("require-transport-encryption = false"),
-            "{saved}"
+            !path.exists(),
+            "consent did not write pairing state to config"
         );
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn canceling_plaintext_pairing_consent_discards_the_provisional_entry() {
+    fn canceling_plaintext_pairing_consent_leaves_config_untouched() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "plaintext-consent-cancel");
         let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}consent-secret");
@@ -14670,6 +14812,7 @@ mod tests {
 
         assert!(app.pairing_idle());
         assert!(app.config.servers.is_empty());
+        assert!(!path.exists());
         let _ = std::fs::remove_file(path);
     }
 
@@ -14690,8 +14833,17 @@ mod tests {
         });
 
         assert_eq!(app.pairing_pending().unwrap().server.server_public_key, key);
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains(&key), "{saved}");
+        assert!(!path.exists(), "the TOFU pin remains transient");
+        assert!(
+            app.terminal_channel().drain_events().iter().any(|event| {
+                matches!(
+                    event,
+                    TerminalEvent::Navigation(NavigationEvent::OpenScreen(screen))
+                        if matches!(screen.as_ref(), ScreenSpec::ServerEditor(_))
+                )
+            }),
+            "the retry uses the full server editor"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -14712,6 +14864,7 @@ mod tests {
 
         assert!(app.pairing_idle());
         assert!(app.config.servers.is_empty());
+        assert!(!path.exists());
         let _ = std::fs::remove_file(path);
     }
 
@@ -14730,10 +14883,10 @@ mod tests {
     }
 
     #[test]
-    fn invite_pairing_success_opens_the_editor_above_the_server_list() {
+    fn invite_pairing_success_saves_then_opens_the_editor() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "invite-editor");
-        let attempt = running_invite_pair(&mut app, "invite-token", PairCompletion::OpenEditor);
+        let attempt = running_invite_pair(&mut app, "invite-token");
         let mut h = Harness::new(app);
 
         h.app.handle_app_event(AppEvent::Pairing {
@@ -14743,16 +14896,133 @@ mod tests {
         h.apply();
 
         assert!(editor_on_top(&mut h));
+        assert_eq!(
+            h.app.config.server("public").expect("paired server").token,
+            "invite-token"
+        );
+        assert!(path.exists());
 
         h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
 
         assert_eq!(h.stack.depth(), 1);
-        assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
+        assert!(h.app.config.server("public").is_ok());
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn open_pairing_success_opens_an_editor_that_saves_back_to_the_list() {
+    fn canceling_a_username_retry_editor_discards_only_the_transient_attempt() {
+        let mut app = test_app();
+        let server = awaiting_username_pair(&mut app, "public");
+        let draft = ServerEditDraft::from_new_server(server, &app.config);
+        let mut h = Harness::new(app);
+        h.app.send_to(
+            crate::client_channel::ClientId::PRIMARY,
+            TerminalEvent::Navigation(NavigationEvent::OpenScreen(Box::new(
+                ScreenSpec::ServerEditor(draft),
+            ))),
+        );
+        h.apply();
+        assert!(editor_on_top(&mut h));
+
+        h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        assert!(h.app.pairing_idle());
+        assert_eq!(h.stack.depth(), 1);
+        assert!(h.app.config.servers.is_empty());
+    }
+
+    /// Pairing durably inserts the completed credential. Save and Join then
+    /// applies the editor values and starts exactly one join by the same id.
+    #[test]
+    fn paired_editor_save_and_join_commits_then_starts_one_join() {
+        let mut app = test_app();
+        let path = temp_config_path(&mut app, "join-purpose-pair");
+        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}join-secret");
+        let server = ServerEntry {
+            id: test_server_id("open-pending"),
+            label: "public".to_string(),
+            tcp_addr: "127.0.0.1:1".to_string(),
+            username: "User".to_string(),
+            token: token.clone(),
+            ..ServerEntry::default()
+        };
+        let config = server.client_config(&app.config, app.download_store.clone());
+        let attempt = app.pairing.set_running_for_test(
+            crate::client_channel::ClientId::PRIMARY,
+            PendingPair {
+                server,
+                open: Some(token.clone()),
+                open_password: String::new(),
+                pairing_code: None,
+                completion: PairCompletion::OpenEditor,
+            },
+            PairingJob::Open {
+                config,
+                password: String::new(),
+                existing_token: token,
+            },
+            None,
+        );
+        app.terminal_channel().drain_events();
+
+        app.handle_app_event(AppEvent::Pairing {
+            attempt,
+            event: PairingEvent::OpenSucceeded {
+                token: "issued-token".to_string(),
+                server_public_key: "ab".repeat(32),
+            },
+        });
+
+        let draft = app
+            .terminal_channel()
+            .drain_events()
+            .into_iter()
+            .find_map(|event| match event {
+                TerminalEvent::Navigation(NavigationEvent::OpenScreen(screen)) => match *screen {
+                    ScreenSpec::ServerEditor(draft) => Some(draft),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("paired candidate editor");
+        app.handle_client_command(
+            crate::client_channel::ClientId::PRIMARY,
+            CoreCommand::SubmitServerEdit {
+                request_id: 1,
+                draft,
+                join: true,
+            },
+        );
+
+        assert_eq!(
+            app.config.server("public").expect("committed entry").token,
+            "issued-token",
+            "the credential is durable before the join runs"
+        );
+        assert_eq!(
+            app.config.server("public").unwrap().id,
+            test_server_id("open-pending")
+        );
+        assert!(app.has_pending_join(), "exactly one candidate is running");
+        assert!(
+            app.terminal_channel()
+                .drain_events()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    TerminalEvent::ServerEditResult {
+                        request_id: 1,
+                        outcome: ServerEditOutcome::JoinStarted(_),
+                    }
+                ))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Open pairing commits the completed credential and then opens an editor,
+    /// retaining the id allocated at the beginning of the attempt.
+    #[test]
+    fn open_pairing_success_saves_with_stable_id_then_opens_editor() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "open-pair-editor");
         let attempt = running_open_pair(&mut app, "provisional", "");
@@ -14768,30 +15038,15 @@ mod tests {
         h.apply();
 
         assert!(editor_on_top(&mut h));
-
-        let server = h
-            .app
-            .config
-            .server("public")
-            .expect("paired server")
-            .clone();
-        let draft = ServerEditDraft::from_server(&server, &h.app.config);
-        h.app.handle_client_command(
-            crate::client_channel::ClientId::PRIMARY,
-            CoreCommand::SaveServerEdit {
-                draft,
-                join_after_save: false,
-            },
-        );
-        h.apply();
-
-        assert_eq!(h.stack.depth(), 1);
-        assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
+        let server = h.app.config.server("public").expect("paired server");
+        assert_eq!(server.token, "issued-token");
+        assert_eq!(server.id, test_server_id("open-pending"));
+        assert!(path.exists());
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn password_protected_pairing_replaces_the_prompt_with_the_editor() {
+    fn password_protected_pairing_ends_in_the_server_editor() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "password-pair-editor");
         let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}password-secret");
@@ -14829,34 +15084,32 @@ mod tests {
         h.apply();
 
         assert!(editor_on_top(&mut h));
+        assert!(h.app.config.server("public").is_ok());
+        assert!(path.exists());
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn connection_username_rejection_opens_the_editor_above_the_server_list() {
+    fn connection_username_rejection_replaces_the_join_screen_with_the_editor() {
         let mut app = test_app();
         app.config.servers.push(ServerEntry {
-            label: "public".to_string(),
-            tcp_addr: "127.0.0.1:1".to_string(),
             username: "Zoe".to_string(),
-            token: "token".to_string(),
-            ..ServerEntry::default()
-        });
-        app.connection_attempt = Some(ConnectionAttempt {
-            generation: 1,
-            owner: crate::client_channel::ClientId::PRIMARY,
-            server_label: "public".to_string(),
-            holds_editor: false,
+            ..saved_server("public", "token")
         });
         let mut h = Harness::new(app);
+        let server_id = h.app.config.servers[0].id;
+        h.app
+            .start_join_with_screen(server_id, crate::client_channel::ClientId::PRIMARY);
+        h.apply();
+        let generation = join_generation(&h.app);
 
-        h.app.handle_app_event(
-            NetworkEvent::AuthFailed {
+        h.app.handle_app_event(AppEvent::NetworkFor {
+            generation,
+            event: NetworkEvent::AuthFailed {
                 code: ERROR_USERNAME_TAKEN,
                 message: "username already in use".to_string(),
-            }
-            .into(),
-        );
+            },
+        });
         h.apply();
 
         assert!(editor_on_top(&mut h));
@@ -14867,109 +15120,14 @@ mod tests {
         assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
     }
 
-    /// The pending pair keeps its pre-retry server: the editor the caller
-    /// re-presents is the user's own draft, which still names the old label.
+    /// A hard worker failure ends the attempt without leaving recovery state
+    /// in either the server catalog or the config file.
     #[test]
-    fn username_retry_persist_failure_keeps_the_pre_retry_server() {
-        let mut app = test_app();
-        let _path = unwritable_config_path(&mut app, "username-retry-persist");
-        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
-        let original = ServerEntry {
-            label: "public".to_string(),
-            tcp_addr: "127.0.0.1:1".to_string(),
-            username: "User".to_string(),
-            token: token.clone(),
-            ..ServerEntry::default()
-        };
-        app.config.servers.push(original.clone());
-        app.pairing.set_awaiting_username_for_test(
-            crate::client_channel::ClientId::PRIMARY,
-            PendingPair {
-                server: original.clone(),
-                open: Some(token),
-                open_password: String::new(),
-                pairing_code: None,
-                completion: PairCompletion::OpenEditor,
-                from_editor: false,
-            },
-        );
-        let renamed = ServerEntry {
-            label: "community".to_string(),
-            username: "Different User".to_string(),
-            ..original
-        };
-
-        assert!(!app.retry_username_pairing(renamed, false));
-
-        let pending = app.pairing_pending().expect("retry parked on the username");
-        assert_eq!(pending.server.label, "public");
-        assert_eq!(pending.server.username, "User");
-        assert!(
-            app.pairing
-                .awaiting_username(crate::client_channel::ClientId::PRIMARY)
-        );
-        assert!(matches!(
-            app.take_terminal_event(),
-            Some(TerminalEvent::Error(_))
-        ));
-    }
-
-    /// The retry never reaches a worker, so the form the user submitted is
-    /// where the failure has to land — and it is still up, holding their draft.
-    #[test]
-    fn username_retry_persist_failure_keeps_the_editor() {
-        let mut app = test_app();
-        let _path = unwritable_config_path(&mut app, "username-retry-reopen");
-        let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
-        let server = ServerEntry {
-            label: "public".to_string(),
-            tcp_addr: "127.0.0.1:1".to_string(),
-            username: "User".to_string(),
-            token: token.clone(),
-            ..ServerEntry::default()
-        };
-        app.config.servers.push(server.clone());
-        app.pairing.set_awaiting_username_for_test(
-            crate::client_channel::ClientId::PRIMARY,
-            PendingPair {
-                server: server.clone(),
-                open: Some(token),
-                open_password: String::new(),
-                pairing_code: None,
-                completion: PairCompletion::OpenEditor,
-                from_editor: false,
-            },
-        );
-        let draft = ServerEditDraft::from_server(&server, &app.config);
-
-        app.handle_client_command(
-            crate::client_channel::ClientId::PRIMARY,
-            CoreCommand::SaveServerEdit {
-                draft,
-                join_after_save: false,
-            },
-        );
-
-        assert!(
-            !app.terminal_channel()
-                .drain_events()
-                .iter()
-                .any(|event| matches!(event, TerminalEvent::Navigation(_))),
-            "the submitted form stays up untouched"
-        );
-        assert_eq!(app.view.status.kind(), StatusKind::Error);
-        assert!(
-            app.pairing
-                .awaiting_username(crate::client_channel::ClientId::PRIMARY)
-        );
-    }
-
-    #[test]
-    fn worker_failure_after_a_username_retry_reopens_the_editor() {
+    fn worker_failure_leaves_no_config_state() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "username-retry-failed");
         let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}retry-secret");
-        let attempt = running_open_pair_resuming(&mut app, &token, "", ResumeUi::Editor);
+        let attempt = running_open_pair(&mut app, &token, "");
         let mut h = Harness::new(app);
 
         h.app.handle_app_event(AppEvent::Pairing {
@@ -14978,27 +15136,19 @@ mod tests {
         });
         h.apply();
 
-        assert!(editor_on_top(&mut h));
-        assert!(
-            h.app
-                .pairing
-                .awaiting_username(crate::client_channel::ClientId::PRIMARY)
-        );
+        assert!(h.app.pairing_idle());
+        assert!(h.app.config.servers.is_empty());
+        assert!(!path.exists());
         assert_eq!(h.app.view.status.kind(), StatusKind::Error);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn server_key_change_during_a_password_retry_closes_the_prompt() {
+    fn server_key_change_during_a_password_retry_fails_the_pairing() {
         let mut app = test_app();
         let path = temp_config_path(&mut app, "password-retry-key-change");
         let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}pin-secret");
-        let attempt = running_open_pair_resuming(
-            &mut app,
-            &token,
-            &"ab".repeat(32),
-            ResumeUi::PasswordPrompt,
-        );
+        let attempt = running_open_pair(&mut app, &token, &"ab".repeat(32));
 
         app.apply_pairing_input(PairingInput::Worker {
             attempt,
@@ -15010,17 +15160,26 @@ mod tests {
 
         assert!(app.pairing_idle());
         assert!(app.config.servers.is_empty());
-        assert!(matches!(
-            app.take_terminal_event(),
-            Some(TerminalEvent::Navigation(NavigationEvent::CloseOverlay))
-        ));
+        let events = app.terminal_channel().drain_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::PairingFailed(_)))
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                TerminalEvent::Navigation(NavigationEvent::CloseOverlay)
+            )),
+            "pairing never pops a screen it cannot know is its own"
+        );
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn persist_failure_during_a_password_challenge_keeps_the_prompt() {
+    fn password_challenge_keeps_the_prompt_without_touching_config() {
         let mut app = test_app();
-        let _path = unwritable_config_path(&mut app, "password-challenge-persist");
+        let path = unwritable_config_path(&mut app, "password-challenge-persist");
         let token = format!("{OPEN_PAIR_RECOVERY_PREFIX}challenge-secret");
         let attempt = running_open_pair(&mut app, &token, "");
 
@@ -15042,10 +15201,8 @@ mod tests {
             Some(TerminalEvent::Navigation(NavigationEvent::ShowOverlay(overlay)))
                 if matches!(overlay.as_ref(), OverlaySpec::PairingPassword { retry: false })
         ));
-        assert!(matches!(
-            app.take_terminal_event(),
-            Some(TerminalEvent::PairingFailed(_))
-        ));
+        assert!(app.take_terminal_event().is_none());
+        assert!(!path.exists());
     }
 
     /// The paste prompt is the private way to hand this client a secret, so an
@@ -15105,7 +15262,6 @@ mod tests {
                 open_password: String::new(),
                 pairing_code: None,
                 completion: PairCompletion::OpenEditor,
-                from_editor: false,
             },
             job: PairingJob::Device {
                 config,
@@ -15114,7 +15270,6 @@ mod tests {
                 overwrite_existing: false,
             },
             cancellation: None,
-            persist_first: false,
         });
 
         assert!(!app.pairing_idle());

@@ -56,13 +56,55 @@ pub(crate) enum ScreenSpec {
     RoomSwitcher,
     UserList,
     RoomSettings(RoomSettingsDraft),
+    Joining(JoinView),
+}
+
+/// What one join attempt looks like to the terminal presenting it. Updates
+/// carry the attempt id so a screen left over from an earlier attempt can
+/// never present a newer one's progress.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JoinView {
+    pub(crate) attempt_id: u64,
+    pub(crate) server_label: String,
+    pub(crate) phase: JoinPhaseView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum JoinPhaseView {
+    Connecting,
+    Authenticating,
+    RepairingCredentials,
+    AwaitingConsent,
+    Failed { message: String, retryable: bool },
+}
+
+/// How one server edit submission resolved. Addressed to the submitting
+/// editor by request id; every variant leaves navigation to that mode.
+pub(crate) enum ServerEditOutcome {
+    /// Refused with an error the same draft can still fix.
+    Rejected,
+    /// An asynchronous pairing/connect rejection updated the transient server;
+    /// continue in this replacement draft, focused on the offending field.
+    Retry(Box<ServerEditDraft>),
+    /// The entry changed under the draft; present this reload of it instead.
+    Conflict(Box<ServerEditDraft>),
+    /// The entry is gone and the draft may not re-create it.
+    Missing,
+    /// Persisted; the editor closes.
+    Saved,
+    /// Persisted and a join is running; the editor remains mounted and uses
+    /// the attempt id to cancel its candidate if the user leaves.
+    JoinStarted(JoinView),
+    /// Persisted but the requested join was refused; the editor stays up over
+    /// a draft reloaded from what was written.
+    SavedButJoinFailed(Box<ServerEditDraft>),
 }
 
 /// What an accepted plaintext-transport warning resumes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransportWarningTarget {
-    /// The connection attempt of this generation, restarted by `start_network`.
-    Connection { generation: u64 },
+    /// The join attempt with this id, respawned under the committed policy.
+    Join { attempt_id: u64 },
     /// The pairing attempt the coordinator is holding.
     Pairing,
 }
@@ -113,6 +155,11 @@ pub(crate) enum TerminalEvent {
     ClearVisualSelection,
     CancelPendingEdit,
     ResetRooms,
+    ServerEditResult {
+        request_id: u64,
+        outcome: ServerEditOutcome,
+    },
+    JoinUpdate(JoinView),
     PairingPasswordChallenge {
         retry: bool,
     },

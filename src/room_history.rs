@@ -14,7 +14,6 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_lc_rs::digest::{SHA256, digest};
 use kvlog::encoding::{
     Encoder, Key, LogFields, MunchError, SpanInfo, StaticKey, Value, log_len, munch_log_with_span,
 };
@@ -251,7 +250,7 @@ impl RoomHistoryStore {
 /// Where one server connection persists chat, after room > server > global
 /// resolution of the `[history]` overrides.
 ///
-/// `history_id` is the stable per-server id from [`derive_server_id`], empty
+/// `history_id` is the hex form of the entry's immutable `ServerId`, empty
 /// when persistence is fully disabled. Every stored directory already ends in
 /// the sanitized id, so distinct servers sharing a `location` never collide.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -287,7 +286,7 @@ impl HistoryStorage {
         if !any_enabled {
             return Self::disabled();
         }
-        let history_id = derive_server_id(&server.token);
+        let history_id = server.id.to_hex();
         let leaf = sanitize_alias(&history_id);
         let dir_for = |effective: &crate::config::EffectiveHistory| {
             if !effective.enabled {
@@ -1110,20 +1109,6 @@ fn sanitize_alias(alias: &str) -> String {
     out
 }
 
-/// Stable per-server storage id derived from the server token. It survives alias
-/// renames and endpoint edits, and a re-paired server that reuses an alias gets a
-/// fresh token and id, so unrelated servers never share a history directory.
-pub(crate) fn derive_server_id(token: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let hash = digest(&SHA256, token.as_bytes());
-    let mut id = String::with_capacity(32);
-    for byte in &hash.as_ref()[..16] {
-        id.push(HEX[(byte >> 4) as usize] as char);
-        id.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    id
-}
-
 /// The server's default local data directory, used by tests that bypass
 /// [`HistoryStorage::resolve`]. `None` when `history_id` is empty or no data
 /// dir resolves.
@@ -1746,9 +1731,9 @@ mod tests {
         ];
 
         let storage = HistoryStorage::resolve(&config, &server);
-        let leaf = sanitize_alias(&derive_server_id(&server.token));
+        let leaf = sanitize_alias(&server.id.to_hex());
         let server_dir = PathBuf::from("/srv/base").join(&leaf);
-        assert_eq!(storage.history_id(), derive_server_id(&server.token));
+        assert_eq!(storage.history_id(), server.id.to_hex());
         assert_eq!(storage.catalog_dir(), Some(server_dir.as_path()));
         assert_eq!(storage.room_dir(RoomId(1)), Some(server_dir.as_path()));
         assert_eq!(
@@ -1791,10 +1776,19 @@ mod tests {
     }
 
     #[test]
-    fn derive_server_id_is_stable_and_distinct() {
-        assert_eq!(derive_server_id("token-a"), derive_server_id("token-a"));
-        assert_ne!(derive_server_id("token-a"), derive_server_id("token-b"));
-        assert_eq!(derive_server_id("token-a").len(), 32);
+    fn history_id_follows_the_server_id_not_the_token() {
+        use crate::config::{Config, ServerEntry};
+
+        let mut config = Config::default();
+        config.history.enabled = true;
+        let mut server = ServerEntry::default();
+        server.history.location = Some("/srv/base".to_string());
+
+        let before = HistoryStorage::resolve(&config, &server);
+        server.token = "replaced-after-repair".to_string();
+        let after = HistoryStorage::resolve(&config, &server);
+        assert_eq!(before.history_id(), after.history_id());
+        assert_eq!(before.history_id(), server.id.to_hex());
     }
 
     #[test]

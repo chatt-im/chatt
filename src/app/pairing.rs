@@ -6,41 +6,36 @@ use std::sync::{
 use rpc::control::DeviceLinkTicket;
 use zeroize::Zeroize;
 
-use super::{App, Audience, EditorPresentation, ServerEditDraft, device_pair};
+use super::{App, ServerEditDraft, device_pair, server_catalog};
 use crate::{
     client_channel::{
-        BaseScreen, ClientId, NavigationEvent, OverlaySpec, ScreenSpec, TerminalEvent,
-        TransportWarningTarget,
+        BaseScreen, ClientId, NavigationEvent, OverlaySpec, ScreenSpec, ServerEditOutcome,
+        TerminalEvent, TransportWarningTarget,
     },
     client_net::{
         ClientConfig, PAIRING_CANCELABLE, PAIRING_CANCELED, PAIRING_COMMITTING, PairingEvent,
         spawn_device_pair_once, spawn_open_pair_once, spawn_pair_once,
     },
-    config::{ServerEntry, validate_server_entry},
+    config::ServerEntry,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PairCompletion {
+    /// Pairing was started from Pair/Join and must present the full editor.
     OpenEditor,
-    Save,
-    Join,
-    Reconnect,
+    /// The editor submitted a username retry. Successful pairing completes
+    /// that same save request, optionally starting a join.
+    Submit { request_id: u64, join: bool },
 }
 
 pub(crate) struct PendingPair {
     pub(crate) server: ServerEntry,
+    /// The open-pairing recovery secret, retained only for this in-memory
+    /// attempt and never written to the user's configuration.
     pub(crate) open: Option<String>,
     pub(crate) open_password: String,
     pub(crate) pairing_code: Option<String>,
     pub(crate) completion: PairCompletion,
-    /// The owner submitted this attempt from the server editor and is still on
-    /// that form, wherever the attempt has got to since.
-    ///
-    /// Only the retry of a rejected username is submitted there, and it is the
-    /// one attempt whose outcome has somewhere of its own to land: failures
-    /// replace the form in place instead of stacking over it, and a join it
-    /// completes is held by the form until the session authenticates.
-    pub(crate) from_editor: bool,
 }
 
 impl PendingPair {
@@ -53,12 +48,6 @@ impl PendingPair {
             self.open_password = password;
         }
         Some((self.open_password.clone(), existing_token))
-    }
-
-    fn is_provisional(&self) -> bool {
-        self.server
-            .token
-            .starts_with(rpc::crypto::OPEN_PAIR_RECOVERY_PREFIX)
     }
 }
 
@@ -110,33 +99,6 @@ impl PairingJob {
     }
 }
 
-/// The pairing UI the owner is looking at while a job runs, and therefore what
-/// a failure has to restore or dismiss.
-///
-/// Only the coordinator knows which of these it put up, and only it may close
-/// one: a pop aimed at [`Self::None`] would take away a screen the user opened.
-/// [`Self::Editor`] is the user's screen too — it is where the attempt was
-/// submitted from and where the user still is — so it is restored in place and
-/// never popped.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ResumeUi {
-    None,
-    Editor,
-    PasswordPrompt,
-    DevicePrompt,
-}
-
-impl ResumeUi {
-    /// Whether the coordinator put up an overlay of its own, which it has to
-    /// take down when it abandons the attempt.
-    ///
-    /// The editor is not one of those: the owner submitted the attempt from it
-    /// and is still looking at it, so it stays up and takes the failure.
-    fn is_overlay(self) -> bool {
-        matches!(self, Self::PasswordPrompt | Self::DevicePrompt)
-    }
-}
-
 enum PairingState {
     Idle,
     AwaitingDeviceDetails {
@@ -148,13 +110,14 @@ enum PairingState {
         pending: PendingPair,
         job: PairingJob,
         cancellation: Option<Arc<AtomicU8>>,
-        resume: ResumeUi,
     },
     AwaitingPassword {
         owner: ClientId,
         pending: PendingPair,
     },
-    AwaitingUsername {
+    /// A pairing rejected for its username is being corrected in the server
+    /// editor before the worker is retried.
+    AwaitingEditor {
         owner: ClientId,
         pending: PendingPair,
     },
@@ -166,7 +129,6 @@ enum PairingState {
         pending: PendingPair,
         job: PairingJob,
         cancellation: Option<Arc<AtomicU8>>,
-        resume: ResumeUi,
     },
 }
 
@@ -190,18 +152,17 @@ pub(super) enum PairingInput {
         pending: PendingPair,
         job: PairingJob,
         cancellation: Option<Arc<AtomicU8>>,
-        persist_first: bool,
     },
     Password {
         owner: ClientId,
         password: String,
         config: ClientConfig,
     },
-    RetryUsername {
+    RetryServer {
         owner: ClientId,
         server: ServerEntry,
-        config: ClientConfig,
-        completion: PairCompletion,
+        request_id: u64,
+        join: bool,
     },
     Worker {
         attempt: u64,
@@ -244,7 +205,7 @@ impl PairingCoordinator {
 
     #[cfg(test)]
     pub(super) fn set_awaiting_username_for_test(&mut self, owner: ClientId, pending: PendingPair) {
-        self.state = PairingState::AwaitingUsername { owner, pending };
+        self.state = PairingState::AwaitingEditor { owner, pending };
     }
 
     /// Places the coordinator in the state a spawned worker runs under and
@@ -256,7 +217,6 @@ impl PairingCoordinator {
         pending: PendingPair,
         job: PairingJob,
         cancellation: Option<Arc<AtomicU8>>,
-        resume: ResumeUi,
     ) -> u64 {
         let attempt = self.next_attempt();
         self.state = PairingState::Running {
@@ -265,7 +225,6 @@ impl PairingCoordinator {
             pending,
             job,
             cancellation,
-            resume,
         };
         attempt
     }
@@ -293,7 +252,7 @@ impl PairingCoordinator {
         match &self.state {
             PairingState::Running { pending, .. }
             | PairingState::AwaitingPassword { pending, .. }
-            | PairingState::AwaitingUsername { pending, .. }
+            | PairingState::AwaitingEditor { pending, .. }
             | PairingState::AwaitingPlaintextConsent { pending, .. } => Some(pending),
             PairingState::Idle | PairingState::AwaitingDeviceDetails { .. } => None,
         }
@@ -309,7 +268,7 @@ impl PairingCoordinator {
                 owner: active,
                 pending,
             }
-            | PairingState::AwaitingUsername {
+            | PairingState::AwaitingEditor {
                 owner: active,
                 pending,
             } if *active == owner => Some(&pending.server),
@@ -317,27 +276,30 @@ impl PairingCoordinator {
         }
     }
 
-    /// Whether `owner` is still parked on a rejected username. A started retry
-    /// is [`PairingState::Running`], so this reports a retry that never reached
-    /// a worker and whose editor the caller must re-present.
-    pub(super) fn awaiting_username(&self, owner: ClientId) -> bool {
+    pub(super) fn awaiting_editor_for(
+        &self,
+        owner: ClientId,
+        server_id: rpc::ids::ServerId,
+    ) -> bool {
         matches!(
             &self.state,
-            PairingState::AwaitingUsername { owner: active, .. } if *active == owner
-        )
-    }
-
-    pub(super) fn username_retry_matches(&self, owner: ClientId, label: &str) -> bool {
-        matches!(
-            &self.state,
-            PairingState::AwaitingUsername { owner: active, pending }
-                if *active == owner && pending.server.label == label
+            PairingState::AwaitingEditor {
+                owner: active,
+                pending,
+            } if *active == owner && pending.server.id == server_id
         )
     }
 
     fn next_attempt(&mut self) -> u64 {
         self.next_attempt = self.next_attempt.wrapping_add(1).max(1);
         self.next_attempt
+    }
+
+    /// Reserves a worker attempt id for a caller outside the coordinator, so
+    /// every pairing-shaped worker draws from one id space and stale events
+    /// keep dropping silently.
+    pub(super) fn allocate_attempt(&mut self) -> u64 {
+        self.next_attempt()
     }
 
     pub(super) fn handle(mut self, app: &mut App, input: PairingInput) -> Self {
@@ -350,8 +312,8 @@ impl PairingCoordinator {
                     pairing_string,
                 },
             ) => {
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                         OverlaySpec::DevicePair(device_pair::DevicePairDialog::new(
                             pairing_string,
@@ -359,8 +321,8 @@ impl PairingCoordinator {
                         )),
                     ))),
                 );
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::Status("enter the one-time device link details".to_string()),
                 );
                 self.state = PairingState::AwaitingDeviceDetails { owner };
@@ -372,19 +334,10 @@ impl PairingCoordinator {
                     pending,
                     job,
                     cancellation,
-                    persist_first,
                 },
             ) => {
-                if let Err(failure) = self.start(
-                    app,
-                    owner,
-                    pending,
-                    job,
-                    cancellation,
-                    persist_first,
-                    ResumeUi::None,
-                ) {
-                    self.restore_after_failure(app, owner, failure, ResumeUi::None);
+                if let Err(failure) = self.start(app, owner, pending, job, cancellation) {
+                    self.abandon(app, owner, failure.pending, failure.message);
                 }
             }
             (
@@ -394,21 +347,20 @@ impl PairingCoordinator {
                     pending,
                     job,
                     cancellation,
-                    persist_first,
                 },
             ) if active == owner
                 && matches!(&job, PairingJob::Device { .. } | PairingJob::Invite { .. }) =>
             {
-                if let Err(failure) = self.start(
-                    app,
-                    owner,
-                    pending,
-                    job,
-                    cancellation,
-                    persist_first,
-                    ResumeUi::DevicePrompt,
-                ) {
-                    self.restore_after_failure(app, owner, failure, ResumeUi::DevicePrompt);
+                if let Err(failure) = self.start(app, owner, pending, job, cancellation) {
+                    // The details dialog is still up and retries in place.
+                    self.state = PairingState::AwaitingDeviceDetails { owner };
+                    app.send_to(
+                        owner,
+                        TerminalEvent::DevicePairingFailed {
+                            message: failure.message.clone(),
+                        },
+                    );
+                    app.send_to(owner, TerminalEvent::Error(failure.message));
                 }
             }
             (
@@ -435,31 +387,40 @@ impl PairingCoordinator {
                             existing_token,
                         },
                         None,
-                        false,
-                        ResumeUi::PasswordPrompt,
                     ) {
-                        self.restore_after_failure(app, owner, failure, ResumeUi::PasswordPrompt);
+                        // The prompt is still up and takes the failure.
+                        self.state = PairingState::AwaitingPassword {
+                            owner,
+                            pending: failure.pending,
+                        };
+                        app.send_to(owner, TerminalEvent::PairingFailed(failure.message.clone()));
+                        app.send_to(owner, TerminalEvent::Error(failure.message));
                     }
                 } else {
-                    app.send_terminal_event(
-                        Audience::Client(owner),
+                    app.send_to(
+                        owner,
                         TerminalEvent::Error("pairing retry context is incomplete".to_string()),
                     );
                     self.state = PairingState::AwaitingPassword { owner, pending };
                 }
             }
             (
-                PairingState::AwaitingUsername {
+                PairingState::AwaitingEditor {
                     owner: active,
                     mut pending,
                 },
-                PairingInput::RetryUsername {
+                PairingInput::RetryServer {
                     owner,
                     server,
-                    config,
-                    completion,
+                    request_id,
+                    join,
                 },
             ) if active == owner => {
+                pending.server = server;
+                pending.completion = PairCompletion::Submit { request_id, join };
+                let config = pending
+                    .server
+                    .client_config(&app.config, app.download_store.clone());
                 let job = if let Some(pairing_code) = pending.pairing_code.clone() {
                     Some(PairingJob::Invite {
                         config,
@@ -474,40 +435,30 @@ impl PairingCoordinator {
                             existing_token,
                         })
                 };
-                if let Some(job) = job {
-                    // The editor the caller re-presents is the user's own draft,
-                    // whose original label is the pre-retry one. Restoring the
-                    // edited server instead would make the next save miss
-                    // `username_retry_matches` and collide with the entry this
-                    // attempt already renamed.
-                    let restore = pending.server.clone();
-                    pending.server = server;
-                    pending.completion = completion;
-                    pending.from_editor = true;
-                    let persist_first = pending.is_provisional();
-                    if let Err(failure) = self.start(
-                        app,
+                let Some(job) = job else {
+                    app.send_to(
                         owner,
-                        pending,
-                        job,
-                        None,
-                        persist_first,
-                        ResumeUi::Editor,
-                    ) {
-                        let mut pending = failure.pending;
-                        pending.server = restore;
-                        self.state = PairingState::AwaitingUsername { owner, pending };
-                        app.send_terminal_event(
-                            Audience::Client(owner),
-                            TerminalEvent::Error(failure.message),
-                        );
-                    }
-                } else {
-                    app.send_terminal_event(
-                        Audience::Client(owner),
                         TerminalEvent::Error("pairing retry context is incomplete".to_string()),
                     );
-                    self.state = PairingState::AwaitingUsername { owner, pending };
+                    self.state = PairingState::AwaitingEditor { owner, pending };
+                    return self;
+                };
+                if let Err(failure) = self.start(app, owner, pending, job, None) {
+                    let completion = failure.pending.completion;
+                    self.state = PairingState::AwaitingEditor {
+                        owner,
+                        pending: failure.pending,
+                    };
+                    if let PairCompletion::Submit { request_id, .. } = completion {
+                        app.send_to(
+                            owner,
+                            TerminalEvent::ServerEditResult {
+                                request_id,
+                                outcome: ServerEditOutcome::Rejected,
+                            },
+                        );
+                    }
+                    app.send_to(owner, TerminalEvent::Error(failure.message));
                 }
             }
             (
@@ -517,46 +468,28 @@ impl PairingCoordinator {
                     pending,
                     job,
                     cancellation,
-                    resume,
                 },
                 PairingInput::Worker { attempt, event },
-            ) if active == attempt => self.worker_result(
-                app,
-                attempt,
-                owner,
-                pending,
-                job,
-                cancellation,
-                resume,
-                event,
-            ),
+            ) if active == attempt => {
+                self.worker_result(app, owner, pending, job, cancellation, event)
+            }
             (
                 PairingState::AwaitingPlaintextConsent {
                     owner: active,
                     mut pending,
                     mut job,
                     cancellation,
-                    resume,
                 },
                 PairingInput::AcceptPlaintext { owner },
             ) if active == owner => {
                 pending.server.require_transport_encryption = false;
                 job.config_mut().require_transport_encryption = false;
-                let persist_first = pending.is_provisional();
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
                 );
-                if let Err(failure) = self.start(
-                    app,
-                    owner,
-                    pending,
-                    job,
-                    cancellation,
-                    persist_first,
-                    resume,
-                ) {
-                    self.restore_after_failure(app, owner, failure, resume);
+                if let Err(failure) = self.start(app, owner, pending, job, cancellation) {
+                    self.abandon(app, owner, failure.pending, failure.message);
                 }
             }
             (state, PairingInput::Cancel { owner }) if state.owner() == Some(owner) => {
@@ -567,8 +500,8 @@ impl PairingCoordinator {
             // means that overlay is stale and still has to close.
             (state, PairingInput::Cancel { owner }) => {
                 self.state = state;
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
                 );
             }
@@ -584,14 +517,12 @@ impl PairingCoordinator {
                         Ordering::Acquire,
                     );
                 }
-                if let Some(pending) = state.into_pending().filter(PendingPair::is_provisional) {
-                    let _ = app.discard_provisional_open_pair(&pending);
-                }
+                drop(state.into_pending());
             }
             (state, PairingInput::StartDevicePrompt { owner, .. })
             | (state, PairingInput::Start { owner, .. }) => {
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::Status("a pairing attempt is already in progress".to_string()),
                 );
                 self.state = state;
@@ -604,8 +535,8 @@ impl PairingCoordinator {
     /// Spawns `job`'s worker and parks the coordinator on it.
     ///
     /// A failure sends nothing and discards nothing: it hands `pending` back so
-    /// the caller, which knows what `resume` the owner is looking at, decides
-    /// between restoring that UI and abandoning the attempt.
+    /// the caller, which knows what UI the owner is looking at, decides between
+    /// reporting into that UI and abandoning the attempt.
     fn start(
         &mut self,
         app: &mut App,
@@ -613,12 +544,7 @@ impl PairingCoordinator {
         pending: PendingPair,
         job: PairingJob,
         cancellation: Option<Arc<AtomicU8>>,
-        persist_first: bool,
-        resume: ResumeUi,
     ) -> Result<(), FailedAttempt> {
-        if persist_first && let Err(message) = app.persist_provisional_open_pair(&pending.server) {
-            return Err(FailedAttempt { message, pending });
-        }
         let attempt = self.next_attempt();
         let alias = pending.server.label.clone();
         let events = app.events.sender().for_pairing(attempt);
@@ -665,100 +591,48 @@ impl PairingCoordinator {
             pending,
             job,
             cancellation,
-            resume,
         };
-        app.send_terminal_event(
-            Audience::Client(owner),
-            TerminalEvent::Status(format!("pairing {alias}")),
-        );
+        app.send_to(owner, TerminalEvent::Status(format!("pairing {alias}")));
         Ok(())
     }
 
-    /// Puts the owner back on the UI that can retry a failed attempt, or, when
-    /// the coordinator owns no such UI, reports the failure and stays idle.
-    fn restore_after_failure(
-        &mut self,
-        app: &mut App,
-        owner: ClientId,
-        failure: FailedAttempt,
-        resume: ResumeUi,
-    ) {
-        let FailedAttempt { message, pending } = failure;
-        match resume {
-            ResumeUi::PasswordPrompt if pending.open.is_some() => {
-                self.state = PairingState::AwaitingPassword { owner, pending };
-                app.send_terminal_event(
-                    Audience::Client(owner),
-                    TerminalEvent::PairingFailed(message.clone()),
-                );
-            }
-            ResumeUi::Editor => {
-                let draft =
-                    ServerEditDraft::from_server_focused(&pending.server, &app.config, "Username");
-                let presentation = EditorPresentation::for_hold(pending.from_editor);
-                self.state = PairingState::AwaitingUsername { owner, pending };
-                open_server_editor(app, owner, draft, presentation);
-            }
-            ResumeUi::DevicePrompt => {
-                self.state = PairingState::AwaitingDeviceDetails { owner };
-                app.send_terminal_event(
-                    Audience::Client(owner),
-                    TerminalEvent::DevicePairingFailed {
-                        message: message.clone(),
-                    },
-                );
-            }
-            _ => return self.abandon(app, owner, pending, resume, message),
-        }
-        app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
-    }
-
-    /// Ends an attempt that cannot be retried, closing the pairing UI the
-    /// coordinator put up and discarding any provisional credential.
-    ///
-    /// An editor the owner submitted from is not one of those: it is the user's
-    /// own screen for the whole attempt, and it stays up to take the failure.
+    /// Ends an attempt the coordinator cannot retry. The durable pending
+    /// record stays — failure resumability is what it exists for; only the
+    /// user's cancel removes it. No screen is popped: a prompt the coordinator
+    /// put up shows the failure and closes on the user's own cancel.
     fn abandon(
         &mut self,
         app: &mut App,
         owner: ClientId,
-        pending: PendingPair,
-        resume: ResumeUi,
+        mut pending: PendingPair,
         message: String,
     ) {
-        if pending.is_provisional() {
-            let _ = app.discard_provisional_open_pair(&pending);
-        }
-        if resume.is_overlay() {
-            app.send_terminal_event(
-                Audience::Client(owner),
-                TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
+        if let PairCompletion::Submit { request_id, .. } = pending.completion {
+            pending.completion = PairCompletion::OpenEditor;
+            self.state = PairingState::AwaitingEditor { owner, pending };
+            app.send_to(
+                owner,
+                TerminalEvent::ServerEditResult {
+                    request_id,
+                    outcome: ServerEditOutcome::Rejected,
+                },
             );
         }
-        app.send_terminal_event(
-            Audience::Client(owner),
-            TerminalEvent::PairingFailed(message.clone()),
-        );
-        app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
+        app.send_to(owner, TerminalEvent::PairingFailed(message.clone()));
+        app.send_to(owner, TerminalEvent::Error(message));
     }
 
     fn worker_result(
         &mut self,
         app: &mut App,
-        attempt: u64,
         owner: ClientId,
         mut pending: PendingPair,
         job: PairingJob,
         cancellation: Option<Arc<AtomicU8>>,
-        resume: ResumeUi,
         event: PairingEvent,
     ) {
         match event {
-            // An invite attempt persists nothing before it succeeds, so it owns
-            // no saved entry and has to find its label free.
-            PairingEvent::InviteSucceeded => {
-                self.commit(app, attempt, owner, pending, String::new())
-            }
+            PairingEvent::InviteSucceeded => self.commit(app, owner, pending),
             // Media endpoints are not taken from the server: it cannot know
             // which of its binds this client can route to, nor its own mapped
             // port behind NAT. `udp_addr` keeps whatever the entry already had
@@ -768,94 +642,94 @@ impl PairingCoordinator {
                 token,
                 server_public_key,
             } => {
-                let claimed = std::mem::replace(&mut pending.server.token, token);
+                pending.server.token = token;
                 pending.server.server_public_key = server_public_key;
-                self.commit(app, attempt, owner, pending, claimed);
+                self.commit(app, owner, pending);
             }
             PairingEvent::DeviceSucceeded {
                 token,
                 username,
                 server_public_key,
             } => {
-                let claimed = std::mem::replace(&mut pending.server.token, token);
+                pending.server.token = token;
                 pending.server.username = username;
                 pending.server.server_public_key = server_public_key;
-                self.commit(app, attempt, owner, pending, claimed);
+                self.commit(app, owner, pending);
             }
             PairingEvent::OpenNeedsPassword {
                 retry,
                 server_public_key,
             } => {
                 if let Err(message) = pin_server_key(&mut pending, server_public_key) {
-                    return self.abandon(app, owner, pending, resume, message);
-                }
-                // The provisional write only serves crash recovery, so a failed
-                // one still leaves an attempt the password can complete.
-                let mut persist_error = None;
-                if pending.is_provisional()
-                    && let Err(message) = app.persist_provisional_open_pair(&pending.server)
-                {
-                    persist_error = Some(message);
+                    return self.abandon(app, owner, pending, message);
                 }
                 let replace = !pending.open_password.is_empty();
                 self.state = PairingState::AwaitingPassword { owner, pending };
                 if replace {
-                    app.send_terminal_event(
-                        Audience::Client(owner),
-                        TerminalEvent::PairingPasswordChallenge { retry },
-                    );
+                    app.send_to(owner, TerminalEvent::PairingPasswordChallenge { retry });
                 } else {
-                    app.send_terminal_event(
-                        Audience::Client(owner),
+                    app.send_to(
+                        owner,
                         TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                             OverlaySpec::PairingPassword { retry },
                         ))),
                     );
-                }
-                if let Some(message) = persist_error {
-                    app.send_terminal_event(
-                        Audience::Client(owner),
-                        TerminalEvent::PairingFailed(message.clone()),
-                    );
-                    app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
                 }
             }
             PairingEvent::UsernameTaken {
                 message,
                 server_public_key,
             } => {
-                // The key is pinned before the editor draft is built: the retry
+                // The key is pinned before the prompt goes up: the retry
                 // reconnects with the key this attempt saw rather than running
                 // trust-on-first-use a second time.
                 if let Err(message) = pin_server_key(&mut pending, server_public_key) {
-                    return self.abandon(app, owner, pending, resume, message);
+                    return self.abandon(app, owner, pending, message);
                 }
-                // The pin is only written for crash recovery, so a failed write
-                // still leaves a retry the edited username can complete.
-                let mut message = message;
-                if pending.is_provisional()
-                    && let Err(error) = app.persist_provisional_open_pair(&pending.server)
-                {
-                    message = format!("{message}; {error}");
+                let completion = pending.completion;
+                pending.completion = PairCompletion::OpenEditor;
+                let draft = ServerEditDraft::from_new_server_focused(
+                    pending.server.clone(),
+                    &app.config,
+                    "Username",
+                );
+                self.state = PairingState::AwaitingEditor { owner, pending };
+                match completion {
+                    PairCompletion::OpenEditor => open_server_editor(app, owner, draft),
+                    PairCompletion::Submit { request_id, .. } => app.send_to(
+                        owner,
+                        TerminalEvent::ServerEditResult {
+                            request_id,
+                            outcome: ServerEditOutcome::Retry(Box::new(draft)),
+                        },
+                    ),
                 }
-                let draft =
-                    ServerEditDraft::from_server_focused(&pending.server, &app.config, "Username");
-                let presentation = EditorPresentation::for_hold(pending.from_editor);
-                self.state = PairingState::AwaitingUsername { owner, pending };
-                open_server_editor(app, owner, draft, presentation);
-                app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
+                app.send_to(owner, TerminalEvent::Error(message));
             }
             PairingEvent::Failed(message) => {
-                self.restore_after_failure(app, owner, FailedAttempt { message, pending }, resume)
+                if let PairCompletion::Submit { request_id, .. } = pending.completion {
+                    pending.completion = PairCompletion::OpenEditor;
+                    self.state = PairingState::AwaitingEditor { owner, pending };
+                    app.send_to(
+                        owner,
+                        TerminalEvent::ServerEditResult {
+                            request_id,
+                            outcome: ServerEditOutcome::Rejected,
+                        },
+                    );
+                    app.send_to(owner, TerminalEvent::Error(message));
+                } else {
+                    self.abandon(app, owner, pending, message);
+                }
             }
             PairingEvent::DeviceIdentityExists { message } => {
                 self.state = PairingState::AwaitingDeviceDetails { owner };
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::DevicePairingIdentityExists { message },
                 );
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::Status(
                         "device pairing needs overwrite confirmation".to_string(),
                     ),
@@ -863,13 +737,13 @@ impl PairingCoordinator {
             }
             PairingEvent::DeviceFailed { message } => {
                 self.state = PairingState::AwaitingDeviceDetails { owner };
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::DevicePairingFailed {
                         message: message.clone(),
                     },
                 );
-                app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
+                app.send_to(owner, TerminalEvent::Error(message));
             }
             PairingEvent::TransportEncryptionRequired => {
                 let label = pending.server.label.clone();
@@ -878,10 +752,9 @@ impl PairingCoordinator {
                     pending,
                     job,
                     cancellation,
-                    resume,
                 };
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
                         OverlaySpec::TransportEncryptionWarning {
                             label,
@@ -889,146 +762,51 @@ impl PairingCoordinator {
                         },
                     ))),
                 );
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                app.send_to(
+                    owner,
                     TerminalEvent::Error("server transport encryption is disabled".to_string()),
                 );
             }
         }
     }
 
-    /// Saves a paired server and routes the owner to whatever the attempt was
-    /// started for. Every branch resets the owner's base screen, which drains
-    /// any pairing overlay along with it.
-    ///
-    /// `claimed_token` is the token the attempt's own entry was saved under
-    /// before pairing issued a new one, and is empty for an attempt that saved
-    /// nothing. See [`claim_server_entry`].
-    fn commit(
-        &mut self,
-        app: &mut App,
-        _attempt: u64,
-        owner: ClientId,
-        pending: PendingPair,
-        claimed_token: String,
-    ) {
-        let previous = app.config.servers.clone();
-        let result = validate_server_entry(&pending.server)
-            .and_then(|()| claim_server_entry(app, pending.server.clone(), &claimed_token))
-            .and_then(|()| {
-                app.config.save_runtime().inspect(|path| {
-                    app.config.config_path = Some(path.clone());
-                    app.rebuild_server_items();
-                })
-            });
-        let path = match result {
-            Ok(path) => path,
-            Err(message) => {
-                app.config.servers = previous;
-                app.send_terminal_event(
-                    Audience::Client(owner),
-                    TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
-                        query: None,
-                    })),
-                );
-                app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
-                return;
-            }
-        };
-        let alias = pending.server.label.clone();
-        let from_editor = pending.from_editor;
+    /// Commits a completed pairing before opening its editor. A username retry
+    /// submitted from an already-open editor completes that form's pending
+    /// Save or Save and Join request instead.
+    fn commit(&mut self, app: &mut App, owner: ClientId, pending: PendingPair) {
+        let label = pending.server.label.clone();
         match pending.completion {
             PairCompletion::OpenEditor => {
-                let draft = ServerEditDraft::from_server(&pending.server, &app.config);
-                open_server_editor(app, owner, draft, EditorPresentation::for_hold(from_editor));
-                app.send_terminal_event(
-                    Audience::Client(owner),
+                let (server, path) =
+                    match server_catalog::insert_server(&mut app.config, pending.server) {
+                        Ok(committed) => committed,
+                        Err(message) => {
+                            app.send_to(
+                                owner,
+                                TerminalEvent::Navigation(NavigationEvent::ResetBase(
+                                    BaseScreen::Servers { query: None },
+                                )),
+                            );
+                            app.send_to(owner, TerminalEvent::Error(message));
+                            return;
+                        }
+                    };
+                app.rebuild_server_items();
+                open_server_editor(
+                    app,
+                    owner,
+                    ServerEditDraft::from_server(&server, &app.config),
+                );
+                app.send_to(
+                    owner,
                     TerminalEvent::Status(format!(
-                        "paired {alias}; config saved to {}",
+                        "paired {label}; config saved to {}; review server settings",
                         path.display()
                     )),
                 );
             }
-            PairCompletion::Save => {
-                app.send_terminal_event(
-                    Audience::Client(owner),
-                    TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
-                        query: None,
-                    })),
-                );
-                app.send_terminal_event(
-                    Audience::Client(owner),
-                    TerminalEvent::Status(format!(
-                        "paired {alias}; config saved to {}",
-                        path.display()
-                    )),
-                );
-            }
-            PairCompletion::Join => {
-                app.send_terminal_event(
-                    Audience::Client(owner),
-                    TerminalEvent::Status(format!(
-                        "paired {alias}; config saved to {}",
-                        path.display()
-                    )),
-                );
-                let previous_owner = std::mem::replace(&mut app.command_client, owner);
-                // A join submitted from the server editor is still on it: a
-                // refusal is reported onto that form, and a started join is
-                // held by it until the session authenticates.
-                let held = from_editor;
-                // Pairing runs beside a live session, so the credential is kept
-                // and only the switch waits.
-                // but the switch waits for the transfers that session is running.
-                let started = !app.connection_switch_blocked() && app.start_network(&alias);
-                if !started {
-                    // The credential is saved and only the join was refused. A
-                    // held editor keeps the refusal; anything else goes back to
-                    // the list the pairing was launched from, error intact.
-                    if !held {
-                        app.send_terminal_event(
-                            Audience::Client(owner),
-                            TerminalEvent::Navigation(NavigationEvent::ResetBase(
-                                BaseScreen::Servers { query: None },
-                            )),
-                        );
-                    }
-                    app.command_client = previous_owner;
-                    return;
-                }
-                if held {
-                    app.hold_editor_for_join(&alias);
-                } else {
-                    app.send_terminal_event(
-                        Audience::Client(owner),
-                        TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Room)),
-                    );
-                }
-                app.command_client = previous_owner;
-            }
-            PairCompletion::Reconnect => {
-                app.send_terminal_event(
-                    Audience::Client(owner),
-                    TerminalEvent::Status(format!(
-                        "refreshed {alias}; config saved to {}",
-                        path.display()
-                    )),
-                );
-                let previous_owner = std::mem::replace(&mut app.command_client, owner);
-                // A repair of the credential a held join needed keeps that
-                // join, and the form presenting it, as they were.
-                let held = app.join_hold_owner() == Some(owner);
-                if app.start_network(&alias) {
-                    if !held {
-                        app.send_terminal_event(
-                            Audience::Client(owner),
-                            TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Room)),
-                        );
-                    }
-                } else if !held {
-                    app.open_server_select();
-                }
-                app.command_client = previous_owner;
+            PairCompletion::Submit { request_id, join } => {
+                app.complete_pairing_edit(owner, request_id, pending.server, join);
             }
         }
     }
@@ -1043,109 +821,56 @@ impl PairingCoordinator {
             ) == Err(PAIRING_COMMITTING)
         }) {
             self.state = state;
-            app.send_terminal_event(
-                Audience::Client(owner),
+            app.send_to(
+                owner,
                 TerminalEvent::Status(
                     "pairing is committing and can no longer be canceled".to_string(),
                 ),
             );
             return;
         }
-        if let Some(pending) = state.into_pending().filter(PendingPair::is_provisional)
-            && let Err(message) = app.discard_provisional_open_pair(&pending)
-        {
-            app.send_terminal_event(Audience::Client(owner), TerminalEvent::Error(message));
-        }
+        let submitted_request = state.submitted_request();
+        let pending = state.into_pending();
         app.room.join_notice = None;
+        if let Some(request_id) = submitted_request {
+            if visible && let Some(mut pending) = pending {
+                pending.completion = PairCompletion::OpenEditor;
+                self.state = PairingState::AwaitingEditor { owner, pending };
+            }
+            app.send_to(
+                owner,
+                TerminalEvent::ServerEditResult {
+                    request_id,
+                    outcome: ServerEditOutcome::Rejected,
+                },
+            );
+        }
         if visible {
-            app.send_terminal_event(
-                Audience::Client(owner),
+            app.send_to(
+                owner,
                 TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
             );
-            app.send_terminal_event(
-                Audience::Client(owner),
-                TerminalEvent::Status("pairing canceled".to_string()),
-            );
+            app.send_to(owner, TerminalEvent::Status("pairing canceled".to_string()));
         }
     }
 }
 
-/// Presents the server editor for `owner` as a screen above the server list.
-///
-/// The list is reset first so the editor always has something to close back
-/// onto: replacing the owner's top mode would make the editor the root, where
-/// both its cancel and its save pop into nothing. An attempt the owner
-/// submitted from the editor skips that: it is still on the form, over the list
-/// it opened from, and only the form's contents are replaced.
-fn open_server_editor(
-    app: &mut App,
-    owner: ClientId,
-    draft: ServerEditDraft,
-    presentation: EditorPresentation,
-) {
-    let screen = Box::new(ScreenSpec::ServerEditor(draft));
-    let navigation = match presentation {
-        EditorPresentation::Open => {
-            app.send_terminal_event(
-                Audience::Client(owner),
-                TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
-                    query: None,
-                })),
-            );
-            NavigationEvent::OpenScreen(screen)
-        }
-        EditorPresentation::Replace => NavigationEvent::ReplaceScreen(screen),
-    };
-    app.send_terminal_event(
-        Audience::Client(owner),
-        TerminalEvent::Navigation(navigation),
+/// Presents a paired server above the server list. This accepts both a newly
+/// committed server and the transient candidate of a username-rejected pair;
+/// resetting the base first drains whichever pairing prompt led here.
+fn open_server_editor(app: &mut App, owner: ClientId, draft: ServerEditDraft) {
+    app.send_to(
+        owner,
+        TerminalEvent::Navigation(NavigationEvent::ResetBase(BaseScreen::Servers {
+            query: None,
+        })),
     );
-}
-
-/// Writes a paired entry into the configuration, replacing only the entry the
-/// attempt owns.
-///
-/// The attempt owns whichever entry still holds `claimed_token`: the provisional
-/// recovery entry it wrote before dialing, or the entry it is re-pairing. Any
-/// other entry under the same label belongs to a server saved while the worker
-/// ran, and overwriting it would silently drop that server's credential.
-///
-/// # Errors
-///
-/// Returns the failure to report when the label is held by an entry this attempt
-/// does not own.
-fn claim_server_entry(
-    app: &mut App,
-    server: ServerEntry,
-    claimed_token: &str,
-) -> Result<(), String> {
-    let owned = (!claimed_token.is_empty())
-        .then(|| {
-            app.config
-                .servers
-                .iter()
-                .position(|existing| existing.token == claimed_token)
-        })
-        .flatten();
-    let holder = app
-        .config
-        .servers
-        .iter()
-        .position(|existing| existing.label == server.label);
-    match (owned, holder) {
-        (Some(owned), Some(holder)) if owned != holder => {
-            Err(format!("server label {} already exists", server.label))
-        }
-        (Some(owned), _) => {
-            app.config.servers[owned] = server;
-            Ok(())
-        }
-        (None, Some(_)) => Err(format!("server label {} already exists", server.label)),
-        (None, None) => {
-            app.config.servers.push(server);
-            Ok(())
-        }
-    }
+    app.send_to(
+        owner,
+        TerminalEvent::Navigation(NavigationEvent::OpenScreen(Box::new(
+            ScreenSpec::ServerEditor(draft),
+        ))),
+    );
 }
 
 /// Applies trust-on-first-use continuity to the key a worker just observed.
@@ -1174,13 +899,27 @@ fn pin_server_key(pending: &mut PendingPair, server_public_key: String) -> Resul
 }
 
 impl PairingState {
+    fn submitted_request(&self) -> Option<u64> {
+        let pending = match self {
+            Self::Running { pending, .. }
+            | Self::AwaitingPassword { pending, .. }
+            | Self::AwaitingEditor { pending, .. }
+            | Self::AwaitingPlaintextConsent { pending, .. } => pending,
+            Self::Idle | Self::AwaitingDeviceDetails { .. } => return None,
+        };
+        match pending.completion {
+            PairCompletion::Submit { request_id, .. } => Some(request_id),
+            PairCompletion::OpenEditor => None,
+        }
+    }
+
     fn owner(&self) -> Option<ClientId> {
         match self {
             Self::Idle => None,
             Self::AwaitingDeviceDetails { owner }
             | Self::Running { owner, .. }
             | Self::AwaitingPassword { owner, .. }
-            | Self::AwaitingUsername { owner, .. }
+            | Self::AwaitingEditor { owner, .. }
             | Self::AwaitingPlaintextConsent { owner, .. } => Some(*owner),
         }
     }
@@ -1197,7 +936,7 @@ impl PairingState {
         match self {
             Self::Running { pending, .. }
             | Self::AwaitingPassword { pending, .. }
-            | Self::AwaitingUsername { pending, .. }
+            | Self::AwaitingEditor { pending, .. }
             | Self::AwaitingPlaintextConsent { pending, .. } => Some(pending),
             Self::Idle | Self::AwaitingDeviceDetails { .. } => None,
         }

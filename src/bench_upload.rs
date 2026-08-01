@@ -148,7 +148,7 @@ where
             .checked_duration_since(Instant::now())
             .unwrap_or_else(|| panic!("{label}: timed out waiting for network event"));
         match rx.recv_timeout(remaining) {
-            Ok(AppEvent::Network(event)) => {
+            Ok(AppEvent::NetworkFor { event, .. }) => {
                 match &event {
                     NetworkEvent::Error(message) => panic!("{label}: network error: {message}"),
                     NetworkEvent::AuthFailed { code, message } => {

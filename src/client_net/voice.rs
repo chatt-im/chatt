@@ -3823,7 +3823,7 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().unwrap(),
-            crate::app::AppEvent::Network(NetworkEvent::PlaybackFeedback(received))
+            crate::app::AppEvent::NetworkFor { event: NetworkEvent::PlaybackFeedback(received), .. }
                 if received.stream_id == 8
         ));
         let mut datagram = [0u8; 2048];
