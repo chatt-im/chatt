@@ -6312,6 +6312,7 @@ impl App {
         let ui_changed = ui.room_height != self.config.ui.room_height
             || ui.max_composer_height != self.config.ui.max_composer_height
             || ui.composer_padding != self.config.ui.composer_padding
+            || ui.copy_on_select != self.config.ui.copy_on_select
             || ui.max_messages != self.config.ui.max_messages
             || ui.overscan != self.config.ui.overscan;
         if ui_changed {

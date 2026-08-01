@@ -421,6 +421,10 @@ pub struct UiConfig {
     pub max_composer_height: u16,
     #[toml(default = true, ToToml skip_if = |value: &bool| *value)]
     pub composer_padding: bool,
+    /// Copies clicked or mouse-selected message-log rows to the platform's
+    /// primary selection when the mouse button is released.
+    #[toml(default)]
+    pub copy_on_select: bool,
     #[toml(default = 50_000)]
     pub max_messages: u32,
     #[toml(default = 24)]
@@ -461,6 +465,7 @@ impl Default for UiConfig {
             room_height: 4,
             max_composer_height: 6,
             composer_padding: true,
+            copy_on_select: false,
             max_messages: 50_000,
             overscan: 24,
             default_bindings: DefaultBindings::Standard,
@@ -2993,6 +2998,7 @@ server-public-key = ""
         let content = render_runtime(&Config::default());
 
         assert!(content.contains("default-bindings = \"standard\""));
+        assert!(content.contains("copy-on-select = false"));
         assert!(content.contains("[p2p]\nenabled = false"));
         assert!(content.contains("[history]\nenabled = false"));
         assert!(content.contains("download = \"memory\""));
@@ -3402,6 +3408,20 @@ server-public-key = ""
             .to()
             .unwrap();
         assert!(!disabled.ui.composer_padding);
+    }
+
+    #[test]
+    fn copy_on_select_defaults_off_and_can_be_enabled() {
+        let arena = Arena::new();
+        let default_config: Config = toml_spanner::parse("", &arena).unwrap().to().unwrap();
+        assert!(!default_config.ui.copy_on_select);
+
+        let arena = Arena::new();
+        let enabled: Config = toml_spanner::parse("[ui]\ncopy-on-select = true\n", &arena)
+            .unwrap()
+            .to()
+            .unwrap();
+        assert!(enabled.ui.copy_on_select);
     }
 
     #[test]

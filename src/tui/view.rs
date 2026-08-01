@@ -80,6 +80,7 @@ pub(crate) struct ClientView {
     /// Buffers of rooms this view visited and switched away from.
     parked: HashMap<RoomId, RoomView>,
     pending_clipboard: Option<String>,
+    pending_primary_clipboard: Option<String>,
     pending_url_open: Option<String>,
     syntax: crate::theme::SyntaxTheme,
 }
@@ -141,6 +142,7 @@ impl ClientView {
             active: RoomView::detached(syntax),
             parked: HashMap::new(),
             pending_clipboard: None,
+            pending_primary_clipboard: None,
             pending_url_open: None,
             syntax,
         }
@@ -281,10 +283,21 @@ impl ClientView {
         self.pending_clipboard.take()
     }
 
+    pub(crate) fn take_pending_primary_clipboard(&mut self) -> Option<String> {
+        self.pending_primary_clipboard.take()
+    }
+
     /// Queues public text for the render thread's existing OSC 52/platform
     /// clipboard handoff. Modes must not invoke platform helpers directly.
     pub(crate) fn queue_clipboard(&mut self, text: String) {
         self.pending_clipboard = Some(text);
+    }
+
+    /// Queues text for the render thread's primary-selection handoff. This is
+    /// separate from explicit clipboard copies so X11 can retain an owner for
+    /// each selection independently.
+    pub(crate) fn queue_primary_clipboard(&mut self, text: String) {
+        self.pending_primary_clipboard = Some(text);
     }
 
     /// Queues `url` to be opened by the external opener on the next runtime

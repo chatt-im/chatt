@@ -298,10 +298,16 @@ impl ClientThread {
             }
             flush_commands(&mut queued, &app_events, id);
 
-            let (clipboard_text, url) =
-                (view.take_pending_clipboard(), view.take_pending_url_open());
+            let (clipboard_text, primary_clipboard_text, url) = (
+                view.take_pending_clipboard(),
+                view.take_pending_primary_clipboard(),
+                view.take_pending_url_open(),
+            );
             if let Some(text) = clipboard_text {
                 clipboard.copy(&mut terminal, &text);
+            }
+            if let Some(text) = primary_clipboard_text {
+                clipboard.copy_primary(&mut terminal, &text);
             }
             if let Some(url) = url {
                 url_opener.open(&url);

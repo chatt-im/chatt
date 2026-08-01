@@ -2150,14 +2150,37 @@ impl RoomMode {
                         cx.view.request_open_url(url);
                     }
                 }
+                self.copy_chat_drag_to_primary(cx);
                 cx.view.active.chat.end_drag();
             }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left) => {
+                self.copy_chat_drag_to_primary(cx);
                 cx.view.active.chat.end_drag();
             }
             _ => {}
         }
         Action::Continue
+    }
+
+    /// Copies the body rows covered by the current mouse gesture without
+    /// clearing its visual highlight. A click still has an anchor until
+    /// `end_drag`, so it naturally copies the single row under the pointer.
+    fn copy_chat_drag_to_primary(&mut self, cx: &mut ViewCx<'_>) {
+        if !cx.config.ui.copy_on_select || !cx.view.active.chat.is_dragging() {
+            return;
+        }
+        let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+            return;
+        };
+        let Some(text) = cx
+            .view
+            .active
+            .chat
+            .visual_text(&history, self.layout.chat_width)
+        else {
+            return;
+        };
+        cx.view.queue_primary_clipboard(text);
     }
 
     fn start_scrollbar_drag(
@@ -4652,6 +4675,88 @@ mod tests {
             !app.view.active.chat.has_visual(),
             "a click is a cursor move, not a selection"
         );
+        assert_eq!(app.view.take_pending_primary_clipboard(), None);
+    }
+
+    #[test]
+    fn copy_on_select_copies_clicked_chat_row_to_primary_selection() {
+        let mut app = test_app();
+        app.config.ui.copy_on_select = true;
+        let mut room = RoomMode::default();
+        push_room_message(&mut app, 1, UserId(2), 1, "hello");
+
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let layout = room.layout();
+        let row = layout.chat_rect.y
+            + layout
+                .visible_chat_lines
+                .iter()
+                .position(|line| line.kind == LineKind::Body)
+                .expect("body line rendered") as u16;
+        let column = layout.chat_rect.x + 2;
+
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), column, row),
+        );
+
+        assert_eq!(
+            app.view.take_pending_primary_clipboard().as_deref(),
+            Some("hello")
+        );
+        assert_eq!(app.view.take_pending_clipboard(), None);
+        assert!(!app.view.active.chat.has_visual());
+    }
+
+    #[test]
+    fn copy_on_select_copies_dragged_rows_and_keeps_them_highlighted() {
+        let mut app = test_app();
+        app.config.ui.copy_on_select = true;
+        let mut room = RoomMode::default();
+        push_room_message(&mut app, 1, UserId(2), 1, "first");
+        push_room_message(&mut app, 2, UserId(3), 2, "second");
+
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let layout = room.layout();
+        let row_for = |id| {
+            layout.chat_rect.y
+                + layout
+                    .visible_chat_lines
+                    .iter()
+                    .position(|line| {
+                        line.kind == LineKind::Body
+                            && line.entry == HistoryEntryId::Message(MessageId(id))
+                    })
+                    .expect("message body line rendered") as u16
+        };
+        let first_row = row_for(1);
+        let second_row = row_for(2);
+        let column = layout.chat_rect.x + 2;
+
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), column, first_row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), column, second_row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), column, second_row),
+        );
+
+        assert_eq!(
+            app.view.take_pending_primary_clipboard().as_deref(),
+            Some("first\nsecond")
+        );
+        assert!(app.view.active.chat.has_visual());
     }
 
     #[test]
