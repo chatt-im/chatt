@@ -13375,6 +13375,7 @@ mod tests {
             })
             .expect("the pairing retry returned to its editor");
         assert!(draft.field_focused_for_test("Username"));
+        assert!(draft.username_error_for_test().is_some());
     }
 
     /// Deterministic per-label id, so fixtures pushing several entries never
@@ -13814,6 +13815,7 @@ mod tests {
             })
             .expect("the editor received the rejected server");
         assert!(draft.field_focused_for_test("Username"));
+        assert!(draft.username_error_for_test().is_some());
     }
 
     #[test]
@@ -14222,7 +14224,9 @@ mod tests {
             [NavigationEvent::ReplaceScreen(screen)]
                 if matches!(
                     screen.as_ref(),
-                    ScreenSpec::ServerEditor(draft) if draft.original_label() == "public"
+                    ScreenSpec::ServerEditor(draft)
+                        if draft.original_label() == "public"
+                            && draft.username_error_for_test().is_some()
                 )
         ));
     }

@@ -411,8 +411,7 @@ impl App {
                         self.send_to(client, TerminalEvent::Error(message));
                         return;
                     };
-                    let draft =
-                        ServerEditDraft::from_server_focused(&server, &self.config, "Username");
+                    let draft = ServerEditDraft::from_server_username_taken(&server, &self.config);
                     self.send_to(
                         client,
                         TerminalEvent::Navigation(NavigationEvent::ReplaceScreen(Box::new(
@@ -436,8 +435,7 @@ impl App {
                         self.send_to(client, TerminalEvent::Error(message));
                         return;
                     };
-                    let draft =
-                        ServerEditDraft::from_server_focused(&server, &self.config, "Username");
+                    let draft = ServerEditDraft::from_server_username_taken(&server, &self.config);
                     self.send_to(
                         client,
                         TerminalEvent::ServerEditResult {

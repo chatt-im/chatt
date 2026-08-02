@@ -688,10 +688,9 @@ impl PairingCoordinator {
                 }
                 let completion = pending.completion;
                 pending.completion = PairCompletion::OpenEditor;
-                let draft = ServerEditDraft::from_new_server_focused(
+                let draft = ServerEditDraft::from_new_server_username_taken(
                     pending.server.clone(),
                     &app.config,
-                    "Username",
                 );
                 self.state = PairingState::AwaitingEditor { owner, pending };
                 match completion {
