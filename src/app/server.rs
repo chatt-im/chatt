@@ -146,6 +146,9 @@ pub(crate) struct ServerEditDraft {
     server_public_key: String,
     label: String,
     username: String,
+    /// Whether this server refused the username the form opened with, which
+    /// reads as bad until it is edited to something else.
+    username_taken: bool,
     tcp_addr: String,
     udp_addr: String,
     udp_probe_addr: String,
@@ -176,6 +179,7 @@ impl ServerEditDraft {
             server_public_key: server.server_public_key.clone(),
             label: server.label.clone(),
             username: server.username.clone(),
+            username_taken: false,
             tcp_addr: server.tcp_addr.clone(),
             udp_addr: server.udp_addr.clone(),
             udp_probe_addr: server.udp_probe_addr.clone().unwrap_or_default(),
@@ -202,25 +206,26 @@ impl ServerEditDraft {
         draft
     }
 
-    /// Opens a transient paired candidate focused on the field which must be
-    /// corrected before pairing can be retried.
-    pub(crate) fn from_new_server_focused(
-        server: ServerEntry,
-        config: &Config,
-        field: &str,
-    ) -> Self {
+    /// Opens a transient paired candidate whose username the server refused as
+    /// taken, which must be changed before pairing can be retried.
+    pub(crate) fn from_new_server_username_taken(server: ServerEntry, config: &Config) -> Self {
         let mut draft = Self::from_new_server(server, config);
-        draft.form = form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, field);
+        draft.reject_username(config);
         draft
     }
 
-    /// Like [`Self::from_server`] but opens the form with the cursor on `field`
-    /// (a label inside [`SERVER_SECTION`]), used to send a rejected connect back
-    /// to the offending field.
-    pub(crate) fn from_server_focused(server: &ServerEntry, config: &Config, field: &str) -> Self {
+    /// Like [`Self::from_server`] but opens on the username this server refused
+    /// as taken, used to send a rejected connect back to the offending field.
+    pub(crate) fn from_server_username_taken(server: &ServerEntry, config: &Config) -> Self {
         let mut draft = Self::from_server(server, config);
-        draft.form = form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, field);
+        draft.reject_username(config);
         draft
+    }
+
+    /// Focuses the username and marks it bad.
+    fn reject_username(&mut self, config: &Config) {
+        self.form = form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, "Username");
+        self.username_taken = true;
     }
 
     pub(crate) fn original_label(&self) -> &str {
@@ -398,6 +403,7 @@ impl ServerEditDraft {
                 server_public_key: &self.server_public_key,
                 label: &mut self.label,
                 username: &mut self.username,
+                taken_username: self.username_taken.then(|| origin_username(&self.origin)),
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
@@ -519,6 +525,7 @@ impl ServerEditDraft {
                 server_public_key: &self.server_public_key,
                 label: &mut self.label,
                 username: &mut self.username,
+                taken_username: self.username_taken.then(|| origin_username(&self.origin)),
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
@@ -572,6 +579,15 @@ impl ServerEditDraft {
         self.form.focus() == form::FieldId::new(SERVER_SECTION, field)
     }
 
+    /// What the username row renders as bad, if anything.
+    #[cfg(test)]
+    pub(crate) fn username_error_for_test(&self) -> Option<String> {
+        username_error(
+            &self.username,
+            self.username_taken.then(|| origin_username(&self.origin)),
+        )
+    }
+
     #[cfg(test)]
     fn focused_text_field(&self) -> bool {
         self.form.focused_kind() == FormFieldKind::Text
@@ -605,6 +621,7 @@ impl ServerEditDraft {
             server_public_key: self.server_public_key.clone(),
             label: self.label.clone(),
             username: self.username.clone(),
+            username_taken: self.username_taken,
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.udp_addr.clone(),
             udp_probe_addr: self.udp_probe_addr.clone(),
@@ -628,6 +645,9 @@ struct ServerEditValues<'a> {
     server_public_key: &'a str,
     label: &'a mut String,
     username: &'a mut String,
+    /// The username the server refused as taken, while it is still the one the
+    /// form holds.
+    taken_username: Option<&'a str>,
     tcp_addr: &'a mut String,
     udp_addr: &'a mut String,
     udp_probe_addr: &'a mut String,
@@ -643,6 +663,27 @@ struct ServerEditValues<'a> {
     inherited_history_on: bool,
     /// Whether an outstanding submission stands the submit actions down.
     submitting: bool,
+}
+
+/// The username the form opened with, which a rejection was answered about.
+fn origin_username(origin: &ServerEditOrigin) -> &str {
+    match origin {
+        ServerEditOrigin::Existing { fields, .. } => &fields.username,
+        ServerEditOrigin::New(server) => &server.username,
+    }
+}
+
+/// Why the username row reads as bad: what the local rules reject, then the
+/// name the server refused as taken, until it is edited to a different one.
+/// Names are compared as the server compares them, so restoring a case or
+/// spacing variant of the refused name reads as bad again.
+fn username_error(value: &str, taken: Option<&str>) -> Option<String> {
+    if let Err(error) = validate_username(value) {
+        return Some(error);
+    }
+    let taken = taken?;
+    (rpc::username::fold(value) == rpc::username::fold(taken))
+        .then(|| "already in use on this server; choose another".to_string())
 }
 
 fn server_edit_ui(
@@ -663,9 +704,10 @@ fn server_edit_ui(
     {
         form.set_help("Local alias for this server in the server list and commands.");
     }
+    let taken_username = values.taken_username;
     if form
         .text("Username", values.username, |value| {
-            validate_username(value).err()
+            username_error(value, taken_username)
         })
         .is_focus()
     {
@@ -1191,6 +1233,43 @@ mod tests {
         draft.render(buf.rect(), &mut buf, &Theme::tomorrow_night(), false);
 
         assert!(validate_server_entry(&server).is_err(), "and it is refused");
+    }
+
+    /// A server-refused username reads as bad on the field itself, not only in
+    /// the error line, and stops reading as bad the moment it is changed to a
+    /// name that server did not refuse.
+    #[test]
+    fn a_taken_username_reads_as_bad_until_it_is_changed() {
+        let config = Config::default();
+        let mut server = ServerEntry::default();
+        server.username = "Ada".to_string();
+
+        let mut draft = ServerEditDraft::from_server_username_taken(&server, &config);
+
+        assert!(draft.field_focused_for_test("Username"));
+        assert!(draft.username_error_for_test().is_some());
+
+        draft.active_editor_address().expect("a focused username");
+        draft.set_active_editor_text("Grace");
+        draft.move_focus_for_test(1);
+
+        assert_eq!(draft.username_error_for_test(), None);
+    }
+
+    /// The refused name is compared the way the server compares names, so a
+    /// case or spacing variant of it is not offered as a way through.
+    #[test]
+    fn a_variant_of_a_taken_username_still_reads_as_bad() {
+        let config = Config::default();
+        let mut server = ServerEntry::default();
+        server.username = "Ada Lovelace".to_string();
+        let mut draft = ServerEditDraft::from_server_username_taken(&server, &config);
+        draft.active_editor_address().expect("a focused username");
+
+        draft.set_active_editor_text("ada  LOVELACE");
+        draft.move_focus_for_test(1);
+
+        assert!(draft.username_error_for_test().is_some());
     }
 
     #[test]

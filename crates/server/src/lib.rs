@@ -4490,12 +4490,27 @@ impl Server {
             self.mls.authenticate_credential(auth_token)
         {
             let username = rpc::username::trim(username);
-            if !valid_username(username) || !self.usernames.is_available(username, Some(user_id)) {
+            if let Err(error) = rpc::username::validate(username) {
+                kvlog::warn!(
+                    "authenticate rejected",
+                    token = token.0,
+                    user_id = user_id.0,
+                    reason = "invalid_username"
+                );
                 return self.reject_auth(
                     token,
-                    ERROR_AUTH_REJECTED,
-                    "authentication failed: invalid username for this MLS device".to_string(),
+                    ERROR_PAIRING_INVALID_REQUEST,
+                    format!("authentication failed: {error}"),
                 );
+            }
+            if !self.usernames.is_available(username, Some(user_id)) {
+                kvlog::warn!(
+                    "authenticate rejected",
+                    token = token.0,
+                    user_id = user_id.0,
+                    reason = "username_taken"
+                );
+                return self.reject_username_taken(token);
             }
             let user = self
                 .users
@@ -9819,6 +9834,23 @@ mod tests {
         finish_test_roster(server);
     }
 
+    fn put_test_roster_with_credential(
+        server: &mut Server,
+        user_id: UserId,
+        roster: mls_identity::SignedDeviceRoster,
+        credential: &str,
+    ) {
+        assert!(server.mls_worker.enqueue_typed(MlsWriteRequest::PutRoster {
+            token: Token(usize::MAX),
+            session_id: SessionId(u64::MAX),
+            user_id,
+            expected: None,
+            roster,
+            bootstrap_credential_hash: Some(hash_secret(credential)),
+        }));
+        finish_test_roster(server);
+    }
+
     fn test_room(room_id: RoomId, voice_members: &[SessionId]) -> RoomState {
         RoomState {
             id: room_id,
@@ -13821,6 +13853,60 @@ mod tests {
             panic!("expected invalid-username error");
         };
         assert_eq!(code, ERROR_PAIRING_INVALID_REQUEST);
+        assert!(server.sessions.is_empty());
+    }
+
+    #[test]
+    fn device_credential_authentication_explains_an_invalid_username() {
+        let mut server = test_server();
+        let user_id = UserId(config::FIRST_DYNAMIC_USER_ID);
+        let credential = "alice-device-credential-with-at-least-32-bytes";
+        server.usernames.claim_dynamic(user_id, "Alice").unwrap();
+        let roster = test_mls_roster(&server, user_id, [7; 32], &[(7, "first")], 1);
+        put_test_roster_with_credential(&mut server, user_id, roster, credential);
+        let mut peer = seed_session_client(&mut server, Token(1));
+
+        server
+            .authenticate_client(Token(1), "bad\u{1}name", credential, true, 0)
+            .unwrap();
+
+        assert_eq!(
+            read_plaintext_server_control(&mut server, &mut peer),
+            ServerControl::Error {
+                code: ERROR_PAIRING_INVALID_REQUEST,
+                message: "authentication failed: username must not contain control characters"
+                    .to_string(),
+            }
+        );
+        assert!(server.sessions.is_empty());
+    }
+
+    #[test]
+    fn device_credential_authentication_reports_a_taken_username() {
+        let mut server = test_server();
+        let user_id = UserId(config::FIRST_DYNAMIC_USER_ID);
+        let other_user_id = UserId(config::FIRST_DYNAMIC_USER_ID + 1);
+        let credential = "alice-device-credential-with-at-least-32-bytes";
+        server.usernames.claim_dynamic(user_id, "Alice").unwrap();
+        server
+            .usernames
+            .claim_dynamic(other_user_id, "Bob")
+            .unwrap();
+        let roster = test_mls_roster(&server, user_id, [7; 32], &[(7, "first")], 1);
+        put_test_roster_with_credential(&mut server, user_id, roster, credential);
+        let mut peer = seed_session_client(&mut server, Token(1));
+
+        server
+            .authenticate_client(Token(1), "bob", credential, true, 0)
+            .unwrap();
+
+        assert_eq!(
+            read_plaintext_server_control(&mut server, &mut peer),
+            ServerControl::Error {
+                code: ERROR_USERNAME_TAKEN,
+                message: "username already in use; choose another".to_string(),
+            }
+        );
         assert!(server.sessions.is_empty());
     }
 
