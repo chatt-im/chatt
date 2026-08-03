@@ -8,13 +8,15 @@ use hashbrown::HashMap;
 use super::frame_combiner::{FrameCombiner, MIX_FRAME_SAMPLES};
 use super::neteq::{AudioResult, NetEqDiagnostics};
 use crate::audio::{
+    AudioReportDeviceDirection, AudioReportDeviceTap, AudioReportHub, AudioReportPlaybackBlock,
+    AudioReportRoute,
     errors::AudioErrorKind,
     playback::{
         LivePlaybackPlayoutHints, MixerStreamSource, NetEqMixerSource, RingReader,
         lock_shared_stream, try_lock_shared_stream,
     },
     shared::{
-        AUDIO_POP_DELTA_THRESHOLD, LivePlaybackSnapshot, PlaybackStreamControl,
+        AUDIO_POP_DELTA_THRESHOLD, LivePlaybackSnapshot, PlaybackStreamControl, SAMPLE_RATE,
         audio_callback_logging_enabled, audio_pop_logging_enabled, db_to_gain, max_adjacent_delta,
         peak_normalized, rms_normalized, samples_to_duration,
     },
@@ -91,6 +93,10 @@ pub(crate) struct LivePlaybackMixer {
     callback_render_records_dropped: u64,
     callback_render_blocks: u64,
     current_callback_timing: LivePlaybackOutputCallbackTiming,
+    audio_report: Arc<AudioReportHub>,
+    audio_report_device: Option<AudioReportDeviceTap>,
+    audio_report_mix: Option<AudioReportDeviceTap>,
+    audio_report_scratch: AudioReportPlaybackBlock,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -182,7 +188,7 @@ impl Default for LivePlaybackMixer {
 
 impl LivePlaybackMixer {
     pub(crate) fn new() -> Self {
-        Self::with_streams(HashMap::new())
+        Self::with_streams(HashMap::new(), AudioReportHub::new(), None, None)
     }
 
     pub(crate) fn with_tuning(_tuning: crate::audio::shared::LiveAudioTuning) -> Self {
@@ -190,10 +196,44 @@ impl LivePlaybackMixer {
     }
 
     pub(crate) fn with_live_capacity(_tuning: crate::audio::shared::LiveAudioTuning) -> Self {
-        Self::with_streams(HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS))
+        Self::with_streams(
+            HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
+            AudioReportHub::new(),
+            None,
+            None,
+        )
     }
 
-    fn with_streams(streams: HashMap<u32, ConsumerStream>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_live_capacity_and_report(
+        _tuning: crate::audio::shared::LiveAudioTuning,
+        audio_report: Arc<AudioReportHub>,
+    ) -> Self {
+        let device = audio_report.device_tap(AudioReportDeviceDirection::Playback, SAMPLE_RATE);
+        Self::with_live_capacity_and_device_report(_tuning, audio_report, device)
+    }
+
+    pub(crate) fn with_live_capacity_and_device_report(
+        _tuning: crate::audio::shared::LiveAudioTuning,
+        audio_report: Arc<AudioReportHub>,
+        audio_report_device: AudioReportDeviceTap,
+    ) -> Self {
+        let audio_report_mix = (audio_report_device.sample_rate() != SAMPLE_RATE)
+            .then(|| audio_report.device_tap(AudioReportDeviceDirection::PlaybackMix, SAMPLE_RATE));
+        Self::with_streams(
+            HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
+            audio_report,
+            Some(audio_report_device),
+            audio_report_mix,
+        )
+    }
+
+    fn with_streams(
+        streams: HashMap<u32, ConsumerStream>,
+        audio_report: Arc<AudioReportHub>,
+        audio_report_device: Option<AudioReportDeviceTap>,
+        audio_report_mix: Option<AudioReportDeviceTap>,
+    ) -> Self {
         Self {
             streams,
             pending_controls: HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
@@ -219,12 +259,36 @@ impl LivePlaybackMixer {
             callback_render_records_dropped: 0,
             callback_render_blocks: 0,
             current_callback_timing: LivePlaybackOutputCallbackTiming::default(),
+            audio_report,
+            audio_report_device,
+            audio_report_mix,
+            audio_report_scratch: AudioReportPlaybackBlock::default(),
         }
     }
 
     /// Installs the telemetry the consumer publishes back to the worker.
     pub(crate) fn set_playout_hints(&mut self, hints: Arc<LivePlaybackPlayoutHints>) {
         self.hints = Some(hints);
+    }
+
+    /// Records the post-global-gain 48 kHz mix at the established device tap.
+    #[inline]
+    pub(crate) fn record_final_playback(&self, samples: &[f32], at: Instant) {
+        if let Some(report) = &self.audio_report_mix {
+            report.record_at(samples, at);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_device_playback(&self, samples: &[f32], at: Instant) {
+        if let Some(report) = &self.audio_report_device {
+            report.record_at(samples, at);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn audio_report_active(&self) -> bool {
+        self.audio_report.is_active()
     }
 
     /// Stashes the producer's diagnostics snapshot, preserving the consumer's own
@@ -413,6 +477,18 @@ impl LivePlaybackMixer {
         if let Some(hints) = &self.hints {
             hints.note_callback(duration, period, mixer_events_drained);
         }
+        self.audio_report.record_playback_callback(
+            self.current_callback_timing,
+            duration,
+            render_duration,
+            event_drain_duration,
+            period,
+            staged_samples,
+            mixer_events_drained,
+            self.streams.len(),
+            self.callback_render_blocks,
+            self.callback_render_records_dropped,
+        );
         if audio_callback_logging_enabled() {
             let timing = self.current_callback_timing;
             kvlog::info!(
@@ -640,6 +716,8 @@ impl LivePlaybackMixer {
         let mut neteq_lock_wait_count = 0u64;
         let mut neteq_lock_wait_total = Duration::ZERO;
         let mut neteq_lock_wait_max = Duration::ZERO;
+        let report_active = self.audio_report.is_active();
+        let record_enabled = callback_record_enabled() || report_active;
         {
             let streams = &mut self.streams;
             let source_frames = &mut self.source_frames;
@@ -654,7 +732,8 @@ impl LivePlaybackMixer {
                 };
                 let declick_start = stream.declick_gain;
                 let previous_last_sample = stream.last_rendered_sample;
-                let rendered = render_stream_10ms(stream, now, frame);
+                let locally_muted = stream.control.muted;
+                let rendered = render_stream_10ms(stream, now, frame, record_enabled);
                 if rendered.neteq_lock_wait.as_micros() > 0 {
                     neteq_lock_wait_count = neteq_lock_wait_count.saturating_add(1);
                     neteq_lock_wait_total += rendered.neteq_lock_wait;
@@ -691,6 +770,47 @@ impl LivePlaybackMixer {
                         record.rms = 0.0;
                         record.peak = 0.0;
                     }
+                    if report_active
+                        && self
+                            .audio_report
+                            .prepare_playback_block(&mut self.audio_report_scratch)
+                    {
+                        let report = &mut self.audio_report_scratch;
+                        report.block_index = block_index;
+                        report.playback_track_id = self
+                            .audio_report_device
+                            .as_ref()
+                            .map_or(0, AudioReportDeviceTap::track_id);
+                        report.stream_id = stream_id;
+                        report.active = record.active;
+                        report.muted = locally_muted;
+                        report.route = match record.source_kind {
+                            "neteq_direct" => AudioReportRoute::Direct,
+                            "neteq_assist" => AudioReportRoute::Assist,
+                            "neteq_lock_miss" => AudioReportRoute::LockMiss,
+                            _ => AudioReportRoute::Ring,
+                        };
+                        let direct = report.route == AudioReportRoute::Direct;
+                        report.operation = direct.then_some(record.neteq_op);
+                        report.source = direct.then_some(record.frame_source);
+                        report.result_muted = direct.then_some(record.result_muted);
+                        report.time_stretched = direct.then_some(record.time_stretched);
+                        report.ring_depth_before = record.ring_depth_before as u32;
+                        report.ring_depth_after = record.ring_depth_after as u32;
+                        report.first_delta = record.first_delta;
+                        report.max_delta = record.max_delta;
+                        report.rms = record.rms;
+                        report.peak = record.peak;
+                        if let Some(index) =
+                            record.active.then_some(normal_frames.saturating_sub(1))
+                        {
+                            report.samples.copy_from_slice(&source_frames[index]);
+                        } else {
+                            report.samples.fill(0.0);
+                        }
+                        self.audio_report
+                            .submit_playback_block(&mut self.audio_report_scratch);
+                    }
                     push_callback_render_record(
                         callback_render_records,
                         callback_render_records_dropped,
@@ -721,13 +841,20 @@ fn render_stream_10ms(
     stream: &mut ConsumerStream,
     now: Instant,
     out: &mut [f32; MIX_FRAME_SAMPLES],
+    record_enabled: bool,
 ) -> RenderedStream {
     let gain = db_to_gain(stream.control.volume_db);
     let muted = stream.control.muted;
     match &mut stream.source {
-        ConsumerSource::NetEq(handle) => {
-            render_neteq_stream_10ms(handle, now, &mut stream.declick_gain, gain, muted, out)
-        }
+        ConsumerSource::NetEq(handle) => render_neteq_stream_10ms(
+            handle,
+            now,
+            &mut stream.declick_gain,
+            gain,
+            muted,
+            out,
+            record_enabled,
+        ),
         ConsumerSource::Ring(reader) => {
             let active = render_ring_stream_10ms(
                 reader,
@@ -741,7 +868,7 @@ fn render_stream_10ms(
                 active,
                 neteq_lock_wait: Duration::ZERO,
                 neteq: None,
-                callback_record: callback_record_enabled().then(|| CallbackRenderRecord {
+                callback_record: record_enabled.then(|| CallbackRenderRecord {
                     block_index: 0,
                     stream_id: 0,
                     active,
@@ -778,6 +905,7 @@ fn render_neteq_stream_10ms(
     gain: f32,
     muted: bool,
     out: &mut [f32; MIX_FRAME_SAMPLES],
+    record_enabled: bool,
 ) -> RenderedStream {
     if let Some((active, ring_depth_before, ring_depth_after)) =
         render_assisted_neteq_10ms(source, declick_gain, gain, muted, out)
@@ -786,7 +914,7 @@ fn render_neteq_stream_10ms(
             active,
             neteq_lock_wait: Duration::ZERO,
             neteq: None,
-            callback_record: callback_record_enabled().then(|| CallbackRenderRecord {
+            callback_record: record_enabled.then(|| CallbackRenderRecord {
                 block_index: 0,
                 stream_id: 0,
                 active,
@@ -834,7 +962,7 @@ fn render_neteq_stream_10ms(
             active,
             neteq_lock_wait: Duration::ZERO,
             neteq: None,
-            callback_record: callback_record_enabled().then(|| CallbackRenderRecord {
+            callback_record: record_enabled.then(|| CallbackRenderRecord {
                 block_index: 0,
                 stream_id: 0,
                 active,
@@ -859,11 +987,11 @@ fn render_neteq_stream_10ms(
         };
     };
     let wait = lock_start.elapsed();
-    let diagnostics_before = callback_record_enabled().then(|| shared.diagnostics());
+    let diagnostics_before = record_enabled.then(|| shared.diagnostics());
     let render_start = Instant::now();
     let result = shared.get_audio_10ms(now, out);
     let render_duration = render_start.elapsed();
-    let diagnostics_after = callback_record_enabled().then(|| shared.diagnostics());
+    let diagnostics_after = record_enabled.then(|| shared.diagnostics());
     drop(shared);
     let total_duration = lock_start.elapsed();
     source.source.assist.note_direct_render(total_duration);
@@ -872,7 +1000,7 @@ fn render_neteq_stream_10ms(
         active,
         neteq_lock_wait: wait,
         neteq: Some(result),
-        callback_record: callback_record_enabled().then(|| CallbackRenderRecord {
+        callback_record: record_enabled.then(|| CallbackRenderRecord {
             block_index: 0,
             stream_id: 0,
             active,

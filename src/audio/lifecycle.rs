@@ -18,6 +18,7 @@ use opus_codec::{Channels, Decoder, SampleRate};
 
 use crate::{
     audio::{
+        AudioReportHub,
         backend::with_audio_backend_stderr_suppressed,
         capture::{
             EchoCancellationControl, EchoReferenceSource, OpusVoiceEncoder, run_encoder_worker,
@@ -72,6 +73,7 @@ pub struct LiveCaptureConfig {
     /// Shared three-state voice mode. Muted and deafened states both drive the
     /// outgoing fade/silence transition.
     pub voice_state: Arc<crate::audio::AtomicVoiceState>,
+    pub(crate) audio_report: Arc<AudioReportHub>,
 }
 
 /// Resolved device parameters captured when a capture or playback stream
@@ -169,6 +171,7 @@ pub struct LivePlaybackConfig {
     pub feedback_sender: Option<Sender<LivePlaybackFeedback>>,
     pub echo_control: Option<Arc<EchoCancellationControl>>,
     pub output_volume_percent: Arc<AtomicU32>,
+    pub(crate) audio_report: Arc<AudioReportHub>,
 }
 
 pub struct Recording {
@@ -536,6 +539,7 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
             recycle_rx,
             stats.clone(),
             None,
+            None,
         )
     })?;
     with_audio_backend_stderr_suppressed(|| stream.play())
@@ -734,6 +738,10 @@ where
         let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
         let (recycle_tx, recycle_rx) = sync_channel(CALLBACK_QUEUE_CAPACITY);
         let stream = with_audio_backend_stderr_suppressed(|| {
+            let audio_report = config.audio_report.device_tap(
+                crate::audio::AudioReportDeviceDirection::Capture,
+                selection.device_rate,
+            );
             build_input_stream(
                 &device,
                 selection.supported_config.sample_format(),
@@ -743,6 +751,7 @@ where
                 recycle_rx,
                 stats.clone(),
                 Some(Arc::clone(&observer)),
+                Some(audio_report),
             )
         })?;
         Ok((stream, receiver, recycle_tx))
@@ -811,6 +820,7 @@ where
                 echo_source,
                 selection.device_rate,
                 worker_stats,
+                Arc::clone(&config.audio_report),
                 on_packet,
             );
         })
@@ -919,7 +929,15 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
     let echo_control = config.echo_control.clone();
     let observer = Arc::new(AudioCallbackBufferObserver::new("live_playback"));
     let build = |selection: &ConfigSelection| -> Result<Stream, AudioStartError> {
-        let mut mixer = LivePlaybackMixer::with_live_capacity(config.tuning);
+        let device_report = config.audio_report.device_tap(
+            crate::audio::AudioReportDeviceDirection::Playback,
+            selection.device_rate,
+        );
+        let mut mixer = LivePlaybackMixer::with_live_capacity_and_device_report(
+            config.tuning,
+            Arc::clone(&config.audio_report),
+            device_report,
+        );
         mixer.set_playout_hints(Arc::clone(&playout_hints));
         with_audio_backend_stderr_suppressed(|| {
             build_live_output_stream(
@@ -1001,6 +1019,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
                 feedback_sender,
                 worker_shared_snapshot,
                 worker_playout_hints,
+                config.audio_report,
             )
         })
         .map_err(|error| {
@@ -1169,6 +1188,7 @@ mod tests {
                 None,
                 shared_snapshot,
                 playout_hints,
+                AudioReportHub::new(),
             );
         });
 

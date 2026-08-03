@@ -446,6 +446,8 @@ pub(crate) struct App {
     pub settings_preview_refresh_id: Option<u64>,
     pub allow_settings_preview_capture: bool,
     pub playback: Option<LivePlayback>,
+    audio_report: Arc<audio::AudioReportHub>,
+    active_audio_report: Option<ActiveAudioReport>,
     /// Dedicated playback stream backing the settings loopback monitor when no
     /// call playback exists. `None` when loopback is off or reuses the live call
     /// playback. See [`App::set_loopback_enabled`].
@@ -534,6 +536,12 @@ pub(crate) struct App {
     /// Video connection authentication/protection selected by the current
     /// session handshake, including the concrete peer selected by control.
     video_transport: Option<crate::video::VideoTransport>,
+}
+
+struct ActiveAudioReport {
+    path: PathBuf,
+    deadline: Instant,
+    completion: Sender<Result<PathBuf, String>>,
 }
 
 /// A share this client can view: the secret to bring up a viewer connection and
@@ -926,6 +934,10 @@ pub(crate) enum AppEvent {
     },
     /// A bug report request from `chatt report-bug`, carrying the description.
     ReportBug(String),
+    AudioReport {
+        request: audio::AudioReportRequest,
+        completion: Sender<Result<PathBuf, String>>,
+    },
     /// The outbound screen share's capture or publisher thread ended abnormally,
     /// carrying a one-line reason for the user.
     ScreencastFailed {
@@ -1520,6 +1532,7 @@ impl App {
         };
         let video_fanout = crate::video::VideoFrameFanout::new(web_feed.clone());
         let voice_state = Arc::new(AtomicVoiceState::default());
+        let audio_report = audio::AudioReportHub::new();
         let app = Self {
             events,
             clients: HashMap::new(),
@@ -1557,6 +1570,8 @@ impl App {
             settings_preview_refresh_id: None,
             allow_settings_preview_capture: !soundboard_enabled,
             playback: None,
+            audio_report,
+            active_audio_report: None,
             loopback_playback: None,
             notification_playback: None,
             notification_playback_idle_at: None,
@@ -2141,6 +2156,10 @@ impl App {
             AppEvent::ConfigPath { reply } => self.handle_config_path(reply),
             AppEvent::Web(request) => self.handle_web_request(request),
             AppEvent::ReportBug(description) => self.start_bug_report(description),
+            AppEvent::AudioReport {
+                request,
+                completion,
+            } => self.start_audio_report(request, completion),
             AppEvent::ScreencastFailed {
                 attempt_id,
                 message,
@@ -6169,6 +6188,13 @@ impl App {
     pub(crate) fn tick(&mut self) -> DirtySections {
         let now = Instant::now();
         let mut dirty = DirtySections::EMPTY;
+        if self
+            .active_audio_report
+            .as_ref()
+            .is_some_and(|report| now >= report.deadline)
+        {
+            self.finish_audio_report(true);
+        }
         if self.start_pending_after_welcome() {
             dirty |= DirtySections::ALL;
         }
@@ -6215,6 +6241,9 @@ impl App {
                 .map(|pending| pending.deadline),
             self.pending_voice_teardown_at,
             self.notification_playback_idle_at,
+            self.active_audio_report
+                .as_ref()
+                .map(|report| report.deadline),
         ];
         let mut timeout = TICK_IDLE_INTERVAL;
         for deadline in deadlines.into_iter().flatten() {
@@ -8162,6 +8191,167 @@ impl App {
         self.set_status(diagnostics.status_summary());
     }
 
+    fn audio_report_snapshot(&self) -> audio::AudioReportSnapshot {
+        let (health_lines, recent_events) =
+            self.audio_diagnostics_sections(AUDIO_STATUS_EVENT_LIMIT);
+        let input_device = self
+            .capture
+            .as_ref()
+            .map(|capture| capture.device_info_live());
+        let active_playback = self
+            .playback
+            .as_ref()
+            .or(self.loopback_playback.as_ref())
+            .or(self.notification_playback.as_ref());
+        let output_device = active_playback.map(|playback| playback.device_info_live());
+        let playback = active_playback
+            .map(|playback| playback.stats())
+            .unwrap_or_default();
+        let audio_notice = AudioDiagnostics::new(
+            playback.clone(),
+            self.encoder_profile,
+            self.voice_packets_received,
+            self.voice_bytes_received,
+            input_device.clone(),
+            output_device.clone(),
+            health_lines,
+            recent_events,
+        )
+        .notice_body();
+        audio::AudioReportSnapshot {
+            audio_notice,
+            input_device,
+            output_device,
+            capture: self
+                .capture
+                .as_ref()
+                .map(|capture| capture.stats().snapshot()),
+            playback,
+        }
+    }
+
+    fn audio_report_settings_json(&self) -> String {
+        let suppression = self.config.audio.suppression();
+        let typing = self.config.audio.typing_suppression();
+        let latency = self.config.audio.latency.to_tuning();
+        let voice = self.local_voice_state();
+        jsony::object! {
+            bitrate_bps: self.config.audio.bitrate_bps,
+            denoise_engine: self.config.audio.denoise.label(),
+            dred_mode: self.config.audio.dred.label(),
+            echo_cancellation: self.config.audio.echo_cancellation,
+            max_amplification: self.config.audio.max_amplification,
+            input_device_id: self.config.audio.input_device_id.as_deref(),
+            output_device_id: self.config.audio.output_device_id.as_deref(),
+            input_buffer_request: self.input_buffer_request().label(),
+            output_buffer_request: self.output_buffer_request().label(),
+            suppression: {
+                strength: suppression.strength,
+                release: suppression.release,
+            },
+            typing_suppression: {
+                enabled: typing.enabled,
+                vad_enter: typing.vad_enter,
+                vad_release: typing.vad_release,
+                release_confirm_ms: typing.release_confirm.as_millis() as u64,
+            },
+            latency_tuning: {
+                capture_silence_gate: latency.capture_silence_gate,
+                render_assist: latency.render_assist,
+                neteq_start_delay_ms: latency.neteq_start_delay.as_millis() as u64,
+                neteq_min_delay_ms: latency.neteq_min_delay.as_millis() as u64,
+                neteq_base_minimum_delay_ms: latency.neteq_base_minimum_delay.as_millis() as u64,
+                neteq_max_delay_ms: latency.neteq_max_delay.as_millis() as u64,
+                hard_queue_bound_ms: latency.hard_queue_bound.as_millis() as u64,
+                initial_buffer_ms: latency.initial_buffer.as_millis() as u64,
+                max_reorder_delay_ms: latency.max_reorder_delay.as_millis() as u64,
+                device_period_margin_ms: latency.device_period_margin.as_millis() as u64,
+                silence_vad_max: latency.silence_vad_max,
+                capture_long_silence_stop_ms: latency.capture_long_silence_stop.as_millis() as u64,
+                capture_silence_preroll_ms: latency.capture_silence_preroll.as_millis() as u64,
+                capture_silence_ramp_ms: latency.capture_silence_ramp.as_millis() as u64,
+            },
+            output_volume: self.config.audio.output_volume,
+            muted: matches!(voice, VoiceState::Muted),
+            deafened: matches!(voice, VoiceState::Deafened),
+            encoder_profile: self.encoder_profile.label(),
+        }
+    }
+
+    fn start_audio_report(
+        &mut self,
+        request: audio::AudioReportRequest,
+        completion: Sender<Result<PathBuf, String>>,
+    ) {
+        if let Some(active) = self.active_audio_report.as_ref() {
+            let _ = completion.send(Err(format!(
+                "audio report already active: {}",
+                active.path.display()
+            )));
+            return;
+        }
+        if self.audio_report.is_busy() {
+            let path = self
+                .audio_report
+                .active_path()
+                .unwrap_or_else(|| request.output.clone());
+            let _ = completion.send(Err(format!(
+                "audio report already active: {}",
+                path.display()
+            )));
+            return;
+        }
+        let duration = Duration::from_millis(request.duration_ms);
+        let path = request.output.clone();
+        let start = audio::AudioReportStart {
+            request,
+            settings_json: self.audio_report_settings_json(),
+            tuning: self.config.audio.latency.to_tuning(),
+            snapshot: self.audio_report_snapshot(),
+        };
+        match self.audio_report.start(start) {
+            Ok(()) => {
+                self.active_audio_report = Some(ActiveAudioReport {
+                    path,
+                    deadline: Instant::now() + duration,
+                    completion,
+                });
+            }
+            Err(error) => {
+                let _ = completion.send(Err(error));
+            }
+        }
+    }
+
+    fn finish_audio_report(&mut self, complete: bool) {
+        let Some(active) = self.active_audio_report.take() else {
+            return;
+        };
+        let finish = audio::AudioReportFinish {
+            snapshot: self.audio_report_snapshot(),
+            logs: crate::self_log::snapshot_plain_string(),
+            complete,
+        };
+        self.audio_report.finish_to(finish, active.completion);
+    }
+
+    fn finish_audio_report_on_shutdown(&mut self) {
+        let Some(active) = self.active_audio_report.take() else {
+            return;
+        };
+        let finish = audio::AudioReportFinish {
+            snapshot: self.audio_report_snapshot(),
+            logs: crate::self_log::snapshot_plain_string(),
+            complete: false,
+        };
+        let result = self
+            .audio_report
+            .finish(finish)
+            .recv()
+            .unwrap_or_else(|_| Err("audio report writer stopped".to_string()));
+        let _ = active.completion.send(result);
+    }
+
     /// Bundles recent logs plus audio and device diagnostics and ships them to
     /// the server as a bug report. Invoked by the `/report-bug` TUI command and
     /// the `chatt report-bug` CLI subcommand.
@@ -8445,6 +8635,7 @@ impl App {
             tuning: self.config.audio.latency.to_tuning(),
             echo_control: Some(Arc::clone(&self.echo_control)),
             voice_state: Arc::clone(&self.voice_state),
+            audio_report: Arc::clone(&self.audio_report),
         }
     }
 
@@ -8894,6 +9085,7 @@ impl App {
             feedback_sender,
             echo_control: Some(Arc::clone(&self.echo_control)),
             output_volume_percent: Arc::clone(&self.output_volume_percent_bits),
+            audio_report: Arc::clone(&self.audio_report),
         }
     }
 
@@ -9271,6 +9463,62 @@ mod tests {
         );
         assert!(metadata.contains("\"host\":\""), "{metadata}");
         assert!(metadata.contains("output: inactive"), "{metadata}");
+    }
+
+    #[test]
+    fn audio_report_rejects_concurrent_start_and_deadline_completes_it() {
+        let mut app = test_app();
+        app.config.audio.echo_cancellation = true;
+        app.config.audio.input_device_id = Some("input-for-report".to_string());
+        app.config.audio.output_device_id = Some("output-for-report".to_string());
+        app.config.audio.input_buffer = config::BufferSize::Samples(240);
+        app.config.audio.output_buffer = config::BufferSize::Samples(960);
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("active-report");
+        let (completion, result) = mpsc::channel();
+        app.handle_app_event(AppEvent::AudioReport {
+            request: audio::AudioReportRequest {
+                output: output.clone(),
+                duration_ms: 1_000,
+                label: Some("deadline test".to_string()),
+            },
+            completion,
+        });
+        assert!(app.active_audio_report.is_some());
+
+        let (second_completion, second_result) = mpsc::channel();
+        app.handle_app_event(AppEvent::AudioReport {
+            request: audio::AudioReportRequest {
+                output: parent.path().join("other-report"),
+                duration_ms: 1_000,
+                label: None,
+            },
+            completion: second_completion,
+        });
+        let error = second_result.recv().unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            format!("audio report already active: {}", output.display())
+        );
+
+        app.active_audio_report.as_mut().unwrap().deadline = Instant::now();
+        app.tick();
+        let completed = result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed, output);
+        let manifest = std::fs::read_to_string(output.join("manifest.json")).unwrap();
+        assert!(manifest.contains("\"complete\":true"), "{manifest}");
+        for setting in [
+            "\"echo_cancellation\":true",
+            "\"input_device_id\":\"input-for-report\"",
+            "\"output_device_id\":\"output-for-report\"",
+            "\"input_buffer_request\":\"240 frames\"",
+            "\"output_buffer_request\":\"960 frames\"",
+        ] {
+            assert!(manifest.contains(setting), "missing {setting}: {manifest}");
+        }
     }
 
     #[test]
@@ -15346,6 +15594,7 @@ impl Drop for App {
         // thread-spawn failures may unwind while render access is open. Drop
         // still needs the core projections to persist history and stop audio.
         self.acquire_core_state();
+        self.finish_audio_report_on_shutdown();
         self.save_room_catalog();
         self.stop_audio();
     }

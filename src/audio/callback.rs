@@ -5,6 +5,7 @@ use std::{
 
 use cpal::{FromSample, Sample};
 
+use crate::audio::AudioReportDeviceTap;
 use crate::audio::shared::{
     AudioStats, CaptureCallbackTiming, CapturedAudioChunk, audio_callback_logging_enabled,
     duration_to_us, optional_duration_to_us, peak_i16_scale, rms_i16_scale,
@@ -15,6 +16,7 @@ pub(super) struct CaptureCallbackCore {
     recycle: Receiver<Vec<f32>>,
     stats: AudioStats,
     device_rate: u32,
+    audio_report: Option<AudioReportDeviceTap>,
 }
 
 impl CaptureCallbackCore {
@@ -23,12 +25,14 @@ impl CaptureCallbackCore {
         recycle: Receiver<Vec<f32>>,
         stats: AudioStats,
         device_rate: u32,
+        audio_report: Option<AudioReportDeviceTap>,
     ) -> Self {
         Self {
             sender,
             recycle,
             stats,
             device_rate,
+            audio_report,
         }
     }
 
@@ -52,8 +56,32 @@ impl CaptureCallbackCore {
         let queue_depth_after_enqueue = self.stats.note_capture_chunk_enqueued();
         let expected_callback_delta_us =
             device_callback_period_us(samples as usize, self.device_rate);
-        let chunk = CapturedAudioChunk::new(mono, callback_at, timing, queue_depth_after_enqueue);
+        let mut chunk =
+            CapturedAudioChunk::new(mono, callback_at, timing, queue_depth_after_enqueue);
+        chunk.report_track_id = self
+            .audio_report
+            .as_ref()
+            .map(AudioReportDeviceTap::track_id);
+        let captured_at = callback_at
+            .checked_sub(timing.cpal_capture_to_callback)
+            .unwrap_or(callback_at);
+        if let Some(report) = &self.audio_report {
+            report.record_at(&chunk.samples, captured_at);
+        }
         if self.sender.try_send(chunk).is_ok() {
+            if let Some(report) = &self.audio_report {
+                report.record_capture_callback(
+                    callback_at,
+                    timing,
+                    samples,
+                    self.device_rate,
+                    queue_depth_after_enqueue,
+                    true,
+                    None,
+                    rms,
+                    peak,
+                );
+            }
             if audio_callback_logging_enabled() {
                 kvlog::info!(
                     "capture callback chunk queued",
@@ -79,6 +107,19 @@ impl CaptureCallbackCore {
             // dropped duration so the worker leaves a concealable timestamp gap
             // rather than splicing the media clock across the hole.
             let dropped = self.stats.record_dropped_chunk(samples);
+            if let Some(report) = &self.audio_report {
+                report.record_capture_callback(
+                    callback_at,
+                    timing,
+                    samples,
+                    self.device_rate,
+                    queue_depth_after_enqueue.saturating_sub(1),
+                    false,
+                    Some(dropped),
+                    rms,
+                    peak,
+                );
+            }
             if audio_callback_logging_enabled() {
                 kvlog::warn!(
                     "capture callback chunk dropped",
@@ -207,7 +248,17 @@ mod tests {
                 queue_depth,
             ))
             .unwrap();
-        let core = CaptureCallbackCore::new(sender, recycle, stats.clone(), SAMPLE_RATE);
+        let hub = crate::audio::AudioReportHub::new();
+        let core = CaptureCallbackCore::new(
+            sender,
+            recycle,
+            stats.clone(),
+            SAMPLE_RATE,
+            Some(hub.device_tap(
+                crate::audio::AudioReportDeviceDirection::Capture,
+                SAMPLE_RATE,
+            )),
+        );
 
         core.process(
             vec![0.1; 48],

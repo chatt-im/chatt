@@ -12,6 +12,7 @@ use opus_codec::DredDecoder;
 
 use crate::{
     audio::{
+        AudioReportHub,
         lifecycle::LivePlaybackCommand,
         playback::{
             LivePlaybackFeedbackState, LivePlaybackMixer, LivePlaybackMixerEvent,
@@ -57,8 +58,9 @@ pub(crate) fn run_live_decoder_worker(
     feedback_sender: Option<Sender<LivePlaybackFeedback>>,
     shared_snapshot: Arc<LivePlaybackSharedSnapshot>,
     hints: Arc<LivePlaybackPlayoutHints>,
+    audio_report: Arc<AudioReportHub>,
 ) {
-    let mut streams = LiveDecodeStreams::with_hints(tuning, hints);
+    let mut streams = LiveDecodeStreams::with_hints_and_report(tuning, hints, audio_report);
     let mut last_diagnostic_log: Option<Instant> = None;
 
     loop {
@@ -311,6 +313,7 @@ pub(crate) struct LiveDecodeStreams {
     /// Stopped streams whose NetEQ the worker keeps alive until the mixer acks
     /// the matching `StopStream`, so the mixer-side drop is never the last Arc.
     retiring: Vec<RetiringStream>,
+    audio_report: Arc<AudioReportHub>,
 }
 
 struct RetiringStream {
@@ -330,6 +333,14 @@ impl LiveDecodeStreams {
         tuning: LiveAudioTuning,
         hints: Arc<LivePlaybackPlayoutHints>,
     ) -> Self {
+        Self::with_hints_and_report(tuning, hints, AudioReportHub::new())
+    }
+
+    pub(crate) fn with_hints_and_report(
+        tuning: LiveAudioTuning,
+        hints: Arc<LivePlaybackPlayoutHints>,
+        audio_report: Arc<AudioReportHub>,
+    ) -> Self {
         Self {
             tuning,
             streams: HashMap::new(),
@@ -346,6 +357,7 @@ impl LiveDecodeStreams {
             trash_swap: Vec::with_capacity(PACKET_TRASH_CAPACITY),
             stops_pushed: 0,
             retiring: Vec::new(),
+            audio_report,
         }
     }
 
@@ -432,6 +444,7 @@ impl LiveDecodeStreams {
         packet: RemoteVoicePacket,
         now: Instant,
     ) -> Option<InsertOutcome> {
+        let report_packet = self.audio_report.is_active().then(|| packet.clone());
         let RemoteVoicePacket {
             stream_id,
             sequence,
@@ -441,6 +454,9 @@ impl LiveDecodeStreams {
             received_at,
         } = packet;
         if !self.ensure_entry(stream_id) {
+            if let Some(packet) = report_packet.as_ref() {
+                self.audio_report.record_rx(packet, None);
+            }
             return None;
         }
         if audio_pop_logging_enabled() {
@@ -459,7 +475,7 @@ impl LiveDecodeStreams {
             );
         }
         let stream = self.streams.get_mut(&stream_id)?;
-        match payload {
+        let outcome = match payload {
             VoicePayload::Silence => {
                 let muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
                 stream.observe_sender_silence(stream_id, sequence, muted, now);
@@ -483,7 +499,11 @@ impl LiveDecodeStreams {
                     InsertOutcome::Accepted
                 })
             }
+        };
+        if let Some(packet) = report_packet.as_ref() {
+            self.audio_report.record_rx(packet, outcome);
         }
+        outcome
     }
 
     /// Removes the worker's stream entry, returning the mixer source so the

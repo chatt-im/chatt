@@ -312,6 +312,7 @@ pub fn run_live_audio_file_playback_test(
         feedback_sender: Some(feedback_sender),
         echo_control: None,
         output_volume_percent: Arc::new(AtomicU32::new(config.output_volume.to_bits())),
+        audio_report: crate::audio::AudioReportHub::new(),
     })?;
 
     let mut report = LiveAudioFilePlaybackTestReport {
