@@ -92,6 +92,7 @@ mod imp {
     const OP_RELOAD_THEME: u8 = 7;
     const OP_CONFIG_PATH: u8 = 8;
     const OP_ATTACH: u8 = 9;
+    const OP_AUDIO_REPORT: u8 = 10;
     const OP_SEND_MESSAGE: u8 = 11;
     const OP_UPLOAD_BYTES: u8 = 12;
     const SCREENCAST_START: u8 = 0;
@@ -739,6 +740,14 @@ mod imp {
         room: Option<String>,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+    #[jsony(Binary, version)]
+    struct AudioReportControlRequest {
+        output: String,
+        duration_ms: u64,
+        label: Option<String>,
+    }
+
     #[derive(Debug)]
     enum Request {
         Upload {
@@ -757,6 +766,7 @@ mod imp {
             follow: bool,
         },
         ReportBug(String),
+        AudioReport(crate::audio::AudioReportRequest),
         Attach(ClientHello),
         DaemonRpc(local_rpc::frame::ClientHello),
     }
@@ -1094,8 +1104,36 @@ mod imp {
             }
             return;
         }
+        if let Ok((Request::AudioReport(request), _fds)) = request {
+            let (completion_tx, completion_rx) = mpsc::channel();
+            if events
+                .send(crate::app::AppEvent::AudioReport {
+                    request,
+                    completion: completion_tx,
+                })
+                .is_err()
+            {
+                let _ = write_response(&mut stream, STATUS_ERROR, "chatt client is not running");
+                return;
+            }
+            let _ = stream.set_read_timeout(None);
+            let _ = thread::Builder::new()
+                .name("chatt-audio-report-ctl".to_string())
+                .spawn(move || {
+                    let response = completion_rx.recv().unwrap_or_else(|_| {
+                        Err("chatt client stopped before completing audio report".to_string())
+                    });
+                    let (status, message) = match response {
+                        Ok(path) => (STATUS_OK, path.display().to_string()),
+                        Err(error) => (STATUS_ERROR, error),
+                    };
+                    let _ = write_response(&mut stream, status, &message);
+                });
+            return;
+        }
         let response = match request {
             Ok((Request::ClientLogs { .. }, _)) => unreachable!("handled above"),
+            Ok((Request::AudioReport(_), _)) => unreachable!("handled above"),
             Ok((Request::ReportBug(description), _)) => {
                 match events.send(crate::app::AppEvent::ReportBug(description)) {
                     Ok(()) => Response {
@@ -1387,6 +1425,57 @@ mod imp {
         }
     }
 
+    pub fn send_audio_report(
+        output: &Path,
+        duration: Duration,
+        label: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        let socket_path = socket_path()?;
+        send_audio_report_to_path(&socket_path, output, duration, label)
+    }
+
+    fn send_audio_report_to_path(
+        socket_path: &Path,
+        output: &Path,
+        duration: Duration,
+        label: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        if !output.is_absolute() {
+            return Err("audio-report output path must be absolute".to_string());
+        }
+        let output = output
+            .to_str()
+            .ok_or_else(|| "audio-report output path must be valid UTF-8".to_string())?;
+        let duration_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        if !(1_000..=300_000).contains(&duration_ms) {
+            return Err("audio-report duration must be between 1 and 300 seconds".to_string());
+        }
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(duration + Duration::from_secs(15)))
+            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+        let request = AudioReportControlRequest {
+            output: output.to_string(),
+            duration_ms,
+            label: label.map(ToOwned::to_owned),
+        };
+        write_simple_request(&mut stream, OP_AUDIO_REPORT, &jsony::to_binary(&request))?;
+        let response = read_response(&mut stream)?;
+        match response.status {
+            STATUS_OK => Ok(PathBuf::from(response.message)),
+            STATUS_ERROR => Err(response.message),
+            status => Err(format!("control socket returned unknown status {status}")),
+        }
+    }
+
     fn write_simple_request(
         stream: &mut UnixStream,
         opcode: u8,
@@ -1514,6 +1603,24 @@ mod imp {
             OP_REPORT_BUG => String::from_utf8(body)
                 .map(Request::ReportBug)
                 .map_err(|_| "bug report description is not UTF-8".to_string()),
+            OP_AUDIO_REPORT => {
+                let request: AudioReportControlRequest = jsony::from_binary(&body)
+                    .map_err(|error| format!("invalid audio-report request: {error}"))?;
+                let output = PathBuf::from(request.output);
+                if !output.is_absolute() {
+                    return Err("audio-report output path must be absolute".to_string());
+                }
+                if !(1_000..=300_000).contains(&request.duration_ms) {
+                    return Err(
+                        "audio-report duration must be between 1 and 300 seconds".to_string()
+                    );
+                }
+                Ok(Request::AudioReport(crate::audio::AudioReportRequest {
+                    output,
+                    duration_ms: request.duration_ms,
+                    label: request.label,
+                }))
+            }
             OP_ATTACH => jsony::from_binary(&body)
                 .map(Request::Attach)
                 .map_err(|error| format!("invalid attach hello: {error}")),
@@ -1900,6 +2007,25 @@ mod imp {
                     assert_eq!(request.path, path);
                     assert!(request.inline_bytes.is_none());
                     assert_eq!(room.as_deref(), Some("@alice"));
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn audio_report_request_round_trips_duration_label_and_path() {
+            let wire = AudioReportControlRequest {
+                output: "/tmp/chatt audio report".to_string(),
+                duration_ms: 42_000,
+                label: Some("persistent crunchy speech".to_string()),
+            };
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            write_simple_request(&mut writer, OP_AUDIO_REPORT, &jsony::to_binary(&wire)).unwrap();
+            match read_request(&mut reader).unwrap() {
+                Request::AudioReport(request) => {
+                    assert_eq!(request.output, PathBuf::from("/tmp/chatt audio report"));
+                    assert_eq!(request.duration_ms, 42_000);
+                    assert_eq!(request.label.as_deref(), Some("persistent crunchy speech"));
                 }
                 other => panic!("unexpected request: {other:?}"),
             }
@@ -2380,6 +2506,52 @@ mod imp {
         }
 
         #[test]
+        fn audio_report_waiter_does_not_block_control_accept_loop() {
+            let dir = temp_test_dir("audio-report-detached");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let output = dir.join("report");
+            let (events_tx, events_rx) = mpsc::channel();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), EventSender(events_tx)).unwrap();
+
+            let send_socket = socket_path.clone();
+            let send_output = output.clone();
+            let report = thread::spawn(move || {
+                send_audio_report_to_path(
+                    &send_socket,
+                    &send_output,
+                    Duration::from_secs(1),
+                    Some("detached"),
+                )
+            });
+            let completion = match events_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                crate::app::AppEvent::AudioReport {
+                    request,
+                    completion,
+                } => {
+                    assert_eq!(request.output, output);
+                    assert_eq!(request.duration_ms, 1_000);
+                    assert_eq!(request.label.as_deref(), Some("detached"));
+                    completion
+                }
+                _ => panic!("unexpected event"),
+            };
+
+            let voice = send_voice_to_path(&socket_path, VoiceCommand::ToggleMute).unwrap();
+            assert_eq!(voice, "mute toggle requested");
+            assert!(matches!(
+                events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                crate::app::AppEvent::Voice(VoiceCommand::ToggleMute)
+            ));
+
+            completion.send(Ok(output.clone())).unwrap();
+            assert_eq!(report.join().unwrap().unwrap(), output);
+            drop(socket);
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
         fn control_socket_output_volume_waits_for_reply() {
             let dir = temp_test_dir("output-volume-replies");
             fs::create_dir_all(&dir).unwrap();
@@ -2556,7 +2728,7 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
-    use std::path::Path;
+    use std::{path::Path, time::Duration};
 
     use crate::app::EventSender;
     use rpc::control::VoiceState;
@@ -2649,6 +2821,14 @@ mod imp {
         Err("chatt report-bug is only supported on Unix".to_string())
     }
 
+    pub fn send_audio_report(
+        _output: &Path,
+        _duration: Duration,
+        _label: Option<&str>,
+    ) -> Result<std::path::PathBuf, String> {
+        Err("chatt audio-report is only supported on Unix".to_string())
+    }
+
     pub(crate) fn connect_attach(
         _stdin_fd: i32,
         _stdout_fd: i32,
@@ -2680,8 +2860,8 @@ pub(crate) use imp::{
 };
 pub use imp::{
     ClientHello, ControlSocket, OutputVolumeCommand, ScreencastCommand, VoiceCommand,
-    send_client_logs, send_config_path, send_message, send_output_volume, send_reload_theme,
-    send_report_bug, send_screencast, send_upload, send_voice,
+    send_audio_report, send_client_logs, send_config_path, send_message, send_output_volume,
+    send_reload_theme, send_report_bug, send_screencast, send_upload, send_voice,
 };
 #[cfg(unix)]
 pub(crate) use imp::{RpcPeer, write_attach_ack, write_rpc_ack};

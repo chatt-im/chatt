@@ -12,6 +12,7 @@ mod term;
 use std::{
     io::{self, Read},
     path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::audio::{
@@ -183,6 +184,48 @@ until interrupted.",
             }],
             subs: &[],
             examples: &[],
+        },
+        Command {
+            name: "audio-report",
+            aliases: &[],
+            about: "Record temporary internal audio diagnostics from the running client.",
+            long_about: "Attaches to the running Chatt daemon, records bounded audio-pipeline taps for the requested interval, waits for every output file to be finalized, and prints the report directory.",
+            args: &[Arg {
+                name: "label",
+                value_name: "LABEL",
+                help: "Optional description stored verbatim in the manifest",
+                required: false,
+                possible: &[],
+            }],
+            flags: &[
+                Flag {
+                    long: "duration",
+                    short: "",
+                    value_name: "SECONDS",
+                    help: "Recording duration from 1 through 300 seconds (default: 30)",
+                    global: false,
+                    possible: &[],
+                },
+                Flag {
+                    long: "output",
+                    short: "",
+                    value_name: "DIR",
+                    help: "New report directory (must not already exist)",
+                    global: false,
+                    possible: &[],
+                },
+            ],
+            subs: &[],
+            examples: &[
+                Example {
+                    cmd: "audio-report --duration 30 \"persistent crunchy speech\"",
+                    help: "Record a labeled 30-second session.",
+                },
+                Example {
+                    cmd: "audio-report --duration 60 --output /tmp/chatt-case-a",
+                    help: "Write a 60-second report to an explicit directory.",
+                },
+            ],
         },
         Command {
             name: "report-bug",
@@ -457,6 +500,53 @@ static VOICE_SET: Command = Command {
     examples: &[],
 };
 
+fn parse_audio_report_duration(value: Option<&str>) -> Result<Duration, String> {
+    let seconds = match value {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            "audio-report duration must be an integer from 1 through 300".to_string()
+        })?,
+        None => 30,
+    };
+    if !(1..=300).contains(&seconds) {
+        return Err("audio-report duration must be from 1 through 300 seconds".to_string());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn audio_report_output_path(value: Option<&str>) -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("failed to resolve current directory: {error}"))?;
+    let path = match value {
+        Some(value) => {
+            let supplied = PathBuf::from(value);
+            if supplied.is_absolute() {
+                supplied
+            } else {
+                cwd.join(supplied)
+            }
+        }
+        None => {
+            let unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis());
+            cwd.join(format!(
+                "chatt-audio-report-{unix_ms}-{}",
+                std::process::id()
+            ))
+        }
+    };
+    if path.exists() {
+        return Err(format!(
+            "audio-report output path already exists: {}",
+            path.display()
+        ));
+    }
+    if path.to_str().is_none() {
+        return Err("audio-report output path must be valid UTF-8".to_string());
+    }
+    Ok(path)
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     let logfile =
@@ -543,6 +633,14 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(("client-logs", sub)) => {
             local_control::send_client_logs(sub.is_present("follow")).map_err(Into::into)
+        }
+        Some(("audio-report", sub)) => {
+            let duration = parse_audio_report_duration(sub.value_of("duration"))?;
+            let output = audio_report_output_path(sub.value_of("output"))?;
+            let completed =
+                local_control::send_audio_report(&output, duration, sub.value_of("label"))?;
+            println!("audio report: {}", completed.display());
+            Ok(())
         }
         Some(("report-bug", sub)) => {
             let description = sub.value_of("description").unwrap_or_default().trim();
@@ -1361,6 +1459,67 @@ mod tests {
         assert_eq!(sub.value_of("path"), Some("assets/sample-001.opus"));
         assert_eq!(sub.value_of("loss"), Some("random_60"));
         assert_eq!(sub.value_of("seed"), Some("0x1234"));
+    }
+
+    #[test]
+    fn parses_audio_report_defaults_and_explicit_values() {
+        let matches = run_matches(&["chatt", "audio-report"]);
+        let (name, sub) = matches.subcommand().unwrap();
+        assert_eq!(name, "audio-report");
+        assert_eq!(
+            parse_audio_report_duration(sub.value_of("duration")).unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(sub.value_of("label"), None);
+
+        let matches = run_matches(&[
+            "chatt",
+            "audio-report",
+            "--duration",
+            "60",
+            "--output",
+            "/tmp/chatt-case-a",
+            "persistent crunchy speech",
+        ]);
+        let (_, sub) = matches.subcommand().unwrap();
+        assert_eq!(
+            parse_audio_report_duration(sub.value_of("duration")).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(sub.value_of("output"), Some("/tmp/chatt-case-a"));
+        assert_eq!(sub.value_of("label"), Some("persistent crunchy speech"));
+    }
+
+    #[test]
+    fn audio_report_duration_rejects_out_of_range_and_non_integer_values() {
+        for value in ["0", "301", "1.5", "nope"] {
+            assert!(parse_audio_report_duration(Some(value)).is_err(), "{value}");
+        }
+        assert_eq!(
+            parse_audio_report_duration(Some("1")).unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            parse_audio_report_duration(Some("300")).unwrap(),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn audio_report_output_is_absolute_and_refuses_existing_path() {
+        let generated = audio_report_output_path(None).unwrap();
+        assert!(generated.is_absolute());
+        assert!(
+            generated
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("chatt-audio-report-")
+        );
+
+        let existing = tempfile::tempdir().unwrap();
+        let error = audio_report_output_path(existing.path().to_str()).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
     }
 
     #[test]

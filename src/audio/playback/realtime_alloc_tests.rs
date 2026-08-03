@@ -26,6 +26,10 @@ use crate::audio::shared::{
     audio_callback_logging_enabled, audio_pop_logging_enabled,
 };
 use crate::audio::test_support::test_tuning;
+use crate::audio::{
+    AudioReportFinish, AudioReportHub, AudioReportRequest, AudioReportSnapshot, AudioReportStart,
+    LivePlaybackSnapshot,
+};
 use crate::network::{EncoderNetworkProfile, EncoderNetworkTuning};
 use crate::test_alloc::assert_no_alloc;
 
@@ -264,6 +268,70 @@ fn two_stream_mix_with_limiter_never_allocates() {
             mix_now += Duration::from_millis(10);
         }
     });
+}
+
+#[test]
+fn active_audio_report_mixer_tap_never_allocates() {
+    init_flags();
+    let tuning = test_tuning();
+    let now = Instant::now();
+    let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+    let source = shared_tone_source(tuning, &mut encoder, 20, now);
+    let hub = AudioReportHub::new();
+    let capture_device = hub.device_tap(crate::audio::AudioReportDeviceDirection::Capture, 44_100);
+    let parent = tempfile::tempdir().unwrap();
+    hub.start(AudioReportStart {
+        request: AudioReportRequest {
+            output: parent.path().join("active"),
+            duration_ms: 1_000,
+            label: None,
+        },
+        settings_json: "{}".to_string(),
+        tuning,
+        snapshot: AudioReportSnapshot {
+            audio_notice: String::new(),
+            input_device: None,
+            output_device: None,
+            capture: None,
+            playback: LivePlaybackSnapshot::default(),
+        },
+    })
+    .unwrap();
+    let mut mixer = LivePlaybackMixer::with_live_capacity_and_report(tuning, Arc::clone(&hub));
+    mixer.ensure_stream(1, MixerStreamSource::NetEq(source));
+    let mut out = [0.0f32; MIX_FRAME_SAMPLES];
+    let mut mix_now = now;
+    assert_no_alloc("active audio-report stream tap", || {
+        for _ in 0..20 {
+            capture_device.record_at(&[1_000.0; 64], mix_now);
+            mixer.mix_10ms(mix_now, &mut out);
+            mixer.record_device_playback(&out, mix_now);
+            mixer.note_callback_metrics(
+                Duration::from_micros(200),
+                Duration::from_millis(10),
+                0,
+                Duration::from_micros(5),
+                Duration::from_micros(190),
+                MIX_FRAME_SAMPLES,
+                0,
+            );
+            mix_now += Duration::from_millis(10);
+        }
+    });
+    hub.finish(AudioReportFinish {
+        snapshot: AudioReportSnapshot {
+            audio_notice: String::new(),
+            input_device: None,
+            output_device: None,
+            capture: None,
+            playback: LivePlaybackSnapshot::default(),
+        },
+        logs: String::new(),
+        complete: true,
+    })
+    .recv_timeout(Duration::from_secs(2))
+    .unwrap()
+    .unwrap();
 }
 
 #[test]

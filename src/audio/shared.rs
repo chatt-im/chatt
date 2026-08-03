@@ -287,6 +287,7 @@ pub(crate) struct CapturedAudioChunk {
     pub enqueued_at: Instant,
     pub timing: CaptureCallbackTiming,
     pub queue_depth_after_enqueue: usize,
+    pub report_track_id: Option<u64>,
 }
 
 impl CapturedAudioChunk {
@@ -301,6 +302,7 @@ impl CapturedAudioChunk {
             enqueued_at,
             timing,
             queue_depth_after_enqueue,
+            report_track_id: None,
         }
     }
 }

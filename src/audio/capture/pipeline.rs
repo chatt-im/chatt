@@ -11,6 +11,7 @@ use nnnoiseless::DenoiseState;
 
 use crate::{
     audio::{
+        AudioReportHub,
         capture::{
             dsp::{
                 CaptureGain, CaptureGateDecision, CaptureHighPass, CaptureProcessor, EarshotVad,
@@ -86,6 +87,7 @@ pub(crate) fn run_live_encoder_worker<F>(
     echo_source: Option<EchoReferenceSource>,
     device_rate: u32,
     stats: AudioStats,
+    audio_report: Arc<AudioReportHub>,
     mut on_packet: F,
 ) where
     F: FnMut(LocalVoiceFrame) + Send + 'static,
@@ -104,6 +106,7 @@ pub(crate) fn run_live_encoder_worker<F>(
         echo_source,
         device_rate,
         &stats,
+        Arc::clone(&audio_report),
         &mut on_packet,
     );
     if let Err(error) = result {
@@ -180,6 +183,7 @@ pub(crate) fn run_live_encoder_worker_inner(
     echo_source: Option<EchoReferenceSource>,
     device_rate: u32,
     stats: &AudioStats,
+    audio_report: Arc<AudioReportHub>,
     on_packet: &mut dyn FnMut(LocalVoiceFrame),
 ) -> Result<(), String> {
     let mut pipeline = LiveEncoderPipeline::new(
@@ -193,6 +197,7 @@ pub(crate) fn run_live_encoder_worker_inner(
         echo_source,
         device_rate,
         voice_state.load(Ordering::Relaxed).is_muted(),
+        Arc::clone(&audio_report),
     );
     let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
 
@@ -202,6 +207,7 @@ pub(crate) fn run_live_encoder_worker_inner(
             enqueued_at,
             timing,
             queue_depth_after_enqueue,
+            report_track_id,
         } = chunk;
         let dequeued_at = Instant::now();
         let queue_depth_after_dequeue = stats.note_capture_chunk_dequeued();
@@ -243,6 +249,17 @@ pub(crate) fn run_live_encoder_worker_inner(
             },
         )?;
         let process_time = process_start.elapsed();
+        audio_report.record_capture_process(
+            report_track_id,
+            timing.callback_sequence,
+            queue_age,
+            queue_depth_after_enqueue,
+            queue_depth_after_dequeue,
+            process_time,
+            emitted_packets,
+            dropped_samples,
+            muted,
+        );
         if audio_pop_logging_enabled() {
             let expected_callback_delta_us =
                 duration_to_us(device_samples_to_duration(chunk.len(), device_rate));
@@ -341,6 +358,7 @@ pub(crate) struct LiveEncoderPipeline {
     /// Slaving anchor for [`Self::note_capture_timestamp`]. `None` until the
     /// first callback establishes it.
     capture_clock: Option<CaptureClock>,
+    audio_report: Arc<AudioReportHub>,
 }
 
 #[derive(Clone, Copy)]
@@ -368,6 +386,7 @@ impl LiveEncoderPipeline {
         echo_source: Option<EchoReferenceSource>,
         device_rate: u32,
         initial_muted: bool,
+        audio_report: Arc<AudioReportHub>,
     ) -> Self {
         let echo_enabled = echo_source.as_ref().is_some_and(|source| source.enabled());
         let gain_max_db = if auto_gain_enabled {
@@ -407,6 +426,7 @@ impl LiveEncoderPipeline {
             echo_reference_active: false,
             next_capture_sample: 0,
             capture_clock: None,
+            audio_report,
         }
     }
 
@@ -441,6 +461,7 @@ impl LiveEncoderPipeline {
             }
             None => chunk,
         };
+        self.audio_report.record_capture_input(chunk);
         let mut accumulator = self.take_accumulator();
         let result = accumulator.push_chunk(chunk, |frame| {
             self.process_accumulated_frame(frame, muted, stats, on_packet)
@@ -557,6 +578,7 @@ impl LiveEncoderPipeline {
         let rnnoise_vad = rnnoise_vad.unwrap_or_default();
         let vad_probability = rnnoise_vad.max(earshot_vad);
         self.typing_gate.process(rnnoise_vad, earshot_vad, frame);
+        self.audio_report.record_capture_processed(frame);
         store_processed_level_stats(stats, frame);
         stats.store_vad_probability(vad_probability);
         let vad = vad_to_u8(vad_probability);
@@ -797,6 +819,8 @@ impl LiveEncoderPipeline {
         self.pending_opus_samples.extend_from_slice(frame.samples);
 
         while self.pending_opus_samples.len() >= LIVE_OPUS_FRAME_SAMPLES {
+            self.audio_report
+                .record_capture_opus_input(&self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES]);
             let mut flags = self.next_opus_packet_flags;
             self.next_opus_packet_flags = 0;
             if self.silence_resume_hint_packets > 0 {
@@ -857,11 +881,13 @@ impl LiveEncoderPipeline {
             let packet_len = payload.len();
             self.sender_silence_active = false;
             self.silence_keepalive_frames = 0;
-            on_packet(LocalVoiceFrame {
+            let packet = LocalVoiceFrame {
                 flags,
                 payload,
                 timestamp,
-            });
+            };
+            self.audio_report.record_tx(&packet);
+            on_packet(packet);
             stats.record_encoded_packet(packet_len);
             self.pending_opus_samples.drain(..LIVE_OPUS_FRAME_SAMPLES);
             self.pending_start_sample = self
@@ -921,11 +947,13 @@ impl LiveEncoderPipeline {
         // The marker stands in for the slot just accounted on the clock, so
         // stamp that slot's first sample index.
         let timestamp = self.next_capture_sample.wrapping_sub(FRAME_SAMPLES as u32);
-        on_packet(LocalVoiceFrame {
+        let packet = LocalVoiceFrame {
             flags: LIVE_PACKET_FLAG_SILENCE_HINT | extra_flags,
             payload: VoicePayload::Silence,
             timestamp,
-        });
+        };
+        self.audio_report.record_tx(&packet);
+        on_packet(packet);
     }
 
     fn take_accumulator(&mut self) -> FrameAccumulator {
@@ -1014,6 +1042,7 @@ pub(crate) fn build_live_encoder_pipeline_with_initial_mute(
         echo_reference.map(EchoReferenceSource::Always),
         crate::audio::shared::SAMPLE_RATE,
         initial_muted,
+        AudioReportHub::new(),
     ))
 }
 
@@ -1819,6 +1848,7 @@ mod tests {
             None,
             device_rate,
             &stats,
+            AudioReportHub::new(),
             &mut |packet| packets.push(packet),
         )
         .unwrap();
@@ -2218,6 +2248,7 @@ mod tests {
             None,
             44_100,
             false,
+            AudioReportHub::new(),
         );
         let stats = AudioStats::new();
         let mut packets = Vec::new();
@@ -2314,6 +2345,7 @@ mod tests {
             Some(EchoReferenceSource::Controlled(Arc::clone(&control))),
             crate::audio::shared::SAMPLE_RATE,
             false,
+            AudioReportHub::new(),
         );
         let stats = AudioStats::new();
         let chunk = vec![0.0; FRAME_SAMPLES];
@@ -2365,6 +2397,7 @@ mod tests {
             Some(EchoReferenceSource::Controlled(Arc::clone(&control))),
             crate::audio::shared::SAMPLE_RATE,
             false,
+            AudioReportHub::new(),
         );
         let stats = AudioStats::new();
         let chunk = vec![0.0; FRAME_SAMPLES];

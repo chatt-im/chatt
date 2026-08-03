@@ -7,9 +7,11 @@ mod errors;
 mod lifecycle;
 mod notifications;
 mod playback;
+mod report;
 mod resample;
 mod shared;
 mod sim;
+mod wav;
 
 pub use capture::EchoCancellationControl;
 pub use device::{
@@ -24,6 +26,11 @@ pub use lifecycle::{
     start_live_playback, start_playback, start_recording,
 };
 pub use notifications::{NotificationSound, sound_samples};
+pub(crate) use report::{
+    AudioReportDeviceDirection, AudioReportDeviceTap, AudioReportFinish, AudioReportHub,
+    AudioReportPlaybackBlock, AudioReportRequest, AudioReportRoute, AudioReportSnapshot,
+    AudioReportStart,
+};
 pub use shared::{
     AtomicVoiceState, AudioStats, BufferRequest, CAPTURE_LONG_SILENCE_STOP_MS_RANGE,
     CAPTURE_SILENCE_PREROLL_MS_RANGE, CAPTURE_SILENCE_RAMP_MS_RANGE, CHANNELS,
