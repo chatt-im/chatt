@@ -18,7 +18,10 @@ chatt-message-format.path = "crates/message-format"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 opus-codec = { path = "crates/opus-codec", features = ["dred"] }
-aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
+aws-lc-rs = { version = "1.17.1", default-features = false, features = [
+    "alloc",
+    "non-fips",
+] }
 jsony = "0.1.10"
 rpc.path = "crates/rpc"
 local_rpc = { package = "chatt-local-rpc", path = "crates/local-rpc" }
@@ -28,7 +31,8 @@ darkhttp.path = "crates/darkhttp"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
 sendfd = "0.4.4"
 parking_lot = { version = "0.12.5", features = ["arc_lock"] }
-kvlog = { git = "https://github.com/exrok/kvlog", rev = "0e3092abc1a0be07683b42e689a2acef7cf6014b" }
+kvlog = { git = "https://github.com/exrok/kvlog", rev = "139b426d2050b5f9ad646ab8097d86e8ab0728e9" }
+#kvlog = { path = "/code/logging/kvlog" }
 annotate-snippets = "0.12.10"
 toml-spanner = { version = "1.0.3", features = [
     "to-toml",
@@ -36,7 +40,7 @@ toml-spanner = { version = "1.0.3", features = [
     "derive",
 ] }
 earshot = "1.1.0"
-zstd = { version =  "0.13", default-features = false }
+zstd = { version = "0.13", default-features = false }
 sonora.path = "crates/sonora/crates/sonora"
 sonora-agc2.path = "crates/sonora/crates/sonora-agc2"
 sonora-common-audio.path = "crates/sonora/crates/sonora-common-audio/"
@@ -153,17 +157,17 @@ workspace = true
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-collapsible_if = "allow" # Let-chains often obscure the staged checks in stateful code.
-field_reassign_with_default = "allow" # Defaults plus focused overrides are clearer for config and fixtures.
-items_after_test_module = "allow" # Inline tests should not dictate production item ordering.
-manual_is_multiple_of = "allow" # Modulo directly expresses protocol alignment, parity, and cadence checks.
-manual_range_patterns = "allow" # Protocol discriminants are clearer as explicit values.
-needless_return = "allow" # Explicit returns clarify exits from event and state-machine branches.
-question_mark = "allow" # Try expansion introduces code bloat.
-single_range_in_vec_init = "allow" # One range is a valid initial state for a mutable range collection.
-needless_range_loop = "allow" # Iterators can generate more code and perform worse in numeric loops.
+collapsible_if = "allow"                    # Let-chains often obscure the staged checks in stateful code.
+field_reassign_with_default = "allow"       # Defaults plus focused overrides are clearer for config and fixtures.
+items_after_test_module = "allow"           # Inline tests should not dictate production item ordering.
+manual_is_multiple_of = "allow"             # Modulo directly expresses protocol alignment, parity, and cadence checks.
+manual_range_patterns = "allow"             # Protocol discriminants are clearer as explicit values.
+needless_return = "allow"                   # Explicit returns clarify exits from event and state-machine branches.
+question_mark = "allow"                     # Try expansion introduces code bloat.
+single_range_in_vec_init = "allow"          # One range is a valid initial state for a mutable range collection.
+needless_range_loop = "allow"               # Iterators can generate more code and perform worse in numeric loops.
 needless_borrows_for_generic_args = "allow" # Consistently borrowing can reduce monomorphization.
-manual_find = "allow" # A manual loop can be clearer and avoids iterator compile-time cost.
+manual_find = "allow"                       # A manual loop can be clearer and avoids iterator compile-time cost.
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mls_build_async)'] }
