@@ -22,20 +22,22 @@ use crate::{
         AudioDeviceInfo, LivePlaybackSnapshot, StatsSnapshot,
         playback::{LivePlaybackOutputCallbackTiming, RingReader, SampleRing, SpscSwapQueue},
         shared::{
-            CaptureCallbackTiming, FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LiveAudioTuning,
-            SAMPLE_RATE,
+            CaptureCallbackTiming, FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
+            LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTuning, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE,
         },
         wav::WavF32Writer,
     },
     network::InsertOutcome,
 };
 use jsony::Jsony;
+use opus_codec::{Bandwidth, Channels, Decoder, DredDecoder, DredState, SampleRate};
 
 const SAMPLE_RING_SECONDS: usize = 10;
 const PLAYBACK_BLOCK_CAPACITY: usize = 512;
 const EVENT_CAPACITY: usize = 4096;
 const POLL: Duration = Duration::from_millis(2);
 const CAPTURE_SCALE: f32 = 1.0 / 32768.0;
+const RECEIVED_OPUS_REORDER_PACKETS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub(crate) struct AudioReportRequest {
@@ -900,11 +902,238 @@ impl OptionalWav {
 
 struct StreamFiles {
     packets: Option<BufWriter<File>>,
+    received_opus: Option<ReceivedOpusTrack>,
+    dred_inspector: Option<DredDecoder>,
     events: u64,
     fixture_packets: u64,
     first_packet_us: Option<u64>,
     last_packet_us: Option<u64>,
     first_reset_us: Option<u64>,
+}
+
+struct PendingReceivedOpus {
+    sequence: u32,
+    timestamp: u32,
+    flags: u8,
+    bytes: Vec<u8>,
+}
+
+/// Report-only, primary-packet decode kept deliberately separate from NetEq.
+/// A short reorder window restores media order; missing timestamp spans are
+/// written as zeroes and reset the decoder instead of invoking PLC/FEC/DRED.
+struct ReceivedOpusTrack {
+    decoder: Decoder,
+    wav: OptionalWav,
+    pending: Vec<PendingReceivedOpus>,
+    decode_i16: Vec<i16>,
+    decode_f32: Vec<f32>,
+    next_timestamp: Option<u32>,
+    max_gap_samples: u64,
+    samples: u64,
+    decoded_packets: u64,
+    decode_errors: u64,
+    stale_packets: u64,
+    inserted_gap_samples: u64,
+    omitted_gap_samples: u64,
+}
+
+impl ReceivedOpusTrack {
+    fn new(path: PathBuf, report_duration_ms: u64) -> Result<Self, String> {
+        let decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono)
+            .map_err(|error| format!("failed to create report Opus decoder: {error}"))?;
+        Ok(Self {
+            decoder,
+            wav: OptionalWav::new(path, 1.0),
+            pending: Vec::with_capacity(RECEIVED_OPUS_REORDER_PACKETS + 1),
+            decode_i16: vec![0; MAX_OPUS_DECODE_SAMPLES],
+            decode_f32: Vec::with_capacity(MAX_OPUS_DECODE_SAMPLES),
+            next_timestamp: None,
+            max_gap_samples: report_duration_ms
+                .saturating_mul(u64::from(SAMPLE_RATE))
+                .saturating_div(1_000),
+            samples: 0,
+            decoded_packets: 0,
+            decode_errors: 0,
+            stale_packets: 0,
+            inserted_gap_samples: 0,
+            omitted_gap_samples: 0,
+        })
+    }
+
+    fn push(
+        &mut self,
+        sequence: u32,
+        timestamp: u32,
+        flags: u8,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        self.pending.push(PendingReceivedOpus {
+            sequence,
+            timestamp,
+            flags,
+            bytes,
+        });
+        if self.pending.len() > RECEIVED_OPUS_REORDER_PACKETS {
+            self.flush_earliest()?;
+        }
+        Ok(())
+    }
+
+    fn flush_all(&mut self) -> Result<(), String> {
+        while !self.pending.is_empty() {
+            self.flush_earliest()?;
+        }
+        Ok(())
+    }
+
+    fn flush_earliest(&mut self) -> Result<(), String> {
+        let index = self
+            .pending
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                timestamp_order(left.timestamp, right.timestamp)
+                    .then_with(|| timestamp_order(left.sequence, right.sequence))
+            })
+            .map(|(index, _)| index)
+            .unwrap();
+        let packet = self.pending.remove(index);
+        if let Some(expected) = self.next_timestamp {
+            let delta = packet.timestamp.wrapping_sub(expected);
+            if delta >= 1 << 31 {
+                self.stale_packets += 1;
+                return Ok(());
+            }
+            if delta > 0 {
+                let gap = u64::from(delta);
+                if gap <= self.max_gap_samples {
+                    self.write_zeroes(gap)?;
+                    self.inserted_gap_samples += gap;
+                } else {
+                    self.omitted_gap_samples += gap;
+                }
+                let _ = self.decoder.reset();
+            }
+        }
+        if packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
+            let _ = self.decoder.reset();
+        }
+        match self
+            .decoder
+            .decode(&packet.bytes, &mut self.decode_i16, false)
+        {
+            Ok(decoded) if decoded > 0 => {
+                self.decode_f32.clear();
+                self.decode_f32.extend(
+                    self.decode_i16[..decoded]
+                        .iter()
+                        .map(|sample| f32::from(*sample) / 32768.0),
+                );
+                self.wav.write(&self.decode_f32)?;
+                self.samples += decoded as u64;
+                self.decoded_packets += 1;
+                self.next_timestamp = Some(packet.timestamp.wrapping_add(decoded as u32));
+            }
+            Ok(_) | Err(_) => {
+                self.decode_errors += 1;
+                self.next_timestamp = None;
+                let _ = self.decoder.reset();
+            }
+        }
+        Ok(())
+    }
+
+    fn write_zeroes(&mut self, mut samples: u64) -> Result<(), String> {
+        const ZEROES: [f32; FRAME_SAMPLES] = [0.0; FRAME_SAMPLES];
+        while samples > 0 {
+            let chunk = samples.min(FRAME_SAMPLES as u64) as usize;
+            self.wav.write(&ZEROES[..chunk])?;
+            self.samples += chunk as u64;
+            samples -= chunk as u64;
+        }
+        Ok(())
+    }
+}
+
+fn timestamp_order(left: u32, right: u32) -> std::cmp::Ordering {
+    if left == right {
+        std::cmp::Ordering::Equal
+    } else if right.wrapping_sub(left) < 1 << 31 {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Greater
+    }
+}
+
+struct OpusPacketInspection {
+    mode: Option<&'static str>,
+    bandwidth: Option<&'static str>,
+    channels: Option<usize>,
+    frame_count: Option<usize>,
+    samples_per_frame: Option<usize>,
+    sample_count: Option<usize>,
+    has_lbrr: Option<bool>,
+    dred_reach_samples: Option<usize>,
+    dred_end_samples: Option<i32>,
+}
+
+fn inspect_opus_packet(
+    bytes: &[u8],
+    dred_decoder: Option<&mut DredDecoder>,
+) -> OpusPacketInspection {
+    let mode = bytes.first().map(|toc| match toc >> 3 {
+        0..=11 => "silk",
+        12..=15 => "hybrid",
+        _ => "celt",
+    });
+    let bandwidth = opus_codec::packet_bandwidth(bytes)
+        .ok()
+        .map(bandwidth_label);
+    let channels = opus_codec::packet_channels(bytes)
+        .ok()
+        .map(Channels::as_usize);
+    let frame_count = opus_codec::packet_frame_count(bytes).ok();
+    let samples_per_frame = opus_codec::packet_samples_per_frame(bytes, SampleRate::Hz48000).ok();
+    let sample_count = opus_codec::packet_sample_count(bytes, SampleRate::Hz48000).ok();
+    let has_lbrr = opus_codec::packet_has_lbrr(bytes).ok();
+    let (dred_reach_samples, dred_end_samples) = dred_decoder
+        .and_then(|decoder| {
+            let mut state = DredState::new().ok()?;
+            let mut dred_end = 0;
+            let reach = decoder
+                .parse(
+                    &mut state,
+                    bytes,
+                    LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+                    SampleRate::Hz48000,
+                    &mut dred_end,
+                    true,
+                )
+                .ok()?;
+            Some((reach, dred_end))
+        })
+        .map_or((None, None), |(reach, end)| (Some(reach), Some(end)));
+    OpusPacketInspection {
+        mode,
+        bandwidth,
+        channels,
+        frame_count,
+        samples_per_frame,
+        sample_count,
+        has_lbrr,
+        dred_reach_samples,
+        dred_end_samples,
+    }
+}
+
+fn bandwidth_label(bandwidth: Bandwidth) -> &'static str {
+    match bandwidth {
+        Bandwidth::Narrowband => "narrowband",
+        Bandwidth::Mediumband => "mediumband",
+        Bandwidth::Wideband => "wideband",
+        Bandwidth::SuperWideband => "superwideband",
+        Bandwidth::Fullband => "fullband",
+    }
 }
 
 struct PlaybackStreamFiles {
@@ -1379,22 +1608,42 @@ impl WriterSession {
                 ..
             } => {
                 let replayable = outcome.is_some();
+                let accepted = outcome == Some(InsertOutcome::Accepted);
                 let outcome = outcome.map_or("ignored", |o| match o {
                     InsertOutcome::Accepted => "accepted",
                     InsertOutcome::Late => "late",
                 });
+                let inspection = if let Some(bytes) = opus.as_deref() {
+                    let entry = self.stream(stream_id)?;
+                    Some(inspect_opus_packet(bytes, entry.dred_inspector.as_mut()))
+                } else {
+                    None
+                };
                 let payload = opus.as_ref().map(|v| hex(v));
                 let row = match payload.as_deref() {
-                    Some(opus_hex) => jsony::object! {
-                        at_us,
-                        stream_id,
-                        sequence,
-                        timestamp,
-                        flags,
-                        kind: "opus",
-                        opus_hex,
-                        outcome,
-                    },
+                    Some(opus_hex) => {
+                        let inspection = inspection.as_ref().unwrap();
+                        jsony::object! {
+                            at_us,
+                            stream_id,
+                            sequence,
+                            timestamp,
+                            flags,
+                            kind: "opus",
+                            opus_hex,
+                            outcome,
+                            payload_bytes: opus.as_ref().unwrap().len(),
+                            opus_mode: inspection.mode,
+                            opus_bandwidth: inspection.bandwidth,
+                            opus_channels: inspection.channels,
+                            opus_frame_count: inspection.frame_count,
+                            opus_samples_per_frame: inspection.samples_per_frame,
+                            opus_sample_count: inspection.sample_count,
+                            opus_has_lbrr: inspection.has_lbrr,
+                            opus_dred_reach_samples: inspection.dred_reach_samples,
+                            opus_dred_end_samples: inspection.dred_end_samples,
+                        }
+                    }
                     None => jsony::object! {
                         at_us,
                         stream_id,
@@ -1444,6 +1693,19 @@ impl WriterSession {
                     entry.fixture_packets += 1;
                     entry.first_packet_us.get_or_insert(at_us);
                     entry.last_packet_us = Some(at_us);
+                }
+                if accepted && let Some(bytes) = opus {
+                    let path = streams_path.join(format!("{stream_id}-received-opus.wav"));
+                    let duration_ms = self.start.request.duration_ms;
+                    let entry = self.stream(stream_id)?;
+                    if entry.received_opus.is_none() {
+                        entry.received_opus = Some(ReceivedOpusTrack::new(path, duration_ms)?);
+                    }
+                    entry
+                        .received_opus
+                        .as_mut()
+                        .unwrap()
+                        .push(sequence, timestamp, flags, bytes)?;
                 }
             }
             AudioReportEvent::CaptureCallback {
@@ -1574,6 +1836,8 @@ impl WriterSession {
                 id,
                 StreamFiles {
                     packets: None,
+                    received_opus: None,
+                    dred_inspector: DredDecoder::new().ok(),
                     events: 0,
                     fixture_packets: 0,
                     first_packet_us: None,
@@ -1680,6 +1944,9 @@ impl WriterSession {
             }
         }
         for stream in self.streams.values_mut() {
+            if let Some(received_opus) = stream.received_opus.as_mut() {
+                received_opus.flush_all()?;
+            }
             if let Some(writer) = stream.packets.as_mut() {
                 writer.flush().map_err(|e| e.to_string())?;
                 writer
@@ -1799,6 +2066,29 @@ impl WriterSession {
             );
         }
         for (&id, stream) in self.streams.iter_mut() {
+            if let Some(received_opus) = stream.received_opus.as_mut() {
+                let samples = std::mem::replace(
+                    &mut received_opus.wav,
+                    OptionalWav::new(PathBuf::new(), 1.0),
+                )
+                .finish()?;
+                if samples > 0 {
+                    let first_us = stream.first_packet_us;
+                    let last_us = first_us.map(|first| {
+                        first.saturating_add(
+                            samples.saturating_sub(1) * 1_000_000 / u64::from(SAMPLE_RATE),
+                        )
+                    });
+                    files.insert(
+                        format!("streams/{id}-received-opus.wav"),
+                        FileRecord {
+                            count: samples,
+                            first_us,
+                            last_us,
+                        },
+                    );
+                }
+            }
             if stream.fixture_packets > 0 {
                 files.insert(
                     format!("streams/{id}.packets"),
@@ -1849,6 +2139,19 @@ impl WriterSession {
                 stream_id,
                 contained_opus_reset: stream.first_reset_us.is_some(),
                 first_reset_us: stream.first_reset_us,
+                received_opus: stream
+                    .received_opus
+                    .as_ref()
+                    .filter(|track| track.samples > 0)
+                    .map(|track| ReceivedOpusManifest {
+                        file: format!("streams/{stream_id}-received-opus.wav"),
+                        samples: track.samples,
+                        decoded_packets: track.decoded_packets,
+                        decode_errors: track.decode_errors,
+                        stale_packets: track.stale_packets,
+                        inserted_gap_samples: track.inserted_gap_samples,
+                        omitted_gap_samples: track.omitted_gap_samples,
+                    }),
             })
             .collect::<Vec<_>>();
         let manifest = manifest_json(
@@ -1882,6 +2185,19 @@ struct StreamManifest {
     stream_id: u32,
     contained_opus_reset: bool,
     first_reset_us: Option<u64>,
+    received_opus: Option<ReceivedOpusManifest>,
+}
+
+#[derive(Jsony)]
+#[jsony(Json)]
+struct ReceivedOpusManifest {
+    file: String,
+    samples: u64,
+    decoded_packets: u64,
+    decode_errors: u64,
+    stale_packets: u64,
+    inserted_gap_samples: u64,
+    omitted_gap_samples: u64,
 }
 
 #[derive(Jsony)]
@@ -2708,5 +3024,59 @@ mod tests {
         );
         assert!(manifest.contains("\"first_reset_us\":"), "{manifest}");
         assert!(output.join("streams/0-7.wav").exists());
+    }
+
+    #[test]
+    fn received_opus_baseline_reorders_and_records_packet_inspection() {
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("received-opus");
+        let hub = AudioReportHub::new();
+        start(&hub, output.clone(), None);
+        let packets = crate::audio::test_support::encode_live_dred_packets(
+            crate::network::EncoderNetworkProfile::EXCELLENT,
+            4,
+        );
+        for sequence in [0usize, 3, 2] {
+            hub.record_rx(
+                &crate::audio::RemoteVoicePacket {
+                    stream_id: 9,
+                    sequence: sequence as u32,
+                    timestamp: sequence as u32 * 960,
+                    flags: 0,
+                    payload: crate::audio::VoicePayload::Opus(packets[sequence].clone()),
+                    received_at: Instant::now(),
+                },
+                Some(InsertOutcome::Accepted),
+            );
+        }
+        finish(&hub, true, "");
+
+        let wav = fs::read(output.join("streams/9-received-opus.wav")).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(wav[40..44].try_into().unwrap()),
+            3_840 * 4
+        );
+        let rx = fs::read_to_string(output.join("rx-packets.jsonl")).unwrap();
+        for field in [
+            "\"payload_bytes\":",
+            "\"opus_mode\":",
+            "\"opus_bandwidth\":",
+            "\"opus_channels\":1",
+            "\"opus_frame_count\":1",
+            "\"opus_samples_per_frame\":960",
+            "\"opus_sample_count\":960",
+            "\"opus_has_lbrr\":",
+            "\"opus_dred_reach_samples\":",
+        ] {
+            assert!(rx.contains(field), "missing {field}: {rx}");
+        }
+        let manifest = fs::read_to_string(output.join("manifest.json")).unwrap();
+        assert!(manifest.contains("\"decoded_packets\":3"), "{manifest}");
+        assert!(manifest.contains("\"decode_errors\":0"), "{manifest}");
+        assert!(manifest.contains("\"stale_packets\":0"), "{manifest}");
+        assert!(
+            manifest.contains("\"inserted_gap_samples\":960"),
+            "{manifest}"
+        );
     }
 }

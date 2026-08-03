@@ -126,7 +126,7 @@ exclude = [
 debug = 0
 
 [profile.dev]
-debug = 0
+debug = 1
 opt-level = 1
 
 [profile.dev.package."*"]
