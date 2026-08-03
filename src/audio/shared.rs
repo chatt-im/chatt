@@ -3,7 +3,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -268,9 +268,9 @@ pub(crate) const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10)
 pub(crate) const LIVE_CAPTURE_MUTE_FADE: Duration = Duration::from_millis(60);
 pub(crate) const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 pub(crate) const MAX_OPUS_PACKET_BYTES: usize = 1_500;
-pub(crate) const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
+pub(crate) static AUDIO_DIAGNOSTICS_LOGS: kvlog::EnvGuard =
+    kvlog::EnvGuard::new("CHATT_AUDIO_DIAGNOSTICS");
 pub(crate) const AUDIO_POP_DELTA_THRESHOLD: f32 = 0.025;
-pub(crate) const AUDIO_CALLBACK_LOG_ENV: &str = "CHATT_AUDIO_CALLBACK_LOG";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CaptureCallbackTiming {
@@ -1060,31 +1060,6 @@ pub(crate) fn peak_normalized(samples: &[f32]) -> f32 {
         .map(|sample| sample.abs())
         .fold(0.0, f32::max)
         .clamp(0.0, 1.0)
-}
-
-pub(crate) fn audio_pop_logging_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag_enabled(AUDIO_POP_LOG_ENV))
-}
-
-/// True when kvlog diagnostics on CPAL callback threads are enabled. Logging
-/// from a callback locks the global logger and can allocate, so it is opt-in.
-/// Initialize eagerly at stream build so the env read never runs on a callback.
-pub(crate) fn audio_callback_logging_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag_enabled(AUDIO_CALLBACK_LOG_ENV))
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    let Ok(value) = std::env::var(name) else {
-        return false;
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return false;
-    }
-    let normalized = value.to_ascii_lowercase();
-    !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
 }
 
 pub(crate) fn vad_to_u8(vad_probability: f32) -> u8 {

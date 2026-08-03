@@ -11,7 +11,7 @@ env.RUST_BACKTRACE = "1"
 env.CHATT_RUN_DIR = { if.profile = "public", then = "/tmp/public-dev-chatt-server/", or_else = { if.profile = "plaintext", then = "/tmp/plaintext-dev-chatt-server/", or_else = "/tmp/private-dev-chatt-server/" } }
 env.CHATT_SERVER_CONFIG = { if.profile = "public", then = "dev/public-server.toml", or_else = { if.profile = "plaintext", then = "dev/plaintext-server.toml", or_else = "dev/private-server.toml" } }
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
-env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_DIAGNOSTICS = { if.profile = "pop", then = "1", or_else = "0" }
 ready.when.output_contains = "chatt server listening"
 allow_multiple = "distinct_profiles"
 ready.timeout = 10.0
@@ -27,8 +27,7 @@ env.RUST_BACKTRACE = "1"
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
 env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
-env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
-env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_DIAGNOSTICS = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
 sh = '''
 RUNTIME_CONFIG=/tmp/chatt-dev/config/alice.toml
@@ -54,8 +53,7 @@ cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
 env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
-env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
-env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_DIAGNOSTICS = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
 sh = '''
 RUNTIME_CONFIG=/tmp/chatt-dev/config/alice.toml
@@ -81,8 +79,7 @@ cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
 env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
-env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
-env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_DIAGNOSTICS = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
 sh = '''
 RUNTIME_CONFIG=/tmp/chatt-dev/config/alice.toml
@@ -108,7 +105,7 @@ cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/bob"
 env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
-env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_DIAGNOSTICS = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-bob-playback.wav", or_else = "" }
 sh = '''
 RUNTIME_CONFIG=/tmp/chatt-dev/config/bob.toml
@@ -134,7 +131,7 @@ cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/soundboard"
 env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
-env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_DIAGNOSTICS = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-soundboard-playback.wav", or_else = "" }
 sh = '''
 RUNTIME_CONFIG=/tmp/chatt-dev/config/soundboard.toml

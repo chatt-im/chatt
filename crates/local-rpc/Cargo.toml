@@ -13,6 +13,6 @@ name = "local_rpc"
 chatt-ids = { path = "../ids" }
 chatt-video = { path = "../video" }
 jsony = "0.1.10"
-kvlog = { git = "https://github.com/exrok/kvlog", rev = "0e3092abc1a0be07683b42e689a2acef7cf6014b", default-features = false }
+kvlog = { git = "https://github.com/exrok/kvlog", rev = "139b426d2050b5f9ad646ab8097d86e8ab0728e9", default-features = false }
 libc = "0.2"
 uuid = { version = "1.7.0", default-features = false }

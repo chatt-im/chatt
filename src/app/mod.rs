@@ -542,6 +542,7 @@ struct ActiveAudioReport {
     path: PathBuf,
     deadline: Instant,
     completion: Sender<Result<PathBuf, String>>,
+    diagnostics_logs_were_enabled: bool,
 }
 
 /// A share this client can view: the secret to bring up a viewer connection and
@@ -8309,15 +8310,19 @@ impl App {
             tuning: self.config.audio.latency.to_tuning(),
             snapshot: self.audio_report_snapshot(),
         };
+        let diagnostics_logs_were_enabled = audio::AUDIO_DIAGNOSTICS_LOGS.is_enabled();
+        audio::AUDIO_DIAGNOSTICS_LOGS.set(true);
         match self.audio_report.start(start) {
             Ok(()) => {
                 self.active_audio_report = Some(ActiveAudioReport {
                     path,
                     deadline: Instant::now() + duration,
                     completion,
+                    diagnostics_logs_were_enabled,
                 });
             }
             Err(error) => {
+                audio::AUDIO_DIAGNOSTICS_LOGS.set(diagnostics_logs_were_enabled);
                 let _ = completion.send(Err(error));
             }
         }
@@ -8332,6 +8337,7 @@ impl App {
             logs: crate::self_log::snapshot_plain_string(),
             complete,
         };
+        audio::AUDIO_DIAGNOSTICS_LOGS.set(active.diagnostics_logs_were_enabled);
         self.audio_report.finish_to(finish, active.completion);
     }
 
@@ -8344,6 +8350,7 @@ impl App {
             logs: crate::self_log::snapshot_plain_string(),
             complete: false,
         };
+        audio::AUDIO_DIAGNOSTICS_LOGS.set(active.diagnostics_logs_were_enabled);
         let result = self
             .audio_report
             .finish(finish)
@@ -9476,6 +9483,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let output = parent.path().join("active-report");
         let (completion, result) = mpsc::channel();
+        let diagnostics_logs_were_enabled = audio::AUDIO_DIAGNOSTICS_LOGS.is_enabled();
         app.handle_app_event(AppEvent::AudioReport {
             request: audio::AudioReportRequest {
                 output: output.clone(),
@@ -9485,6 +9493,7 @@ mod tests {
             completion,
         });
         assert!(app.active_audio_report.is_some());
+        assert!(audio::AUDIO_DIAGNOSTICS_LOGS.is_enabled());
 
         let (second_completion, second_result) = mpsc::channel();
         app.handle_app_event(AppEvent::AudioReport {
@@ -9508,6 +9517,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(completed, output);
+        assert_eq!(
+            audio::AUDIO_DIAGNOSTICS_LOGS.is_enabled(),
+            diagnostics_logs_were_enabled
+        );
         let manifest = std::fs::read_to_string(output.join("manifest.json")).unwrap();
         assert!(manifest.contains("\"complete\":true"), "{manifest}");
         for setting in [

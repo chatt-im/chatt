@@ -7,8 +7,8 @@ use cpal::{FromSample, Sample};
 
 use crate::audio::AudioReportDeviceTap;
 use crate::audio::shared::{
-    AudioStats, CaptureCallbackTiming, CapturedAudioChunk, audio_callback_logging_enabled,
-    duration_to_us, optional_duration_to_us, peak_i16_scale, rms_i16_scale,
+    AUDIO_DIAGNOSTICS_LOGS, AudioStats, CaptureCallbackTiming, CapturedAudioChunk, duration_to_us,
+    optional_duration_to_us, peak_i16_scale, rms_i16_scale,
 };
 
 pub(super) struct CaptureCallbackCore {
@@ -82,23 +82,21 @@ impl CaptureCallbackCore {
                     peak,
                 );
             }
-            if audio_callback_logging_enabled() {
-                kvlog::info!(
-                    "capture callback chunk queued",
-                    callback_sequence = timing.callback_sequence,
-                    samples,
-                    device_rate = self.device_rate,
-                    expected_callback_delta_us,
-                    callback_delta_us = optional_duration_to_us(timing.callback_delta),
-                    cpal_callback_ns = timing.cpal_callback_ns,
-                    cpal_capture_ns = timing.cpal_capture_ns,
-                    cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
-                    cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
-                    queue_depth_after_enqueue,
-                    rms,
-                    peak
-                );
-            }
+            kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+                "capture callback chunk queued",
+                callback_sequence = timing.callback_sequence,
+                samples,
+                device_rate = self.device_rate,
+                expected_callback_delta_us,
+                callback_delta_us = optional_duration_to_us(timing.callback_delta),
+                cpal_callback_ns = timing.cpal_callback_ns,
+                cpal_capture_ns = timing.cpal_capture_ns,
+                cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
+                cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
+                queue_depth_after_enqueue,
+                rms,
+                peak
+            );
         } else {
             let _ = self.stats.note_capture_chunk_dequeued();
             // The encoder worker is behind, so this chunk is lost. Surface the
@@ -120,25 +118,23 @@ impl CaptureCallbackCore {
                     peak,
                 );
             }
-            if audio_callback_logging_enabled() {
-                kvlog::warn!(
-                    "capture callback chunk dropped",
-                    callback_sequence = timing.callback_sequence,
-                    samples,
-                    device_rate = self.device_rate,
-                    expected_callback_delta_us,
-                    callback_delta_us = optional_duration_to_us(timing.callback_delta),
-                    cpal_callback_ns = timing.cpal_callback_ns,
-                    cpal_capture_ns = timing.cpal_capture_ns,
-                    cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
-                    cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
-                    queue_depth_after_enqueue = queue_depth_after_enqueue.saturating_sub(1),
-                    dropped_chunks = dropped,
-                    rms,
-                    peak
-                );
-            }
-            if dropped.is_power_of_two() && audio_callback_logging_enabled() {
+            kvlog::warn!(AUDIO_DIAGNOSTICS_LOGS;
+                "capture callback chunk dropped",
+                callback_sequence = timing.callback_sequence,
+                samples,
+                device_rate = self.device_rate,
+                expected_callback_delta_us,
+                callback_delta_us = optional_duration_to_us(timing.callback_delta),
+                cpal_callback_ns = timing.cpal_callback_ns,
+                cpal_capture_ns = timing.cpal_capture_ns,
+                cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
+                cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
+                queue_depth_after_enqueue = queue_depth_after_enqueue.saturating_sub(1),
+                dropped_chunks = dropped,
+                rms,
+                peak
+            );
+            if dropped.is_power_of_two() {
                 kvlog::warn!(
                     "capture worker backpressure dropped chunk",
                     dropped_chunks = dropped

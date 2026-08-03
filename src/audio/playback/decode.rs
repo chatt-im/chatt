@@ -23,11 +23,11 @@ use crate::{
             neteq::{NetEqDiagnostics, NetEqPreparedPacket, PACKET_TRASH_CAPACITY, Packet},
         },
         shared::{
-            FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE, LIVE_PACKET_FLAG_MUTE,
+            AUDIO_DIAGNOSTICS_LOGS, FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE, LIVE_PACKET_FLAG_MUTE,
             LIVE_PLAYBACK_DRAIN_INTERVAL, LiveAudioTraceWriter, LiveAudioTuning,
             LivePlaybackFeedback, LivePlaybackSnapshot, LivePlaybackStreamActivity,
-            PlaybackStreamControl, RemoteVoicePacket, VoicePayload, audio_pop_logging_enabled,
-            duration_to_ms, samples_to_duration, samples_to_ms,
+            PlaybackStreamControl, RemoteVoicePacket, VoicePayload, duration_to_ms,
+            samples_to_duration, samples_to_ms,
         },
     },
     network::InsertOutcome,
@@ -459,21 +459,19 @@ impl LiveDecodeStreams {
             }
             return None;
         }
-        if audio_pop_logging_enabled() {
-            kvlog::info!(
-                "audio pop playback packet dequeued",
-                stream_id,
-                sequence,
-                media_timestamp = timestamp,
-                flags,
-                payload_kind = match &payload {
-                    VoicePayload::Opus(_) => "opus",
-                    VoicePayload::Silence => "silence",
-                },
-                receive_to_worker_us =
-                    now.saturating_duration_since(received_at).as_micros() as u64
-            );
-        }
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+            "audio pop playback packet dequeued",
+            stream_id,
+            sequence,
+            media_timestamp = timestamp,
+            flags,
+            payload_kind = match &payload {
+                VoicePayload::Opus(_) => "opus",
+                VoicePayload::Silence => "silence",
+            },
+            receive_to_worker_us =
+                now.saturating_duration_since(received_at).as_micros() as u64
+        );
         let stream = self.streams.get_mut(&stream_id)?;
         let outcome = match payload {
             VoicePayload::Silence => {
@@ -483,16 +481,14 @@ impl LiveDecodeStreams {
             }
             VoicePayload::Opus(opus) => {
                 let late = stream.insert_audio(timestamp, sequence, flags, opus, now);
-                if audio_pop_logging_enabled() {
-                    kvlog::info!(
-                        "audio pop playback packet inserted",
-                        stream_id,
-                        sequence,
-                        media_timestamp = timestamp,
-                        flags,
-                        late
-                    );
-                }
+                kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+                    "audio pop playback packet inserted",
+                    stream_id,
+                    sequence,
+                    media_timestamp = timestamp,
+                    flags,
+                    late
+                );
                 Some(if late {
                     InsertOutcome::Late
                 } else {
@@ -1035,16 +1031,14 @@ impl LiveDecodeStream {
             self.control_mute_fallback_at = None;
             self.control_fallback_active = false;
         }
-        if audio_pop_logging_enabled() {
-            kvlog::info!(
-                "audio pop decode sender silence marker",
-                stream_id,
-                sequence,
-                muted,
-                control_muted = self.control_muted,
-                control_fallback_active = self.control_fallback_active
-            );
-        }
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+            "audio pop decode sender silence marker",
+            stream_id,
+            sequence,
+            muted,
+            control_muted = self.control_muted,
+            control_fallback_active = self.control_fallback_active
+        );
     }
 
     pub(crate) fn set_control_muted(&mut self, muted: bool) {
@@ -1091,16 +1085,14 @@ impl LiveDecodeStream {
             self.control_mute_fallback_at = None;
             self.control_fallback_active = false;
         }
-        if audio_pop_logging_enabled() {
-            kvlog::info!(
-                "audio pop decode control mute pending applied",
-                stream_id,
-                muted,
-                sender_muted = self.sender_muted,
-                media_muted = self.media_muted,
-                fallback_armed = self.control_mute_fallback_at.is_some()
-            );
-        }
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+            "audio pop decode control mute pending applied",
+            stream_id,
+            muted,
+            sender_muted = self.sender_muted,
+            media_muted = self.media_muted,
+            fallback_armed = self.control_mute_fallback_at.is_some()
+        );
     }
 
     fn activate_control_mute_fallback_if_due(&mut self, now: Instant, stream_id: u32) {
@@ -1118,13 +1110,11 @@ impl LiveDecodeStream {
             self.sender_silence_pending = true;
         }
         lock_shared_stream(&self.source.shared).set_idle_expand_stats_suppressed(true);
-        if audio_pop_logging_enabled() {
-            kvlog::info!(
-                "audio pop decode control mute fallback activated",
-                stream_id,
-                sender_muted = self.sender_muted
-            );
-        }
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+            "audio pop decode control mute fallback activated",
+            stream_id,
+            sender_muted = self.sender_muted
+        );
     }
 
     fn prefill_render_assist(&mut self, now: Instant) {

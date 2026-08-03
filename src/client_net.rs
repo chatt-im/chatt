@@ -11,7 +11,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicU8, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
     },
@@ -64,8 +64,8 @@ use std::net::IpAddr;
 
 use crate::app::{NetworkEventSender, PairingEventSender};
 use crate::audio::{
-    LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
-    VoicePayload as AudioVoicePayload,
+    AUDIO_DIAGNOSTICS_LOGS, LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink,
+    LocalVoiceFrame, RemoteVoicePacket, VoicePayload as AudioVoicePayload,
 };
 use crate::config::{CandidatePrivacy, DownloadTarget, E2ePeerPin, EffectiveFiles};
 use crate::e2e::{AcceptedPeerIdentity, AuthenticatedChat, E2eState};
@@ -152,7 +152,6 @@ const P2P_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// is the hard send-stop, while staying well above [`P2P_KEEPALIVE_INTERVAL`] so
 /// answered keepalives keep it fresh.
 const P2P_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
-const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
 const AUDIO_POP_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
 const AUDIO_POP_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
@@ -3883,12 +3882,10 @@ impl WorkerState<'_> {
                 kvlog::debug!("media fast-path command reached chatt-net fallback");
             }
             NetworkCommand::SetVoiceState(state) => {
-                if audio_pop_logging_enabled() {
-                    kvlog::info!(
-                        "audio pop control voice state tx",
-                        state = ?state
-                    );
-                }
+                kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+                    "audio pop control voice state tx",
+                    state = ?state
+                );
                 self.queue_control(ClientControl::SetVoiceState { state })?;
             }
             NetworkCommand::StartShare {
@@ -5600,13 +5597,11 @@ impl WorkerState<'_> {
                     user_id = user_id.0,
                     state = ?state
                 );
-                if audio_pop_logging_enabled() {
-                    kvlog::info!(
-                        "audio pop control voice state rx",
-                        user_id = user_id.0,
-                        state = ?state
-                    );
-                }
+                kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+                    "audio pop control voice state rx",
+                    user_id = user_id.0,
+                    state = ?state
+                );
                 let _ = self
                     .events
                     .send(NetworkEvent::VoiceStateChanged { user_id, state });
@@ -6696,23 +6691,6 @@ fn audio_payload_from_media(payload: MediaVoicePayload) -> AudioVoicePayload {
     }
 }
 
-fn audio_pop_logging_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag_enabled(AUDIO_POP_LOG_ENV))
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    let Ok(value) = std::env::var(name) else {
-        return false;
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return false;
-    }
-    let normalized = value.to_ascii_lowercase();
-    !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-}
-
 fn log_audio_pop_media_packet(
     direction: &'static str,
     route: &'static str,
@@ -6723,10 +6701,10 @@ fn log_audio_pop_media_packet(
     payload_size: usize,
     payload_kind: &'static str,
 ) {
-    if !audio_pop_logging_enabled() || !audio_pop_should_log_packet(flags, payload_kind) {
+    if !audio_pop_should_log_packet(flags, payload_kind) {
         return;
     }
-    kvlog::info!(
+    kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
         "audio pop media packet",
         direction,
         route,
