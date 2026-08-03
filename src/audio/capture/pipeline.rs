@@ -23,12 +23,12 @@ use crate::{
         },
         resample::CaptureResampler,
         shared::{
-            AUDIO_POP_DELTA_THRESHOLD, AudioStats, CapturedAudioChunk, DenoiseConfig,
-            DenoiseSuppression, DenoiseTypingSuppression, FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE,
-            LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE, LIVE_PACKET_FLAG_OPUS_RESET,
-            LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning,
-            LiveEncoderProfile, LocalVoiceFrame, MAX_OPUS_PACKET_BYTES, VoicePayload,
-            apply_gain_ramp, audio_pop_logging_enabled, convert_i16_scale_to_pcm_i16,
+            AUDIO_DIAGNOSTICS_LOGS, AUDIO_POP_DELTA_THRESHOLD, AudioStats, CapturedAudioChunk,
+            DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression, FRAME_SAMPLES,
+            LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
+            LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
+            LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning, LiveEncoderProfile, LocalVoiceFrame,
+            MAX_OPUS_PACKET_BYTES, VoicePayload, apply_gain_ramp, convert_i16_scale_to_pcm_i16,
             duration_to_us, max_adjacent_delta, mute_gain_step, optional_duration_to_us,
             peak_normalized, rms_normalized, samples_for_duration, vad_to_u8,
         },
@@ -220,8 +220,8 @@ pub(crate) fn run_live_encoder_worker_inner(
         // The software-drop counter no longer drives the clock (the timestamp path
         // covers it); drain and log it purely as a backpressure signal.
         let dropped_samples = stats.take_dropped_capture_samples();
-        if dropped_samples > 0 && audio_pop_logging_enabled() {
-            kvlog::info!(
+        if dropped_samples > 0 {
+            kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                 "audio pop capture software drop observed",
                 callback_sequence = timing.callback_sequence,
                 dropped_device_samples = dropped_samples,
@@ -260,28 +260,25 @@ pub(crate) fn run_live_encoder_worker_inner(
             dropped_samples,
             muted,
         );
-        if audio_pop_logging_enabled() {
-            let expected_callback_delta_us =
-                duration_to_us(device_samples_to_duration(chunk.len(), device_rate));
-            kvlog::info!(
-                "audio pop capture chunk processed",
-                callback_sequence = timing.callback_sequence,
-                samples = chunk.len(),
-                device_rate,
-                expected_callback_delta_us,
-                callback_delta_us = optional_duration_to_us(timing.callback_delta),
-                cpal_callback_ns = timing.cpal_callback_ns,
-                cpal_capture_ns = timing.cpal_capture_ns,
-                cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
-                cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
-                queue_age_us = duration_to_us(queue_age),
-                queue_depth_after_enqueue,
-                queue_depth_after_dequeue,
-                process_us = duration_to_us(process_time),
-                emitted_packets,
-                muted,
-            );
-        }
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+            "audio pop capture chunk processed",
+            callback_sequence = timing.callback_sequence,
+            samples = chunk.len(),
+            device_rate,
+            expected_callback_delta_us =
+                duration_to_us(device_samples_to_duration(chunk.len(), device_rate)),
+            callback_delta_us = optional_duration_to_us(timing.callback_delta),
+            cpal_callback_ns = timing.cpal_callback_ns,
+            cpal_capture_ns = timing.cpal_capture_ns,
+            cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
+            cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
+            queue_age_us = duration_to_us(queue_age),
+            queue_depth_after_enqueue,
+            queue_depth_after_dequeue,
+            process_us = duration_to_us(process_time),
+            emitted_packets,
+            muted,
+        );
         let _ = recycle.try_send(chunk);
     }
 
@@ -607,7 +604,7 @@ impl LiveEncoderPipeline {
             .unwrap_or(CaptureGateDecision::TransmitCurrent {
                 silence_hint: false,
             });
-        if audio_pop_logging_enabled() {
+        if AUDIO_DIAGNOSTICS_LOGS.is_enabled() {
             let slot_start = self.next_capture_sample.wrapping_sub(FRAME_SAMPLES as u32);
             let (decision_label, silence_hint, resume_frames) = match &decision {
                 CaptureGateDecision::TransmitCurrent { silence_hint } => {
@@ -616,7 +613,7 @@ impl LiveEncoderPipeline {
                 CaptureGateDecision::SuppressCurrent => ("suppress", false, 0),
                 CaptureGateDecision::Resume(frames) => ("resume", false, frames.len()),
             };
-            kvlog::info!(
+            kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                 "audio pop capture frame decision",
                 slot_start_sample = slot_start,
                 next_capture_sample = self.next_capture_sample,
@@ -677,10 +674,7 @@ impl LiveEncoderPipeline {
                 gate.reset();
             }
         }
-        if !audio_pop_logging_enabled() {
-            return;
-        }
-        kvlog::info!(
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
             "audio pop capture mute transition",
             transition_id = self.mute_transition_id,
             muted,
@@ -715,7 +709,7 @@ impl LiveEncoderPipeline {
         on_packet: &mut dyn FnMut(LocalVoiceFrame),
     ) -> Result<(), String> {
         let target = if muted { 0.0 } else { 1.0 };
-        let log_enabled = audio_pop_logging_enabled();
+        let log_enabled = AUDIO_DIAGNOSTICS_LOGS.is_enabled();
         let gain_before = self.mute_gain;
         let was_suppressed = self.mute_suppressed;
         let input_first = frame.first().copied().unwrap_or_default();
@@ -747,7 +741,7 @@ impl LiveEncoderPipeline {
             self.mute_suppressed = false;
             self.reset_opus_stream()?;
             if log_enabled {
-                kvlog::info!(
+                kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                     "audio pop capture mute resume",
                     transition_id = self.mute_transition_id,
                     pending_opus_samples = self.pending_opus_samples.len(),
@@ -770,7 +764,7 @@ impl LiveEncoderPipeline {
                 || self.mute_gain < 1.0
                 || input_max_delta >= AUDIO_POP_DELTA_THRESHOLD)
         {
-            kvlog::info!(
+            kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                 "audio pop capture mute ramp",
                 transition_id = self.mute_transition_id,
                 muted,
@@ -835,25 +829,22 @@ impl LiveEncoderPipeline {
             )?;
             let encode_us = encode_start.elapsed().as_micros() as u64;
             let timestamp = self.pending_start_sample;
-            if audio_pop_logging_enabled() {
-                kvlog::info!(
-                    "audio pop capture encoded packet timing",
-                    media_timestamp = timestamp,
-                    flags,
-                    payload_size = payload.len(),
-                    pending_opus_samples = self.pending_opus_samples.len(),
-                    encode_us
-                );
-            }
-            if audio_pop_logging_enabled()
-                && (flags != 0
-                    || self.mute_gain < 1.0
-                    || self.mute_suppressed
-                    || max_adjacent_delta(&self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES])
-                        >= AUDIO_POP_DELTA_THRESHOLD)
+            kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+                "audio pop capture encoded packet timing",
+                media_timestamp = timestamp,
+                flags,
+                payload_size = payload.len(),
+                pending_opus_samples = self.pending_opus_samples.len(),
+                encode_us
+            );
+            if flags != 0
+                || self.mute_gain < 1.0
+                || self.mute_suppressed
+                || max_adjacent_delta(&self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES])
+                    >= AUDIO_POP_DELTA_THRESHOLD
             {
                 let samples = &self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES];
-                kvlog::info!(
+                kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                     "audio pop capture encoded packet",
                     transition_id = self.mute_transition_id,
                     media_timestamp = timestamp,
@@ -929,10 +920,10 @@ impl LiveEncoderPipeline {
         if entering_sender_silence {
             self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
         }
-        if entering_sender_silence && audio_pop_logging_enabled() {
+        if entering_sender_silence {
             let flags = LIVE_PACKET_FLAG_SILENCE_HINT | extra_flags;
             let timestamp = self.next_capture_sample.wrapping_sub(FRAME_SAMPLES as u32);
-            kvlog::info!(
+            kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                 "audio pop capture silence marker",
                 transition_id = self.mute_transition_id,
                 media_timestamp = timestamp,
@@ -968,15 +959,13 @@ impl LiveEncoderPipeline {
         self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
         self.sender_silence_active = true;
         self.silence_keepalive_frames = 0;
-        if audio_pop_logging_enabled() {
-            kvlog::info!(
-                "audio pop capture opus reset",
-                transition_id = self.mute_transition_id,
-                next_capture_sample = self.next_capture_sample,
-                mute_gain = self.mute_gain,
-                mute_suppressed = self.mute_suppressed
-            );
-        }
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+            "audio pop capture opus reset",
+            transition_id = self.mute_transition_id,
+            next_capture_sample = self.next_capture_sample,
+            mute_gain = self.mute_gain,
+            mute_suppressed = self.mute_suppressed
+        );
         Ok(())
     }
 

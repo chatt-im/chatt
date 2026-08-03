@@ -22,8 +22,8 @@ use crate::audio::capture::OpusVoiceEncoder;
 use crate::audio::device::drain_live_playback_mixer_events;
 use crate::audio::playback::stream::LivePlaybackPlayoutHints;
 use crate::audio::shared::{
-    DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LiveAudioTuning, SAMPLE_RATE,
-    audio_callback_logging_enabled, audio_pop_logging_enabled,
+    AUDIO_DIAGNOSTICS_LOGS, DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LiveAudioTuning,
+    SAMPLE_RATE,
 };
 use crate::audio::test_support::test_tuning;
 use crate::audio::{
@@ -36,8 +36,7 @@ use crate::test_alloc::assert_no_alloc;
 const OUTPUT_SIZE_SAMPLES: usize = SAMPLE_RATE as usize / 100;
 
 fn init_flags() {
-    let _ = audio_pop_logging_enabled();
-    let _ = audio_callback_logging_enabled();
+    let _ = AUDIO_DIAGNOSTICS_LOGS.is_enabled();
 }
 
 fn encode_tone(encoder: &mut OpusVoiceEncoder, base: usize) -> Vec<u8> {

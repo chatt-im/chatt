@@ -338,7 +338,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "imagesize",
  "jsony",
- "kvlog 0.1.6",
+ "kvlog",
  "libc",
  "memchr",
  "mimalloc",
@@ -368,7 +368,7 @@ name = "chatt-ids"
 version = "0.1.0"
 dependencies = [
  "jsony",
- "kvlog 0.1.5",
+ "kvlog",
  "toml-spanner",
  "uuid",
 ]
@@ -380,7 +380,7 @@ dependencies = [
  "chatt-ids",
  "chatt-video",
  "jsony",
- "kvlog 0.1.5",
+ "kvlog",
  "libc",
  "uuid",
 ]
@@ -1024,29 +1024,13 @@ checksum = "8116d59990025388dfe1382f58b3ad82729312538a9a4b81a1dcdee8a17bee49"
 
 [[package]]
 name = "kvlog"
-version = "0.1.5"
-source = "git+https://github.com/exrok/kvlog?rev=0e3092abc1a0be07683b42e689a2acef7cf6014b#0e3092abc1a0be07683b42e689a2acef7cf6014b"
-dependencies = [
- "itoa",
- "kvlog-macros 0.1.1",
- "uuid",
-]
-
-[[package]]
-name = "kvlog"
 version = "0.1.6"
 source = "git+https://github.com/exrok/kvlog?rev=139b426d2050b5f9ad646ab8097d86e8ab0728e9#139b426d2050b5f9ad646ab8097d86e8ab0728e9"
 dependencies = [
  "itoa",
- "kvlog-macros 0.1.2",
+ "kvlog-macros",
  "uuid",
 ]
-
-[[package]]
-name = "kvlog-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175e52cba734851ef3ed52c39c5df2937b5ffe912d3ab0c757bb53aa8e58b522"
 
 [[package]]
 name = "kvlog-macros"
@@ -1966,7 +1950,7 @@ dependencies = [
  "foldhash",
  "hashbrown 0.17.1",
  "jsony",
- "kvlog 0.1.5",
+ "kvlog",
  "libc",
  "mimalloc",
  "mio",

@@ -4,8 +4,8 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     process::ExitCode,
+    sync::Arc,
     sync::mpsc,
-    sync::{Arc, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -243,7 +243,7 @@ const CONTROL_SEAL_BUDGET_RECORDS: usize = 32;
 /// overshoot the cap by at most [`READ_BUDGET_BYTES`] plus one chunk, far
 /// under the high water.
 const FILE_RELAY_WRITE_SOFT_CAP: usize = 1024 * 1024;
-const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
+static AUDIO_DIAGNOSTICS_LOGS: kvlog::EnvGuard = kvlog::EnvGuard::new("CHATT_AUDIO_DIAGNOSTICS");
 const AUDIO_POP_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
 const AUDIO_POP_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
@@ -7492,15 +7492,13 @@ impl Server {
             user_id = user_id.0,
             state = ?state
         );
-        if audio_pop_logging_enabled() {
-            kvlog::info!(
-                "audio pop control voice state relay",
-                session_id = session_id.0,
-                room_id = room_id.0,
-                user_id = user_id.0,
-                state = ?state
-            );
-        }
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+            "audio pop control voice state relay",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            user_id = user_id.0,
+            state = ?state
+        );
         self.broadcast_control(
             room_id,
             &ServerControl::VoiceStateChanged {
@@ -9585,23 +9583,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn audio_pop_logging_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag_enabled(AUDIO_POP_LOG_ENV))
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    let Ok(value) = std::env::var(name) else {
-        return false;
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return false;
-    }
-    let normalized = value.to_ascii_lowercase();
-    !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-}
-
 fn log_audio_pop_server_media_packet(
     direction: &'static str,
     session_id: SessionId,
@@ -9612,10 +9593,10 @@ fn log_audio_pop_server_media_packet(
     payload: &media::VoicePayloadRef<'_>,
     recipient_count: Option<usize>,
 ) {
-    if !audio_pop_logging_enabled() || !audio_pop_should_log_packet(flags, payload) {
+    if !audio_pop_should_log_packet(flags, payload) {
         return;
     }
-    kvlog::info!(
+    kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
         "audio pop server media packet",
         direction,
         session_id = session_id.0,

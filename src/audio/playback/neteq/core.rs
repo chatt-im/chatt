@@ -47,10 +47,10 @@ use super::redundancy::{DredInfo, FecInfo, parse_payload_redundancy};
 use super::sync_buffer::SyncBuffer;
 use super::tick_timer::{Stopwatch, TickTimer};
 use crate::audio::shared::{
-    DecodedFrameSource, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
-    LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_DRED_MAX_SAMPLES,
-    LiveAudioTuning, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE, apply_gain_ramp,
-    audio_pop_logging_enabled, duration_to_ms, mute_gain_step, samples_for_duration, samples_to_ms,
+    AUDIO_DIAGNOSTICS_LOGS, DecodedFrameSource, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES,
+    LIVE_PACKET_FLAG_MUTE, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME,
+    LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTuning, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE,
+    apply_gain_ramp, duration_to_ms, mute_gain_step, samples_for_duration, samples_to_ms,
 };
 
 /// Expand's overlap lookahead the sync buffer always retains (`5 * fs_mult` at
@@ -647,24 +647,22 @@ impl NetEqCore {
                 &self.tick_timer,
                 arrival_samples,
             );
-            if audio_pop_logging_enabled() {
-                kvlog::info!(
-                    "audio pop neteq packet arrived",
-                    sequence,
-                    datagram_timestamp = timestamp,
-                    packet_timestamp,
-                    packet_length_samples,
-                    priority_codec_level,
-                    priority_red_level,
-                    muted,
-                    flags,
-                    silence_resume,
-                    buffer_flush,
-                    should_update_stats,
-                    arrival_samples,
-                    arrival_delay_ms
-                );
-            }
+            kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+                "audio pop neteq packet arrived",
+                sequence,
+                datagram_timestamp = timestamp,
+                packet_timestamp,
+                packet_length_samples,
+                priority_codec_level,
+                priority_red_level,
+                muted,
+                flags,
+                silence_resume,
+                buffer_flush,
+                should_update_stats,
+                arrival_samples,
+                arrival_delay_ms
+            );
         }
 
         // Reference sets `new_codec_` only after the arrival loop, inside the

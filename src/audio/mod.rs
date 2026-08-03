@@ -31,6 +31,7 @@ pub(crate) use report::{
     AudioReportPlaybackBlock, AudioReportRequest, AudioReportRoute, AudioReportSnapshot,
     AudioReportStart,
 };
+pub(crate) use shared::AUDIO_DIAGNOSTICS_LOGS;
 pub use shared::{
     AtomicVoiceState, AudioStats, BufferRequest, CAPTURE_LONG_SILENCE_STOP_MS_RANGE,
     CAPTURE_SILENCE_PREROLL_MS_RANGE, CAPTURE_SILENCE_RAMP_MS_RANGE, CHANNELS,

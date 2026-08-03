@@ -16,9 +16,9 @@ use crate::audio::{
         lock_shared_stream, try_lock_shared_stream,
     },
     shared::{
-        AUDIO_POP_DELTA_THRESHOLD, LivePlaybackSnapshot, PlaybackStreamControl, SAMPLE_RATE,
-        audio_callback_logging_enabled, audio_pop_logging_enabled, db_to_gain, max_adjacent_delta,
-        peak_normalized, rms_normalized, samples_to_duration,
+        AUDIO_DIAGNOSTICS_LOGS, AUDIO_POP_DELTA_THRESHOLD, LivePlaybackSnapshot,
+        PlaybackStreamControl, SAMPLE_RATE, db_to_gain, max_adjacent_delta, peak_normalized,
+        rms_normalized, samples_to_duration,
     },
 };
 
@@ -489,9 +489,9 @@ impl LivePlaybackMixer {
             self.callback_render_blocks,
             self.callback_render_records_dropped,
         );
-        if audio_callback_logging_enabled() {
+        if AUDIO_DIAGNOSTICS_LOGS.is_enabled() {
             let timing = self.current_callback_timing;
-            kvlog::info!(
+            kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                 "callback",
                 callback_sequence = timing.callback_sequence,
                 us = duration_us(duration),
@@ -531,7 +531,7 @@ impl LivePlaybackMixer {
             return;
         }
         self.callback_overruns = self.callback_overruns.saturating_add(1);
-        if !audio_callback_logging_enabled() {
+        if !AUDIO_DIAGNOSTICS_LOGS.is_enabled() {
             return;
         }
         let now = Instant::now();
@@ -541,7 +541,7 @@ impl LivePlaybackMixer {
             return;
         }
         self.last_overrun_log_at = Some(now);
-        kvlog::warn!(
+        kvlog::warn!(AUDIO_DIAGNOSTICS_LOGS;
             "live playback callback overrun",
             duration_us = duration.as_micros().min(u64::MAX as u128) as u64,
             period_us = period.as_micros().min(u64::MAX as u128) as u64,
@@ -584,7 +584,7 @@ impl LivePlaybackMixer {
                 _ => {}
             }
         }
-        kvlog::info!(
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
             "live playback slow callback",
             total_us = duration_us(duration),
             render_us = duration_us(render_duration),
@@ -635,7 +635,7 @@ impl LivePlaybackMixer {
             after_packets,
             after_next_gap_ms,
         ) = diagnostics_fields(record.diagnostics_after.as_ref());
-        kvlog::info!(
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
             "live playback slow callback stream",
             block_index = record.block_index,
             stream_id = record.stream_id,
@@ -1092,7 +1092,7 @@ fn apply_declick(
 }
 
 fn callback_record_enabled() -> bool {
-    audio_callback_logging_enabled()
+    AUDIO_DIAGNOSTICS_LOGS.is_enabled()
 }
 
 fn push_callback_render_record(
@@ -1199,11 +1199,11 @@ impl LivePlaybackMixer {
             0.0
         };
         let max_delta = max_adjacent_delta(out);
-        if audio_pop_logging_enabled()
+        if AUDIO_DIAGNOSTICS_LOGS.is_enabled()
             && (first_delta >= AUDIO_POP_DELTA_THRESHOLD || max_delta >= AUDIO_POP_DELTA_THRESHOLD)
         {
             let timing = self.current_callback_timing;
-            kvlog::info!(
+            kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                 "audio pop mixer output block",
                 block_index = self.output_block_index,
                 callback_sequence = timing.callback_sequence,
@@ -1234,14 +1234,14 @@ impl LivePlaybackMixer {
     }
 
     fn log_playout_block_if_due(&self, block: usize, out: &[f32]) {
-        if !audio_pop_logging_enabled()
+        if !AUDIO_DIAGNOSTICS_LOGS.is_enabled()
             || self.streams.is_empty()
             || self.output_block_index % LIVE_PLAYBACK_PLAYOUT_LOG_INTERVAL_BLOCKS != 0
         {
             return;
         }
         let timing = self.current_callback_timing;
-        kvlog::info!(
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
             "audio pop playback playout block",
             block_index = self.output_block_index,
             callback_sequence = timing.callback_sequence,
@@ -1274,7 +1274,7 @@ impl LivePlaybackMixer {
                     let rendered_media_timestamp = diagnostics
                         .playout_media_timestamp
                         .wrapping_sub(MIX_FRAME_SAMPLES as u32);
-                    kvlog::info!(
+                    kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                         "audio pop playback playout stream",
                         block_index = self.output_block_index,
                         callback_sequence = self.current_callback_timing.callback_sequence,
@@ -1299,7 +1299,7 @@ impl LivePlaybackMixer {
                     );
                 }
                 ConsumerSource::Ring(_) => {
-                    kvlog::info!(
+                    kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                         "audio pop playback playout stream",
                         block_index = self.output_block_index,
                         callback_sequence = self.current_callback_timing.callback_sequence,
@@ -1344,7 +1344,7 @@ impl LivePlaybackMixer {
                     let rendered_media_timestamp = diagnostics
                         .playout_media_timestamp
                         .wrapping_sub(MIX_FRAME_SAMPLES as u32);
-                    kvlog::info!(
+                    kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                         "audio pop stream block",
                         block_index = self.output_block_index,
                         stream_id = record.stream_id,
@@ -1380,7 +1380,7 @@ impl LivePlaybackMixer {
                     let rendered_media_timestamp = diagnostics
                         .playout_media_timestamp
                         .wrapping_sub(MIX_FRAME_SAMPLES as u32);
-                    kvlog::info!(
+                    kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                         "audio pop stream block",
                         block_index = self.output_block_index,
                         stream_id = record.stream_id,
@@ -1409,7 +1409,7 @@ impl LivePlaybackMixer {
                     );
                 }
                 (ConsumerSource::Ring(_), _) => {
-                    kvlog::info!(
+                    kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                         "audio pop stream block",
                         block_index = self.output_block_index,
                         stream_id = record.stream_id,
@@ -1553,9 +1553,6 @@ impl LivePlaybackSharedSnapshot {
     ) {
         let is_xrun = kind == AudioErrorKind::Xrun;
         let Ok(mut inner) = self.inner.lock() else {
-            if !audio_callback_logging_enabled() {
-                return;
-            }
             if is_xrun {
                 kvlog::warn!("live playback backend xrun", error = error.as_str());
             } else {
@@ -1576,7 +1573,7 @@ impl LivePlaybackSharedSnapshot {
         }
         inner.snapshot.last_backend_error = Some(error.clone());
 
-        if !audio_callback_logging_enabled() {
+        if !AUDIO_DIAGNOSTICS_LOGS.is_enabled() {
             return;
         }
         if inner.last_backend_error_log_at.is_some_and(|at| {
@@ -1586,14 +1583,14 @@ impl LivePlaybackSharedSnapshot {
         }
         inner.last_backend_error_log_at = Some(now);
         if is_xrun {
-            kvlog::warn!(
+            kvlog::warn!(AUDIO_DIAGNOSTICS_LOGS;
                 "live playback backend xrun",
                 error = error.as_str(),
                 backend_xruns = inner.snapshot.backend_xruns,
                 backend_stream_errors = inner.snapshot.backend_stream_errors
             );
         } else {
-            kvlog::warn!(
+            kvlog::warn!(AUDIO_DIAGNOSTICS_LOGS;
                 "live playback backend stream error",
                 error = error.as_str(),
                 backend_xruns = inner.snapshot.backend_xruns,
