@@ -501,20 +501,33 @@ body {
   top: calc(var(--space) - 3px);
 }
 
-/* The timestamp always occupies the reserved gutter as a single right-aligned
+/* The timestamp always occupies the reserved gutter as a single flush-right
  * column. Absolute, so revealing it never affects layout or virtua's measure. */
 .message-time-gutter {
   position: absolute;
   left: 0;
   top: 1px;
   width: var(--gutter);
-  padding-right: var(--space);
-  text-align: right;
+  /* Flush right by flex alignment rather than `text-align`, and clipped to the
+   * gutter. A browser minimum-font-size setting clamps the 11px below upward
+   * with nothing in CSS able to observe it, so the gutter cannot be sized to
+   * fit; what a time too wide for it must not do is reach the message. A line
+   * is never laid out before its box's start edge, so a right-aligned one
+   * overflows rightward, over the sender name; flex alignment overflows the
+   * start edge instead, and the time runs off the left of the log. The gap to
+   * the message grows with the text so the two never appear to touch. */
+  display: flex;
+  justify-content: flex-end;
+  overflow: hidden;
+  white-space: nowrap;
+  padding-right: max(var(--space), 0.5em);
   color: var(--text-dim);
   font-size: 11px;
   /* Match the content's line-box height so the smaller time sits centered on
-   * the same line as the sender/body text it labels, rather than riding high. */
-  line-height: calc(var(--font-size) * var(--line-height));
+   * the same line as the sender/body text it labels, rather than riding high.
+   * The em floor keeps a clamped-up time inside the box `overflow` clips to,
+   * so its ascenders and descenders are not shaved off. */
+  line-height: max(calc(var(--font-size) * var(--line-height)), 1.3em);
   opacity: 0;
 }
 
