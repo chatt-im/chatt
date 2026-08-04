@@ -928,6 +928,12 @@ pub(crate) enum AppEvent {
         styled_diagnostics: bool,
         reply: Sender<Result<String, String>>,
     },
+    /// A stylesheet-reload request from `chatt reload-web-css`. Tells connected
+    /// browsers to re-fetch the user stylesheet; the reply reports whether a
+    /// browser view was there to tell.
+    ReloadWebCss {
+        reply: Sender<Result<String, String>>,
+    },
     /// A config-path query from `chatt reload-theme --watch`, so the watcher
     /// tracks the same file the running client will reload.
     ConfigPath {
@@ -1293,6 +1299,7 @@ fn spawn_web_feed(
     download_store: crate::receive_store::DownloadStore,
     max_upload_bytes: u64,
     room_name: String,
+    custom_css: Option<PathBuf>,
     events: &EventSender,
 ) -> Option<crate::web_server::WebFeedSender> {
     let (web_tx, web_rx) = mpsc::channel();
@@ -1303,6 +1310,7 @@ fn spawn_web_feed(
         web.readonly,
         max_upload_bytes,
         room_name,
+        custom_css,
     ) {
         Ok(feed) => feed,
         Err(error) => {
@@ -1526,6 +1534,7 @@ impl App {
                 download_store.clone(),
                 config.files.max_upload_bytes(),
                 room.room_name.clone(),
+                config.web_css_path(),
                 &events.tx,
             )
         } else {
@@ -2154,6 +2163,7 @@ impl App {
                 styled_diagnostics,
                 reply,
             } => self.handle_reload_theme(styled_diagnostics, reply),
+            AppEvent::ReloadWebCss { reply } => self.handle_reload_web_css(reply),
             AppEvent::ConfigPath { reply } => self.handle_config_path(reply),
             AppEvent::Web(request) => self.handle_web_request(request),
             AppEvent::ReportBug(description) => self.start_bug_report(description),
@@ -2339,6 +2349,18 @@ impl App {
             self.mark_daemon_config_changed();
         }
         let _ = reply.send(Ok("theme reloaded".to_string()));
+    }
+
+    /// Tells every connected browser to re-fetch the user stylesheet. The web
+    /// server reads the file per request, so nothing is reloaded here — this
+    /// only saves the reader a manual refresh.
+    fn handle_reload_web_css(&mut self, reply: Sender<Result<String, String>>) {
+        let Some(feed) = &self.web_feed else {
+            let _ = reply.send(Err("browser view is not running".to_string()));
+            return;
+        };
+        feed.reload_css();
+        let _ = reply.send(Ok("web css reloaded".to_string()));
     }
 
     fn handle_config_path(&mut self, reply: Sender<Result<String, String>>) {
@@ -6066,6 +6088,7 @@ impl App {
                 self.download_store.clone(),
                 self.config.files.max_upload_bytes(),
                 self.room.room_name.clone(),
+                self.config.web_css_path(),
                 &self.events.tx,
             );
             match feed {

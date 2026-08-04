@@ -36,6 +36,11 @@ use crate::web_wire::{self, Fragment, split_fragments};
 
 /// The path a browser opens a WebSocket on for the live feed.
 const WS_PATH: &str = "/ws";
+/// The optional user stylesheet, requested by every page load and applied after
+/// the bundled styles. Absent on most installs, so the route answers with an
+/// empty stylesheet rather than a `404` the browser would log.
+const USER_CSS_PATH: &str = "/web.css";
+const USER_CSS_CONTENT_TYPE: &str = "text/css; charset=UTF-8";
 /// Loopback HTTP requests should always make prompt progress. This is an idle
 /// progress deadline, not a total request-duration limit.
 const HTTP_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -452,6 +457,9 @@ enum WebFeed {
     },
     /// Read-only browser projection of the viewed DM's E2E security state.
     E2eSecurity { payload: String, active: bool },
+    /// Asks every browser to re-fetch [`USER_CSS_PATH`]. Not retained: a browser
+    /// that connects later fetches the current stylesheet with the page.
+    ReloadCss,
     /// A `share_available` envelope. The web thread retains it by `stream_id` and
     /// replays it to a browser that connects after the share started.
     ShareAvailable { stream_id: u32, payload: String },
@@ -505,7 +513,10 @@ impl WebFeed {
     fn retained_bytes(&self) -> usize {
         let heap = match self {
             Self::Message { message, .. } => message.heap_bytes(),
-            Self::Delete { .. } | Self::VideoFrame(_) | Self::Config { .. } => 0,
+            Self::Delete { .. }
+            | Self::VideoFrame(_)
+            | Self::Config { .. }
+            | Self::ReloadCss => 0,
             Self::DeleteError(payload)
             | Self::ActionError(payload)
             | Self::FileProgress(payload)
@@ -552,6 +563,7 @@ impl WebFeed {
             Self::Config { .. }
             | Self::SetRoomName { .. }
             | Self::E2eSecurity { .. }
+            | Self::ReloadCss
             | Self::ShareAvailable { .. }
             | Self::ShareEnded { .. } => FeedBudget::Unmetered,
             Self::DeleteError(_)
@@ -1013,6 +1025,12 @@ impl WebFeedSender {
         });
     }
 
+    /// Asks connected browsers to re-fetch the user stylesheet, applying an edit
+    /// without a manual page reload.
+    pub fn reload_css(&self) {
+        self.queue(WebFeed::ReloadCss);
+    }
+
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
         self.wake.wake();
@@ -1062,6 +1080,26 @@ fn files_route(store: DownloadStore) -> darkhttp::GeneratedHandler {
             None => darkhttp::GeneratedResponse::error(404),
         },
     )
+}
+
+/// Builds the `/web.css` handler serving the user's stylesheet from disk.
+///
+/// The file is read per request, so an edit reaches a browser on reload; disk
+/// serving keeps `Last-Modified`/`If-Modified-Since` revalidation. A missing
+/// file — the common case — is an empty stylesheet, because the page always
+/// requests this path and a `404` would be a console error on every load.
+fn user_css_route(path: Option<PathBuf>) -> darkhttp::GeneratedHandler {
+    Arc::new(move |request: &darkhttp::GeneratedRequest| {
+        // Nothing lives under the stylesheet, so a deeper path is not a miss
+        // that should fall back to the empty body.
+        if !request.relative.is_empty() {
+            return darkhttp::GeneratedResponse::error(404);
+        }
+        match &path {
+            Some(path) if path.is_file() => darkhttp::GeneratedResponse::file(path.clone()),
+            _ => darkhttp::GeneratedResponse::ok(USER_CSS_CONTENT_TYPE, ""),
+        }
+    })
 }
 
 /// Builds the `/highlight/<name>` handler serving a file's line-indexed
@@ -1156,6 +1194,9 @@ fn websocket_origins(cfg: &WebConfig, addr: SocketAddr) -> Vec<String> {
 /// path — so downloads resolve in any mode and from any directory without a
 /// captured mount.
 ///
+/// `custom_css` is the user stylesheet [`USER_CSS_PATH`] serves, read from disk
+/// per request so an edit needs only a browser reload.
+///
 /// # Errors
 ///
 /// Returns an error if `cfg.bind` is not a valid socket address or the listener
@@ -1174,6 +1215,7 @@ pub fn spawn(
         readonly,
         rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
         String::new(),
+        None,
     )
 }
 
@@ -1184,6 +1226,7 @@ pub fn spawn_with_upload_limit(
     readonly: bool,
     max_upload_bytes: u64,
     room_name: String,
+    custom_css: Option<PathBuf>,
 ) -> io::Result<WebFeedSender> {
     let addr: SocketAddr = cfg.bind.parse().map_err(|error| {
         io::Error::new(
@@ -1198,6 +1241,7 @@ pub fn spawn_with_upload_limit(
     #[cfg_attr(feature = "embed-web", allow(unused_mut))]
     let mut router = Router::new()
         .websocket(WS_PATH)
+        .mount_generated(USER_CSS_PATH, user_css_route(custom_css))
         .mount_generated("/files", files_route(download_store.clone()))
         .mount_generated("/highlight", highlight_route(download_store));
     #[cfg(not(feature = "embed-web"))]
@@ -2024,6 +2068,12 @@ fn run(
                     }
                     e2e_security = active.then_some(payload);
                 }
+                Ok(WebFeed::ReloadCss) => {
+                    let payload = reload_css_envelope();
+                    for id in &clients {
+                        let _ = server.send_websocket_text(*id, &payload);
+                    }
+                }
                 Ok(WebFeed::Config {
                     readonly: new_readonly,
                     autoplay: new_autoplay,
@@ -2225,6 +2275,12 @@ fn config_envelope(
                 placeholder: command.arg.placeholder(),
             }
         ],
+    }
+}
+
+fn reload_css_envelope() -> String {
+    jsony::object! {
+        type: "reload_css",
     }
 }
 
@@ -2915,6 +2971,82 @@ mod tests {
         assert!(body.contains(&chatt_message_format::highlight::HlClass::Keyword.as_u8()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawns a server whose only interesting route is the user stylesheet.
+    fn spawn_css_server(custom_css: Option<PathBuf>) -> WebFeedSender {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        spawn_with_upload_limit(
+            &cfg,
+            DownloadStore::new(1024),
+            web_tx,
+            true,
+            rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            String::new(),
+            custom_css,
+        )
+        .unwrap()
+    }
+
+    fn http_get(addr: SocketAddr, path: &str) -> (String, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).unwrap();
+        (headers, body)
+    }
+
+    #[test]
+    fn web_css_serves_user_stylesheet() {
+        let dir = std::env::temp_dir().join(format!("chatt-css-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let css = dir.join("web.css");
+        std::fs::write(&css, ":root { --bg: #101820; }\n").unwrap();
+
+        let sender = spawn_css_server(Some(css));
+        let (headers, body) = http_get(sender.local_addr(), "/web.css");
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+        assert!(headers.contains("text/css"), "{headers}");
+        assert_eq!(body, b":root { --bg: #101820; }\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_css_is_empty_when_file_absent() {
+        let missing = std::env::temp_dir().join(format!("chatt-no-css-{}/web.css", std::process::id()));
+        let sender = spawn_css_server(Some(missing));
+        let (headers, body) = http_get(sender.local_addr(), "/web.css");
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+        assert!(headers.contains("text/css"), "{headers}");
+        assert!(body.is_empty(), "{body:?}");
+
+        // A client without a resolvable config path answers the same way.
+        let sender = spawn_css_server(None);
+        let (headers, body) = http_get(sender.local_addr(), "/web.css");
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+        assert!(body.is_empty(), "{body:?}");
+    }
+
+    #[test]
+    fn web_css_subpath_is_not_found() {
+        let sender = spawn_css_server(None);
+        let (headers, _) = http_get(sender.local_addr(), "/web.css/nested.css");
+        assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
     }
 
     #[test]
@@ -3650,6 +3782,7 @@ Sec-WebSocket-Version: 13\r\n\
             true,
             rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
             "lobby".to_string(),
+            None,
         )
         .unwrap();
 
@@ -3687,6 +3820,7 @@ Sec-WebSocket-Version: 13\r\n\
             true,
             rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
             "lobby".to_string(),
+            None,
         )
         .unwrap();
 
@@ -3707,6 +3841,23 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(text.contains("\"viewer\":\"tab\""), "{text}");
         assert!(text.contains("\"max_upload_bytes\":123"), "{text}");
         assert!(text.contains("\"room_name\":\"lobby\""), "{text}");
+    }
+
+    #[test]
+    fn reload_css_pushes_envelope_to_connected_browser() {
+        let sender = spawn_css_server(None);
+        let mut stream = open_ws(sender.local_addr());
+        let (opcode, config) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        assert!(
+            String::from_utf8(config).unwrap().contains("\"config\""),
+            "the connect envelope precedes any reload"
+        );
+
+        sender.reload_css();
+        let (opcode, payload) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        assert_eq!(String::from_utf8(payload).unwrap(), "{\"type\":\"reload_css\"}");
     }
 
     #[test]
@@ -4021,6 +4172,7 @@ Sec-WebSocket-Version: 13\r\n\
             false,
             10,
             String::new(),
+            None,
         )
         .unwrap();
         let mut stream = open_ready_ws(sender.local_addr(), &web_rx);

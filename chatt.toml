@@ -105,6 +105,8 @@ prefer-ipv6 = true
 enabled = false
 
 [web]
+# A `web.css` beside this file is served last to the browser view, so its rules
+# override the shipped stylesheet. Absent is the same as empty.
 # Browser WebSocket origins default to the bound address and, for loopback or
 # unspecified binds, localhost. A non-empty list replaces those defaults.
 # allowed-origins = ["https://chat.example.test"]

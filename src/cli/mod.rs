@@ -358,6 +358,35 @@ polled and reloaded on every change until interrupted.",
             ],
         },
         Command {
+            name: "reload-web-css",
+            aliases: &[],
+            about: "Reload the browser view's user stylesheet in every open tab.",
+            long_about: "Tells the connected browsers to re-fetch `web.css`, the \
+optional user stylesheet beside the config file, so an edit applies without a \
+page reload. With `--watch` that file is polled and reloaded on every change \
+until interrupted.",
+            args: &[],
+            flags: &[Flag {
+                long: "watch",
+                short: "w",
+                value_name: "",
+                help: "Reload on every web.css change until interrupted",
+                global: false,
+                possible: &[],
+            }],
+            subs: &[],
+            examples: &[
+                Example {
+                    cmd: "reload-web-css",
+                    help: "Reload the user stylesheet once.",
+                },
+                Example {
+                    cmd: "reload-web-css --watch",
+                    help: "Reload the user stylesheet live on every change.",
+                },
+            ],
+        },
+        Command {
             name: "mute",
             aliases: &[],
             about: "Mute or unmute the active call.",
@@ -720,6 +749,15 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             }
         }
+        Some(("reload-web-css", sub)) => {
+            if sub.is_present("watch") {
+                watch_reload_web_css()
+            } else {
+                let response = local_control::send_reload_web_css()?;
+                println!("{response}");
+                Ok(())
+            }
+        }
         Some(("mute", sub)) => {
             let command = match sub.subcommand() {
                 Some(("set", set)) => {
@@ -873,6 +911,40 @@ fn report_reload_theme() {
     match local_control::send_reload_theme() {
         Ok(response) => println!("{response}"),
         Err(error) => eprintln!("reload-theme: {error}"),
+    }
+}
+
+/// Polls the user stylesheet and asks the running client to push a reload to
+/// every open tab on each change, until interrupted.
+///
+/// The watched file is the running client's config path with the file name
+/// replaced, matching how the client resolves the stylesheet it serves. A
+/// missing file is a valid state — it stat's as `None` and reloads once created
+/// — because the client answers that path with an empty stylesheet either way.
+fn watch_reload_web_css() -> Result<(), Box<dyn std::error::Error>> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(30);
+
+    let path = local_control::send_config_path()?.with_file_name("web.css");
+    println!("watching {}", path.display());
+
+    let mut last = file_signature(&path);
+    report_reload_web_css();
+    loop {
+        std::thread::sleep(POLL);
+        let signature = file_signature(&path);
+        if signature != last {
+            last = signature;
+            report_reload_web_css();
+        }
+    }
+}
+
+/// Sends a single stylesheet-reload request and prints the outcome, keeping a
+/// failure (no browser view yet, or a client that exited) from ending the watch.
+fn report_reload_web_css() {
+    match local_control::send_reload_web_css() {
+        Ok(response) => println!("{response}"),
+        Err(error) => eprintln!("reload-web-css: {error}"),
     }
 }
 
