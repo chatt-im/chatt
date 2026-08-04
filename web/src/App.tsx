@@ -111,6 +111,8 @@ const UPLOAD_MAX_BUFFERED_BYTES = 1024 * 1024;
 const UPLOAD_DRAIN_POLL_MS = 10;
 const DRAFT_STORAGE_KEY = "chatt.web.compose-draft";
 const REQUEST_TIMEOUT_MS = 15_000;
+// The optional user stylesheet, injected last in <head> by the build.
+const USER_CSS_PATH = "/web.css";
 
 // Warm a small number of image attachments from the edge of each message batch.
 // This keeps near-viewport images responsive without fetching the whole sync or
@@ -283,6 +285,27 @@ const CHAT_END_MARGIN_PX = 8;
 // Builds the asset URL for an attachment served from the client's receive dir.
 function fileUrl(name: string): string {
   return `/files/${encodeURIComponent(name)}`;
+}
+
+// Re-fetches the user stylesheet the page loads last, answering a client-pushed
+// `reload_css`. The replacement link is inserted after the current one and the
+// old sheet is dropped only once the new one has loaded or failed, so a reload
+// never flashes the page unstyled.
+function reloadUserStylesheet() {
+  for (const link of document.querySelectorAll<HTMLLinkElement>('head link[rel="stylesheet"]')) {
+    const url = new URL(link.href, location.href);
+    if (url.pathname !== USER_CSS_PATH) continue;
+    // A cache-busting query: the response revalidates, but a browser may still
+    // hold a heuristically fresh copy it would not re-request at all.
+    url.search = `?r=${Date.now()}`;
+    const fresh = link.cloneNode() as HTMLLinkElement;
+    fresh.href = url.pathname + url.search;
+    const drop = () => link.remove();
+    fresh.addEventListener("load", drop, { once: true });
+    fresh.addEventListener("error", drop, { once: true });
+    link.after(fresh);
+    return;
+  }
 }
 
 function previewItemFromRef(anchor: HTMLElement): PreviewItem | null {
@@ -3804,6 +3827,8 @@ export default function App() {
         );
         setMessages((prev) => [...prev, ...rows]);
         pin();
+      } else if (env.type === "reload_css") {
+        reloadUserStylesheet();
       } else if (env.type === "room") {
         setAssist(CLOSED_ASSIST);
         candidateRequests.invalidate();

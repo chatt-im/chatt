@@ -26,7 +26,12 @@ It consists of two applications:
 
 The web view is built for media that does not fit in a terminal. Its
 production bundle tiny and shipped in the repo so building Chatt does not require a
-JavaScript toolchain.
+JavaScript toolchain. It is restyled without rebuilding that bundle: a `web.css`
+placed next to the client config (`~/.config/chatt/web.css` on Linux) loads
+after the shipped stylesheet, so it overrides the `:root` custom properties and
+the semantic class names in `web/src/styles.css`. Reload the tab to pick up an
+edit, or run `chatt reload-web-css --watch` to have every open tab restyle
+itself on each save.
 
 ## Audio
 

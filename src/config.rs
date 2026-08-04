@@ -2201,6 +2201,13 @@ impl Config {
             .ok_or_else(|| "HOME is not set; cannot determine config path".to_string())
     }
 
+    /// Path of the optional user stylesheet the browser view serves at
+    /// `/web.css`, resolved as a sibling of the config file in use.
+    pub(crate) fn web_css_path(&self) -> Option<PathBuf> {
+        let config = self.config_path.clone().or_else(paths::client_config_path)?;
+        Some(config.with_file_name("web.css"))
+    }
+
     fn runtime_source(&self) -> Result<(String, u64), String> {
         runtime_source_at(&self.runtime_path()?).map(|(content, revision, _)| (content, revision))
     }
@@ -2873,6 +2880,21 @@ path = "assets/sample-001.opus"
         let outcome = Config::collect(Some(path.to_str().unwrap())).unwrap();
         let _ = std::fs::remove_file(path);
         outcome
+    }
+
+    #[test]
+    fn web_css_path_resolves_next_to_config() {
+        let mut config = Config::default();
+        config.config_path = Some(PathBuf::from("/home/alice/.config/chatt/client.toml"));
+        assert_eq!(
+            config.web_css_path(),
+            Some(PathBuf::from("/home/alice/.config/chatt/web.css"))
+        );
+
+        // A relative `--config` resolves beside that file, not in the home
+        // config directory, so a checkout can carry its own stylesheet.
+        config.config_path = Some(PathBuf::from("chatt.toml"));
+        assert_eq!(config.web_css_path(), Some(PathBuf::from("web.css")));
     }
 
     #[test]

@@ -5,6 +5,10 @@
  * prose; monospace is reserved for code. Restyle by overriding the custom
  * properties under :root. Class names are semantic and stable so users can
  * target them directly.
+ *
+ * Those overrides belong in the user's own `web.css` (served from beside the
+ * client config), which the page loads after this file. Keep that possible:
+ * specificity here should stay low enough for a plain class rule to win.
  */
 
 :root {
@@ -370,7 +374,6 @@ body {
   color: var(--text);
   background: var(--bg-elevated);
   border: 1px solid var(--accent);
-  border-radius: 999px;
   cursor: pointer;
 }
 

@@ -95,6 +95,8 @@ mod imp {
     const OP_AUDIO_REPORT: u8 = 10;
     const OP_SEND_MESSAGE: u8 = 11;
     const OP_UPLOAD_BYTES: u8 = 12;
+    // 13 is `local_rpc::unix::OP_DAEMON_RPC`, shared with the renderer protocol.
+    const OP_RELOAD_WEB_CSS: u8 = 14;
     const SCREENCAST_START: u8 = 0;
     const SCREENCAST_STOP: u8 = 1;
     const SCREENCAST_TOGGLE: u8 = 2;
@@ -654,30 +656,20 @@ mod imp {
         socket_path: &Path,
         styled_diagnostics: bool,
     ) -> Result<String, String> {
-        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
-            format!(
-                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
-                socket_path.display()
-            )
-        })?;
-        stream
-            .set_read_timeout(Some(STREAM_TIMEOUT))
-            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
-        stream
-            .set_write_timeout(Some(STREAM_TIMEOUT))
-            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
-
-        write_simple_request(
-            &mut stream,
+        send_simple_request(
+            socket_path,
             OP_RELOAD_THEME,
             &[u8::from(styled_diagnostics)],
-        )?;
-        let response = read_response(&mut stream)?;
-        match response.status {
-            STATUS_OK => Ok(response.message),
-            STATUS_ERROR => Err(response.message),
-            status => Err(format!("control socket returned unknown status {status}")),
-        }
+        )
+    }
+
+    pub fn send_reload_web_css() -> Result<String, String> {
+        let socket_path = socket_path()?;
+        send_reload_web_css_to_path(&socket_path)
+    }
+
+    fn send_reload_web_css_to_path(socket_path: &Path) -> Result<String, String> {
+        send_simple_request(socket_path, OP_RELOAD_WEB_CSS, &[])
     }
 
     pub fn send_config_path() -> Result<PathBuf, String> {
@@ -687,6 +679,12 @@ mod imp {
     }
 
     fn send_config_path_to_path(socket_path: &Path) -> Result<String, String> {
+        send_simple_request(socket_path, OP_CONFIG_PATH, &[])
+    }
+
+    /// Connects to the control socket, sends one bodied request, and returns the
+    /// running client's reply message.
+    fn send_simple_request(socket_path: &Path, opcode: u8, body: &[u8]) -> Result<String, String> {
         let mut stream = UnixStream::connect(socket_path).map_err(|error| {
             format!(
                 "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
@@ -700,7 +698,7 @@ mod imp {
             .set_write_timeout(Some(STREAM_TIMEOUT))
             .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
 
-        write_simple_request(&mut stream, OP_CONFIG_PATH, &[])?;
+        write_simple_request(&mut stream, opcode, body)?;
         let response = read_response(&mut stream)?;
         match response.status {
             STATUS_OK => Ok(response.message),
@@ -761,6 +759,7 @@ mod imp {
         ReloadTheme {
             styled_diagnostics: bool,
         },
+        ReloadWebCss,
         ConfigPath,
         ClientLogs {
             follow: bool,
@@ -1255,64 +1254,21 @@ mod imp {
                 }
             }
             Ok((Request::ReloadTheme { styled_diagnostics }, _)) => {
-                let (reply_tx, reply_rx) = mpsc::channel();
-                match events.send(crate::app::AppEvent::ReloadTheme {
-                    styled_diagnostics,
-                    reply: reply_tx,
-                }) {
-                    Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
-                        Ok(Ok(message)) => Response {
-                            status: STATUS_OK,
-                            message,
-                        },
-                        Ok(Err(error)) => Response {
-                            status: STATUS_ERROR,
-                            message: error,
-                        },
-                        Err(mpsc::RecvTimeoutError::Timeout) => Response {
-                            status: STATUS_ERROR,
-                            message: "chatt client did not answer reload-theme request".to_string(),
-                        },
-                        Err(mpsc::RecvTimeoutError::Disconnected) => Response {
-                            status: STATUS_ERROR,
-                            message: "chatt client stopped before answering reload-theme request"
-                                .to_string(),
-                        },
-                    },
-                    Err(_) => Response {
-                        status: STATUS_ERROR,
-                        message: "chatt client is not running".to_string(),
-                    },
-                }
+                ask_app(events, "reload-theme", |reply| {
+                    crate::app::AppEvent::ReloadTheme {
+                        styled_diagnostics,
+                        reply,
+                    }
+                })
             }
-            Ok((Request::ConfigPath, _)) => {
-                let (reply_tx, reply_rx) = mpsc::channel();
-                match events.send(crate::app::AppEvent::ConfigPath { reply: reply_tx }) {
-                    Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
-                        Ok(Ok(message)) => Response {
-                            status: STATUS_OK,
-                            message,
-                        },
-                        Ok(Err(error)) => Response {
-                            status: STATUS_ERROR,
-                            message: error,
-                        },
-                        Err(mpsc::RecvTimeoutError::Timeout) => Response {
-                            status: STATUS_ERROR,
-                            message: "chatt client did not answer config-path request".to_string(),
-                        },
-                        Err(mpsc::RecvTimeoutError::Disconnected) => Response {
-                            status: STATUS_ERROR,
-                            message: "chatt client stopped before answering config-path request"
-                                .to_string(),
-                        },
-                    },
-                    Err(_) => Response {
-                        status: STATUS_ERROR,
-                        message: "chatt client is not running".to_string(),
-                    },
-                }
+            Ok((Request::ReloadWebCss, _)) => {
+                ask_app(events, "reload-web-css", |reply| {
+                    crate::app::AppEvent::ReloadWebCss { reply }
+                })
             }
+            Ok((Request::ConfigPath, _)) => ask_app(events, "config-path", |reply| {
+                crate::app::AppEvent::ConfigPath { reply }
+            }),
             Ok((Request::Screencast(command), _)) => {
                 let ack = command.ack_message();
                 match events.send(command) {
@@ -1333,6 +1289,40 @@ mod imp {
         };
         if let Err(error) = write_response(&mut stream, response.status, &response.message) {
             kvlog::warn!("local control response failed", error = %error);
+        }
+    }
+
+    /// Sends an app event carrying a reply channel and waits for the running
+    /// client's answer. `label` names the request in the timeout messages.
+    fn ask_app(
+        events: &EventSender,
+        label: &str,
+        event: impl FnOnce(mpsc::Sender<Result<String, String>>) -> crate::app::AppEvent,
+    ) -> Response {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let Ok(()) = events.send(event(reply_tx)) else {
+            return Response {
+                status: STATUS_ERROR,
+                message: "chatt client is not running".to_string(),
+            };
+        };
+        match reply_rx.recv_timeout(STREAM_TIMEOUT) {
+            Ok(Ok(message)) => Response {
+                status: STATUS_OK,
+                message,
+            },
+            Ok(Err(error)) => Response {
+                status: STATUS_ERROR,
+                message: error,
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => Response {
+                status: STATUS_ERROR,
+                message: format!("chatt client did not answer {label} request"),
+            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => Response {
+                status: STATUS_ERROR,
+                message: format!("chatt client stopped before answering {label} request"),
+            },
         }
     }
 
@@ -1596,6 +1586,7 @@ mod imp {
             OP_RELOAD_THEME => Ok(Request::ReloadTheme {
                 styled_diagnostics: body.first().is_some_and(|byte| *byte != 0),
             }),
+            OP_RELOAD_WEB_CSS => Ok(Request::ReloadWebCss),
             OP_CONFIG_PATH => Ok(Request::ConfigPath),
             OP_CLIENT_LOGS => Ok(Request::ClientLogs {
                 follow: body.first().is_some_and(|byte| *byte != 0),
@@ -2289,6 +2280,16 @@ mod imp {
         }
 
         #[test]
+        fn reload_web_css_request_round_trips() {
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            write_simple_request(&mut writer, OP_RELOAD_WEB_CSS, &[]).unwrap();
+            match read_request(&mut reader).unwrap() {
+                Request::ReloadWebCss => {}
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+
+        #[test]
         fn config_path_request_round_trips() {
             let (mut writer, mut reader) = UnixStream::pair().unwrap();
             write_simple_request(&mut writer, OP_CONFIG_PATH, &[]).unwrap();
@@ -2809,6 +2810,10 @@ mod imp {
         Err("chatt reload-theme is only supported on Unix".to_string())
     }
 
+    pub fn send_reload_web_css() -> Result<String, String> {
+        Err("chatt reload-web-css is only supported on Unix".to_string())
+    }
+
     pub fn send_config_path() -> Result<std::path::PathBuf, String> {
         Err("chatt config-path is only supported on Unix".to_string())
     }
@@ -2861,7 +2866,8 @@ pub(crate) use imp::{
 pub use imp::{
     ClientHello, ControlSocket, OutputVolumeCommand, ScreencastCommand, VoiceCommand,
     send_audio_report, send_client_logs, send_config_path, send_message, send_output_volume,
-    send_reload_theme, send_report_bug, send_screencast, send_upload, send_voice,
+    send_reload_theme, send_reload_web_css, send_report_bug, send_screencast, send_upload,
+    send_voice,
 };
 #[cfg(unix)]
 pub(crate) use imp::{RpcPeer, write_attach_ack, write_rpc_ack};

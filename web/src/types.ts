@@ -176,6 +176,8 @@ export type ServerEnvelope =
       message: string;
     }
   | { type: "room"; name: string }
+  // The user stylesheet changed on disk; re-fetch `/web.css`.
+  | { type: "reload_css" }
   // Captured output of a `run_command`, shown as ephemeral system rows.
   | { type: "command_output"; lines: CommandOutputLine[] }
   // Argument candidates answering a `command_candidates` request.
