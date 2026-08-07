@@ -429,7 +429,7 @@ impl<'a> RoomHistoryRef<'a> {
                 entry_id: id,
                 sender: &record.sender,
                 body: &record.body,
-                timestamp_ms: 0,
+                timestamp_ms: record.timestamp_ms.unwrap_or(0),
                 local: false,
                 unverified: false,
                 edited: false,
@@ -447,8 +447,10 @@ pub(crate) struct NoticeRecord {
     pub(crate) body: String,
     pub(crate) kind: NoticeKind,
     /// Wall-clock creation time when this notice is part of the generic
-    /// external system-message timeline. `None` keeps diagnostics TUI-local.
-    pub(crate) projected_timestamp_ms: Option<u64>,
+    /// system-message timeline: it renders a heading age like a message and is
+    /// projected to web and local-RPC frontends. `None` keeps a diagnostic
+    /// TUI-local and timeless.
+    pub(crate) timestamp_ms: Option<u64>,
     /// Whether a newly observed notice snaps each attached viewport to the
     /// bottom. Gap markers deliberately leave a reader's position alone.
     pub(crate) scroll_bottom: bool,
@@ -1815,7 +1817,7 @@ impl RoomHistoryFixture {
                 sender: "test".to_string(),
                 body: body.to_string(),
                 kind: NoticeKind::Info,
-                projected_timestamp_ms: None,
+                timestamp_ms: None,
                 scroll_bottom,
             },
             usize::MAX,
@@ -1952,7 +1954,7 @@ fn projected_system_message(
         after: notice.after.map(MessageId),
         sender: notice.record.sender.clone(),
         body: notice.record.body.clone(),
-        timestamp_ms: notice.record.projected_timestamp_ms?,
+        timestamp_ms: notice.record.timestamp_ms?,
         kind: notice.record.kind,
     })
 }
@@ -3103,7 +3105,7 @@ impl RoomSession {
                     sender: "history".to_string(),
                     body: "older messages missing".to_string(),
                     kind: NoticeKind::Info,
-                    projected_timestamp_ms: None,
+                    timestamp_ms: None,
                     scroll_bottom: false,
                 },
                 max_notices,
@@ -3742,7 +3744,7 @@ impl RoomSession {
                 sender: "security".to_string(),
                 body,
                 kind,
-                projected_timestamp_ms: None,
+                timestamp_ms: None,
                 scroll_bottom: true,
             },
             max_notices,
@@ -4230,7 +4232,7 @@ impl RoomSession {
                 sender: sender.into(),
                 body: body.into(),
                 kind: NoticeKind::Info,
-                projected_timestamp_ms: None,
+                timestamp_ms: None,
                 scroll_bottom: true,
             },
             max_notices,
@@ -4257,7 +4259,7 @@ impl RoomSession {
             .filter_map(|(id, notice)| {
                 notice
                     .record
-                    .projected_timestamp_ms
+                    .timestamp_ms
                     .is_some()
                     .then_some(*id)
             })
@@ -4267,7 +4269,7 @@ impl RoomSession {
                 sender: sender.into(),
                 body: body.into(),
                 kind,
-                projected_timestamp_ms: Some(timestamp_ms),
+                timestamp_ms: Some(timestamp_ms),
                 scroll_bottom: true,
             },
             max_notices,
@@ -4299,7 +4301,7 @@ impl RoomSession {
                 sender: sender.into(),
                 body: body.into(),
                 kind: NoticeKind::Error,
-                projected_timestamp_ms: None,
+                timestamp_ms: None,
                 scroll_bottom: true,
             },
             max_notices,
@@ -4325,7 +4327,7 @@ impl RoomSession {
                 sender: sender.into(),
                 body: body.into(),
                 kind,
-                projected_timestamp_ms: None,
+                timestamp_ms: None,
                 scroll_bottom: true,
             },
             max_notices,
@@ -6783,6 +6785,38 @@ mod tests {
         assert!(
             (0..room.chat().len()).any(|index| room.chat().message(index).body == "help text"),
             "notice survived incremental merge"
+        );
+    }
+
+    #[test]
+    fn system_messages_carry_a_timestamp_while_diagnostics_stay_timeless() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
+        room.push_notice("audio", "device report");
+        assert!(
+            room.session
+                .push_system_message_to(
+                    RoomId(1),
+                    "call",
+                    "bob joined the call",
+                    1_700_000_000_000,
+                    NoticeKind::Info,
+                )
+                .is_some()
+        );
+
+        let mut timestamps = Vec::new();
+        for index in 0..room.chat().len() {
+            let chat = room.chat();
+            let record = chat.message(index);
+            timestamps.push((record.body.to_string(), record.timestamp_ms));
+        }
+        assert_eq!(
+            timestamps,
+            vec![
+                ("device report".to_string(), 0),
+                ("bob joined the call".to_string(), 1_700_000_000_000),
+            ]
         );
     }
 
