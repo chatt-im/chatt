@@ -454,6 +454,9 @@ fn is_control_save_chord_cx(cx: &ViewCx<'_>, key: &KeyEvent) -> bool {
 pub(crate) struct ServerListMode {
     select: FuzzySelect,
     searching: bool,
+    /// Hit box of the `Add Server` button, recorded by the last render. Empty
+    /// until the first frame and whenever the screen was too small for it.
+    add_server_button: Rect,
 }
 
 impl ServerListMode {
@@ -461,6 +464,7 @@ impl ServerListMode {
         Self {
             select: FuzzySelect::default(),
             searching: false,
+            add_server_button: Rect::EMPTY,
         }
     }
 
@@ -473,6 +477,7 @@ impl ServerListMode {
         Self {
             select,
             searching: true,
+            add_server_button: Rect::EMPTY,
         }
     }
 
@@ -503,6 +508,7 @@ impl ServerListMode {
             SelectPrev => {
                 self.select.move_selection(-1);
             }
+            AddServer => cx.send(CoreCommand::AddServer),
             EditServer => {
                 let Some(label) = self.selected_label(cx) else {
                     cx.set_error("no server selected");
@@ -587,6 +593,17 @@ impl ServerListMode {
             BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
         }
     }
+
+    fn process_mouse_cx(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        use extui::event::{MouseButton, MouseEventKind};
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !crate::tui::form::rect_contains(self.add_server_button, mouse.column, mouse.row)
+        {
+            return Action::Continue;
+        }
+        self.process_action_cx(cx, BindCommand::AddServer)
+    }
 }
 
 impl Default for ServerListMode {
@@ -606,7 +623,7 @@ impl AppMode for ServerListMode {
         self.select.refresh(cx.view.server_catalog.items());
         let chrome = self.presentation(cx).chrome.expect("base mode has chrome");
         let mut render = crate::tui::render::RenderState::new(cx);
-        crate::tui::render::draw_server_select_screen(
+        self.add_server_button = crate::tui::render::draw_server_select_screen(
             &mut render,
             &mut self.select,
             self.searching,
@@ -619,6 +636,10 @@ impl AppMode for ServerListMode {
 
     fn process_input(&mut self, cx: &mut ViewCx<'_>, key: KeyEvent) -> Action {
         self.process_input_cx(cx, key)
+    }
+
+    fn process_mouse(&mut self, cx: &mut ViewCx<'_>, mouse: MouseEvent) -> Action {
+        self.process_mouse_cx(cx, mouse)
     }
 
     fn paste_editor_mode(&self, _cx: &ViewCx<'_>) -> Option<EditorMode> {
@@ -3252,6 +3273,53 @@ mod tests {
                 "focus {focus:?} did not receive paste"
             );
         }
+    }
+
+    /// The list's add action is reachable both ways, and the button only
+    /// answers clicks that land on it.
+    #[test]
+    fn add_server_opens_the_prompt_by_binding_and_by_click() {
+        let mut app = test_app();
+        let mut servers = ServerListMode::new();
+        let mut buffer = Buffer::new(80, 24);
+        servers.render(&mut app, &mut buffer, 0);
+        let button = servers.add_server_button;
+        assert!(!button.is_empty(), "the action row drew no button");
+        assert!(row_text(&mut buffer, button.y).contains("Add Server"));
+
+        servers.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+        );
+        assert!(
+            app.pairing_idle(),
+            "a click off the button opened the prompt"
+        );
+
+        servers.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), button.x, button.y),
+        );
+        assert!(!app.pairing_idle(), "the button did not open the prompt");
+
+        let mut app = test_app();
+        servers.process_action(&mut app, BindCommand::AddServer);
+        assert!(!app.pairing_idle(), "AddServer did not open the prompt");
+    }
+
+    /// The empty-list welcome block is laid out at its natural height, so a
+    /// screen too short for it drops its tail instead of painting over the
+    /// action row underneath.
+    #[test]
+    fn welcome_block_does_not_overrun_the_action_row() {
+        let mut app = test_app();
+        let mut servers = ServerListMode::new();
+        let mut buffer = Buffer::new(80, 24);
+
+        servers.render(&mut app, &mut buffer, 0);
+
+        let button = servers.add_server_button;
+        assert_eq!(row_text(&mut buffer, button.y).trim(), "Add Server");
     }
 
     #[test]

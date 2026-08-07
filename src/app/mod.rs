@@ -1903,6 +1903,7 @@ impl App {
                 }
             }
             CoreCommand::Connect { alias } => self.connect_by_label(&alias),
+            CoreCommand::AddServer => self.start_device_pairing_prompt(None),
             CoreCommand::DeleteServer { server_id } => self.delete_server(server_id),
             CoreCommand::SubmitServerEdit {
                 request_id,
@@ -3970,6 +3971,10 @@ impl App {
         });
     }
 
+    /// Adds a server from whatever the prompt was handed: a device link, an
+    /// invite ticket, or a public `host:port`. These are the three inputs
+    /// `chatt pair` takes on argv, and the prompt is the private way to give
+    /// this client the two that are secrets.
     fn submit_device_pairing(
         &mut self,
         pairing_string: String,
@@ -3977,17 +3982,17 @@ impl App {
         overwrite_existing: bool,
     ) {
         let result = (|| -> Result<(), String> {
-            // The prompt is the private way to hand this client a secret, so it
-            // takes invite tickets too rather than forcing them onto argv.
-            if pairing_string
-                .trim()
-                .starts_with(rpc::control::JOIN_STRING_PREFIX)
-            {
-                let ticket = rpc::control::decode_invite_ticket(pairing_string.trim())?;
+            let pairing_string = pairing_string.trim();
+            if pairing_string.starts_with(rpc::control::JOIN_STRING_PREFIX) {
+                let ticket = rpc::control::decode_invite_ticket(pairing_string)?;
                 self.start_join_pairing(ticket);
                 return Ok(());
             }
-            let ticket = rpc::control::decode_device_link_ticket(pairing_string.trim())?;
+            if !pairing_string.starts_with(rpc::control::DEVICE_LINK_STRING_PREFIX) {
+                self.start_open_pairing(crate::cli::parse_pair_address(pairing_string)?);
+                return Ok(());
+            }
+            let ticket = rpc::control::decode_device_link_ticket(pairing_string)?;
             let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&ticket.tcp_addr));
             let server = ServerEntry {
                 id: server::generate_server_id()?,
@@ -15724,6 +15729,36 @@ mod tests {
             pending.pairing_code.as_deref(),
             Some("pairing-code-long-enough")
         );
+    }
+
+    /// The prompt takes the third input `chatt pair` takes on argv: a public
+    /// address, which self-service pairs rather than being read as a link.
+    #[test]
+    fn server_address_pasted_into_the_device_prompt_starts_open_pairing() {
+        let mut app = test_app();
+        app.start_device_pairing_prompt(None);
+
+        app.submit_device_pairing("10.0.0.1:4000".to_string(), String::new(), false);
+
+        let pending = app.pairing_pending().expect("open pairing started");
+        assert_eq!(pending.server.tcp_addr, "10.0.0.1:4000");
+        assert!(pending.open.is_some());
+        assert!(pending.pairing_code.is_none());
+    }
+
+    /// Anything that is neither a link nor an address is reported as a bad
+    /// address, and pairing stays idle so the prompt can be corrected.
+    #[test]
+    fn unparseable_prompt_input_reports_an_address_error() {
+        let mut app = test_app();
+        app.start_device_pairing_prompt(None);
+
+        app.submit_device_pairing("not-an-address".to_string(), String::new(), false);
+        app.sync_terminal_events();
+
+        assert!(app.pairing_pending().is_none());
+        assert_eq!(app.view.status.kind(), StatusKind::Error);
+        assert!(app.view.status.text().contains("invalid server address"));
     }
 
     /// A device job cannot spawn without its cancellation flag, which is the

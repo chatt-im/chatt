@@ -1600,8 +1600,7 @@ impl AppMode for DevicePairMode {
         let Some(panel) = crate::tui::render::form_dialog_panel(area, form_height) else {
             return;
         };
-        let body =
-            crate::tui::render::draw_dialog_frame(panel, buf, &app.view.theme, "Pair a device");
+        let body = crate::tui::render::draw_dialog_frame(panel, buf, &app.view.theme, "Add Server");
         self.dialog.render(body, buf, &app.view.theme);
         crate::tui::render::draw_overlay_key_preview(&mut app, bindings::FORM_LAYER, buf);
     }

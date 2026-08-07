@@ -95,6 +95,7 @@ pub enum BindCommand {
     ToggleKeyPreview,
     SubmitPassword,
     TogglePasswordVisibility,
+    AddServer,
     EditServer,
     DeleteServer,
     SearchServers,
@@ -167,6 +168,7 @@ impl std::fmt::Display for BindCommand {
             ToggleKeyPreview => "ToggleKeyPreview",
             SubmitPassword => "SubmitPassword",
             TogglePasswordVisibility => "TogglePasswordVisibility",
+            AddServer => "AddServer",
             EditServer => "EditServer",
             DeleteServer => "DeleteServer",
             SearchServers => "SearchServers",
@@ -251,6 +253,7 @@ impl BindCommand {
             ToggleKeyPreview => spec("More", APP),
             SubmitPassword => spec("Submit", ACTION),
             TogglePasswordVisibility => spec("Reveal", ACTION),
+            AddServer => spec("Add Server", ACTION),
             EditServer => spec("Edit", ACTION),
             DeleteServer => spec("Delete", DESTRUCTIVE),
             SearchServers => spec("Search", ACTION),
@@ -648,6 +651,21 @@ mod tests {
             command(&runtime, PICKER_LAYER, "C-d"),
             Some(BindCommand::HalfPageDown)
         ));
+    }
+
+    /// The server list's add action ships bound, so a config that customizes
+    /// the picker without naming it still reaches the add-server prompt.
+    #[test]
+    fn default_picker_binds_add_server() {
+        let runtime = BindingRuntime::default();
+        assert!(matches!(
+            command(&runtime, PICKER_LAYER, "n"),
+            Some(BindCommand::AddServer)
+        ));
+        assert_eq!(
+            command_key_hint(&runtime, PICKER_LAYER, BindCommand::AddServer).as_deref(),
+            Some("n")
+        );
     }
 
     #[test]
