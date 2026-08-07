@@ -222,6 +222,7 @@ inherit = ["workspace"]
 [bindings.picker]
 inherit = ["list"]
 "C-k" = "RoomSwitcher"
+"n" = "AddServer"
 "e" = "EditServer"
 "d" = "DeleteServer"
 "/" = "SearchServers"

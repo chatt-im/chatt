@@ -106,6 +106,9 @@ pub(crate) enum CoreCommand {
     Connect {
         alias: String,
     },
+    /// Opens the prompt that adds a server from a device link, an invite
+    /// ticket, or a public `host:port`.
+    AddServer,
     DeleteServer {
         server_id: ServerId,
     },

@@ -15,16 +15,15 @@ const PAIR_SECTION: &str = "Device pairing";
 const LINK_SECTION: &str = "Device link";
 const LABEL_WIDTH: u16 = 19;
 const PAIR_DESCRIPTION: &str = "Paste a one-time device link from an existing device, then name \
-this installation, or paste a server invite ticket.";
+this installation. A server invite ticket or a public host:port address adds a server instead.";
 
-/// Whether a pasted string is a server invite rather than a device link.
-///
-/// An invite enrolls no device, so the name this installation would be known by
-/// is not part of that form.
-fn is_invite(pairing_string: &str) -> bool {
-    pairing_string
-        .trim()
-        .starts_with(rpc::control::JOIN_STRING_PREFIX)
+/// Whether this input enrolls a device, which is the only case that needs a
+/// name for this installation. An invite ticket and a bare `host:port` both add
+/// a server without enrolling anything, so neither carries that field.
+fn enrolls_device(pairing_string: &str) -> bool {
+    let pairing_string = pairing_string.trim();
+    !pairing_string.starts_with(rpc::control::JOIN_STRING_PREFIX)
+        && crate::cli::parse_pair_address(pairing_string).is_err()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,8 +57,9 @@ pub(crate) struct DevicePairDialog {
 
 impl DevicePairDialog {
     pub(crate) fn new(pairing_string: String, bindings: FormBindings) -> Self {
-        let initial_field = if pairing_string.trim().is_empty() {
-            "Pairing string"
+        let initial_field = if pairing_string.trim().is_empty() || !enrolls_device(&pairing_string)
+        {
+            "Link or address"
         } else {
             "Device name"
         };
@@ -67,7 +67,7 @@ impl DevicePairDialog {
             pairing_string,
             device_name: String::new(),
             show_secrets: false,
-            feedback: "Enter the one-time link details".to_string(),
+            feedback: "Enter a device link, invite ticket, or server address".to_string(),
             feedback_error: false,
             submitting: false,
             confirm_overwrite: false,
@@ -77,10 +77,10 @@ impl DevicePairDialog {
 
     pub(crate) fn form_height(&self, terminal_width: u16) -> u16 {
         let width = dialog_body_width(terminal_width);
-        let rows = if is_invite(&self.pairing_string) {
-            5
-        } else {
+        let rows = if enrolls_device(&self.pairing_string) {
             6
+        } else {
+            5
         };
         form::wrapped_line_count(PAIR_DESCRIPTION, width)
             .saturating_add(form::wrapped_line_count(&self.feedback, width))
@@ -217,8 +217,10 @@ impl DevicePairDialog {
                 let overwrite_existing = self.confirm_overwrite;
                 self.feedback = if overwrite_existing {
                     "Overwriting local identity and linking device...".to_string()
-                } else {
+                } else if enrolls_device(&self.pairing_string) {
                     "Linking device...".to_string()
+                } else {
+                    "Adding server...".to_string()
                 };
                 self.feedback_error = false;
                 DevicePairEvent::Submit {
@@ -289,14 +291,15 @@ fn device_pair_form(
     feedback_error: bool,
     confirm_overwrite: bool,
 ) -> Option<DevicePairButton> {
+    let enrolling = enrolls_device(pairing_string);
     form.section_with_id("Enrollment", PAIR_SECTION);
     form.description(PAIR_DESCRIPTION);
     if *show_secrets {
-        form.text("Pairing string", pairing_string, required);
+        form.text("Link or address", pairing_string, required);
     } else {
-        form.secret_text("Pairing string", pairing_string, required);
+        form.secret_text("Link or address", pairing_string, required);
     }
-    if !is_invite(pairing_string) {
+    if enrolling {
         form.text("Device name", device_name, device_name_error);
     }
     form.checkbox("Show secrets", show_secrets);
@@ -307,20 +310,24 @@ fn device_pair_form(
             key: "cancel",
             label: "Cancel",
             value: DevicePairButton::Cancel,
-            help: "Cancel device pairing.",
+            help: "Cancel this attempt.",
         },
         ActionButton {
             key: "pair",
             label: if confirm_overwrite {
                 "Overwrite & pair"
-            } else {
+            } else if enrolling {
                 "Pair"
+            } else {
+                "Add"
             },
             value: DevicePairButton::Pair,
             help: if confirm_overwrite {
                 "Replace the existing local identity, then redeem this one-time link."
-            } else {
+            } else if enrolling {
                 "Redeem this one-time link and create the device identity."
+            } else {
+                "Pair with this server and add it to the server list."
             },
         },
         ActionButton {
@@ -347,11 +354,11 @@ fn device_name_error(value: &str) -> Option<String> {
 
 fn pair_validation(ticket: &str, name: &str) -> Option<String> {
     if ticket.trim().is_empty() {
-        Some("Pairing string is required".to_string())
-    } else if is_invite(ticket) {
-        None
-    } else {
+        Some("A device link, invite ticket, or server address is required".to_string())
+    } else if enrolls_device(ticket) {
         device_name_error(name)
+    } else {
+        None
     }
 }
 
@@ -772,6 +779,45 @@ mod tests {
             }
             _ => panic!("an invite ticket did not submit without a device name"),
         }
+    }
+
+    /// A bare address adds a server without enrolling anything, so it drops the
+    /// name field exactly as an invite does.
+    #[test]
+    fn server_address_submits_without_a_device_name() {
+        let theme = Theme::tomorrow_night();
+        let mut dialog = DevicePairDialog::new(String::new(), FormBindings::Standard);
+        render_pair(&mut dialog, &theme);
+        let device_link_height = dialog.form_height(80);
+
+        dialog.paste("chat.example:41000", &theme);
+        render_pair(&mut dialog, &theme);
+
+        assert_eq!(dialog.form_height(80), device_link_height - 1);
+        match dialog.activate(DevicePairButton::Pair) {
+            DevicePairEvent::Submit {
+                pairing_string,
+                device_name,
+                ..
+            } => {
+                assert_eq!(pairing_string, "chat.example:41000");
+                assert!(device_name.is_empty());
+            }
+            _ => panic!("a server address did not submit without a device name"),
+        }
+    }
+
+    /// Only a device link needs a name for this installation. A half-typed
+    /// address is not yet an address, so the field stays up until the input is
+    /// something that adds a server on its own.
+    #[test]
+    fn device_name_field_follows_the_kind_of_input() {
+        assert!(enrolls_device(""));
+        assert!(enrolls_device("chat.example"));
+        assert!(enrolls_device("tcd1_ticket"));
+        assert!(!enrolls_device("tcj1_ticket"));
+        assert!(!enrolls_device("chat.example:41000"));
+        assert!(!enrolls_device(" 10.0.0.4:41000 "));
     }
 
     #[test]

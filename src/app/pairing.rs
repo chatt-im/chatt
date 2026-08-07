@@ -323,7 +323,9 @@ impl PairingCoordinator {
                 );
                 app.send_to(
                     owner,
-                    TerminalEvent::Status("enter the one-time device link details".to_string()),
+                    TerminalEvent::Status(
+                        "enter a device link, invite ticket, or server address".to_string(),
+                    ),
                 );
                 self.state = PairingState::AwaitingDeviceDetails { owner };
             }
@@ -349,7 +351,10 @@ impl PairingCoordinator {
                     cancellation,
                 },
             ) if active == owner
-                && matches!(&job, PairingJob::Device { .. } | PairingJob::Invite { .. }) =>
+                && matches!(
+                    &job,
+                    PairingJob::Device { .. } | PairingJob::Invite { .. } | PairingJob::Open { .. }
+                ) =>
             {
                 if let Err(failure) = self.start(app, owner, pending, job, cancellation) {
                     // The details dialog is still up and retries in place.

@@ -146,6 +146,8 @@ fn join_notice_header_style(theme: &Theme) -> Style {
     }
 }
 
+/// Draws the server picker and returns the hit box of its `Add Server` button,
+/// which is [`Rect::EMPTY`] when the screen was too small to draw it.
 pub(crate) fn draw_server_select_screen(
     app: &mut RenderState<'_>,
     select: &mut FuzzySelect,
@@ -154,17 +156,55 @@ pub(crate) fn draw_server_select_screen(
     status_label: &'static str,
     layer: LayerId,
     buf: &mut Buffer,
-) {
+) -> Rect {
     let capture = prepare_screen(app, buf);
     let mut screen = buf.rect();
     refresh_key_preview_cache(app, Some(layer));
     let key_preview_height = key_preview_height(app, screen.w);
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
+    // The actions row yields to the list when the screen cannot afford both;
+    // the key preview still names the binding that opens the same prompt.
+    let actions_area = if screen.h > 1 {
+        screen.take_bottom(1)
+    } else {
+        Rect::EMPTY
+    };
     draw_join_notice(&mut screen, app, buf);
     draw_server_select(screen, app, select, searching, buf);
+    let add_server = draw_server_actions(actions_area, app, buf);
     draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
     draw_key_preview(key_preview_area, app, buf);
+    add_server
+}
+
+const ADD_SERVER_LABEL: &str = " Add Server ";
+
+/// Draws the server list's action row as one flat segment and returns its hit
+/// box.
+fn draw_server_actions(area: Rect, app: &RenderState<'_>, buf: &mut Buffer) -> Rect {
+    if area.is_empty() {
+        return Rect::EMPTY;
+    }
+    let theme = &app.view.theme;
+    area.with(theme.background).fill(buf);
+    let width = ADD_SERVER_LABEL.width() as u16;
+    if area.w <= width {
+        return Rect::EMPTY;
+    }
+    let button = Rect {
+        x: area.x + 1,
+        y: area.y,
+        w: width,
+        h: 1,
+    };
+    crate::tui::widgets::draw_button(
+        button,
+        buf,
+        theme.status_section.patch(theme.text),
+        ADD_SERVER_LABEL,
+    );
+    button
 }
 
 /// Centered panel geometry for a form dialog overlay: `form_height` body rows
@@ -1026,8 +1066,8 @@ fn draw_server_welcome(area: Rect, buf: &mut Buffer, theme: &Theme) {
     let quick_start = [
         Section("Quick start:"),
         Binding {
-            key: "chatt pair",
-            desc: "Pair with a server from a join string",
+            key: "n",
+            desc: "Add a server from a link or address",
         },
         Binding {
             key: "F2",
@@ -1104,16 +1144,16 @@ fn draw_server_welcome(area: Rect, buf: &mut Buffer, theme: &Theme) {
         let right_x = left_x + left_width as u16 + SERVER_WELCOME_COLUMN_GAP as u16;
 
         for (index, line) in header.iter().enumerate() {
-            draw_server_welcome_line(buf, left_x, start_y + index as u16, line, theme);
+            draw_server_welcome_line(buf, area, left_x, start_y + index as u16, line, theme);
         }
         let body_y = start_y + header.len() as u16;
         for index in 0..body_height {
             let y = body_y + index as u16;
             if let Some(line) = left.get(index) {
-                draw_server_welcome_line(buf, left_x, y, line, theme);
+                draw_server_welcome_line(buf, area, left_x, y, line, theme);
             }
             if let Some(line) = right.get(index) {
-                draw_server_welcome_line(buf, right_x, y, line, theme);
+                draw_server_welcome_line(buf, area, right_x, y, line, theme);
             }
         }
     } else {
@@ -1136,7 +1176,7 @@ fn draw_server_welcome(area: Rect, buf: &mut Buffer, theme: &Theme) {
             .unwrap_or(0) as u16;
         let x = area.x + area.w.saturating_sub(max_width) / 2;
         for (index, line) in lines.iter().enumerate() {
-            draw_server_welcome_line(buf, x, start_y + index as u16, line, theme);
+            draw_server_welcome_line(buf, area, x, start_y + index as u16, line, theme);
         }
     }
 }
@@ -1158,13 +1198,20 @@ fn server_welcome_line_width(line: &ServerWelcomeLine) -> usize {
     }
 }
 
+/// Draws one welcome line, skipping rows `area` cannot hold: the block is laid
+/// out at its natural height, so a short screen drops its tail instead of
+/// writing over the rows below.
 fn draw_server_welcome_line(
     buf: &mut Buffer,
+    area: Rect,
     x: u16,
     y: u16,
     line: &ServerWelcomeLine,
     theme: &Theme,
 ) {
+    if y < area.y || y >= area.y.saturating_add(area.h) {
+        return;
+    }
     let section_style = theme.background.patch(theme.text | Modifier::BOLD);
     let text_style = theme.background.patch(theme.muted);
     let key_style = theme.background.patch(theme.accent);
