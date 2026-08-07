@@ -29,6 +29,7 @@ import type {
   CandidateItem,
   CandidateKind,
   MessageId,
+  WebSystemMessage,
 } from "./types";
 import {
   acceptReplacement,
@@ -166,6 +167,8 @@ function isMessageContinuation(
 ): boolean {
   return (
     !!previous &&
+    !message.system &&
+    !previous.system &&
     !message.edited &&
     !previous.edited &&
     message.unverified === previous.unverified &&
@@ -175,7 +178,9 @@ function isMessageContinuation(
 }
 
 function messageCollapseKey(message: WebMessage): string {
-  return `${message.timestamp_ms}:${message.message_id}:${message.id}`;
+  return message.system_id === undefined
+    ? `${message.timestamp_ms}:${message.message_id}:${message.id}`
+    : `system:${message.system_id}`;
 }
 
 function debugMessageKey(message: WebMessage | undefined): string | undefined {
@@ -1174,6 +1179,7 @@ function MessageRow(props: {
         "is-group-collapsed": props.group.collapsed,
         "is-system": !!props.message.system,
         "is-system-error": props.message.system === "error",
+        "is-system-warning": props.message.system === "warning",
         "is-large-emoji": isLargeEmojiMessage(props.message.body),
       }}
       data-ts={props.message.timestamp_ms}
@@ -2327,6 +2333,59 @@ export default function App() {
   function compareMessageIds(a: MessageId, b: MessageId): number {
     if (a.length !== b.length) return a.length - b.length;
     return a < b ? -1 : a > b ? 1 : 0;
+  }
+
+  function systemMessageRow(message: WebSystemMessage): WebMessage {
+    return {
+      id: message.system_id.toString(16),
+      sender: message.sender,
+      body: message.body,
+      local: false,
+      edited: false,
+      unverified: false,
+      timestamp_ms: message.timestamp_ms,
+      attachment: null,
+      file_id: null,
+      message_id: "0",
+      ref_code: "",
+      fragments: [],
+      system: message.level,
+      system_id: message.system_id,
+      after_message_id: message.after_message_id,
+    };
+  }
+
+  function compareTimelineEntries(left: WebMessage, right: WebMessage): number {
+    const leftSystem = left.system_id !== undefined;
+    const rightSystem = right.system_id !== undefined;
+    if (!leftSystem && !rightSystem) {
+      return compareMessageIds(left.message_id, right.message_id);
+    }
+    if (leftSystem && rightSystem) {
+      const leftAfter = left.after_message_id ?? null;
+      const rightAfter = right.after_message_id ?? null;
+      if (leftAfter !== rightAfter) {
+        if (leftAfter === null) return -1;
+        if (rightAfter === null) return 1;
+        const compared = compareMessageIds(leftAfter, rightAfter);
+        if (compared !== 0) return compared;
+      }
+      return left.system_id! - right.system_id!;
+    }
+    const system = leftSystem ? left : right;
+    const chat = leftSystem ? right : left;
+    const after = system.after_message_id ?? null;
+    const systemBeforeChat =
+      after === null || compareMessageIds(after, chat.message_id) < 0;
+    const order = systemBeforeChat ? -1 : 1;
+    return leftSystem ? order : -order;
+  }
+
+  function mergeTimeline(
+    chat: readonly WebMessage[],
+    systems: readonly WebSystemMessage[]
+  ): WebMessage[] {
+    return [...chat, ...systems.map(systemMessageRow)].sort(compareTimelineEntries);
   }
 
   // Message ids are the durable identity; `ts` rides along for display only.
@@ -3530,7 +3589,7 @@ export default function App() {
           ) {
             refPreviewCache.clear();
           }
-          setMessages(feed.messages);
+          setMessages(mergeTimeline(feed.messages, feed.system_messages));
           currentRoomId = feed.room_id;
           currentRoomGeneration = feed.room_generation;
           olderCursor = feed.older_cursor;
@@ -3570,7 +3629,9 @@ export default function App() {
             preloadRecentImages(feed.messages);
             holdPrependSettling();
             setPrepend(true);
-            setMessages((prev) => [...feed.messages, ...prev]);
+            setMessages((prev) =>
+              [...feed.messages, ...prev].sort(compareTimelineEntries)
+            );
             debugScrollState("older-applied", {
               count: feed.messages.length,
               olderCursor: feed.older_cursor,
@@ -3613,7 +3674,32 @@ export default function App() {
             prev.filter((message) => message.message_id !== feed.message_id)
           );
           pin();
-        } else {
+        } else if (feed.kind === "system_message") {
+          if (
+            feed.room_id !== currentRoomId ||
+            feed.room_generation !== currentRoomGeneration
+          ) return;
+          const row = systemMessageRow(feed.message);
+          setMessages((prev) =>
+            [
+              ...prev.filter(
+                (message) => message.system_id !== feed.message.system_id
+              ),
+              row,
+            ].sort(compareTimelineEntries)
+          );
+          if (!following) setNewMessageCount((count) => count + 1);
+          pin();
+        } else if (feed.kind === "system_message_delete") {
+          if (
+            feed.room_id !== currentRoomId ||
+            feed.room_generation !== currentRoomGeneration
+          ) return;
+          setMessages((prev) =>
+            prev.filter((message) => message.system_id !== feed.system_id)
+          );
+          pin();
+        } else if (feed.kind === "message") {
           if (
             feed.room_id !== currentRoomId ||
             feed.room_generation !== currentRoomGeneration

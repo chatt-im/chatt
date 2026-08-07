@@ -797,12 +797,14 @@ pub enum NetworkEvent {
         session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
+        user_joined: bool,
     },
     VoiceStopped {
         room_id: RoomId,
         session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
+        user_left: bool,
     },
     PeerTransport {
         user_id: UserId,
@@ -5588,6 +5590,7 @@ impl WorkerState<'_> {
                 session_id,
                 user_id,
                 stream_id,
+                user_joined,
             } => {
                 kvlog::info!(
                     "client voice started",
@@ -5611,6 +5614,7 @@ impl WorkerState<'_> {
                     session_id,
                     user_id,
                     stream_id,
+                    user_joined,
                 });
             }
             ServerControl::VoiceStopped {
@@ -5618,6 +5622,7 @@ impl WorkerState<'_> {
                 session_id,
                 user_id,
                 stream_id,
+                user_left,
             } => {
                 kvlog::info!(
                     "client voice stopped",
@@ -5641,6 +5646,7 @@ impl WorkerState<'_> {
                     session_id,
                     user_id,
                     stream_id,
+                    user_left,
                 });
             }
             ServerControl::VoiceStateChanged { user_id, state, .. } => {

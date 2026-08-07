@@ -446,6 +446,9 @@ pub(crate) struct NoticeRecord {
     pub(crate) sender: String,
     pub(crate) body: String,
     pub(crate) kind: NoticeKind,
+    /// Wall-clock creation time when this notice is part of the generic
+    /// external system-message timeline. `None` keeps diagnostics TUI-local.
+    pub(crate) projected_timestamp_ms: Option<u64>,
     /// Whether a newly observed notice snaps each attached viewport to the
     /// bottom. Gap markers deliberately leave a reader's position alone.
     pub(crate) scroll_bottom: bool,
@@ -701,6 +704,15 @@ impl RoomHistory {
     }
 
     fn push_notice_record(&mut self, record: NoticeRecord, max_notices: usize) -> NoticeKey {
+        self.push_notice_record_with_evictions(record, max_notices)
+            .0
+    }
+
+    fn push_notice_record_with_evictions(
+        &mut self,
+        record: NoticeRecord,
+        max_notices: usize,
+    ) -> (NoticeKey, Vec<NoticeKey>) {
         self.next_notice_key += 1;
         let key = self.next_notice_key;
         let after = self.messages.last().map(MessageLog::key);
@@ -713,13 +725,14 @@ impl RoomHistory {
         // The fresh key is the largest, so trimming can only drop older
         // notices. Report those before the addition so a consumer never sees an
         // id it has yet to materialize being removed.
-        for evicted in self.trim_notices(max_notices) {
-            self.record(HistoryDelta::NoticeRemoved(evicted));
+        let evicted = self.trim_notices(max_notices);
+        for key in &evicted {
+            self.record(HistoryDelta::NoticeRemoved(*key));
         }
         // A notice is anchored after the newest message, so it always lands at
         // the tail of the canonical sequence.
         self.record(HistoryDelta::NoticeAdded(key));
-        key
+        (key, evicted)
     }
 
     /// Drops the oldest notices over `max_notices`, returning their keys.
@@ -1802,6 +1815,7 @@ impl RoomHistoryFixture {
                 sender: "test".to_string(),
                 body: body.to_string(),
                 kind: NoticeKind::Info,
+                projected_timestamp_ms: None,
                 scroll_bottom,
             },
             usize::MAX,
@@ -1857,6 +1871,8 @@ pub(crate) struct HistoryChange {
     pub(crate) refresh_window: bool,
     pub(crate) upserted: Option<MessageId>,
     pub(crate) removed: Vec<MessageId>,
+    pub(crate) system_upserted: Option<NoticeKey>,
+    pub(crate) systems_removed: Vec<NoticeKey>,
 }
 
 impl HistoryChange {
@@ -1867,6 +1883,8 @@ impl HistoryChange {
             refresh_window: false,
             upserted: None,
             removed: Vec::new(),
+            system_upserted: None,
+            systems_removed: Vec::new(),
         }
     }
 
@@ -1896,6 +1914,47 @@ impl HistoryChange {
             ..Self::empty(room_id, room_generation)
         }
     }
+
+    fn system(
+        room_id: RoomId,
+        room_generation: u64,
+        system_upserted: NoticeKey,
+        systems_removed: Vec<NoticeKey>,
+    ) -> Self {
+        Self {
+            system_upserted: Some(system_upserted),
+            systems_removed,
+            ..Self::empty(room_id, room_generation)
+        }
+    }
+}
+
+/// A generic room-local system line projected to web and local-RPC frontends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SystemMessage {
+    pub(crate) id: NoticeKey,
+    pub(crate) room_id: RoomId,
+    pub(crate) after: Option<MessageId>,
+    pub(crate) sender: String,
+    pub(crate) body: String,
+    pub(crate) timestamp_ms: u64,
+    pub(crate) kind: NoticeKind,
+}
+
+fn projected_system_message(
+    room_id: RoomId,
+    id: NoticeKey,
+    notice: &AnchoredNotice,
+) -> Option<SystemMessage> {
+    Some(SystemMessage {
+        id,
+        room_id,
+        after: notice.after.map(MessageId),
+        sender: notice.record.sender.clone(),
+        body: notice.record.body.clone(),
+        timestamp_ms: notice.record.projected_timestamp_ms?,
+        kind: notice.record.kind,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2156,6 +2215,20 @@ impl RoomSession {
 
     pub(crate) fn room_history_revision(&self, room_id: RoomId) -> Option<Revision> {
         self.rooms.room(room_id).map(RoomHistory::revision)
+    }
+
+    pub(crate) fn system_message(&self, room_id: RoomId, id: NoticeKey) -> Option<SystemMessage> {
+        let notice = self.rooms.room(room_id)?.notices.get(&id)?;
+        projected_system_message(room_id, id, notice)
+    }
+
+    pub(crate) fn system_messages(&self, room_id: RoomId) -> Vec<SystemMessage> {
+        self.rooms
+            .room(room_id)
+            .into_iter()
+            .flat_map(|room| &room.notices)
+            .filter_map(|(id, notice)| projected_system_message(room_id, *id, notice))
+            .collect()
     }
 
     #[cfg(test)]
@@ -3030,6 +3103,7 @@ impl RoomSession {
                     sender: "history".to_string(),
                     body: "older messages missing".to_string(),
                     kind: NoticeKind::Info,
+                    projected_timestamp_ms: None,
                     scroll_bottom: false,
                 },
                 max_notices,
@@ -3668,6 +3742,7 @@ impl RoomSession {
                 sender: "security".to_string(),
                 body,
                 kind,
+                projected_timestamp_ms: None,
                 scroll_bottom: true,
             },
             max_notices,
@@ -4155,11 +4230,50 @@ impl RoomSession {
                 sender: sender.into(),
                 body: body.into(),
                 kind: NoticeKind::Info,
+                projected_timestamp_ms: None,
                 scroll_bottom: true,
             },
             max_notices,
         );
         true
+    }
+
+    /// Appends a generic externally projected system line to `room_id`.
+    /// Unlike ordinary notices, the returned change lets web and local-RPC
+    /// frontends apply the same retained timeline update as the TUI.
+    pub(super) fn push_system_message_to(
+        &mut self,
+        room_id: RoomId,
+        sender: impl Into<String>,
+        body: impl Into<String>,
+        timestamp_ms: u64,
+        kind: NoticeKind,
+    ) -> Option<HistoryChange> {
+        let max_notices = self.rooms.max_messages();
+        let room = self.room_mut_materializing(room_id)?;
+        let projected_before = room
+            .notices
+            .iter()
+            .filter_map(|(id, notice)| {
+                notice
+                    .record
+                    .projected_timestamp_ms
+                    .is_some()
+                    .then_some(*id)
+            })
+            .collect::<HashSet<_>>();
+        let (id, mut removed) = room.push_notice_record_with_evictions(
+            NoticeRecord {
+                sender: sender.into(),
+                body: body.into(),
+                kind,
+                projected_timestamp_ms: Some(timestamp_ms),
+                scroll_bottom: true,
+            },
+            max_notices,
+        );
+        removed.retain(|id| projected_before.contains(id));
+        Some(HistoryChange::system(room_id, room.generation, id, removed))
     }
 
     pub(super) fn push_error_notice(
@@ -4185,6 +4299,7 @@ impl RoomSession {
                 sender: sender.into(),
                 body: body.into(),
                 kind: NoticeKind::Error,
+                projected_timestamp_ms: None,
                 scroll_bottom: true,
             },
             max_notices,
@@ -4210,6 +4325,7 @@ impl RoomSession {
                 sender: sender.into(),
                 body: body.into(),
                 kind,
+                projected_timestamp_ms: None,
                 scroll_bottom: true,
             },
             max_notices,
@@ -4276,6 +4392,7 @@ impl RoomSession {
     /// Records a voice stream starting in `room_id`. The stream mapping is
     /// only tracked when it belongs to the client's own voice room (that is
     /// the call being played back); occupancy display updates for any room.
+    #[cfg(test)]
     pub(super) fn voice_started(
         &mut self,
         room_id: RoomId,
@@ -4285,10 +4402,33 @@ impl RoomSession {
         local_session: Option<SessionId>,
         voice_room: Option<RoomId>,
     ) -> VoiceNotice {
-        if let Some(meta) = self.metas.get_mut(&room_id) {
-            meta.voice_users.insert(user_id);
+        self.voice_started_transition(
+            room_id,
+            session_id,
+            user_id,
+            stream_id,
+            local_session,
+            voice_room,
+            true,
+        )
+    }
+
+    pub(super) fn voice_started_transition(
+        &mut self,
+        room_id: RoomId,
+        session_id: SessionId,
+        user_id: UserId,
+        stream_id: StreamId,
+        local_session: Option<SessionId>,
+        voice_room: Option<RoomId>,
+        user_joined: bool,
+    ) -> VoiceNotice {
+        if user_joined {
+            if let Some(meta) = self.metas.get_mut(&room_id) {
+                meta.voice_users.insert(user_id);
+            }
+            self.note_voice_join(room_id, user_id);
         }
-        self.note_voice_join(room_id, user_id);
         if voice_room == Some(room_id) {
             self.stream_users.insert(stream_id, user_id);
         }
@@ -4309,6 +4449,7 @@ impl RoomSession {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn voice_stopped(
         &mut self,
         room_id: RoomId,
@@ -4317,15 +4458,37 @@ impl RoomSession {
         stream_id: StreamId,
         local_session: Option<SessionId>,
     ) -> VoiceNotice {
-        if let Some(meta) = self.metas.get_mut(&room_id) {
-            meta.voice_users.remove(&user_id);
+        self.voice_stopped_transition(room_id, session_id, user_id, stream_id, local_session, true)
+    }
+
+    pub(super) fn voice_stopped_transition(
+        &mut self,
+        room_id: RoomId,
+        session_id: SessionId,
+        user_id: UserId,
+        stream_id: StreamId,
+        local_session: Option<SessionId>,
+        user_left: bool,
+    ) -> VoiceNotice {
+        if user_left {
+            if let Some(meta) = self.metas.get_mut(&room_id) {
+                meta.voice_users.remove(&user_id);
+            }
+            self.note_voice_leave(room_id, user_id);
         }
-        self.note_voice_leave(room_id, user_id);
         if self.voice_room.or(self.viewed_room) == Some(room_id) {
             self.participants.voice_stopped(user_id, stream_id);
-            // Keep the row but demote it to `away`: the user was in this call,
-            // just not anymore.
-            if let Some(mut user) = self.users.get(&user_id).cloned() {
+            self.stream_users.remove(&stream_id);
+            if !user_left
+                && let Some(replacement) = self
+                    .stream_users
+                    .iter()
+                    .find_map(|(stream, owner)| (*owner == user_id).then_some(*stream))
+            {
+                self.participants.voice_started(user_id, replacement);
+            } else if user_left && let Some(mut user) = self.users.get(&user_id).cloned() {
+                // Keep the row but demote it to `away`: the user was in this
+                // call, just not anymore.
                 user.online = false;
                 self.participants.upsert(RosterSeed {
                     user,

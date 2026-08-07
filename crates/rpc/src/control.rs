@@ -371,12 +371,17 @@ pub enum ServerControl {
         session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
+        /// True only when this stream is the user's first active session in
+        /// the room. Replayed streams and additional linked devices are false.
+        user_joined: bool,
     },
     VoiceStopped {
         room_id: RoomId,
         session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
+        /// True only when this was the user's final active session in the room.
+        user_left: bool,
     },
     VoiceStateChanged {
         room_id: RoomId,

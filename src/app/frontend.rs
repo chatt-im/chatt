@@ -7,7 +7,8 @@ use local_rpc::{
         AttachmentDescriptor, AttachmentId, CommandCandidate, CommandCandidateKind,
         CommandOutputLine, ConnectionState, MediaKind, Message, RequestId, RoomKind, RoomSnapshot,
         RoomSummary, ServerAvailability, ServerSelectionState, ServerSummary, StateSnapshot,
-        TrustState, VoiceSessionState, VoiceState,
+        SystemMessage as RpcSystemMessage, SystemMessageLevel, TrustState, VoiceSessionState,
+        VoiceState,
     },
 };
 
@@ -305,13 +306,22 @@ impl App {
     }
 
     pub(crate) fn rpc_room_snapshot(&self, room_id: RoomId) -> RoomSnapshot {
+        let mut system_messages = self.room.system_messages(room_id);
+        if system_messages.len() > local_rpc::MAX_MESSAGES {
+            system_messages.drain(..system_messages.len() - local_rpc::MAX_MESSAGES);
+        }
+        let system_bytes = system_messages
+            .iter()
+            .map(rpc_system_message_size_estimate)
+            .sum::<usize>()
+            .min(local_rpc::MAX_ROOM_SNAPSHOT_BYTES);
         let page = self
             .room
             .resident_message_page(
                 room_id,
                 None,
                 local_rpc::MAX_MESSAGES,
-                local_rpc::MAX_ROOM_SNAPSHOT_BYTES,
+                local_rpc::MAX_ROOM_SNAPSHOT_BYTES.saturating_sub(system_bytes),
                 rpc_message_size_estimate,
             )
             .unwrap_or_else(|| super::room::ResidentMessagePage {
@@ -330,6 +340,10 @@ impl App {
             snapshot.at_start = false;
         }
         snapshot.messages = messages;
+        snapshot.system_messages = system_messages
+            .into_iter()
+            .map(rpc_system_message)
+            .collect();
         snapshot
     }
 
@@ -340,6 +354,7 @@ impl App {
             room_generation: self.room.room_generation(room_id).unwrap_or_default(),
             history_revision: self.room.room_history_revision(room_id).unwrap_or_default(),
             messages: Vec::new(),
+            system_messages: Vec::new(),
             older_cursor,
             at_start,
             participants: self
@@ -450,7 +465,6 @@ impl App {
                 message.message_id,
                 local_user,
             ),
-            notice: false,
             reference: None,
             attachment,
         }
@@ -1120,6 +1134,28 @@ fn core_voice_state(state: VoiceState) -> rpc::control::VoiceState {
         VoiceState::Muted => rpc::control::VoiceState::Muted,
         VoiceState::Deafened => rpc::control::VoiceState::Deafened,
     }
+}
+
+pub(crate) fn rpc_system_message(message: super::room::SystemMessage) -> RpcSystemMessage {
+    RpcSystemMessage {
+        room_id: message.room_id,
+        system_id: message.id,
+        after_message_id: message.after,
+        sender: message.sender,
+        body: message.body,
+        timestamp_ms: message.timestamp_ms,
+        level: match message.kind {
+            crate::chat_buffer::NoticeKind::Info => SystemMessageLevel::Info,
+            crate::chat_buffer::NoticeKind::Warning => SystemMessageLevel::Warning,
+            crate::chat_buffer::NoticeKind::Error => SystemMessageLevel::Error,
+        },
+    }
+}
+
+fn rpc_system_message_size_estimate(message: &super::room::SystemMessage) -> usize {
+    128usize
+        .saturating_add(message.sender.len())
+        .saturating_add(message.body.len())
 }
 
 fn rpc_message_size_estimate(message: &rpc::control::ChatMessage) -> usize {

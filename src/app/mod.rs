@@ -1263,6 +1263,25 @@ fn web_message_from_canonical(
     }
 }
 
+fn web_system_message(message: room::SystemMessage) -> crate::web_server::WebSystemMessage {
+    crate::web_server::WebSystemMessage {
+        id: message.id,
+        after_message_id: message.after.map(|id| id.0),
+        sender: message.sender,
+        body: message.body,
+        timestamp_ms: message.timestamp_ms,
+        level: match message.kind {
+            crate::chat_buffer::NoticeKind::Info => crate::web_server::WebSystemMessageLevel::Info,
+            crate::chat_buffer::NoticeKind::Warning => {
+                crate::web_server::WebSystemMessageLevel::Warning
+            }
+            crate::chat_buffer::NoticeKind::Error => {
+                crate::web_server::WebSystemMessageLevel::Error
+            }
+        },
+    }
+}
+
 /// Registers persistent downloads already on disk so the web view can serve them
 /// after a restart. Each configured persistent directory is scanned and its
 /// files registered under their on-disk names (first-wins on collision),
@@ -2199,6 +2218,9 @@ impl App {
         for message_id in &change.removed {
             feed.send_delete(change.room_id, change.room_generation, message_id.0);
         }
+        for system_id in &change.systems_removed {
+            feed.send_system_message_delete(change.room_id, change.room_generation, *system_id);
+        }
         if let Some(message_id) = change.upserted
             && let Some(message) = self.room.resident_message(change.room_id, message_id)
         {
@@ -2211,6 +2233,16 @@ impl App {
                     &|target| self.room.resolve_web_ref(target),
                     self.user_id,
                 ),
+            );
+        }
+        if let Some(message) = change
+            .system_upserted
+            .and_then(|id| self.room.system_message(change.room_id, id))
+        {
+            feed.send_system_message(
+                change.room_id,
+                change.room_generation,
+                web_system_message(message),
             );
         }
     }
@@ -2923,6 +2955,7 @@ impl App {
                 RoomId(0),
                 0,
                 Vec::new(),
+                Vec::new(),
                 None,
                 true,
             );
@@ -2934,12 +2967,19 @@ impl App {
         let page = history.latest_page(crate::web_server::SYNC_WINDOW);
         let projected =
             web_messages_from_canonical(page.messages.iter().copied(), &self.room, self.user_id);
+        let system_messages = self
+            .room
+            .system_messages(room_id)
+            .into_iter()
+            .map(web_system_message)
+            .collect();
         feed.send_history_window(
             audience,
             crate::web_server::HistoryWindowKind::Sync,
             room_id,
             page.room_generation,
             projected,
+            system_messages,
             page.older_cursor,
             page.at_start,
         );
@@ -3005,6 +3045,7 @@ impl App {
                     room_id,
                     requested_generation,
                     projected,
+                    Vec::new(),
                     page.older_cursor,
                     page.at_start,
                 );
@@ -3067,6 +3108,7 @@ impl App {
             crate::web_server::HistoryWindowKind::Older,
             room_id,
             requested_generation,
+            Vec::new(),
             Vec::new(),
             older_cursor,
             at_start || self.room.older_paging_exhausted(room_id),
@@ -4921,6 +4963,7 @@ impl App {
                 session_id,
                 user_id,
                 stream_id,
+                user_joined,
             } => {
                 if Some(session_id) == self.session_id {
                     self.room.voice_room = Some(room_id);
@@ -4928,14 +4971,28 @@ impl App {
                     self.requested_voice_room = None;
                 }
                 let voice_room = self.room.voice_room;
-                let notice = self.room.voice_started(
+                let notice = self.room.voice_started_transition(
                     room_id,
                     session_id,
                     user_id,
                     stream_id,
                     self.session_id,
                     voice_room,
+                    user_joined,
                 );
+                if user_joined
+                    && self.room.voice_room == Some(room_id)
+                    && let Some(change) = self.room.push_system_message_to(
+                        room_id,
+                        "call",
+                        format!("{} joined the call", notice.username),
+                        unix_now_ms(),
+                        crate::chat_buffer::NoticeKind::Info,
+                    )
+                {
+                    self.project_history_change_to_web(&change);
+                    *history_change = Some(change);
+                }
                 if self.room.voice_room == Some(room_id) {
                     if let Some(playback) = &self.playback {
                         playback.start_stream(stream_id.0);
@@ -4960,14 +5017,30 @@ impl App {
                 session_id,
                 user_id,
                 stream_id,
+                user_left,
             } => {
-                let notice = self.room.voice_stopped(
+                let was_participating = self.room.voice_room == Some(room_id);
+                let notice = self.room.voice_stopped_transition(
                     room_id,
                     session_id,
                     user_id,
                     stream_id,
                     self.session_id,
+                    user_left,
                 );
+                if user_left
+                    && was_participating
+                    && let Some(change) = self.room.push_system_message_to(
+                        room_id,
+                        "call",
+                        format!("{} left the call", notice.username),
+                        unix_now_ms(),
+                        crate::chat_buffer::NoticeKind::Info,
+                    )
+                {
+                    self.project_history_change_to_web(&change);
+                    *history_change = Some(change);
+                }
                 if notice.local {
                     if self.room.voice_room == Some(room_id) {
                         self.clear_shares_for_voice_room(room_id);
@@ -9362,6 +9435,14 @@ fn video_rate_label(bytes_per_sec: u64) -> String {
     format!("{}/s", crate::client_net::format_bytes(bytes_per_sec))
 }
 
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 #[allow(dead_code, reason = "used in debug only logging")]
 fn network_event_kind(event: &NetworkEvent) -> &'static str {
     match event {
@@ -11358,16 +11439,126 @@ mod tests {
             session_id: SessionId(1),
             user_id: UserId(1),
             stream_id: StreamId(10),
+            user_left: true,
         });
         app.handle_network_event(NetworkEvent::VoiceStarted {
             room_id: RoomId(2),
             session_id: SessionId(1),
             user_id: UserId(1),
             stream_id: StreamId(11),
+            user_joined: true,
         });
 
         assert_eq!(app.room.voice_room, Some(RoomId(2)));
         assert!(app.voice_tx_enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn call_status_messages_follow_user_transitions_only_in_current_call() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        app.session_id = Some(SessionId(1));
+        let local_user = app.user_id;
+        app.room.authenticated(
+            &[test_room_info(1), test_room_info(2)],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(1),
+            None,
+            local_user,
+        );
+        app.room.voice_room = Some(RoomId(1));
+
+        let event = |stream_id, user_joined| NetworkEvent::VoiceStarted {
+            room_id: RoomId(1),
+            session_id: SessionId(stream_id),
+            user_id: UserId(2),
+            stream_id: StreamId(stream_id as u32),
+            user_joined,
+        };
+        let first = app.handle_network_event_change(event(10, true));
+        assert!(first.is_some());
+        assert_eq!(
+            app.room.system_messages(RoomId(1))[0].body,
+            "bob joined the call"
+        );
+
+        assert!(app.handle_network_event_change(event(11, false)).is_none());
+        app.handle_network_event(NetworkEvent::VoiceStarted {
+            room_id: RoomId(2),
+            session_id: SessionId(12),
+            user_id: UserId(2),
+            stream_id: StreamId(12),
+            user_joined: true,
+        });
+        assert_eq!(app.room.system_messages(RoomId(1)).len(), 1);
+        assert!(app.room.system_messages(RoomId(2)).is_empty());
+
+        assert!(
+            app.handle_network_event_change(NetworkEvent::VoiceStopped {
+                room_id: RoomId(1),
+                session_id: SessionId(10),
+                user_id: UserId(2),
+                stream_id: StreamId(10),
+                user_left: false,
+            })
+            .is_none()
+        );
+        let final_leave = app.handle_network_event_change(NetworkEvent::VoiceStopped {
+            room_id: RoomId(1),
+            session_id: SessionId(11),
+            user_id: UserId(2),
+            stream_id: StreamId(11),
+            user_left: true,
+        });
+        assert!(final_leave.is_some());
+        let messages = app.room.system_messages(RoomId(1));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].body, "bob left the call");
+    }
+
+    #[test]
+    fn own_confirmed_join_and_leave_are_retained_as_system_messages() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        app.session_id = Some(SessionId(1));
+        let local_user = app.user_id;
+        app.room.authenticated(
+            &[test_room_info(1)],
+            vec![user_summary(UserId(1), "alice")],
+            RoomId(1),
+            None,
+            local_user,
+        );
+
+        app.handle_network_event(NetworkEvent::VoiceStarted {
+            room_id: RoomId(1),
+            session_id: SessionId(1),
+            user_id: UserId(1),
+            stream_id: StreamId(10),
+            user_joined: true,
+        });
+        app.handle_network_event(NetworkEvent::VoiceStopped {
+            room_id: RoomId(1),
+            session_id: SessionId(1),
+            user_id: UserId(1),
+            stream_id: StreamId(10),
+            user_left: true,
+        });
+
+        let messages = app.room.system_messages(RoomId(1));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].sender, "call");
+        assert_eq!(messages[0].body, "alice joined the call");
+        assert_eq!(messages[1].body, "alice left the call");
+        assert_eq!(app.room.voice_room, None);
+        let snapshot = app.rpc_snapshot(crate::client_channel::ClientId::PRIMARY);
+        let projected = snapshot.room.expect("selected room").system_messages;
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0].sender, "call");
+        assert_eq!(projected[0].body, "alice joined the call");
     }
 
     #[test]
@@ -11429,6 +11620,7 @@ mod tests {
             session_id: SessionId(1),
             user_id: UserId(1),
             stream_id: StreamId(1),
+            user_left: true,
         });
         assert!(app.room.available_shares.is_empty());
     }
