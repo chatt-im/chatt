@@ -2622,7 +2622,9 @@ mod tests {
     }
 }
 
-/// Formats a message age for the heading. Empty for notices (`timestamp_ms == 0`).
+/// Formats a message age for the heading. Empty for the timeless notices —
+/// local diagnostics and gap markers — that carry no wall clock
+/// (`timestamp_ms == 0`).
 fn chat_age(timestamp_ms: u64, now_ms: u64) -> String {
     if timestamp_ms == 0 {
         return String::new();
