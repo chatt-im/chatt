@@ -277,9 +277,34 @@ pub struct Message {
     pub local: bool,
     pub edited: bool,
     pub unverified: bool,
-    pub notice: bool,
     pub reference: Option<MessageReference>,
     pub attachment: Option<AttachmentDescriptor>,
+}
+
+/// A daemon-session room timeline entry produced by the application rather
+/// than by server chat. This generic shape is intentionally source-agnostic so
+/// future system messages do not require another protocol change.
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct SystemMessage {
+    pub room_id: RoomId,
+    pub system_id: u64,
+    /// Chat message after which this row was created. Renderers merge missing
+    /// anchors by numeric position, then order equal anchors by `system_id`.
+    pub after_message_id: Option<MessageId>,
+    pub sender: String,
+    pub body: String,
+    pub timestamp_ms: u64,
+    pub level: SystemMessageLevel,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum SystemMessageLevel {
+    #[default]
+    Info,
+    Warning,
+    Error,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -433,6 +458,7 @@ pub struct RoomSnapshot {
     /// Canonical resident-history revision represented by this snapshot.
     pub history_revision: u64,
     pub messages: Vec<Message>,
+    pub system_messages: Vec<SystemMessage>,
     pub older_cursor: Option<MessageId>,
     pub at_start: bool,
     pub participants: Vec<Participant>,
@@ -645,6 +671,22 @@ impl Message {
     }
 }
 
+impl SystemMessage {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.system_id == 0 {
+            return Err("system message id must be nonzero".into());
+        }
+        check_nonempty_string(&self.sender)?;
+        if self.body.is_empty() {
+            return Err("system message body must not be empty".into());
+        }
+        if self.body.len() > super::MAX_MESSAGE_BODY_BYTES {
+            return Err("system message body exceeds limit".into());
+        }
+        Ok(())
+    }
+}
+
 impl AttachmentDescriptor {
     pub fn validate(&self) -> Result<(), String> {
         check_nonempty_string(&self.file_name)?;
@@ -704,6 +746,9 @@ impl RoomSnapshot {
         if self.participants.len() > super::MAX_PARTICIPANTS {
             return Err("participant collection exceeds limit".into());
         }
+        if self.system_messages.len() > super::MAX_MESSAGES {
+            return Err("system message collection exceeds limit".into());
+        }
         for message in &self.messages {
             if message.room_id != self.room_id {
                 return Err("message belongs to a different room".into());
@@ -719,6 +764,19 @@ impl RoomSnapshot {
         }
         for participant in &self.participants {
             participant.validate()?;
+        }
+        for message in &self.system_messages {
+            if message.room_id != self.room_id {
+                return Err("system message belongs to a different room".into());
+            }
+            message.validate()?;
+        }
+        if self
+            .system_messages
+            .windows(2)
+            .any(|messages| messages[0].system_id >= messages[1].system_id)
+        {
+            return Err("system messages must be strictly ordered by id".into());
         }
         Ok(())
     }

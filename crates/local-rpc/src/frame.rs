@@ -11,7 +11,7 @@ use super::{
         AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo,
         CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, LiveShareViewStatus,
         Message, Participant, RequestId, RoomSnapshot, RoomSummary, ServerSelectionState,
-        StateSnapshot, TransferSummary, TrustState, VoiceSessionState, VoiceState,
+        StateSnapshot, SystemMessage, TransferSummary, TrustState, VoiceSessionState, VoiceState,
     },
     settings::{SettingsCommand, SettingsEvent, SettingsResult},
 };
@@ -306,6 +306,13 @@ pub enum StateDelta {
     MessageDeleted {
         room_id: RoomId,
         message_id: MessageId,
+    },
+    SystemMessageUpserted {
+        message: SystemMessage,
+    },
+    SystemMessageDeleted {
+        room_id: RoomId,
+        system_id: u64,
     },
     ParticipantsChanged {
         room_id: RoomId,
@@ -1072,6 +1079,10 @@ fn validate_delta(delta: &StateDelta) -> Result<(), String> {
             Ok(())
         }
         StateDelta::MessageUpserted { message } => message.validate(),
+        StateDelta::SystemMessageUpserted { message } => message.validate(),
+        StateDelta::SystemMessageDeleted { system_id: 0, .. } => {
+            Err("system message id must be nonzero".into())
+        }
         StateDelta::ParticipantsChanged { participants, .. } => {
             if participants.len() > super::MAX_PARTICIPANTS {
                 return Err("participant collection exceeds limit".into());
@@ -1518,6 +1529,29 @@ mod tests {
             }),
             DaemonFrame::Event(StateEvent {
                 instance_id,
+                event_seq: 5,
+                delta: StateDelta::SystemMessageUpserted {
+                    message: SystemMessage {
+                        room_id: RoomId(2),
+                        system_id: 7,
+                        after_message_id: Some(MessageId(2)),
+                        sender: "call".into(),
+                        body: "alice joined the call".into(),
+                        timestamp_ms: 5,
+                        level: super::super::model::SystemMessageLevel::Info,
+                    },
+                },
+            }),
+            DaemonFrame::Event(StateEvent {
+                instance_id,
+                event_seq: 6,
+                delta: StateDelta::SystemMessageDeleted {
+                    room_id: RoomId(2),
+                    system_id: 7,
+                },
+            }),
+            DaemonFrame::Event(StateEvent {
+                instance_id,
                 event_seq: 3,
                 delta: StateDelta::DaemonStopping,
             }),
@@ -1588,7 +1622,6 @@ mod tests {
                         local: false,
                         edited: false,
                         unverified: false,
-                        notice: false,
                         reference: None,
                         attachment: Some(descriptor),
                     },

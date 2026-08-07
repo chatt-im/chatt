@@ -5,13 +5,21 @@
 // first field is a length), so `decodeFeed` returns null for one, letting the
 // caller treat it as video. All integers are little-endian.
 
-import type { WebMessage, Fragment, MediaKind, MessageId } from "./types";
+import type {
+  WebMessage,
+  WebSystemMessage,
+  Fragment,
+  MediaKind,
+  MessageId,
+} from "./types";
 
 const KIND_SYNC = 1;
 const KIND_MESSAGE = 2;
 const KIND_OLDER = 3;
 const KIND_REF_PREVIEW = 4;
 const KIND_DELETE = 5;
+const KIND_SYSTEM_MESSAGE = 6;
+const KIND_SYSTEM_MESSAGE_DELETE = 7;
 
 const FRAG_TEXT = 0;
 const FRAG_CODE = 1;
@@ -28,6 +36,7 @@ export type FeedFrame =
       room_id: number;
       room_generation: number;
       messages: WebMessage[];
+      system_messages: WebSystemMessage[];
       older_cursor: MessageId | null;
       at_start: boolean;
     }
@@ -36,11 +45,24 @@ export type FeedFrame =
       room_id: number;
       room_generation: number;
       messages: WebMessage[];
+      system_messages: WebSystemMessage[];
       older_cursor: MessageId | null;
       at_start: boolean;
     }
   | { kind: "message"; room_id: number; room_generation: number; message: WebMessage }
   | { kind: "delete"; room_id: number; room_generation: number; message_id: MessageId }
+  | {
+      kind: "system_message";
+      room_id: number;
+      room_generation: number;
+      message: WebSystemMessage;
+    }
+  | {
+      kind: "system_message_delete";
+      room_id: number;
+      room_generation: number;
+      system_id: number;
+    }
   | {
       kind: "ref_preview";
       room_id: number;
@@ -79,6 +101,22 @@ export function decodeFeed(buffer: ArrayBuffer): FeedFrame | null {
       message_id: reader.messageId(),
     };
   }
+  if (kind === KIND_SYSTEM_MESSAGE) {
+    return {
+      kind: "system_message",
+      room_id: reader.u53(),
+      room_generation: reader.u53(),
+      message: reader.systemMessage(),
+    };
+  }
+  if (kind === KIND_SYSTEM_MESSAGE_DELETE) {
+    return {
+      kind: "system_message_delete",
+      room_id: reader.u53(),
+      room_generation: reader.u53(),
+      system_id: reader.u53(),
+    };
+  }
   // Unknown kinds (newer server) must not fall into the window parser.
   if (kind !== KIND_SYNC && kind !== KIND_OLDER) return null;
   const room_id = reader.u53();
@@ -88,11 +126,15 @@ export function decodeFeed(buffer: ArrayBuffer): FeedFrame | null {
   const count = reader.u32();
   const messages: WebMessage[] = [];
   for (let i = 0; i < count; i++) messages.push(reader.message());
+  const systemCount = reader.u32();
+  const system_messages: WebSystemMessage[] = [];
+  for (let i = 0; i < systemCount; i++) system_messages.push(reader.systemMessage());
   return {
     kind: kind === KIND_SYNC ? "sync" : "older",
     room_id,
     room_generation,
     messages,
+    system_messages,
     older_cursor,
     at_start,
   };
@@ -217,5 +259,17 @@ class Reader {
       ref_code,
       fragments,
     };
+  }
+
+  systemMessage(): WebSystemMessage {
+    const system_id = this.u53();
+    const after_message_id = this.u8() === 1 ? this.messageId() : null;
+    const sender = this.string();
+    const body = this.string();
+    const timestamp_ms = this.u53();
+    const levelCode = this.u8();
+    const level = (["info", "warning", "error"] as const)[levelCode];
+    if (!level) throw new Error(`unknown system message level ${levelCode}`);
+    return { system_id, after_message_id, sender, body, timestamp_ms, level };
   }
 }

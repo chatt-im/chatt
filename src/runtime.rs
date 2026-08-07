@@ -1003,6 +1003,7 @@ fn spawn_rpc_client(
     };
     if let Some(room) = retained_snapshot.room.as_mut() {
         room.messages.clear();
+        room.system_messages.clear();
     }
     Ok(RemoteRpcClient {
         sender,
@@ -1175,6 +1176,7 @@ fn send_rpc_snapshot(
     let mut snapshot = client.sender.send_snapshot(instance_id, seq, snapshot)?;
     if let Some(room) = snapshot.room.as_mut() {
         room.messages.clear();
+        room.system_messages.clear();
     }
     client.last_snapshot = snapshot;
     client.pending_history = None;
@@ -1270,11 +1272,24 @@ fn project_rpc_history_change(
                 message_id: *message_id,
             })
             .collect::<Vec<_>>();
+        deltas.extend(change.systems_removed.iter().map(|system_id| {
+            StateDelta::SystemMessageDeleted {
+                room_id: change.room_id,
+                system_id: *system_id,
+            }
+        }));
         if let Some(message) = change
             .upserted
             .and_then(|id| app.rpc_canonical_message(change.room_id, id))
         {
             deltas.push(StateDelta::MessageUpserted { message });
+        }
+        if let Some(message) = change
+            .system_upserted
+            .and_then(|id| app.room.system_message(change.room_id, id))
+            .map(crate::app::frontend::rpc_system_message)
+        {
+            deltas.push(StateDelta::SystemMessageUpserted { message });
         }
         (deltas, None)
     };
@@ -1339,6 +1354,7 @@ fn sync_rpc_state(
             .send_snapshot(instance_id, seq, app.rpc_snapshot(id))?;
         if let Some(room) = snapshot.room.as_mut() {
             room.messages.clear();
+            room.system_messages.clear();
         }
         client.live_viewers.retain(|stream_id, viewer| {
             snapshot

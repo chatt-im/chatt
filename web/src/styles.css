@@ -2021,6 +2021,10 @@ body {
   color: var(--warn);
 }
 
+.message.is-system-warning .message-system-text {
+  color: var(--warn);
+}
+
 /* A dashed accent border signals the composer is a drop target while dragging. */
 .composer.is-drag-active {
   outline: 2px dashed var(--accent);

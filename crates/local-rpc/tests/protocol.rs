@@ -15,15 +15,15 @@ use local_rpc::{
 };
 
 #[test]
-fn renderer_and_daemon_exchange_protocol_v14_frames_and_live_share_fd() {
-    assert_eq!(PROTOCOL_MIN_VERSION, 14);
-    assert_eq!(PROTOCOL_MAX_VERSION, 14);
+fn renderer_and_daemon_exchange_protocol_v15_frames_and_live_share_fd() {
+    assert_eq!(PROTOCOL_MIN_VERSION, 15);
+    assert_eq!(PROTOCOL_MAX_VERSION, 15);
     assert_eq!(MAX_MESSAGE_BODY_BYTES, 16 * 1024);
     assert_eq!(DEFAULT_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
     assert_eq!(MAX_HISTORY_REQUEST_MESSAGES, 500);
 
     let hello = ClientHello::current("test-renderer");
-    assert_eq!(hello.negotiated_version(), Some(14));
+    assert_eq!(hello.negotiated_version(), Some(15));
 
     let incompatible = ClientHello {
         min_version: 12,
@@ -32,7 +32,7 @@ fn renderer_and_daemon_exchange_protocol_v14_frames_and_live_share_fd() {
     };
     assert_eq!(
         incompatible.unsupported_version_message(),
-        "unsupported daemon RPC protocol version: client supports 12..=13, daemon supports 14..=14"
+        "unsupported daemon RPC protocol version: client supports 12..=13, daemon supports 15..=15"
     );
 
     let (daemon_socket, renderer_socket) = UnixStream::pair().unwrap();

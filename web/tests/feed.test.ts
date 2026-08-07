@@ -70,14 +70,43 @@ test("decodes canonical room generation and message paging cursor", () => {
   u64(bytes, 42);
   u8(bytes, 0);
   u32(bytes, 0);
+  u32(bytes, 0);
 
   expect(decodeFeed(Uint8Array.from(bytes).buffer)).toEqual({
     kind: "sync",
     room_id: 9,
     room_generation: 7,
     messages: [],
+    system_messages: [],
     older_cursor: "2a",
     at_start: false,
+  });
+});
+
+test("decodes generic system messages without a source-specific wire shape", () => {
+  const bytes = [0, 0, 0, 0, 6];
+  u64(bytes, 9);
+  u64(bytes, 7);
+  u64(bytes, 3);
+  u8(bytes, 1);
+  u64(bytes, 42);
+  string(bytes, "call");
+  string(bytes, "Alice joined the call");
+  u64(bytes, 8_000);
+  u8(bytes, 0);
+
+  expect(decodeFeed(Uint8Array.from(bytes).buffer)).toEqual({
+    kind: "system_message",
+    room_id: 9,
+    room_generation: 7,
+    message: {
+      system_id: 3,
+      after_message_id: "2a",
+      sender: "call",
+      body: "Alice joined the call",
+      timestamp_ms: 8_000,
+      level: "info",
+    },
   });
 });
 

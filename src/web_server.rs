@@ -199,6 +199,30 @@ pub struct WebMessage {
     pub fragments: Vec<Fragment>,
 }
 
+/// Generic daemon-session system row delivered beside canonical chat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebSystemMessage {
+    pub id: u64,
+    pub after_message_id: Option<u64>,
+    pub sender: String,
+    pub body: String,
+    pub timestamp_ms: u64,
+    pub level: WebSystemMessageLevel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebSystemMessageLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+impl WebSystemMessage {
+    fn heap_bytes(&self) -> usize {
+        self.sender.capacity() + self.body.capacity()
+    }
+}
+
 /// An inline media file attached to a [`WebMessage`], served from `/files`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebAttachment {
@@ -430,6 +454,16 @@ enum WebFeed {
         room_generation: u64,
         message_id: u64,
     },
+    SystemMessage {
+        room_id: RoomId,
+        room_generation: u64,
+        message: WebSystemMessage,
+    },
+    SystemMessageDelete {
+        room_id: RoomId,
+        room_generation: u64,
+        system_id: u64,
+    },
     /// A transient `delete_error` envelope for a locally/server-rejected web
     /// deletion request.
     DeleteError(String),
@@ -445,6 +479,7 @@ enum WebFeed {
         room_id: RoomId,
         room_generation: u64,
         messages: Vec<WebMessage>,
+        system_messages: Vec<WebSystemMessage>,
         older_cursor: Option<MessageId>,
         at_start: bool,
     },
@@ -513,15 +548,29 @@ impl WebFeed {
     fn retained_bytes(&self) -> usize {
         let heap = match self {
             Self::Message { message, .. } => message.heap_bytes(),
-            Self::Delete { .. } | Self::VideoFrame(_) | Self::Config { .. } | Self::ReloadCss => 0,
+            Self::Delete { .. }
+            | Self::SystemMessageDelete { .. }
+            | Self::VideoFrame(_)
+            | Self::Config { .. }
+            | Self::ReloadCss => 0,
+            Self::SystemMessage { message, .. } => message.heap_bytes(),
             Self::DeleteError(payload)
             | Self::ActionError(payload)
             | Self::FileProgress(payload)
             | Self::FileTerminal(payload) => payload.capacity(),
             Self::SetRoomName { name } => name.capacity(),
-            Self::HistoryWindow { messages, .. } => {
+            Self::HistoryWindow {
+                messages,
+                system_messages,
+                ..
+            } => {
                 messages.capacity() * std::mem::size_of::<WebMessage>()
                     + messages.iter().map(WebMessage::heap_bytes).sum::<usize>()
+                    + system_messages.capacity() * std::mem::size_of::<WebSystemMessage>()
+                    + system_messages
+                        .iter()
+                        .map(WebSystemMessage::heap_bytes)
+                        .sum::<usize>()
             }
             Self::RefPreview { message, .. } => message.as_ref().map_or(0, WebMessage::heap_bytes),
             Self::E2eSecurity { payload, .. }
@@ -555,6 +604,8 @@ impl WebFeed {
             Self::VideoFrame(_) => FeedBudget::Video,
             Self::Message { .. }
             | Self::Delete { .. }
+            | Self::SystemMessage { .. }
+            | Self::SystemMessageDelete { .. }
             | Self::HistoryWindow { .. }
             | Self::RefPreview { .. } => FeedBudget::History,
             Self::Config { .. }
@@ -582,7 +633,10 @@ impl WebFeed {
     /// every connected tab a fresh snapshot.
     fn resync_on_drop(&self) -> Option<WebAudience> {
         match self {
-            Self::Message { .. } | Self::Delete { .. } => Some(WebAudience::All),
+            Self::Message { .. }
+            | Self::Delete { .. }
+            | Self::SystemMessage { .. }
+            | Self::SystemMessageDelete { .. } => Some(WebAudience::All),
             Self::HistoryWindow { audience, .. } => Some(*audience),
             _ => None,
         }
@@ -875,6 +929,32 @@ impl WebFeedSender {
         });
     }
 
+    pub fn send_system_message(
+        &self,
+        room_id: RoomId,
+        room_generation: u64,
+        message: WebSystemMessage,
+    ) {
+        self.queue(WebFeed::SystemMessage {
+            room_id,
+            room_generation,
+            message,
+        });
+    }
+
+    pub fn send_system_message_delete(
+        &self,
+        room_id: RoomId,
+        room_generation: u64,
+        system_id: u64,
+    ) {
+        self.queue(WebFeed::SystemMessageDelete {
+            room_id,
+            room_generation,
+            system_id,
+        });
+    }
+
     pub fn set_room_name(&self, name: String) {
         self.queue(WebFeed::SetRoomName { name });
     }
@@ -886,6 +966,7 @@ impl WebFeedSender {
         room_id: RoomId,
         room_generation: u64,
         messages: Vec<WebMessage>,
+        system_messages: Vec<WebSystemMessage>,
         older_cursor: Option<MessageId>,
         at_start: bool,
     ) {
@@ -895,6 +976,7 @@ impl WebFeedSender {
             room_id,
             room_generation,
             messages,
+            system_messages,
             older_cursor,
             at_start,
         });
@@ -2008,6 +2090,36 @@ fn run(
                         let _ = server.send_websocket_binary(*id, &feed_frame);
                     }
                 }
+                Ok(WebFeed::SystemMessage {
+                    room_id,
+                    room_generation,
+                    message,
+                }) => {
+                    web_wire::encode_system_message_into(
+                        &mut feed_frame,
+                        room_id,
+                        room_generation,
+                        &message,
+                    );
+                    for id in &clients {
+                        let _ = server.send_websocket_binary(*id, &feed_frame);
+                    }
+                }
+                Ok(WebFeed::SystemMessageDelete {
+                    room_id,
+                    room_generation,
+                    system_id,
+                }) => {
+                    web_wire::encode_system_message_delete_into(
+                        &mut feed_frame,
+                        room_id,
+                        room_generation,
+                        system_id,
+                    );
+                    for id in &clients {
+                        let _ = server.send_websocket_binary(*id, &feed_frame);
+                    }
+                }
                 Ok(WebFeed::SetRoomName { name }) => {
                     room_name = name;
                     let payload = room_envelope(&room_name);
@@ -2021,6 +2133,7 @@ fn run(
                     room_id,
                     room_generation,
                     messages,
+                    system_messages,
                     older_cursor,
                     at_start,
                 }) => {
@@ -2033,6 +2146,7 @@ fn run(
                         room_id,
                         room_generation,
                         &messages,
+                        &system_messages,
                         older_cursor,
                         at_start,
                     );
@@ -2752,6 +2866,7 @@ mod tests {
             room_id: RoomId(1),
             room_generation: 1,
             messages: Vec::new(),
+            system_messages: Vec::new(),
             older_cursor: None,
             at_start: false,
         };
@@ -2919,8 +3034,15 @@ mod tests {
     #[test]
     fn text_message_encodes_without_attachment() {
         let message = WebMessage::text_for_test(1, "hi");
-        let frame =
-            web_wire::encode_window(web_wire::KIND_SYNC, RoomId(1), 7, &[message], None, true);
+        let frame = web_wire::encode_window(
+            web_wire::KIND_SYNC,
+            RoomId(1),
+            7,
+            &[message],
+            &[],
+            None,
+            true,
+        );
         let decoded = web_wire::decode_window(&frame);
         assert!(decoded.messages[0].attachment_name.is_none());
         assert!(decoded.messages[0].attachment_file_id.is_none());
@@ -3488,6 +3610,7 @@ Sec-WebSocket-Version: 13\r\n\
             RoomId(3),
             11,
             vec![WebMessage::text_for_test(1, "room one")],
+            Vec::new(),
             Some(MessageId(1)),
             true,
         );

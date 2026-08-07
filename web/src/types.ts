@@ -81,9 +81,22 @@ export interface WebMessage {
   autoplay?: AutoplayMode;
   // Client-synthesized ephemeral system row carrying slash-command output.
   // Never sent by Rust; the next room sync clears these naturally.
-  system?: "info" | "error";
+  system?: "info" | "warning" | "error";
+  system_id?: number;
+  after_message_id?: MessageId | null;
   // The body pre-split into prose and code fragments.
   fragments: Fragment[];
+}
+
+// A daemon-session system row. The shape is source-agnostic so new system
+// message producers can reuse it without changing the browser protocol.
+export interface WebSystemMessage {
+  system_id: number;
+  after_message_id: MessageId | null;
+  sender: string;
+  body: string;
+  timestamp_ms: number;
+  level: "info" | "warning" | "error";
 }
 
 // The argument domain a slash command completes from. "free" arguments show a

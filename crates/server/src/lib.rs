@@ -5592,17 +5592,21 @@ impl Server {
     }
 
     fn room_info(&self, room: &RoomState) -> RoomInfo {
+        let mut voice_users = room
+            .active_streams
+            .values()
+            .filter_map(|session_id| self.sessions.get(session_id))
+            .map(|session| session.user_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        voice_users.sort_by_key(|user_id| user_id.0);
         RoomInfo {
             room_id: room.id,
             name: room.name.clone(),
             kind: room.access.kind(),
             head: self.store.head(room.id),
-            voice_users: room
-                .active_streams
-                .values()
-                .filter_map(|session_id| self.sessions.get(session_id))
-                .map(|session| session.user_id)
-                .collect(),
+            voice_users,
         }
     }
 
@@ -5741,7 +5745,18 @@ impl Server {
             route: Some(VoiceRoute { room_id, stream_id }),
         });
         if !already_active {
-            self.broadcast_voice_started(room_id, session_id, user_id, stream_id);
+            let user_joined = self.rooms.get(&room_id).is_some_and(|room| {
+                room.active_streams
+                    .values()
+                    .filter(|member_session| {
+                        self.sessions
+                            .get(*member_session)
+                            .is_some_and(|session| session.user_id == user_id)
+                    })
+                    .count()
+                    == 1
+            });
+            self.broadcast_voice_started(room_id, session_id, user_id, stream_id, user_joined);
             if let Some(token) = self.live_token_for_session(session_id) {
                 self.send_existing_voice_streams_to_token(room_id, session_id, token);
             }
@@ -7428,6 +7443,7 @@ impl Server {
         session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
+        user_joined: bool,
     ) {
         self.broadcast_control(
             room_id,
@@ -7436,6 +7452,7 @@ impl Server {
                 session_id,
                 user_id,
                 stream_id,
+                user_joined,
             },
         );
     }
@@ -7473,6 +7490,7 @@ impl Server {
                     session_id,
                     user_id,
                     stream_id,
+                    user_joined: false,
                 },
             );
         }
@@ -7510,6 +7528,13 @@ impl Server {
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.active_streams.remove(&stream_id);
         }
+        let user_left = self.rooms.get(&room_id).is_none_or(|room| {
+            !room.active_streams.values().any(|member_session| {
+                self.sessions
+                    .get(member_session)
+                    .is_some_and(|session| session.user_id == user_id)
+            })
+        });
         kvlog::info!(
             "voice stopped",
             session_id = session_id.0,
@@ -7524,6 +7549,7 @@ impl Server {
                 session_id,
                 user_id,
                 stream_id,
+                user_left,
             },
             excluded_broadcast_session,
         );
@@ -11551,18 +11577,86 @@ mod tests {
 
         server.join_voice(joining, room_id);
 
-        let ServerControl::VoiceStarted { user_id, .. } =
-            read_plaintext_server_control(&mut server, &mut joining_peer)
+        let ServerControl::VoiceStarted {
+            user_id,
+            user_joined,
+            ..
+        } = read_plaintext_server_control(&mut server, &mut joining_peer)
         else {
             panic!("voice confirmation must be the first control");
         };
         assert_eq!(user_id, UserId(2));
-        let ServerControl::VoiceStarted { user_id, .. } =
-            read_plaintext_server_control(&mut server, &mut joining_peer)
+        assert!(user_joined);
+        let ServerControl::VoiceStarted {
+            user_id,
+            user_joined,
+            ..
+        } = read_plaintext_server_control(&mut server, &mut joining_peer)
         else {
             panic!("existing voice member must follow local confirmation");
         };
         assert_eq!(user_id, UserId(1));
+        assert!(!user_joined);
+    }
+
+    #[test]
+    fn voice_transitions_are_user_level_across_multiple_sessions() {
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let first = SessionId(1);
+        let second = SessionId(2);
+        let observer = SessionId(3);
+        let _first_peer = live_user(&mut server, Token(11), first, UserId(1));
+        let _second_peer = live_user(&mut server, Token(22), second, UserId(1));
+        let mut observer_peer = live_user(&mut server, Token(33), observer, UserId(2));
+
+        server.join_voice(first, room_id);
+        let first_join = read_until(&mut server, &mut observer_peer, |control| {
+            matches!(control, ServerControl::VoiceStarted { .. })
+        });
+        assert!(matches!(
+            first_join,
+            ServerControl::VoiceStarted {
+                user_joined: true,
+                ..
+            }
+        ));
+
+        server.join_voice(second, room_id);
+        let second_join = read_until(&mut server, &mut observer_peer, |control| {
+            matches!(control, ServerControl::VoiceStarted { .. })
+        });
+        assert!(matches!(
+            second_join,
+            ServerControl::VoiceStarted {
+                user_joined: false,
+                ..
+            }
+        ));
+
+        server.leave_voice(first, None);
+        let first_leave = read_until(&mut server, &mut observer_peer, |control| {
+            matches!(control, ServerControl::VoiceStopped { .. })
+        });
+        assert!(matches!(
+            first_leave,
+            ServerControl::VoiceStopped {
+                user_left: false,
+                ..
+            }
+        ));
+
+        server.leave_voice(second, None);
+        let final_leave = read_until(&mut server, &mut observer_peer, |control| {
+            matches!(control, ServerControl::VoiceStopped { .. })
+        });
+        assert!(matches!(
+            final_leave,
+            ServerControl::VoiceStopped {
+                user_left: true,
+                ..
+            }
+        ));
     }
 
     #[test]

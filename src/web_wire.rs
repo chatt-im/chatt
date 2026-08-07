@@ -13,7 +13,7 @@
 //! 17-byte header), so the frontend tells the two apart by that word. All
 //! integers are little-endian. Keep `web/src/feed.ts` in sync.
 
-use crate::web_server::{WebAttachment, WebMessage};
+use crate::web_server::{WebAttachment, WebMessage, WebSystemMessage, WebSystemMessageLevel};
 use chatt_message_format::{Token, TokenKind, highlight};
 
 /// Marks a feed frame, distinguishing it from a raw video frame.
@@ -25,6 +25,8 @@ pub const KIND_MESSAGE: u8 = 2;
 pub const KIND_OLDER: u8 = 3;
 pub const KIND_REF_PREVIEW: u8 = 4;
 pub const KIND_DELETE: u8 = 5;
+pub const KIND_SYSTEM_MESSAGE: u8 = 6;
+pub const KIND_SYSTEM_MESSAGE_DELETE: u8 = 7;
 
 /// Fragment kind bytes.
 const FRAG_TEXT: u8 = 0;
@@ -292,6 +294,7 @@ pub fn encode_window(
     room_id: rpc::ids::RoomId,
     room_generation: u64,
     messages: &[WebMessage],
+    system_messages: &[WebSystemMessage],
     older_cursor: Option<rpc::ids::MessageId>,
     at_start: bool,
 ) -> Vec<u8> {
@@ -302,6 +305,7 @@ pub fn encode_window(
         room_id,
         room_generation,
         messages,
+        system_messages,
         older_cursor,
         at_start,
     );
@@ -314,6 +318,7 @@ pub fn encode_window_into(
     room_id: rpc::ids::RoomId,
     room_generation: u64,
     messages: &[WebMessage],
+    system_messages: &[WebSystemMessage],
     older_cursor: Option<rpc::ids::MessageId>,
     at_start: bool,
 ) {
@@ -333,6 +338,10 @@ pub fn encode_window_into(
     put_u32(buf, messages.len() as u32);
     for message in messages {
         encode_message(buf, message);
+    }
+    put_u32(buf, system_messages.len() as u32);
+    for message in system_messages {
+        encode_system_message(buf, message);
     }
 }
 
@@ -395,6 +404,53 @@ pub fn encode_delete_into(
     put_u64(buf, room_id.0 as u64);
     put_u64(buf, room_generation);
     put_u64(buf, message_id);
+}
+
+pub fn encode_system_message_into(
+    buf: &mut Vec<u8>,
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
+    message: &WebSystemMessage,
+) {
+    buf.clear();
+    buf.extend_from_slice(&SENTINEL);
+    buf.push(KIND_SYSTEM_MESSAGE);
+    put_u64(buf, room_id.0 as u64);
+    put_u64(buf, room_generation);
+    encode_system_message(buf, message);
+}
+
+pub fn encode_system_message_delete_into(
+    buf: &mut Vec<u8>,
+    room_id: rpc::ids::RoomId,
+    room_generation: u64,
+    system_id: u64,
+) {
+    buf.clear();
+    buf.extend_from_slice(&SENTINEL);
+    buf.push(KIND_SYSTEM_MESSAGE_DELETE);
+    put_u64(buf, room_id.0 as u64);
+    put_u64(buf, room_generation);
+    put_u64(buf, system_id);
+}
+
+fn encode_system_message(buf: &mut Vec<u8>, message: &WebSystemMessage) {
+    put_u64(buf, message.id);
+    match message.after_message_id {
+        Some(message_id) => {
+            buf.push(1);
+            put_u64(buf, message_id);
+        }
+        None => buf.push(0),
+    }
+    put_str(buf, &message.sender);
+    put_str(buf, &message.body);
+    put_u64(buf, message.timestamp_ms);
+    buf.push(match message.level {
+        WebSystemMessageLevel::Info => 0,
+        WebSystemMessageLevel::Warning => 1,
+        WebSystemMessageLevel::Error => 2,
+    });
 }
 
 /// Encodes a single live `message` frame.
@@ -517,6 +573,17 @@ pub(crate) struct DecodedWindow {
     pub older_cursor: Option<u64>,
     pub at_start: bool,
     pub messages: Vec<DecodedMessage>,
+    pub system_messages: Vec<DecodedSystemMessage>,
+}
+
+#[cfg(test)]
+pub(crate) struct DecodedSystemMessage {
+    pub id: u64,
+    pub after_message_id: Option<u64>,
+    pub sender: String,
+    pub body: String,
+    pub timestamp_ms: u64,
+    pub level: u8,
 }
 
 #[cfg(test)]
@@ -545,6 +612,8 @@ pub(crate) fn decode_window(frame: &[u8]) -> DecodedWindow {
     let at_start = reader.u8() == 1;
     let count = reader.u32();
     let messages = (0..count).map(|_| reader.message()).collect();
+    let system_count = reader.u32();
+    let system_messages = (0..system_count).map(|_| reader.system_message()).collect();
     DecodedWindow {
         kind,
         room_id,
@@ -552,6 +621,7 @@ pub(crate) fn decode_window(frame: &[u8]) -> DecodedWindow {
         older_cursor,
         at_start,
         messages,
+        system_messages,
     }
 }
 
@@ -657,6 +727,17 @@ impl Reader<'_> {
             attachment_file_id,
             attachment_timestamp_ms,
             fragments,
+        }
+    }
+
+    fn system_message(&mut self) -> DecodedSystemMessage {
+        DecodedSystemMessage {
+            id: self.u64(),
+            after_message_id: (self.u8() == 1).then(|| self.u64()),
+            sender: self.string(),
+            body: self.string(),
+            timestamp_ms: self.u64(),
+            level: self.u8(),
         }
     }
 }
@@ -839,6 +920,7 @@ mod tests {
             rpc::ids::RoomId(7),
             11,
             &messages,
+            &[],
             Some(rpc::ids::MessageId(1)),
             false,
         );
@@ -850,6 +932,35 @@ mod tests {
         assert_eq!(decoded.older_cursor, Some(1));
         assert!(!decoded.at_start);
         assert_eq!(decoded.messages.len(), 2);
+    }
+
+    #[test]
+    fn window_carries_generic_system_messages_with_stable_anchors() {
+        let system = WebSystemMessage {
+            id: 3,
+            after_message_id: Some(2),
+            sender: "call".into(),
+            body: "Alice joined the call".into(),
+            timestamp_ms: 8_000,
+            level: WebSystemMessageLevel::Info,
+        };
+        let frame = encode_window(
+            KIND_SYNC,
+            rpc::ids::RoomId(7),
+            11,
+            &[],
+            &[system],
+            None,
+            true,
+        );
+        let decoded = decode_window(&frame);
+        let message = &decoded.system_messages[0];
+        assert_eq!(message.id, 3);
+        assert_eq!(message.after_message_id, Some(2));
+        assert_eq!(message.sender, "call");
+        assert_eq!(message.body, "Alice joined the call");
+        assert_eq!(message.timestamp_ms, 8_000);
+        assert_eq!(message.level, 0);
     }
 
     #[test]
