@@ -1261,11 +1261,9 @@ mod imp {
                     }
                 })
             }
-            Ok((Request::ReloadWebCss, _)) => {
-                ask_app(events, "reload-web-css", |reply| {
-                    crate::app::AppEvent::ReloadWebCss { reply }
-                })
-            }
+            Ok((Request::ReloadWebCss, _)) => ask_app(events, "reload-web-css", |reply| {
+                crate::app::AppEvent::ReloadWebCss { reply }
+            }),
             Ok((Request::ConfigPath, _)) => ask_app(events, "config-path", |reply| {
                 crate::app::AppEvent::ConfigPath { reply }
             }),

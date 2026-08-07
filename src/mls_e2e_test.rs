@@ -29,7 +29,7 @@ use crate::{
         ClientConfig, FilePolicy, NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE,
         PairingEvent, UploadFileRequest, spawn_device_pair_once,
     },
-    config::{CandidatePrivacy, DownloadTarget, EffectiveFiles},
+    config::{CandidatePrivacy, DownloadTarget, EffectiveFiles, MediaTransportSetting},
     receive_store::DownloadStore,
     test_temp::TempDir,
 };
@@ -326,6 +326,7 @@ fn config(addrs: &Addrs, root: &Path, name: &str, token: &str, receive: bool) ->
         download_store: DownloadStore::new(8 * 1024 * 1024),
         max_upload_bytes: 8 * 1024 * 1024,
         upload_rate_bytes: 0,
+        media_transport: crate::config::MediaTransportSetting::Auto,
         p2p_enabled: false,
         candidate_privacy: CandidatePrivacy::Disabled,
         prefer_ipv6: false,
@@ -685,6 +686,10 @@ fn join_voice(client: &Client, room_id: RoomId, user_id: UserId) -> StreamId {
         Duration::from_secs(10),
         |event| matches!(event, NetworkEvent::Status(message) if message == "udp media bound"),
     );
+    join_voice_room(client, room_id, user_id)
+}
+
+fn join_voice_room(client: &Client, room_id: RoomId, user_id: UserId) -> StreamId {
     client
         .handle
         .try_send(NetworkCommand::JoinVoice(room_id))
@@ -1692,6 +1697,288 @@ fn mls_live_shared_client_data_root_separates_accounts() {
     wait_room_upsert(&bob, room_id, "shared root Bob room");
     send_until_received(&alice, &bob, room_id, "shared root account isolation");
     send_until_received(&bob, &alice, room_id, "shared root reverse isolation");
+}
+
+#[test]
+fn voice_live_auto_falls_back_to_tcp_when_udp_is_blackholed() {
+    let _guard = live_mls_e2e_guard();
+    let root = temp_dir("voice-tcp-auto");
+    std::fs::create_dir_all(root.join("server")).unwrap();
+    let addrs = start_server(&root);
+    // A bound socket nothing ever reads: Alice's binds are swallowed without
+    // errors, exactly like a firewall dropping UDP.
+    let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut alice_config = config(&addrs, &root, "voice-auto-Alice", ALICE_TOKEN, false);
+    alice_config.udp_addr = blackhole.local_addr().unwrap().to_string();
+    let alice = spawn(alice_config);
+    let bob = spawn(config(&addrs, &root, "voice-auto-Bob", BOB_TOKEN, false));
+    wait_authenticated(&alice, "voice auto Alice");
+    wait_authenticated(&bob, "voice auto Bob");
+
+    let alice_stream = join_voice_room(&alice, PUBLIC_ROOM, UserId(1));
+    wait_event(
+        &alice,
+        "auto fallback lane active",
+        Duration::from_secs(20),
+        |event| {
+            matches!(
+                event,
+                NetworkEvent::MediaTransport {
+                    state: crate::client_net::MediaTransportState::Tcp,
+                }
+            )
+        },
+    );
+    let bob_stream = join_voice(&bob, PUBLIC_ROOM, UserId(2));
+
+    relay_voice(&alice, &bob, alice_stream, vec![0xa2, 1, 2, 3]);
+    relay_voice(&bob, &alice, bob_stream, vec![0xb2, 4, 5, 6, 7, 8]);
+}
+
+/// One-way UDP relay: datagrams from the client reach the server, and anything
+/// the server sends back is dropped. `UdpBound` still arrives over the control
+/// connection, so the fallback cannot lean on bind retries going unanswered.
+struct UdpForwarder {
+    addr: std::net::SocketAddr,
+    /// Set to drop client datagrams instead of forwarding them, taking away the
+    /// upstream direction of an established session.
+    block_upstream: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl UdpForwarder {
+    /// One-way: client datagrams reach the server, replies are dropped.
+    fn to_server(server: &str) -> Self {
+        Self::spawn(server, false)
+    }
+
+    /// Both directions, until [`UdpForwarder::block_upstream`] takes the
+    /// client-to-server one away.
+    fn bidirectional(server: &str) -> Self {
+        Self::spawn(server, true)
+    }
+
+    fn spawn(server: &str, downstream: bool) -> Self {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let server = server.parse::<std::net::SocketAddr>().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let block_upstream = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_block = Arc::clone(&block_upstream);
+        let worker = thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let mut client = None;
+            while !worker_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok((len, src)) = socket.recv_from(&mut buf) else {
+                    continue;
+                };
+                if src == server {
+                    if let Some(client) = client.filter(|_| downstream) {
+                        let _ = socket.send_to(&buf[..len], client);
+                    }
+                    continue;
+                }
+                // Recorded even while blocked: downstream has to keep flowing
+                // to the client whose upstream just disappeared.
+                client = Some(src);
+                if worker_block.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let _ = socket.send_to(&buf[..len], server);
+            }
+        });
+        Self {
+            addr,
+            block_upstream,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn block_upstream(&self) {
+        self.block_upstream
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Keeps one client talking in the background, so a peer under test has the
+/// continuous inbound speech a busy room would give it.
+struct BackgroundTalker {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl BackgroundTalker {
+    fn start(client: &Client, payload: Vec<u8>) -> Self {
+        let sender = client.handle.sender();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            let mut timestamp = 0;
+            while !worker_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if sender
+                    .send(NetworkCommand::LocalVoicePacket(LocalVoiceFrame {
+                        flags: 0,
+                        payload: VoicePayload::Opus(payload.clone()),
+                        timestamp,
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
+                timestamp += 960;
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for BackgroundTalker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+impl Drop for UdpForwarder {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn voice_live_auto_falls_back_to_tcp_when_udp_replies_are_dropped() {
+    let _guard = live_mls_e2e_guard();
+    let root = temp_dir("voice-tcp-oneway");
+    std::fs::create_dir_all(root.join("server")).unwrap();
+    let addrs = start_server(&root);
+    let forwarder = UdpForwarder::to_server(&addrs.udp);
+    let mut alice_config = config(&addrs, &root, "voice-oneway-Alice", ALICE_TOKEN, false);
+    alice_config.udp_addr = forwarder.addr.to_string();
+    let alice = spawn(alice_config);
+    let bob = spawn(config(&addrs, &root, "voice-oneway-Bob", BOB_TOKEN, false));
+    wait_authenticated(&alice, "voice oneway Alice");
+    wait_authenticated(&bob, "voice oneway Bob");
+
+    let alice_stream = join_voice_room(&alice, PUBLIC_ROOM, UserId(1));
+    wait_event(
+        &alice,
+        "one-way fallback lane active",
+        Duration::from_secs(40),
+        |event| {
+            matches!(
+                event,
+                NetworkEvent::MediaTransport {
+                    state: crate::client_net::MediaTransportState::Tcp,
+                }
+            )
+        },
+    );
+    let bob_stream = join_voice(&bob, PUBLIC_ROOM, UserId(2));
+
+    // The forwarder keeps delivering Alice's binds, so the server keeps
+    // confirming them: the lane must not flap back to the dead UDP path.
+    relay_voice(&alice, &bob, alice_stream, vec![0xa3, 1, 2, 3]);
+    relay_voice(&bob, &alice, bob_stream, vec![0xb3, 4, 5, 6, 7, 8]);
+}
+
+/// The failure inbound speech hides: a client whose datagrams stop reaching the
+/// server still hears the room, so any liveness rule that counts arbitrary
+/// inbound traffic keeps clearing its timer while the microphone goes nowhere.
+#[test]
+fn voice_live_auto_falls_back_when_client_to_server_udp_dies() {
+    let _guard = live_mls_e2e_guard();
+    let root = temp_dir("voice-tcp-upstream");
+    std::fs::create_dir_all(root.join("server")).unwrap();
+    let addrs = start_server(&root);
+    let forwarder = UdpForwarder::bidirectional(&addrs.udp);
+    let mut alice_config = config(&addrs, &root, "voice-upstream-Alice", ALICE_TOKEN, false);
+    alice_config.udp_addr = forwarder.addr.to_string();
+    let alice = spawn(alice_config);
+    let bob = spawn(config(
+        &addrs,
+        &root,
+        "voice-upstream-Bob",
+        BOB_TOKEN,
+        false,
+    ));
+    wait_authenticated(&alice, "voice upstream Alice");
+    wait_authenticated(&bob, "voice upstream Bob");
+
+    let alice_stream = join_voice(&alice, PUBLIC_ROOM, UserId(1));
+    let bob_stream = join_voice(&bob, PUBLIC_ROOM, UserId(2));
+    relay_voice(&alice, &bob, alice_stream, vec![0xa4, 1, 2, 3]);
+    relay_voice(&bob, &alice, bob_stream, vec![0xb4, 4, 5, 6]);
+
+    // Only the upstream direction disappears. Bob keeps talking, so Alice has
+    // unbroken inbound UDP for the whole detection window.
+    forwarder.block_upstream();
+    let talking = BackgroundTalker::start(&bob, vec![0xb5, 7, 8, 9]);
+    wait_event(
+        &alice,
+        "upstream failure fallback",
+        Duration::from_secs(40),
+        |event| {
+            matches!(
+                event,
+                NetworkEvent::MediaTransport {
+                    state: crate::client_net::MediaTransportState::Tcp,
+                }
+            )
+        },
+    );
+    drop(talking);
+
+    relay_voice(&alice, &bob, alice_stream, vec![0xa5, 1, 2, 3, 4]);
+}
+
+#[test]
+fn voice_live_force_tcp_media_relays_both_directions() {
+    let _guard = live_mls_e2e_guard();
+    let root = temp_dir("voice-tcp");
+    std::fs::create_dir_all(root.join("server")).unwrap();
+    let addrs = start_server(&root);
+    let mut alice_config = config(&addrs, &root, "voice-tcp-Alice", ALICE_TOKEN, false);
+    alice_config.media_transport = MediaTransportSetting::Tcp;
+    alice_config.udp_addr = "unused UDP endpoint".to_string();
+    alice_config.udp_probe_addr = Some("unused UDP probe endpoint".to_string());
+    let alice = spawn(alice_config);
+    let bob = spawn(config(&addrs, &root, "voice-tcp-Bob", BOB_TOKEN, false));
+    wait_authenticated(&alice, "voice tcp Alice");
+    wait_authenticated(&bob, "voice tcp Bob");
+
+    let alice_stream = join_voice_room(&alice, PUBLIC_ROOM, UserId(1));
+    wait_event(
+        &alice,
+        "voice tcp lane active",
+        Duration::from_secs(10),
+        |event| {
+            matches!(
+                event,
+                NetworkEvent::MediaTransport {
+                    state: crate::client_net::MediaTransportState::Tcp,
+                }
+            )
+        },
+    );
+    let bob_stream = join_voice(&bob, PUBLIC_ROOM, UserId(2));
+
+    relay_voice(&alice, &bob, alice_stream, vec![0xa1, 1, 2, 3]);
+    relay_voice(&bob, &alice, bob_stream, vec![0xb0, 4, 5, 6, 7, 8]);
 }
 
 #[test]

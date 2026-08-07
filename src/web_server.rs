@@ -513,10 +513,7 @@ impl WebFeed {
     fn retained_bytes(&self) -> usize {
         let heap = match self {
             Self::Message { message, .. } => message.heap_bytes(),
-            Self::Delete { .. }
-            | Self::VideoFrame(_)
-            | Self::Config { .. }
-            | Self::ReloadCss => 0,
+            Self::Delete { .. } | Self::VideoFrame(_) | Self::Config { .. } | Self::ReloadCss => 0,
             Self::DeleteError(payload)
             | Self::ActionError(payload)
             | Self::FileProgress(payload)
@@ -3028,7 +3025,8 @@ mod tests {
 
     #[test]
     fn web_css_is_empty_when_file_absent() {
-        let missing = std::env::temp_dir().join(format!("chatt-no-css-{}/web.css", std::process::id()));
+        let missing =
+            std::env::temp_dir().join(format!("chatt-no-css-{}/web.css", std::process::id()));
         let sender = spawn_css_server(Some(missing));
         let (headers, body) = http_get(sender.local_addr(), "/web.css");
         assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
@@ -3857,7 +3855,10 @@ Sec-WebSocket-Version: 13\r\n\
         sender.reload_css();
         let (opcode, payload) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x1);
-        assert_eq!(String::from_utf8(payload).unwrap(), "{\"type\":\"reload_css\"}");
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            "{\"type\":\"reload_css\"}"
+        );
     }
 
     #[test]

@@ -6,6 +6,21 @@ pub const UDP_HEADER_LEN: usize = 14;
 pub const SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
 pub const MAX_VOICE_PAYLOAD_BYTES: usize = 1_024;
 
+/// Largest sealed media datagram: header, maximum encoded payload, and AEAD
+/// tag.
+pub const MAX_SEALED_MEDIA_BYTES: usize = UDP_HEADER_LEN + SAFE_UDP_PAYLOAD_BYTES + crypto::TAG_LEN;
+
+/// Preamble that identifies a TCP voice-fallback connection on the shared
+/// control listener, mirroring video's first-bytes classification. The first
+/// four bytes read as a control frame length above
+/// [`frame::MAX_FRAME_LEN`](crate::frame::MAX_FRAME_LEN), so the magic can
+/// never collide with a control hello.
+pub const VOICE_TCP_MAGIC: [u8; 8] = *b"CHTVOI01";
+
+/// Frame cap for the TCP voice lane, where each length-prefixed frame carries
+/// exactly one sealed media datagram.
+pub const VOICE_TCP_MAX_FRAME_BYTES: usize = MAX_SEALED_MEDIA_BYTES;
+
 pub const KIND_BIND: u8 = 1;
 pub const KIND_VOICE: u8 = 2;
 pub const KIND_PING: u8 = 3;
@@ -738,7 +753,8 @@ impl MediaPayloadRef<'_> {
         }
     }
 
-    fn into_owned(self) -> MediaPayload {
+    /// Converts to the owned payload, copying only voice bytes.
+    pub fn into_owned(self) -> MediaPayload {
         match self {
             MediaPayloadRef::Bind => MediaPayload::Bind,
             MediaPayloadRef::NatProbe { probe_id } => MediaPayload::NatProbe { probe_id },
@@ -1453,6 +1469,48 @@ mod tests {
                 .unwrap()
                 .payload,
             payload
+        );
+    }
+
+    #[test]
+    fn voice_tcp_magic_first_word_exceeds_control_frame_cap() {
+        let word = u32::from_le_bytes(VOICE_TCP_MAGIC[0..4].try_into().unwrap()) as usize;
+        assert!(word > crate::frame::MAX_FRAME_LEN);
+    }
+
+    #[test]
+    fn voice_tcp_magic_differs_from_video_magic() {
+        assert_ne!(VOICE_TCP_MAGIC, crate::video::VIDEO_MAGIC);
+    }
+
+    #[test]
+    fn max_sealed_voice_datagram_fits_voice_tcp_frame() {
+        let protection = aead_protection(9);
+        let payload = MediaPayload::Voice {
+            stream_id: StreamId(5),
+            sequence: 9,
+            timestamp: 8_640,
+            flags: 0,
+            payload: VoicePayload::Opus(vec![0x5A; MAX_VOICE_PAYLOAD_BYTES]),
+        };
+        let packet = seal_media(&protection, 0, &payload).unwrap();
+        assert!(packet.len() <= VOICE_TCP_MAX_FRAME_BYTES);
+
+        let mut framed = Vec::new();
+        crate::frame::encode_frame(&packet, &mut framed).unwrap();
+        let (parsed, total) =
+            crate::frame::parse_frame_with_limit(&framed, VOICE_TCP_MAX_FRAME_BYTES)
+                .unwrap()
+                .expect("whole frame");
+        assert_eq!(parsed, packet.as_slice());
+        assert_eq!(total, framed.len());
+
+        let mut oversized = Vec::new();
+        crate::frame::encode_frame(&vec![0; VOICE_TCP_MAX_FRAME_BYTES + 1], &mut oversized)
+            .unwrap();
+        assert_eq!(
+            crate::frame::parse_frame_with_limit(&oversized, VOICE_TCP_MAX_FRAME_BYTES),
+            Err(crate::frame::FrameError::TooLarge)
         );
     }
 

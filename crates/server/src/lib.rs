@@ -109,6 +109,10 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const SLOW_EVENT_LOOP_WORK: Duration = Duration::from_millis(20);
 const EVENT_LOOP_STATS_INTERVAL: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+/// TCP voice-fallback lanes leave this budget at classification, but only after
+/// reserving one of the relay's unauthenticated-lane permits, so a handed-over
+/// connection is never unbudgeted — not even while queued between the threads.
+/// Worst-case fds are `MAX_CLIENTS` plus the relay's lane caps.
 const MAX_CLIENTS: usize = 1024;
 /// Connections accepted but not yet through classification, handshake, and
 /// auth. Budgeted separately from [`MAX_CLIENTS`] so a flood of half-open
@@ -2181,6 +2185,48 @@ impl Server {
         self.pre_auth.release(addr);
     }
 
+    /// Hands a connection classified as a voice lane to the relay thread. The
+    /// connection is still [`ConnKind::Unidentified`], so none of
+    /// [`Server::disconnect`]'s control bookkeeping applies; the receive buffer
+    /// moves with the socket so bytes that arrived behind the magic are not
+    /// lost.
+    ///
+    /// The relay's unauthenticated-lane permit is reserved before this side
+    /// gives up its pre-auth slot, so a socket queued for the relay thread is
+    /// still budgeted by one class or the other the whole way across.
+    fn attach_voice_tcp_conn(&mut self, token: Token) {
+        let Some(permit) = self.voice_relay.reserve_tcp_handoff() else {
+            kvlog::warn!(
+                "voice tcp handoff rejected, unauthenticated lane cap reached",
+                token = token.0
+            );
+            self.disconnect(token);
+            return;
+        };
+        let Some(mut client) = self.clients.remove(&token) else {
+            return;
+        };
+        debug_assert!(client.write_buf.is_empty());
+        if client.pre_auth {
+            client.pre_auth = false;
+            self.pre_auth.release(client.addr.ip());
+        }
+        if let Err(error) = self.poll.registry().deregister(&mut client.socket) {
+            kvlog::warn!(
+                "voice tcp handoff deregister failed",
+                token = token.0,
+                error = %error
+            );
+            return;
+        }
+        self.voice_relay.submit(VoiceCommand::AttachTcp {
+            socket: client.socket,
+            addr: client.addr,
+            read_buf: client.read_buf,
+            permit,
+        });
+    }
+
     fn read_client(&mut self, token: Token) {
         // A parked uploader neither fills nor processes: leaving the bytes in
         // the socket closes the uploading client's send window, which is the
@@ -2227,9 +2273,10 @@ impl Server {
             self.loop_work.queue_client_read(token);
         }
 
-        // Classify a freshly accepted connection on its first bytes. A video
-        // connection opens with VIDEO_MAGIC, which reads as a control frame
-        // length far above MAX_FRAME_LEN, so it can never collide with a hello.
+        // Classify a freshly accepted connection on its first bytes. Video and
+        // voice connections open with their magic, which reads as a control
+        // frame length far above MAX_FRAME_LEN, so neither can collide with a
+        // hello.
         if matches!(
             self.clients.get(&token).map(|client| &client.kind),
             Some(ConnKind::Unidentified)
@@ -2242,6 +2289,15 @@ impl Server {
                 client.read_buf.consume(video::VIDEO_MAGIC.len());
                 client.kind = ConnKind::Video(VideoConn::new());
                 kvlog::info!("video connection classified", token = token.0);
+            } else if client
+                .read_buf
+                .pending()
+                .starts_with(&media::VOICE_TCP_MAGIC)
+            {
+                client.read_buf.consume(media::VOICE_TCP_MAGIC.len());
+                kvlog::info!("voice tcp connection classified", token = token.0);
+                self.attach_voice_tcp_conn(token);
+                return;
             } else {
                 client.kind = ConnKind::Control;
             }

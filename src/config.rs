@@ -66,6 +66,8 @@ pub struct ServerEntry {
     pub e2e_peer_pins: Vec<E2ePeerPin>,
     #[toml(default = true, ToToml skip_if = |value: &bool| *value)]
     pub require_transport_encryption: bool,
+    #[toml(default, ToToml skip_if = MediaTransportSetting::is_auto)]
+    pub media_transport: MediaTransportSetting,
     #[toml(default, style = Header, ToToml skip_if = FileOverrides::is_empty)]
     pub files: FileOverrides,
     #[toml(default, style = Header, ToToml skip_if = HistoryOverrides::is_empty)]
@@ -87,6 +89,7 @@ impl Default for ServerEntry {
             server_public_key: String::new(),
             e2e_peer_pins: Vec::new(),
             require_transport_encryption: true,
+            media_transport: MediaTransportSetting::Auto,
             files: FileOverrides::default(),
             history: HistoryOverrides::default(),
             rooms: Vec::new(),
@@ -116,6 +119,24 @@ pub enum E2eTrustLevel {
     Verified,
 }
 
+/// How voice reaches the server: `Auto` binds UDP and falls back to a TCP
+/// voice lane while UDP is unreachable, `Tcp` opens no UDP socket at all and
+/// uses the lane from the start. Direct P2P is UDP-only, so `Tcp` also means
+/// every peer is relayed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum MediaTransportSetting {
+    #[default]
+    Auto,
+    Tcp,
+}
+
+impl MediaTransportSetting {
+    pub fn is_auto(&self) -> bool {
+        matches!(self, MediaTransportSetting::Auto)
+    }
+}
+
 /// A TOFU-pinned DM identity tuple for one contact, stored per server entry.
 /// The room and stable user id are trust material; `username` is display state.
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
@@ -143,14 +164,16 @@ impl ServerEntry {
     /// spawn. A candidate authenticated with different values must never be
     /// presented as a session for the current record.
     pub(crate) fn worker_fields_eq(&self, other: &Self) -> bool {
+        let udp_fields_eq = (!self.media_transport.is_auto() && !other.media_transport.is_auto())
+            || (self.udp_addr == other.udp_addr && self.udp_probe_addr == other.udp_probe_addr);
         self.username == other.username
             && self.tcp_addr == other.tcp_addr
-            && self.udp_addr == other.udp_addr
-            && self.udp_probe_addr == other.udp_probe_addr
+            && udp_fields_eq
             && self.token == other.token
             && self.server_public_key == other.server_public_key
             && self.e2e_peer_pins == other.e2e_peer_pins
             && self.require_transport_encryption == other.require_transport_encryption
+            && self.media_transport == other.media_transport
     }
 
     /// Whether `other` carries the same values for every field the live session
@@ -180,6 +203,7 @@ impl ServerEntry {
             data_dir: crate::paths::client_data_dir(),
             e2e_peer_pins: self.e2e_peer_pins.clone(),
             require_transport_encryption: self.require_transport_encryption,
+            media_transport: self.media_transport,
             file_policy: config.file_policy(self),
             download_store,
             max_upload_bytes: config.files.max_upload_bytes(),
@@ -1866,11 +1890,13 @@ impl Config {
             if let Err(error) = validate_endpoint(&server.tcp_addr, "tcp-addr") {
                 out.push(Diag::error(format!("server {label}: {error}")));
             }
-            if let Err(error) = validate_endpoint(&server.effective_udp_addr(), "udp-addr") {
-                out.push(Diag::error(format!("server {label}: {error}")));
-            }
-            if let Some(addr) = &server.udp_probe_addr {
-                if let Err(error) = validate_endpoint(addr, "udp-probe-addr") {
+            if server.media_transport.is_auto() {
+                if let Err(error) = validate_endpoint(&server.effective_udp_addr(), "udp-addr") {
+                    out.push(Diag::error(format!("server {label}: {error}")));
+                }
+                if let Some(addr) = &server.udp_probe_addr
+                    && let Err(error) = validate_endpoint(addr, "udp-probe-addr")
+                {
                     out.push(Diag::error(format!("server {label}: {error}")));
                 }
             }
@@ -2204,7 +2230,10 @@ impl Config {
     /// Path of the optional user stylesheet the browser view serves at
     /// `/web.css`, resolved as a sibling of the config file in use.
     pub(crate) fn web_css_path(&self) -> Option<PathBuf> {
-        let config = self.config_path.clone().or_else(paths::client_config_path)?;
+        let config = self
+            .config_path
+            .clone()
+            .or_else(paths::client_config_path)?;
         Some(config.with_file_name("web.css"))
     }
 
@@ -2480,9 +2509,11 @@ pub fn validate_server_entry(server: &ServerEntry) -> Result<(), String> {
     validate_server_public_key(&server.server_public_key)?;
     validate_username(&server.username)?;
     validate_endpoint(&server.tcp_addr, "tcp-addr")?;
-    validate_endpoint(&server.effective_udp_addr(), "udp-addr")?;
-    if let Some(addr) = &server.udp_probe_addr {
-        validate_endpoint(addr, "udp-probe-addr")?;
+    if server.media_transport.is_auto() {
+        validate_endpoint(&server.effective_udp_addr(), "udp-addr")?;
+        if let Some(addr) = &server.udp_probe_addr {
+            validate_endpoint(addr, "udp-probe-addr")?;
+        }
     }
     Ok(())
 }
@@ -2650,6 +2681,68 @@ allowed-origins = ["https://chat.example.test", "http://localhost:5173"]
             config.web.allowed_origins,
             ["https://chat.example.test", "http://localhost:5173"]
         );
+    }
+
+    #[test]
+    fn media_transport_parses_tcp_and_defaults_to_auto() {
+        assert_eq!(
+            ServerEntry::default().media_transport,
+            MediaTransportSetting::Auto
+        );
+        let arena = Arena::new();
+        let mut doc = toml_spanner::parse(
+            r#"
+active-server = "lab"
+
+[[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
+label = "lab"
+username = "Alice"
+token = "alice-dev-token"
+tcp-addr = "127.0.0.1:42000"
+server-public-key = ""
+media-transport = "tcp"
+"#,
+            &arena,
+        )
+        .unwrap();
+        let config: Config = doc.to().unwrap();
+        assert_eq!(
+            config.servers[0].media_transport,
+            MediaTransportSetting::Tcp
+        );
+    }
+
+    #[test]
+    fn forced_tcp_ignores_unused_udp_fields_for_validation_and_connection_equality() {
+        let mut left = ServerEntry::default();
+        left.media_transport = MediaTransportSetting::Tcp;
+        left.udp_addr = "not a UDP endpoint".to_string();
+        left.udp_probe_addr = Some("not a UDP probe endpoint".to_string());
+
+        let mut config = Config::default();
+        config.servers.push(left.clone());
+        assert!(validate_server_entry(&left).is_ok());
+        assert!(validation_errors(&config).is_empty());
+
+        let mut right = left.clone();
+        right.udp_addr = "another unused endpoint".to_string();
+        right.udp_probe_addr = None;
+        assert!(left.worker_fields_eq(&right));
+        assert!(left.connection_fields_eq(&right));
+
+        left.media_transport = MediaTransportSetting::Auto;
+        right.media_transport = MediaTransportSetting::Auto;
+        assert!(!left.worker_fields_eq(&right));
+        assert!(!left.connection_fields_eq(&right));
+        assert!(validate_server_entry(&left).is_err());
+
+        right = left.clone();
+        right.media_transport = MediaTransportSetting::Tcp;
+        assert!(!left.worker_fields_eq(&right));
+        assert!(!left.connection_fields_eq(&right));
+        assert!(!right.worker_fields_eq(&left));
+        assert!(!right.connection_fields_eq(&left));
     }
 
     #[test]
@@ -3005,6 +3098,30 @@ server-public-key = ""
         }));
     }
 
+    #[test]
+    fn forced_tcp_config_loads_with_unusable_udp_endpoints() {
+        let outcome = collect_from(
+            "forced-tcp-unused-udp",
+            r#"
+active-server = "lab"
+
+[[servers]]
+id = "feedfacefeedfacefeedfacefeedfa01"
+label = "lab"
+username = "Alice"
+token = "alice-dev-token"
+tcp-addr = "127.0.0.1:41000"
+udp-addr = "not a UDP endpoint"
+udp-probe-addr = "not a UDP probe endpoint"
+server-public-key = ""
+media-transport = "tcp"
+"#,
+        );
+
+        assert!(outcome.config.is_some());
+        assert!(outcome.diagnostics.iter().all(|diag| !diag.error));
+    }
+
     fn render_runtime(config: &Config) -> String {
         config.runtime_toml(DEFAULT_CONFIG).unwrap()
     }
@@ -3018,6 +3135,18 @@ server-public-key = ""
         assert!(content.contains("[[servers]]"));
         assert!(!content.contains("active-server"));
         assert!(!content.contains("pairing-code"));
+    }
+
+    #[test]
+    fn runtime_config_keeps_auto_transport_implicit() {
+        let mut config = Config::default();
+        config.servers.push(ServerEntry::default());
+        let content = render_runtime(&config);
+        assert!(!content.contains("media-transport"), "{content}");
+
+        config.servers[0].media_transport = MediaTransportSetting::Tcp;
+        let content = render_runtime(&config);
+        assert!(content.contains("media-transport = \"tcp\""), "{content}");
     }
 
     #[test]
