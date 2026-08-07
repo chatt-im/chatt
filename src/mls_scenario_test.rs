@@ -739,6 +739,7 @@ fn scenario_client_config(
         download_store: DownloadStore::new(8 * 1024 * 1024),
         max_upload_bytes: 8 * 1024 * 1024,
         upload_rate_bytes: 0,
+        media_transport: crate::config::MediaTransportSetting::Auto,
         p2p_enabled: false,
         candidate_privacy: CandidatePrivacy::Disabled,
         prefer_ipv6: false,

@@ -14,12 +14,18 @@ use chatt_p2p::{
     stun::StunMessage,
 };
 use hashbrown::{HashMap, HashSet};
-use mio::{Events, Interest, Poll, Token, Waker, net::UdpSocket};
+use mio::{
+    Events, Interest, Poll, Registry, Token, Waker,
+    net::{TcpStream, UdpSocket},
+};
 use rpc::{
     control::{P2pCandidate, P2pNatKind, P2pPeerInfo, ParticipantServerRtt},
     crypto::{AntiReplay, KeyMaterial, TransportMode},
+    evented::{ReadLimit, Readiness, WriteQueue, read_into_buffer, write_queue_to},
+    frame,
     ids::{RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload, MediaProtection},
+    recv::RecvBuffer,
 };
 use std::{
     collections::VecDeque,
@@ -39,14 +45,14 @@ use std::{
 use crate::{
     app::NetworkEventSender,
     audio::{LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame},
-    config::CandidatePrivacy,
+    config::{CandidatePrivacy, MediaTransportSetting},
     mdns::MdnsSystem,
 };
 
 use super::{
     DIRECT_CONFIRM_WINDOW, DIRECT_FAILOVER_IDLE, ENCODER_FEEDBACK_ALPHA, ENCODER_PROFILE_HOLD,
-    INTERFACE_POLL_INTERVAL, MAX_RECENT_VOICE_SEQUENCES, NetworkCommand, NetworkEvent,
-    P2P_CONSENT_TIMEOUT, P2P_KEEPALIVE_INTERVAL, RECENT_VOICE_SEQUENCE_WORD_BITS,
+    INTERFACE_POLL_INTERVAL, MAX_RECENT_VOICE_SEQUENCES, MediaTransportState, NetworkCommand,
+    NetworkEvent, P2P_CONSENT_TIMEOUT, P2P_KEEPALIVE_INTERVAL, RECENT_VOICE_SEQUENCE_WORD_BITS,
     RECENT_VOICE_SEQUENCE_WORDS, RELAY_KEEPALIVE_INTERVAL, RTT_PROBE_INTERVAL, RestartPortPolicy,
     UDP_BIND_FAILURE_ATTEMPTS, UDP_BIND_RETRY_INTERVAL, advance_local_voice_sequence_past,
     allocate_local_voice_sequence, apply_candidate_privacy, audio_payload_from_media,
@@ -63,7 +69,26 @@ const COMMANDS: Token = Token(0);
 const UDP: Token = Token(1);
 const MDNS_V4: Token = Token(2);
 const MDNS_V6: Token = Token(3);
+const VOICE_TCP: Token = Token(4);
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+const TCP_LANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_LANE_BACKOFF_MIN: Duration = Duration::from_millis(500);
+const TCP_LANE_BACKOFF_MAX: Duration = Duration::from_secs(8);
+/// After UDP recovers the lane half-closes and keeps reading briefly so
+/// downstream frames already in flight still play before the socket drops.
+const TCP_LANE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const TCP_LANE_READ_BUDGET_BYTES: usize = 16 * 1024;
+const TCP_LANE_WRITE_ATTEMPTS: usize = 32;
+/// A lane is closed instead of queued beyond this backlog; preserving bytes at
+/// this depth would replay stale speech after the path becomes writable.
+const TCP_LANE_WRITE_CAP_BYTES: usize = 32 * 1024;
+/// A lane is closed once its oldest unsent byte is this old. The byte cap alone
+/// is not a latency bound — at ordinary voice bitrates it is seconds of speech —
+/// and audio this stale is past any jitter buffer's reach.
+const TCP_LANE_STALE_BACKLOG: Duration = Duration::from_millis(250);
+const TCP_LANE_MAX_WIRE_FRAME_BYTES: usize =
+    frame::LENGTH_PREFIX_LEN + media::VOICE_TCP_MAX_FRAME_BYTES;
+const _: () = assert!(TCP_LANE_WRITE_CAP_BYTES > TCP_LANE_MAX_WIRE_FRAME_BYTES);
 const P2P_POLL_TIMEOUT: Duration = Duration::from_millis(20);
 const UDP_DRAIN_BUDGET: usize = 64;
 const MDNS_DRAIN_BUDGET: usize = 32;
@@ -400,11 +425,6 @@ fn voice_sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
     }
 }
 
-/// A token bucket that paces upload chunk emission to a byte-per-second ceiling.
-///
-/// A `rate` of `0` disables pacing: [`budget`](Self::budget) is unbounded and the
-/// other operations are no-ops. Otherwise tokens accrue at `rate` bytes per
-/// second, capped at one second's worth so a poll loop that parked between
 pub(super) struct PeerConnection {
     pub(super) user_id: UserId,
     pub(super) agent: TraversalAgent,
@@ -589,6 +609,131 @@ pub(super) fn bind_voice_udp_socket(addr: SocketAddr) -> io::Result<StdUdpSocket
     Ok(socket)
 }
 
+/// Which transport a server media packet arrived on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaPath {
+    Udp,
+    Tcp,
+}
+
+impl MediaPath {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+/// What is known about the relay's UDP path.
+///
+/// Only a `Pong` answering a nonce this client sent over UDP proves it: inbound
+/// speech travels the opposite direction and says nothing about whether the
+/// microphone is reaching the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UdpPath {
+    /// Nothing proven yet. Media still rides it until a lane is up — nothing
+    /// better exists — but the lane is wanted once the cold-start grace passes.
+    Unproven,
+    /// Recent matched round trips: UDP carries media and no lane is wanted.
+    Verified,
+    /// Probes or binds went unanswered; reported to the UI as unavailable.
+    Failed,
+}
+
+/// Ping/Pong liveness for one server transport.
+///
+/// Nonces are tracked per path so a `Pong` only proves the path it came back
+/// on, and so a UDP recovery probe answered while the lane carries media never
+/// folds into the lane's RTT.
+#[derive(Default)]
+struct PathProbes {
+    /// Outstanding nonces with their send time, bounded by [`RTT_IN_FLIGHT_CAP`].
+    in_flight: VecDeque<(u64, Instant)>,
+    /// When the oldest probe with nothing matched since was sent. `None` while
+    /// the path is proven live; reaching [`RTT_STALE_AFTER`] declares it dead.
+    /// Unlike an RTT sample this starts at authentication, so a path that never
+    /// answers at all is still detected.
+    pending_since: Option<Instant>,
+    /// Consecutive matched round trips since the last miss, the recovery score.
+    streak: u8,
+}
+
+impl PathProbes {
+    /// Records an outbound probe, opening the liveness window if the path has
+    /// nothing outstanding.
+    fn sent(&mut self, nonce: u64, now: Instant) {
+        push_rtt_in_flight(&mut self.in_flight, nonce, now);
+        if self.pending_since.is_none() {
+            self.pending_since = Some(now);
+        }
+    }
+
+    /// Matches an inbound `Pong`, returning its round-trip time in
+    /// milliseconds. An unknown nonce is not proof of anything and leaves the
+    /// window running.
+    fn matched(&mut self, nonce: u64, now: Instant) -> Option<f32> {
+        let sample = take_rtt_sample(&mut self.in_flight, nonce, now)?;
+        self.pending_since = None;
+        self.streak = self.streak.saturating_add(1);
+        Some(sample)
+    }
+
+    /// Drops probes that have gone unanswered for `timeout` and resets the
+    /// streak when any is found, so one missed round trip restarts the dwell.
+    fn expire(&mut self, now: Instant, timeout: Duration) {
+        let mut missed = false;
+        while let Some((_, sent)) = self.in_flight.front() {
+            if now.saturating_duration_since(*sent) < timeout {
+                break;
+            }
+            self.in_flight.pop_front();
+            missed = true;
+        }
+        if missed {
+            self.streak = 0;
+        }
+    }
+
+    /// Restarts the window for a path that has been neither proven nor
+    /// disproven, used when a transport takes over carrying media.
+    fn restart(&mut self, now: Instant) {
+        self.in_flight.clear();
+        self.pending_since = Some(now);
+        self.streak = 0;
+    }
+}
+
+enum TcpLaneState {
+    Connecting {
+        deadline: Instant,
+    },
+    Active,
+    /// Half-closed after UDP recovered: writes are shut down, reads continue
+    /// until the server's EOF or the deadline.
+    Draining {
+        deadline: Instant,
+    },
+}
+
+struct TcpLane {
+    stream: TcpStream,
+    state: TcpLaneState,
+    /// The server has opened and answered on this lane. A completed TCP
+    /// handshake alone does not prove that the relay accepted the magic and
+    /// authenticated Bind.
+    confirmed: bool,
+    read_buf: RecvBuffer,
+    readiness: Readiness,
+    write_queue: WriteQueue,
+    write_blocked: bool,
+    /// When the write queue last went from empty to non-empty, `None` while it
+    /// is empty. A healthy lane drains on every flush, so a queue that stays
+    /// occupied bounds how stale its oldest unsent byte can be — the latency
+    /// limit [`TCP_LANE_WRITE_CAP_BYTES`] cannot express.
+    backlog_since: Option<Instant>,
+}
+
 pub(super) struct InitialUdpBind {
     udp: StdUdpSocket,
     packet: Vec<u8>,
@@ -655,15 +800,26 @@ pub(super) struct PublishP2pRequest {
     pub(super) candidates: Vec<P2pCandidate>,
 }
 
+/// The UDP media leg handed to a starting session: the socket plus the server
+/// addresses it talks to. A forced-TCP session has none, and then opens no UDP
+/// socket at all.
+pub(super) struct UdpMediaSetup {
+    pub(super) socket: StdUdpSocket,
+    pub(super) server_addr: SocketAddr,
+    pub(super) server_probe_addr: Option<SocketAddr>,
+}
+
 pub(super) enum VoiceCommand {
     StartSession {
         generation: u64,
-        udp: StdUdpSocket,
+        udp: Option<UdpMediaSetup>,
         media: MediaProtection,
         initial_bind_attempted: bool,
         transport_mode: TransportMode,
-        server_udp_addr: SocketAddr,
-        server_udp_probe_addr: Option<SocketAddr>,
+        /// The control connection's resolved peer address; the TCP voice lane
+        /// dials exactly the address that already worked for control.
+        server_tcp_addr: SocketAddr,
+        media_transport: MediaTransportSetting,
         p2p_enabled: bool,
         candidate_privacy: CandidatePrivacy,
         prefer_ipv6: bool,
@@ -1378,6 +1534,8 @@ struct VoiceLoop {
     playback_ingress: PlaybackIngressState,
     udp_work: bool,
     mdns_work: u8,
+    tcp_read_work: bool,
+    tcp_writable: bool,
     command_work: bool,
     shutting_down: bool,
 }
@@ -1405,6 +1563,8 @@ impl VoiceLoop {
             playback_ingress: PlaybackIngressState::default(),
             udp_work: false,
             mdns_work: 0,
+            tcp_read_work: false,
+            tcp_writable: false,
             command_work: false,
             shutting_down: false,
         }
@@ -1415,6 +1575,18 @@ impl VoiceLoop {
             self.drain_commands();
             if self.udp_work {
                 self.udp_work = self.session.as_mut().is_some_and(VoiceSession::read_udp);
+            }
+            if self.tcp_writable {
+                self.tcp_writable = false;
+                if let Some(session) = self.session.as_mut() {
+                    session.tcp_lane_writable();
+                }
+            }
+            if self.tcp_read_work {
+                self.tcp_read_work = self
+                    .session
+                    .as_mut()
+                    .is_some_and(VoiceSession::read_tcp_lane);
             }
             if self.mdns_work != 0 {
                 let work = std::mem::take(&mut self.mdns_work);
@@ -1442,7 +1614,12 @@ impl VoiceLoop {
             if self.shutting_down {
                 break;
             }
-            let timeout = if self.command_work || self.udp_work || self.mdns_work != 0 {
+            let timeout = if self.command_work
+                || self.udp_work
+                || self.mdns_work != 0
+                || self.tcp_read_work
+                || self.tcp_writable
+            {
                 Duration::ZERO
             } else {
                 self.session.as_ref().map_or(IDLE_POLL_TIMEOUT, |session| {
@@ -1455,14 +1632,27 @@ impl VoiceLoop {
                 Err(error) => return Err(error),
             }
             for event in self.poll_events.iter() {
-                if !rpc::evented::MioReady::from_event(event).readable_like() {
-                    continue;
-                }
+                let ready = rpc::evented::MioReady::from_event(event);
                 match event.token() {
                     COMMANDS => {}
-                    UDP => self.udp_work = true,
-                    MDNS_V4 => self.mdns_work |= 1,
-                    MDNS_V6 => self.mdns_work |= 2,
+                    UDP if ready.readable_like() => self.udp_work = true,
+                    MDNS_V4 if ready.readable_like() => self.mdns_work |= 1,
+                    MDNS_V6 if ready.readable_like() => self.mdns_work |= 2,
+                    VOICE_TCP => {
+                        if ready.readable_like() {
+                            self.tcp_read_work = true;
+                            if let Some(lane) = self
+                                .session
+                                .as_mut()
+                                .and_then(|session| session.tcp_lane.as_mut())
+                            {
+                                lane.readiness.mark_ready();
+                            }
+                        }
+                        if ready.writable_like() {
+                            self.tcp_writable = true;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1520,8 +1710,8 @@ impl VoiceLoop {
                 media,
                 initial_bind_attempted,
                 transport_mode,
-                server_udp_addr,
-                server_udp_probe_addr,
+                server_tcp_addr,
+                media_transport,
                 p2p_enabled,
                 candidate_privacy,
                 prefer_ipv6,
@@ -1534,8 +1724,8 @@ impl VoiceLoop {
                     media,
                     initial_bind_attempted,
                     transport_mode,
-                    server_udp_addr,
-                    server_udp_probe_addr,
+                    server_tcp_addr,
+                    media_transport,
                     p2p_enabled,
                     candidate_privacy,
                     prefer_ipv6,
@@ -1695,16 +1885,34 @@ impl VoiceLoop {
         self.generation = None;
         self.udp_work = false;
         self.mdns_work = 0;
+        self.tcp_read_work = false;
+        self.tcp_writable = false;
     }
+}
+
+/// The session's UDP media leg. Absent in forced-TCP mode, where the client
+/// opens no UDP socket at all: every relay-UDP and P2P path is gated on it.
+struct UdpMedia {
+    socket: UdpSocket,
+    local_addr: SocketAddr,
+    server_addr: SocketAddr,
+    server_probe_addr: Option<SocketAddr>,
 }
 
 struct VoiceSession {
     generation: u64,
     events: NetworkEventSender,
-    udp: UdpSocket,
-    udp_local_addr: SocketAddr,
-    server_udp_addr: SocketAddr,
-    server_udp_probe_addr: Option<SocketAddr>,
+    registry: Registry,
+    udp: Option<UdpMedia>,
+    server_tcp_addr: SocketAddr,
+    media_transport: MediaTransportSetting,
+    tcp_lane: Option<TcpLane>,
+    /// Whether UDP has proven itself with matched round trips. Anything but
+    /// [`UdpPath::Verified`] keeps the TCP voice lane up in `Auto` mode, so a
+    /// session that has never proven UDP is treated like one that lost it.
+    udp_path: UdpPath,
+    next_tcp_connect: Instant,
+    tcp_backoff: Duration,
     media: MediaProtection,
     transport_mode: TransportMode,
     media_send_counter: u64,
@@ -1737,8 +1945,16 @@ struct VoiceSession {
     next_relay_keepalive: Instant,
     next_rtt_probe: Instant,
     next_udp_bind_retry: Instant,
+    /// Next UDP verification probe, scheduled only while
+    /// [`VoiceSession::udp_verify_wanted`] holds. A proven, answering path
+    /// never arms it, so the idle wake budget is unchanged.
+    next_udp_verify: Instant,
     rtt_probe_seq: u64,
-    server_rtt_in_flight: VecDeque<(u64, Instant)>,
+    /// Per-transport probe liveness. A `Pong` proves only the path it returned
+    /// on, so a session whose upstream UDP is blackholed is detected even while
+    /// a room's inbound speech keeps arriving over UDP.
+    udp_probes: PathProbes,
+    tcp_probes: PathProbes,
     server_rtt_ms: Option<f32>,
     server_rtt_last_sample_at: Option<Instant>,
     playback_ingress: PlaybackIngressState,
@@ -1748,7 +1964,7 @@ struct VoiceSession {
     udp_rebind_requested: bool,
     awaiting_udp_bound: bool,
     udp_bind_attempts: u32,
-    udp_reported_unreachable: bool,
+    reported_media_transport: MediaTransportState,
     interface_monitor: InterfaceMonitor,
     pending_publish: Option<PublishP2pRequest>,
 }
@@ -1758,26 +1974,51 @@ impl VoiceSession {
     fn new(
         poll: &Poll,
         generation: u64,
-        udp: StdUdpSocket,
+        udp: Option<UdpMediaSetup>,
         media: MediaProtection,
         initial_bind_attempted: bool,
         transport_mode: TransportMode,
-        server_udp_addr: SocketAddr,
-        server_udp_probe_addr: Option<SocketAddr>,
+        server_tcp_addr: SocketAddr,
+        media_transport: MediaTransportSetting,
         p2p_enabled: bool,
         candidate_privacy: CandidatePrivacy,
         prefer_ipv6: bool,
         events: NetworkEventSender,
     ) -> Result<Self, String> {
-        udp.set_nonblocking(true)
-            .map_err(|error| format!("failed to make voice UDP socket nonblocking: {error}"))?;
-        let udp_local_addr = udp
-            .local_addr()
-            .map_err(|error| format!("failed to read UDP socket address: {error}"))?;
-        let mut udp = UdpSocket::from_std(udp);
-        poll.registry()
-            .register(&mut udp, UDP, Interest::READABLE)
-            .map_err(|error| format!("failed to register UDP socket: {error}"))?;
+        let udp = match udp {
+            Some(setup) => {
+                setup.socket.set_nonblocking(true).map_err(|error| {
+                    format!("failed to make voice UDP socket nonblocking: {error}")
+                })?;
+                let local_addr = setup
+                    .socket
+                    .local_addr()
+                    .map_err(|error| format!("failed to read UDP socket address: {error}"))?;
+                let mut socket = UdpSocket::from_std(setup.socket);
+                poll.registry()
+                    .register(&mut socket, UDP, Interest::READABLE)
+                    .map_err(|error| format!("failed to register UDP socket: {error}"))?;
+                Some(UdpMedia {
+                    socket,
+                    local_addr,
+                    server_addr: setup.server_addr,
+                    server_probe_addr: setup.server_probe_addr,
+                })
+            }
+            None => None,
+        };
+        // Direct P2P is UDP-only, so a session without the leg relays through
+        // the server lane no matter what the config asks for.
+        if p2p_enabled && udp.is_none() {
+            let _ = events.send(NetworkEvent::Status(
+                "P2P unavailable while media transport is forced to TCP".to_string(),
+            ));
+        }
+        let p2p_enabled = p2p_enabled && udp.is_some();
+        let registry = poll
+            .registry()
+            .try_clone()
+            .map_err(|error| format!("failed to clone voice poll registry: {error}"))?;
         let mut mdns = if p2p_enabled {
             MdnsSystem::bind()
         } else {
@@ -1787,13 +2028,25 @@ impl VoiceSession {
             kvlog::warn!("failed to register voice mdns sockets", error = %error);
         }
         let now = Instant::now();
+        let reported_media_transport = if media_transport.is_auto() {
+            MediaTransportState::Udp
+        } else {
+            let _ = events.send(NetworkEvent::MediaTransport {
+                state: MediaTransportState::Unavailable,
+            });
+            MediaTransportState::Unavailable
+        };
         Ok(Self {
             generation,
             events,
+            registry,
             udp,
-            udp_local_addr,
-            server_udp_addr,
-            server_udp_probe_addr,
+            server_tcp_addr,
+            media_transport,
+            tcp_lane: None,
+            udp_path: UdpPath::Unproven,
+            next_tcp_connect: now,
+            tcp_backoff: TCP_LANE_BACKOFF_MIN,
             media,
             transport_mode,
             media_send_counter: u64::from(initial_bind_attempted),
@@ -1826,8 +2079,10 @@ impl VoiceSession {
             next_relay_keepalive: now + RELAY_KEEPALIVE_INTERVAL,
             next_rtt_probe: now + RTT_PROBE_INTERVAL,
             next_udp_bind_retry: now + UDP_BIND_RETRY_INTERVAL,
+            next_udp_verify: now,
             rtt_probe_seq: 0,
-            server_rtt_in_flight: VecDeque::new(),
+            udp_probes: PathProbes::default(),
+            tcp_probes: PathProbes::default(),
             server_rtt_ms: None,
             server_rtt_last_sample_at: None,
             playback_ingress: PlaybackIngressState::default(),
@@ -1837,14 +2092,19 @@ impl VoiceSession {
             udp_rebind_requested: false,
             awaiting_udp_bound: false,
             udp_bind_attempts: 0,
-            udp_reported_unreachable: false,
+            reported_media_transport,
             interface_monitor: InterfaceMonitor::new(now),
             pending_publish: None,
         })
     }
 
     fn shutdown(&mut self, poll: &Poll) {
-        let _ = poll.registry().deregister(&mut self.udp);
+        if let Some(udp) = self.udp.as_mut() {
+            let _ = poll.registry().deregister(&mut udp.socket);
+        }
+        if let Some(mut lane) = self.tcp_lane.take() {
+            let _ = poll.registry().deregister(&mut lane.stream);
+        }
         self.mdns.shutdown(poll.registry());
         self.playback_ingress = PlaybackIngressState::Suspended;
         self.pending_playback_packets.clear();
@@ -1863,11 +2123,35 @@ impl VoiceSession {
         if self.awaiting_udp_bound {
             timeout = timeout.min(self.next_udp_bind_retry.saturating_duration_since(now));
         }
+        match &self.tcp_lane {
+            Some(lane) => {
+                match lane.state {
+                    TcpLaneState::Connecting { deadline } | TcpLaneState::Draining { deadline } => {
+                        timeout = timeout.min(deadline.saturating_duration_since(now));
+                    }
+                    TcpLaneState::Active => {}
+                }
+                if !lane.write_blocked && !lane.write_queue.is_empty() {
+                    return Duration::ZERO;
+                }
+            }
+            None => {
+                if self.lane_wanted() && self.session_id.is_some() {
+                    timeout = timeout.min(self.next_tcp_connect.saturating_duration_since(now));
+                }
+            }
+        }
         timeout = timeout.min(self.next_relay_keepalive.saturating_duration_since(now));
         timeout = timeout.min(self.next_rtt_probe.saturating_duration_since(now));
         if let Some(sample_at) = self.server_rtt_last_sample_at {
             timeout =
                 timeout.min((sample_at + super::RTT_STALE_AFTER).saturating_duration_since(now));
+        }
+        if let Some(since) = self.carrying_probes().pending_since {
+            timeout = timeout.min((since + super::RTT_STALE_AFTER).saturating_duration_since(now));
+        }
+        if self.udp_verify_wanted() {
+            timeout = timeout.min(self.next_udp_verify.saturating_duration_since(now));
         }
         if self.p2p_enabled && self.voice_room.is_some() {
             timeout = timeout.min(self.interface_monitor.next_wake(now));
@@ -1899,6 +2183,9 @@ impl VoiceSession {
         self.poll_udp_bind_retry(now);
         self.poll_relay_keepalive(now);
         self.poll_rtt_probe(now);
+        self.poll_udp_verify(now);
+        self.poll_server_path_liveness(now);
+        self.poll_tcp_lane(now);
         if self.pending_publish.is_some() {
             output.publish_p2p = self.pending_publish.take();
         }
@@ -1906,18 +2193,49 @@ impl VoiceSession {
 
     fn authenticated(&mut self, session_id: SessionId) {
         self.session_id = Some(session_id);
+        let now = Instant::now();
+        self.carrying_probes_mut().pending_since = Some(now);
+        if !self.media_transport.is_auto() {
+            self.next_tcp_connect = now;
+            return;
+        }
         if self.initial_bind_attempted {
             self.awaiting_udp_bound = true;
             self.udp_bind_attempts = 0;
-            self.next_udp_bind_retry = Instant::now() + UDP_BIND_RETRY_INTERVAL;
+            self.next_udp_bind_retry = now + UDP_BIND_RETRY_INTERVAL;
             if self.p2p_enabled {
-                self.send_nat_probe(0, self.server_udp_addr);
-                if let Some(addr) = self.server_udp_probe_addr {
-                    self.send_nat_probe(1, addr);
-                }
+                self.send_server_nat_probes();
             }
         } else {
             self.bind_udp();
+        }
+        self.begin_udp_verification(now);
+    }
+
+    /// Restarts UDP verification for a path that has proven nothing: at
+    /// authentication, and after a rebind moves the session to a fresh port.
+    ///
+    /// A lane is wanted from here — UDP is unproven, and putting speech on an
+    /// unproven path is what loses the opening seconds of a call — but a single
+    /// round trip settles it, so the probe gets a grace period before a
+    /// connection is spent on a path that is probably fine.
+    fn begin_udp_verification(&mut self, now: Instant) {
+        self.udp_path = UdpPath::Unproven;
+        self.udp_probes.restart(now);
+        self.next_udp_verify = now;
+        self.next_tcp_connect = self.next_tcp_connect.max(now + super::UDP_COLD_START_GRACE);
+        self.send_udp_verify_probe(now);
+    }
+
+    fn send_server_nat_probes(&mut self) {
+        let Some(udp) = self.udp.as_ref() else {
+            return;
+        };
+        let server_addr = udp.server_addr;
+        let probe_addr = udp.server_probe_addr;
+        self.send_nat_probe(0, server_addr);
+        if let Some(addr) = probe_addr {
+            self.send_nat_probe(1, addr);
         }
     }
 
@@ -1982,25 +2300,52 @@ impl VoiceSession {
         self.clear_pending_playback_stream(stream_id);
     }
 
+    /// The server confirming the address claim proves only that datagrams reach
+    /// it, so this stops the bind retries but leaves the path unverified until
+    /// [`VoiceSession::maybe_recover_udp`] also sees answered probes come back.
     fn udp_bound(&mut self) {
         if !self.awaiting_udp_bound {
             return;
         }
         self.awaiting_udp_bound = false;
-        kvlog::info!("client udp bound");
-        if self.udp_reported_unreachable {
-            let _ = self
-                .events
-                .send(NetworkEvent::MediaConnectivity { udp_ok: true });
-        }
-        self.udp_reported_unreachable = false;
         self.udp_bind_attempts = 0;
+        kvlog::info!("client udp bound");
+        self.maybe_recover_udp();
+    }
+
+    /// Promotes UDP to carrying media once its probes come back.
+    ///
+    /// A path that has merely never been tested needs one round trip; one that
+    /// already failed needs [`UDP_VERIFY_SUCCESSES`] in a row. The asymmetry is
+    /// the point: hysteresis exists to stop a lane flapping back onto a path
+    /// that keeps dropping, and at cold start there is no lane to flap.
+    fn maybe_recover_udp(&mut self) {
+        let required = match self.udp_path {
+            UdpPath::Verified => return,
+            UdpPath::Unproven => 1,
+            UdpPath::Failed => super::UDP_VERIFY_SUCCESSES,
+        };
+        if self.awaiting_udp_bound || self.udp_probes.streak < required {
+            return;
+        }
+        kvlog::info!(
+            "udp path verified",
+            round_trips = u32::from(self.udp_probes.streak)
+        );
+        self.udp_path = UdpPath::Verified;
+        self.report_media_transport(MediaTransportState::Udp);
+        if self.media_transport.is_auto() {
+            self.drain_tcp_lane();
+        }
     }
 
     fn nat_probe_observed(&mut self, probe_id: u8, addr: SocketAddr) {
-        let server_addr = self
+        let Some(server_addr) = self
             .probe_addr_for_id(probe_id)
-            .unwrap_or(self.server_udp_addr);
+            .or_else(|| self.udp.as_ref().map(|udp| udp.server_addr))
+        else {
+            return;
+        };
         self.p2p_nat_classifier.observe(ReflexiveObservation {
             server_addr,
             mapped_addr: addr,
@@ -2029,6 +2374,12 @@ impl VoiceSession {
             ));
             return;
         }
+        if enabled && self.udp.is_none() {
+            let _ = self.events.send(NetworkEvent::Status(
+                "P2P unavailable while media transport is forced to TCP".to_string(),
+            ));
+            return;
+        }
         if self.p2p_enabled == enabled {
             return;
         }
@@ -2050,36 +2401,116 @@ impl VoiceSession {
     }
 
     fn bind_udp(&mut self) {
-        if let Some(session_id) = self.session_id {
-            kvlog::info!("udp bind sending", session_id = session_id.0);
-            self.awaiting_udp_bound = true;
-            self.udp_bind_attempts = 0;
-            self.next_udp_bind_retry = Instant::now() + UDP_BIND_RETRY_INTERVAL;
-            self.send_media(&MediaPayload::Bind);
-            if self.p2p_enabled {
-                self.send_nat_probe(0, self.server_udp_addr);
-                if let Some(addr) = self.server_udp_probe_addr {
-                    self.send_nat_probe(1, addr);
-                }
-            }
+        let Some(session_id) = self.session_id else {
+            return;
+        };
+        if self.udp.is_none() {
+            return;
+        }
+        kvlog::info!("udp bind sending", session_id = session_id.0);
+        self.awaiting_udp_bound = true;
+        self.udp_bind_attempts = 0;
+        self.next_udp_bind_retry = Instant::now() + UDP_BIND_RETRY_INTERVAL;
+        self.send_media_udp(&MediaPayload::Bind);
+        if self.p2p_enabled {
+            self.send_server_nat_probes();
         }
     }
 
+    /// Bind retries stay on UDP even while the lane carries media: a delivered
+    /// `Bind` producing `UdpBound` is how the client-to-server direction is
+    /// reconfirmed. The reverse direction is proven separately, by answered UDP
+    /// probes in [`VoiceSession::poll_udp_verify`].
     fn poll_udp_bind_retry(&mut self, now: Instant) {
         if !self.awaiting_udp_bound || now < self.next_udp_bind_retry {
             return;
         }
         self.next_udp_bind_retry = now + UDP_BIND_RETRY_INTERVAL;
         if self.session_id.is_some() {
-            self.send_media(&MediaPayload::Bind);
+            self.send_media_udp(&MediaPayload::Bind);
         }
         self.udp_bind_attempts = self.udp_bind_attempts.saturating_add(1);
-        if self.udp_bind_attempts >= UDP_BIND_FAILURE_ATTEMPTS && !self.udp_reported_unreachable {
-            self.udp_reported_unreachable = true;
-            let _ = self
-                .events
-                .send(NetworkEvent::MediaConnectivity { udp_ok: false });
+        if self.udp_bind_attempts >= UDP_BIND_FAILURE_ATTEMPTS {
+            self.latch_udp_suspect();
         }
+    }
+
+    /// Demotes UDP after a real failure. Deliberately coarse: only exhausted
+    /// bind retries or an elapsed liveness window land here, so one lost `Pong`
+    /// on a working path cannot cost a lane.
+    fn latch_udp_suspect(&mut self) {
+        if self.udp_path != UdpPath::Failed {
+            kvlog::info!("udp path failed, wanting tcp voice lane");
+        }
+        self.udp_path = UdpPath::Failed;
+        self.udp_probes.streak = 0;
+        self.report_media_transport(MediaTransportState::Unavailable);
+    }
+
+    /// The probe tracker for the transport currently carrying media.
+    fn carrying_path(&self) -> MediaPath {
+        if self.tcp_lane_active() {
+            MediaPath::Tcp
+        } else {
+            MediaPath::Udp
+        }
+    }
+
+    fn probes_mut(&mut self, path: MediaPath) -> &mut PathProbes {
+        match path {
+            MediaPath::Udp => &mut self.udp_probes,
+            MediaPath::Tcp => &mut self.tcp_probes,
+        }
+    }
+
+    fn carrying_probes(&self) -> &PathProbes {
+        match self.carrying_path() {
+            MediaPath::Udp => &self.udp_probes,
+            MediaPath::Tcp => &self.tcp_probes,
+        }
+    }
+
+    fn carrying_probes_mut(&mut self) -> &mut PathProbes {
+        self.probes_mut(self.carrying_path())
+    }
+
+    fn udp_verify_wanted(&self) -> bool {
+        if self.udp.is_none() || self.session_id.is_none() {
+            return false;
+        }
+        // A path that has proven nothing, or has failed, needs probing to say
+        // anything at all. So does one that is carrying media with a probe
+        // still outstanding: escalating to this cadence is what separates a
+        // single unlucky lost `Pong` from a path that has actually gone, before
+        // the sparse [`RTT_PROBE_INTERVAL`] would have asked twice more.
+        self.udp_path != UdpPath::Verified || self.udp_probes.pending_since.is_some()
+    }
+
+    /// Probes UDP independently of whichever transport carries media, so a
+    /// blackholed path is proven — and a recovered one re-proven — without
+    /// waiting for the sparse [`RTT_PROBE_INTERVAL`] cadence.
+    fn poll_udp_verify(&mut self, now: Instant) {
+        if !self.udp_verify_wanted() {
+            return;
+        }
+        self.udp_probes.expire(now, super::UDP_VERIFY_TIMEOUT);
+        if now < self.next_udp_verify {
+            return;
+        }
+        self.send_udp_verify_probe(now);
+    }
+
+    fn send_udp_verify_probe(&mut self, now: Instant) {
+        if !self.udp_verify_wanted() {
+            return;
+        }
+        self.next_udp_verify = now + super::UDP_VERIFY_INTERVAL;
+        let nonce = self.next_rtt_nonce();
+        self.udp_probes.sent(nonce, now);
+        self.send_media_udp(&MediaPayload::Ping {
+            nonce,
+            observed_rtt_ms: None,
+        });
     }
 
     fn send_nat_probe(&mut self, probe_id: u8, addr: SocketAddr) {
@@ -2092,9 +2523,10 @@ impl VoiceSession {
     }
 
     fn probe_addr_for_id(&self, probe_id: u8) -> Option<SocketAddr> {
+        let udp = self.udp.as_ref()?;
         match probe_id {
-            0 => Some(self.server_udp_addr),
-            1 => self.server_udp_probe_addr,
+            0 => Some(udp.server_addr),
+            1 => udp.server_probe_addr,
             _ => None,
         }
     }
@@ -2134,14 +2566,16 @@ impl VoiceSession {
 
     fn rebind_udp_socket(&mut self, poll: &mut Poll) -> Result<(), String> {
         self.udp_rebind_requested = false;
-        let _ = poll.registry().deregister(&mut self.udp);
-        self.restart_port_policy.record(self.udp_local_addr.port());
-        let bind_addr =
-            RestartPortPolicy::bind_addr_for_restart(if self.server_udp_addr.is_ipv4() {
-                "0.0.0.0:0".parse().unwrap()
-            } else {
-                "[::]:0".parse().unwrap()
-            });
+        let Some(udp) = self.udp.as_mut() else {
+            return Ok(());
+        };
+        let _ = poll.registry().deregister(&mut udp.socket);
+        self.restart_port_policy.record(udp.local_addr.port());
+        let bind_addr = RestartPortPolicy::bind_addr_for_restart(if udp.server_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        });
         let mut last_error = None;
         for _ in 0..8 {
             match bind_voice_udp_socket(bind_addr) {
@@ -2153,15 +2587,21 @@ impl VoiceSession {
                         self.restart_port_policy.record(local_addr.port());
                         continue;
                     }
-                    self.udp_local_addr = local_addr;
-                    self.udp = UdpSocket::from_std(socket);
+                    let Some(udp) = self.udp.as_mut() else {
+                        return Ok(());
+                    };
+                    udp.local_addr = local_addr;
+                    udp.socket = UdpSocket::from_std(socket);
                     poll.registry()
-                        .register(&mut self.udp, UDP, Interest::READABLE)
+                        .register(&mut udp.socket, UDP, Interest::READABLE)
                         .map_err(|error| {
                             format!("failed to register rebound UDP socket: {error}")
                         })?;
                     self.reset_server_rtt();
                     self.bind_udp();
+                    // The fresh port has proven nothing, whatever the old one
+                    // managed: re-verify before trusting it with media.
+                    self.begin_udp_verification(Instant::now());
                     self.publish_p2p_candidates();
                     return Ok(());
                 }
@@ -2245,6 +2685,13 @@ impl VoiceSession {
     }
 
     fn gather_p2p_candidates(&self) -> GatheredP2p {
+        let Some(udp) = self.udp.as_ref() else {
+            return GatheredP2p {
+                local: Vec::new(),
+                published: Vec::new(),
+                mdns_names: HashMap::new(),
+            };
+        };
         let mut next_id = 1;
         let mut candidates = self
             .interface_monitor
@@ -2253,7 +2700,7 @@ impl VoiceSession {
                 snapshot.host_candidates_with_metadata(
                     1,
                     self.p2p_generation,
-                    self.udp_local_addr.port(),
+                    udp.local_addr.port(),
                     true,
                     &mut next_id,
                     self.prefer_ipv6,
@@ -2261,7 +2708,7 @@ impl VoiceSession {
             })
             .unwrap_or_default();
         if candidates.is_empty() {
-            let fallback_ip = if self.server_udp_addr.is_ipv4() {
+            let fallback_ip = if udp.server_addr.is_ipv4() {
                 "127.0.0.1".parse().unwrap()
             } else {
                 "::1".parse().unwrap()
@@ -2271,7 +2718,7 @@ impl VoiceSession {
                 1,
                 self.p2p_generation,
                 CandidateKind::Host,
-                SocketAddr::new(fallback_ip, self.udp_local_addr.port()),
+                SocketAddr::new(fallback_ip, udp.local_addr.port()),
                 None,
                 true,
                 self.prefer_ipv6,
@@ -2285,7 +2732,7 @@ impl VoiceSession {
                 self.p2p_generation,
                 CandidateKind::ServerReflexive,
                 reflexive,
-                Some(self.udp_local_addr),
+                Some(udp.local_addr),
                 true,
                 self.prefer_ipv6,
             ));
@@ -2296,7 +2743,7 @@ impl VoiceSession {
             1,
             self.p2p_generation,
             CandidateKind::Relay,
-            self.server_udp_addr,
+            udp.server_addr,
             None,
             true,
             self.prefer_ipv6,
@@ -2494,7 +2941,6 @@ impl VoiceSession {
     fn reset_server_rtt(&mut self) {
         self.server_rtt_ms = None;
         self.server_rtt_last_sample_at = None;
-        self.server_rtt_in_flight.clear();
         let _ = self.events.send(NetworkEvent::ServerRtt { rtt_ms: None });
         self.publish_all_relay_rtts();
     }
@@ -2514,11 +2960,20 @@ impl VoiceSession {
         self.next_rtt_probe = now + RTT_PROBE_INTERVAL;
         if self.session_id.is_some() {
             let nonce = self.next_rtt_nonce();
-            push_rtt_in_flight(&mut self.server_rtt_in_flight, nonce, now);
-            self.send_media(&MediaPayload::Ping {
+            // Recorded against the path the probe actually left on: the server
+            // answers each `Ping` on its arrival transport, so only a `Pong`
+            // returning there proves anything.
+            if let Some(path) = self.send_media(&MediaPayload::Ping {
                 nonce,
                 observed_rtt_ms: self.server_rtt_ms.map(clamp_rtt_ms),
-            });
+            }) {
+                self.probes_mut(path).sent(nonce, now);
+                if path == MediaPath::Udp {
+                    // This probe is the escalation timer's first ask; a healthy
+                    // answer arrives long before it would follow up.
+                    self.next_udp_verify = now + super::UDP_VERIFY_INTERVAL;
+                }
+            }
         }
         let peer_sessions = self
             .p2p_peers
@@ -2578,10 +3033,17 @@ impl VoiceSession {
     /// Drains a bounded receive burst. `true` retains local work so an
     /// edge-triggered readable socket cannot strand datagrams after the budget.
     fn read_udp(&mut self) -> bool {
+        let Some(udp) = self.udp.as_ref() else {
+            return false;
+        };
+        let server_addr = udp.server_addr;
         let mut buf = [0u8; 2048];
         let mut datagrams_this_wake = 0usize;
         loop {
-            let (len, src) = match recv_udp_datagram(&self.udp, &mut buf) {
+            let Some(udp) = self.udp.as_ref() else {
+                return false;
+            };
+            let (len, src) = match recv_udp_datagram(&udp.socket, &mut buf) {
                 Ok(Some(value)) => value,
                 Ok(None) => {
                     if datagrams_this_wake > 1 {
@@ -2605,83 +3067,21 @@ impl VoiceSession {
             if chatt_p2p::stun::is_stun_message(packet) {
                 self.handle_p2p_stun(now, src, packet);
             } else if self.handle_p2p_media(now, src, packet) {
-            } else if src != self.server_udp_addr {
+            } else if src != server_addr {
                 kvlog::warn!(
                     "udp packet ignored",
                     addr = %src,
-                    expected_addr = %self.server_udp_addr,
+                    expected_addr = %server_addr,
                     packet_size = len
                 );
             } else {
-                match self.open_server_media(packet) {
-                    Ok((
-                        _,
-                        MediaPayload::Voice {
-                            stream_id,
-                            sequence,
-                            timestamp,
-                            flags,
-                            payload,
-                        },
-                    )) => {
-                        let payload_size = payload.len();
-                        let payload_kind = media_voice_payload_kind(&payload);
-                        log_audio_pop_media_packet(
-                            "rx",
-                            "server",
-                            stream_id.0,
-                            sequence,
-                            timestamp,
-                            flags,
-                            payload_size,
-                            payload_kind,
-                        );
-                        self.dispatch_voice_packet(
-                            crate::audio::RemoteVoicePacket {
-                                stream_id: stream_id.0,
-                                sequence,
-                                timestamp,
-                                flags,
-                                payload: audio_payload_from_media(payload),
-                                received_at: now,
-                            },
-                            "server",
-                        );
+                let packet = &mut buf[..len];
+                match media::open_media_in_place(&self.media, &mut self.media_recv_replay, packet) {
+                    Ok(opened) => {
+                        let payload = opened.payload.into_owned();
+                        self.note_server_media(MediaPath::Udp);
+                        self.handle_server_media(now, MediaPath::Udp, payload);
                     }
-                    Ok((_, MediaPayload::Pong { nonce })) => {
-                        if let Some(sample) =
-                            take_rtt_sample(&mut self.server_rtt_in_flight, nonce, now)
-                        {
-                            let rtt = fold_rtt_ewma(self.server_rtt_ms, sample);
-                            self.server_rtt_ms = Some(rtt);
-                            self.server_rtt_last_sample_at = Some(now);
-                            let _ = self.events.send(NetworkEvent::ServerRtt {
-                                rtt_ms: Some(clamp_rtt_ms(rtt)),
-                            });
-                            self.publish_all_relay_rtts();
-                        }
-                    }
-                    Ok((
-                        _,
-                        MediaPayload::VoiceFeedbackFrom {
-                            reporter,
-                            stream_id,
-                            feedback,
-                        },
-                    )) => {
-                        let feedback = live_feedback_from_media(stream_id, feedback);
-                        self.handle_encoder_feedback(reporter, feedback, now);
-                    }
-                    Ok((_, MediaPayload::Ping { nonce, .. })) => {
-                        self.send_media(&MediaPayload::Pong { nonce });
-                    }
-                    Ok((_, MediaPayload::Bind | MediaPayload::NatProbe { .. })) => {}
-                    Ok((
-                        _,
-                        MediaPayload::PeerVoice { .. }
-                        | MediaPayload::PeerVoiceFeedback { .. }
-                        | MediaPayload::VoiceFeedback { .. },
-                    )) => {}
                     Err(error) => {
                         kvlog::warn!("udp packet rejected", packet_size = len, error = %error);
                         let _ = self
@@ -2696,12 +3096,66 @@ impl VoiceSession {
         }
     }
 
-    fn open_server_media(
-        &mut self,
-        packet: &[u8],
-    ) -> Result<(media::UdpHeader, MediaPayload), media::MediaError> {
-        let opened = media::open_media(&self.media, &mut self.media_recv_replay, packet)?;
-        Ok((opened.header, opened.payload))
+    /// Dispatches an authenticated server media payload, shared by the UDP
+    /// path and the TCP voice lane. `path` is where it arrived, which is what
+    /// a `Pong` proves and where an inbound `Ping` must be answered.
+    fn handle_server_media(&mut self, now: Instant, path: MediaPath, payload: MediaPayload) {
+        match payload {
+            MediaPayload::Voice {
+                stream_id,
+                sequence,
+                timestamp,
+                flags,
+                payload,
+            } => {
+                let payload_size = payload.len();
+                let payload_kind = media_voice_payload_kind(&payload);
+                log_audio_pop_media_packet(
+                    "rx",
+                    "server",
+                    stream_id.0,
+                    sequence,
+                    timestamp,
+                    flags,
+                    payload_size,
+                    payload_kind,
+                );
+                self.dispatch_voice_packet(
+                    crate::audio::RemoteVoicePacket {
+                        stream_id: stream_id.0,
+                        sequence,
+                        timestamp,
+                        flags,
+                        payload: audio_payload_from_media(payload),
+                        received_at: now,
+                    },
+                    "server",
+                );
+            }
+            MediaPayload::Pong { nonce } => self.observe_pong(now, path, nonce),
+            MediaPayload::VoiceFeedbackFrom {
+                reporter,
+                stream_id,
+                feedback,
+            } => {
+                let feedback = live_feedback_from_media(stream_id, feedback);
+                self.handle_encoder_feedback(reporter, feedback, now);
+            }
+            MediaPayload::Ping { nonce, .. } => {
+                // Answered where it arrived, so the peer's probe measures the
+                // path it was testing rather than whichever one carries media.
+                match path {
+                    MediaPath::Udp => self.send_media_udp(&MediaPayload::Pong { nonce }),
+                    MediaPath::Tcp => {
+                        self.send_media_tcp(&MediaPayload::Pong { nonce });
+                    }
+                }
+            }
+            MediaPayload::Bind | MediaPayload::NatProbe { .. } => {}
+            MediaPayload::PeerVoice { .. }
+            | MediaPayload::PeerVoiceFeedback { .. }
+            | MediaPayload::VoiceFeedback { .. } => {}
+        }
     }
 
     fn dispatch_voice_packet(
@@ -2845,7 +3299,28 @@ impl VoiceSession {
         }
     }
 
-    fn send_media(&mut self, payload: &MediaPayload) {
+    /// Sends a server media payload over the active transport: the TCP lane
+    /// while it is up, UDP otherwise. Force-TCP sessions drop payloads while
+    /// the lane is down instead of leaking them onto UDP.
+    ///
+    /// Returns the transport it left on, so probes can be recorded against the
+    /// path that will answer them; `None` means the payload was dropped.
+    fn send_media(&mut self, payload: &MediaPayload) -> Option<MediaPath> {
+        if self.tcp_lane_active() {
+            return self.send_media_tcp(payload).then_some(MediaPath::Tcp);
+        }
+        if !self.media_transport.is_auto() || self.udp.is_none() {
+            return None;
+        }
+        self.send_media_udp(payload);
+        Some(MediaPath::Udp)
+    }
+
+    fn send_media_udp(&mut self, payload: &MediaPayload) {
+        let Some(udp) = self.udp.as_ref() else {
+            return;
+        };
+        let server_addr = udp.server_addr;
         let kind = media_payload_kind(payload);
         let counter = self.media_send_counter;
         self.media_send_counter = self.media_send_counter.wrapping_add(1);
@@ -2858,7 +3333,7 @@ impl VoiceSession {
         ) {
             Ok(()) => {
                 let packet = std::mem::take(&mut self.media_packet);
-                if let Err(error) = self.udp.send_to(&packet, self.server_udp_addr) {
+                if let Err(error) = udp.socket.send_to(&packet, server_addr) {
                     kvlog::warn!("udp send failed", kind, packet_size = packet.len(), error = %error);
                     let _ = self
                         .events
@@ -2880,6 +3355,441 @@ impl VoiceSession {
         }
     }
 
+    /// Queues a payload on the lane, reporting whether it was accepted.
+    fn send_media_tcp(&mut self, payload: &MediaPayload) -> bool {
+        let now = Instant::now();
+        if self.fail_stale_lane_backlog(now) {
+            return false;
+        }
+        let Some(lane) = self.tcp_lane.as_ref() else {
+            return false;
+        };
+        // Reserve a maximum frame before spending a counter or doing crypto.
+        // Once the queue reaches real-time latency territory, abandon the
+        // entire stale stream rather than later replaying it in FIFO order.
+        if lane.write_queue.len() > TCP_LANE_WRITE_CAP_BYTES - TCP_LANE_MAX_WIRE_FRAME_BYTES {
+            self.fail_tcp_lane("write backlog overflow");
+            return false;
+        }
+        let droppable = matches!(
+            payload,
+            MediaPayload::Voice { .. } | MediaPayload::VoiceFeedback { .. }
+        );
+        let kind = media_payload_kind(payload);
+        let counter = self.media_send_counter;
+        self.media_send_counter = self.media_send_counter.wrapping_add(1);
+        if let Err(error) = media::seal_media_into(
+            &self.media,
+            counter,
+            payload,
+            &mut self.media_packet,
+            &mut self.media_scratch,
+        ) {
+            kvlog::warn!("voice tcp seal failed", kind, error = %error);
+            return false;
+        }
+        let Some(lane) = self.tcp_lane.as_mut() else {
+            return false;
+        };
+        let packet = std::mem::take(&mut self.media_packet);
+        if frame::encode_frame(&packet, lane.write_queue.tail_mut()).is_err() {
+            debug_assert!(false, "sealed media exceeds the control frame cap");
+            self.media_packet = packet;
+            return false;
+        }
+        if lane.backlog_since.is_none() {
+            lane.backlog_since = Some(now);
+        }
+        if !droppable {
+            kvlog::info!(
+                "voice tcp packet sent",
+                kind,
+                packet_size = packet.len(),
+                counter
+            );
+        }
+        self.media_packet = packet;
+        self.flush_tcp_lane();
+        true
+    }
+
+    /// Closes a lane whose oldest unsent byte is older than
+    /// [`TCP_LANE_STALE_BACKLOG`], reporting whether it did.
+    ///
+    /// The byte cap is a memory bound, not a latency one: 32 KiB is seconds of
+    /// speech at ordinary bitrates, so freshness needs its own limit. Checked
+    /// at enqueue and after each flush rather than on a timer — a backlog with
+    /// nothing fresh behind it is harmless, and a speaking client enqueues
+    /// every 20 ms.
+    fn fail_stale_lane_backlog(&mut self, now: Instant) -> bool {
+        let stale = self.tcp_lane.as_ref().is_some_and(|lane| {
+            matches!(lane.state, TcpLaneState::Active)
+                && lane.backlog_since.is_some_and(|since| {
+                    now.saturating_duration_since(since) >= TCP_LANE_STALE_BACKLOG
+                })
+        });
+        if stale {
+            self.fail_tcp_lane("stale backlog");
+        }
+        stale
+    }
+
+    fn lane_wanted(&self) -> bool {
+        !self.media_transport.is_auto() || self.udp_path != UdpPath::Verified
+    }
+
+    fn tcp_lane_active(&self) -> bool {
+        self.tcp_lane
+            .as_ref()
+            .is_some_and(|lane| matches!(lane.state, TcpLaneState::Active))
+    }
+
+    fn suspect_udp_path(&mut self, now: Instant) {
+        if !self.media_transport.is_auto() || self.tcp_lane_active() {
+            return;
+        }
+        self.latch_udp_suspect();
+        if !self.awaiting_udp_bound {
+            self.awaiting_udp_bound = true;
+            self.udp_bind_attempts = 0;
+            self.next_udp_bind_retry = now + UDP_BIND_RETRY_INTERVAL;
+        }
+    }
+
+    /// Records that the relay accepted and answered on a freshly opened lane.
+    ///
+    /// Deliberately not liveness: an authenticated packet only proves the
+    /// server-to-client direction, and in a busy room inbound speech would
+    /// otherwise mask a blackholed upstream forever. Path liveness comes from
+    /// [`VoiceSession::observe_pong`] alone.
+    fn note_server_media(&mut self, path: MediaPath) {
+        if path != MediaPath::Tcp {
+            return;
+        }
+        let newly_confirmed = self.tcp_lane.as_mut().is_some_and(|lane| {
+            if matches!(lane.state, TcpLaneState::Active) && !lane.confirmed {
+                lane.confirmed = true;
+                true
+            } else {
+                false
+            }
+        });
+        if newly_confirmed {
+            kvlog::info!("voice tcp lane confirmed by server");
+            self.tcp_backoff = TCP_LANE_BACKOFF_MIN;
+            self.report_media_transport(MediaTransportState::Tcp);
+        }
+    }
+
+    /// Matches a `Pong` against the probes `path` sent, the only proof that a
+    /// transport works in both directions. An unmatched nonce, or one this path
+    /// never sent, leaves the liveness window running.
+    fn observe_pong(&mut self, now: Instant, path: MediaPath, nonce: u64) {
+        let Some(sample) = self.probes_mut(path).matched(nonce, now) else {
+            kvlog::debug!("unmatched pong ignored", path = path.label(), nonce);
+            return;
+        };
+        // Only the carrying transport's samples describe the media path; a UDP
+        // verification probe answered while the lane carries media must not
+        // move the reported RTT.
+        if path == self.carrying_path() {
+            let rtt = fold_rtt_ewma(self.server_rtt_ms, sample);
+            self.server_rtt_ms = Some(rtt);
+            self.server_rtt_last_sample_at = Some(now);
+            let _ = self.events.send(NetworkEvent::ServerRtt {
+                rtt_ms: Some(clamp_rtt_ms(rtt)),
+            });
+            self.publish_all_relay_rtts();
+        }
+        if path == MediaPath::Udp {
+            self.maybe_recover_udp();
+        }
+    }
+
+    /// Fails the media path once probes have gone unanswered for
+    /// [`RTT_STALE_AFTER`]. A live lane is reconnected under its own backoff; a
+    /// blackholed UDP path asks for a lane instead.
+    fn poll_server_path_liveness(&mut self, now: Instant) {
+        let carrying = self.carrying_path();
+        let Some(since) = self.probes_mut(carrying).pending_since else {
+            return;
+        };
+        if now.saturating_duration_since(since) < super::RTT_STALE_AFTER {
+            return;
+        }
+        kvlog::warn!("server media path silent", path = carrying.label());
+        if self.tcp_lane_active() {
+            self.drop_tcp_lane("server silent");
+            self.schedule_tcp_reconnect(now);
+            return;
+        }
+        // Restarted rather than cleared: an unanswered UDP path keeps the
+        // window running so a lane that later drops is detected again.
+        self.udp_probes.pending_since = Some(now);
+        self.suspect_udp_path(now);
+    }
+
+    fn poll_tcp_lane(&mut self, now: Instant) {
+        match &self.tcp_lane {
+            None => {
+                if self.lane_wanted() && self.session_id.is_some() && now >= self.next_tcp_connect {
+                    self.connect_tcp_lane(now);
+                }
+            }
+            Some(lane) => {
+                match lane.state {
+                    TcpLaneState::Connecting { deadline } if now >= deadline => {
+                        self.fail_tcp_lane("connect timeout");
+                        return;
+                    }
+                    TcpLaneState::Draining { deadline } if now >= deadline => {
+                        self.drop_tcp_lane("drain timeout");
+                        return;
+                    }
+                    _ => {}
+                }
+                self.flush_tcp_lane();
+            }
+        }
+    }
+
+    fn connect_tcp_lane(&mut self, now: Instant) {
+        debug_assert!(self.tcp_lane.is_none());
+        let mut stream = match TcpStream::connect(self.server_tcp_addr) {
+            Ok(stream) => stream,
+            Err(error) => {
+                kvlog::warn!("voice tcp lane connect failed", addr = %self.server_tcp_addr, error = %error);
+                self.schedule_tcp_reconnect(now);
+                return;
+            }
+        };
+        if let Err(error) = self.registry.register(
+            &mut stream,
+            VOICE_TCP,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            kvlog::warn!("voice tcp lane register failed", error = %error);
+            self.schedule_tcp_reconnect(now);
+            return;
+        }
+        kvlog::info!("voice tcp lane connecting", addr = %self.server_tcp_addr);
+        self.tcp_lane = Some(TcpLane {
+            stream,
+            state: TcpLaneState::Connecting {
+                deadline: now + TCP_LANE_CONNECT_TIMEOUT,
+            },
+            confirmed: false,
+            read_buf: RecvBuffer::new(),
+            readiness: Readiness::new(),
+            write_queue: WriteQueue::new(),
+            write_blocked: false,
+            backlog_since: None,
+        });
+    }
+
+    fn tcp_lane_writable(&mut self) {
+        let Some(lane) = self.tcp_lane.as_mut() else {
+            return;
+        };
+        lane.write_blocked = false;
+        if let TcpLaneState::Connecting { .. } = lane.state {
+            let error = match lane.stream.take_error() {
+                Ok(None) => match lane.stream.peer_addr() {
+                    Ok(_) => None,
+                    Err(error) if error.kind() == io::ErrorKind::NotConnected => return,
+                    Err(error) => Some(error),
+                },
+                Ok(Some(error)) | Err(error) => Some(error),
+            };
+            if let Some(error) = error {
+                kvlog::warn!("voice tcp lane connect failed", addr = %self.server_tcp_addr, error = %error);
+                self.fail_tcp_lane("connect error");
+                return;
+            }
+            self.activate_tcp_lane();
+        }
+        self.flush_tcp_lane();
+    }
+
+    fn activate_tcp_lane(&mut self) {
+        let Some(lane) = self.tcp_lane.as_mut() else {
+            return;
+        };
+        if let Err(error) = lane.stream.set_nodelay(true) {
+            kvlog::warn!("voice tcp lane nodelay failed", error = %error);
+        }
+        if let Ok(local_addr) = lane.stream.local_addr()
+            && let Err(_error) = rpc::qos::apply_voice_qos(lane.stream.as_raw_fd(), local_addr)
+        {
+            kvlog::debug!("voice tcp lane qos unavailable", error = %_error);
+        }
+        let now = Instant::now();
+        lane.state = TcpLaneState::Active;
+        lane.write_queue
+            .tail_mut()
+            .extend_from_slice(&media::VOICE_TCP_MAGIC);
+        lane.backlog_since = Some(now);
+        kvlog::info!("voice tcp lane connected", addr = %self.server_tcp_addr);
+        // The sealed Bind authenticates the lane to the session; pulling the
+        // RTT probe forward gets a Ping/Pong RTT sample over it immediately.
+        // The liveness window restarts with the transport: the new path has
+        // been neither proven nor disproven.
+        self.send_media(&MediaPayload::Bind);
+        self.next_rtt_probe = now;
+        self.tcp_probes.restart(now);
+    }
+
+    fn flush_tcp_lane(&mut self) {
+        let Some(lane) = self.tcp_lane.as_mut() else {
+            return;
+        };
+        if matches!(lane.state, TcpLaneState::Draining { .. })
+            || lane.write_blocked
+            || lane.write_queue.is_empty()
+        {
+            return;
+        }
+        match write_queue_to(
+            &mut lane.stream,
+            &mut lane.write_queue,
+            TCP_LANE_WRITE_ATTEMPTS,
+        ) {
+            Ok(outcome) => {
+                let now = Instant::now();
+                if lane.write_queue.is_empty() {
+                    lane.backlog_since = None;
+                }
+                if outcome.blocked {
+                    lane.write_blocked = true;
+                }
+                if outcome.wrote_zero {
+                    self.fail_tcp_lane("write returned zero");
+                } else {
+                    self.fail_stale_lane_backlog(now);
+                }
+            }
+            Err(error) => {
+                kvlog::warn!("voice tcp lane write failed", error = %error);
+                self.fail_tcp_lane("write error");
+            }
+        }
+    }
+
+    /// Drains a bounded lane read burst, mirroring [`VoiceSession::read_udp`]:
+    /// `true` retains work after the budget so buffered frames are not
+    /// stranded.
+    fn read_tcp_lane(&mut self) -> bool {
+        let Some(lane) = self.tcp_lane.as_mut() else {
+            return false;
+        };
+        let outcome = match read_into_buffer(
+            &lane.stream,
+            &mut lane.read_buf,
+            &mut lane.readiness,
+            2048,
+            ReadLimit::ByteBudget(TCP_LANE_READ_BUDGET_BYTES),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                kvlog::warn!("voice tcp lane read failed", error = %error);
+                self.fail_tcp_lane("read error");
+                return false;
+            }
+        };
+        let mut read_buf = std::mem::take(&mut lane.read_buf);
+        loop {
+            let total = match frame::parse_frame_with_limit(
+                read_buf.pending(),
+                media::VOICE_TCP_MAX_FRAME_BYTES,
+            ) {
+                Ok(Some((_, total))) => total,
+                Ok(None) => break,
+                Err(error) => {
+                    kvlog::warn!("voice tcp lane frame invalid", error = %error);
+                    self.fail_tcp_lane("invalid frame");
+                    return false;
+                }
+            };
+            let now = Instant::now();
+            let packet = &mut read_buf.pending_mut()[frame::LENGTH_PREFIX_LEN..total];
+            match media::open_media_in_place(&self.media, &mut self.media_recv_replay, packet) {
+                Ok(opened) => {
+                    let payload = opened.payload.into_owned();
+                    self.note_server_media(MediaPath::Tcp);
+                    self.handle_server_media(now, MediaPath::Tcp, payload);
+                }
+                Err(error) => {
+                    kvlog::warn!("voice tcp lane packet rejected", error = %error);
+                }
+            }
+            read_buf.consume(total);
+        }
+        let Some(lane) = self.tcp_lane.as_mut() else {
+            return false;
+        };
+        lane.read_buf = read_buf;
+        if outcome.disconnected {
+            if matches!(lane.state, TcpLaneState::Draining { .. }) {
+                self.drop_tcp_lane("drained");
+            } else {
+                self.fail_tcp_lane("server closed");
+            }
+            return false;
+        }
+        outcome.hit_limit
+    }
+
+    /// Half-closes an active lane after UDP recovery: no more writes, but
+    /// in-flight downstream frames still play until the server's EOF.
+    fn drain_tcp_lane(&mut self) {
+        self.flush_tcp_lane();
+        let Some(lane) = self.tcp_lane.as_mut() else {
+            return;
+        };
+        if !matches!(lane.state, TcpLaneState::Active) {
+            self.drop_tcp_lane("udp recovered");
+            return;
+        }
+        kvlog::info!("voice tcp lane draining, udp recovered");
+        let _ = lane.stream.shutdown(std::net::Shutdown::Write);
+        let now = Instant::now();
+        lane.state = TcpLaneState::Draining {
+            deadline: now + TCP_LANE_DRAIN_TIMEOUT,
+        };
+        // UDP takes over carrying media: its window runs from here.
+        self.udp_probes.pending_since.get_or_insert(now);
+    }
+
+    fn drop_tcp_lane(&mut self, reason: &str) {
+        let Some(mut lane) = self.tcp_lane.take() else {
+            return;
+        };
+        let _ = self.registry.deregister(&mut lane.stream);
+        kvlog::info!("voice tcp lane closed", reason);
+        self.udp_probes.pending_since.get_or_insert(Instant::now());
+        if matches!(lane.state, TcpLaneState::Active) && self.lane_wanted() {
+            self.report_media_transport(MediaTransportState::Unavailable);
+        }
+    }
+
+    fn report_media_transport(&mut self, state: MediaTransportState) {
+        if self.reported_media_transport == state {
+            return;
+        }
+        self.reported_media_transport = state;
+        let _ = self.events.send(NetworkEvent::MediaTransport { state });
+    }
+
+    fn fail_tcp_lane(&mut self, reason: &str) {
+        self.drop_tcp_lane(reason);
+        self.schedule_tcp_reconnect(Instant::now());
+    }
+
+    fn schedule_tcp_reconnect(&mut self, now: Instant) {
+        self.next_tcp_connect = now + self.tcp_backoff;
+        self.tcp_backoff = (self.tcp_backoff * 2).min(TCP_LANE_BACKOFF_MAX);
+    }
+
     fn send_udp_raw(
         &mut self,
         kind: &'static str,
@@ -2887,7 +3797,10 @@ impl VoiceSession {
         addr: SocketAddr,
         packet: &[u8],
     ) {
-        match self.udp.send_to(packet, addr) {
+        let Some(udp) = self.udp.as_ref() else {
+            return;
+        };
+        match udp.socket.send_to(packet, addr) {
             Ok(_) => {}
             Err(error) if chatt_p2p::socket::is_ignorable_udp_error(&error) => {
                 kvlog::warn!(
@@ -3294,6 +4207,8 @@ mod tests {
     use super::*;
     use crate::audio::VoicePayload;
     use rpc::crypto::{KEY_LEN, KeyMaterial};
+    use std::io::{Read, Write};
+    use std::net::TcpListener as StdTcpListener;
     use std::sync::mpsc;
 
     fn protection(route_id: u32) -> MediaProtection {
@@ -3341,16 +4256,20 @@ mod tests {
     }
 
     fn start_command_with_p2p(generation: u64, p2p_enabled: bool) -> VoiceCommand {
-        let udp = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
-        udp.set_nonblocking(true).unwrap();
+        let socket = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        socket.set_nonblocking(true).unwrap();
         VoiceCommand::StartSession {
             generation,
-            udp,
+            udp: Some(UdpMediaSetup {
+                socket,
+                server_addr: "127.0.0.1:9".parse().unwrap(),
+                server_probe_addr: None,
+            }),
             media: protection(100 + generation as u32),
             initial_bind_attempted: false,
             transport_mode: TransportMode::Encrypted,
-            server_udp_addr: "127.0.0.1:9".parse().unwrap(),
-            server_udp_probe_addr: None,
+            server_tcp_addr: "127.0.0.1:9".parse().unwrap(),
+            media_transport: MediaTransportSetting::Auto,
             p2p_enabled,
             candidate_privacy: CandidatePrivacy::Disabled,
             prefer_ipv6: false,
@@ -3645,12 +4564,16 @@ mod tests {
         let mut session = VoiceSession::new(
             &actor_poll,
             1,
-            udp,
+            Some(UdpMediaSetup {
+                socket: udp,
+                server_addr: server.local_addr().unwrap(),
+                server_probe_addr: None,
+            }),
             protection(55),
             false,
             TransportMode::Encrypted,
             server.local_addr().unwrap(),
-            None,
+            MediaTransportSetting::Auto,
             false,
             CandidatePrivacy::Disabled,
             false,
@@ -3709,12 +4632,16 @@ mod tests {
         let mut session = VoiceSession::new(
             &actor_poll,
             1,
-            udp,
+            Some(UdpMediaSetup {
+                socket: udp,
+                server_addr: server.local_addr().unwrap(),
+                server_probe_addr: None,
+            }),
             protection(55),
             false,
             TransportMode::Encrypted,
             server.local_addr().unwrap(),
-            None,
+            MediaTransportSetting::Auto,
             false,
             CandidatePrivacy::Disabled,
             false,
@@ -3801,12 +4728,16 @@ mod tests {
         let mut session = VoiceSession::new(
             &actor_poll,
             1,
-            udp,
+            Some(UdpMediaSetup {
+                socket: udp,
+                server_addr: server.local_addr().unwrap(),
+                server_probe_addr: None,
+            }),
             protection(55),
             false,
             TransportMode::Encrypted,
             server.local_addr().unwrap(),
-            None,
+            MediaTransportSetting::Auto,
             false,
             CandidatePrivacy::Disabled,
             false,
@@ -3882,7 +4813,8 @@ mod tests {
         assert!(session.active_stream.is_none());
         assert!(session.pending_playback_packets.is_empty());
         assert!(session.p2p_peers.is_empty());
-        assert!(session.server_rtt_in_flight.is_empty());
+        assert!(session.udp_probes.in_flight.is_empty());
+        assert!(session.tcp_probes.in_flight.is_empty());
         assert!(session.playback_ingress.sink().is_some());
     }
 
@@ -3956,12 +4888,16 @@ mod tests {
             control
                 .submit(VoiceCommand::StartSession {
                     generation: 7,
-                    udp,
+                    udp: Some(UdpMediaSetup {
+                        socket: udp,
+                        server_addr: server.local_addr().unwrap(),
+                        server_probe_addr: None,
+                    }),
                     media: protection(77),
                     initial_bind_attempted: false,
                     transport_mode: TransportMode::Encrypted,
-                    server_udp_addr: server.local_addr().unwrap(),
-                    server_udp_probe_addr: None,
+                    server_tcp_addr: server.local_addr().unwrap(),
+                    media_transport: MediaTransportSetting::Auto,
                     p2p_enabled: true,
                     candidate_privacy: CandidatePrivacy::Disabled,
                     prefer_ipv6: false,
@@ -4025,5 +4961,696 @@ mod tests {
         }
         assert!(received_voice);
         drop(handle);
+    }
+
+    fn lane_test_session(
+        media_transport: MediaTransportSetting,
+        server_tcp_addr: SocketAddr,
+    ) -> (VoiceSession, Poll, mpsc::Receiver<crate::app::AppEvent>) {
+        let poll = Poll::new().unwrap();
+        // Mirrors the worker: a forced-TCP session is handed no UDP leg at all.
+        let udp = media_transport.is_auto().then(|| {
+            let socket = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+            socket.set_nonblocking(true).unwrap();
+            UdpMediaSetup {
+                socket,
+                server_addr: "127.0.0.1:9".parse().unwrap(),
+                server_probe_addr: None,
+            }
+        });
+        let (event_tx, event_rx) = mpsc::channel();
+        let session = VoiceSession::new(
+            &poll,
+            1,
+            udp,
+            protection(55),
+            false,
+            TransportMode::Encrypted,
+            server_tcp_addr,
+            media_transport,
+            false,
+            CandidatePrivacy::Disabled,
+            false,
+            NetworkEventSender::for_test(event_tx),
+        )
+        .unwrap();
+        (session, poll, event_rx)
+    }
+
+    fn drive_lane_active(session: &mut VoiceSession) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !session.tcp_lane_active() {
+            assert!(Instant::now() < deadline, "lane failed to activate");
+            session.tcp_lane_writable();
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn force_tcp_lane_skips_udp_and_authenticates_with_magic_then_bind() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Tcp, listener.local_addr().unwrap());
+        session.authenticated(SessionId(6));
+        assert!(!session.awaiting_udp_bound);
+
+        session.poll_tcp_lane(Instant::now());
+        assert!(session.tcp_lane.is_some());
+        let (mut server_end, _) = listener.accept().unwrap();
+        server_end
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        drive_lane_active(&mut session);
+
+        let mut magic = [0u8; 8];
+        server_end.read_exact(&mut magic).unwrap();
+        assert_eq!(magic, media::VOICE_TCP_MAGIC);
+        let mut prefix = [0u8; frame::LENGTH_PREFIX_LEN];
+        server_end.read_exact(&mut prefix).unwrap();
+        let mut sealed = vec![0u8; u32::from_le_bytes(prefix) as usize];
+        server_end.read_exact(&mut sealed).unwrap();
+        let mut replay = AntiReplay::new();
+        let opened = media::open_media(&protection(55), &mut replay, &sealed).unwrap();
+        assert_eq!(opened.payload, MediaPayload::Bind);
+        assert_eq!(opened.header.counter, 0);
+    }
+
+    #[test]
+    fn tcp_lane_is_confirmed_only_by_valid_server_media() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, event_rx) =
+            lane_test_session(MediaTransportSetting::Tcp, listener.local_addr().unwrap());
+        session.authenticated(SessionId(6));
+        session.tcp_backoff = TCP_LANE_BACKOFF_MAX;
+        session.poll_tcp_lane(Instant::now());
+        let (mut server_end, _) = listener.accept().unwrap();
+        drive_lane_active(&mut session);
+
+        assert!(!session.tcp_lane.as_ref().unwrap().confirmed);
+        assert_eq!(session.tcp_backoff, TCP_LANE_BACKOFF_MAX);
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Unavailable,
+                },
+                ..
+            }
+        )));
+
+        let packet =
+            media::seal_media(&protection(55), 0, &MediaPayload::Pong { nonce: 17 }).unwrap();
+        let mut framed = Vec::new();
+        frame::encode_frame(&packet, &mut framed).unwrap();
+        let packet =
+            media::seal_media(&protection(55), 1, &MediaPayload::Pong { nonce: 18 }).unwrap();
+        frame::encode_frame(&packet, &mut framed).unwrap();
+        server_end.write_all(&framed).unwrap();
+        session.tcp_lane.as_mut().unwrap().readiness.mark_ready();
+        session.read_tcp_lane();
+
+        assert!(session.tcp_lane.as_ref().unwrap().confirmed);
+        assert_eq!(session.tcp_backoff, TCP_LANE_BACKOFF_MIN);
+        assert_eq!(
+            event_rx
+                .try_iter()
+                .filter(|event| matches!(
+                    event,
+                    crate::app::AppEvent::NetworkFor {
+                        event: NetworkEvent::MediaTransport {
+                            state: MediaTransportState::Tcp,
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unconfirmed_tcp_close_preserves_escalating_backoff() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, event_rx) =
+            lane_test_session(MediaTransportSetting::Tcp, listener.local_addr().unwrap());
+        session.authenticated(SessionId(6));
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Unavailable,
+                },
+                ..
+            }
+        )));
+        session.tcp_backoff = TCP_LANE_BACKOFF_MIN * 4;
+        session.poll_tcp_lane(Instant::now());
+        let (server_end, _) = listener.accept().unwrap();
+        drive_lane_active(&mut session);
+        drop(server_end);
+
+        session.tcp_lane.as_mut().unwrap().readiness.mark_ready();
+        session.read_tcp_lane();
+
+        assert!(session.tcp_lane.is_none());
+        assert_eq!(session.tcp_backoff, TCP_LANE_BACKOFF_MIN * 8);
+        assert!(!event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn tcp_write_cap_closes_confirmed_lane_and_discards_backlog() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, event_rx) =
+            lane_test_session(MediaTransportSetting::Tcp, listener.local_addr().unwrap());
+        session.authenticated(SessionId(6));
+        session.poll_tcp_lane(Instant::now());
+        let (_server_end, _) = listener.accept().unwrap();
+        drive_lane_active(&mut session);
+        session.note_server_media(MediaPath::Tcp);
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Tcp,
+                },
+                ..
+            }
+        )));
+
+        let counter = session.media_send_counter;
+        let lane = session.tcp_lane.as_mut().unwrap();
+        lane.write_blocked = true;
+        lane.write_queue
+            .tail_mut()
+            .extend_from_slice(&vec![0; TCP_LANE_WRITE_CAP_BYTES + 1]);
+        session.send_media(&MediaPayload::Pong { nonce: 19 });
+
+        assert!(session.tcp_lane.is_none());
+        assert_eq!(session.media_send_counter, counter);
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Unavailable,
+                },
+                ..
+            }
+        )));
+    }
+
+    /// Answers the oldest probe outstanding on `path`, the way the relay does:
+    /// on the transport the `Ping` arrived over.
+    fn answer_probe(session: &mut VoiceSession, path: MediaPath) {
+        let nonce = session
+            .probes_mut(path)
+            .in_flight
+            .front()
+            .expect("a probe was outstanding")
+            .0;
+        session.handle_server_media(Instant::now(), path, MediaPayload::Pong { nonce });
+    }
+
+    #[test]
+    fn repeated_bind_failures_latch_udp_suspect() {
+        let (mut session, _poll, event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, "127.0.0.1:9".parse().unwrap());
+        session.authenticated(SessionId(6));
+        assert!(session.awaiting_udp_bound);
+        assert_eq!(session.udp_path, UdpPath::Unproven);
+
+        let mut now = Instant::now();
+        for _ in 0..UDP_BIND_FAILURE_ATTEMPTS {
+            now += UDP_BIND_RETRY_INTERVAL;
+            session.poll_udp_bind_retry(now);
+        }
+        assert_eq!(session.udp_path, UdpPath::Failed);
+        assert!(session.lane_wanted());
+        let unreachable_reports = event_rx
+            .try_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::app::AppEvent::NetworkFor {
+                        event: NetworkEvent::MediaTransport {
+                            state: MediaTransportState::Unavailable,
+                        },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(unreachable_reports, 1);
+    }
+
+    /// `UdpBound` travels over the control connection, so on its own it proves
+    /// only that the client's datagrams arrive, and inbound speech proves only
+    /// the reverse direction. Recovery has to wait for round trips that close,
+    /// and for enough of them that one transient success cannot flap the lane.
+    #[test]
+    fn udp_recovery_needs_repeated_matched_pongs() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, listener.local_addr().unwrap());
+        session.authenticated(SessionId(6));
+        session.suspect_udp_path(Instant::now());
+        session.poll_tcp_lane(session.next_tcp_connect);
+        let (server_end, _) = listener.accept().unwrap();
+        drive_lane_active(&mut session);
+        session.note_server_media(MediaPath::Tcp);
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Tcp,
+                },
+                ..
+            }
+        )));
+
+        session.udp_bound();
+        assert_eq!(session.udp_path, UdpPath::Failed);
+        assert!(!event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Udp,
+                },
+                ..
+            }
+        )));
+        assert!(matches!(
+            session.tcp_lane.as_ref().unwrap().state,
+            TcpLaneState::Active
+        ));
+
+        // A room's inbound speech arriving over UDP says nothing about the
+        // direction the microphone travels.
+        session.handle_server_media(
+            Instant::now(),
+            MediaPath::Udp,
+            MediaPayload::Voice {
+                stream_id: StreamId(4),
+                sequence: 1,
+                timestamp: 960,
+                flags: 0,
+                payload: media::VoicePayload::Opus(vec![1, 2, 3]),
+            },
+        );
+        assert_eq!(session.udp_path, UdpPath::Failed);
+
+        let mut now = Instant::now();
+        for round in 1..crate::client_net::UDP_VERIFY_SUCCESSES {
+            now += crate::client_net::UDP_VERIFY_INTERVAL;
+            session.poll_udp_verify(now);
+            answer_probe(&mut session, MediaPath::Udp);
+            assert_eq!(session.udp_probes.streak, round);
+            assert_eq!(session.udp_path, UdpPath::Failed, "round {round}");
+            assert!(matches!(
+                session.tcp_lane.as_ref().unwrap().state,
+                TcpLaneState::Active
+            ));
+        }
+
+        now += crate::client_net::UDP_VERIFY_INTERVAL;
+        session.poll_udp_verify(now);
+        answer_probe(&mut session, MediaPath::Udp);
+        assert_eq!(session.udp_path, UdpPath::Verified);
+        assert!(matches!(
+            session.tcp_lane.as_ref().unwrap().state,
+            TcpLaneState::Draining { .. }
+        ));
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Udp,
+                },
+                ..
+            }
+        )));
+
+        drop(server_end);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while session.tcp_lane.is_some() {
+            assert!(Instant::now() < deadline, "drained lane failed to close");
+            if let Some(lane) = session.tcp_lane.as_mut() {
+                lane.readiness.mark_ready();
+            }
+            session.read_tcp_lane();
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn force_tcp_lane_loss_reports_unavailable_until_reconfirmed() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, event_rx) =
+            lane_test_session(MediaTransportSetting::Tcp, listener.local_addr().unwrap());
+        session.authenticated(SessionId(6));
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Unavailable,
+                },
+                ..
+            }
+        )));
+
+        session.poll_tcp_lane(Instant::now());
+        let (server_end, _) = listener.accept().unwrap();
+        drive_lane_active(&mut session);
+        session.note_server_media(MediaPath::Tcp);
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Tcp,
+                },
+                ..
+            }
+        )));
+
+        drop(server_end);
+        session.tcp_lane.as_mut().unwrap().readiness.mark_ready();
+        session.read_tcp_lane();
+        assert!(session.tcp_lane.is_none());
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Unavailable,
+                },
+                ..
+            }
+        )));
+
+        let counter = session.media_send_counter;
+        session.send_media(&MediaPayload::Voice {
+            stream_id: StreamId(9),
+            sequence: 12,
+            timestamp: 960,
+            flags: 0,
+            payload: media::VoicePayload::Opus(vec![1, 2, 3]),
+        });
+        assert_eq!(session.media_send_counter, counter);
+
+        session.poll_tcp_lane(session.next_tcp_connect);
+        let (_server_end, _) = listener.accept().unwrap();
+        drive_lane_active(&mut session);
+        assert!(!event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Tcp,
+                },
+                ..
+            }
+        )));
+        session.note_server_media(MediaPath::Tcp);
+        assert!(event_rx.try_iter().any(|event| matches!(
+            event,
+            crate::app::AppEvent::NetworkFor {
+                event: NetworkEvent::MediaTransport {
+                    state: MediaTransportState::Tcp,
+                },
+                ..
+            }
+        )));
+    }
+
+    /// The server confirms the bind over the control connection, so a session
+    /// whose inbound UDP is dropped never gets a first RTT sample at all. The
+    /// liveness window has to run from authentication for that to be caught.
+    #[test]
+    fn unanswered_probes_suspect_udp_without_any_rtt_sample() {
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, "127.0.0.1:9".parse().unwrap());
+        session.authenticated(SessionId(6));
+        session.udp_bound();
+        assert_eq!(session.udp_path, UdpPath::Unproven);
+        assert!(session.server_rtt_last_sample_at.is_none());
+
+        let now = session.udp_probes.pending_since.unwrap() + crate::client_net::RTT_STALE_AFTER;
+        session.poll_rtt_probe(now);
+        session.poll_server_path_liveness(now);
+        assert_eq!(session.udp_path, UdpPath::Failed);
+        assert!(session.lane_wanted());
+    }
+
+    /// The failure this whole scheme exists for: in a busy room a client whose
+    /// upstream UDP is blackholed keeps hearing everyone, so any rule that
+    /// treats inbound traffic as liveness never fires and the microphone stays
+    /// silently dead.
+    #[test]
+    fn inbound_voice_does_not_stand_in_for_a_matched_pong() {
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, "127.0.0.1:9".parse().unwrap());
+        session.authenticated(SessionId(6));
+        session.udp_bound();
+        let opened_at = session.udp_probes.pending_since.unwrap();
+
+        let mut now = Instant::now();
+        for _ in 0..8 {
+            now += Duration::from_secs(2);
+            session.handle_server_media(
+                now,
+                MediaPath::Udp,
+                MediaPayload::Voice {
+                    stream_id: StreamId(4),
+                    sequence: 1,
+                    timestamp: 960,
+                    flags: 0,
+                    payload: media::VoicePayload::Opus(vec![1, 2, 3]),
+                },
+            );
+            session.note_server_media(MediaPath::Udp);
+        }
+        assert_eq!(session.udp_probes.pending_since, Some(opened_at));
+
+        let now = opened_at + crate::client_net::RTT_STALE_AFTER;
+        session.poll_server_path_liveness(now);
+        assert_eq!(session.udp_path, UdpPath::Failed);
+        assert!(session.lane_wanted());
+    }
+
+    #[test]
+    fn a_matched_pong_clears_the_liveness_window() {
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, "127.0.0.1:9".parse().unwrap());
+        session.authenticated(SessionId(6));
+        session.udp_bound();
+        assert!(session.udp_probes.pending_since.is_some());
+        answer_probe(&mut session, MediaPath::Udp);
+        assert!(session.udp_probes.pending_since.is_none());
+
+        let now = Instant::now() + crate::client_net::RTT_STALE_AFTER;
+        session.poll_server_path_liveness(now);
+        assert_eq!(session.udp_path, UdpPath::Verified);
+    }
+
+    /// A `Pong` proves the path it came back on. One arriving over the lane for
+    /// a probe UDP sent would otherwise let a dead UDP path claim to be alive.
+    #[test]
+    fn a_pong_on_the_wrong_path_or_nonce_proves_nothing() {
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, "127.0.0.1:9".parse().unwrap());
+        session.authenticated(SessionId(6));
+        let nonce = session.udp_probes.in_flight.front().unwrap().0;
+        let opened_at = session.udp_probes.pending_since.unwrap();
+
+        let now = Instant::now();
+        session.handle_server_media(now, MediaPath::Tcp, MediaPayload::Pong { nonce });
+        session.handle_server_media(
+            now,
+            MediaPath::Udp,
+            MediaPayload::Pong {
+                nonce: nonce.wrapping_add(1000),
+            },
+        );
+
+        assert_eq!(session.udp_probes.pending_since, Some(opened_at));
+        assert_eq!(session.udp_probes.streak, 0);
+        assert_eq!(session.udp_path, UdpPath::Unproven);
+    }
+
+    /// Cold start is the same problem as a mid-session failure: nothing has
+    /// proven UDP yet, so speech must not sit on it for the whole liveness
+    /// window. One round trip settles it, so the lane is only worth opening if
+    /// that round trip does not come back.
+    #[test]
+    fn cold_start_opens_a_lane_only_when_udp_stays_unproven() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, listener.local_addr().unwrap());
+        let start = Instant::now();
+        session.authenticated(SessionId(6));
+        assert!(session.lane_wanted());
+
+        assert!(session.next_tcp_connect >= start + crate::client_net::UDP_COLD_START_GRACE);
+        session.poll_tcp_lane(start);
+        assert!(session.tcp_lane.is_none(), "lane opened inside the grace");
+
+        session.poll_tcp_lane(session.next_tcp_connect);
+        assert!(session.tcp_lane.is_some());
+    }
+
+    #[test]
+    fn cold_start_verifies_udp_within_the_grace_without_a_lane() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, listener.local_addr().unwrap());
+        let start = Instant::now();
+        session.authenticated(SessionId(6));
+        session.udp_bound();
+        answer_probe(&mut session, MediaPath::Udp);
+
+        assert_eq!(session.udp_path, UdpPath::Verified);
+        assert!(!session.lane_wanted());
+        session.poll_tcp_lane(start + crate::client_net::UDP_COLD_START_GRACE);
+        assert!(session.tcp_lane.is_none());
+    }
+
+    /// One lost `Pong` on a working path must not cost a lane. An outstanding
+    /// probe escalates the cadence to a second, so the fifteen-second window
+    /// closes on the follow-up instead of expiring after three sparse asks.
+    #[test]
+    fn a_single_lost_pong_escalates_probing_instead_of_failing_over() {
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, "127.0.0.1:9".parse().unwrap());
+        session.authenticated(SessionId(6));
+        session.udp_bound();
+        answer_probe(&mut session, MediaPath::Udp);
+        assert_eq!(session.udp_path, UdpPath::Verified);
+        assert!(!session.udp_verify_wanted());
+
+        // The periodic probe goes out over UDP and its answer is lost.
+        let mut now = session.next_rtt_probe;
+        session.poll_rtt_probe(now);
+        assert!(session.udp_verify_wanted());
+        assert_eq!(
+            session.next_udp_verify,
+            now + crate::client_net::UDP_VERIFY_INTERVAL
+        );
+
+        now += crate::client_net::UDP_VERIFY_INTERVAL;
+        session.poll_udp_verify(now);
+        now += crate::client_net::UDP_VERIFY_INTERVAL;
+        session.poll_udp_verify(now);
+        answer_probe(&mut session, MediaPath::Udp);
+
+        assert!(session.udp_probes.pending_since.is_none());
+        session.poll_server_path_liveness(now + crate::client_net::RTT_STALE_AFTER);
+        assert_eq!(session.udp_path, UdpPath::Verified);
+        assert!(!session.lane_wanted());
+    }
+
+    /// A probe that goes unanswered restarts the dwell, so recovery cannot be
+    /// assembled out of successes spread across an unhealthy path.
+    #[test]
+    fn a_missed_probe_resets_the_recovery_streak() {
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, "127.0.0.1:9".parse().unwrap());
+        session.authenticated(SessionId(6));
+        session.udp_bound();
+        session.latch_udp_suspect();
+
+        let mut now = Instant::now();
+        now += crate::client_net::UDP_VERIFY_INTERVAL;
+        session.poll_udp_verify(now);
+        answer_probe(&mut session, MediaPath::Udp);
+        assert_eq!(session.udp_probes.streak, 1);
+
+        now += crate::client_net::UDP_VERIFY_INTERVAL;
+        session.poll_udp_verify(now);
+        now += crate::client_net::UDP_VERIFY_TIMEOUT;
+        session.poll_udp_verify(now);
+        assert_eq!(session.udp_probes.streak, 0);
+        assert_eq!(session.udp_path, UdpPath::Failed);
+    }
+
+    /// The byte cap bounds memory, not latency: 32 KiB is seconds of speech, so
+    /// a lane whose queue stops draining has to be closed on age too.
+    #[test]
+    fn stale_backlog_fails_a_lane_far_under_the_write_cap() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Tcp, listener.local_addr().unwrap());
+        session.authenticated(SessionId(6));
+        session.poll_tcp_lane(Instant::now());
+        let (_server_end, _) = listener.accept().unwrap();
+        drive_lane_active(&mut session);
+
+        let lane = session.tcp_lane.as_mut().unwrap();
+        lane.write_blocked = true;
+        lane.write_queue.tail_mut().extend_from_slice(&[0; 64]);
+        lane.backlog_since = Some(Instant::now() - TCP_LANE_STALE_BACKLOG);
+        assert!(lane.write_queue.len() < TCP_LANE_WRITE_CAP_BYTES);
+
+        session.send_media(&MediaPayload::Pong { nonce: 3 });
+        assert!(session.tcp_lane.is_none());
+    }
+
+    #[test]
+    fn a_drained_lane_queue_closes_the_backlog_window() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Tcp, listener.local_addr().unwrap());
+        session.authenticated(SessionId(6));
+        session.poll_tcp_lane(Instant::now());
+        let (_server_end, _) = listener.accept().unwrap();
+        drive_lane_active(&mut session);
+
+        // Activation queues the magic and a Bind, both flushed to the socket.
+        assert_eq!(session.tcp_lane.as_ref().unwrap().backlog_since, None);
+
+        session.tcp_lane.as_mut().unwrap().write_blocked = true;
+        session.send_media(&MediaPayload::Pong { nonce: 3 });
+        assert!(session.tcp_lane.as_ref().unwrap().backlog_since.is_some());
+
+        session.tcp_lane.as_mut().unwrap().write_blocked = false;
+        session.flush_tcp_lane();
+        assert_eq!(session.tcp_lane.as_ref().unwrap().backlog_since, None);
+    }
+
+    /// A silently blackholed lane holds a force-TCP session hostage until the
+    /// OS TCP timeout, which an idle session never reaches on its own.
+    #[test]
+    fn silent_tcp_lane_is_dropped_and_reconnected() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Tcp, listener.local_addr().unwrap());
+        session.authenticated(SessionId(6));
+        session.poll_tcp_lane(Instant::now());
+        let (_server_end, _) = listener.accept().unwrap();
+        drive_lane_active(&mut session);
+        assert!(session.tcp_probes.pending_since.is_some());
+
+        let now = session.tcp_probes.pending_since.unwrap() + crate::client_net::RTT_STALE_AFTER;
+        session.poll_server_path_liveness(now);
+        assert!(session.tcp_lane.is_none());
+        assert_eq!(session.next_tcp_connect, now + TCP_LANE_BACKOFF_MIN);
+        assert!(session.lane_wanted());
+    }
+
+    #[test]
+    fn tcp_reconnect_backoff_doubles_to_cap() {
+        let (mut session, _poll, _event_rx) =
+            lane_test_session(MediaTransportSetting::Auto, "127.0.0.1:9".parse().unwrap());
+        let now = Instant::now();
+        session.schedule_tcp_reconnect(now);
+        assert_eq!(session.next_tcp_connect, now + TCP_LANE_BACKOFF_MIN);
+        session.schedule_tcp_reconnect(now);
+        assert_eq!(session.next_tcp_connect, now + TCP_LANE_BACKOFF_MIN * 2);
+        for _ in 0..10 {
+            session.schedule_tcp_reconnect(now);
+        }
+        assert_eq!(session.next_tcp_connect, now + TCP_LANE_BACKOFF_MAX);
     }
 }

@@ -49,8 +49,8 @@ use crate::{
         TerminalEvent,
     },
     client_net::{
-        NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE, PairingEvent,
-        TerminalVerb, TransferDirection, UploadFileRequest,
+        MediaTransportState, NetworkClient, NetworkCommand, NetworkEvent, PAIRING_CANCELABLE,
+        PairingEvent, TerminalVerb, TransferDirection, UploadFileRequest,
     },
     config::{
         self, Config, NotificationSoundMode, ServerEntry, SoundboardClip, ThemeSelection,
@@ -3583,7 +3583,7 @@ impl App {
         self.pending_voice_teardown_at = None;
         self.pending_network_commands.clear();
         self.room.network_disconnected = true;
-        self.room.udp_unreachable = false;
+        self.room.media_transport = MediaTransportState::Udp;
         self.pending_dm_open.clear();
         self.pending_dm_clients.clear();
         self.pending_identity_review.clear();
@@ -4486,7 +4486,6 @@ impl App {
                     video_auth_key,
                 ));
                 self.room.network_disconnected = false;
-                self.room.udp_unreachable = false;
                 self.room.clear_e2e_trust_states();
                 self.last_network_notice = None;
                 let catalog = crate::room_catalog::load(self.room.history_storage().catalog_dir());
@@ -5178,7 +5177,7 @@ impl App {
             } => {
                 self.handle_screencast_failed(attempt_id, message);
             }
-            NetworkEvent::MediaConnectivity { udp_ok } => self.room.udp_unreachable = !udp_ok,
+            NetworkEvent::MediaTransport { state } => self.room.media_transport = state,
             NetworkEvent::Status(status) => self.set_status(status),
             NetworkEvent::Error(error) => {
                 kvlog::warn!("app network error", error = error.as_str());
@@ -5237,7 +5236,7 @@ impl App {
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.room.network_disconnected = true;
-                self.room.udp_unreachable = false;
+                self.room.media_transport = MediaTransportState::Udp;
                 self.video_transport = None;
                 self.stop_audio();
                 self.fail_screencast_if_running(
@@ -9400,7 +9399,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Error(_) => "error",
         NetworkEvent::AuthFailed { .. } => "auth_failed",
         NetworkEvent::TransportEncryptionRequired => "transport_encryption_required",
-        NetworkEvent::MediaConnectivity { .. } => "media_connectivity",
+        NetworkEvent::MediaTransport { .. } => "media_transport",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::LocalIdentityUnavailable { .. } => "local_identity_unavailable",
         NetworkEvent::WorkerStopped { .. } => "worker_stopped",
@@ -9475,6 +9474,21 @@ mod tests {
 
     fn test_app() -> TestApp {
         TestApp::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn media_transport_events_project_all_app_states() {
+        let mut app = test_app();
+        assert_eq!(app.room.media_transport, MediaTransportState::Udp);
+
+        for state in [
+            MediaTransportState::Unavailable,
+            MediaTransportState::Tcp,
+            MediaTransportState::Udp,
+        ] {
+            app.handle_network_event(NetworkEvent::MediaTransport { state });
+            assert_eq!(app.room.media_transport, state);
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::{
     bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind, NoticeKind},
     client_channel::DirtySections,
-    client_net::{TerminalVerb, TransferDirection, format_bytes},
+    client_net::{MediaTransportState, TerminalVerb, TransferDirection, format_bytes},
     config::Config,
     theme::{self, Theme},
     tui::{
@@ -70,10 +70,6 @@ impl<'a> RenderState<'a> {
 
     fn is_offline(&self) -> bool {
         !self.room.network_selected || self.room.network_disconnected
-    }
-
-    fn is_udp_unreachable(&self) -> bool {
-        self.room.udp_unreachable
     }
 }
 
@@ -2136,6 +2132,30 @@ mod tests {
     use super::*;
     use rpc::ids::{StreamId, UserId};
 
+    #[test]
+    fn media_transport_status_labels_cover_every_state() {
+        let theme = Theme::tomorrow_night();
+        assert_eq!(
+            media_transport_status_label(MediaTransportState::Udp, theme),
+            None
+        );
+        assert_eq!(
+            media_transport_status_label(MediaTransportState::Tcp, theme).map(|(label, _)| label),
+            Some("Voice over TCP")
+        );
+        assert_eq!(
+            media_transport_status_label(MediaTransportState::Unavailable, theme)
+                .map(|(label, _)| label),
+            Some("Voice Reconnecting")
+        );
+        assert_eq!(
+            media_transport_status_label(MediaTransportState::Unavailable, theme)
+                .unwrap()
+                .1,
+            theme.status_fill.patch(theme.error)
+        );
+    }
+
     fn peer_identity() -> crate::config::E2ePeerIdentity {
         crate::config::E2ePeerIdentity {
             room_id: 9,
@@ -3181,13 +3201,21 @@ fn connection_status_label(app: &RenderState<'_>) -> Option<(&'static str, Style
         Some(("Offline", theme.status_fill.patch(theme.error)))
     } else if app.room.local_user.is_none() {
         Some(("Connecting", theme.status_fill.patch(theme.muted)))
-    } else if app.is_udp_unreachable() {
-        Some((
-            "UDP Connection Failure",
-            theme.status_fill.patch(theme.error),
-        ))
     } else {
-        None
+        media_transport_status_label(app.room.media_transport, theme)
+    }
+}
+
+fn media_transport_status_label(
+    state: MediaTransportState,
+    theme: Theme,
+) -> Option<(&'static str, Style)> {
+    match state {
+        MediaTransportState::Udp => None,
+        MediaTransportState::Tcp => Some(("Voice over TCP", theme.status_fill.patch(theme.muted))),
+        MediaTransportState::Unavailable => {
+            Some(("Voice Reconnecting", theme.status_fill.patch(theme.error)))
+        }
     }
 }
 

@@ -139,6 +139,22 @@ const UDP_BIND_FAILURE_ATTEMPTS: u32 = 5;
 /// A server RTT without a successful probe for this long no longer describes
 /// the current relay path and is reported as unavailable.
 const RTT_STALE_AFTER: Duration = Duration::from_secs(15);
+/// How long an `Auto` session waits for its first UDP round trip before it
+/// wants a TCP voice lane. One RTT is enough on a working path, so a healthy
+/// client never opens a lane, while a blackholed one stops putting speech on
+/// UDP within this window instead of after the whole liveness timeout.
+const UDP_COLD_START_GRACE: Duration = Duration::from_millis(500);
+/// Cadence of the UDP `Ping` probes sent while the UDP path is unverified,
+/// both at cold start and while a lane carries media. Only runs while UDP is
+/// unproven, so a healthy idle session keeps its [`RTT_PROBE_INTERVAL`] wake.
+const UDP_VERIFY_INTERVAL: Duration = Duration::from_secs(1);
+/// A verification probe unanswered for this long is a miss and resets the
+/// recovery streak.
+const UDP_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Consecutive matched UDP round trips before UDP is trusted with media again.
+/// A single transient success must not close the lane, so recovery costs at
+/// least [`UDP_VERIFY_INTERVAL`] times this many probes of healthy dwell.
+const UDP_VERIFY_SUCCESSES: u8 = 3;
 /// Smoothing weight applied to each new RTT sample folded into the EWMA.
 const RTT_EWMA_WEIGHT: f32 = 0.2;
 /// Cap on outstanding RTT probes tracked per destination before the oldest is
@@ -312,6 +328,7 @@ pub struct ClientConfig {
     /// Durable DM contact identity tuples and former trusted tuples.
     pub e2e_peer_pins: Vec<E2ePeerPin>,
     pub require_transport_encryption: bool,
+    pub media_transport: crate::config::MediaTransportSetting,
     pub file_policy: FilePolicy,
     /// The in-memory download ring buffer shared with the web server, filled
     /// when a room's download target resolves to [`DownloadTarget::Memory`].
@@ -643,6 +660,18 @@ enum UploadAbort {
     Failure(String),
 }
 
+/// Current usable path for server-relayed media.
+///
+/// `Unavailable` means the control session remains connected, but neither UDP
+/// nor a confirmed TCP voice lane can currently carry media.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MediaTransportState {
+    #[default]
+    Udp,
+    Tcp,
+    Unavailable,
+}
+
 #[derive(Clone, Debug)]
 pub enum NetworkEvent {
     Connected,
@@ -858,11 +887,10 @@ pub enum NetworkEvent {
         retry_in: Duration,
         reason: String,
     },
-    /// UDP media reachability to the server changed. `udp_ok: false` after
-    /// repeated `Bind` retries go unconfirmed; `true` once a `UdpBound` finally
-    /// lands after such a failure.
-    MediaConnectivity {
-        udp_ok: bool,
+    /// Which path currently carries server media, including a connected
+    /// control session whose media path is temporarily unavailable.
+    MediaTransport {
+        state: MediaTransportState,
     },
     WorkerStopped {
         reason: String,
@@ -1591,54 +1619,73 @@ fn run_worker_inner(
     // P2P is available only with transport encryption, regardless of the
     // client's P2P config.
     let p2p_enabled = config.p2p_enabled && transport_mode == TransportMode::Encrypted;
-    let server_udp_addr = match resolve_endpoint(&config.udp_addr) {
-        Ok(addr) => addr,
-        Err(error) => return SessionEnd::ConnectFailed(format!("invalid UDP endpoint: {error}")),
-    };
-    let server_udp_probe_addr = match config.udp_probe_addr.as_deref() {
-        Some(addr) => match resolve_endpoint(addr) {
-            Ok(addr) => Some(addr),
-            Err(error) => {
-                return SessionEnd::ConnectFailed(format!("invalid UDP probe endpoint: {error}"));
-            }
-        },
-        None => None,
-    };
-    let std_udp = match voice::bind_voice_udp_socket(if server_udp_addr.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
+    // Force-TCP sessions never touch UDP: no endpoint resolution, no socket,
+    // and the shared media counter starts at zero for the lane's own Bind
+    // instead of being consumed by an initial UDP bind.
+    let force_tcp_media = !config.media_transport.is_auto();
+    let udp_media = if force_tcp_media {
+        None
     } else {
-        "[::]:0".parse().unwrap()
-    }) {
-        Ok(socket) => socket,
-        Err(error) => {
-            return SessionEnd::ConnectFailed(format!("failed to bind UDP socket: {error}"));
+        let server_addr = match resolve_endpoint(&config.udp_addr) {
+            Ok(addr) => addr,
+            Err(error) => {
+                return SessionEnd::ConnectFailed(format!("invalid UDP endpoint: {error}"));
+            }
+        };
+        let server_probe_addr = match config.udp_probe_addr.as_deref() {
+            Some(addr) => match resolve_endpoint(addr) {
+                Ok(addr) => Some(addr),
+                Err(error) => {
+                    return SessionEnd::ConnectFailed(format!(
+                        "invalid UDP probe endpoint: {error}"
+                    ));
+                }
+            },
+            None => None,
+        };
+        let socket = match voice::bind_voice_udp_socket(if server_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        }) {
+            Ok(socket) => socket,
+            Err(error) => {
+                return SessionEnd::ConnectFailed(format!("failed to bind UDP socket: {error}"));
+            }
+        };
+        match socket.local_addr() {
+            Ok(addr) => kvlog::info!("udp socket bound", addr = %addr),
+            Err(error) => {
+                return SessionEnd::ConnectFailed(format!(
+                    "failed to read UDP socket address: {error}"
+                ));
+            }
         }
+        Some(voice::UdpMediaSetup {
+            socket,
+            server_addr,
+            server_probe_addr,
+        })
     };
-    let udp_local_addr = match std_udp.local_addr() {
-        Ok(addr) => addr,
-        Err(error) => {
-            return SessionEnd::ConnectFailed(format!(
-                "failed to read UDP socket address: {error}"
-            ));
-        }
-    };
-    kvlog::info!("udp socket bound", addr = %udp_local_addr);
     if let Err(error) = std_tcp.set_nonblocking(true) {
         return SessionEnd::ConnectFailed(format!("failed to make TCP nonblocking: {error}"));
     }
-    let initial_udp_bind = match voice::InitialUdpBind::prepare(&std_udp, &media, server_udp_addr) {
-        Ok(bind) => bind,
-        Err(error) => return SessionEnd::ConnectFailed(error),
+    let initial_udp_bind = match udp_media.as_ref() {
+        Some(udp) => match voice::InitialUdpBind::prepare(&udp.socket, &media, udp.server_addr) {
+            Ok(bind) => Some(bind),
+            Err(error) => return SessionEnd::ConnectFailed(error),
+        },
+        None => None,
     };
 
     let voice_start = voice::VoiceCommand::StartSession {
         generation: mls_generation,
-        udp: std_udp,
+        udp: udp_media,
         media,
-        initial_bind_attempted: true,
+        initial_bind_attempted: !force_tcp_media,
         transport_mode,
-        server_udp_addr,
-        server_udp_probe_addr,
+        server_tcp_addr: video_addr,
+        media_transport: config.media_transport,
         p2p_enabled,
         candidate_privacy: config.candidate_privacy,
         prefer_ipv6: config.prefer_ipv6,
@@ -1660,7 +1707,7 @@ fn run_worker_inner(
         events: events.clone(),
         voice: voice_control,
         voice_generation: mls_generation,
-        pending_initial_udp_bind: Some(initial_udp_bind),
+        pending_initial_udp_bind: initial_udp_bind,
         tcp: TcpStream::from_std(std_tcp),
         loop_work: WorkerWork::default(),
         read_buf: RecvBuffer::new(),
@@ -2513,6 +2560,11 @@ impl PendingMlsFileOffer {
         }
     }
 }
+/// A token bucket that paces upload chunk emission to a byte-per-second ceiling.
+///
+/// A `rate` of `0` disables pacing: [`budget`](Self::budget) is unbounded and the
+/// other operations are no-ops. Otherwise tokens accrue at `rate` bytes per
+/// second, capped at one second's worth so a poll loop that parked between
 /// transfers cannot bank credit and then burst.
 struct UploadThrottle {
     /// Ceiling in bytes per second. `0` disables throttling.
@@ -5894,12 +5946,14 @@ impl WorkerState<'_> {
             server_public_key: self.server_public_key,
             device_name: device_name.to_string(),
         })?;
-        let initial_udp_bind = self
-            .pending_initial_udp_bind
-            .take()
-            .ok_or_else(|| "initial UDP bind was already dispatched".to_string())?;
-        let send_error = initial_udp_bind.dispatch()?;
-        report_initial_udp_bind_send_error(&self.events, send_error);
+        if self.config.media_transport.is_auto() {
+            let initial_udp_bind = self
+                .pending_initial_udp_bind
+                .take()
+                .ok_or_else(|| "initial UDP bind was already dispatched".to_string())?;
+            let send_error = initial_udp_bind.dispatch()?;
+            report_initial_udp_bind_send_error(&self.events, send_error);
+        }
         self.queue_voice_command(voice::VoiceCommand::Authenticated {
             generation: self.voice_generation,
             session_id,

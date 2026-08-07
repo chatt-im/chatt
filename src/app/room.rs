@@ -15,7 +15,7 @@ use crate::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 
 use crate::{
     chat_buffer::{ChatRecord, ChatViewport, HistoryEntryId, NoticeKind},
-    client_net::{TerminalVerb, TransferDirection},
+    client_net::{MediaTransportState, TerminalVerb, TransferDirection},
     config::{Config, E2ePeerIdentity},
     e2e::{AuthenticatedChat, MessageProvenance},
     room_catalog::{CatalogRoom, CatalogRoomKind, RoomCatalog},
@@ -1262,9 +1262,9 @@ pub(crate) struct RoomSession {
     /// Whether a network worker/server selection exists. Render threads use
     /// this projection instead of reaching into the core's worker handle.
     pub network_selected: bool,
-    /// UDP media path to the server never bound after repeated retries while
-    /// the TCP session is otherwise up. Surfaced as "UDP Connection Failure".
-    pub udp_unreachable: bool,
+    /// Current usable server-media path. `Unavailable` leaves the control
+    /// connection up while the voice path reconnects.
+    pub media_transport: MediaTransportState,
     pub screencast_status: super::ScreencastStatus,
     /// Shares this client can view, keyed by stream id, learned from
     /// `ShareAvailable`. Holds the per-stream view secret and codec metadata.
@@ -2112,7 +2112,7 @@ impl RoomSession {
             server_rtt_ms: None,
             network_disconnected: false,
             network_selected: false,
-            udp_unreachable: false,
+            media_transport: MediaTransportState::Udp,
             screencast_status: super::ScreencastStatus::default(),
             available_shares: HashMap::new(),
             active_server_id: None,
