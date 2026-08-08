@@ -227,6 +227,7 @@ impl App {
                 room_id: share.room_id,
                 stream_id: *stream_id,
                 generation: share.generation,
+                sender_id: share.sender_id,
                 sender_name: share.sender_name.clone(),
                 codec: share.codec.clone(),
                 coded_width: share.coded_width,
@@ -2152,6 +2153,7 @@ mod tests {
                 room_id: RoomId(7),
                 generation: 4,
                 view_secret: vec![9; 32],
+                sender_id: UserId(8),
                 sender_name: "alice".into(),
                 codec: "avc1.42C00D".into(),
                 coded_width: 320,
@@ -2164,6 +2166,7 @@ mod tests {
         let share = &snapshot.live_shares[0];
         assert_eq!(share.stream_id, stream_id);
         assert_eq!(share.generation, 4);
+        assert_eq!(share.sender_id, UserId(8));
         assert_eq!(share.sender_name, "alice");
         assert_eq!((share.coded_width, share.coded_height), (320, 240));
         assert_eq!(share.extradata, vec![1, 2, 3]);

@@ -260,7 +260,10 @@ mod viewport_tests {
         let third = viewport
             .entry_index(HistoryEntryId::Message(MessageId(3)))
             .unwrap();
-        assert!(!viewport.entries[third].expanded, "new messages keep the fold default");
+        assert!(
+            !viewport.entries[third].expanded,
+            "new messages keep the fold default"
+        );
     }
 
     #[test]

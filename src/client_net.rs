@@ -855,6 +855,7 @@ pub enum NetworkEvent {
     ShareAvailable {
         room_id: RoomId,
         stream_id: StreamId,
+        user_id: UserId,
         sender_name: String,
         codec: String,
         coded_width: u32,
@@ -5804,7 +5805,7 @@ impl WorkerState<'_> {
             ServerControl::ShareAvailable {
                 room_id,
                 stream_id,
-                user_id: _,
+                user_id,
                 sender_name,
                 codec,
                 coded_width,
@@ -5821,6 +5822,7 @@ impl WorkerState<'_> {
                 let _ = self.events.send(NetworkEvent::ShareAvailable {
                     room_id,
                     stream_id,
+                    user_id,
                     sender_name,
                     codec,
                     coded_width,

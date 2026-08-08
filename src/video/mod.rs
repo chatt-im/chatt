@@ -27,6 +27,7 @@ use rpc::{
 };
 
 pub use fanout::{NativeViewerHandle, VideoFrameFanout};
+pub(crate) use nut::NutPipeMuxer;
 pub use publisher::{ScreencastHandle, start as start_screencast};
 pub use subscriber::{SubscriberHandle, start as start_subscriber};
 

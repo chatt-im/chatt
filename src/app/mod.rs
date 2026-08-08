@@ -88,9 +88,7 @@ pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{
     ParticipantState, ParticipantVoiceFeedback, Participants, participant_latency_estimate_ms,
 };
-pub(crate) use room::{
-    ComposerSubmission, DeleteSelection, HistoryChange, RoomSession,
-};
+pub(crate) use room::{ComposerSubmission, DeleteSelection, HistoryChange, RoomSession};
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
     ServerEditDraft, ServerEditEvent, ServerSelectItem, alias_from_tcp_addr, canonical_endpoint,
@@ -554,6 +552,7 @@ struct AvailableShare {
     room_id: RoomId,
     generation: u64,
     view_secret: Vec<u8>,
+    sender_id: UserId,
     sender_name: String,
     codec: String,
     coded_width: u32,
@@ -5158,12 +5157,20 @@ impl App {
                     .user_id
                     .map(|user_id| self.room.participants.username_for(user_id).to_string())
                     .unwrap_or_else(|| "you".to_string());
+                let Some(sender_id) = self.user_id else {
+                    self.fail_screencast_if_running(
+                        "screen share started without an authenticated user",
+                        true,
+                    );
+                    return;
+                };
                 self.room.available_shares.insert(
                     stream_id,
                     AvailableShare {
                         room_id,
                         generation,
                         view_secret: Vec::new(),
+                        sender_id,
                         sender_name: sender.clone(),
                         codec: codec.clone(),
                         coded_width,
@@ -5197,6 +5204,7 @@ impl App {
             NetworkEvent::ShareAvailable {
                 room_id,
                 stream_id,
+                user_id,
                 sender_name,
                 codec,
                 coded_width,
@@ -5226,6 +5234,7 @@ impl App {
                         room_id,
                         generation,
                         view_secret,
+                        sender_id: user_id,
                         sender_name: sender_name.clone(),
                         codec: codec.clone(),
                         coded_width,
@@ -11647,6 +11656,7 @@ mod tests {
         let available = |room_id, stream_id| NetworkEvent::ShareAvailable {
             room_id,
             stream_id,
+            user_id: UserId(2),
             sender_name: "bob".to_string(),
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,
@@ -11660,6 +11670,10 @@ mod tests {
 
         app.handle_network_event(available(RoomId(1), StreamId(10)));
         assert!(app.room.available_shares.contains_key(&StreamId(10)));
+        assert_eq!(
+            app.room.available_shares[&StreamId(10)].sender_id,
+            UserId(2)
+        );
         let first_generation = app.room.available_shares[&StreamId(10)].generation;
         app.handle_network_event(available(RoomId(1), StreamId(10)));
         assert_eq!(
@@ -11669,6 +11683,7 @@ mod tests {
         app.handle_network_event(NetworkEvent::ShareAvailable {
             room_id: RoomId(1),
             stream_id: StreamId(10),
+            user_id: UserId(2),
             sender_name: "bob".to_string(),
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,
@@ -11740,6 +11755,7 @@ mod tests {
         app.handle_network_event(NetworkEvent::ShareAvailable {
             room_id: RoomId(1),
             stream_id: StreamId(10),
+            user_id: UserId(2),
             sender_name: "bob".to_string(),
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,

@@ -503,6 +503,7 @@ pub struct LiveShare {
     pub stream_id: StreamId,
     /// Daemon-local identity for this use of `stream_id`.
     pub generation: u64,
+    pub sender_id: UserId,
     pub sender_name: String,
     pub codec: String,
     pub coded_width: u32,
@@ -685,7 +686,7 @@ impl ServerSelectionPrompt {
 
 impl LiveShare {
     pub fn validate(&self) -> Result<(), String> {
-        if self.stream_id.0 == 0 || self.generation == 0 {
+        if self.stream_id.0 == 0 || self.generation == 0 || self.sender_id.0 == 0 {
             return Err("live share identity must be nonzero".into());
         }
         check_nonempty_string(&self.sender_name)?;

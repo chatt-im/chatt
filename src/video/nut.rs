@@ -1,4 +1,4 @@
-//! Minimal incremental NUT container demuxer for the capture pipe.
+//! Minimal incremental NUT container support for capture and playback pipes.
 //!
 //! Raw Annex-B has no frame-size framing, so a splitter can only emit an access
 //! unit once the next frame's start code arrives — with damage-driven capture
@@ -14,7 +14,7 @@
 //! Checksums are skipped, not verified: the pipe is a local subprocess, and a
 //! malformed stream fails the capture with a visible reason instead.
 
-use rpc::bitstream::Codec;
+use rpc::bitstream::{self, Codec};
 
 use super::capture::{CapturedFrame, start_code_offsets};
 
@@ -25,6 +25,12 @@ pub const NUT_MAGIC: &[u8; 25] = b"nut/multimedia container\0";
 const MAIN_STARTCODE: u64 = 0x4E4D7A561F5F04AD;
 const STREAM_STARTCODE: u64 = 0x4E5311405BF2F9DB;
 const SYNCPOINT_STARTCODE: u64 = 0x4E4BE4ADEECA4569;
+
+const NUT_VERSION: u64 = 4;
+const NUT_MINOR_VERSION: u64 = 1;
+const NUT_FLAG_PIPE: u64 = 2;
+const NUT_MAX_DISTANCE: u64 = 32 * 1024 - 1;
+const PTS_SHIFT: u64 = 14;
 
 const FLAG_KEY: u64 = 1;
 const FLAG_EOR: u64 = 2;
@@ -44,6 +50,184 @@ const FLAG_INVALID: u64 = 8192;
 const MAX_PACKET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_FRAME_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRADATA_BYTES: u64 = 1024 * 1024;
+
+/// Incremental NUT PIPE muxer for the local renderer frame stream.
+///
+/// This mirrors the native GUI bridge: headers are emitted once, timestamps
+/// are rebased to the first received frame, and the first keyframe carries the
+/// only syncpoint. Frame payloads are appended directly into their final NUT
+/// allocation and converted from four-byte NAL lengths to Annex-B in place.
+pub(crate) struct NutPipeMuxer {
+    header: Vec<u8>,
+    base_timestamp: Option<i64>,
+    wrote_initial_syncpoint: bool,
+}
+
+impl NutPipeMuxer {
+    pub(crate) fn new(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        configuration: &[u8],
+    ) -> Result<Self, String> {
+        let extradata = bitstream::configuration_to_annex_b(codec, configuration)?;
+        let mut header = NUT_MAGIC.to_vec();
+        header.extend_from_slice(&nut_main_header());
+        header.extend_from_slice(&nut_stream_header(codec, width, height, &extradata));
+        Ok(Self {
+            header,
+            base_timestamp: None,
+            wrote_initial_syncpoint: false,
+        })
+    }
+
+    pub(crate) fn header(&self) -> &[u8] {
+        &self.header
+    }
+
+    /// Starts one NUT frame in `out`, returning where its payload belongs.
+    pub(crate) fn start_frame(
+        &mut self,
+        out: &mut Vec<u8>,
+        timestamp_ms: i64,
+        is_key: bool,
+        payload_len: usize,
+    ) -> usize {
+        let base = *self.base_timestamp.get_or_insert(timestamp_ms);
+        let pts = timestamp_ms.saturating_sub(base).max(0) as u64;
+        let initial_syncpoint = is_key && !self.wrote_initial_syncpoint;
+        let payload_offset = start_nut_frame(out, pts, is_key, initial_syncpoint, payload_len);
+        if initial_syncpoint {
+            self.wrote_initial_syncpoint = true;
+        }
+        payload_offset
+    }
+}
+
+fn nut_main_header() -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_v(&mut payload, NUT_VERSION);
+    put_v(&mut payload, NUT_MINOR_VERSION);
+    put_v(&mut payload, 1);
+    put_v(&mut payload, NUT_MAX_DISTANCE);
+    put_v(&mut payload, 1);
+    put_v(&mut payload, 1);
+    put_v(&mut payload, 1000);
+    put_v(&mut payload, FLAG_CODED);
+    put_v(&mut payload, 6);
+    put_s(&mut payload, 0);
+    put_v(&mut payload, 1);
+    put_v(&mut payload, 0);
+    put_v(&mut payload, 0);
+    put_v(&mut payload, 0);
+    put_v(&mut payload, 255);
+    put_v(&mut payload, 0);
+    put_v(&mut payload, NUT_FLAG_PIPE);
+    packet(MAIN_STARTCODE, &payload)
+}
+
+fn nut_stream_header(codec: Codec, width: u32, height: u32, extradata: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_v(&mut payload, 0);
+    put_v(&mut payload, 0);
+    put_v(&mut payload, 4);
+    payload.extend_from_slice(match codec {
+        Codec::H264 => b"H264",
+        Codec::Hevc => b"HEVC",
+    });
+    put_v(&mut payload, 0);
+    put_v(&mut payload, PTS_SHIFT);
+    put_v(&mut payload, 10_000);
+    put_v(&mut payload, 0);
+    put_v(&mut payload, 0);
+    put_v(&mut payload, extradata.len() as u64);
+    payload.extend_from_slice(extradata);
+    for value in [width as u64, height as u64, 0, 0, 0] {
+        put_v(&mut payload, value);
+    }
+    packet(STREAM_STARTCODE, &payload)
+}
+
+fn start_nut_frame(
+    out: &mut Vec<u8>,
+    pts: u64,
+    is_key: bool,
+    initial_syncpoint: bool,
+    payload_len: usize,
+) -> usize {
+    out.clear();
+    if initial_syncpoint {
+        let mut sync = Vec::new();
+        put_v(&mut sync, pts);
+        put_v(&mut sync, 0);
+        append_packet(out, SYNCPOINT_STARTCODE, &sync);
+    }
+    let frame_header_start = out.len();
+    out.push(0);
+    let flags =
+        (if is_key { FLAG_KEY } else { 0 }) | FLAG_CODED_PTS | FLAG_SIZE_MSB | FLAG_CHECKSUM;
+    put_v(out, FLAG_CODED ^ flags);
+    put_v(out, pts + (1 << PTS_SHIFT));
+    put_v(out, payload_len as u64);
+    let checksum = nut_crc(&out[frame_header_start..]);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out.reserve_exact(payload_len);
+    out.len()
+}
+
+fn packet(startcode: u64, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 16);
+    append_packet(&mut out, startcode, payload);
+    out
+}
+
+fn append_packet(out: &mut Vec<u8>, startcode: u64, payload: &[u8]) {
+    let prefix_start = out.len();
+    out.extend_from_slice(&startcode.to_be_bytes());
+    put_v(out, payload.len() as u64 + 4);
+    if payload.len() + 4 > 4096 {
+        let checksum = nut_crc(&out[prefix_start..]);
+        out.extend_from_slice(&checksum.to_le_bytes());
+    }
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&nut_crc(payload).to_le_bytes());
+}
+
+fn nut_crc(bytes: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for byte in bytes {
+        let mut entry = (((crc as u8) ^ *byte) as u32) << 24;
+        for _ in 0..8 {
+            entry = if entry & 0x8000_0000 != 0 {
+                (entry << 1) ^ 0x04C1_1DB7
+            } else {
+                entry << 1
+            };
+        }
+        crc = entry.swap_bytes() ^ (crc >> 8);
+    }
+    crc
+}
+
+fn put_v(out: &mut Vec<u8>, value: u64) {
+    let groups = ((64 - value.leading_zeros() as usize).max(1) + 6) / 7;
+    for index in (0..groups).rev() {
+        let mut byte = ((value >> (index * 7)) & 0x7f) as u8;
+        if index != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+    }
+}
+
+fn put_s(out: &mut Vec<u8>, value: i64) {
+    let coded = if value > 0 {
+        value as u64 * 2 - 1
+    } else {
+        value.unsigned_abs() * 2
+    };
+    put_v(out, coded);
+}
 
 /// Why the NUT stream could not be demuxed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -627,7 +811,90 @@ fn with_extradata_prefix(extradata: &[u8], data: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+
+    #[test]
+    fn crc_matches_ffmpeg_nut_polynomial_vector() {
+        assert_eq!(super::nut_crc(b"123456789"), 0x7F89_A189);
+    }
+
+    #[test]
+    fn nut_pipe_muxer_round_trips_a_native_h264_frame() {
+        let sps = [
+            0x67, 0x42, 0xc0, 0x0d, 0xda, 0x05, 0x07, 0xec, 0x04, 0x40, 0x00, 0x00, 0x03, 0x00,
+            0x40, 0x00, 0x00, 0x0f, 0x03, 0xc5, 0x0a, 0xa8,
+        ];
+        let pps = [0x68, 0xce, 0x0f, 0xc8];
+        let avcc = rpc::bitstream::h264::build_avcc_extra_data(&sps, &pps);
+        let mut muxer = NutPipeMuxer::new(Codec::H264, 320, 240, &avcc).unwrap();
+        let body = [0, 0, 0, 2, 0x65, 0x88];
+        let mut frame = Vec::new();
+        let payload = muxer.start_frame(&mut frame, 4_000, true, body.len());
+        frame.extend_from_slice(&body);
+        rpc::bitstream::length_prefixed_to_annex_b_in_place(&mut frame[payload..]).unwrap();
+
+        let mut stream = muxer.header().to_vec();
+        stream.extend_from_slice(&frame);
+        let mut demuxer = NutDemuxer::new(Codec::H264);
+        let mut frames = Vec::new();
+        demuxer.push(&stream, &mut frames).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_key);
+        assert_eq!(frames[0].ts_ms, 0);
+        assert!(frames[0].data.ends_with(&[0, 0, 0, 1, 0x65, 0x88]));
+    }
+
+    #[test]
+    fn ffprobe_accepts_generated_nut_pipe_frames() {
+        let sps = [
+            0x67, 0x42, 0xc0, 0x0d, 0xda, 0x05, 0x07, 0xec, 0x04, 0x40, 0x00, 0x00, 0x03, 0x00,
+            0x40, 0x00, 0x00, 0x0f, 0x03, 0xc5, 0x0a, 0xa8,
+        ];
+        let pps = [0x68, 0xce, 0x0f, 0xc8];
+        let avcc = rpc::bitstream::h264::build_avcc_extra_data(&sps, &pps);
+        let mut muxer = NutPipeMuxer::new(Codec::H264, 320, 240, &avcc).unwrap();
+        let mut nut = muxer.header().to_vec();
+        for (timestamp, key, body) in [
+            (0, true, vec![0, 0, 0, 2, 0x65, 0x88]),
+            (30_000, false, vec![0, 0, 0, 2, 0x41, 0x9a]),
+        ] {
+            let mut frame = Vec::new();
+            let payload = muxer.start_frame(&mut frame, timestamp, key, body.len());
+            frame.extend_from_slice(&body);
+            rpc::bitstream::length_prefixed_to_annex_b_in_place(&mut frame[payload..]).unwrap();
+            nut.extend_from_slice(&frame);
+        }
+
+        let mut child = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "nut",
+                "-show_entries",
+                "packet=pts,size,flags",
+                "-of",
+                "csv=p=0",
+                "-i",
+                "pipe:0",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffprobe is available alongside ffmpeg");
+        child.stdin.take().unwrap().write_all(&nut).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "ffprobe rejected generated NUT PIPE stream: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 2);
+    }
 
     fn put_v(out: &mut Vec<u8>, value: u64) {
         let mut groups = vec![(value & 0x7f) as u8];

@@ -1872,12 +1872,10 @@ fn draw_chat(
         } else {
             app.config.ui.scroll_buffer as usize
         };
-        app.view.active.chat.keep_cursor_visible(
-            &history,
-            content_width,
-            area.h,
-            scroll_buffer,
-        );
+        app.view
+            .active
+            .chat
+            .keep_cursor_visible(&history, content_width, area.h, scroll_buffer);
     }
     queue_chat_scroll(area, app, &history, layout, content_width, buf);
     app.view.active.chat.visible_lines_into(

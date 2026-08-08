@@ -2643,11 +2643,12 @@ impl RoomMode {
             return;
         };
         let changed = match expanded {
-            Some(expanded) => cx
-                .view
-                .active
-                .chat
-                .set_expand_entry(&history, cursor.entry, width, expanded),
+            Some(expanded) => {
+                cx.view
+                    .active
+                    .chat
+                    .set_expand_entry(&history, cursor.entry, width, expanded)
+            }
             None => Some(
                 cx.view
                     .active
@@ -2923,11 +2924,12 @@ impl RoomMode {
             self.layout.chat_height,
             cx.config.ui.scroll_buffer as usize,
         );
-        if cx.view.active.chat.is_at_top(
-            &history,
-            self.layout.chat_width,
-            self.layout.chat_height,
-        ) && let Some(room_id) = cx.view.viewed_room
+        if cx
+            .view
+            .active
+            .chat
+            .is_at_top(&history, self.layout.chat_width, self.layout.chat_height)
+            && let Some(room_id) = cx.view.viewed_room
         {
             cx.send(CoreCommand::RequestOlderHistory { room_id });
         }
@@ -3332,7 +3334,10 @@ mod tests {
         let buffer = app.config.ui.scroll_buffer as usize;
         let before = buffer.min(height / 2);
         let after = buffer.min(height.saturating_sub(1) / 2);
-        assert!(selected >= before, "only {selected} rendered rows above cursor");
+        assert!(
+            selected >= before,
+            "only {selected} rendered rows above cursor"
+        );
         assert!(
             height - selected - 1 >= after,
             "only {} rendered rows below cursor",
@@ -4951,10 +4956,7 @@ mod tests {
         assert_chat_cursor_buffered(&app, &room);
 
         let rect = room.layout().chat_rect;
-        room.process_mouse(
-            &mut app,
-            mouse(MouseEventKind::ScrollUp, rect.x, rect.y),
-        );
+        room.process_mouse(&mut app, mouse(MouseEventKind::ScrollUp, rect.x, rect.y));
         render_room(&mut app, &mut room, &mut buffer);
         assert_chat_cursor_buffered(&app, &room);
     }

@@ -8,6 +8,7 @@
 mod command;
 mod help;
 mod term;
+mod video_stream;
 
 use std::{
     io::{self, Read},
@@ -422,6 +423,33 @@ an active share or otherwise behaves like `start`.",
             examples: &[],
         },
         Command {
+            name: "video-stream",
+            aliases: &[],
+            about: "List, play, or pipe live screen-share streams.",
+            long_about: "Lists screen shares available through the running Chatt daemon, plays one with a low-latency mpv configuration, or writes one as a NUT stream to standard output.",
+            args: &[],
+            flags: &[],
+            subs: &VIDEO_STREAM_SUBS,
+            examples: &[
+                Example {
+                    cmd: "video-stream list",
+                    help: "List the currently available live streams.",
+                },
+                Example {
+                    cmd: "video-stream play",
+                    help: "Play the sole live stream with mpv.",
+                },
+                Example {
+                    cmd: "video-stream play ali",
+                    help: "Play the stream whose sender name uniquely starts with ali.",
+                },
+                Example {
+                    cmd: "video-stream pipe | mpv --demuxer-lavf-format=nut --profile=low-latency --no-cache --untimed -",
+                    help: "Pipe the sole stream to a separately configured mpv.",
+                },
+            ],
+        },
+        Command {
             name: "help",
             aliases: &[],
             about: "Print help for a command.",
@@ -505,6 +533,51 @@ command as `start`.",
         about: "Stop the active screen share.",
         long_about: "",
         args: &[],
+        flags: &[],
+        subs: &[],
+        examples: &[],
+    },
+];
+
+static VIDEO_STREAM_SUBS: [Command; 3] = [
+    Command {
+        name: "list",
+        aliases: &[],
+        about: "List live video streams available from the daemon.",
+        long_about: "Prints the sender identity, room, codec, and resolution for every live screen share currently available to this Chatt session.",
+        args: &[],
+        flags: &[],
+        subs: &[],
+        examples: &[],
+    },
+    Command {
+        name: "play",
+        aliases: &[],
+        about: "Play one live video stream with mpv.",
+        long_about: "Subscribes through the running daemon and starts mpv with an untimed, low-latency NUT configuration. SELECTOR may be an id:NUMBER sender id or a unique sender-name prefix. Omit it when exactly one stream is available.",
+        args: &[Arg {
+            name: "selector",
+            value_name: "SELECTOR",
+            help: "Sender name prefix or id:NUMBER sender id",
+            required: false,
+            possible: &[],
+        }],
+        flags: &[],
+        subs: &[],
+        examples: &[],
+    },
+    Command {
+        name: "pipe",
+        aliases: &[],
+        about: "Write one live video stream as NUT to standard output.",
+        long_about: "Subscribes through the running daemon and writes a NUT PIPE stream to standard output. Live players must use untimed playback because source timestamps include idle periods in which damage-based capture emits no frames. SELECTOR may be an id:NUMBER sender id or a unique sender-name prefix. Omit it when exactly one stream is available.",
+        args: &[Arg {
+            name: "selector",
+            value_name: "SELECTOR",
+            help: "Sender name prefix or id:NUMBER sender id",
+            required: false,
+            possible: &[],
+        }],
         flags: &[],
         subs: &[],
         examples: &[],
@@ -700,6 +773,12 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             println!("{response}");
             Ok(())
         }
+        Some(("video-stream", sub)) => match sub.subcommand() {
+            Some(("list", _)) => video_stream::list(),
+            Some(("play", play)) => video_stream::play(play.value_of("selector")),
+            Some(("pipe", pipe)) => video_stream::pipe(pipe.value_of("selector")),
+            _ => Err("usage: chatt video-stream <list | play [SELECTOR] | pipe [SELECTOR]>".into()),
+        },
         Some(("test-audio-playback", sub)) => {
             let path = PathBuf::from(sub.value_of("path").unwrap_or_default());
             let packet_loss = match sub.value_of("loss") {
@@ -1644,6 +1723,31 @@ mod tests {
     fn alias_resolves_to_canonical_name() {
         let matches = run_matches(&["chatt", "audio-playback-test", "f.opus"]);
         assert_eq!(matches.subcommand().unwrap().0, "test-audio-playback");
+    }
+
+    #[test]
+    fn video_stream_outputs_accept_an_optional_sender_selector() {
+        for action in ["play", "pipe"] {
+            let matches = run_matches(&["chatt", "video-stream", action, "id:42"]);
+            let (name, video_stream) = matches.subcommand().unwrap();
+            assert_eq!(name, "video-stream");
+            let (parsed_action, command) = video_stream.subcommand().unwrap();
+            assert_eq!(parsed_action, action);
+            assert_eq!(command.value_of("selector"), Some("id:42"));
+
+            let matches = run_matches(&["chatt", "video-stream", action]);
+            assert_eq!(
+                matches
+                    .subcommand()
+                    .unwrap()
+                    .1
+                    .subcommand()
+                    .unwrap()
+                    .1
+                    .value_of("selector"),
+                None
+            );
+        }
     }
 
     #[test]
