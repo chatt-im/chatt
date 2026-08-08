@@ -329,8 +329,9 @@ pub enum ServerControl {
         session_id: SessionId,
         user_id: UserId,
         rooms: Vec<RoomInfo>,
-        /// Server-wide user directory: every configured user plus online
-        /// dynamic users.
+        /// User directory for this account: every configured user, every
+        /// online dynamic user, and offline dynamic users who share a DM or
+        /// private room with it.
         users: Vec<UserSummary>,
         /// The room clients drop into (voice and first view) on connect.
         default_room: RoomId,
@@ -349,6 +350,7 @@ pub enum ServerControl {
         session_id: SessionId,
         user_id: UserId,
         rooms: Vec<RoomInfo>,
+        /// Same requester-scoped directory as [`ServerControl::Authenticated`].
         users: Vec<UserSummary>,
         default_room: RoomId,
     },
@@ -594,6 +596,7 @@ pub enum ServerControl {
         session_id: SessionId,
         user_id: UserId,
         rooms: Vec<RoomInfo>,
+        /// Same requester-scoped directory as [`ServerControl::Authenticated`].
         users: Vec<UserSummary>,
         default_room: RoomId,
     },
@@ -638,7 +641,7 @@ pub enum RoomKind {
     Dm { user_a: UserId, user_b: UserId },
 }
 
-/// Server-wide user directory entry.
+/// Entry in an account's authentication user directory.
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub struct UserSummary {

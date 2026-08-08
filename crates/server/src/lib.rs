@@ -5513,7 +5513,7 @@ impl Server {
             file_receive_limit_bytes
         );
         let rooms = self.accessible_room_infos(user_id);
-        let users = self.user_summaries();
+        let users = self.user_summaries(user_id, &rooms);
         let response = match issued_token {
             Some(IssuedSessionToken::OpenPair(token)) => ServerControl::OpenPaired {
                 token,
@@ -5610,35 +5610,81 @@ impl Server {
         }
     }
 
-    /// The server-wide user directory: every configured user (online or not)
-    /// plus currently-online dynamic users.
-    fn user_summaries(&self) -> Vec<UserSummary> {
-        let mut users: Vec<UserSummary> = self
+    /// The requester's user directory: every configured user, every announced
+    /// online dynamic user, and offline dynamic users who share a DM or private
+    /// room with the requester.
+    fn user_summaries(&self, requester: UserId, accessible_rooms: &[RoomInfo]) -> Vec<UserSummary> {
+        let mut announced_by_user = HashMap::new();
+        for session in self.sessions.values().filter(|session| session.announced) {
+            announced_by_user.entry(session.user_id).or_insert(session);
+        }
+
+        let contacts = Self::room_contact_ids(requester, accessible_rooms);
+        let capacity = self
             .users
             .users
-            .iter()
-            .map(|user| {
-                let session = self
-                    .sessions
-                    .values()
-                    .find(|session| session.user_id == user.id && session.announced);
-                UserSummary {
-                    user_id: user.id,
-                    username: user.username.clone(),
-                    online: session.is_some(),
-                    connected_at_ms: session.map(|s| s.connected_at_ms).unwrap_or(0),
-                    voice_state: session.map(|s| s.voice_state).unwrap_or_default(),
-                }
-            })
-            .collect();
-        for session in self.sessions.values() {
-            if session.announced && is_dynamic_user_id(session.user_id) {
+            .len()
+            .saturating_add(announced_by_user.len())
+            .saturating_add(contacts.len());
+        let mut users = Vec::with_capacity(capacity);
+        let mut included = HashSet::with_capacity(capacity);
+
+        users.extend(self.users.users.iter().map(|user| {
+            let session = announced_by_user.get(&user.id).copied();
+            included.insert(user.id);
+            UserSummary {
+                user_id: user.id,
+                username: user.username.clone(),
+                online: session.is_some(),
+                connected_at_ms: session.map(|s| s.connected_at_ms).unwrap_or(0),
+                voice_state: session.map(|s| s.voice_state).unwrap_or_default(),
+            }
+        }));
+        for (user_id, session) in announced_by_user {
+            if is_dynamic_user_id(user_id) && included.insert(user_id) {
                 users.push(Self::session_user_summary(session, true));
             }
         }
+        for user_id in contacts {
+            if !is_dynamic_user_id(user_id) || included.contains(&user_id) {
+                continue;
+            }
+            let Some(username) = self.usernames.username_for(user_id) else {
+                continue;
+            };
+            included.insert(user_id);
+            users.push(UserSummary {
+                user_id,
+                username: username.to_string(),
+                online: false,
+                connected_at_ms: 0,
+                voice_state: control::VoiceState::default(),
+            });
+        }
         users.sort_by_key(|user| user.user_id.0);
-        users.dedup_by_key(|user| user.user_id.0);
         users
+    }
+
+    fn room_contact_ids(requester: UserId, accessible_rooms: &[RoomInfo]) -> HashSet<UserId> {
+        let mut contacts = HashSet::new();
+        for room in accessible_rooms {
+            match &room.kind {
+                RoomKind::Dm { user_a, user_b } => {
+                    if *user_a == requester {
+                        contacts.insert(*user_b);
+                    }
+                    if *user_b == requester {
+                        contacts.insert(*user_a);
+                    }
+                }
+                RoomKind::Private { members } => {
+                    contacts.extend(members.iter().copied());
+                }
+                RoomKind::Public => {}
+            }
+        }
+        contacts.remove(&requester);
+        contacts
     }
 
     fn session_user_summary(session: &Session, online: bool) -> UserSummary {
@@ -9936,6 +9982,15 @@ mod tests {
         }
     }
 
+    fn dm_room(room_id: RoomId, user_a: UserId, user_b: UserId) -> RoomState {
+        RoomState {
+            id: room_id,
+            name: dm_room_name(user_a, user_b),
+            access: RoomAccess::Dm(user_a, user_b),
+            active_streams: HashMap::new(),
+        }
+    }
+
     fn test_session(user_id: UserId, token: Token, voice_room: Option<RoomId>) -> Session {
         Session {
             user_id,
@@ -10365,7 +10420,9 @@ mod tests {
         dynamic.announced = false;
         server.sessions.insert(SessionId(2), dynamic);
 
-        let users = server.user_summaries();
+        let requester = UserId(1);
+        let rooms = server.accessible_room_infos(requester);
+        let users = server.user_summaries(requester, &rooms);
 
         let configured = users
             .iter()
@@ -10380,6 +10437,128 @@ mod tests {
             users.iter().all(|user| user.user_id != dynamic_id),
             "an unannounced dynamic session must stay out of the directory"
         );
+    }
+
+    #[test]
+    fn user_summaries_includes_offline_dynamic_contacts() {
+        let mut server = test_server();
+        let requester = UserId(config::FIRST_DYNAMIC_USER_ID + 10);
+        let dm_peer = UserId(config::FIRST_DYNAMIC_USER_ID + 11);
+        let group_peer = UserId(config::FIRST_DYNAMIC_USER_ID + 12);
+        let unrelated = UserId(config::FIRST_DYNAMIC_USER_ID + 13);
+        server.usernames.claim_dynamic(requester, "Alice").unwrap();
+        server.usernames.claim_dynamic(dm_peer, "Bob").unwrap();
+        server.usernames.claim_dynamic(group_peer, "Carol").unwrap();
+        server
+            .usernames
+            .claim_dynamic(unrelated, "Mallory")
+            .unwrap();
+        server.rooms.insert(
+            RoomId(0x8000_1000),
+            dm_room(RoomId(0x8000_1000), requester, dm_peer),
+        );
+        server.rooms.insert(
+            RoomId(0x8000_1001),
+            private_room(RoomId(0x8000_1001), &[requester, group_peer]),
+        );
+
+        let rooms = server.accessible_room_infos(requester);
+        let users = server.user_summaries(requester, &rooms);
+
+        for (user_id, username) in [(dm_peer, "Bob"), (group_peer, "Carol")] {
+            let summary = users
+                .iter()
+                .find(|summary| summary.user_id == user_id)
+                .expect("offline room contact is included");
+            assert_eq!(summary.username, username);
+            assert!(!summary.online);
+            assert_eq!(summary.connected_at_ms, 0);
+            assert_eq!(summary.voice_state, control::VoiceState::default());
+        }
+        assert!(users.iter().all(|summary| summary.user_id != unrelated));
+        assert!(
+            users
+                .windows(2)
+                .all(|pair| pair[0].user_id.0 < pair[1].user_id.0)
+        );
+    }
+
+    #[test]
+    fn user_summaries_excludes_inaccessible_group_members() {
+        let mut server = test_server();
+        let requester = UserId(config::FIRST_DYNAMIC_USER_ID + 20);
+        let outsider = UserId(config::FIRST_DYNAMIC_USER_ID + 21);
+        let other_member = UserId(config::FIRST_DYNAMIC_USER_ID + 22);
+        server
+            .usernames
+            .claim_dynamic(other_member, "Hidden")
+            .unwrap();
+        let hidden_room = RoomId(0x8000_1010);
+        server.rooms.insert(
+            hidden_room,
+            private_room(hidden_room, &[outsider, other_member]),
+        );
+
+        let rooms = server.accessible_room_infos(requester);
+        assert!(rooms.iter().all(|room| room.room_id != hidden_room));
+        let users = server.user_summaries(requester, &rooms);
+
+        assert!(users.iter().all(|summary| summary.user_id != other_member));
+    }
+
+    #[test]
+    fn user_summaries_prefers_announced_state() {
+        let mut server = test_server();
+        let requester = UserId(1);
+        let dm_peer = UserId(config::FIRST_DYNAMIC_USER_ID + 30);
+        let online_stranger = UserId(config::FIRST_DYNAMIC_USER_ID + 31);
+        server.usernames.claim_dynamic(dm_peer, "Bob").unwrap();
+        let room_id = RoomId(0x8000_1020);
+        server
+            .rooms
+            .insert(room_id, dm_room(room_id, requester, dm_peer));
+        let mut peer_session = test_session(dm_peer, Token(30), None);
+        peer_session.username = "Bob".to_string();
+        peer_session.connected_at_ms = 42;
+        peer_session.voice_state = control::VoiceState::Deafened;
+        server.sessions.insert(SessionId(30), peer_session);
+        server.sessions.insert(
+            SessionId(31),
+            test_session(online_stranger, Token(31), None),
+        );
+
+        let rooms = server.accessible_room_infos(requester);
+        let users = server.user_summaries(requester, &rooms);
+
+        let matching: Vec<_> = users
+            .iter()
+            .filter(|summary| summary.user_id == dm_peer)
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert!(matching[0].online);
+        assert_eq!(matching[0].connected_at_ms, 42);
+        assert_eq!(matching[0].voice_state, control::VoiceState::Deafened);
+        assert!(
+            users
+                .iter()
+                .any(|summary| summary.user_id == online_stranger && summary.online)
+        );
+    }
+
+    #[test]
+    fn user_summaries_skips_contacts_without_registered_names() {
+        let mut server = test_server();
+        let requester = UserId(1);
+        let unknown = UserId(config::FIRST_DYNAMIC_USER_ID + 40);
+        let room_id = RoomId(0x8000_1030);
+        server
+            .rooms
+            .insert(room_id, private_room(room_id, &[requester, unknown]));
+
+        let rooms = server.accessible_room_infos(requester);
+        let users = server.user_summaries(requester, &rooms);
+
+        assert!(users.iter().all(|summary| summary.user_id != unknown));
     }
 
     fn live_user(

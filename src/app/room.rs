@@ -4256,13 +4256,7 @@ impl RoomSession {
         let projected_before = room
             .notices
             .iter()
-            .filter_map(|(id, notice)| {
-                notice
-                    .record
-                    .timestamp_ms
-                    .is_some()
-                    .then_some(*id)
-            })
+            .filter_map(|(id, notice)| notice.record.timestamp_ms.is_some().then_some(*id))
             .collect::<HashSet<_>>();
         let (id, mut removed) = room.push_notice_record_with_evictions(
             NoticeRecord {
