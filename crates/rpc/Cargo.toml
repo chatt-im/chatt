@@ -17,5 +17,5 @@ chatt-message-format = { path = "../message-format", default-features = false }
 jsony = "0.1.10"
 libc = "0.2"
 mio = { version = "1.2.1", features = ["os-poll"] }
-aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
+aws-lc-rs = { version = "1.18.0", default-features = false, features = ["alloc", "non-fips"] }
 unicode-width = { version = "0.2", default-features = false }

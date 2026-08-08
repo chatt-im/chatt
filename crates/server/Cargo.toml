@@ -15,7 +15,7 @@ jsony = "0.1.10"
 rpc.path = "../rpc"
 chatt-mls.path = "../mls"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
-aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
+aws-lc-rs = { version = "1.18.0", default-features = false, features = ["alloc", "non-fips"] }
 kvlog = { git = "https://github.com/exrok/kvlog", rev = "139b426d2050b5f9ad646ab8097d86e8ab0728e9" }
 annotate-snippets = "0.12.10"
 toml-spanner = { version = "1.0.3", features = [
