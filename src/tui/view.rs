@@ -17,7 +17,7 @@ use crate::{
         commands::{CommandCompletionState, RefCompletionState},
         room::{
             ComposerSubmission, DeleteDenied, DeleteSelection, EditDenied, PendingEdit, RefJump,
-            RoomSession, RoomView, SessionEpoch, ToggleExpandResult, strip_blank_edge_lines,
+            RoomSession, RoomView, SessionEpoch, strip_blank_edge_lines,
         },
     },
     chat_buffer::NoticeKind,
@@ -694,28 +694,6 @@ impl ClientView {
             .chat
             .scroll_entry_into_view(&history, entry, width, height);
         RefJump::Jumped
-    }
-
-    pub(crate) fn toggle_cursor_message_expand(
-        &mut self,
-        session: &RoomSession,
-        width: u16,
-    ) -> ToggleExpandResult {
-        let Some(history) = self.viewed_room.and_then(|id| session.history_ref(id)) else {
-            return ToggleExpandResult::NoMessages;
-        };
-        let Some(cursor) = self.active.chat.ensure_cursor(&history, width) else {
-            return ToggleExpandResult::NoMessages;
-        };
-        if self
-            .active
-            .chat
-            .toggle_expand_entry(&history, cursor.entry, width)
-        {
-            ToggleExpandResult::Toggled
-        } else {
-            ToggleExpandResult::NotCollapsible
-        }
     }
 
     pub(crate) fn move_chat_cursor(

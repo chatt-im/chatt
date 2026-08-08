@@ -1866,6 +1866,19 @@ fn draw_chat(
     }
     // Clamp a stale cursor (eviction, collapse) before styling against it.
     app.view.active.chat.ensure_cursor(&history, content_width);
+    if focus == ChatPanelFocus::ChatLog {
+        let scroll_buffer = if app.view.active.chat.is_dragging() {
+            0
+        } else {
+            app.config.ui.scroll_buffer as usize
+        };
+        app.view.active.chat.keep_cursor_visible(
+            &history,
+            content_width,
+            area.h,
+            scroll_buffer,
+        );
+    }
     queue_chat_scroll(area, app, &history, layout, content_width, buf);
     app.view.active.chat.visible_lines_into(
         &history,

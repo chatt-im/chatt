@@ -2006,13 +2006,6 @@ pub(crate) struct VoiceNotice {
     pub local: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToggleExpandResult {
-    Toggled,
-    NoMessages,
-    NotCollapsible,
-}
-
 /// Outcome of [`RoomSession::jump_to_ref`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefJump {

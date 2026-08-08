@@ -444,6 +444,10 @@ pub struct UiConfig {
     pub copy_on_select: bool,
     #[toml(default = 50_000)]
     pub max_messages: u32,
+    /// Rendered timeline rows kept above and below the selected row while
+    /// navigating. Values larger than the viewport center the selection.
+    #[toml(default = 3)]
+    pub scroll_buffer: u32,
     #[toml(default = 24)]
     pub overscan: u32,
     #[toml(default)]
@@ -484,6 +488,7 @@ impl Default for UiConfig {
             composer_padding: true,
             copy_on_select: false,
             max_messages: 50_000,
+            scroll_buffer: 3,
             overscan: 24,
             default_bindings: DefaultBindings::Standard,
             theme: ThemeSelection::default(),
@@ -3005,6 +3010,7 @@ path = "assets/sample-001.opus"
 
         assert_eq!(config.config_path.as_deref(), Some(path.as_path()));
         assert_eq!(config.ui.default_bindings, DefaultBindings::Standard);
+        assert_eq!(config.ui.scroll_buffer, 3);
         assert_eq!(
             config.ui.theme,
             ThemeSelection::Builtin(ThemeChoice::TomorrowNight)

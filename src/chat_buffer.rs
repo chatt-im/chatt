@@ -207,6 +207,140 @@ mod viewport_tests {
     }
 
     #[test]
+    fn explicit_fold_state_is_idempotent_and_expand_all_only_affects_current_entries() {
+        let mut history = TestHistory::new();
+        let long = (0..20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        history.push(1, "alice", &long);
+        history.push(2, "bob", "short");
+        history.notice(&long, false);
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 1);
+
+        let first = HistoryEntryId::Message(MessageId(1));
+        assert_eq!(
+            viewport.set_expand_entry(&history.history(), first, 40, true),
+            Some(true)
+        );
+        assert_eq!(
+            viewport.set_expand_entry(&history.history(), first, 40, true),
+            Some(false)
+        );
+        assert_eq!(
+            viewport.set_expand_entry(&history.history(), first, 40, false),
+            Some(true)
+        );
+        assert_eq!(
+            viewport.set_expand_entry(
+                &history.history(),
+                HistoryEntryId::Message(MessageId(2)),
+                40,
+                true,
+            ),
+            None
+        );
+
+        assert!(viewport.expand_all());
+        viewport.visible_lines(&history.history(), 40, 8, 1);
+        let first_index = viewport.entry_index(first).unwrap();
+        let notice_index = viewport
+            .entry_ids()
+            .position(|entry| matches!(entry, HistoryEntryId::Notice(_)))
+            .unwrap();
+        assert!(viewport.entries[first_index].expanded);
+        assert!(viewport.entries[notice_index].expanded);
+        assert!(!viewport.expand_all());
+
+        history.push(3, "carol", &long);
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 8, 1);
+        let third = viewport
+            .entry_index(HistoryEntryId::Message(MessageId(3)))
+            .unwrap();
+        assert!(!viewport.entries[third].expanded, "new messages keep the fold default");
+    }
+
+    #[test]
+    fn large_expanded_message_keeps_cursor_buffered_and_high_buffer_centers_it() {
+        let mut history = TestHistory::new();
+        let body = (0..60)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        history.push(1, "alice", &body);
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.ensure_cursor(&history.history(), 40);
+        assert!(viewport.toggle_expand(&history.history(), 0, 40));
+        viewport.move_cursor_line(&history.history(), 20, 40);
+
+        viewport
+            .keep_cursor_visible(&history.history(), 40, 9, 3)
+            .unwrap();
+        let visible = viewport.visible_lines(&history.history(), 40, 9, 1);
+        let cursor = viewport.cursor().unwrap();
+        let selected = visible
+            .iter()
+            .position(|line| {
+                line.kind == LineKind::Body
+                    && line.entry == cursor.entry
+                    && line.line == cursor.line
+            })
+            .expect("cursor row is visible");
+        assert!(selected >= 3, "only {selected} rows above cursor");
+        assert!(visible.len() - selected - 1 >= 3);
+
+        // The prior render installed a scroll anchor. Centering must discard
+        // it instead of allowing the next visible-lines pass to restore the
+        // old viewport.
+        viewport.move_cursor_line(&history.history(), 1, 40);
+        viewport
+            .keep_cursor_visible(&history.history(), 40, 9, 1_000)
+            .unwrap();
+        let visible = viewport.visible_lines(&history.history(), 40, 9, 1);
+        let cursor = viewport.cursor().unwrap();
+        let selected = visible
+            .iter()
+            .position(|line| {
+                line.kind == LineKind::Body
+                    && line.entry == cursor.entry
+                    && line.line == cursor.line
+            })
+            .expect("centered cursor row is visible");
+        assert_eq!(selected, 4);
+    }
+
+    #[test]
+    fn viewport_scrolling_moves_cursor_into_the_safe_band() {
+        let mut history = TestHistory::new();
+        for id in 1..=30 {
+            history.push(id, &format!("user-{id}"), &format!("message {id}"));
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.visible_lines(&history.history(), 40, 9, 1);
+
+        viewport
+            .scroll_with_cursor(&history.history(), -5, 40, 9, 3)
+            .unwrap();
+        let visible = viewport.visible_lines(&history.history(), 40, 9, 1);
+        let cursor = viewport.cursor().unwrap();
+        let selected = visible
+            .iter()
+            .position(|line| {
+                line.kind == LineKind::Body
+                    && line.entry == cursor.entry
+                    && line.line == cursor.line
+            })
+            .expect("scrolled cursor row is visible");
+        assert!(selected >= 3);
+        assert!(visible.len() - selected - 1 >= 3);
+    }
+
+    #[test]
     fn layout_cache_retains_only_the_visible_window() {
         let mut history = TestHistory::new();
         for id in 1..=200 {
@@ -1785,6 +1919,40 @@ impl ChatViewport {
         self.toggle_expand(history, index, width)
     }
 
+    /// Sets the selected entry's fold state. `None` means the entry is absent
+    /// or not collapsible at the current width; `Some(false)` is an idempotent
+    /// request whose state already matched.
+    pub fn set_expand_entry(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        id: HistoryEntryId,
+        width: u16,
+        expanded: bool,
+    ) -> Option<bool> {
+        let index = self.entry_index(id)?;
+        self.set_expand(history, index, width, expanded)
+    }
+
+    /// Opens every entry currently retained by this viewport. Entries that do
+    /// not wrap far enough to fold remember the preference in case a later
+    /// reflow makes them collapsible; future arrivals keep their normal
+    /// message/notice defaults.
+    pub fn expand_all(&mut self) -> bool {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if !entry.expanded {
+                entry.expanded = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.layout_index.invalidate();
+            self.scroll_anchor = None;
+            self.bump_layout_epoch();
+        }
+        changed
+    }
+
     pub fn scroll_entry_into_view(
         &mut self,
         history: &RoomHistoryRef<'_>,
@@ -2260,12 +2428,15 @@ impl ChatViewport {
         None
     }
 
-    /// Scrolls the minimum amount that brings the cursor's row into view.
+    /// Scrolls the minimum amount that brings the cursor's row into the safe
+    /// viewport band. `scroll_buffer` is the desired rendered-row context on
+    /// both sides; when it cannot fit, the safe band contracts to the center.
     pub fn keep_cursor_visible(
         &mut self,
         history: &RoomHistoryRef<'_>,
         width: u16,
         height: u16,
+        scroll_buffer: usize,
     ) -> Option<()> {
         let height = height as usize;
         if height == 0 {
@@ -2277,14 +2448,108 @@ impl ChatViewport {
         self.scroll_offset = self.scroll_offset.min(max_scroll);
         let top = total.saturating_sub(self.scroll_offset.saturating_add(height));
         let bottom = top.saturating_add(height);
-        if row < top {
+        let before = scroll_buffer.min(height / 2);
+        let after = scroll_buffer.min(height.saturating_sub(1) / 2);
+        let safe_top = top.saturating_add(before);
+        let safe_bottom = bottom.saturating_sub(after);
+        let previous = self.scroll_offset;
+        if row < safe_top {
+            let desired_top = row.saturating_sub(before).min(max_scroll);
             self.scroll_offset = total
-                .saturating_sub(row.saturating_add(height))
+                .saturating_sub(desired_top.saturating_add(height))
                 .min(max_scroll);
-        } else if row >= bottom {
-            self.scroll_offset = total.saturating_sub(row + 1).min(max_scroll);
+        } else if row >= safe_bottom {
+            let desired_bottom = row.saturating_add(after).saturating_add(1).min(total);
+            let desired_top = desired_bottom.saturating_sub(height).min(max_scroll);
+            self.scroll_offset = total
+                .saturating_sub(desired_top.saturating_add(height))
+                .min(max_scroll);
+        }
+        if self.scroll_offset != previous {
+            // Explicit navigation owns the viewport now. A retained layout
+            // anchor from the previous frame must not restore the old window.
+            self.scroll_anchor = None;
         }
         Some(())
+    }
+
+    /// Moves the viewport by rendered rows while keeping its cursor in the
+    /// configured safe band. If scrolling would push the cursor outside, the
+    /// cursor moves to the nearest selectable body row in that band.
+    pub fn scroll_with_cursor(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        rows: isize,
+        width: u16,
+        height: u16,
+        scroll_buffer: usize,
+    ) -> Option<()> {
+        if rows < 0 {
+            self.scroll_up(history, rows.unsigned_abs(), width, height);
+        } else if rows > 0 {
+            self.scroll_down(rows as usize);
+        } else {
+            return self.keep_cursor_visible(history, width, height, scroll_buffer);
+        }
+
+        let height = height as usize;
+        if height == 0 {
+            return None;
+        }
+        let cursor = self.ensure_layout_cursor(history, width)?;
+        let (cursor_row, total) = self.pos_row_and_total(history, cursor, width)?;
+        let max_top = total.saturating_sub(height);
+        let top = total
+            .saturating_sub(self.scroll_offset.saturating_add(height))
+            .min(max_top);
+        let bottom = top.saturating_add(height).min(total);
+        let before = scroll_buffer.min(height / 2);
+        let after = scroll_buffer.min(height.saturating_sub(1) / 2);
+        let safe_top = top.saturating_add(before).min(bottom.saturating_sub(1));
+        let safe_bottom = bottom.saturating_sub(after).max(safe_top.saturating_add(1));
+
+        let replacement = if cursor_row < safe_top {
+            self.body_cursor_at_or_after(safe_top, total)
+                .or_else(|| self.body_cursor_at_or_before(safe_top))
+        } else if cursor_row >= safe_bottom {
+            self.body_cursor_at_or_before(safe_bottom.saturating_sub(1))
+                .or_else(|| self.body_cursor_at_or_after(safe_bottom, total))
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            self.cursor = Some(ViewCursor {
+                entry: self.entries[replacement.message].id,
+                line: replacement.line,
+            });
+        }
+        self.keep_cursor_visible(history, width, height as u16, scroll_buffer)
+    }
+
+    fn body_cursor_at_or_after(&self, start: usize, total: usize) -> Option<LayoutCursor> {
+        for row in start..total {
+            let line = self.cached_visible_line(row)?;
+            if line.kind == LineKind::Body {
+                return Some(LayoutCursor {
+                    message: line.message,
+                    line: line.line,
+                });
+            }
+        }
+        None
+    }
+
+    fn body_cursor_at_or_before(&self, start: usize) -> Option<LayoutCursor> {
+        for row in (0..=start).rev() {
+            let line = self.cached_visible_line(row)?;
+            if line.kind == LineKind::Body {
+                return Some(LayoutCursor {
+                    message: line.message,
+                    line: line.line,
+                });
+            }
+        }
+        None
     }
 
     /// Reflow at a new width invalidates wrapped-line coordinates: the anchor
@@ -2293,6 +2558,7 @@ impl ChatViewport {
     pub fn on_reflow(&mut self, history: &RoomHistoryRef<'_>, width: u16) {
         self.anchor = None;
         self.dragging = false;
+        self.scroll_anchor = None;
         self.layout_index.invalidate();
         self.bump_layout_epoch();
         self.clamp_positions(history, width);
@@ -2352,6 +2618,7 @@ impl ChatViewport {
         self.scroll_offset = total_rows
             .saturating_sub(top.saturating_add(height))
             .min(max_scroll);
+        self.scroll_anchor = None;
 
         // A reference jump is an explicit navigation action. When the target is
         // already in the tail viewport, move one row off the bottom if possible
@@ -2371,12 +2638,29 @@ impl ChatViewport {
         message: usize,
         width: u16,
     ) -> bool {
+        let Some(expanded) = self.entries.get(message).map(|entry| !entry.expanded) else {
+            return false;
+        };
+        self.set_expand(history, message, width, expanded)
+            .is_some_and(|changed| changed)
+    }
+
+    fn set_expand(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        width: u16,
+        expanded: bool,
+    ) -> Option<bool> {
         if message >= self.entries.len()
             || self.ensure_lines(history, message, width) <= COLLAPSE_LIMIT
         {
-            return false;
+            return None;
         }
-        self.entries[message].expanded = !self.entries[message].expanded;
+        if self.entries[message].expanded == expanded {
+            return Some(false);
+        }
+        self.entries[message].expanded = expanded;
         if self.layout_index.valid
             && self.layout_index.width == width.max(1)
             && self.layout_index.line_counts.len() == self.entries.len()
@@ -2401,8 +2685,9 @@ impl ChatViewport {
         }
         // Collapsing under the cursor or anchor pulls them into the preview.
         self.clamp_positions(history, width);
+        self.scroll_anchor = None;
         self.bump_layout_epoch();
-        true
+        Some(true)
     }
 
     /// Whether `message` is collapsible (over [`COLLAPSE_LIMIT`] lines) and

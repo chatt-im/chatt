@@ -89,7 +89,7 @@ pub(crate) use participants::{
     ParticipantState, ParticipantVoiceFeedback, Participants, participant_latency_estimate_ms,
 };
 pub(crate) use room::{
-    ComposerSubmission, DeleteSelection, HistoryChange, RoomSession, ToggleExpandResult,
+    ComposerSubmission, DeleteSelection, HistoryChange, RoomSession,
 };
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
@@ -6203,6 +6203,7 @@ impl App {
             || ui.composer_padding != self.config.ui.composer_padding
             || ui.copy_on_select != self.config.ui.copy_on_select
             || ui.max_messages != self.config.ui.max_messages
+            || ui.scroll_buffer != self.config.ui.scroll_buffer
             || ui.overscan != self.config.ui.overscan;
         if ui_changed {
             self.config.ui = ui;

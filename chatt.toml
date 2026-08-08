@@ -55,6 +55,9 @@ composer-padding = true
 # Copy clicked or drag-selected message rows to the primary selection.
 copy-on-select = false
 max-messages = 50000
+# Timeline rows kept above and below the selected row. A value larger than the
+# available space keeps the selection centered.
+scroll-buffer = 3
 overscan = 24
 default-bindings = "standard"
 # Color theme: a builtin ("tomorrow-night", "base16-dark", "base16-light") or
@@ -175,7 +178,6 @@ viewer = "panel"
 "l" = "AdjustRight"
 "LEFT" = "AdjustLeft"
 "RIGHT" = "AdjustRight"
-"c" = "ClearChat"
 "v" = "ToggleVisual"
 "{" = "ParagraphBack"
 "}" = "ParagraphForward"
@@ -190,6 +192,11 @@ viewer = "panel"
 "p" = "PasteClipboard"
 "C-v" = "PasteClipboard"
 "C-M-v" = "PasteClipboard"
+"z" = { Label = "Fold" }
+"z O" = "ExpandAll"
+"z o" = "Expand"
+"z c" = "Collapse"
+"z a" = "ToggleExpand"
 "TAB" = "ToggleExpand"
 "C-k" = "RoomSwitcher"
 "M-DOWN" = "NextRoom"

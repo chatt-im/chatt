@@ -103,6 +103,7 @@ pub struct SettingsDraft {
     pub(crate) ui_composer_padding: bool,
     pub(crate) ui_copy_on_select: bool,
     pub(crate) ui_max_messages: String,
+    pub(crate) ui_scroll_buffer: String,
     pub(crate) ui_overscan: String,
     /// The URL opener command, one argument per row; the clicked URL is
     /// appended last. Empty falls back to platform behavior (inert opener).
@@ -278,6 +279,7 @@ impl SettingsDraft {
             ui_composer_padding: UiConfig::default().composer_padding,
             ui_copy_on_select: UiConfig::default().copy_on_select,
             ui_max_messages: UiConfig::default().max_messages.to_string(),
+            ui_scroll_buffer: UiConfig::default().scroll_buffer.to_string(),
             ui_overscan: UiConfig::default().overscan.to_string(),
             url_open: Vec::new(),
             url_open_new: String::new(),
@@ -346,6 +348,7 @@ impl SettingsDraft {
         self.ui_composer_padding = ui.composer_padding;
         self.ui_copy_on_select = ui.copy_on_select;
         self.ui_max_messages = ui.max_messages.to_string();
+        self.ui_scroll_buffer = ui.scroll_buffer.to_string();
         self.ui_overscan = ui.overscan.to_string();
     }
 
@@ -457,6 +460,9 @@ impl SettingsDraft {
         ui.copy_on_select = self.ui_copy_on_select;
         if let Ok(value) = self.ui_max_messages.trim().parse::<u32>() {
             ui.max_messages = value;
+        }
+        if let Ok(value) = self.ui_scroll_buffer.trim().parse::<u32>() {
+            ui.scroll_buffer = value;
         }
         if let Ok(value) = self.ui_overscan.trim().parse::<u32>() {
             ui.overscan = value;
@@ -571,6 +577,12 @@ impl SettingsDraft {
             labeled_error(
                 "max messages",
                 int_range_error(&self.ui_max_messages, UI_MAX_MESSAGES_RANGE),
+            )
+        })
+        .or_else(|| {
+            labeled_error(
+                "scroll buffer",
+                int_range_error(&self.ui_scroll_buffer, UI_SCROLL_BUFFER_RANGE),
             )
         })
         .or_else(|| {
@@ -851,6 +863,7 @@ impl DownloadChoice {
 pub(crate) const UI_ROOM_HEIGHT_RANGE: (u64, u64) = (1, 32);
 pub(crate) const UI_MAX_COMPOSER_HEIGHT_RANGE: (u64, u64) = (1, 32);
 pub(crate) const UI_MAX_MESSAGES_RANGE: (u64, u64) = (100, 1_000_000);
+pub(crate) const UI_SCROLL_BUFFER_RANGE: (u64, u64) = (0, 1_000);
 pub(crate) const UI_OVERSCAN_RANGE: (u64, u64) = (0, 1_000);
 pub(crate) const MAX_AMPLIFICATION_DB_RANGE: (f32, f32) = (0.0, 30.0);
 
@@ -1749,6 +1762,7 @@ mod tests {
             composer_padding: false,
             copy_on_select: true,
             max_messages: 12_345,
+            scroll_buffer: 9,
             overscan: 48,
             ..UiConfig::default()
         };
@@ -1761,6 +1775,7 @@ mod tests {
         assert!(!produced.composer_padding);
         assert!(produced.copy_on_select);
         assert_eq!(produced.max_messages, 12_345);
+        assert_eq!(produced.scroll_buffer, 9);
         assert_eq!(produced.overscan, 48);
     }
 
@@ -1857,6 +1872,11 @@ mod tests {
         draft.ui_overscan = "9999".to_string();
         let error = draft.settings_text_invalid().unwrap();
         assert!(error.contains("overscan"), "{error}");
+
+        draft.ui_overscan = UiConfig::default().overscan.to_string();
+        draft.ui_scroll_buffer = "1001".to_string();
+        let error = draft.settings_text_invalid().unwrap();
+        assert!(error.contains("scroll buffer"), "{error}");
     }
 
     #[test]

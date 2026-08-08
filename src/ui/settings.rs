@@ -19,12 +19,12 @@ use crate::{
         DENOISE_RELEASES, DENOISE_SUPPRESSION_LABELS, DENOISE_SUPPRESSIONS,
         DENOISE_TYPING_VAD_LABELS, DENOISE_TYPING_VAD_THRESHOLDS, MAX_AMPLIFICATION_DB_RANGE,
         SettingsDraft, UI_MAX_COMPOSER_HEIGHT_RANGE, UI_MAX_MESSAGES_RANGE, UI_OVERSCAN_RANGE,
-        UI_ROOM_HEIGHT_RANGE, buffer_field_error, byte_size_error, download_path_error,
-        form_bindings_label, int_range_error, latency_ms_error, max_amplification_error,
-        notification_volume_error, output_volume_field_error, parse_db_value, positive_mib_error,
-        raw_device_error, raw_device_selection, selected_audio_input_label,
-        selected_audio_output_label, vad_level_error, volume_db_label, web_bind_error,
-        web_origin_error,
+        UI_ROOM_HEIGHT_RANGE, UI_SCROLL_BUFFER_RANGE, buffer_field_error, byte_size_error,
+        download_path_error, form_bindings_label, int_range_error, latency_ms_error,
+        max_amplification_error, notification_volume_error, output_volume_field_error,
+        parse_db_value, positive_mib_error, raw_device_error, raw_device_selection,
+        selected_audio_input_label, selected_audio_output_label, vad_level_error, volume_db_label,
+        web_bind_error, web_origin_error,
     },
     theme::Theme,
     tui::{
@@ -1073,6 +1073,17 @@ fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
             "Copies clicked or drag-selected message rows to the primary selection on mouse release.",
         );
         form.set_default("off");
+    }
+    if form
+        .text("Scroll Buffer", &mut draft.ui_scroll_buffer, |text| {
+            int_range_error(text, UI_SCROLL_BUFFER_RANGE)
+        })
+        .is_focus()
+    {
+        form.set_help(
+            "Timeline rows kept above and below the selection; high values keep it centered.",
+        );
+        form.set_default(ui_defaults.scroll_buffer.to_string());
     }
 
     form.section("Links");

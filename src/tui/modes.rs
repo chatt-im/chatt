@@ -7,7 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     app::{
         App, ChatPanelFocus, DeleteSelection, PendingJoin, RoomSettingsDraft, ServerEditDraft,
-        ServerEditEvent, ToggleExpandResult, UserVolumeDialog,
+        ServerEditEvent, UserVolumeDialog,
         command::{CoreCommand, SettingsOp},
     },
     bindings::{self, BindCommand, Resolved},
@@ -2021,6 +2021,9 @@ impl RoomMode {
             OpenMessageRef => self.open_message_ref_if_focused(cx),
             EditMessage => self.edit_cursor_message_if_focused(cx),
             DeleteMessage => self.delete_selected_messages_if_focused(cx),
+            ExpandAll => self.expand_all_chat_if_focused(cx),
+            Expand => self.apply_selected_fold(cx, Some(true)),
+            Collapse => self.apply_selected_fold(cx, Some(false)),
             ToggleExpand => self.toggle_chat_expand_if_focused(cx),
             FocusNext => self.move_focus(cx, 1),
             FocusPrev => self.move_focus(cx, -1),
@@ -2274,7 +2277,7 @@ impl RoomMode {
             extui::event::MouseEventKind::ScrollUp if in_chat => {
                 let was_focused = self.focus == ChatPanelFocus::ChatLog;
                 self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
-                self.scroll_chat_up(cx, 5);
+                self.scroll_chat_with_cursor(cx, -5);
                 if was_focused {
                     cx.narrow_dirty(CHAT_SCROLL_DIRTY);
                 }
@@ -2282,7 +2285,7 @@ impl RoomMode {
             extui::event::MouseEventKind::ScrollDown if in_chat => {
                 let was_focused = self.focus == ChatPanelFocus::ChatLog;
                 self.set_focus_cx(cx, ChatPanelFocus::ChatLog);
-                cx.view.active.chat.scroll_down(5);
+                self.scroll_chat_with_cursor(cx, 5);
                 if was_focused {
                     cx.narrow_dirty(CHAT_SCROLL_DIRTY);
                 }
@@ -2623,21 +2626,59 @@ impl RoomMode {
     }
 
     fn toggle_selected_log_collapse(&mut self, cx: &mut ViewCx<'_>) {
+        self.apply_selected_fold(cx, None);
+    }
+
+    fn apply_selected_fold(&mut self, cx: &mut ViewCx<'_>, expanded: Option<bool>) {
+        if self.focus != ChatPanelFocus::ChatLog {
+            return;
+        }
         let width = self.layout.chat_width;
         let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
             cx.set_status("no messages");
             return;
         };
-        match cx.view.toggle_cursor_message_expand(cx.session, width) {
-            ToggleExpandResult::Toggled => {}
-            ToggleExpandResult::NoMessages => {
-                cx.set_status("no messages");
-                return;
-            }
-            ToggleExpandResult::NotCollapsible => {
-                cx.set_status("selected log is not collapsible");
-            }
+        let Some(cursor) = cx.view.active.chat.ensure_cursor(&history, width) else {
+            cx.set_status("no messages");
+            return;
+        };
+        let changed = match expanded {
+            Some(expanded) => cx
+                .view
+                .active
+                .chat
+                .set_expand_entry(&history, cursor.entry, width, expanded),
+            None => Some(
+                cx.view
+                    .active
+                    .chat
+                    .toggle_expand_entry(&history, cursor.entry, width),
+            ),
+        };
+        if changed.is_none() || changed == Some(false) && expanded.is_none() {
+            cx.set_status("selected log is not collapsible");
         }
+        cx.view
+            .active
+            .chat
+            .clamp_scroll(&history, width, self.layout.chat_height);
+        self.keep_chat_cursor_visible(cx);
+    }
+
+    fn expand_all_chat_if_focused(&mut self, cx: &mut ViewCx<'_>) {
+        if self.focus != ChatPanelFocus::ChatLog {
+            return;
+        }
+        let width = self.layout.chat_width;
+        let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+            cx.set_status("no messages");
+            return;
+        };
+        if cx.view.active.chat.is_empty() {
+            cx.set_status("no messages");
+            return;
+        }
+        cx.view.active.chat.expand_all();
         cx.view
             .active
             .chat
@@ -2867,12 +2908,29 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        if rows < 0 {
-            self.scroll_chat_up(cx, rows.unsigned_abs());
-        } else {
-            cx.view.active.chat.scroll_down(rows as usize);
-        }
+        self.scroll_chat_with_cursor(cx, rows);
         cx.narrow_dirty(CHAT_SCROLL_DIRTY);
+    }
+
+    fn scroll_chat_with_cursor(&mut self, cx: &mut ViewCx<'_>, rows: isize) {
+        let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
+            return;
+        };
+        cx.view.active.chat.scroll_with_cursor(
+            &history,
+            rows,
+            self.layout.chat_width,
+            self.layout.chat_height,
+            cx.config.ui.scroll_buffer as usize,
+        );
+        if cx.view.active.chat.is_at_top(
+            &history,
+            self.layout.chat_width,
+            self.layout.chat_height,
+        ) && let Some(room_id) = cx.view.viewed_room
+        {
+            cx.send(CoreCommand::RequestOlderHistory { room_id });
+        }
     }
 
     fn chat_half_page_rows(&self) -> usize {
@@ -2899,6 +2957,7 @@ impl RoomMode {
             &history,
             self.layout.chat_width,
             self.layout.chat_height,
+            cx.config.ui.scroll_buffer as usize,
         );
     }
 
@@ -3256,6 +3315,29 @@ mod tests {
             row,
             modifiers: KeyModifiers::empty(),
         }
+    }
+
+    fn assert_chat_cursor_buffered(app: &TestApp, room: &RoomMode) {
+        let cursor = app.view.active.chat.cursor().expect("chat cursor");
+        let visible = &room.layout.visible_chat_lines;
+        let selected = visible
+            .iter()
+            .position(|line| {
+                line.kind == LineKind::Body
+                    && line.entry == cursor.entry
+                    && line.line == cursor.line
+            })
+            .expect("selected chat row must be visible");
+        let height = visible.len();
+        let buffer = app.config.ui.scroll_buffer as usize;
+        let before = buffer.min(height / 2);
+        let after = buffer.min(height.saturating_sub(1) / 2);
+        assert!(selected >= before, "only {selected} rendered rows above cursor");
+        assert!(
+            height - selected - 1 >= after,
+            "only {} rendered rows below cursor",
+            height - selected - 1
+        );
     }
 
     #[test]
@@ -4736,6 +4818,148 @@ mod tests {
     }
 
     #[test]
+    fn vim_fold_chords_open_close_toggle_and_open_all() {
+        let mut app = test_app();
+        let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
+        let long = (0..20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        push_room_message(&mut app, 1, UserId(2), 1_000, &long);
+        push_room_message(&mut app, 2, UserId(3), 2_000, &long);
+
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        room.set_focus(&mut app, ChatPanelFocus::ChatLog);
+        let width = room.layout().chat_width;
+
+        room.process_input(&mut app, key('z'));
+        room.process_input(&mut app, key('o'));
+        {
+            let (core, view) = app.parts_mut();
+            let history = core.room.history_ref(RoomId(1)).unwrap();
+            assert_eq!(
+                view.active.chat.set_expand_entry(
+                    &history,
+                    HistoryEntryId::Message(MessageId(2)),
+                    width,
+                    true,
+                ),
+                Some(false)
+            );
+        }
+
+        room.process_input(&mut app, key('z'));
+        room.process_input(&mut app, key('c'));
+        {
+            let (core, view) = app.parts_mut();
+            let history = core.room.history_ref(RoomId(1)).unwrap();
+            assert_eq!(
+                view.active.chat.set_expand_entry(
+                    &history,
+                    HistoryEntryId::Message(MessageId(2)),
+                    width,
+                    false,
+                ),
+                Some(false)
+            );
+        }
+
+        room.process_input(&mut app, key('z'));
+        room.process_input(&mut app, key('a'));
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        {
+            let (core, view) = app.parts_mut();
+            let history = core.room.history_ref(RoomId(1)).unwrap();
+            assert_eq!(
+                view.active.chat.set_expand_entry(
+                    &history,
+                    HistoryEntryId::Message(MessageId(2)),
+                    width,
+                    false,
+                ),
+                Some(false),
+                "za opens and Tab closes the selected fold"
+            );
+        }
+
+        room.process_input(&mut app, key('z'));
+        room.process_input(&mut app, key('O'));
+        let (core, view) = app.parts_mut();
+        let history = core.room.history_ref(RoomId(1)).unwrap();
+        for id in [1, 2] {
+            assert_eq!(
+                view.active.chat.set_expand_entry(
+                    &history,
+                    HistoryEntryId::Message(MessageId(id)),
+                    width,
+                    true,
+                ),
+                Some(false),
+                "zO did not open message {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_message_navigation_survives_rendered_scroll_anchor_with_buffer() {
+        let mut app = test_app();
+        let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
+        let long = (0..80)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        push_room_message(&mut app, 1, UserId(2), 1_000, long);
+
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        room.set_focus(&mut app, ChatPanelFocus::ChatLog);
+        room.process_input(&mut app, key('z'));
+        room.process_input(&mut app, key('o'));
+        for _ in 0..20 {
+            room.process_input(&mut app, key('j'));
+        }
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_chat_cursor_buffered(&app, &room);
+
+        // The render above retains an anchor for the scrolled viewport. The
+        // next cursor movement must supersede it rather than being undone.
+        room.process_input(&mut app, key('j'));
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_chat_cursor_buffered(&app, &room);
+    }
+
+    #[test]
+    fn paging_and_mouse_wheel_keep_the_chat_cursor_buffered() {
+        let mut app = test_app();
+        let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
+        for id in 1..=40 {
+            push_room_message(
+                &mut app,
+                id,
+                UserId(id),
+                id * 120_000,
+                format!("message {id}"),
+            );
+        }
+
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        room.set_focus(&mut app, ChatPanelFocus::ChatLog);
+        room.process_input(&mut app, ctrl('u'));
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_chat_cursor_buffered(&app, &room);
+
+        let rect = room.layout().chat_rect;
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::ScrollUp, rect.x, rect.y),
+        );
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_chat_cursor_buffered(&app, &room);
+    }
+
+    #[test]
     fn mouse_collapse_reclamps_scroll_and_fills_viewport() {
         // Regression: collapsing an expanded message via mouse must re-clamp the
         // scroll offset so the top-anchored chat log re-fills the viewport
@@ -4785,6 +5009,7 @@ mod tests {
         view.active.chat.toggle_expand(&history, 0, width);
         assert!(view.active.chat.is_expanded(0));
         view.active.chat.top(&history, width, height);
+        view.active.chat.cursor_to_first();
         render_room(&mut app, &mut room, &mut buffer);
 
         let heading_row = room

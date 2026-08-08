@@ -67,6 +67,9 @@ pub enum BindCommand {
     OpenMessageRef,
     EditMessage,
     DeleteMessage,
+    ExpandAll,
+    Expand,
+    Collapse,
     ToggleExpand,
     ToggleMute,
     ToggleDeafen,
@@ -140,6 +143,9 @@ impl std::fmt::Display for BindCommand {
             OpenMessageRef => "OpenMessageRef",
             EditMessage => "EditMessage",
             DeleteMessage => "DeleteMessage",
+            ExpandAll => "ExpandAll",
+            Expand => "Expand",
+            Collapse => "Collapse",
             ToggleExpand => "ToggleExpand",
             ToggleMute => "ToggleMute",
             ToggleDeafen => "ToggleDeafen",
@@ -225,7 +231,10 @@ impl BindCommand {
             OpenMessageRef => spec("Open Ref", ACTION),
             EditMessage => spec("Edit", ACTION),
             DeleteMessage => spec("Delete", DESTRUCTIVE),
-            ToggleExpand => spec("Expand", ACTION),
+            ExpandAll => spec("Open All", ACTION),
+            Expand => spec("Open", ACTION),
+            Collapse => spec("Close", ACTION),
+            ToggleExpand => spec("Fold Toggle", ACTION),
             ToggleMute => spec("Mute", ACTION),
             ToggleDeafen => spec("Deafen", ACTION),
             RefreshDevices => spec("Refresh", ACTION),
@@ -580,6 +589,23 @@ mod tests {
         Some(runtime.actions.get(id).clone())
     }
 
+    fn sequence_command(
+        runtime: &BindingRuntime,
+        layer: LayerId,
+        sequence: &str,
+    ) -> Option<BindCommand> {
+        let mut pending = None;
+        let mut resolved = None;
+        for key in parse_sequence(sequence).unwrap() {
+            match resolve(&runtime.router, layer, &mut pending, key) {
+                Resolved::Action(id) => resolved = Some(runtime.actions.get(id).clone()),
+                Resolved::Consumed => {}
+                Resolved::Unmatched => return None,
+            }
+        }
+        resolved
+    }
+
     #[test]
     fn inherits_bindings_from_named_table() {
         let runtime = parse_runtime(concat!(
@@ -666,6 +692,34 @@ mod tests {
             command_key_hint(&runtime, PICKER_LAYER, BindCommand::AddServer).as_deref(),
             Some("n")
         );
+    }
+
+    #[test]
+    fn default_workspace_exposes_vim_fold_chords_without_clear_key() {
+        let runtime = BindingRuntime::default();
+        for layer in [WORKSPACE_LAYER, CHAT_VISUAL_LAYER] {
+            assert!(matches!(
+                sequence_command(&runtime, layer, "z O"),
+                Some(BindCommand::ExpandAll)
+            ));
+            assert!(matches!(
+                sequence_command(&runtime, layer, "z o"),
+                Some(BindCommand::Expand)
+            ));
+            assert!(matches!(
+                sequence_command(&runtime, layer, "z c"),
+                Some(BindCommand::Collapse)
+            ));
+            assert!(matches!(
+                sequence_command(&runtime, layer, "z a"),
+                Some(BindCommand::ToggleExpand)
+            ));
+            assert!(matches!(
+                command(&runtime, layer, "TAB"),
+                Some(BindCommand::ToggleExpand)
+            ));
+            assert!(command(&runtime, layer, "c").is_none());
+        }
     }
 
     #[test]
