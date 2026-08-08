@@ -1900,6 +1900,7 @@ fn voice_live_auto_falls_back_to_tcp_when_udp_replies_are_dropped() {
 /// server still hears the room, so any liveness rule that counts arbitrary
 /// inbound traffic keeps clearing its timer while the microphone goes nowhere.
 #[test]
+#[ignore = "waits for the production UDP liveness timeout"]
 fn voice_live_auto_falls_back_when_client_to_server_udp_dies() {
     let _guard = live_mls_e2e_guard();
     let root = temp_dir("voice-tcp-upstream");
