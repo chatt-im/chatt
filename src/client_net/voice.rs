@@ -5006,6 +5006,20 @@ mod tests {
         }
     }
 
+    fn drive_lane_confirmed(session: &mut VoiceSession) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let lane = session.tcp_lane.as_ref().expect("lane closed before confirmation");
+            if lane.confirmed {
+                return;
+            }
+            assert!(Instant::now() < deadline, "lane failed to confirm");
+            session.tcp_lane.as_mut().unwrap().readiness.mark_ready();
+            session.read_tcp_lane();
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn force_tcp_lane_skips_udp_and_authenticates_with_magic_then_bind() {
         let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
@@ -5066,8 +5080,7 @@ mod tests {
             media::seal_media(&protection(55), 1, &MediaPayload::Pong { nonce: 18 }).unwrap();
         frame::encode_frame(&packet, &mut framed).unwrap();
         server_end.write_all(&framed).unwrap();
-        session.tcp_lane.as_mut().unwrap().readiness.mark_ready();
-        session.read_tcp_lane();
+        drive_lane_confirmed(&mut session);
 
         assert!(session.tcp_lane.as_ref().unwrap().confirmed);
         assert_eq!(session.tcp_backoff, TCP_LANE_BACKOFF_MIN);
