@@ -273,11 +273,24 @@ impl UsernameRegistry {
     }
 }
 
+/// Appends a dynamic user's claim on the identity writer thread, ahead of
+/// [`UsernameRegistry::apply_dynamic_claim`] installing it in memory.
+///
+/// # Errors
+///
+/// Returns an error when `user_id` is not a dynamic user or the append fails.
+/// The id is checked here and not only in the in-memory appliers because this is
+/// the one place that writes the log, and replay refuses to load a log holding a
+/// non-dynamic record: a caller that reached here with an explicit id would
+/// leave behind a server that cannot start again.
 pub(crate) fn persist_dynamic_claim(
     path: &Path,
     user_id: UserId,
     name: &str,
 ) -> Result<(), String> {
+    if user_id.0 < FIRST_DYNAMIC_USER_ID {
+        return Err(format!("user {user_id} is not a dynamic user"));
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -362,6 +375,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(error.contains("failed to read"));
         assert!(error.contains(USERNAMES_LOG_FILE));
+    }
+
+    #[test]
+    fn persist_dynamic_claim_refuses_an_explicit_user() {
+        let dir = temp_data_dir("explicit-claim");
+        let path = dir.join(USERNAMES_LOG_FILE);
+
+        let error = persist_dynamic_claim(&path, UserId(7), "Orphan").unwrap_err();
+
+        // A record for an explicit id is unloadable, so writing one strands the
+        // server: `open` refuses the log on every later start.
+        let reopened = UsernameRegistry::open(Some(dir.clone()), &[]);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(error, "user 7 is not a dynamic user");
+        assert!(reopened.is_ok());
     }
 
     fn explicit(id: u64, username: &str) -> UserConfig {

@@ -3089,14 +3089,11 @@ impl Server {
         coded_height: u32,
         extradata: Vec<u8>,
     ) -> Result<(), String> {
-        let (user_id, sender_name, in_voice) = match self.sessions.get(&session_id) {
-            Some(session) => (
-                session.user_id,
-                session.username.clone(),
-                session.voice_room == Some(room_id),
-            ),
+        let (user_id, in_voice) = match self.sessions.get(&session_id) {
+            Some(session) => (session.user_id, session.voice_room == Some(room_id)),
             None => return Err("unknown session".to_string()),
         };
+        let sender_name = self.username_of(user_id).to_string();
         if !in_voice {
             return Err("join the room's voice call before sharing".to_string());
         }
@@ -4572,22 +4569,55 @@ impl Server {
                 );
                 return self.reject_username_taken(token);
             }
-            let user = self
+            // A device credential proves the account, not its display name: the
+            // client still sends the name it wants, so the rename has to be
+            // persisted here exactly as the token paths below do it. Leaving it
+            // in the session alone would let peers read a stale name from the
+            // registry for as long as this account stays offline.
+            let explicit = self
                 .users
                 .users
                 .iter()
                 .find(|user| user.id == user_id)
-                .cloned()
-                .unwrap_or_else(|| Self::dynamic_user(user_id, username));
-            return self.establish_session_with_credential(
-                token,
-                &user,
-                receive_files,
-                file_receive_limit_bytes,
-                true,
-                None,
-                None,
-            );
+                .cloned();
+            return match explicit {
+                Some(user) => self.authenticate_explicit_user(
+                    token,
+                    user,
+                    username,
+                    receive_files,
+                    file_receive_limit_bytes,
+                    None,
+                ),
+                // The MLS store outlived the `users.toml` row: an operator
+                // revoked a paired user by deleting it, or restored an older
+                // `users.toml` beside this data dir. Refuse rather than route an
+                // explicit id through the dynamic path, which would append a
+                // record the username log then refuses to load, leaving a server
+                // that cannot start again.
+                None if !is_dynamic_user_id(user_id) => {
+                    kvlog::error!(
+                        "authenticate rejected",
+                        token = token.0,
+                        user_id = user_id.0,
+                        reason = "account_removed"
+                    );
+                    self.reject_auth(
+                        token,
+                        ERROR_AUTH_REJECTED,
+                        "authentication failed: this account no longer exists on this server"
+                            .to_string(),
+                    )
+                }
+                None => self.authenticate_dynamic_user(
+                    token,
+                    user_id,
+                    username,
+                    receive_files,
+                    file_receive_limit_bytes,
+                    None,
+                ),
+            };
         }
         if auth_token.starts_with(DYNAMIC_TOKEN_PREFIX) {
             let claims =
@@ -4626,39 +4656,12 @@ impl Server {
                     "authentication failed: invalid username for this account".to_string(),
                 );
             }
-            let user = Self::dynamic_user(claims.user_id, username);
-            if self.usernames.needs_dynamic_claim(claims.user_id, username) {
-                if let Some(path) = self.usernames.persistence_path() {
-                    return self.begin_identity_write(
-                        token,
-                        IdentityWrite::DynamicUsername {
-                            path,
-                            user_id: claims.user_id,
-                            username: username.to_string(),
-                        },
-                        PendingIdentity::DynamicAuthentication {
-                            username: username.to_string(),
-                            establish: PendingEstablish {
-                                user,
-                                receive_files,
-                                file_receive_limit_bytes,
-                                announce: true,
-                                issued_token: None,
-                                bootstrap_credential_hash: Some(hash_secret(auth_token)),
-                            },
-                        },
-                        "authentication failed: the server could not persist the username; retry later",
-                    );
-                }
-                self.usernames.claim_dynamic(claims.user_id, username)?;
-            }
-            return self.establish_session_with_credential(
+            return self.authenticate_dynamic_user(
                 token,
-                &user,
+                claims.user_id,
+                username,
                 receive_files,
                 file_receive_limit_bytes,
-                true,
-                None,
                 Some(hash_secret(auth_token)),
             );
         }
@@ -4713,6 +4716,86 @@ impl Server {
                 "authentication failed: use an active MLS device credential".to_string(),
             );
         }
+        let credential_hash = user.token_hash.clone();
+        self.authenticate_explicit_user(
+            token,
+            user,
+            username,
+            receive_files,
+            file_receive_limit_bytes,
+            Some(credential_hash),
+        )
+    }
+
+    /// Claims `username` for a dynamic account when it differs from the
+    /// registered one, then establishes the authenticated session.
+    ///
+    /// With a data dir the log append runs on the identity writer and the
+    /// session resumes from [`PendingIdentity::DynamicAuthentication`] in
+    /// [`Self::drain_identity_replies`]; without one the claim is applied
+    /// inline. The caller has already validated the name and confirmed it is
+    /// available to this account.
+    fn authenticate_dynamic_user(
+        &mut self,
+        token: Token,
+        user_id: UserId,
+        username: &str,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+        bootstrap_credential_hash: Option<String>,
+    ) -> Result<(), String> {
+        let user = Self::dynamic_user(user_id, username);
+        if self.usernames.needs_dynamic_claim(user_id, username) {
+            if let Some(path) = self.usernames.persistence_path() {
+                return self.begin_identity_write(
+                    token,
+                    IdentityWrite::DynamicUsername {
+                        path,
+                        user_id,
+                        username: username.to_string(),
+                    },
+                    PendingIdentity::DynamicAuthentication {
+                        username: username.to_string(),
+                        establish: PendingEstablish {
+                            user,
+                            receive_files,
+                            file_receive_limit_bytes,
+                            announce: true,
+                            issued_token: None,
+                            bootstrap_credential_hash,
+                        },
+                    },
+                    "authentication failed: the server could not persist the username; retry later",
+                );
+            }
+            self.claim_dynamic_username(user_id, username)?;
+        }
+        self.establish_session_with_credential(
+            token,
+            &user,
+            receive_files,
+            file_receive_limit_bytes,
+            true,
+            None,
+            bootstrap_credential_hash,
+        )
+    }
+
+    /// Renames an explicit user in `users.toml` when `username` differs from
+    /// the stored one, then establishes the authenticated session.
+    ///
+    /// A rewrite that cannot be prepared or persisted is not fatal: the session
+    /// is established under the stored name instead, so a full disk cannot lock
+    /// an invited user out of their account.
+    fn authenticate_explicit_user(
+        &mut self,
+        token: Token,
+        user: UserConfig,
+        username: &str,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+        bootstrap_credential_hash: Option<String>,
+    ) -> Result<(), String> {
         let user = if username == user.username {
             user
         } else {
@@ -4722,7 +4805,6 @@ impl Server {
             {
                 Ok((updated, users)) => {
                     if let Some(path) = self.users.persistence_path() {
-                        let credential_hash = user.token_hash.clone();
                         return self.begin_identity_write(
                             token,
                             IdentityWrite::UsersToml {
@@ -4737,7 +4819,7 @@ impl Server {
                                     file_receive_limit_bytes,
                                     announce: true,
                                     issued_token: None,
-                                    bootstrap_credential_hash: Some(credential_hash.clone()),
+                                    bootstrap_credential_hash: bootstrap_credential_hash.clone(),
                                 },
                                 fallback: PendingEstablish {
                                     user,
@@ -4745,14 +4827,13 @@ impl Server {
                                     file_receive_limit_bytes,
                                     announce: true,
                                     issued_token: None,
-                                    bootstrap_credential_hash: Some(credential_hash),
+                                    bootstrap_credential_hash,
                                 },
                             },
                             "authentication failed: the server could not persist the username; retry later",
                         );
                     }
-                    self.users.install_users(users);
-                    self.usernames.set_explicit(updated.id, &updated.username);
+                    self.install_explicit_username(users, &updated);
                     updated
                 }
                 Err(error) => {
@@ -4772,7 +4853,7 @@ impl Server {
             file_receive_limit_bytes,
             true,
             None,
-            Some(user.token_hash.clone()),
+            bootstrap_credential_hash,
         )
     }
 
@@ -4917,9 +4998,8 @@ impl Server {
                 "pairing failed: the server could not persist the pairing; retry pairing",
             );
         }
-        self.users.install_users(users);
+        self.install_explicit_username(users, &user);
         self.invites.remove(&user_name);
-        self.usernames.set_explicit(user.id, &user.username);
         kvlog::info!(
             "pairing accepted",
             token = token.0,
@@ -5073,7 +5153,7 @@ impl Server {
                     "open pairing failed: the server could not persist state; retry later",
                 );
             }
-            if let Err(error) = self.usernames.claim_dynamic(user_id, username) {
+            if let Err(error) = self.claim_dynamic_username(user_id, username) {
                 kvlog::error!(
                     "open pair rejected",
                     token = token.0,
@@ -5285,7 +5365,7 @@ impl Server {
                 } => match reply.result {
                     Ok(()) => {
                         let user_id = establish.user.id;
-                        match self.usernames.apply_dynamic_claim(user_id, &username) {
+                        match self.apply_dynamic_username(user_id, &username) {
                             Ok(()) => self.finish_pending_establish(token, establish),
                             Err(error) => {
                                 kvlog::error!(
@@ -5322,9 +5402,7 @@ impl Server {
                     fallback,
                 } => match reply.result {
                     Ok(()) => {
-                        self.users.install_users(users);
-                        self.usernames
-                            .set_explicit(updated.user.id, &updated.user.username);
+                        self.install_explicit_username(users, &updated.user);
                         self.finish_pending_establish(token, updated);
                     }
                     Err(error) => {
@@ -5342,9 +5420,7 @@ impl Server {
                     establish,
                 } => match reply.result {
                     Ok(()) => {
-                        self.users.install_users(users);
-                        self.usernames
-                            .set_explicit(establish.user.id, &establish.user.username);
+                        self.install_explicit_username(users, &establish.user);
                         self.invites.remove(&invite_name);
                         kvlog::info!(
                             "pairing accepted",
@@ -5376,7 +5452,7 @@ impl Server {
                 } => match reply.result {
                     Ok(()) => {
                         let user_id = establish.user.id;
-                        match self.usernames.apply_dynamic_claim(user_id, &username) {
+                        match self.apply_dynamic_username(user_id, &username) {
                             Ok(()) => {
                                 kvlog::info!(
                                     "open pair accepted",
@@ -5465,7 +5541,9 @@ impl Server {
 
         let session_id = SessionId(self.next_session);
         self.next_session += 1;
-        let username = user.username.clone();
+        // The registry is authoritative: every rename is applied to it before
+        // the session it belongs to is established.
+        let username = self.username_of(user_id).to_string();
 
         let transport = self
             .clients
@@ -5482,7 +5560,6 @@ impl Server {
             session_id,
             Session {
                 user_id,
-                username: username.clone(),
                 tcp_token: token,
                 voice_room: None,
                 transport,
@@ -5618,11 +5695,7 @@ impl Server {
     /// online dynamic user, and offline dynamic users who share a DM or private
     /// room with the requester.
     fn user_summaries(&self, requester: UserId, accessible_rooms: &[RoomInfo]) -> Vec<UserSummary> {
-        let mut announced_by_user = HashMap::new();
-        for session in self.sessions.values().filter(|session| session.announced) {
-            announced_by_user.entry(session.user_id).or_insert(session);
-        }
-
+        let announced_by_user = self.representative_sessions();
         let contacts = Self::room_contact_ids(requester, accessible_rooms);
         let capacity = self
             .users
@@ -5634,19 +5707,19 @@ impl Server {
         let mut included = HashSet::with_capacity(capacity);
 
         users.extend(self.users.users.iter().map(|user| {
-            let session = announced_by_user.get(&user.id).copied();
+            let session = announced_by_user.get(&user.id).map(|(_, session)| *session);
             included.insert(user.id);
             UserSummary {
                 user_id: user.id,
-                username: user.username.clone(),
+                username: self.username_of(user.id).to_string(),
                 online: session.is_some(),
                 connected_at_ms: session.map(|s| s.connected_at_ms).unwrap_or(0),
                 voice_state: session.map(|s| s.voice_state).unwrap_or_default(),
             }
         }));
-        for (user_id, session) in announced_by_user {
+        for (user_id, (_, session)) in announced_by_user {
             if is_dynamic_user_id(user_id) && included.insert(user_id) {
-                users.push(Self::session_user_summary(session, true));
+                users.push(self.session_user_summary(session, true));
             }
         }
         for user_id in contacts {
@@ -5691,10 +5764,46 @@ impl Server {
         contacts
     }
 
-    fn session_user_summary(session: &Session, online: bool) -> UserSummary {
+    /// The account's authoritative display name.
+    ///
+    /// [`UsernameRegistry`] is the single source: `users.toml` mirrors into it
+    /// at startup and on every rename, and dynamic users claim through it, so
+    /// no session can drift from the name peers were told. Every established
+    /// session's user is registered — [`Self::redeem_device_link`] and the
+    /// device-credential branch of [`Self::authenticate_client`] both refuse an
+    /// account with no registered name — so the empty fallback is unreachable.
+    fn username_of(&self, user_id: UserId) -> &str {
+        self.usernames.username_for(user_id).unwrap_or_default()
+    }
+
+    /// The announced session that represents each account to its peers: the
+    /// account's oldest live device.
+    ///
+    /// A multi-device account has several sessions that could speak for it, and
+    /// they differ in voice state and connect time. Sessions are keyed in a hash
+    /// map, so picking by iteration order would let the directory snapshot and a
+    /// presence broadcast describe different devices from one call to the next.
+    /// Callers share this rule so the two always agree.
+    fn representative_sessions(&self) -> HashMap<UserId, (SessionId, &Session)> {
+        let mut by_user: HashMap<UserId, (SessionId, &Session)> = HashMap::new();
+        for (session_id, session) in &self.sessions {
+            if !session.announced {
+                continue;
+            }
+            let slot = by_user
+                .entry(session.user_id)
+                .or_insert((*session_id, session));
+            if *session_id < slot.0 {
+                *slot = (*session_id, session);
+            }
+        }
+        by_user
+    }
+
+    fn session_user_summary(&self, session: &Session, online: bool) -> UserSummary {
         UserSummary {
             user_id: session.user_id,
-            username: session.username.clone(),
+            username: self.username_of(session.user_id).to_string(),
             online,
             connected_at_ms: if online { session.connected_at_ms } else { 0 },
             voice_state: if online {
@@ -5712,7 +5821,7 @@ impl Server {
             return;
         };
         let own_token = session.tcp_token;
-        let user = Self::session_user_summary(session, online);
+        let user = self.session_user_summary(session, online);
         let control = ServerControl::Presence { user, online };
         let tokens: Vec<Token> = self
             .sessions
@@ -5721,6 +5830,59 @@ impl Server {
             .filter(|token| *token != own_token && self.clients.contains_key(token))
             .collect();
         self.send_control_to_tokens(&tokens, &control);
+    }
+
+    /// Tells every connected client the account's current authoritative name.
+    ///
+    /// Presence only fires on an account's first and last announced session, so
+    /// a rename made while another device is already online reaches nobody:
+    /// peers keep labeling the DM with the previous name. Announcing it here
+    /// covers exactly that gap, which is why an account with no announced
+    /// session returns early — the caller is mid-authentication and the session
+    /// it is about to establish broadcasts the new name by itself. Sending an
+    /// unsolicited `online: false` instead would read as a departure.
+    fn broadcast_username_change(&mut self, user_id: UserId) {
+        let Some(user) = self
+            .representative_sessions()
+            .get(&user_id)
+            .map(|(_, session)| self.session_user_summary(session, true))
+        else {
+            return;
+        };
+        let control = ServerControl::Presence { user, online: true };
+        let tokens: Vec<Token> = self
+            .sessions
+            .values()
+            .map(|candidate| candidate.tcp_token)
+            .filter(|token| self.clients.contains_key(token))
+            .collect();
+        self.send_control_to_tokens(&tokens, &control);
+    }
+
+    /// Records a dynamic user's freshly persisted name and announces it.
+    ///
+    /// Pairs with [`Self::claim_dynamic_username`]: the identity writer already
+    /// appended the log record, so this only installs it in memory.
+    fn apply_dynamic_username(&mut self, user_id: UserId, username: &str) -> Result<(), String> {
+        self.usernames.apply_dynamic_claim(user_id, username)?;
+        self.broadcast_username_change(user_id);
+        Ok(())
+    }
+
+    /// Appends a dynamic user's name to the username log and announces it. Used
+    /// where the server has no data dir, so there is no writer to go through.
+    fn claim_dynamic_username(&mut self, user_id: UserId, username: &str) -> Result<(), String> {
+        self.usernames.claim_dynamic(user_id, username)?;
+        self.broadcast_username_change(user_id);
+        Ok(())
+    }
+
+    /// Installs a rewritten `users.toml` snapshot, mirrors the explicit user's
+    /// name into the registry, and announces it.
+    fn install_explicit_username(&mut self, users: Vec<UserConfig>, user: &UserConfig) {
+        self.users.install_users(users);
+        self.usernames.set_explicit(user.id, &user.username);
+        self.broadcast_username_change(user.id);
     }
 
     /// Whether the session's user may access the room. Denials never reveal
@@ -6762,17 +6924,19 @@ impl Server {
             room_id = room_id.0,
             body_size
         );
-        let (sender, sender_name) = match self.sessions.get(&session_id) {
-            Some(session) => (session.user_id, session.username.clone()),
-            None => {
-                kvlog::warn!(
-                    "chat send rejected",
-                    session_id = session_id.0,
-                    error = "unknown session"
-                );
-                return Err("unknown session".into());
-            }
+        let Some(sender) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.user_id)
+        else {
+            kvlog::warn!(
+                "chat send rejected",
+                session_id = session_id.0,
+                error = "unknown session"
+            );
+            return Err("unknown session".into());
         };
+        let sender_name = self.username_of(sender).to_string();
         if !self.check_room_access(session_id, room_id) {
             kvlog::warn!(
                 "chat send rejected",
@@ -6848,17 +7012,19 @@ impl Server {
         kind: MutationKind,
         body: String,
     ) -> Result<(), String> {
-        let (sender, sender_name) = match self.sessions.get(&session_id) {
-            Some(session) => (session.user_id, session.username.clone()),
-            None => {
-                kvlog::warn!(
-                    "chat mutation rejected",
-                    session_id = session_id.0,
-                    error = "unknown session"
-                );
-                return Err("unknown session".into());
-            }
+        let Some(sender) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.user_id)
+        else {
+            kvlog::warn!(
+                "chat mutation rejected",
+                session_id = session_id.0,
+                error = "unknown session"
+            );
+            return Err("unknown session".into());
         };
+        let sender_name = self.username_of(sender).to_string();
         if !self.check_room_access(session_id, room_id) {
             kvlog::warn!(
                 "chat mutation rejected",
@@ -7052,10 +7218,14 @@ impl Server {
         if session_uploads >= MAX_ACTIVE_UPLOADS_PER_SESSION {
             return Err("too many concurrent file uploads".into());
         }
-        let (sender, sender_name) = match self.sessions.get(&session_id) {
-            Some(session) => (session.user_id, session.username.clone()),
-            None => return Err("unknown session".into()),
+        let Some(sender) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.user_id)
+        else {
+            return Err("unknown session".into());
         };
+        let sender_name = self.username_of(sender).to_string();
         if !self.check_room_access(session_id, room_id) {
             return Ok(());
         }
@@ -8710,7 +8880,8 @@ impl Server {
         let username = self
             .sessions
             .get(&session_id)
-            .map(|session| session.username.clone())
+            .map(|session| session.user_id)
+            .map(|user_id| self.username_of(user_id).to_string())
             .unwrap_or_default();
         let key = (session_id, report_id);
         self.pending_bug_reports.insert(key);
@@ -9134,7 +9305,6 @@ impl VideoConn {
 
 struct Session {
     user_id: UserId,
-    username: String,
     tcp_token: Token,
     /// The room whose voice call this session is in, independent of which
     /// room's chat the client is reading.
@@ -9998,7 +10168,6 @@ mod tests {
     fn test_session(user_id: UserId, token: Token, voice_room: Option<RoomId>) -> Session {
         Session {
             user_id,
-            username: format!("user-{}", user_id.0),
             tcp_token: token,
             voice_room,
             transport: test_transport(1),
@@ -10522,7 +10691,6 @@ mod tests {
             .rooms
             .insert(room_id, dm_room(room_id, requester, dm_peer));
         let mut peer_session = test_session(dm_peer, Token(30), None);
-        peer_session.username = "Bob".to_string();
         peer_session.connected_at_ms = 42;
         peer_session.voice_state = control::VoiceState::Deafened;
         server.sessions.insert(SessionId(30), peer_session);
@@ -14113,6 +14281,7 @@ mod tests {
             username: "Alice".to_string(),
             token_hash: hash_secret(token_secret),
         }];
+        server.usernames = UsernameRegistry::in_memory(&server.users.users);
 
         // The session is established from the client's handshake transport; the
         // display name matches the stored one, so no config save is attempted.
@@ -14124,8 +14293,8 @@ mod tests {
             .values()
             .find(|session| session.tcp_token == Token(1))
             .expect("session established by token");
-        assert_eq!(session.username, "Alice");
         assert_eq!(session.user_id, UserId(7));
+        assert_eq!(server.username_of(UserId(7)), "Alice");
     }
 
     #[test]
@@ -14224,6 +14393,254 @@ mod tests {
         assert!(server.sessions.is_empty());
     }
 
+    /// Sets up a dynamic account holding `username` with an MLS device
+    /// credential, so authenticating with it takes the device-credential path.
+    fn seed_mls_account(server: &mut Server, user_id: UserId, username: &str, credential: &str) {
+        server.usernames.claim_dynamic(user_id, username).unwrap();
+        let roster = test_mls_roster(server, user_id, [7; 32], &[(7, "first")], 1);
+        put_test_roster_with_credential(server, user_id, roster, credential);
+    }
+
+    #[test]
+    fn device_credential_authentication_persists_a_renamed_dynamic_user() {
+        let mut server = test_server();
+        let user_id = UserId(config::FIRST_DYNAMIC_USER_ID);
+        let credential = "alice-device-credential-with-at-least-32-bytes";
+        seed_mls_account(&mut server, user_id, "Alice", credential);
+        let _peer = seed_session_client(&mut server, Token(1));
+
+        server
+            .authenticate_client(Token(1), "Alicia", credential, true, 0)
+            .unwrap();
+
+        // The registry is what names this account to everyone else; leaving the
+        // new name in the session alone is what stranded peers on the old one.
+        assert_eq!(server.usernames.owner_of("alicia"), Some(user_id));
+        assert_eq!(server.usernames.owner_of("alice"), None);
+        assert_eq!(server.username_of(user_id), "Alicia");
+    }
+
+    #[test]
+    fn device_credential_authentication_renames_an_explicit_user() {
+        let mut server = test_server();
+        let user_id = UserId(7);
+        let credential = "bob-device-credential-with-at-least-32-bytes";
+        server.users.users = vec![UserConfig {
+            id: user_id,
+            internal_reference: "bob-internal".to_string(),
+            username: "Bob".to_string(),
+            token_hash: String::new(),
+        }];
+        server.usernames = UsernameRegistry::in_memory(&server.users.users);
+        let roster = test_mls_roster(&server, user_id, [7; 32], &[(7, "first")], 1);
+        put_test_roster_with_credential(&mut server, user_id, roster, credential);
+        let _peer = seed_session_client(&mut server, Token(1));
+
+        server
+            .authenticate_client(Token(1), "Robert", credential, true, 0)
+            .unwrap();
+
+        assert_eq!(server.users.users[0].username, "Robert");
+        assert_eq!(server.usernames.owner_of("robert"), Some(user_id));
+        assert_eq!(server.usernames.owner_of("bob"), None);
+    }
+
+    #[test]
+    fn a_renamed_offline_dm_contact_is_summarized_under_its_new_name() {
+        let mut server = test_server();
+        let requester = UserId(config::FIRST_DYNAMIC_USER_ID + 40);
+        let peer_id = UserId(config::FIRST_DYNAMIC_USER_ID + 41);
+        let credential = "peer-device-credential-with-at-least-32-bytes";
+        server.usernames.claim_dynamic(requester, "Alice").unwrap();
+        seed_mls_account(&mut server, peer_id, "Bob", credential);
+        let room_id = RoomId(0x8000_1030);
+        server
+            .rooms
+            .insert(room_id, dm_room(room_id, requester, peer_id));
+
+        let _peer = seed_session_client(&mut server, Token(1));
+        server
+            .authenticate_client(Token(1), "Robert", credential, true, 0)
+            .unwrap();
+        let session_id = *server
+            .sessions
+            .iter()
+            .find(|(_, session)| session.tcp_token == Token(1))
+            .map(|(session_id, _)| session_id)
+            .expect("renamed session established");
+        server.teardown_session(session_id, "test");
+
+        // The peer is offline now, so its summary comes from the registry — the
+        // path that used to keep serving the pre-rename name forever.
+        let rooms = server.accessible_room_infos(requester);
+        let summary = server
+            .user_summaries(requester, &rooms)
+            .into_iter()
+            .find(|summary| summary.user_id == peer_id)
+            .expect("offline dm contact is included");
+        assert_eq!(summary.username, "Robert");
+        assert!(!summary.online);
+    }
+
+    #[test]
+    fn a_rename_reaches_peers_while_another_device_is_online() {
+        let mut server = test_server();
+        let user_id = UserId(config::FIRST_DYNAMIC_USER_ID + 50);
+        let watcher = UserId(config::FIRST_DYNAMIC_USER_ID + 51);
+        let credential = "multi-device-credential-with-at-least-32-bytes";
+        seed_mls_account(&mut server, user_id, "Alice", credential);
+        server.usernames.claim_dynamic(watcher, "Carol").unwrap();
+        // The account's first device is already online, so establishing the
+        // second one broadcasts no presence transition to carry the new name.
+        let _first_device = live_user(&mut server, Token(1), SessionId(1), user_id);
+        let mut watching = live_user(&mut server, Token(2), SessionId(2), watcher);
+
+        let _second_device = seed_session_client(&mut server, Token(3));
+        server
+            .authenticate_client(Token(3), "Alicia", credential, true, 0)
+            .unwrap();
+
+        assert_eq!(
+            read_plaintext_server_control(&mut server, &mut watching),
+            ServerControl::Presence {
+                user: UserSummary {
+                    user_id,
+                    username: "Alicia".to_string(),
+                    online: true,
+                    connected_at_ms: 0,
+                    voice_state: control::VoiceState::default(),
+                },
+                online: true,
+            }
+        );
+        // The account now has two announced sessions. Summaries pick one of them
+        // arbitrarily, so they must not be the ones holding the name.
+        let rooms = server.accessible_room_infos(watcher);
+        let summary = server
+            .user_summaries(watcher, &rooms)
+            .into_iter()
+            .find(|summary| summary.user_id == user_id)
+            .expect("the online account is listed");
+        assert_eq!(summary.username, "Alicia");
+    }
+
+    /// Seeds an MLS device credential for `user_id` with no `users.toml` row and
+    /// no registered username — the state an operator leaves behind by deleting
+    /// a paired user, or by restoring an older `users.toml` beside the data dir.
+    fn seed_orphaned_mls_credential(server: &mut Server, user_id: UserId, credential: &str) {
+        let roster = test_mls_roster(server, user_id, [7; 32], &[(7, "first")], 1);
+        put_test_roster_with_credential(server, user_id, roster, credential);
+    }
+
+    #[test]
+    fn an_mls_credential_without_a_users_toml_row_is_refused() {
+        let mut server = test_server();
+        let user_id = UserId(7);
+        let credential = "orphan-device-credential-with-at-least-32-bytes";
+        seed_orphaned_mls_credential(&mut server, user_id, credential);
+        let mut peer = seed_session_client(&mut server, Token(1));
+
+        server
+            .authenticate_client(Token(1), "Orphan", credential, true, 0)
+            .unwrap();
+
+        assert_eq!(
+            read_plaintext_server_control(&mut server, &mut peer),
+            ServerControl::Error {
+                code: ERROR_AUTH_REJECTED,
+                message: "authentication failed: this account no longer exists on this server"
+                    .to_string(),
+            }
+        );
+        assert!(server.sessions.is_empty());
+        // Explicit ids have no business in the dynamic username log, and the
+        // registry is what would have to name this session to its peers.
+        assert_eq!(server.usernames.username_for(user_id), None);
+    }
+
+    #[test]
+    fn a_refused_orphan_credential_leaves_the_username_log_loadable() {
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-orphan-credential-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = test_server_config();
+        config.storage.data_dir = Some(dir.display().to_string());
+        let mut server = Server::bind(config).expect("test server");
+        let user_id = UserId(7);
+        let credential = "orphan-device-credential-with-at-least-32-bytes";
+        seed_orphaned_mls_credential(&mut server, user_id, credential);
+        let _peer = seed_session_client(&mut server, Token(1));
+
+        server
+            .authenticate_client(Token(1), "Orphan", credential, true, 0)
+            .unwrap();
+
+        // Nothing reached the identity writer, so nothing raced ahead of these
+        // assertions: routing this account through the dynamic path would have
+        // appended a record the log refuses to replay, leaving a server that
+        // cannot start again.
+        assert!(server.pending_identity.is_none());
+        let log = server
+            .usernames
+            .persistence_path()
+            .expect("the registry logs to the data dir");
+        let written = std::fs::metadata(&log).map(|meta| meta.len()).unwrap_or(0);
+        let reopened = username_registry::UsernameRegistry::open(Some(dir.clone()), &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(written, 0);
+        assert!(reopened.is_ok());
+    }
+
+    #[test]
+    fn a_rename_broadcast_agrees_with_the_directory_snapshot() {
+        let mut server = test_server();
+        let user_id = UserId(config::FIRST_DYNAMIC_USER_ID + 60);
+        let watcher = UserId(config::FIRST_DYNAMIC_USER_ID + 61);
+        let credential = "agreeing-device-credential-with-at-least-32-bytes";
+        seed_mls_account(&mut server, user_id, "Alice", credential);
+        server.usernames.claim_dynamic(watcher, "Carol").unwrap();
+
+        let _older_device = live_user(&mut server, Token(1), SessionId(1), user_id);
+        // A newer device of the same account carries different live state, so a
+        // broadcast that picked it would contradict the snapshot peers get on
+        // their next authentication.
+        let _newer_device = live_user(&mut server, Token(2), SessionId(4), user_id);
+        let newer = server
+            .sessions
+            .get_mut(&SessionId(4))
+            .expect("newer device session");
+        newer.voice_state = control::VoiceState::Deafened;
+        newer.connected_at_ms = 99;
+        let mut watching = live_user(&mut server, Token(3), SessionId(5), watcher);
+        // Keep the session the rename establishes above the seeded ids, so it
+        // does not displace the account's oldest device.
+        server.next_session = 10;
+
+        let _renaming_device = seed_session_client(&mut server, Token(4));
+        server
+            .authenticate_client(Token(4), "Alicia", credential, true, 0)
+            .unwrap();
+
+        let broadcast = read_plaintext_server_control(&mut server, &mut watching);
+        let rooms = server.accessible_room_infos(watcher);
+        let summary = server
+            .user_summaries(watcher, &rooms)
+            .into_iter()
+            .find(|summary| summary.user_id == user_id)
+            .expect("the renamed account is listed");
+        assert_eq!(summary.username, "Alicia");
+        assert_eq!(
+            broadcast,
+            ServerControl::Presence {
+                user: summary,
+                online: true,
+            }
+        );
+    }
+
     fn open_pair_test_server() -> Server {
         let mut server = test_server();
         server.config.security.public = true;
@@ -14258,7 +14675,7 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!(session.username, "Zoe");
+        assert_eq!(server.username_of(session.user_id), "Zoe");
     }
 
     #[test]
@@ -14340,7 +14757,8 @@ mod tests {
         server
             .open_pair_client(Token(3), "Zabette", "", &existing, true, 0)
             .unwrap();
-        assert_eq!(session_for(&server, Token(3)).unwrap().username, "Zabette");
+        let renamed = session_for(&server, Token(3)).unwrap().user_id;
+        assert_eq!(server.username_of(renamed), "Zabette");
         assert_eq!(server.usernames.owner_of("zoe"), None);
         assert_eq!(server.usernames.owner_of("zabette"), Some(id));
     }
@@ -14926,7 +15344,7 @@ mod tests {
         let session = server
             .sessions
             .values()
-            .find(|session| session.username == "Gwen")
+            .find(|session| server.username_of(session.user_id) == "Gwen")
             .expect("pairing session exists");
         assert_eq!(session.voice_room, None);
         assert!(!session.announced);
@@ -15116,7 +15534,7 @@ mod tests {
             server
                 .sessions
                 .values()
-                .any(|session| session.username == "Hana")
+                .any(|session| server.username_of(session.user_id) == "Hana")
         );
     }
 

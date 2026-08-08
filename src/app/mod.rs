@@ -4836,6 +4836,11 @@ impl App {
             }
             NetworkEvent::Presence { user, online } => {
                 let notice = self.room.presence_changed(user, online, self.user_id);
+                if notice.renamed {
+                    // DM rooms are labeled by their peer's name, and the
+                    // catalog is what names them while offline.
+                    self.mark_room_catalog_dirty();
+                }
                 if !notice.local && notice.relevant {
                     self.play_notification(if online {
                         NotificationSound::PeerJoin
@@ -10845,6 +10850,49 @@ mod tests {
         });
 
         assert_eq!(app.view.status.text(), "steady");
+    }
+
+    #[test]
+    fn renaming_presence_relabels_the_dm_without_a_join_notice() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        let user_id = app.user_id;
+        let dm = RoomId(0x8000_0001);
+        app.room.authenticated(
+            &[dm_room_info(0x8000_0001, UserId(1), UserId(2))],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            dm,
+            None,
+            user_id,
+        );
+        app.set_status("steady");
+
+        // The server reannounces an online user to publish a rename: the label
+        // must follow, but the peer never left and never rejoined.
+        app.handle_network_event(NetworkEvent::Presence {
+            user: user_summary(UserId(2), "robert"),
+            online: true,
+        });
+
+        assert_eq!(
+            app.room.room_meta(dm).map(|meta| meta.name.as_str()),
+            Some("@robert")
+        );
+        assert_eq!(app.view.status.text(), "steady");
+        // The catalog names DM rooms while offline, so it has to follow too.
+        let catalog = app.room.catalog(None);
+        let peer_names = catalog
+            .rooms
+            .iter()
+            .filter_map(|room| match &room.kind {
+                crate::room_catalog::CatalogRoomKind::Dm { peer_name, .. } => Some(peer_name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(peer_names, vec!["robert"]);
     }
 
     #[test]

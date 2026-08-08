@@ -1985,7 +1985,12 @@ pub(crate) struct MessageIdRegression {
 pub(crate) struct ParticipantNotice {
     pub username: String,
     pub local: bool,
+    /// Whether the event was a join or a departure worth announcing, as opposed
+    /// to a rename reannouncement of a user whose presence did not change.
     pub relevant: bool,
+    /// Whether the user's display name changed, so DM labels captured in the
+    /// offline room catalog need rewriting.
+    pub renamed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4344,10 +4349,17 @@ impl RoomSession {
         let username = user.username.clone();
         let local = Some(user.user_id) == local_user;
         let user_id = user.user_id;
-        let relevant = self
-            .metas
-            .values()
-            .any(|meta| Self::user_belongs_to_room_kind(user_id, &meta.kind));
+        // The server reannounces an online user to publish a rename, so a
+        // presence event that does not flip the directory's belief is not a
+        // join or a departure and must not read as one.
+        let previous = self.users.get(&user_id);
+        let transition = previous.is_none_or(|previous| previous.online != online);
+        let renamed = previous.is_some_and(|previous| previous.username != username);
+        let relevant = transition
+            && self
+                .metas
+                .values()
+                .any(|meta| Self::user_belongs_to_room_kind(user_id, &meta.kind));
         self.users.insert(user_id, user);
         if online {
             self.presence_seen.insert(user_id, None);
@@ -4382,6 +4394,7 @@ impl RoomSession {
             username,
             local,
             relevant,
+            renamed,
         }
     }
 
