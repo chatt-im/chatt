@@ -329,6 +329,74 @@ pub struct Participant {
     pub voice_state: VoiceState,
 }
 
+/// The call this client is in: the room it belongs to and everyone in it.
+///
+/// The two travel together so a renderer can never draw one call's members
+/// under another's header — the room is part of the value, not a field
+/// alongside it that a consumer may ignore.
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct VoiceRoster {
+    pub room_id: RoomId,
+    pub members: Vec<VoiceMember>,
+}
+
+/// One member of a voice call, with everything a renderer needs to draw a
+/// roster row.
+///
+/// Kept separate from [`Participant`] because the two change on wildly
+/// different cadences: a room's participant list is the whole server directory
+/// for a public room and changes rarely, while [`VoiceMemberStatus::speaking`]
+/// flips on every talk spurt. Folding these fields into `Participant` would
+/// re-send thousands of names several times a second.
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct VoiceMember {
+    pub user_id: UserId,
+    pub name: String,
+    pub is_local: bool,
+    /// UNIX milliseconds this member's current call membership began.
+    ///
+    /// Only joins the daemon observed are exact: a member already in the call
+    /// when the daemon connected is stamped at connect time, because the server
+    /// relays call occupancy as a bare set with no per-member join time.
+    pub joined_ms: u64,
+    pub status: VoiceMemberStatus,
+}
+
+/// The half of a roster row that moves while the call runs.
+///
+/// Split out so a talk spurt costs one of these rather than the whole roster:
+/// [`super::frame::StateDelta::VoiceMembersUpdated`] carries only the rows whose
+/// status changed, while the identifying half above is re-sent only when
+/// membership itself does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct VoiceMemberStatus {
+    /// This member's own mute/deafen. A renderer showing the local row should
+    /// prefer [`VoiceSessionState::state`], which leads this optimistically.
+    pub voice_state: VoiceState,
+    pub speaking: bool,
+    /// Whether this member's audio takes a direct peer-to-peer path rather than
+    /// the server relay.
+    pub p2p_direct: bool,
+    /// Mouth-to-ear estimate for audio arriving from this member: their jitter
+    /// buffer, the output ring, and the one-way network leg. `None` while no
+    /// fresh reception report backs it.
+    pub inbound_latency_ms: Option<u16>,
+    /// The same estimate for the audio this member receives from us, derived
+    /// from their reception reports about our stream.
+    pub outbound_latency_ms: Option<u16>,
+}
+
+/// One member's [`VoiceMemberStatus`], addressed by user id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct VoiceMemberUpdate {
+    pub user_id: UserId,
+    pub status: VoiceMemberStatus,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub enum VoiceState {
@@ -475,6 +543,10 @@ pub struct StateSnapshot {
     pub selected_room: Option<RoomId>,
     pub room: Option<RoomSnapshot>,
     pub voice: VoiceSessionState,
+    /// The call this client is in, if any. Global rather than per-room because
+    /// [`VoiceSessionState::joined_room`] is independent of the selected room —
+    /// a renderer draws the call it is *in*, not the room it is looking at.
+    pub voice_roster: Option<VoiceRoster>,
     pub transfers: Vec<TransferSummary>,
     pub live_shares: Vec<LiveShare>,
 }
@@ -516,6 +588,15 @@ impl StateSnapshot {
             return Err("selected room is absent from room catalog".into());
         }
         self.voice.validate()?;
+        if let Some(roster) = &self.voice_roster {
+            roster.validate()?;
+        }
+        // The roster and the session state must name the same call. A snapshot
+        // that disagrees would let a renderer draw one call's members under
+        // another's header for as long as it took the next frame to arrive.
+        if self.voice_roster.as_ref().map(|roster| roster.room_id) != self.voice.joined_room {
+            return Err("voice roster and joined call do not match".into());
+        }
         for transfer in &self.transfers {
             transfer.validate()?;
             if Some(transfer.room_id) != self.selected_room {
@@ -711,6 +792,27 @@ impl Participant {
     }
 }
 
+impl VoiceRoster {
+    pub fn validate(&self) -> Result<(), String> {
+        check_voice_members(&self.members)
+    }
+}
+
+impl VoiceMember {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.is_empty() {
+            return Err("string must not be empty".into());
+        }
+        // Bounded by what the server accepts as a username rather than by the
+        // generic string cap: a roster carries one name per caller, and the
+        // 16 KiB default would let a full call claim a far larger frame than
+        // any real one can need.
+        (self.name.len() <= super::MAX_USERNAME_BYTES)
+            .then_some(())
+            .ok_or_else(|| "voice member name exceeds the username limit".into())
+    }
+}
+
 impl VoiceSessionState {
     pub fn validate(&self) -> Result<(), String> {
         if !self.output_volume.is_finite()
@@ -797,4 +899,45 @@ pub(super) fn check_nonempty_string(value: &str) -> Result<(), String> {
 
 pub(super) fn check_opt_string(value: &Option<String>) -> Result<(), String> {
     value.as_deref().map_or(Ok(()), check_string)
+}
+
+/// Validates a voice roster wherever it appears: the snapshot's own field and
+/// the delta that resets it must agree on cap, contents, and ordering, so they
+/// share one check rather than two that can drift.
+pub fn check_voice_members(members: &[VoiceMember]) -> Result<(), String> {
+    if members.len() > super::MAX_VOICE_MEMBERS {
+        return Err("voice member collection exceeds limit".into());
+    }
+    for member in members {
+        member.validate()?;
+    }
+    if members
+        .windows(2)
+        .any(|members| members[0].user_id >= members[1].user_id)
+    {
+        return Err("voice members must be strictly ordered by user id".into());
+    }
+    if members.iter().filter(|member| member.is_local).count() > 1 {
+        return Err("voice roster names more than one local member".into());
+    }
+    Ok(())
+}
+
+/// The same cap and ordering for the volatile half. A renderer applies these by
+/// user id, so a duplicate would make the frame's outcome depend on which of
+/// two rows it happened to see last.
+pub fn check_voice_member_updates(updates: &[VoiceMemberUpdate]) -> Result<(), String> {
+    if updates.is_empty() {
+        return Err("voice member updates must not be empty".into());
+    }
+    if updates.len() > super::MAX_VOICE_MEMBERS {
+        return Err("voice member collection exceeds limit".into());
+    }
+    if updates
+        .windows(2)
+        .any(|updates| updates[0].user_id >= updates[1].user_id)
+    {
+        return Err("voice members must be strictly ordered by user id".into());
+    }
+    Ok(())
 }

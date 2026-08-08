@@ -140,7 +140,6 @@ opt-level = 2
 [profile.release-v3]
 inherits = "release"
 lto="fat"
-codegen=1
 debug = 0
 
 # Heap-profiling build. Release codegen so the allocation pattern matches a real

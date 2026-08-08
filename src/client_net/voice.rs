@@ -5009,7 +5009,10 @@ mod tests {
     fn drive_lane_confirmed(session: &mut VoiceSession) {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let lane = session.tcp_lane.as_ref().expect("lane closed before confirmation");
+            let lane = session
+                .tcp_lane
+                .as_ref()
+                .expect("lane closed before confirmation");
             if lane.confirmed {
                 return;
             }

@@ -15,25 +15,36 @@ use local_rpc::{
 };
 
 #[test]
-fn renderer_and_daemon_exchange_protocol_v15_frames_and_live_share_fd() {
-    assert_eq!(PROTOCOL_MIN_VERSION, 15);
-    assert_eq!(PROTOCOL_MAX_VERSION, 15);
+fn renderer_and_daemon_exchange_frames_and_a_live_share_fd() {
+    assert_eq!(PROTOCOL_MIN_VERSION, 0);
+    assert_eq!(PROTOCOL_MAX_VERSION, 0);
     assert_eq!(MAX_MESSAGE_BODY_BYTES, 16 * 1024);
     assert_eq!(DEFAULT_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
     assert_eq!(MAX_HISTORY_REQUEST_MESSAGES, 500);
 
     let hello = ClientHello::current("test-renderer");
-    assert_eq!(hello.negotiated_version(), Some(15));
+    assert!(hello.validate().is_ok());
+    assert_eq!(hello.negotiated_version(), Some(0));
 
     let incompatible = ClientHello {
         min_version: 12,
         max_version: 13,
         build: "old-renderer".into(),
     };
+    assert_eq!(incompatible.negotiated_version(), None);
     assert_eq!(
         incompatible.unsupported_version_message(),
-        "unsupported daemon RPC protocol version: client supports 12..=13, daemon supports 15..=15"
+        "unsupported daemon RPC protocol version: client supports 12..=13, daemon supports 0..=0"
     );
+
+    // The range check is all that is left guarding the hello's versions, so it
+    // has to be the thing that rejects an inverted one.
+    let inverted = ClientHello {
+        min_version: 4,
+        max_version: 1,
+        build: "confused-renderer".into(),
+    };
+    assert!(inverted.validate().is_err());
 
     let (daemon_socket, renderer_socket) = UnixStream::pair().unwrap();
     let mut daemon_reader = FrameReader::new(daemon_socket.try_clone().unwrap());
@@ -93,6 +104,7 @@ fn renderer_and_daemon_exchange_protocol_v15_frames_and_live_share_fd() {
                 output_volume: 100.0,
                 joined_room: None,
             },
+            voice_roster: None,
             transfers: Vec::new(),
             live_shares: Vec::new(),
         },

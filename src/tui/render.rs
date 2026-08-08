@@ -1,7 +1,4 @@
-use std::{
-    cmp::Ordering as CmpOrdering,
-    time::{Duration, Instant},
-};
+use std::{cmp::Ordering as CmpOrdering, time::Instant};
 
 use extui::{
     AnsiColor, Buffer, Cell, CursorShape, DisplayRect, Ellipsis, HAlign, Rect, Style, vt::Modifier,
@@ -18,6 +15,7 @@ use crate::{
         ChatPanelFocus, ParticipantState, ParticipantVoiceFeedback, RoomSession, ScreencastPhase,
         ServerEditDraft, ServerSelectItem, StatusKind,
         audio_supervisor::AudioHealthState,
+        participant_latency_estimate_ms,
         room::{RoomSelectItem, TransferProgress, TransferStatus},
         volume_db_label,
     },
@@ -1300,13 +1298,7 @@ fn room_user_voice_feedback_label(lobby_details: bool, participant: &Participant
     // (round-trip already covers me -> them), halved to one way. The self row has
     // no peer link and carries neither side, so it renders blank.
     let rtt_ms = participant.peer_rtt_ms;
-    let fresh = |feedback: &ParticipantVoiceFeedback| {
-        feedback.updated_at.elapsed() <= Duration::from_secs(10)
-    };
-    let inbound = participant
-        .voice_feedback
-        .filter(|feedback| participant.voice_active && fresh(feedback));
-    let outbound = participant.outbound_feedback.filter(fresh);
+    let (inbound, outbound) = participant.fresh_feedback(Instant::now());
 
     let (inbound, outbound) = if lobby_details {
         (
@@ -1348,19 +1340,6 @@ fn voice_feedback_stats(feedback: &ParticipantVoiceFeedback, rtt_ms: Option<u16>
         feedback.max_output_ring_ms,
         feedback.max_interarrival_jitter_ms,
     )
-}
-
-/// Combines the stabilized jitter-buffer depth (an EWMA of the NetEQ target that
-/// holds steady through silence), the output device ring, and one-way network
-/// latency (half the measured RTT) into a single latency figure in milliseconds.
-fn participant_latency_estimate_ms(
-    feedback: &ParticipantVoiceFeedback,
-    rtt_ms: Option<u16>,
-) -> u16 {
-    feedback
-        .jitter_buffer_ms
-        .saturating_add(feedback.max_output_ring_ms)
-        .saturating_add(rtt_ms.unwrap_or(0) / 2)
 }
 
 fn room_user_status_indicator(

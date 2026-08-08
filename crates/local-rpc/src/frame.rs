@@ -11,7 +11,8 @@ use super::{
         AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo,
         CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, LiveShareViewStatus,
         Message, Participant, RequestId, RoomSnapshot, RoomSummary, ServerSelectionState,
-        StateSnapshot, SystemMessage, TransferSummary, TrustState, VoiceSessionState, VoiceState,
+        StateSnapshot, SystemMessage, TransferSummary, TrustState, VoiceMemberUpdate, VoiceRoster,
+        VoiceSessionState, VoiceState, check_voice_member_updates,
     },
     settings::{SettingsCommand, SettingsEvent, SettingsResult},
 };
@@ -46,7 +47,7 @@ impl ClientHello {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.min_version == 0 || self.min_version > self.max_version {
+        if self.min_version > self.max_version {
             return Err("invalid daemon protocol version range".into());
         }
         super::model::check_nonempty_string(&self.build)?;
@@ -317,6 +318,25 @@ pub enum StateDelta {
     ParticipantsChanged {
         room_id: RoomId,
         participants: Vec<Participant>,
+    },
+    /// The call's membership, set or cleared wholesale. Separate from
+    /// [`Self::ParticipantsChanged`] so a talk spurt never re-sends the room's
+    /// participant list; the vector is bounded by call size, not room size.
+    ///
+    /// Low frequency by construction: only joining, leaving, and renaming reach
+    /// it. Everything that moves during a call arrives as
+    /// [`Self::VoiceMembersUpdated`].
+    VoiceRosterReset {
+        roster: Option<VoiceRoster>,
+    },
+    /// The volatile half of the rows that moved, and nothing else.
+    ///
+    /// Carries no room id: [`Self::VoiceRosterReset`] establishes which call
+    /// this is and [`VoiceSessionState::joined_room`] is the authority on it, so
+    /// repeating it on the frame a talk spurt emits would be paying per spurt
+    /// for a value the consumer already holds.
+    VoiceMembersUpdated {
+        updates: Vec<VoiceMemberUpdate>,
     },
     SecurityChanged {
         room_id: RoomId,
@@ -1092,6 +1112,10 @@ fn validate_delta(delta: &StateDelta) -> Result<(), String> {
             }
             Ok(())
         }
+        StateDelta::VoiceRosterReset { roster } => {
+            roster.as_ref().map_or(Ok(()), VoiceRoster::validate)
+        }
+        StateDelta::VoiceMembersUpdated { updates } => check_voice_member_updates(updates),
         StateDelta::TransferChanged { transfer } => transfer.validate(),
         StateDelta::TransferRemoved { transfer_id } if transfer_id.0 == 0 => {
             Err("transfer id must be nonzero".into())
@@ -1126,6 +1150,7 @@ fn validate_result(result: &RequestResult) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{VoiceMember, VoiceMemberStatus};
 
     #[test]
     fn directional_frames_round_trip() {
@@ -1516,6 +1541,7 @@ mod tests {
                         output_volume: 100.0,
                         joined_room: None,
                     },
+                    voice_roster: None,
                     transfers: Vec::new(),
                     live_shares: Vec::new(),
                 },
@@ -1525,6 +1551,59 @@ mod tests {
                 event_seq: 2,
                 delta: StateDelta::LocalIdentityChanged {
                     local_identity: Some("bob".into()),
+                },
+            }),
+            DaemonFrame::Event(StateEvent {
+                instance_id,
+                event_seq: 7,
+                delta: StateDelta::VoiceRosterReset {
+                    roster: Some(VoiceRoster {
+                        room_id: RoomId(2),
+                        members: vec![
+                            VoiceMember {
+                                user_id: crate::ids::UserId(3),
+                                name: "alice".into(),
+                                is_local: true,
+                                joined_ms: 1,
+                                status: VoiceMemberStatus {
+                                    voice_state: VoiceState::Live,
+                                    speaking: true,
+                                    p2p_direct: false,
+                                    inbound_latency_ms: None,
+                                    outbound_latency_ms: None,
+                                },
+                            },
+                            VoiceMember {
+                                user_id: crate::ids::UserId(4),
+                                name: "bob".into(),
+                                is_local: false,
+                                joined_ms: 2,
+                                status: VoiceMemberStatus {
+                                    voice_state: VoiceState::Deafened,
+                                    speaking: false,
+                                    p2p_direct: true,
+                                    inbound_latency_ms: Some(90),
+                                    outbound_latency_ms: Some(60),
+                                },
+                            },
+                        ],
+                    }),
+                },
+            }),
+            DaemonFrame::Event(StateEvent {
+                instance_id,
+                event_seq: 8,
+                delta: StateDelta::VoiceMembersUpdated {
+                    updates: vec![VoiceMemberUpdate {
+                        user_id: crate::ids::UserId(4),
+                        status: VoiceMemberStatus {
+                            voice_state: VoiceState::Muted,
+                            speaking: true,
+                            p2p_direct: false,
+                            inbound_latency_ms: Some(85),
+                            outbound_latency_ms: None,
+                        },
+                    }],
                 },
             }),
             DaemonFrame::Event(StateEvent {
@@ -1643,6 +1722,84 @@ mod tests {
                 frame
             );
         }
+    }
+
+    fn voice_member(user_id: u64) -> VoiceMember {
+        VoiceMember {
+            user_id: crate::ids::UserId(user_id),
+            name: "alice".into(),
+            is_local: false,
+            joined_ms: 0,
+            status: VoiceMemberStatus::default(),
+        }
+    }
+
+    fn roster_frame(members: Vec<VoiceMember>) -> DaemonFrame {
+        DaemonFrame::Event(StateEvent {
+            instance_id: DaemonInstanceId([4; 16]),
+            event_seq: 1,
+            delta: StateDelta::VoiceRosterReset {
+                roster: Some(VoiceRoster {
+                    room_id: RoomId(2),
+                    members,
+                }),
+            },
+        })
+    }
+
+    /// The roster is diffed by equality and rendered in wire order, so an
+    /// unordered or duplicated one would make identical calls compare unequal
+    /// and re-send on every projection.
+    #[test]
+    fn rejects_a_voice_roster_that_is_not_ordered_by_user_id() {
+        assert!(encode_daemon(&roster_frame(vec![voice_member(1), voice_member(2)])).is_ok());
+        assert!(encode_daemon(&roster_frame(vec![voice_member(2), voice_member(1)])).is_err());
+        assert!(encode_daemon(&roster_frame(vec![voice_member(1), voice_member(1)])).is_err());
+    }
+
+    /// Updates are applied by user id, so a duplicate would make the frame's
+    /// outcome depend on iteration order, and an empty one would be a frame
+    /// that says nothing.
+    #[test]
+    fn rejects_voice_member_updates_that_are_empty_or_unordered() {
+        let update = |user_id: u64| VoiceMemberUpdate {
+            user_id: crate::ids::UserId(user_id),
+            status: VoiceMemberStatus::default(),
+        };
+        let updated = |updates: Vec<VoiceMemberUpdate>| {
+            DaemonFrame::Event(StateEvent {
+                instance_id: DaemonInstanceId([4; 16]),
+                event_seq: 1,
+                delta: StateDelta::VoiceMembersUpdated { updates },
+            })
+        };
+        assert!(encode_daemon(&updated(vec![update(1), update(2)])).is_ok());
+        assert!(encode_daemon(&updated(vec![update(2), update(1)])).is_err());
+        assert!(encode_daemon(&updated(Vec::new())).is_err());
+    }
+
+    /// The roster carries one name per caller, so it is bounded by the server's
+    /// username limit rather than by the generic 16 KiB string cap.
+    #[test]
+    fn rejects_a_voice_member_name_beyond_the_username_limit() {
+        let mut member = voice_member(1);
+        member.name = "a".repeat(super::super::MAX_USERNAME_BYTES);
+        assert!(encode_daemon(&roster_frame(vec![member.clone()])).is_ok());
+
+        member.name.push('a');
+        assert!(encode_daemon(&roster_frame(vec![member])).is_err());
+    }
+
+    /// Exactly one row is the viewer's own. Two would make "which row is me"
+    /// depend on which the renderer happened to check first.
+    #[test]
+    fn rejects_a_voice_roster_with_two_local_members() {
+        let local = |user_id: u64| VoiceMember {
+            is_local: true,
+            ..voice_member(user_id)
+        };
+        assert!(encode_daemon(&roster_frame(vec![local(1), voice_member(2)])).is_ok());
+        assert!(encode_daemon(&roster_frame(vec![local(1), local(2)])).is_err());
     }
 
     #[test]

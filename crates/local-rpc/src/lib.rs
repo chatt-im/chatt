@@ -24,8 +24,12 @@ pub use chatt_video::{bitstream, video};
 mod framing;
 mod recv_buffer;
 
-pub const PROTOCOL_MIN_VERSION: u16 = 15;
-pub const PROTOCOL_MAX_VERSION: u16 = 15;
+/// This protocol is private to a daemon and the renderers it ships with, and
+/// has no external users, so the number is not a compatibility record — a
+/// daemon and a renderer either come from the same tree or refuse to speak.
+/// Bump it only if something ever has to negotiate across versions for real.
+pub const PROTOCOL_MIN_VERSION: u16 = 0;
+pub const PROTOCOL_MAX_VERSION: u16 = 0;
 pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ROOM_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
@@ -37,6 +41,15 @@ pub const MAX_ROOMS: usize = 4096;
 pub const MAX_SERVERS: usize = 1024;
 pub const MAX_MESSAGES: usize = 2000;
 pub const MAX_PARTICIPANTS: usize = 4096;
+/// The largest call this protocol can carry. Set to the server's own client cap
+/// (`server::MAX_CLIENTS`), because nothing between the two admits fewer: the
+/// voice relay is sized for the same number and there is no per-room voice
+/// admission limit. A tighter bound here would be a limit renderers impose on
+/// calls the rest of the system considers valid.
+pub const MAX_VOICE_MEMBERS: usize = 1024;
+/// The server's username bound (`rpc::username::MAX_USERNAME_BYTES`), restated
+/// because this crate shares only resource IDs with the remote protocol.
+pub const MAX_USERNAME_BYTES: usize = 64;
 pub const MAX_TRANSFERS: usize = 32;
 pub const MAX_LIVE_SHARES: usize = 64;
 pub const MAX_COMMANDS: usize = 128;

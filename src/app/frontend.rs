@@ -1,20 +1,71 @@
+use std::time::Instant;
+
 use local_rpc::{
     bulk::BeginAttachmentRead,
     bulk::BeginUpload,
-    frame::{ClientFrame, Operation, RequestOutcome, RequestResult},
+    frame::{ClientFrame, Operation, RequestOutcome, RequestResult, StateDelta},
     ids::RoomId,
     model::{
         AttachmentDescriptor, AttachmentId, CommandCandidate, CommandCandidateKind,
         CommandOutputLine, ConnectionState, MediaKind, Message, RequestId, RoomKind, RoomSnapshot,
         RoomSummary, ServerAvailability, ServerSelectionState, ServerSummary, StateSnapshot,
-        SystemMessage as RpcSystemMessage, SystemMessageLevel, TrustState, VoiceSessionState,
-        VoiceState,
+        SystemMessage as RpcSystemMessage, SystemMessageLevel, TrustState, VoiceMember,
+        VoiceMemberStatus, VoiceMemberUpdate, VoiceRoster, VoiceSessionState, VoiceState,
     },
 };
+use rpc::ids::UserId;
 
 use crate::{client_channel::ClientId, client_net::NetworkCommand};
 
-use super::{App, room::ClientRoomKind};
+use super::{
+    App,
+    participants::{ParticipantState, participant_latency_estimate_ms},
+    room::ClientRoomKind,
+};
+
+/// The call roster as renderers see it, kept between projections so a change
+/// can be described rather than resent.
+///
+/// One projection serves every attached renderer: they all draw the same call,
+/// and rebuilding it per client per event was what made a one-bit speaking
+/// change cost a full roster rebuild, clone, and retransmit.
+#[derive(Default)]
+pub(crate) struct VoiceRosterProjection {
+    roster: Option<VoiceRoster>,
+    /// Membership, identity, or the addressed room changed since the last
+    /// change was drained.
+    reset: bool,
+    /// User ids whose [`VoiceMemberStatus`] changed since then, ascending.
+    dirty: Vec<UserId>,
+    /// Scratch holding the in-call participant indices in user-id order.
+    /// Retained so a refresh allocates nothing once the call is steady.
+    order: Vec<usize>,
+    /// When the oldest displayed reception report stops being fresh.
+    expires_at: Option<Instant>,
+}
+
+impl VoiceRosterProjection {
+    fn clear(&mut self) {
+        self.dirty.clear();
+        self.order.clear();
+        self.expires_at = None;
+        if self.roster.take().is_some() {
+            self.reset = true;
+        }
+    }
+}
+
+/// Which of the two snapshots is being built: the one a renderer attaches with,
+/// or the daemon-side basis it diffs the next projection against.
+///
+/// The diff basis deliberately carries neither resident history nor the call
+/// roster. Both are large, neither is diffed field-by-field, and the roster in
+/// particular travels on its own change path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotScope {
+    Attach,
+    Diff,
+}
 
 pub(crate) struct RpcLiveShareOpen {
     pub(crate) handle: crate::video::NativeViewerHandle,
@@ -92,15 +143,19 @@ impl App {
         }
     }
 
+    /// The snapshot a renderer attaches or resynchronizes with. Reads the
+    /// cached roster, so [`Self::refresh_voice_roster`] must have run for this
+    /// client set — otherwise the roster and the joined call disagree and the
+    /// frame fails validation on the way out.
     pub(crate) fn rpc_snapshot(&self, client_id: ClientId) -> StateSnapshot {
-        self.rpc_snapshot_inner(client_id, true)
+        self.rpc_snapshot_inner(client_id, SnapshotScope::Attach)
     }
 
     pub(crate) fn rpc_projection_state(&self, client_id: ClientId) -> StateSnapshot {
-        self.rpc_snapshot_inner(client_id, false)
+        self.rpc_snapshot_inner(client_id, SnapshotScope::Diff)
     }
 
-    fn rpc_snapshot_inner(&self, client_id: ClientId, include_history: bool) -> StateSnapshot {
+    fn rpc_snapshot_inner(&self, client_id: ClientId, scope: SnapshotScope) -> StateSnapshot {
         let issue = self
             .rpc_server_selection_issue
             .as_ref()
@@ -160,12 +215,9 @@ impl App {
                 },
             })
             .collect();
-        let room = selected_room.map(|room_id| {
-            if include_history {
-                self.rpc_room_snapshot(room_id)
-            } else {
-                self.rpc_room_projection(room_id)
-            }
+        let room = selected_room.map(|room_id| match scope {
+            SnapshotScope::Attach => self.rpc_room_snapshot(room_id),
+            SnapshotScope::Diff => self.rpc_room_projection(room_id),
         });
         let mut live_shares = self
             .room
@@ -211,11 +263,180 @@ impl App {
                 output_volume: self.config.audio.output_volume,
                 joined_room: self.room.voice_room,
             },
+            voice_roster: match scope {
+                SnapshotScope::Attach => self.voice_roster.roster.clone(),
+                SnapshotScope::Diff => None,
+            },
             transfers: selected_room.map_or_else(Vec::new, |room_id| {
                 self.room.rpc_transfer_summaries(room_id)
             }),
             live_shares,
         }
+    }
+
+    /// Recomputes the call roster renderers see, in place, and records what
+    /// changed since the last time a change was drained.
+    ///
+    /// The roster is one value shared by every attached renderer, so it is
+    /// projected once here rather than rebuilt per client per event. Diffing in
+    /// place is also what makes the change set meaningful: a member starting to
+    /// speak marks one row dirty instead of making the whole roster compare
+    /// unequal.
+    ///
+    /// Keyed off the joined voice room rather than the viewed one: a renderer
+    /// draws the call it is in even while the user reads another room.
+    pub(crate) fn refresh_voice_roster(&mut self, now: Instant) {
+        // Nothing to project for: an unattached daemon should not pay for a
+        // roster nobody reads, and the stale expiry deadline below would
+        // otherwise keep waking the tick.
+        let room_id = self
+            .room
+            .voice_room
+            .filter(|_| !self.rpc_clients.is_empty());
+        let Some(room_id) = room_id else {
+            self.voice_roster.clear();
+            return;
+        };
+
+        // `rebuild_roster` keys `participants` on `voice_room.or(viewed_room)`,
+        // so while a call is joined this collection *is* that call's roster and
+        // can be read directly rather than snapshotted.
+        let participants = &self.room.participants.entries;
+        let local_user = self.room.local_user;
+        let VoiceRosterProjection {
+            roster,
+            reset,
+            dirty,
+            order,
+            expires_at,
+        } = &mut self.voice_roster;
+
+        order.clear();
+        order.extend(
+            participants
+                .iter()
+                .enumerate()
+                .filter(|(_, participant)| participant.voice_active)
+                .map(|(index, _)| index),
+        );
+        // Storage order is the lobby's display order, which sorts on
+        // `p2p_direct` among other volatile facts; the wire order is by user id.
+        order.sort_unstable_by_key(|index| participants[*index].user_id);
+        *expires_at = order
+            .iter()
+            .filter_map(|index| participants[*index].feedback_expires_at())
+            .min();
+
+        if roster.as_ref().map(|roster| roster.room_id) != Some(room_id) {
+            *reset = true;
+        }
+        let roster = roster.get_or_insert_with(|| VoiceRoster {
+            room_id,
+            members: Vec::new(),
+        });
+        roster.room_id = room_id;
+        if roster.members.len() > order.len() {
+            roster.members.truncate(order.len());
+            *reset = true;
+        }
+
+        for (slot, index) in order.iter().enumerate() {
+            let participant = &participants[*index];
+            let user_id = participant.user_id;
+            let is_local = Some(user_id) == local_user;
+            let status = participant_voice_status(participant, now);
+            let Some(member) = roster.members.get_mut(slot) else {
+                *reset = true;
+                roster.members.push(VoiceMember {
+                    user_id,
+                    name: participant.username().to_string(),
+                    is_local,
+                    // A row is only stamped once canonical occupancy places it
+                    // in the call, and a stream can arrive first; stamp it here
+                    // rather than report an epoch timestamp.
+                    joined_ms: participant.call_since_ms.unwrap_or_else(super::unix_now_ms),
+                    status,
+                });
+                continue;
+            };
+            if member.user_id != user_id || member.is_local != is_local {
+                *reset = true;
+                member.user_id = user_id;
+                member.is_local = is_local;
+            }
+            // Only a real stamp overwrites the projected one. Re-deriving the
+            // fallback each time would re-read the wall clock and make an
+            // otherwise unchanged roster reset on every projection.
+            if let Some(joined_ms) = participant.call_since_ms
+                && member.joined_ms != joined_ms
+            {
+                *reset = true;
+                member.joined_ms = joined_ms;
+            }
+            if member.name != participant.username() {
+                *reset = true;
+                member.name.clear();
+                member.name.push_str(participant.username());
+            }
+            if member.status != status {
+                member.status = status;
+                if let Err(slot) = dirty.binary_search(&user_id) {
+                    dirty.insert(slot, user_id);
+                }
+            }
+        }
+    }
+
+    /// Drains the roster change accumulated since the last call, as the frame
+    /// that carries it.
+    ///
+    /// Accumulating rather than reporting per refresh is what lets
+    /// [`Self::refresh_voice_roster`] run more than once between broadcasts: a
+    /// change is only forgotten once it has been handed to a sender.
+    pub(crate) fn take_voice_roster_delta(&mut self) -> Option<StateDelta> {
+        let projection = &mut self.voice_roster;
+        if std::mem::take(&mut projection.reset) {
+            projection.dirty.clear();
+            return Some(StateDelta::VoiceRosterReset {
+                roster: projection.roster.clone(),
+            });
+        }
+        if projection.dirty.is_empty() {
+            return None;
+        }
+        let members = projection
+            .roster
+            .as_ref()
+            .map_or(&[][..], |roster| &roster.members);
+        let updates = projection
+            .dirty
+            .drain(..)
+            .filter_map(|user_id| {
+                let member = members.iter().find(|member| member.user_id == user_id)?;
+                Some(VoiceMemberUpdate {
+                    user_id,
+                    status: member.status,
+                })
+            })
+            .collect::<Vec<_>>();
+        (!updates.is_empty()).then_some(StateDelta::VoiceMembersUpdated { updates })
+    }
+
+    /// Whether the pending change is a membership one.
+    ///
+    /// Such a change must travel with a fresh projection, because a renderer
+    /// validates the roster's room against [`VoiceSessionState::joined_room`]:
+    /// a reset that arrived ahead of the session change that explains it would
+    /// read as divergence and force a resync.
+    pub(crate) fn voice_roster_reset_pending(&self) -> bool {
+        self.voice_roster.reset
+    }
+
+    /// When a displayed latency figure goes stale, so the runtime can schedule
+    /// the refresh that clears it. Without this a value already on a renderer
+    /// would stay there until something unrelated happened to project.
+    pub(crate) fn voice_roster_expires_at(&self) -> Option<Instant> {
+        self.voice_roster.expires_at
     }
 
     pub(crate) fn start_rpc_live_share(
@@ -1120,6 +1341,39 @@ pub(crate) fn rpc_live_share_status(
     }
 }
 
+/// One roster row's volatile half, as of `now`.
+///
+/// The latency figures are the only place a renderer sees a reception report,
+/// so they are quantized here: an unrounded EWMA would mark the row dirty on
+/// every feedback window for a change no one can see.
+fn participant_voice_status(participant: &ParticipantState, now: Instant) -> VoiceMemberStatus {
+    let (inbound, outbound) = participant.fresh_feedback(now);
+    let rtt_ms = participant.peer_rtt_ms;
+    let latency = |feedback: Option<_>| {
+        feedback.map(|feedback| quantize_ms(participant_latency_estimate_ms(&feedback, rtt_ms)))
+    };
+    VoiceMemberStatus {
+        voice_state: rpc_voice_state(participant.voice_state),
+        speaking: participant.talking_display,
+        p2p_direct: participant.p2p_direct,
+        inbound_latency_ms: latency(inbound),
+        outbound_latency_ms: latency(outbound),
+    }
+}
+
+/// Rounds a millisecond figure to the nearest [`LATENCY_QUANTUM_MS`].
+///
+/// The voice roster is diffed by equality, so an unrounded EWMA would emit a
+/// delta on every feedback window for a change no one can see.
+fn quantize_ms(value: u16) -> u16 {
+    let quantum = LATENCY_QUANTUM_MS;
+    (value.saturating_add(quantum / 2) / quantum).saturating_mul(quantum)
+}
+
+/// Resolution the roster reports latency at. Fine enough to tell a good link
+/// from a bad one, coarse enough that jitter alone never emits a delta.
+const LATENCY_QUANTUM_MS: u16 = 5;
+
 fn rpc_voice_state(state: rpc::control::VoiceState) -> VoiceState {
     match state {
         rpc::control::VoiceState::Live => VoiceState::Live,
@@ -1197,6 +1451,8 @@ fn rejected(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use rpc::{
         control::{RoomInfo, RoomKind as WireRoomKind, UserSummary, VoiceState},
@@ -1215,6 +1471,251 @@ mod tests {
             ..Default::default()
         });
         App::new(config, None).unwrap()
+    }
+
+    /// Rounding is what keeps a drifting EWMA from emitting a roster delta per
+    /// feedback window, so it must round to nearest rather than truncate.
+    #[test]
+    fn latency_quantization_rounds_to_the_nearest_step() {
+        assert_eq!(quantize_ms(0), 0);
+        assert_eq!(quantize_ms(2), 0);
+        assert_eq!(quantize_ms(3), 5);
+        assert_eq!(quantize_ms(87), 85);
+        assert_eq!(quantize_ms(88), 90);
+        assert_eq!(quantize_ms(u16::MAX), u16::MAX / 5 * 5);
+    }
+
+    const CALL_ROOM: RoomId = RoomId(1);
+
+    fn roster_seed(user_id: UserId, username: String) -> crate::app::participants::RosterSeed {
+        crate::app::participants::RosterSeed {
+            user: UserSummary {
+                user_id,
+                username,
+                online: true,
+                connected_at_ms: 0,
+                voice_state: VoiceState::default(),
+            },
+            in_call: true,
+            away_since: None,
+        }
+    }
+
+    /// An app with one attached renderer, in a call with `names` and everyone
+    /// else, streaming so reception reports can land.
+    fn app_in_call(names: &[&str]) -> App {
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
+        app.rpc_clients.insert(ClientId(1));
+        app.room.voice_room = Some(CALL_ROOM);
+        app.room.local_user = Some(UserId(1));
+        let seeds = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| roster_seed(UserId(index as u64 + 1), (*name).to_string()))
+            .collect();
+        app.room.participants.replace_room(Some(CALL_ROOM), seeds);
+        for index in 0..names.len() {
+            let user_id = UserId(index as u64 + 1);
+            app.room
+                .participants
+                .voice_started(user_id, rpc::ids::StreamId(index as u32 + 1));
+        }
+        app
+    }
+
+    fn feedback_window(
+        stream_id: u32,
+        playout_delay_ms: u16,
+    ) -> crate::audio::LivePlaybackFeedback {
+        crate::audio::LivePlaybackFeedback {
+            stream_id,
+            highest_contiguous_sequence: 0,
+            expected_packets: 25,
+            lost_packets: 0,
+            late_packets: 0,
+            duplicate_packets: 0,
+            reordered_packets: 0,
+            window_ms: 500,
+            max_output_ring_ms: 0,
+            max_neteq_target_ms: playout_delay_ms,
+            max_neteq_playout_delay_ms: playout_delay_ms,
+            max_neteq_packet_buffer_ms: 0,
+            max_interarrival_jitter_ms: 0,
+        }
+    }
+
+    fn roster_of(app: &App) -> &[VoiceMember] {
+        app.voice_roster
+            .roster
+            .as_ref()
+            .map_or(&[][..], |roster| &roster.members)
+    }
+
+    /// No call means no roster, whatever the viewed room holds — the panel a
+    /// renderer draws belongs to the call, not to what is on screen.
+    #[test]
+    fn no_voice_room_projects_no_roster() {
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
+        app.rpc_clients.insert(ClientId(1));
+        assert!(app.room.voice_room.is_none());
+
+        app.refresh_voice_roster(Instant::now());
+        assert!(app.voice_roster.roster.is_none());
+        assert!(app.take_voice_roster_delta().is_none());
+    }
+
+    /// The renderer bound must not be tighter than the call the rest of the
+    /// system admits: the server accepts `MAX_CLIENTS` and neither the voice
+    /// relay nor room admission narrows that, so a full house forms a valid call
+    /// this protocol has to be able to carry.
+    #[test]
+    fn the_largest_call_the_server_admits_projects_and_encodes() {
+        assert!(local_rpc::MAX_VOICE_MEMBERS >= server::MAX_CLIENTS);
+
+        let names = (0..server::MAX_CLIENTS)
+            .map(|index| format!("{index:0>width$}", width = local_rpc::MAX_USERNAME_BYTES))
+            .collect::<Vec<_>>();
+        let mut app = App::new(crate::config::Config::default(), None).unwrap();
+        app.rpc_clients.insert(ClientId(1));
+        app.room.voice_room = Some(CALL_ROOM);
+        app.room.local_user = Some(UserId(1));
+        let seeds = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| roster_seed(UserId(index as u64 + 1), name.clone()))
+            .collect();
+        app.room.participants.replace_room(Some(CALL_ROOM), seeds);
+        app.refresh_voice_roster(Instant::now());
+        assert_eq!(roster_of(&app).len(), server::MAX_CLIENTS);
+
+        let snapshot = app.rpc_snapshot(ClientId(1));
+        assert_eq!(
+            snapshot
+                .voice_roster
+                .as_ref()
+                .map(|roster| roster.members.len()),
+            Some(server::MAX_CLIENTS)
+        );
+        local_rpc::frame::encode_daemon(&local_rpc::frame::DaemonFrame::Snapshot {
+            instance_id: local_rpc::model::DaemonInstanceId([7; 16]),
+            event_seq: 1,
+            snapshot,
+        })
+        .expect("a full house must fit in one frame");
+    }
+
+    /// Feedback arrives on its own cadence, so waiting for a speaking edge to
+    /// carry it means a quiet call never reports latency at all.
+    #[test]
+    fn a_feedback_window_reaches_renderers_without_a_speaking_edge() {
+        let mut app = app_in_call(&["alice", "bob"]);
+        let now = Instant::now();
+        app.refresh_voice_roster(now);
+        assert!(matches!(
+            app.take_voice_roster_delta(),
+            Some(StateDelta::VoiceRosterReset { .. })
+        ));
+        assert!(roster_of(&app).iter().all(|member| !member.status.speaking));
+
+        app.room.participants.voice_feedback(feedback_window(2, 90));
+        app.refresh_voice_roster(now);
+
+        let Some(StateDelta::VoiceMembersUpdated { updates }) = app.take_voice_roster_delta()
+        else {
+            panic!("a feedback window must reach renderers on its own");
+        };
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].user_id, UserId(2));
+        assert_eq!(updates[0].status.inbound_latency_ms, Some(90));
+        assert!(!updates[0].status.speaking);
+    }
+
+    /// A figure that has aged out has to be taken back off the renderer. The
+    /// deadline is what schedules the refresh that does it.
+    #[test]
+    fn stale_feedback_expires_to_none_on_its_own_deadline() {
+        let mut app = app_in_call(&["alice", "bob"]);
+        let now = Instant::now();
+        app.room.participants.voice_feedback(feedback_window(2, 90));
+        app.refresh_voice_roster(now);
+        app.take_voice_roster_delta();
+        assert_eq!(roster_of(&app)[1].status.inbound_latency_ms, Some(90));
+
+        let expires_at = app
+            .voice_roster_expires_at()
+            .expect("a displayed figure must schedule its own expiry");
+        assert!(expires_at > now);
+
+        app.refresh_voice_roster(expires_at + Duration::from_millis(1));
+        let Some(StateDelta::VoiceMembersUpdated { updates }) = app.take_voice_roster_delta()
+        else {
+            panic!("expiry must reach renderers");
+        };
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].user_id, UserId(2));
+        assert_eq!(updates[0].status.inbound_latency_ms, None);
+    }
+
+    /// The whole point of projecting once and diffing in place: an unchanged
+    /// call must not produce a frame, however often it is projected.
+    #[test]
+    fn repeated_projections_of_an_unchanged_call_report_nothing() {
+        let mut app = app_in_call(&["alice", "bob"]);
+        let now = Instant::now();
+        app.refresh_voice_roster(now);
+        let first = app.take_voice_roster_delta();
+        assert!(first.is_some());
+        let members = roster_of(&app).to_vec();
+
+        for _ in 0..4 {
+            app.refresh_voice_roster(now);
+            assert!(app.take_voice_roster_delta().is_none());
+        }
+        assert_eq!(roster_of(&app), members.as_slice());
+    }
+
+    /// A stream can arrive before the occupancy that stamps the join clock, so
+    /// the projection has to stamp such a row itself — once. Re-deriving it
+    /// would re-read the wall clock and reset the whole roster every 50 ms.
+    #[test]
+    fn a_row_stamped_by_the_projection_holds_its_join_time() {
+        let mut app = app_in_call(&["alice"]);
+        app.room
+            .participants
+            .voice_started(UserId(2), rpc::ids::StreamId(2));
+        app.refresh_voice_roster(Instant::now());
+        app.take_voice_roster_delta();
+
+        let stamped = roster_of(&app)[1].joined_ms;
+        assert!(stamped > 0);
+        for _ in 0..4 {
+            // The wall clock must be seen to move, or re-deriving the fallback
+            // would land on the same millisecond and look stable.
+            std::thread::sleep(Duration::from_millis(2));
+            app.refresh_voice_roster(Instant::now());
+            assert!(app.take_voice_roster_delta().is_none());
+        }
+        assert_eq!(roster_of(&app)[1].joined_ms, stamped);
+    }
+
+    /// Leaving takes the roster away rather than leaving the last one up, and
+    /// the snapshot's roster and joined call must agree at every step or the
+    /// frame will not encode.
+    #[test]
+    fn leaving_the_call_clears_the_roster_and_keeps_the_snapshot_valid() {
+        let mut app = app_in_call(&["alice", "bob"]);
+        app.refresh_voice_roster(Instant::now());
+        app.take_voice_roster_delta();
+        app.rpc_snapshot(ClientId(1)).validate().unwrap();
+
+        app.room.voice_room = None;
+        app.refresh_voice_roster(Instant::now());
+
+        assert!(matches!(
+            app.take_voice_roster_delta(),
+            Some(StateDelta::VoiceRosterReset { roster: None })
+        ));
+        app.rpc_snapshot(ClientId(1)).validate().unwrap();
     }
 
     #[test]

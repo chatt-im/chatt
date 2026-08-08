@@ -601,12 +601,14 @@ fn take_rights(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
         let control_len = msg.msg_controllen;
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let control_len = msg.msg_controllen as usize;
-        let control_end = control_start.checked_add(control_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ancillary buffer range overflow",
-            )
-        })?;
+        let control_end = control_start
+            .checked_add(control_len as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ancillary buffer range overflow",
+                )
+            })?;
         let mut cmsg = libc::CMSG_FIRSTHDR(msg);
         while !cmsg.is_null() {
             let cmsg_start = cmsg as usize;

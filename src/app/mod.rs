@@ -85,7 +85,9 @@ use pairing::{PairingCoordinator, PairingInput, PairingJob, RetainedTicket};
 use shared::CoreRw;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
-pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
+pub(crate) use participants::{
+    ParticipantState, ParticipantVoiceFeedback, Participants, participant_latency_estimate_ms,
+};
 pub(crate) use room::{
     ComposerSubmission, DeleteSelection, HistoryChange, RoomSession, ToggleExpandResult,
 };
@@ -405,6 +407,7 @@ pub(crate) struct App {
     events: AppEvents,
     clients: HashMap<crate::client_channel::ClientId, ClientHandle>,
     rpc_clients: HashSet<crate::client_channel::ClientId>,
+    voice_roster: frontend::VoiceRosterProjection,
     command_client: crate::client_channel::ClientId,
     quit_requested: bool,
     /// Advances when configuration mirrored into attached terminal views changes.
@@ -1566,6 +1569,7 @@ impl App {
             events,
             clients: HashMap::new(),
             rpc_clients: HashSet::new(),
+            voice_roster: frontend::VoiceRosterProjection::default(),
             command_client: crate::client_channel::ClientId::PRIMARY,
             quit_requested: false,
             daemon_config_generation: 0,
@@ -6317,6 +6321,13 @@ impl App {
         if self.sync_daemon_config_if_changed() {
             dirty |= DirtySections::ALL;
         }
+        // Talking state and the reception reports behind the roster's latency
+        // figures are both derived from audio statistics here rather than from
+        // an event, and the events that carry them arrive per packet and are
+        // deliberately kept off the projection path. Refreshing on the tick is
+        // what turns those into something a renderer sees, and it is also what
+        // keeps `voice_roster_expires_at` current for the timeout below.
+        self.refresh_voice_roster(now);
         dirty
     }
 
@@ -6345,6 +6356,7 @@ impl App {
             self.active_audio_report
                 .as_ref()
                 .map(|report| report.deadline),
+            self.voice_roster_expires_at(),
         ];
         let mut timeout = TICK_IDLE_INTERVAL;
         for deadline in deadlines.into_iter().flatten() {

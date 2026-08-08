@@ -2,7 +2,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rpc::{
     control::{UserSummary, VoiceState},
-    ids::{StreamId, UserId},
+    ids::{RoomId, StreamId, UserId},
 };
 
 use crate::audio::LivePlaybackFeedback;
@@ -34,6 +34,18 @@ pub(crate) struct ParticipantState {
     /// the true age, while away it is stamped locally when the offline
     /// transition is observed. Backs the lobby age column.
     pub(crate) presence_since: Option<Instant>,
+    /// UNIX milliseconds at which this participant's current call membership
+    /// began, or `None` while they are not in the call. Distinct from
+    /// [`Self::presence_since`], which tracks server presence: a user can be
+    /// online for hours before joining a call. Stamped only from canonical
+    /// occupancy in [`Participants::upsert`], never from stream start/stop, so
+    /// a mid-call stream restart does not restart the clock.
+    ///
+    /// Absolute rather than an [`Instant`] because its only consumer reports it
+    /// as an absolute timestamp. Deriving one from a monotonic clock re-samples
+    /// two clocks whose fractional phases differ, which made an unchanged
+    /// roster alternate by a millisecond and compare unequal.
+    pub(crate) call_since_ms: Option<u64>,
     pub(crate) active_stream: Option<StreamId>,
     /// Inbound (this user -> me) reception estimate, measured locally from my
     /// NetEQ decode of their stream.
@@ -60,6 +72,42 @@ impl ParticipantState {
         self.username.as_deref().unwrap_or(UNKNOWN_NAME)
     }
 
+    /// The reception reports fresh enough to report at `now`, as
+    /// `(inbound, outbound)`.
+    ///
+    /// Inbound additionally requires live call membership: a report left over
+    /// from a stopped stream describes audio that is no longer arriving.
+    ///
+    /// `now` is a parameter rather than read here so expiry can be exercised
+    /// without waiting out [`VOICE_FEEDBACK_FRESHNESS`].
+    pub(crate) fn fresh_feedback(
+        &self,
+        now: Instant,
+    ) -> (
+        Option<ParticipantVoiceFeedback>,
+        Option<ParticipantVoiceFeedback>,
+    ) {
+        let fresh = |feedback: &ParticipantVoiceFeedback| {
+            now.saturating_duration_since(feedback.updated_at) <= VOICE_FEEDBACK_FRESHNESS
+        };
+        (
+            self.voice_feedback
+                .filter(|feedback| self.voice_active && fresh(feedback)),
+            self.outbound_feedback.filter(fresh),
+        )
+    }
+
+    /// When the reports [`Self::fresh_feedback`] would return stop being fresh,
+    /// so a caller that displays them can schedule the update that clears them.
+    pub(crate) fn feedback_expires_at(&self) -> Option<Instant> {
+        let inbound = self.voice_feedback.filter(|_| self.voice_active);
+        [inbound, self.outbound_feedback]
+            .into_iter()
+            .flatten()
+            .map(|feedback| feedback.updated_at + VOICE_FEEDBACK_FRESHNESS)
+            .min()
+    }
+
     /// A bare online, in-voice roster row with no feedback, for rendering tests in
     /// sibling modules that cannot name this struct's private fields.
     #[cfg(test)]
@@ -74,6 +122,7 @@ impl ParticipantState {
             last_talking_at: None,
             p2p_direct: false,
             presence_since: None,
+            call_since_ms: None,
             active_stream: None,
             voice_feedback: None,
             outbound_feedback: None,
@@ -109,6 +158,26 @@ pub(crate) struct ParticipantVoiceFeedback {
     pub(crate) jitter_buffer_ms: u16,
     pub(crate) updated_at: Instant,
 }
+
+/// Combines the stabilized jitter-buffer depth (an EWMA of the NetEQ target that
+/// holds steady through silence), the output device ring, and one-way network
+/// latency (half the measured RTT) into a single latency figure in milliseconds.
+///
+/// Lives here rather than in a renderer because both the TUI's lobby and the
+/// local-RPC projection report this number, and they must agree.
+pub(crate) fn participant_latency_estimate_ms(
+    feedback: &ParticipantVoiceFeedback,
+    rtt_ms: Option<u16>,
+) -> u16 {
+    feedback
+        .jitter_buffer_ms
+        .saturating_add(feedback.max_output_ring_ms)
+        .saturating_add(rtt_ms.unwrap_or(0) / 2)
+}
+
+/// How long a reception report stays worth showing. Past this the link has gone
+/// quiet and the last window says nothing about the present.
+pub(crate) const VOICE_FEEDBACK_FRESHNESS: Duration = Duration::from_secs(10);
 
 /// Folds one reception-report window into a directional latency slot: updates the
 /// stabilized jitter-buffer EWMA (`jitter_buffer_ms`) on active windows and writes
@@ -154,6 +223,11 @@ fn fold_participant_feedback(
 
 #[derive(Clone, Default)]
 pub(crate) struct Participants {
+    /// The room these rows describe. Every transient field below — the call
+    /// clock, the active stream, the reception reports, the talking indicator —
+    /// only means something about one call, so the room is part of the roster's
+    /// identity rather than context the caller is trusted to remember.
+    room: Option<RoomId>,
     pub(crate) entries: Vec<ParticipantState>,
     pub(crate) scroll: usize,
     pub(crate) selected_user: Option<UserId>,
@@ -174,10 +248,19 @@ fn instant_from_server_ms(joined_at_ms: u64) -> Instant {
 }
 
 impl Participants {
-    /// Rebuilds the roster for a newly viewed room, keeping the transient
-    /// voice display state (streams, feedback, talking) of users that remain.
-    pub(crate) fn replace_room(&mut self, seeds: Vec<RosterSeed>) {
+    /// Rebuilds the roster for `room`, keeping the transient voice display
+    /// state (streams, feedback, talking) of users that remain.
+    ///
+    /// Retention is scoped to one room. A user can be in two calls at once
+    /// through linked sessions, so carrying their row across a room change
+    /// would show one call's join age, transport, and talking state under
+    /// another's.
+    pub(crate) fn replace_room(&mut self, room: Option<RoomId>, seeds: Vec<RosterSeed>) {
         let selected_user = self.selected_user;
+        if self.room != room {
+            self.room = room;
+            self.entries.clear();
+        }
         self.entries
             .retain(|entry| seeds.iter().any(|seed| seed.user.user_id == entry.user_id));
         for seed in seeds {
@@ -202,6 +285,16 @@ impl Participants {
             .find(|entry| entry.user_id == user.user_id)
         {
             let was_online = existing.online;
+            // Only the false -> true edge stamps the call clock. Occupancy
+            // snapshots re-seed every member on arrival, so stamping
+            // unconditionally would restart everyone's timer each time one.
+            if in_call {
+                if !existing.voice_active {
+                    existing.call_since_ms = Some(super::unix_now_ms());
+                }
+            } else {
+                existing.call_since_ms = None;
+            }
             existing.username = Some(user.username);
             existing.online = online;
             existing.voice_active = in_call;
@@ -243,6 +336,7 @@ impl Participants {
                 last_talking_at: None,
                 p2p_direct: false,
                 presence_since: Some(presence_since),
+                call_since_ms: in_call.then(super::unix_now_ms),
                 active_stream: None,
                 voice_feedback: None,
                 outbound_feedback: None,
@@ -417,6 +511,7 @@ impl Participants {
             last_talking_at: None,
             p2p_direct: false,
             presence_since: None,
+            call_since_ms: None,
             active_stream: None,
             voice_feedback: None,
             outbound_feedback: None,
@@ -489,6 +584,8 @@ impl Participants {
 mod tests {
     use super::*;
 
+    const TEST_ROOM: RoomId = RoomId(1);
+
     fn participant(user_id: UserId) -> RosterSeed {
         RosterSeed {
             user: UserSummary {
@@ -528,7 +625,7 @@ mod tests {
     #[test]
     fn jitter_buffer_estimate_holds_through_silence() {
         let mut participants = Participants::default();
-        participants.replace_room(vec![participant(UserId(1))]);
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
         participants.voice_started(UserId(1), StreamId(7));
 
         // An active window seeds the stabilized jitter buffer at the target.
@@ -567,7 +664,7 @@ mod tests {
     #[test]
     fn outbound_feedback_estimate_holds_through_silence() {
         let mut participants = Participants::default();
-        participants.replace_room(vec![participant(UserId(1))]);
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
         participants.voice_started(UserId(1), StreamId(7));
 
         // An active report seeds the outbound stabilized jitter buffer.
@@ -606,7 +703,10 @@ mod tests {
         // The smear-bug regression: in a >2 call, two listeners reporting on my
         // stream must each update their own row, not collapse together.
         let mut participants = Participants::default();
-        participants.replace_room(vec![participant(UserId(1)), participant(UserId(2))]);
+        participants.replace_room(
+            Some(TEST_ROOM),
+            vec![participant(UserId(1)), participant(UserId(2))],
+        );
 
         participants.outbound_feedback(UserId(1), live_feedback(50, 25, 60));
         participants.outbound_feedback(UserId(2), live_feedback(50, 25, 180));
@@ -628,7 +728,7 @@ mod tests {
     #[test]
     fn outbound_feedback_cleared_on_voice_stopped() {
         let mut participants = Participants::default();
-        participants.replace_room(vec![participant(UserId(1))]);
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
         participants.voice_started(UserId(1), StreamId(7));
         participants.outbound_feedback(UserId(1), live_feedback(99, 25, 80));
         assert!(participants.entries[0].outbound_feedback.is_some());
@@ -641,7 +741,7 @@ mod tests {
     #[test]
     fn transport_change_clears_peer_rtt_in_both_directions() {
         let mut participants = Participants::default();
-        participants.replace_room(vec![participant(UserId(1))]);
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
 
         participants.set_peer_rtt(UserId(1), Some(40));
         participants.set_peer_transport(UserId(1), true);
@@ -659,10 +759,82 @@ mod tests {
         assert_eq!(participants.entries[0].peer_rtt_ms, None);
     }
 
+    /// Occupancy snapshots re-seed the whole roster whenever anything about the
+    /// room changes, so a member's call clock must survive re-seeding untouched.
+    #[test]
+    fn the_call_clock_starts_once_and_survives_reseeding() {
+        let mut participants = Participants::default();
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
+        let started = participants.entries[0].call_since_ms;
+        assert!(started.is_some());
+
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
+        assert_eq!(participants.entries[0].call_since_ms, started);
+
+        // Nor does a stream restart within the call disturb it: that is a
+        // transport event, not a membership one.
+        participants.voice_started(UserId(1), StreamId(7));
+        participants.voice_stopped(UserId(1), StreamId(7));
+        participants.voice_started(UserId(1), StreamId(8));
+        assert_eq!(participants.entries[0].call_since_ms, started);
+    }
+
+    #[test]
+    fn leaving_the_call_clears_the_clock_and_rejoining_restarts_it() {
+        let mut participants = Participants::default();
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
+        let started = participants.entries[0].call_since_ms.unwrap();
+
+        let mut left = participant(UserId(1));
+        left.in_call = false;
+        left.away_since = Some(Instant::now());
+        participants.replace_room(Some(TEST_ROOM), vec![left]);
+        assert_eq!(participants.entries[0].call_since_ms, None);
+
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
+        // The stamp is millisecond-resolution wall clock, so a rejoin within the
+        // same millisecond legitimately reproduces it; what must hold is that
+        // the clock was cleared and restamped, not that the value moved.
+        assert!(participants.entries[0].call_since_ms.unwrap() >= started);
+    }
+
+    /// A user can be in two calls at once through linked sessions. Their row
+    /// carries a join age, a transport, and reception reports that describe one
+    /// of those calls, so none of it may follow them into the other.
+    #[test]
+    fn switching_rooms_restarts_the_call_state_of_a_user_in_both() {
+        let mut participants = Participants::default();
+        participants.replace_room(
+            Some(RoomId(1)),
+            vec![participant(UserId(1)), participant(UserId(2))],
+        );
+        participants.voice_started(UserId(1), StreamId(7));
+        participants.set_peer_transport(UserId(1), true);
+        participants.voice_feedback(live_feedback(7, 25, 80));
+        let started = participants.entries[0].call_since_ms.unwrap();
+
+        participants.replace_room(Some(RoomId(2)), vec![participant(UserId(1))]);
+
+        let row = &participants.entries[0];
+        assert_eq!(row.user_id, UserId(1));
+        assert!(row.call_since_ms.unwrap() >= started);
+        assert_eq!(row.active_stream, None);
+        assert!(!row.p2p_direct);
+        assert!(row.voice_feedback.is_none());
+        assert!(row.outbound_feedback.is_none());
+        assert_eq!(row.peer_rtt_ms, None);
+        assert!(!row.talking_display);
+        assert_eq!(
+            participants.entries.len(),
+            1,
+            "the other call's members must not linger"
+        );
+    }
+
     #[test]
     fn unknown_peer_rtt_clears_previous_measurement() {
         let mut participants = Participants::default();
-        participants.replace_room(vec![participant(UserId(1))]);
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
 
         participants.set_peer_rtt(UserId(1), Some(40));
         participants.set_peer_rtt(UserId(1), None);
@@ -727,7 +899,7 @@ mod tests {
     #[test]
     fn talking_display_uses_release_hold() {
         let mut participants = Participants::default();
-        participants.replace_room(vec![participant(UserId(1))]);
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
         let now = Instant::now();
 
         assert!(participants.update_talking_display(
@@ -786,7 +958,7 @@ mod tests {
     #[test]
     fn muted_status_clears_talking_display_immediately() {
         let mut participants = Participants::default();
-        participants.replace_room(vec![participant(UserId(1))]);
+        participants.replace_room(Some(TEST_ROOM), vec![participant(UserId(1))]);
         let now = Instant::now();
         participants.update_talking_display(UserId(1), true, now, Duration::from_millis(200));
 

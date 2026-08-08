@@ -113,7 +113,11 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 /// reserving one of the relay's unauthenticated-lane permits, so a handed-over
 /// connection is never unbudgeted — not even while queued between the threads.
 /// Worst-case fds are `MAX_CLIENTS` plus the relay's lane caps.
-const MAX_CLIENTS: usize = 1024;
+///
+/// Public because it is also the largest call the rest of the system can
+/// produce: nothing narrows it between here and a renderer's roster, so a
+/// downstream limit that disagrees is a limit on valid calls.
+pub const MAX_CLIENTS: usize = 1024;
 /// Connections accepted but not yet through classification, handshake, and
 /// auth. Budgeted separately from [`MAX_CLIENTS`] so a flood of half-open
 /// peers can only exhaust its own class: established sessions keep the

@@ -598,7 +598,23 @@ fn run_app_inner(
                 daemon_instance,
             );
         }
-        dirty |= app.tick();
+        let ticked = app.tick();
+        // The tick is where the call roster picks up talking state and voice
+        // telemetry, so it is also where a renderer learns of them. A talk
+        // spurt changes one row and nothing else in the snapshot, so it takes
+        // the roster-only path: rebuilding every attached client's whole
+        // projection at speaking-edge rate is the cost this split exists to
+        // avoid. Membership changes and the tick's own escalating sources still
+        // go the full way — a roster reset has to travel alongside the session
+        // state a renderer validates it against.
+        if !rpc_clients.is_empty() {
+            if ticked.contains(DirtySections::ALL) || app.voice_roster_reset_pending() {
+                broadcast_rpc_snapshots(&mut app, &mut rpc_clients, daemon_instance);
+            } else {
+                broadcast_rpc_voice_roster(&mut app, &mut rpc_clients, daemon_instance);
+            }
+        }
+        dirty |= ticked;
         broadcast_rpc_settings_events(&app, &mut rpc_clients, Instant::now());
         broadcast_rpc_appearance_events(&app, &mut rpc_clients);
         broadcast_rpc_identity_events(&mut app, &mut rpc_clients);
@@ -969,6 +985,10 @@ fn spawn_rpc_client(
         }
     };
     app.register_rpc_client(id);
+    // The roster projection is skipped while nothing is attached, so the first
+    // client has to build it before reading it — an attach snapshot whose roster
+    // disagreed with the joined call would fail validation on the way out.
+    app.refresh_voice_roster(Instant::now());
     let snapshot = app.rpc_snapshot(id);
     let mut limits = NegotiatedLimits::default();
     limits.upload_bytes = app.config.files.max_upload_bytes();
@@ -1166,11 +1186,12 @@ fn rpc_writer_loop(
 }
 
 fn send_rpc_snapshot(
-    app: &App,
+    app: &mut App,
     id: ClientId,
     client: &mut RemoteRpcClient,
     instance_id: DaemonInstanceId,
 ) -> Result<(), String> {
+    app.refresh_voice_roster(Instant::now());
     let seq = client.next_event_seq;
     let snapshot = app.rpc_snapshot(id);
     let mut snapshot = client.sender.send_snapshot(instance_id, seq, snapshot)?;
@@ -1185,15 +1206,52 @@ fn send_rpc_snapshot(
 }
 
 fn broadcast_rpc_snapshots(
-    app: &App,
+    app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     instance_id: DaemonInstanceId,
 ) {
+    app.refresh_voice_roster(Instant::now());
+    // Drained once for the whole broadcast: every attached renderer is in step
+    // with the same projection, so they all owe the same change.
+    let roster = app.take_voice_roster_delta();
     let mut failed = Vec::new();
     for (id, client) in clients.iter_mut() {
-        if let Err(error) = sync_rpc_state(app, *id, client, instance_id) {
+        if let Err(error) = sync_rpc_state(app, *id, client, instance_id, roster.as_ref()) {
             kvlog::error!(
                 "could not send daemon RPC state update",
+                client_id = id.0,
+                error = %error
+            );
+            failed.push(*id);
+        }
+    }
+    for id in failed {
+        if let Some(client) = clients.get(&id) {
+            let _ = client.control.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// Sends the roster change and nothing else.
+///
+/// The path a talk spurt takes. It skips `rpc_projection_state` entirely, which
+/// is the point: a speaking edge is sampled every 50 ms and moves one bit of
+/// one row, so rebuilding and diffing every client's whole snapshot for it is
+/// pure waste.
+fn broadcast_rpc_voice_roster(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    instance_id: DaemonInstanceId,
+) {
+    app.refresh_voice_roster(Instant::now());
+    let Some(delta) = app.take_voice_roster_delta() else {
+        return;
+    };
+    let mut failed = Vec::new();
+    for (id, client) in clients.iter_mut() {
+        if let Err(error) = send_rpc_event(client, instance_id, delta.clone()) {
+            kvlog::error!(
+                "could not send daemon RPC voice roster",
                 client_id = id.0,
                 error = %error
             );
@@ -1329,6 +1387,7 @@ fn sync_rpc_state(
     id: ClientId,
     client: &mut RemoteRpcClient,
     instance_id: DaemonInstanceId,
+    roster: Option<&StateDelta>,
 ) -> Result<(), String> {
     complete_pending_rpc_history(app, id, client, instance_id)?;
     // Decide on room identity before projecting anything. A client that
@@ -1348,6 +1407,8 @@ fn sync_rpc_state(
                 )
             });
     if !same_room {
+        // The snapshot carries the roster itself, so the change is already in
+        // it — sending the delta as well would repeat it.
         let seq = client.next_event_seq;
         let mut snapshot = client
             .sender
@@ -1381,6 +1442,12 @@ fn sync_rpc_state(
     let deltas = projection_deltas(&client.last_snapshot, &next);
     for delta in deltas {
         send_rpc_event(client, instance_id, delta)?;
+    }
+    // After the session state, never before it: a renderer checks the roster's
+    // room against `joined_room`, so a reset that overtook the change explaining
+    // it would read as divergence.
+    if let Some(roster) = roster {
+        send_rpc_event(client, instance_id, roster.clone())?;
     }
     client.last_snapshot = next;
     Ok(())
@@ -2861,8 +2928,12 @@ mod tests {
         use crate::app::AppEvent;
         use crate::client_net::NetworkEvent;
 
-        // These arrive per packet and touch no StateSnapshot field, so paying a
-        // full snapshot rebuild per attached client for each one is pure waste.
+        // These arrive per packet. The RTT ones do feed the voice roster, but
+        // rebuilding every attached client's projection at packet rate to carry
+        // a figure quantized to 5 ms is pure waste. Their effect reaches
+        // renderers because the tick refreshes the roster projection and
+        // broadcasts when the *quantized* result moved — not because some
+        // unrelated event happened to broadcast at the right moment.
         for event in [
             NetworkEvent::ServerRtt { rtt_ms: Some(4) },
             NetworkEvent::PeerRtt {

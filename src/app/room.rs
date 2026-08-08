@@ -2331,7 +2331,7 @@ impl RoomSession {
             }
             ServerContinuity::NewServer => {
                 self.epoch.advance();
-                self.participants.replace_room(Vec::new());
+                self.participants.replace_room(None, Vec::new());
                 self.room_name = "lobby".to_string();
                 self.metas.clear();
                 self.rooms.reset_server();
@@ -2357,7 +2357,7 @@ impl RoomSession {
 
     pub(crate) fn reset_for_server_list(&mut self) {
         self.epoch.advance();
-        self.participants.replace_room(Vec::new());
+        self.participants.replace_room(None, Vec::new());
         self.server_alias.clear();
         self.history = HistoryStorage::disabled();
         self.local_username.clear();
@@ -2808,7 +2808,7 @@ impl RoomSession {
         if let Some(view) = view {
             self.set_viewed_room(view);
         } else {
-            self.participants.replace_room(Vec::new());
+            self.participants.replace_room(None, Vec::new());
         }
     }
 
@@ -3853,11 +3853,11 @@ impl RoomSession {
     /// render as `away`.
     pub(crate) fn rebuild_roster(&mut self) {
         let Some(room_id) = self.voice_room.or(self.viewed_room) else {
-            self.participants.replace_room(Vec::new());
+            self.participants.replace_room(None, Vec::new());
             return;
         };
         let seeds = self.roster_seeds(room_id);
-        self.participants.replace_room(seeds);
+        self.participants.replace_room(Some(room_id), seeds);
     }
 
     fn roster_seeds(&self, room_id: RoomId) -> Vec<RosterSeed> {
@@ -3898,7 +3898,7 @@ impl RoomSession {
             return self.participants.clone();
         }
         let mut participants = Participants::default();
-        participants.replace_room(self.roster_seeds(room_id));
+        participants.replace_room(Some(room_id), self.roster_seeds(room_id));
         participants
     }
 
