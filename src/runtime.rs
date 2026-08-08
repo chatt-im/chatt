@@ -5,10 +5,7 @@ use std::{
     os::fd::{AsRawFd, IntoRawFd, OwnedFd},
     os::unix::net::UnixStream,
     panic::{self, AssertUnwindSafe},
-    sync::{
-        Arc, Once,
-        mpsc::{self, Receiver, SyncSender, TrySendError},
-    },
+    sync::{Arc, Once},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -87,9 +84,13 @@ struct RpcUpload {
     offset: u64,
 }
 
-enum QueuedRpcFrame {
-    Frame {
-        framed: Vec<u8>,
+/// Something the writer thread has to do at a byte position in [`RpcOutbound`],
+/// rather than just putting more bytes on the socket.
+enum RpcOutboundControl {
+    /// A frame handing over descriptors, which needs a `sendmsg` of its own and
+    /// so bounds the write in front of it.
+    Descriptors {
+        length: usize,
         fds: Vec<OwnedFd>,
     },
     StartBulk {
@@ -98,6 +99,46 @@ enum QueuedRpcFrame {
         source: crate::receive_store::Source,
     },
     Shutdown,
+}
+
+/// What the writer thread has yet to put on the socket.
+///
+/// Frames are encoded straight into `bytes`, where they already sit next to
+/// each other, so a runtime tick's worth of broadcasts leaves in one write
+/// instead of one write each. The writer swaps the buffer out for its own
+/// emptied one rather than draining it, so the two ping-pong and neither
+/// reallocates.
+#[derive(Default)]
+struct RpcOutbound {
+    bytes: Vec<u8>,
+    /// Ordered by the offset in `bytes` each one happens at, so descriptors and
+    /// shutdown stay in sequence with the frames around them.
+    control: Vec<(usize, RpcOutboundControl)>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct RpcOutboundQueue {
+    state: Mutex<RpcOutbound>,
+    ready: parking_lot::Condvar,
+}
+
+impl RpcOutboundQueue {
+    /// Swaps everything queued into the writer's own buffers, blocking while
+    /// `idle` until there is something to do.
+    fn take(&self, into: &mut RpcOutbound, idle: bool) {
+        let mut state = self.state.lock();
+        while idle && state.bytes.is_empty() && state.control.is_empty() {
+            self.ready.wait(&mut state);
+        }
+        std::mem::swap(&mut state.bytes, &mut into.bytes);
+        std::mem::swap(&mut state.control, &mut into.control);
+    }
+
+    fn close(&self) {
+        self.state.lock().closed = true;
+        self.ready.notify_one();
+    }
 }
 
 enum RpcAttachmentReader {
@@ -204,63 +245,12 @@ impl RpcAttachmentStream {
     }
 }
 
-#[derive(Default)]
-struct RpcQueueBudgetState {
-    bytes: usize,
-    closed: bool,
-}
-
-#[derive(Default)]
-struct RpcQueueBudget {
-    state: Mutex<RpcQueueBudgetState>,
-}
-
-impl RpcQueueBudget {
-    #[cfg(test)]
-    fn with_bytes(bytes: usize) -> Self {
-        Self {
-            state: Mutex::new(RpcQueueBudgetState {
-                bytes,
-                closed: false,
-            }),
-        }
-    }
-
-    fn reserve(&self, bytes: usize, limit: usize) -> Result<(), String> {
-        let mut state = self.state.lock();
-        if state.closed {
-            return Err("RPC client writer stopped".into());
-        }
-        if state
-            .bytes
-            .checked_add(bytes)
-            .is_none_or(|next| next > limit)
-        {
-            return Err("RPC client outbound queue is full".into());
-        }
-        state.bytes += bytes;
-        Ok(())
-    }
-
-    fn release(&self, bytes: usize) {
-        let mut state = self.state.lock();
-        state.bytes = state.bytes.saturating_sub(bytes);
-    }
-
-    fn close(&self) {
-        let mut state = self.state.lock();
-        state.closed = true;
-    }
-}
-
 #[derive(Clone)]
 struct RpcClientSender {
-    tx: SyncSender<QueuedRpcFrame>,
+    outbound: Arc<RpcOutboundQueue>,
     control: Arc<UnixStream>,
-    queue_budget: Arc<RpcQueueBudget>,
     active_bulk: Arc<Mutex<HashSet<local_rpc::model::BulkTransferId>>>,
     outstanding: Arc<Mutex<HashSet<local_rpc::model::RequestId>>>,
-    buffers: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl RpcClientSender {
@@ -298,45 +288,26 @@ impl RpcClientSender {
         if fds.len() != expected_fds {
             return Err("daemon frame carries an invalid descriptor count".into());
         }
-        let mut framed = self.buffers.lock().pop().unwrap_or_default();
-        if let Err(error) = local_rpc::frame::encode_daemon_framed_into(frame, &mut framed) {
-            recycle_rpc_buffer(&self.buffers, framed);
-            return Err(error);
+        let mut state = self.outbound.state.lock();
+        if state.closed {
+            return Err("RPC client writer stopped".into());
         }
-        let bytes = framed.len();
-        if let Err(error) = self
-            .queue_budget
-            .reserve(bytes, local_rpc::MAX_QUEUED_BYTES)
-        {
-            recycle_rpc_buffer(&self.buffers, framed);
-            return Err(error);
+        let offset = state.bytes.len();
+        local_rpc::frame::encode_daemon_framed_append(frame, &mut state.bytes)?;
+        if state.bytes.len() > local_rpc::MAX_QUEUED_BYTES {
+            state.bytes.truncate(offset);
+            return Err("RPC client outbound queue is full".into());
         }
-        match self.tx.try_send(QueuedRpcFrame::Frame { framed, fds }) {
-            Ok(()) => {
-                self.complete_request(frame);
-                Ok(())
-            }
-            Err(TrySendError::Full(QueuedRpcFrame::Frame { framed, .. })) => {
-                self.queue_budget.release(bytes);
-                recycle_rpc_buffer(&self.buffers, framed);
-                Err("RPC client outbound queue is full".into())
-            }
-            Err(TrySendError::Disconnected(QueuedRpcFrame::Frame { framed, .. })) => {
-                self.queue_budget.release(bytes);
-                recycle_rpc_buffer(&self.buffers, framed);
-                Err("RPC client writer stopped".into())
-            }
-            Err(
-                TrySendError::Full(QueuedRpcFrame::Shutdown)
-                | TrySendError::Disconnected(QueuedRpcFrame::Shutdown),
-            ) => {
-                unreachable!("send only queues frame values")
-            }
-            Err(
-                TrySendError::Full(QueuedRpcFrame::StartBulk { .. })
-                | TrySendError::Disconnected(QueuedRpcFrame::StartBulk { .. }),
-            ) => unreachable!("send only queues frame values"),
+        if !fds.is_empty() {
+            let length = state.bytes.len() - offset;
+            state
+                .control
+                .push((offset, RpcOutboundControl::Descriptors { length, fds }));
         }
+        drop(state);
+        self.outbound.ready.notify_one();
+        self.complete_request(frame);
+        Ok(())
     }
 
     fn start_bulk(
@@ -345,21 +316,32 @@ impl RpcClientSender {
         descriptor: local_rpc::model::AttachmentDescriptor,
         source: crate::receive_store::Source,
     ) -> Result<(), String> {
-        match self.tx.try_send(QueuedRpcFrame::StartBulk {
-            transfer_id,
-            descriptor,
-            source,
-        }) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                self.cancel_bulk(transfer_id);
-                Err("RPC client writer cannot start attachment transfer".into())
-            }
+        let mut state = self.outbound.state.lock();
+        if state.closed {
+            drop(state);
+            self.cancel_bulk(transfer_id);
+            return Err("RPC client writer cannot start attachment transfer".into());
         }
+        let at = state.bytes.len();
+        state.control.push((
+            at,
+            RpcOutboundControl::StartBulk {
+                transfer_id,
+                descriptor,
+                source,
+            },
+        ));
+        drop(state);
+        self.outbound.ready.notify_one();
+        Ok(())
     }
 
     fn shutdown(&self) {
-        let _ = self.tx.try_send(QueuedRpcFrame::Shutdown);
+        let mut state = self.outbound.state.lock();
+        let at = state.bytes.len();
+        state.control.push((at, RpcOutboundControl::Shutdown));
+        drop(state);
+        self.outbound.ready.notify_one();
     }
 
     fn abort(&self) {
@@ -445,15 +427,6 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::Appearance(_) => "appearance",
         DaemonFrame::IdentityResult(_) => "identity_result",
         DaemonFrame::IdentityEvent(_) => "identity_event",
-    }
-}
-
-fn recycle_rpc_buffer(pool: &Mutex<Vec<Vec<u8>>>, mut buffer: Vec<u8>) {
-    const MAX_POOLED_BUFFERS: usize = 32;
-    buffer.clear();
-    let mut pool = pool.lock();
-    if pool.len() < MAX_POOLED_BUFFERS {
-        pool.push(buffer);
     }
 }
 
@@ -943,24 +916,20 @@ fn spawn_rpc_client(
     };
     let reader_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let writer_stream = stream.try_clone().map_err(|error| error.to_string())?;
-    let (tx, rx) = mpsc::sync_channel(256);
-    let queue_budget = Arc::new(RpcQueueBudget::default());
-    let buffers = Arc::new(Mutex::new(Vec::new()));
+    let outbound = Arc::new(RpcOutboundQueue::default());
     let uploads = Arc::new(Mutex::new(HashMap::new()));
     crate::local_control::write_rpc_ack(&mut stream, Ok(id.0))?;
     let control = Arc::new(stream);
     let active_bulk = Arc::new(Mutex::new(HashSet::new()));
     let sender = RpcClientSender {
-        tx,
+        outbound: outbound.clone(),
         control: control.clone(),
-        queue_budget: queue_budget.clone(),
         active_bulk: active_bulk.clone(),
         outstanding: Arc::new(Mutex::new(HashSet::new())),
-        buffers: buffers.clone(),
     };
     let writer_thread = thread::Builder::new()
         .name(format!("chatt-rpc-write-{}", id.0))
-        .spawn(move || rpc_writer_loop(writer_stream, rx, queue_budget, buffers, active_bulk))
+        .spawn(move || rpc_writer_loop(writer_stream, outbound, active_bulk))
         .map_err(|error| error.to_string())?;
     let reader_events = events.clone();
     let reader_uploads = uploads.clone();
@@ -1092,97 +1061,103 @@ fn rpc_reader_loop(
 
 fn rpc_writer_loop(
     stream: UnixStream,
-    rx: Receiver<QueuedRpcFrame>,
-    queue_budget: Arc<RpcQueueBudget>,
-    buffers: Arc<Mutex<Vec<Vec<u8>>>>,
+    outbound: Arc<RpcOutboundQueue>,
     active_bulk: Arc<Mutex<HashSet<local_rpc::model::BulkTransferId>>>,
 ) {
-    use std::sync::mpsc::TryRecvError;
-
     let mut writer = local_rpc::unix::FrameWriter::new(stream);
     let mut streams = std::collections::VecDeque::<RpcAttachmentStream>::new();
-    let mut control_burst = 0usize;
+    let mut pending = RpcOutbound::default();
+    let mut cursor = 0usize;
     loop {
-        let queued = if streams.is_empty() {
-            match rx.recv() {
-                Ok(queued) => Some(queued),
-                Err(_) => break,
-            }
-        } else if control_burst < RPC_CONTROL_BURST {
-            match rx.try_recv() {
-                Ok(queued) => Some(queued),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => break,
-            }
-        } else {
-            None
-        };
-        let Some(queued) = queued else {
-            let Some(mut transfer) = streams.pop_front() else {
-                continue;
+        if cursor == pending.bytes.len() && pending.control.is_empty() {
+            pending.bytes.clear();
+            cursor = 0;
+            outbound.take(&mut pending, streams.is_empty());
+        }
+        // Everything up to the next thing that has to happen at a byte
+        // position, capped while an attachment is waiting its turn so a long
+        // run of control frames cannot starve it.
+        let limit = pending
+            .control
+            .first()
+            .map_or(pending.bytes.len(), |(offset, _)| *offset);
+        if cursor < limit {
+            let burst = match streams.is_empty() {
+                true => usize::MAX,
+                false => RPC_CONTROL_BURST,
             };
-            if !active_bulk.lock().contains(&transfer.transfer_id) {
-                continue;
-            }
-            match transfer.pump(&mut writer) {
-                Ok(false) => streams.push_back(transfer),
-                Ok(true) => {
-                    active_bulk.lock().remove(&transfer.transfer_id);
-                }
-                Err(reason) => {
-                    kvlog::error!(
-                        "daemon attachment stream failed",
-                        transfer_id = transfer.transfer_id.0,
-                        file = transfer.file_name.as_str(),
-                        bytes = transfer.expected,
-                        error = reason.as_str()
-                    );
-                    let _ = writer.send_daemon(&DaemonFrame::BulkCanceled {
-                        transfer_id: transfer.transfer_id,
-                        reason,
-                    });
-                    active_bulk.lock().remove(&transfer.transfer_id);
-                }
-            }
-            control_burst = 0;
-            continue;
-        };
-        match queued {
-            QueuedRpcFrame::Frame { framed, fds } => {
-                let bytes = framed.len();
-                let raw_fds = fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
-                let result = writer.send_framed(&framed, &raw_fds);
-                queue_budget.release(bytes);
-                recycle_rpc_buffer(&buffers, framed);
-                if let Err(error) = result {
+            match writer.send_frames(&pending.bytes[cursor..limit], burst) {
+                Ok(written) => cursor += written,
+                Err(error) => {
                     kvlog::error!("daemon RPC writer failed", error = %error);
                     let _ = writer.shutdown();
                     break;
                 }
-                control_burst += 1;
             }
-            QueuedRpcFrame::StartBulk {
-                transfer_id,
-                descriptor,
-                source,
-            } => match RpcAttachmentStream::new(transfer_id, descriptor, source) {
-                Ok(transfer) => streams.push_back(transfer),
-                Err(reason) => {
-                    let _ = writer.send_daemon(&DaemonFrame::BulkCanceled {
-                        transfer_id,
-                        reason,
-                    });
-                    active_bulk.lock().remove(&transfer_id);
+        } else if !pending.control.is_empty() {
+            // Handled on its own pass, so the frames queued behind it still get
+            // their turn ahead of the attachment stream it may have started.
+            match pending.control.remove(0).1 {
+                RpcOutboundControl::Descriptors { length, fds } => {
+                    let raw_fds = fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+                    let frame = &pending.bytes[cursor..cursor + length];
+                    if let Err(error) = writer.send_framed(frame, &raw_fds) {
+                        kvlog::error!("daemon RPC writer failed", error = %error);
+                        let _ = writer.shutdown();
+                        break;
+                    }
+                    cursor += length;
                 }
-            },
-            QueuedRpcFrame::Shutdown => {
-                let _ = writer.shutdown();
-                break;
+                RpcOutboundControl::StartBulk {
+                    transfer_id,
+                    descriptor,
+                    source,
+                } => match RpcAttachmentStream::new(transfer_id, descriptor, source) {
+                    Ok(transfer) => streams.push_back(transfer),
+                    Err(reason) => {
+                        let _ = writer.send_daemon(&DaemonFrame::BulkCanceled {
+                            transfer_id,
+                            reason,
+                        });
+                        active_bulk.lock().remove(&transfer_id);
+                    }
+                },
+                RpcOutboundControl::Shutdown => {
+                    let _ = writer.shutdown();
+                    break;
+                }
+            }
+            continue;
+        }
+        let Some(mut transfer) = streams.pop_front() else {
+            continue;
+        };
+        if !active_bulk.lock().contains(&transfer.transfer_id) {
+            continue;
+        }
+        match transfer.pump(&mut writer) {
+            Ok(false) => streams.push_back(transfer),
+            Ok(true) => {
+                active_bulk.lock().remove(&transfer.transfer_id);
+            }
+            Err(reason) => {
+                kvlog::error!(
+                    "daemon attachment stream failed",
+                    transfer_id = transfer.transfer_id.0,
+                    file = transfer.file_name.as_str(),
+                    bytes = transfer.expected,
+                    error = reason.as_str()
+                );
+                let _ = writer.send_daemon(&DaemonFrame::BulkCanceled {
+                    transfer_id: transfer.transfer_id,
+                    reason,
+                });
+                active_bulk.lock().remove(&transfer.transfer_id);
             }
         }
     }
     active_bulk.lock().clear();
-    queue_budget.close();
+    outbound.close();
 }
 
 fn send_rpc_snapshot(
@@ -2910,11 +2885,7 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        os::unix::net::UnixStream,
-        sync::{Arc, mpsc},
-        thread,
-    };
+    use std::{os::unix::net::UnixStream, sync::Arc, thread};
 
     use super::{
         RemoteClient, RemoteShutdown, affects_rpc_projection, daemon_instance_id,
@@ -2984,17 +2955,13 @@ mod tests {
 
     #[test]
     fn rpc_queue_rejects_frames_past_total_capacity() {
-        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
-        let queue_budget = Arc::new(super::RpcQueueBudget::with_bytes(
-            local_rpc::MAX_QUEUED_BYTES,
-        ));
+        let outbound = Arc::new(super::RpcOutboundQueue::default());
+        outbound.state.lock().bytes = vec![0; local_rpc::MAX_QUEUED_BYTES];
         let sender = super::RpcClientSender {
-            tx,
+            outbound,
             control: Arc::new(UnixStream::pair().unwrap().0),
-            queue_budget,
             active_bulk: Arc::new(Mutex::new(std::collections::HashSet::new())),
             outstanding: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            buffers: Arc::new(Mutex::new(Vec::new())),
         };
         assert!(
             sender
@@ -3071,22 +3038,17 @@ mod tests {
     fn rpc_attachment_stream_can_exceed_outbound_queue_capacity() {
         let (writer_stream, reader_stream) = UnixStream::pair().unwrap();
         let control = Arc::new(writer_stream.try_clone().unwrap());
-        let (tx, rx) = mpsc::sync_channel(256);
-        let queue_budget = Arc::new(super::RpcQueueBudget::default());
-        let buffers = Arc::new(Mutex::new(Vec::new()));
+        let outbound = Arc::new(super::RpcOutboundQueue::default());
         let transfer_id = local_rpc::model::BulkTransferId(7);
         let active_bulk = Arc::new(Mutex::new(std::collections::HashSet::from([transfer_id])));
         let sender = super::RpcClientSender {
-            tx,
+            outbound: outbound.clone(),
             control,
-            queue_budget: queue_budget.clone(),
             active_bulk: active_bulk.clone(),
             outstanding: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            buffers: buffers.clone(),
         };
-        let writer = thread::spawn(move || {
-            super::rpc_writer_loop(writer_stream, rx, queue_budget, buffers, active_bulk)
-        });
+        let writer =
+            thread::spawn(move || super::rpc_writer_loop(writer_stream, outbound, active_bulk));
         let reader = thread::spawn(move || {
             let mut reader = local_rpc::unix::FrameReader::new(reader_stream);
             let mut received = 0u64;
@@ -3155,7 +3117,7 @@ mod tests {
         let expected = bytes.clone();
         let tail_offset = bytes.len() as u64 - 31;
         let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
         let client_id = crate::client_channel::ClientId(44);
         let request_id = local_rpc::model::RequestId(45);
         let attachment_id = local_rpc::model::AttachmentId {
@@ -3243,18 +3205,14 @@ mod tests {
     fn rpc_attachment_stream_is_not_starved_by_control_frames() {
         let (writer_stream, reader_stream) = UnixStream::pair().unwrap();
         let control = Arc::new(writer_stream.try_clone().unwrap());
-        let (tx, rx) = mpsc::sync_channel(256);
-        let queue_budget = Arc::new(super::RpcQueueBudget::default());
-        let buffers = Arc::new(Mutex::new(Vec::new()));
+        let outbound = Arc::new(super::RpcOutboundQueue::default());
         let transfer_id = local_rpc::model::BulkTransferId(8);
         let active_bulk = Arc::new(Mutex::new(std::collections::HashSet::from([transfer_id])));
         let sender = super::RpcClientSender {
-            tx,
+            outbound: outbound.clone(),
             control,
-            queue_budget: queue_budget.clone(),
             active_bulk: active_bulk.clone(),
             outstanding: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            buffers: buffers.clone(),
         };
         sender
             .start_bulk(
@@ -3285,9 +3243,8 @@ mod tests {
                 })
                 .unwrap();
         }
-        let writer = thread::spawn(move || {
-            super::rpc_writer_loop(writer_stream, rx, queue_budget, buffers, active_bulk)
-        });
+        let writer =
+            thread::spawn(move || super::rpc_writer_loop(writer_stream, outbound, active_bulk));
 
         let mut reader = local_rpc::unix::FrameReader::new(reader_stream);
         let mut control_frames = 0;

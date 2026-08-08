@@ -1,6 +1,7 @@
 use std::{
+    collections::VecDeque,
     env, fs,
-    io::{self, IoSlice, Read, Write},
+    io::{self, IoSlice, Write},
     mem,
     os::{
         fd::{AsRawFd, OwnedFd, RawFd},
@@ -137,12 +138,16 @@ pub fn validate_socket_path(path: &Path) -> Result<(), ConnectError> {
     Ok(())
 }
 
-pub fn connect(hello: &ClientHello) -> Result<UnixStream, ConnectError> {
+/// Connects and completes the bootstrap handshake, returning the reader the
+/// session continues on. Frames the daemon pipelined behind its acknowledgement
+/// are already buffered in it; take the writer end with
+/// [`FrameReader::stream`].
+pub fn connect(hello: &ClientHello) -> Result<FrameReader, ConnectError> {
     let path = control_socket_path().map_err(ConnectError::Protocol)?;
     connect_to(&path, hello)
 }
 
-pub fn connect_to(path: &Path, hello: &ClientHello) -> Result<UnixStream, ConnectError> {
+pub fn connect_to(path: &Path, hello: &ClientHello) -> Result<FrameReader, ConnectError> {
     hello.validate().map_err(ConnectError::Protocol)?;
     validate_socket_path(path)?;
     let mut stream = UnixStream::connect(path).map_err(|error| {
@@ -176,39 +181,12 @@ pub fn connect_to(path: &Path, hello: &ClientHello) -> Result<UnixStream, Connec
     request.extend_from_slice(&(body.len() as u32).to_be_bytes());
     request.extend_from_slice(&body);
     stream.write_all(&request).map_err(ConnectError::Io)?;
-    let (status, message) = read_bootstrap_response(&mut stream)?;
-    if status != STATUS_OK {
-        if message.contains("version") {
-            return Err(ConnectError::Incompatible(message));
-        }
-        return Err(ConnectError::Rejected(message));
-    }
+    let mut reader = FrameReader::new(stream);
+    reader.read_bootstrap_response()?;
+    let stream = reader.stream();
     stream.set_read_timeout(None).map_err(ConnectError::Io)?;
     stream.set_write_timeout(None).map_err(ConnectError::Io)?;
-    Ok(stream)
-}
-
-fn read_bootstrap_response(stream: &mut UnixStream) -> Result<(u8, String), ConnectError> {
-    let mut magic = [0; CONTROL_MAGIC.len()];
-    stream.read_exact(&mut magic).map_err(ConnectError::Io)?;
-    if magic != CONTROL_MAGIC {
-        return Err(ConnectError::Protocol(
-            "invalid control response magic".into(),
-        ));
-    }
-    let mut header = [0; 5];
-    stream.read_exact(&mut header).map_err(ConnectError::Io)?;
-    let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-    if len > MAX_RESPONSE_BYTES {
-        return Err(ConnectError::Protocol(
-            "control response exceeds limit".into(),
-        ));
-    }
-    let mut body = vec![0; len];
-    stream.read_exact(&mut body).map_err(ConnectError::Io)?;
-    let message = String::from_utf8(body)
-        .map_err(|_| ConnectError::Protocol("control response is not UTF-8".into()))?;
-    Ok((header[0], message))
+    Ok(reader)
 }
 
 pub fn peer_credentials(stream: &UnixStream) -> io::Result<(u32, u32)> {
@@ -279,7 +257,17 @@ pub struct FrameReader {
     stream: UnixStream,
     buffer: crate::recv_buffer::RecvBuffer,
     control: ControlBuffer,
-    current_fds: Vec<OwnedFd>,
+    /// Descriptors received but not yet claimed by the frame that carries them,
+    /// in arrival order. Reads batch across frames, so a descriptor can land
+    /// alongside frames that precede its own; see [`FrameReader::recv_more`].
+    pending_fds: VecDeque<PendingFd>,
+}
+
+struct PendingFd {
+    fd: OwnedFd,
+    /// Unconsumed bytes left from the read that delivered this descriptor; the
+    /// frame claiming it has to begin within them.
+    budget: usize,
 }
 
 #[derive(Debug)]
@@ -294,7 +282,51 @@ impl FrameReader {
             stream,
             buffer: crate::recv_buffer::RecvBuffer::new(),
             control: ControlBuffer::new(super::MAX_FDS_PER_FRAME),
-            current_fds: Vec::new(),
+            pending_fds: VecDeque::new(),
+        }
+    }
+
+    pub fn stream(&self) -> &UnixStream {
+        &self.stream
+    }
+
+    /// Consumes the daemon's bootstrap acknowledgement out of the receive
+    /// buffer. Whatever the daemon already pipelined behind it stays buffered
+    /// for the session, so the handshake costs one read rather than one per
+    /// field, and the message only becomes a `String` when it is a rejection.
+    fn read_bootstrap_response(&mut self) -> Result<(), ConnectError> {
+        const HEADER: usize = CONTROL_MAGIC.len() + 5;
+        loop {
+            let pending = self.buffer.pending();
+            if let Some(header) = pending.get(..HEADER) {
+                if &header[..CONTROL_MAGIC.len()] != CONTROL_MAGIC {
+                    return Err(ConnectError::Protocol(
+                        "invalid control response magic".into(),
+                    ));
+                }
+                let status = header[CONTROL_MAGIC.len()];
+                let len = u32::from_be_bytes(header[CONTROL_MAGIC.len() + 1..].try_into().unwrap())
+                    as usize;
+                if len > MAX_RESPONSE_BYTES {
+                    return Err(ConnectError::Protocol(
+                        "control response exceeds limit".into(),
+                    ));
+                }
+                if let Some(message) = pending.get(HEADER..HEADER + len) {
+                    if status == STATUS_OK {
+                        self.buffer.consume(HEADER + len);
+                        return Ok(());
+                    }
+                    let message = String::from_utf8(message.to_vec()).map_err(|_| {
+                        ConnectError::Protocol("control response is not UTF-8".into())
+                    })?;
+                    return Err(match message.contains("version") {
+                        true => ConnectError::Incompatible(message),
+                        false => ConnectError::Rejected(message),
+                    });
+                }
+            }
+            self.recv_more(false).map_err(ConnectError::Io)?;
         }
     }
 
@@ -376,9 +408,9 @@ impl FrameReader {
         })
     }
 
-    /// Descriptor-aware receive path with a borrowed bulk payload. Descriptor
-    /// association requires exact frame-boundary reads, so this path does not
-    /// batch across frames.
+    /// Descriptor-aware receive path with a borrowed bulk payload. Only two
+    /// frame variants ever carry a descriptor, so the decoded frame claims it
+    /// and reads batch like every other path.
     pub fn recv_daemon_with_fds_and_bulk(
         &mut self,
         mut receive_bulk: impl FnMut(super::model::BulkTransferId, &[u8]) -> io::Result<()>,
@@ -389,34 +421,65 @@ impl FrameReader {
                 super::MAX_FRAME_BYTES,
             ) {
                 Ok(Some((payload, consumed))) => {
-                    let frame = match super::frame::decode_daemon_wire(payload)
+                    let decoded = match super::frame::decode_daemon_wire(payload)
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
                     {
-                        super::frame::DecodedWire::Frame(frame) => {
-                            let fds = mem::take(&mut self.current_fds);
-                            validate_daemon_frame_fds(&frame, &fds)?;
-                            Some(ReceivedFrame { frame, fds })
-                        }
+                        super::frame::DecodedWire::Frame(frame) => Some(frame),
                         super::frame::DecodedWire::BulkChunk { transfer_id, bytes } => {
-                            if !self.current_fds.is_empty() {
-                                self.current_fds.clear();
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "bulk chunk unexpectedly carried file descriptors",
-                                ));
-                            }
                             receive_bulk(transfer_id, bytes)?;
                             None
                         }
                     };
+                    let fds = self.claim_descriptor(decoded.as_ref(), consumed)?;
                     self.buffer.consume(consumed);
-                    return Ok(frame);
+                    return Ok(decoded.map(|frame| ReceivedFrame { frame, fds }));
                 }
                 Ok(None) => {}
                 Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
-            self.recv_more_exact()?;
+            self.recv_more(true)?;
         }
+    }
+
+    /// Hands the just-decoded frame the descriptor it declares, and charges its
+    /// bytes against the reads that delivered still-unclaimed ones.
+    ///
+    /// A descriptor is attached to the first byte of one message, and no stream
+    /// `recvmsg` returns bytes past that message: Linux stops its copy loop
+    /// once it has collected `scm.fp`, and xnu's `soreceive` stops at the next
+    /// `MT_CONTROL` mbuf. So the frame carrying a descriptor always begins
+    /// inside the read that delivered it, and arrival order is decode order. A
+    /// frame that claims nothing while exhausting the oldest descriptor's read
+    /// is that descriptor's frame — and it does not carry descriptors.
+    fn claim_descriptor(
+        &mut self,
+        frame: Option<&super::frame::DaemonFrame>,
+        consumed: usize,
+    ) -> io::Result<Vec<OwnedFd>> {
+        let claimed = if frame.is_some_and(expects_descriptor) {
+            let Some(pending) = self.pending_fds.pop_front() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "descriptor-bearing daemon frame must carry exactly one file descriptor",
+                ));
+            };
+            vec![pending.fd]
+        } else if self
+            .pending_fds
+            .front()
+            .is_some_and(|pending| pending.budget <= consumed)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon frame unexpectedly carried file descriptors",
+            ));
+        } else {
+            Vec::new()
+        };
+        for pending in &mut self.pending_fds {
+            pending.budget = pending.budget.saturating_sub(consumed);
+        }
+        Ok(claimed)
     }
 
     fn recv_decoded<T>(&mut self, mut decode: impl FnMut(&[u8]) -> io::Result<T>) -> io::Result<T> {
@@ -428,23 +491,19 @@ impl FrameReader {
                 Ok(Some((payload, consumed))) => {
                     let decoded = decode(payload)?;
                     self.buffer.consume(consumed);
-                    if !self.current_fds.is_empty() {
-                        self.current_fds.clear();
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "unexpected file descriptors in daemon frame",
-                        ));
-                    }
                     return Ok(decoded);
                 }
                 Ok(None) => {}
                 Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
-            self.recv_more_batched()?;
+            self.recv_more(false)?;
         }
     }
 
-    fn recv_more_batched(&mut self) -> io::Result<()> {
+    /// Reads once, taking the whole frame in front plus whatever else is
+    /// already queued behind it. `accept_fds` decides whether descriptors that
+    /// arrive are queued for a later frame to claim or rejected outright.
+    fn recv_more(&mut self, accept_fds: bool) -> io::Result<()> {
         let pending = self.buffer.pending();
         let wanted = if pending.len() < crate::framing::LENGTH_PREFIX_LEN {
             RECEIVE_BATCH_BYTES
@@ -474,55 +533,22 @@ impl FrameReader {
                 "truncated daemon frame or ancillary data",
             ));
         }
-        if !fds.is_empty() {
+        if !accept_fds && !fds.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected file descriptors in daemon frame",
             ));
         }
-        Ok(())
-    }
-
-    fn recv_more_exact(&mut self) -> io::Result<()> {
-        // Never read across a frame boundary. SCM_RIGHTS on a Unix stream is
-        // attached to a byte position, not to a message, so bounding recvmsg
-        // this way lets us associate every descriptor with exactly one frame.
-        let pending = self.buffer.pending();
-        let wanted = if pending.len() < crate::framing::LENGTH_PREFIX_LEN {
-            crate::framing::LENGTH_PREFIX_LEN - pending.len()
-        } else {
-            let payload_len = u32::from_le_bytes(
-                pending[..crate::framing::LENGTH_PREFIX_LEN]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            if payload_len > super::MAX_FRAME_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "daemon frame exceeds maximum length",
-                ));
-            }
-            crate::framing::LENGTH_PREFIX_LEN + payload_len - pending.len()
-        };
-        let (read, fds, flags) = self.recv_into(wanted)?;
-        if read == 0 {
-            return Err(self.eof_error());
-        }
-        if flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
-            // `fds` owns and closes every descriptor that fit in the truncated
-            // control buffer before this error is returned.
+        // `fds` owns and closes every descriptor it holds if this errors.
+        if self.pending_fds.len() + fds.len() > super::MAX_PENDING_FDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "truncated daemon frame or ancillary data",
+                "too many unclaimed file descriptors",
             ));
         }
-        if self.current_fds.len() + fds.len() > super::MAX_FDS_PER_FRAME {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "too many file descriptors in daemon frame",
-            ));
-        }
-        self.current_fds.extend(fds);
+        let budget = self.buffer.pending().len();
+        self.pending_fds
+            .extend(fds.into_iter().map(|fd| PendingFd { fd, budget }));
         Ok(())
     }
 
@@ -759,6 +785,28 @@ impl FrameWriter {
         send_frame_bytes(&mut self.stream, &self.buffer, fds)
     }
 
+    /// Writes up to `max_frames` whole frames from the front of an already
+    /// encoded run, in one write, and returns how many bytes went out. Lets a
+    /// sender that accumulated a burst spend one syscall on all of it while
+    /// still bounding how much it sends before doing something else.
+    pub fn send_frames(&mut self, frames: &[u8], max_frames: usize) -> io::Result<usize> {
+        let mut end = 0;
+        for _ in 0..max_frames {
+            let parsed =
+                crate::framing::parse_frame_with_limit(&frames[end..], super::MAX_FRAME_BYTES)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let Some((_, consumed)) = parsed else {
+                break;
+            };
+            end += consumed;
+            if end == frames.len() {
+                break;
+            }
+        }
+        send_frame_bytes(&mut self.stream, &frames[..end], &[])?;
+        Ok(end)
+    }
+
     /// Writes an already encoded, length-prefixed frame without copying it.
     pub fn send_framed(&mut self, frame: &[u8], fds: &[RawFd]) -> io::Result<()> {
         let Some((_, consumed)) =
@@ -791,19 +839,21 @@ impl FrameWriter {
     }
 }
 
-fn validate_daemon_frame_fds(frame: &super::frame::DaemonFrame, fds: &[OwnedFd]) -> io::Result<()> {
-    validate_daemon_frame_fd_count(frame, fds.len())
+/// Whether this variant hands over a descriptor: a live share's video socket
+/// or an attachment source, both zero-copy handoffs.
+fn expects_descriptor(frame: &super::frame::DaemonFrame) -> bool {
+    matches!(
+        frame,
+        super::frame::DaemonFrame::LiveShareOpened { .. }
+            | super::frame::DaemonFrame::AttachmentSourceOpened { .. }
+    )
 }
 
 fn validate_daemon_frame_fd_count(
     frame: &super::frame::DaemonFrame,
     fd_count: usize,
 ) -> io::Result<()> {
-    let expected = match frame {
-        super::frame::DaemonFrame::LiveShareOpened { .. }
-        | super::frame::DaemonFrame::AttachmentSourceOpened { .. } => 1,
-        _ => 0,
-    };
+    let expected = usize::from(expects_descriptor(frame));
     if fd_count != expected {
         let message = if expected == 1 {
             "descriptor-bearing daemon frame must carry exactly one file descriptor"
@@ -1019,6 +1069,115 @@ mod tests {
         assert!(error.to_string().contains("unexpectedly"));
     }
 
+    fn bootstrap_ack(status: u8, message: &str) -> Vec<u8> {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(CONTROL_MAGIC);
+        ack.push(status);
+        ack.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        ack.extend_from_slice(message.as_bytes());
+        ack
+    }
+
+    #[test]
+    fn bootstrap_ack_and_the_frames_behind_it_arrive_in_one_read() {
+        let (mut left, right) = UnixStream::pair().unwrap();
+        left.write_all(&bootstrap_ack(STATUS_OK, "39")).unwrap();
+        let pong = super::super::frame::DaemonFrame::Pong {
+            request_id: super::super::model::RequestId(1),
+            nonce: 5,
+        };
+        FrameWriter::new(left).send_daemon(&pong).unwrap();
+
+        let mut reader = FrameReader::new(right);
+        reader.read_bootstrap_response().unwrap();
+        // The one read that took the acknowledgement also took the frame the
+        // daemon pipelined behind it.
+        assert!(!reader.buffer.is_empty());
+        assert_eq!(reader.recv_daemon().unwrap(), pong);
+    }
+
+    #[test]
+    fn bootstrap_rejection_separates_version_mismatch_from_refusal() {
+        for (message, expected) in [
+            ("renderer version 4 is unsupported", "Incompatible"),
+            ("daemon is shutting down", "Rejected"),
+        ] {
+            let (mut left, right) = UnixStream::pair().unwrap();
+            left.write_all(&bootstrap_ack(STATUS_ERROR, message))
+                .unwrap();
+            let error = FrameReader::new(right)
+                .read_bootstrap_response()
+                .unwrap_err();
+            assert_eq!(error.to_string(), message);
+            assert!(format!("{error:?}").starts_with(expected));
+        }
+    }
+
+    #[test]
+    fn descriptor_aware_reader_batches_queued_frames_into_one_receive() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut writer = FrameWriter::new(left);
+        for nonce in 1..=3 {
+            writer
+                .send_daemon(&super::super::frame::DaemonFrame::Pong {
+                    request_id: super::super::model::RequestId(nonce),
+                    nonce,
+                })
+                .unwrap();
+        }
+
+        let mut reader = FrameReader::new(right);
+        assert!(reader.recv_daemon_with_fds().is_ok());
+        // The first receive took all three frames, so the rest decode without
+        // touching the socket again.
+        assert!(!reader.buffer.is_empty());
+        for nonce in 2..=3 {
+            let received = reader.recv_daemon_with_fds().unwrap();
+            assert_eq!(
+                received.frame,
+                super::super::frame::DaemonFrame::Pong {
+                    request_id: super::super::model::RequestId(nonce),
+                    nonce,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn batched_receive_gives_the_descriptor_to_the_frame_that_carries_it() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let (video, _peer) = UnixStream::pair().unwrap();
+        let mut writer = FrameWriter::new(left);
+        let pong = super::super::frame::DaemonFrame::Pong {
+            request_id: super::super::model::RequestId(1),
+            nonce: 9,
+        };
+        let opened = super::super::frame::DaemonFrame::LiveShareOpened {
+            request_id: super::super::model::RequestId(2),
+            stream_id: crate::ids::StreamId(7),
+            generation: 3,
+            status: crate::model::LiveShareViewStatus::WaitingForKeyframe,
+        };
+        // All three queued before the reader wakes, so one receive spans the
+        // descriptor-bearing frame and the plain frames around it.
+        writer.send_daemon(&pong).unwrap();
+        writer
+            .send_daemon_with_fds(&opened, &[video.as_raw_fd()])
+            .unwrap();
+        writer.send_daemon(&pong).unwrap();
+
+        let mut reader = FrameReader::new(right);
+        let received = reader.recv_daemon_with_fds().unwrap();
+        assert_eq!(received.frame, pong);
+        assert!(received.fds.is_empty());
+        let received = reader.recv_daemon_with_fds().unwrap();
+        assert_eq!(received.frame, opened);
+        assert_eq!(received.fds.len(), 1);
+        let received = reader.recv_daemon_with_fds().unwrap();
+        assert_eq!(received.frame, pong);
+        assert!(received.fds.is_empty());
+    }
+
     #[test]
     fn descriptor_aware_reader_rejects_descriptors_on_bulk_chunks() {
         let (left, right) = UnixStream::pair().unwrap();
@@ -1031,7 +1190,7 @@ mod tests {
 
         let error = FrameReader::new(right).recv_daemon_with_fds().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("bulk chunk"));
+        assert!(error.to_string().contains("unexpectedly"));
     }
 
     #[test]

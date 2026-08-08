@@ -657,6 +657,16 @@ pub fn encode_daemon(frame: &DaemonFrame) -> Result<Vec<u8>, String> {
 /// Serializes a complete length-prefixed daemon frame into reusable storage.
 pub fn encode_daemon_framed_into(frame: &DaemonFrame, output: &mut Vec<u8>) -> Result<(), String> {
     output.clear();
+    encode_daemon_framed_append(frame, output)
+}
+
+/// Appends one length-prefixed frame, leaving `output` untouched on failure.
+/// Lets a sender accumulate a whole burst in one buffer and put it on the
+/// socket with a single write.
+pub fn encode_daemon_framed_append(
+    frame: &DaemonFrame,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
     validate_daemon(frame)?;
     if let DaemonFrame::BulkChunk(chunk) = frame {
         return encode_bulk_framed_into(chunk, output);
@@ -691,17 +701,19 @@ fn bounded_encode_framed_into<T: jsony::ToBinary>(
     value: &T,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
+    let start = output.len();
     output.extend_from_slice(&[0; crate::framing::LENGTH_PREFIX_LEN]);
     output.push(WIRE_JSON);
     let encoded_len = jsony::to_binary_into(value, &mut *output).len();
     let payload_len = encoded_len + 1;
     if payload_len > super::MAX_FRAME_BYTES {
-        output.clear();
+        output.truncate(start);
         return Err("daemon frame exceeds maximum length".into());
     }
     let payload_len =
         u32::try_from(payload_len).map_err(|_| "daemon frame length does not fit in u32")?;
-    output[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(&payload_len.to_le_bytes());
+    output[start..start + crate::framing::LENGTH_PREFIX_LEN]
+        .copy_from_slice(&payload_len.to_le_bytes());
     Ok(())
 }
 

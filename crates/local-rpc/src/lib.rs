@@ -57,6 +57,10 @@ pub const MAX_COMMAND_CANDIDATES: usize = 4096;
 pub const MAX_COMMAND_OUTPUT_LINES: usize = 64;
 pub const MAX_CHUNK_BYTES: usize = 1024 * 1024;
 pub const MAX_FDS_PER_FRAME: usize = 4;
+/// Descriptors a receiver will hold for frames it has not decoded yet. Reads
+/// batch across frames, so a descriptor can arrive one read before the frame
+/// that claims it completes; two is the most legitimate traffic ever reaches.
+pub const MAX_PENDING_FDS: usize = 4;
 pub const MAX_RPC_CLIENTS: usize = 16;
 pub const MAX_OUTSTANDING_REQUESTS: usize = 128;
 pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
