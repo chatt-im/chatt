@@ -129,12 +129,12 @@ const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Cadence of media `Ping` probes used to estimate round-trip latency to the
 /// server relay and to each direct peer.
 const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
-/// Retry cadence for the UDP address claim while no `UdpBound` confirmation has
-/// arrived. Plaintext mode cannot use ordinary clear pings to establish the
-/// address, so losing the first `Bind` must be recoverable.
+/// Fast retry cadence for the UDP address claim before a TCP fallback is
+/// confirmed. Once TCP is healthy, Bind and Ping share the bounded recovery
+/// backoff in the voice worker.
 const UDP_BIND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-/// Number of unconfirmed `Bind` retries (at [`UDP_BIND_RETRY_INTERVAL`]) after
-/// which the UDP media path is reported unreachable to the UI.
+/// Number of unconfirmed `Bind` retries after which the UDP media path is
+/// marked failed. A confirmed TCP lane remains the reported usable transport.
 const UDP_BIND_FAILURE_ATTEMPTS: u32 = 5;
 /// A server RTT without a successful probe for this long no longer describes
 /// the current relay path and is reported as unavailable.
@@ -144,9 +144,8 @@ const RTT_STALE_AFTER: Duration = Duration::from_secs(15);
 /// client never opens a lane, while a blackholed one stops putting speech on
 /// UDP within this window instead of after the whole liveness timeout.
 const UDP_COLD_START_GRACE: Duration = Duration::from_millis(500);
-/// Cadence of the UDP `Ping` probes sent while the UDP path is unverified,
-/// both at cold start and while a lane carries media. Only runs while UDP is
-/// unproven, so a healthy idle session keeps its [`RTT_PROBE_INTERVAL`] wake.
+/// Fast cadence of UDP `Ping` probes while no confirmed fallback carries
+/// media. A confirmed TCP lane uses a bounded, jittered recovery backoff.
 const UDP_VERIFY_INTERVAL: Duration = Duration::from_secs(1);
 /// A verification probe unanswered for this long is a miss and resets the
 /// recovery streak.
