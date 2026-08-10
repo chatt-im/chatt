@@ -16,11 +16,14 @@
 //!   selection is owned by a live client, so the process stays up until another
 //!   client takes ownership.
 //!
-//! To support both without leaking zombies, [`Clipboard`] keeps the most recent
-//! helper for each selection. The next copy to that selection kills and waits
-//! on its previous owner before spawning a replacement, so a long-lived owner
-//! is reaped exactly when it is superseded and a short-lived one is reaped at
-//! the latest by the following copy.
+//! To support both selections without leaking zombies, [`Clipboard`] keeps the
+//! most recent helper for each one. The next copy to that selection kills and
+//! waits on its previous owner before spawning a replacement, so replacing the
+//! primary selection cannot disturb an explicit clipboard copy.
+//!
+//! Helper startup is checked asynchronously. This lets a command that exists
+//! but cannot serve the current display (for example `wl-copy` in an X11
+//! session) fail over to the next command without blocking the render loop.
 //!
 //! On drop the final owners are deliberately *not* killed: an X11 selection
 //! lives only as long as its owner, so killing `xclip` on exit would wipe
@@ -30,8 +33,9 @@
 //! its own, so it would hang quit.
 
 use std::{
-    io::Write,
+    io::{self, Write},
     process::{Child, Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use extui::{
@@ -39,13 +43,12 @@ use extui::{
     vt::{BufferWrite, ClipboardSelection, SetClipboard},
 };
 
-/// Owns the background clipboard helper so it can be reaped deterministically.
+const HELPER_STARTUP_GRACE: Duration = Duration::from_millis(300);
+
+/// Owns background clipboard helpers so they can be reaped deterministically.
 pub(crate) struct Clipboard {
-    /// The most recent CLI helpers that may still be running to own the two
-    /// selections. They must be retained separately on X11: replacing the
-    /// primary selection must not discard an explicit clipboard copy.
-    clipboard_owner: Option<Child>,
-    primary_owner: Option<Child>,
+    clipboard_owner: Option<ClipboardOwner>,
+    primary_owner: Option<ClipboardOwner>,
 }
 
 impl Clipboard {
@@ -67,39 +70,56 @@ impl Clipboard {
     }
 
     fn copy_to(&mut self, term: &mut Terminal, selection: ClipboardSelection, text: &str) {
-        let mut out = Vec::new();
-        SetClipboard { selection, text }.write_to_buffer(&mut out);
-        let _ = term.write_all(&out);
+        let out = osc52_copy(selection, text);
+        if let Err(error) = term.write_all(&out) {
+            kvlog::warn!("OSC 52 clipboard write failed", selection = ?selection, error = %error);
+        }
 
-        // Replace any previous owner before spawning a new helper.
         self.reap_owner(selection);
-        for command in CLIPBOARD_COMMANDS {
-            let Some(args) = command.args(selection) else {
-                continue;
-            };
-            if let Some(child) = spawn_clipboard_command(command.program, args, text) {
-                *self.owner_mut(selection) = retain_if_running(child);
-                return;
+        *self.owner_mut(selection) = start_clipboard_owner(CLIPBOARD_COMMANDS, selection, text, 0);
+    }
+
+    /// Advances startup verification and falls through helpers that exit with
+    /// an error. Called from the render loop, so verification never stalls UI.
+    pub(crate) fn poll(&mut self) {
+        for selection in [ClipboardSelection::Clipboard, ClipboardSelection::Primary] {
+            if let Some(owner) = self.owner_mut(selection).take() {
+                *self.owner_mut(selection) = poll_clipboard_owner(selection, owner);
             }
         }
     }
 
-    /// Kills and waits on the selection's current owner, clearing its slot.
-    /// Killing an already-exited process is harmless; `wait` reaps it either
-    /// way.
+    /// Kills and waits on one selection's current owner, clearing its slot.
     fn reap_owner(&mut self, selection: ClipboardSelection) {
-        if let Some(mut child) = self.owner_mut(selection).take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(owner) = self.owner_mut(selection).take() {
+            terminate(owner.child);
         }
     }
 
-    fn owner_mut(&mut self, selection: ClipboardSelection) -> &mut Option<Child> {
+    fn owner_mut(&mut self, selection: ClipboardSelection) -> &mut Option<ClipboardOwner> {
         match selection {
             ClipboardSelection::Clipboard => &mut self.clipboard_owner,
             ClipboardSelection::Primary => &mut self.primary_owner,
         }
     }
+}
+
+fn osc52_copy(selection: ClipboardSelection, text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    SetClipboard { selection, text }.write_to_buffer(&mut out);
+    out
+}
+
+struct ClipboardOwner {
+    child: Child,
+    next_command: usize,
+    program: &'static str,
+    /// Retained only during startup, while a nonzero exit should try the next
+    /// helper. Once the command has survived the grace period it is considered
+    /// an X11 selection owner, and a later exit must not reclaim the selection.
+    fallback_text: Option<String>,
+    verify_until: Instant,
+    commands: &'static [ClipboardCommand],
 }
 
 struct ClipboardCommand {
@@ -146,38 +166,203 @@ const CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[];
 
-/// Spawns `command`, writes `text` to its stdin, and closes the pipe. Returns
-/// the child on success, or `None` if the program could not be launched or
-/// would not accept the text (e.g. it is not installed).
-fn spawn_clipboard_command(program: &str, args: &[&str], text: &str) -> Option<Child> {
+/// Starts the first usable helper at or after `start`. A helper that exits
+/// successfully during startup has already completed the handoff and needs no
+/// owner slot. A running helper is retained while its startup is verified.
+fn start_clipboard_owner(
+    commands: &'static [ClipboardCommand],
+    selection: ClipboardSelection,
+    text: &str,
+    start: usize,
+) -> Option<ClipboardOwner> {
+    for (command_index, command) in commands.iter().enumerate().skip(start) {
+        let Some(args) = command.args(selection) else {
+            continue;
+        };
+        let mut child = match spawn_clipboard_command(command.program, args, text) {
+            Ok(child) => child,
+            Err(error) => {
+                kvlog::warn!(
+                    "clipboard helper startup failed",
+                    program = command.program,
+                    selection = ?selection,
+                    error = %error
+                );
+                continue;
+            }
+        };
+
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return None,
+            Ok(Some(status)) => {
+                kvlog::warn!(
+                    "clipboard helper exited during startup",
+                    program = command.program,
+                    selection = ?selection,
+                    status = %status
+                );
+            }
+            Ok(None) => {
+                return Some(ClipboardOwner {
+                    child,
+                    next_command: command_index + 1,
+                    program: command.program,
+                    fallback_text: Some(text.to_string()),
+                    verify_until: Instant::now() + HELPER_STARTUP_GRACE,
+                    commands,
+                });
+            }
+            Err(error) => {
+                kvlog::warn!(
+                    "clipboard helper status unavailable",
+                    program = command.program,
+                    selection = ?selection,
+                    error = %error
+                );
+                return Some(ClipboardOwner {
+                    child,
+                    next_command: command_index + 1,
+                    program: command.program,
+                    fallback_text: Some(text.to_string()),
+                    verify_until: Instant::now() + HELPER_STARTUP_GRACE,
+                    commands,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn poll_clipboard_owner(
+    selection: ClipboardSelection,
+    mut owner: ClipboardOwner,
+) -> Option<ClipboardOwner> {
+    match owner.child.try_wait() {
+        Ok(Some(status)) if status.success() => None,
+        Ok(Some(status)) => {
+            kvlog::warn!(
+                "clipboard helper exited",
+                program = owner.program,
+                selection = ?selection,
+                status = %status
+            );
+            if let Some(text) = owner.fallback_text.take() {
+                start_clipboard_owner(owner.commands, selection, &text, owner.next_command)
+            } else {
+                None
+            }
+        }
+        Ok(None) => {
+            if Instant::now() > owner.verify_until {
+                owner.fallback_text = None;
+            }
+            Some(owner)
+        }
+        Err(error) => {
+            kvlog::warn!(
+                "clipboard helper status unavailable",
+                program = owner.program,
+                selection = ?selection,
+                error = %error
+            );
+            Some(owner)
+        }
+    }
+}
+
+/// Spawns `program`, writes `text` to its stdin, and closes the pipe.
+fn spawn_clipboard_command(program: &str, args: &[&str], text: &str) -> io::Result<Child> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .spawn()?;
     // Take and drop stdin after writing so the pipe closes and the helper can
     // finish reading (and, for the short-lived ones, exit).
-    let mut stdin = child.stdin.take()?;
-    let wrote = stdin.write_all(text.as_bytes()).is_ok();
+    let Some(mut stdin) = child.stdin.take() else {
+        terminate(child);
+        return Err(io::Error::other("clipboard helper stdin unavailable"));
+    };
+    let wrote = stdin.write_all(text.as_bytes());
     drop(stdin);
-    if wrote {
-        Some(child)
-    } else {
-        // Could not hand off the text; don't keep a useless process around.
-        let _ = child.kill();
-        let _ = child.wait();
-        None
+    if let Err(error) = wrote {
+        terminate(child);
+        return Err(error);
     }
+    Ok(child)
 }
 
-/// Keeps `child` only if it is still running (a selection owner like `xclip`);
-/// a helper that already exited is reaped here and the slot left empty.
-fn retain_if_running(mut child: Child) -> Option<Child> {
-    match child.try_wait() {
-        Ok(Some(_)) => None,     // Exited already; reaped by try_wait.
-        Ok(None) => Some(child), // Still owning the selection; keep it.
-        Err(_) => Some(child),   // Status unknown; keep so Drop can reap it.
+fn terminate(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_keep_clipboard_and_primary_arguments_distinct() {
+        let command = ClipboardCommand {
+            program: "helper",
+            clipboard_args: &["--clipboard"],
+            primary_args: Some(&["--primary"]),
+        };
+
+        assert_eq!(
+            command.args(ClipboardSelection::Clipboard),
+            Some(&["--clipboard"][..])
+        );
+        assert_eq!(
+            command.args(ClipboardSelection::Primary),
+            Some(&["--primary"][..])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_helper_falls_through_to_next_command() {
+        static COMMANDS: &[ClipboardCommand] = &[
+            ClipboardCommand {
+                program: "/bin/false",
+                clipboard_args: &[],
+                primary_args: Some(&[]),
+            },
+            ClipboardCommand {
+                program: "/bin/sleep",
+                clipboard_args: &["10"],
+                primary_args: Some(&["10"]),
+            },
+        ];
+
+        let mut owner =
+            start_clipboard_owner(COMMANDS, ClipboardSelection::Clipboard, "copied text", 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner
+            .as_ref()
+            .is_some_and(|owner| owner.program == "/bin/false")
+        {
+            assert!(Instant::now() < deadline, "failed helper did not exit");
+            owner =
+                owner.and_then(|owner| poll_clipboard_owner(ClipboardSelection::Clipboard, owner));
+            std::thread::yield_now();
+        }
+
+        let owner = owner.expect("fallback helper should remain as the selection owner");
+        assert_eq!(owner.program, "/bin/sleep");
+        terminate(owner.child);
+    }
+
+    #[test]
+    fn osc52_targets_the_requested_selection() {
+        assert_eq!(
+            osc52_copy(ClipboardSelection::Clipboard, "hello"),
+            b"\x1b]52;c;aGVsbG8=\x07"
+        );
+        assert_eq!(
+            osc52_copy(ClipboardSelection::Primary, "hello"),
+            b"\x1b]52;p;aGVsbG8=\x07"
+        );
     }
 }

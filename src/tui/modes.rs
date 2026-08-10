@@ -13,6 +13,7 @@ use crate::{
     bindings::{self, BindCommand, Resolved},
     chat_buffer::{LineKind, ViewCursor as ChatCursor, VisibleLine},
     client_channel::{DirtySections, JoinPhaseView, JoinView, ServerEditOutcome, TerminalEvent},
+    config::CopyOnSelect,
     settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft},
     theme,
     tui::{
@@ -1686,12 +1687,22 @@ enum DividerDrag {
 }
 
 #[derive(Debug)]
+enum ChatClickTarget {
+    Reference(rpc::msgref::MessageRef),
+    Url(String),
+}
+
+#[derive(Debug)]
 pub(crate) struct RoomMode {
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     layout: RoomLayout,
     divider_drag: Option<DividerDrag>,
     scrollbar_drag: Option<ScrollbarDrag>,
+    /// Link or message reference under the initial press. A line-wise drag
+    /// does not track horizontal cells, so resolving this again at release
+    /// could lose a valid click after harmless same-row pointer movement.
+    chat_click_target: Option<ChatClickTarget>,
     history_search: Option<HistorySearch>,
     last_history_search: Option<HistorySearch>,
     /// Room the search state above belongs to.
@@ -1712,6 +1723,7 @@ impl RoomMode {
             layout: RoomLayout::default(),
             divider_drag: None,
             scrollbar_drag: None,
+            chat_click_target: None,
             history_search: None,
             last_history_search: None,
             searched_room: None,
@@ -1726,6 +1738,7 @@ impl RoomMode {
             layout: RoomLayout::default(),
             divider_drag: None,
             scrollbar_drag: None,
+            chat_click_target: None,
             history_search: None,
             last_history_search: None,
             searched_room: None,
@@ -2171,6 +2184,13 @@ impl RoomMode {
             .find(|(rect, _)| crate::tui::form::rect_contains(*rect, mouse.column, mouse.row))
             .map(|(_, id)| *id);
 
+        if matches!(
+            mouse.kind,
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
+        ) {
+            self.chat_click_target = None;
+        }
+
         match mouse.kind {
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
                 if in_identity_status =>
@@ -2310,6 +2330,21 @@ impl RoomMode {
                             }
                         }
                         LineKind::Body => {
+                            self.chat_click_target = self
+                                .chat_ref_at(cx, mouse.column, mouse.row)
+                                .map(ChatClickTarget::Reference)
+                                .or_else(|| {
+                                    self.chat_link_at(cx, mouse.column, mouse.row)
+                                        .map(ChatClickTarget::Url)
+                                });
+                            if matches!(self.chat_click_target, Some(ChatClickTarget::Url(_))) {
+                                kvlog::info!(
+                                    "timeline URL pressed",
+                                    column = mouse.column,
+                                    row = mouse.row,
+                                    timeline_line = line.line
+                                );
+                            }
                             cx.view.active.chat.begin_drag(ChatCursor {
                                 entry: line.entry,
                                 line: line.line,
@@ -2352,17 +2387,23 @@ impl RoomMode {
                 // reference jumps to it and over a URL opens it; a drag remains
                 // a visual selection.
                 if cx.view.active.chat.drag_is_click() {
-                    if let Some(target) = self.chat_ref_at(cx, mouse.column, mouse.row) {
-                        self.jump_to_ref(cx, target);
-                    } else if let Some(url) = self.chat_link_at(cx, mouse.column, mouse.row) {
-                        cx.view.request_open_url(url);
+                    match self.chat_click_target.take() {
+                        Some(ChatClickTarget::Reference(target)) => self.jump_to_ref(cx, target),
+                        Some(ChatClickTarget::Url(url)) => {
+                            kvlog::info!("timeline URL click queued", url_bytes = url.len());
+                            cx.view.request_open_url(url);
+                        }
+                        None => {}
                     }
+                } else {
+                    self.chat_click_target = None;
                 }
-                self.copy_chat_drag_to_primary(cx);
+                self.copy_chat_drag(cx);
                 cx.view.active.chat.end_drag();
             }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left) => {
-                self.copy_chat_drag_to_primary(cx);
+                self.chat_click_target = None;
+                self.copy_chat_drag(cx);
                 cx.view.active.chat.end_drag();
             }
             _ => {}
@@ -2373,8 +2414,9 @@ impl RoomMode {
     /// Copies the body rows covered by the current mouse gesture without
     /// clearing its visual highlight. A click still has an anchor until
     /// `end_drag`, so it naturally copies the single row under the pointer.
-    fn copy_chat_drag_to_primary(&mut self, cx: &mut ViewCx<'_>) {
-        if !cx.config.ui.copy_on_select || !cx.view.active.chat.is_dragging() {
+    fn copy_chat_drag(&mut self, cx: &mut ViewCx<'_>) {
+        let destination = cx.config.ui.copy_on_select;
+        if destination == CopyOnSelect::Off || !cx.view.active.chat.is_dragging() {
             return;
         }
         let Some(history) = history_for_view(cx.session, cx.view.viewed_room) else {
@@ -2388,7 +2430,11 @@ impl RoomMode {
         else {
             return;
         };
-        cx.view.queue_primary_clipboard(text);
+        match destination {
+            CopyOnSelect::Off => unreachable!("off returned before collecting selection text"),
+            CopyOnSelect::Clipboard => cx.view.queue_clipboard(text),
+            CopyOnSelect::Primary => cx.view.queue_primary_clipboard(text),
+        }
     }
 
     fn start_scrollbar_drag(
@@ -5338,13 +5384,14 @@ mod tests {
             !app.view.active.chat.has_visual(),
             "a click is a cursor move, not a selection"
         );
+        assert_eq!(app.view.take_pending_clipboard(), None);
         assert_eq!(app.view.take_pending_primary_clipboard(), None);
     }
 
     #[test]
-    fn copy_on_select_copies_clicked_chat_row_to_primary_selection() {
+    fn copy_on_select_copies_clicked_chat_row_to_clipboard() {
         let mut app = test_app();
-        app.config.ui.copy_on_select = true;
+        app.config.ui.copy_on_select = CopyOnSelect::Clipboard;
         let mut room = RoomMode::default();
         push_room_message(&mut app, 1, UserId(2), 1, "hello");
 
@@ -5368,18 +5415,15 @@ mod tests {
             mouse(MouseEventKind::Up(MouseButton::Left), column, row),
         );
 
-        assert_eq!(
-            app.view.take_pending_primary_clipboard().as_deref(),
-            Some("hello")
-        );
-        assert_eq!(app.view.take_pending_clipboard(), None);
+        assert_eq!(app.view.take_pending_clipboard().as_deref(), Some("hello"));
+        assert_eq!(app.view.take_pending_primary_clipboard(), None);
         assert!(!app.view.active.chat.has_visual());
     }
 
     #[test]
-    fn copy_on_select_copies_dragged_rows_and_keeps_them_highlighted() {
+    fn copy_on_select_copies_dragged_rows_to_primary_and_keeps_them_highlighted() {
         let mut app = test_app();
-        app.config.ui.copy_on_select = true;
+        app.config.ui.copy_on_select = CopyOnSelect::Primary;
         let mut room = RoomMode::default();
         push_room_message(&mut app, 1, UserId(2), 1, "first");
         push_room_message(&mut app, 2, UserId(3), 2, "second");
@@ -5419,7 +5463,47 @@ mod tests {
             app.view.take_pending_primary_clipboard().as_deref(),
             Some("first\nsecond")
         );
+        assert_eq!(app.view.take_pending_clipboard(), None);
         assert!(app.view.active.chat.has_visual());
+    }
+
+    #[test]
+    fn link_click_keeps_pressed_target_during_same_row_pointer_movement() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let body = "see https://example.com now";
+        push_room_message(&mut app, 1, UserId(2), 1, body);
+
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let layout = room.layout();
+        let row = layout.chat_rect.y
+            + layout
+                .visible_chat_lines
+                .iter()
+                .position(|line| line.kind == LineKind::Body)
+                .expect("body line rendered") as u16;
+        let content_x = layout.chat_rect.x + 1;
+        let link_column = content_x + body.find("https").expect("url") as u16 + 1;
+        let suffix_column = content_x + body.find(" now").expect("suffix") as u16 + 1;
+
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), link_column, row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), suffix_column, row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), suffix_column, row),
+        );
+
+        assert_eq!(
+            app.view.take_pending_url_open().as_deref(),
+            Some("https://example.com")
+        );
     }
 
     #[test]

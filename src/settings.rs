@@ -7,8 +7,8 @@ use crate::{
         NETEQ_START_DELAY_MS_RANGE, StreamPreview,
     },
     config::{
-        AudioConfig, AudioLatencyConfig, BufferSize, CandidatePrivacy, DEFAULT_DENOISE_RELEASE,
-        DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
+        AudioConfig, AudioLatencyConfig, BufferSize, CandidatePrivacy, CopyOnSelect,
+        DEFAULT_DENOISE_RELEASE, DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_TARGET_LATENCY,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_TARGET_LATENCY, DownloadMode, FileConfig,
         FormBindings, HistoryConfig, MAX_NOTIFICATION_VOLUME_DB, MIN_NOTIFICATION_VOLUME_DB,
@@ -101,7 +101,7 @@ pub struct SettingsDraft {
     pub(crate) ui_room_height: String,
     pub(crate) ui_max_composer_height: String,
     pub(crate) ui_composer_padding: bool,
-    pub(crate) ui_copy_on_select: bool,
+    pub(crate) ui_copy_on_select: CopyOnSelect,
     pub(crate) ui_max_messages: String,
     pub(crate) ui_scroll_buffer: String,
     pub(crate) ui_overscan: String,
@@ -1760,7 +1760,7 @@ mod tests {
             room_height: 7,
             max_composer_height: 12,
             composer_padding: false,
-            copy_on_select: true,
+            copy_on_select: CopyOnSelect::Clipboard,
             max_messages: 12_345,
             scroll_buffer: 9,
             overscan: 48,
@@ -1773,7 +1773,7 @@ mod tests {
         assert_eq!(produced.room_height, 7);
         assert_eq!(produced.max_composer_height, 12);
         assert!(!produced.composer_padding);
-        assert!(produced.copy_on_select);
+        assert_eq!(produced.copy_on_select, CopyOnSelect::Clipboard);
         assert_eq!(produced.max_messages, 12_345);
         assert_eq!(produced.scroll_buffer, 9);
         assert_eq!(produced.overscan, 48);

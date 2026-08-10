@@ -1066,13 +1066,18 @@ fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
         form.set_default("on");
     }
     if form
-        .checkbox("Copy on Select", &mut draft.ui_copy_on_select)
+        .choice_value(
+            "Copy on Select",
+            &mut draft.ui_copy_on_select,
+            &crate::config::CopyOnSelect::ALL,
+            |value| value.label().to_string(),
+        )
         .is_focus()
     {
         form.set_help(
-            "Copies clicked or drag-selected message rows to the primary selection on mouse release.",
+            "Copies clicked or drag-selected message rows to the chosen selection on mouse release.",
         );
-        form.set_default("off");
+        form.set_default(crate::config::CopyOnSelect::default().label());
     }
     if form
         .text("Scroll Buffer", &mut draft.ui_scroll_buffer, |text| {

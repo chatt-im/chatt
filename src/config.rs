@@ -438,10 +438,10 @@ pub struct UiConfig {
     pub max_composer_height: u16,
     #[toml(default = true, ToToml skip_if = |value: &bool| *value)]
     pub composer_padding: bool,
-    /// Copies clicked or mouse-selected message-log rows to the platform's
-    /// primary selection when the mouse button is released.
+    /// Where clicked or mouse-selected message-log rows are copied when the
+    /// mouse button is released.
     #[toml(default)]
-    pub copy_on_select: bool,
+    pub copy_on_select: CopyOnSelect,
     #[toml(default = 50_000)]
     pub max_messages: u32,
     /// Rendered timeline rows kept above and below the selected row while
@@ -456,6 +456,54 @@ pub struct UiConfig {
     pub theme: ThemeSelection,
     #[toml(default, style = Header, ToToml skip_if = ThemesConfig::is_empty)]
     pub themes: ThemesConfig,
+}
+
+/// Destination for text copied by a mouse selection in the timeline.
+///
+/// The string values are canonical. Booleans remain accepted for compatibility
+/// with configs written before the destination became configurable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CopyOnSelect {
+    #[default]
+    Off,
+    Clipboard,
+    Primary,
+}
+
+impl CopyOnSelect {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Clipboard, Self::Primary];
+
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Clipboard => "clipboard",
+            Self::Primary => "primary",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        self.wire_name()
+    }
+}
+
+impl<'de> FromToml<'de> for CopyOnSelect {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        match (item.as_bool(), item.as_str()) {
+            (Some(false), _) | (_, Some("off")) => Ok(Self::Off),
+            (Some(true), _) | (_, Some("primary")) => Ok(Self::Primary),
+            (_, Some("clipboard")) => Ok(Self::Clipboard),
+            _ => Err(ctx.report_custom_error(
+                "expected \"off\", \"clipboard\", \"primary\", true, or false",
+                item,
+            )),
+        }
+    }
+}
+
+impl ToToml for CopyOnSelect {
+    fn to_toml<'a>(&'a self, _arena: &'a Arena) -> Result<Item<'a>, ToTomlError> {
+        Ok(Item::string(self.wire_name()))
+    }
 }
 
 /// The platform default URL opener: `open` on macOS, `xdg-open` on Linux, and
@@ -486,7 +534,7 @@ impl Default for UiConfig {
             room_height: 4,
             max_composer_height: 6,
             composer_padding: true,
-            copy_on_select: false,
+            copy_on_select: CopyOnSelect::Off,
             max_messages: 50_000,
             scroll_buffer: 3,
             overscan: 24,
@@ -3160,7 +3208,7 @@ media-transport = "tcp"
         let content = render_runtime(&Config::default());
 
         assert!(content.contains("default-bindings = \"standard\""));
-        assert!(content.contains("copy-on-select = false"));
+        assert!(content.contains("copy-on-select = \"off\""));
         assert!(content.contains("[p2p]\nenabled = false"));
         assert!(content.contains("[history]\nenabled = false"));
         assert!(content.contains("download = \"memory\""));
@@ -3573,17 +3621,40 @@ media-transport = "tcp"
     }
 
     #[test]
-    fn copy_on_select_defaults_off_and_can_be_enabled() {
+    fn copy_on_select_accepts_destinations_and_legacy_booleans() {
         let arena = Arena::new();
         let default_config: Config = toml_spanner::parse("", &arena).unwrap().to().unwrap();
-        assert!(!default_config.ui.copy_on_select);
+        assert_eq!(default_config.ui.copy_on_select, CopyOnSelect::Off);
 
-        let arena = Arena::new();
-        let enabled: Config = toml_spanner::parse("[ui]\ncopy-on-select = true\n", &arena)
-            .unwrap()
-            .to()
-            .unwrap();
-        assert!(enabled.ui.copy_on_select);
+        for (value, expected) in [
+            ("\"off\"", CopyOnSelect::Off),
+            ("\"clipboard\"", CopyOnSelect::Clipboard),
+            ("\"primary\"", CopyOnSelect::Primary),
+            ("true", CopyOnSelect::Primary),
+            ("false", CopyOnSelect::Off),
+        ] {
+            let arena = Arena::new();
+            let text = format!("[ui]\ncopy-on-select = {value}\n");
+            let config: Config = toml_spanner::parse(&text, &arena).unwrap().to().unwrap();
+            assert_eq!(config.ui.copy_on_select, expected, "value {value}");
+        }
+    }
+
+    #[test]
+    fn copy_on_select_serializes_as_canonical_string() {
+        for (value, wire_name) in [
+            (CopyOnSelect::Off, "off"),
+            (CopyOnSelect::Clipboard, "clipboard"),
+            (CopyOnSelect::Primary, "primary"),
+        ] {
+            let mut config = Config::default();
+            config.ui.copy_on_select = value;
+            let content = render_runtime(&config);
+            assert!(
+                content.contains(&format!("copy-on-select = \"{wire_name}\"")),
+                "{content}"
+            );
+        }
     }
 
     #[test]

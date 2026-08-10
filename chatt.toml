@@ -52,8 +52,8 @@ capture-silence-ramp-ms = 10
 room-height = 4
 max-composer-height = 6
 composer-padding = true
-# Copy clicked or drag-selected message rows to the primary selection.
-copy-on-select = false
+# Copy clicked or drag-selected message rows: "off", "clipboard", or "primary".
+copy-on-select = "off"
 max-messages = 50000
 # Timeline rows kept above and below the selected row. A value larger than the
 # available space keeps the selection centered.

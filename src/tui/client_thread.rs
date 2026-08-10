@@ -159,6 +159,11 @@ impl ClientThread {
                 dirty = DirtySections::ALL;
             }
             dirty |= channel.take_dirty();
+            clipboard.poll();
+            if let Some(error) = url_opener.poll_failure() {
+                view.set_error(error);
+                dirty |= DirtySections::COMPOSE_BAR;
+            }
             let client_events = channel.drain_events();
 
             let active_animation = {
@@ -310,7 +315,11 @@ impl ClientThread {
                 clipboard.copy_primary(&mut terminal, &text);
             }
             if let Some(url) = url {
-                url_opener.open(&url);
+                match url_opener.open(&url) {
+                    Ok(()) => view.set_transient_status("opening link"),
+                    Err(error) => view.set_error(error),
+                }
+                dirty |= DirtySections::COMPOSE_BAR;
             }
         }
         Ok(())
