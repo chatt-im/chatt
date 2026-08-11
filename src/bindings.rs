@@ -723,6 +723,19 @@ mod tests {
     }
 
     #[test]
+    fn default_normal_modes_bind_shift_m_to_deafen() {
+        let runtime = BindingRuntime::default();
+        for layer in [WORKSPACE_LAYER, CHAT_VISUAL_LAYER, COMPOSE_NORMAL_LAYER] {
+            assert!(matches!(
+                command(&runtime, layer, "M"),
+                Some(BindCommand::ToggleDeafen)
+            ));
+            assert!(command(&runtime, layer, "C-h").is_none());
+        }
+        assert!(command(&runtime, INSERT_LAYER, "C-h").is_none());
+    }
+
+    #[test]
     fn inherit_cycle_reports_error() {
         let errors = parse_errors(concat!(
             "[a]\n",

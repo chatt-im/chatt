@@ -6479,7 +6479,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_deafen_uses_ctrl_h_after_h_moves_to_rooms() {
+    fn workspace_deafen_uses_shift_m_after_h_moves_to_rooms() {
         let mut app = test_app();
         let mut room = RoomMode::with_focus(ChatPanelFocus::Lobby);
 
@@ -6487,7 +6487,7 @@ mod tests {
         assert_eq!(room.lobby_list_focus(), LobbyListFocus::Rooms);
         assert!(!app.voice_state.load(Ordering::Relaxed).is_deafened());
 
-        room.process_input(&mut app, ctrl('h'));
+        room.process_input(&mut app, key('M'));
         assert!(app.voice_state.load(Ordering::Relaxed).is_deafened());
     }
 
