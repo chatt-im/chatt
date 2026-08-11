@@ -293,6 +293,7 @@ export const createScroller = (
   $scrollTo: (offset: number) => void;
   $scrollBy: (offset: number) => void;
   $scrollToIndex: (index: number, opts?: ScrollToIndexOpts) => void;
+  $cancelScroll: () => void;
 } => {
   let viewportElement: HTMLElement | undefined;
   let scrollObserver: ScrollObserver | undefined;
@@ -374,6 +375,7 @@ export const createScroller = (
       offset += store.$getScrollOffset();
       scheduleScroll(() => offset);
     },
+    $cancelScroll: cancelScroll,
     $scrollToIndex(index, { align, smooth, offset = 0 } = {}) {
       index = clamp(index, 0, store.$getItemsLength() - 1);
 

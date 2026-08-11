@@ -2089,6 +2089,14 @@ export default function App() {
   function markUser() {
     const wasDriving = userDriving;
     userDriving = true;
+    // A real gesture supersedes a pin already in flight. Cancel both the
+    // virtualizer's measurement loop and our matching scroll-event suppression;
+    // clearing only one still lets the old bottom target win the race.
+    handle?.cancelScroll();
+    if (suppress) {
+      suppress = false;
+      clearSuppressTimer();
+    }
     if (!wasDriving) debugScrollState("user-start");
     if (idleTimer) {
       clearTimeout(idleTimer);

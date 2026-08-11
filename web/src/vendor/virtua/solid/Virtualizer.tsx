@@ -84,6 +84,8 @@ export interface VirtualizerHandle {
    * @param offset offset from current position
    */
   scrollBy(offset: number): void;
+  /** Cancel an imperative scroll that is still waiting for item measurement. */
+  cancelScroll(): void;
 }
 
 /**
@@ -243,6 +245,7 @@ export const Virtualizer = <T,>(props: VirtualizerProps<T>): JSX.Element => {
         scrollToIndex: scroller.$scrollToIndex,
         scrollTo: scroller.$scrollTo,
         scrollBy: scroller.$scrollBy,
+        cancelScroll: scroller.$cancelScroll,
       });
     }
 
