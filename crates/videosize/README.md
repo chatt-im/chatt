@@ -11,7 +11,13 @@ println!("{}x{}", size.width, size.height);
 
 let file = std::fs::File::open("anamorphic.mkv")?;
 let info = videosize::probe(file)?;
-println!("codec: {:?}, display aspect: {}", info.codec, info.aspect_ratio());
+println!(
+    "codec: {:?}, display: {}x{} ({})",
+    info.codec,
+    info.display_size.width,
+    info.display_size.height,
+    info.aspect_ratio()
+);
 # Ok::<(), videosize::VideoError>(())
 ```
 
@@ -21,9 +27,11 @@ designed to identify a container from partial header bytes. An owned file's
 initial cursor is ignored.
 
 `VideoInfo::size` and the result of `size` are encoded/container pixel
-dimensions. `VideoInfo::display_aspect_ratio` (also returned by
-`VideoInfo::aspect_ratio()`) applies container apertures or crops, pixel aspect,
-codec cropping/render geometry, and supported quarter-turn transforms.
+dimensions. `VideoInfo::display_size` is the best-known integral square-pixel
+presentation canvas after container apertures or crops, pixel aspect, codec
+cropping/render geometry, and supported transforms; fractional axes round to
+the nearest pixel. `VideoInfo::display_aspect_ratio` (also returned by
+`VideoInfo::aspect_ratio()`) retains the exact ratio before that rounding.
 
 | Container | Metadata and bounded header support |
 | --- | --- |

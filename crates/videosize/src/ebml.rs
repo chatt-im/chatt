@@ -1,6 +1,6 @@
 use crate::codecs::{self, CodecGeometry};
 use crate::source::{Source, Span};
-use crate::util::{be, invalid, ratio4};
+use crate::util::{be, invalid, ratio4, scale_round};
 use crate::{AspectRatio, Codec, VideoError, VideoInfo, VideoResult, VideoType, make_info};
 
 const EBML: u64 = 0x1a45dfa3;
@@ -390,14 +390,26 @@ fn finish(
     } else {
         AspectRatio::new(visible.0, visible.1).multiply_ratio(pixel)
     };
+    let mut display_size = if explicit && track.display_unit == 0 {
+        display
+    } else {
+        (
+            scale_round(visible.1, ratio.numerator, ratio.denominator)
+                .ok_or(VideoError::CorruptedVideo)?,
+            visible.1,
+        )
+    };
     if matches!(track.rotation, 90 | 270) {
         ratio = ratio.inverse();
+        display_size = (display_size.1, display_size.0);
     }
     make_info(
         kind,
         track.codec,
         width,
         height,
+        display_size.0,
+        display_size.1,
         pixel,
         ratio,
         track.rotation,

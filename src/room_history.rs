@@ -55,7 +55,8 @@ pub(crate) struct FileDetail {
     pub file_name: String,
     /// Byte size of the transferred file.
     pub length: u64,
-    /// Image dimensions packed as `(height << 32) | width`, `0` when unknown.
+    /// Media display dimensions packed as `(height << 32) | width`, `0` when
+    /// unknown.
     pub packed_dims: u64,
 }
 

@@ -62,6 +62,44 @@ test("decodes durable attachment identity from a message frame", () => {
   });
 });
 
+test("decodes the intrinsic size of a video attachment", () => {
+  const bytes = [0, 0, 0, 0, 2];
+  u64(bytes, 3);
+  u64(bytes, 7);
+  u64(bytes, 37);
+  u64(bytes, 8_000);
+  u64(bytes, 91);
+  string(bytes, "");
+  string(bytes, "Alice");
+  string(bytes, "sent file");
+  u8(bytes, 0);
+  u8(bytes, 0);
+  u8(bytes, 0);
+  u8(bytes, 1);
+  string(bytes, "clip.mp4");
+  u8(bytes, 1);
+  u64(bytes, 37);
+  u64(bytes, 8_000);
+  u8(bytes, 1);
+  u32(bytes, 1_080);
+  u32(bytes, 1_920);
+  u8(bytes, 1);
+  u64(bytes, 37);
+  u32(bytes, 0);
+
+  const frame = decodeFeed(Uint8Array.from(bytes).buffer);
+
+  if (!frame || frame.kind !== "message") throw new Error("expected message frame");
+  expect(frame.message.attachment).toEqual({
+    file_id: 37,
+    timestamp_ms: 8_000,
+    name: "clip.mp4",
+    kind: "video",
+    width: 1_080,
+    height: 1_920,
+  });
+});
+
 test("decodes canonical room generation and message paging cursor", () => {
   const bytes = [0, 0, 0, 0, 1];
   u64(bytes, 9);

@@ -739,8 +739,8 @@ pub enum NetworkEvent {
         /// view), mode-agnostic: an on-disk file name for persistent downloads
         /// or the ring-buffer key for in-memory ones.
         served_name: String,
-        /// Intrinsic pixel size, parsed from the file's header as it streamed.
-        /// `Some` only for images whose header fit the captured prefix.
+        /// Locally derived intrinsic display size. Images are parsed from their
+        /// streaming prefix; videos are bounded-probed from the complete file.
         dimensions: Option<(u32, u32)>,
     },
     /// A live byte-count update for an in-flight file transfer, correlated to the
@@ -2672,7 +2672,8 @@ struct OutgoingUpload {
     /// If that copy is disabled or cannot be made (for example, a video larger
     /// than the memory ring), this source becomes the locally served file.
     fallback_source: Option<PendingUploadSource>,
-    /// Intrinsic image size, parsed from the first chunk as it streams.
+    /// Intrinsic media size: an image's is parsed from the first chunk as it
+    /// streams, a video's is probed from the complete source before it does.
     dimensions: Option<(u32, u32)>,
     image_prefix: Vec<u8>,
     /// End-to-end sealing state for DM uploads, `None` outside DM rooms.
@@ -3031,29 +3032,37 @@ impl Write for SinkTarget {
     }
 }
 
+/// How an incoming file's intrinsic size is recovered, decided from its name
+/// when the transfer starts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaProbe {
+    /// Nothing to probe; the file is not displayable media.
+    None,
+    /// An image header, captured from the leading decoded bytes as they stream.
+    Image,
+    /// A video container, probed from the complete file once it lands. Video
+    /// metadata is not confined to the head of the file, so no prefix is kept.
+    Video,
+}
+
 struct ReceiveSink {
     target: SinkTarget,
     expected: u64,
     decoded: u64,
     work_budget: usize,
-    capture_image_prefix: bool,
+    probe: MediaProbe,
     image_prefix: Vec<u8>,
     digest: Option<aws_lc_rs::digest::Context>,
 }
 
 impl ReceiveSink {
-    fn new(
-        target: SinkTarget,
-        expected: u64,
-        capture_image_prefix: bool,
-        verify_digest: bool,
-    ) -> Self {
+    fn new(target: SinkTarget, expected: u64, probe: MediaProbe, verify_digest: bool) -> Self {
         Self {
             target,
             expected,
             decoded: 0,
             work_budget: 0,
-            capture_image_prefix,
+            probe,
             image_prefix: Vec::new(),
             digest: verify_digest
                 .then(|| aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256)),
@@ -3084,7 +3093,7 @@ impl Write for ReceiveSink {
         if let Some(digest) = self.digest.as_mut() {
             digest.update(&buf[..written]);
         }
-        if self.capture_image_prefix && self.image_prefix.len() < MAX_FILE_CHUNK_BYTES {
+        if self.probe == MediaProbe::Image && self.image_prefix.len() < MAX_FILE_CHUNK_BYTES {
             let capture = written.min(MAX_FILE_CHUNK_BYTES - self.image_prefix.len());
             self.image_prefix.extend_from_slice(&buf[..capture]);
         }
@@ -3243,10 +3252,21 @@ impl IncomingFile {
                 ));
             }
         }
-        let dimensions = sink
-            .capture_image_prefix
-            .then(|| crate::web_server::image_dimensions(&sink.image_prefix))
-            .flatten();
+        let dimensions = match (sink.probe, &sink.target, &dest) {
+            (MediaProbe::Image, _, _) => crate::web_server::image_dimensions(&sink.image_prefix),
+            (MediaProbe::Video, SinkTarget::Memory(bytes), _) => {
+                crate::web_server::video_dimensions(bytes)
+            }
+            // The sink's own handle is write-only, so the landed file is read
+            // back through a fresh one. `File` buffers nothing, so every decoded
+            // byte is already visible to it.
+            (MediaProbe::Video, SinkTarget::Disk(_), ReceiveDest::Disk { path, .. }) => {
+                File::open(path)
+                    .ok()
+                    .and_then(crate::web_server::video_dimensions_of_file)
+            }
+            _ => None,
+        };
         let location = match (dest, sink.target) {
             (ReceiveDest::Disk { path, reservation }, _) => {
                 let served_name = reservation.commit(path.clone());
@@ -4149,6 +4169,7 @@ impl WorkerState<'_> {
                 delete_after_open,
             ),
         };
+        let dimensions = video_source_dimensions(&name, source_bytes.as_deref(), &path);
         Ok(OutgoingUpload {
             transfer_id,
             server_metadata: None,
@@ -4171,7 +4192,7 @@ impl WorkerState<'_> {
             next_status_at: FILE_PROGRESS_STEP_BYTES.min(size),
             local_copy: None,
             fallback_source: Some(fallback_source),
-            dimensions: None,
+            dimensions,
             image_prefix: Vec::new(),
             seal,
         })
@@ -5168,7 +5189,7 @@ impl WorkerState<'_> {
         let sink = ReceiveSink::new(
             target,
             file.size,
-            is_image_name(&file.file_name),
+            media_probe(&file.file_name),
             seal.is_some(),
         );
         let body = match file.encoding {
@@ -6525,6 +6546,38 @@ fn is_auth_failure_code(code: u16) -> bool {
 /// Whether `name`'s extension marks it as an image worth probing for size.
 fn is_image_name(name: &str) -> bool {
     crate::web_server::classify(name) == "image"
+}
+
+/// How a file named `name` should be probed for its intrinsic size.
+fn media_probe(name: &str) -> MediaProbe {
+    match crate::web_server::classify(name) {
+        "image" => MediaProbe::Image,
+        "video" => MediaProbe::Video,
+        _ => MediaProbe::None,
+    }
+}
+
+/// The display size of an outgoing video, bounded-probed once before streaming.
+///
+/// A video's geometry can live anywhere in the container, so unlike an image it
+/// cannot be recovered from the chunks as they stream past
+/// ([`capture_upload_image_prefix`]). The source is complete on disk (or already
+/// resident) at this point. The probe has strict read and seek budgets; a file
+/// that exceeds them simply uploads without geometry.
+fn video_source_dimensions(
+    name: &str,
+    source_bytes: Option<&[u8]>,
+    path: &Path,
+) -> Option<(u32, u32)> {
+    if media_probe(name) != MediaProbe::Video {
+        return None;
+    }
+    let Some(bytes) = source_bytes else {
+        // A fresh handle, never `upload.file`: that one's cursor drives the
+        // upload and probing seeks all over the file.
+        return crate::web_server::video_dimensions_of_file(File::open(path).ok()?);
+    };
+    crate::web_server::video_dimensions(bytes)
 }
 
 /// Creates a uniquely named file under `dir` for a persistent download and
@@ -8036,17 +8089,54 @@ mod tests {
         path: &Path,
         original_size: u64,
         encoding: FileContentEncoding,
-        image: bool,
+        probe: MediaProbe,
     ) -> IncomingFile {
-        let file_name = if image { "image.png" } else { "data.bin" };
+        let file_name = match probe {
+            MediaProbe::Image => "image.png",
+            MediaProbe::Video => "clip.mp4",
+            MediaProbe::None => "data.bin",
+        };
         let store = crate::receive_store::DownloadStore::new(64 * 1024 * 1024);
         let reservation = store.reserve_disk_name(file_name.to_string()).unwrap();
         let sink = ReceiveSink::new(
             SinkTarget::Disk(File::create(path).unwrap()),
             original_size,
-            image,
+            probe,
             false,
         );
+        incoming_from_sink(
+            sink,
+            file_name,
+            original_size,
+            encoding,
+            ReceiveDest::Disk {
+                path: path.to_path_buf(),
+                reservation,
+            },
+        )
+    }
+
+    /// The [`incoming_test_file`] counterpart for a [`DownloadTarget::Memory`]
+    /// transfer, which never touches the filesystem.
+    ///
+    /// [`DownloadTarget::Memory`]: crate::config::DownloadTarget::Memory
+    fn incoming_test_memory_file(
+        file_name: &str,
+        original_size: u64,
+        encoding: FileContentEncoding,
+        probe: MediaProbe,
+    ) -> IncomingFile {
+        let sink = ReceiveSink::new(SinkTarget::Memory(Vec::new()), original_size, probe, false);
+        incoming_from_sink(sink, file_name, original_size, encoding, ReceiveDest::Memory)
+    }
+
+    fn incoming_from_sink(
+        sink: ReceiveSink,
+        file_name: &str,
+        original_size: u64,
+        encoding: FileContentEncoding,
+        dest: ReceiveDest,
+    ) -> IncomingFile {
         let body = match encoding {
             FileContentEncoding::Identity | FileContentEncoding::Sealed => {
                 IncomingBody::Identity(sink)
@@ -8073,10 +8163,7 @@ mod tests {
                 encoding,
                 timestamp_ms: 1,
             },
-            dest: ReceiveDest::Disk {
-                path: path.to_path_buf(),
-                reservation,
-            },
+            dest,
             body,
             pending_wire: Vec::new(),
             pending_wire_offset: 0,
@@ -8136,8 +8223,12 @@ mod tests {
                 let encoded = encode_test_stream(&data, source_chunk, 211);
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("received.bin");
-                let mut incoming =
-                    incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
+                let mut incoming = incoming_test_file(
+                    &path,
+                    data.len() as u64,
+                    FileContentEncoding::Zstd,
+                    MediaProbe::None,
+                );
                 pump_test_input(&mut incoming, &encoded, 313, 64 * 1024).unwrap();
                 let (_, location, _, _, _) = incoming.finalize().unwrap();
                 let FinalizedLocation::Disk { path, served_name } = location else {
@@ -8162,8 +8253,12 @@ mod tests {
         }] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("broken.bin");
-            let mut incoming =
-                incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
+            let mut incoming = incoming_test_file(
+                &path,
+                data.len() as u64,
+                FileContentEncoding::Zstd,
+                MediaProbe::None,
+            );
             assert!(pump_test_input(&mut incoming, &broken, 127, 32 * 1024).is_err());
         }
     }
@@ -8175,7 +8270,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("limited.bin");
         let declared = 64 * 1024;
-        let mut incoming = incoming_test_file(&path, declared, FileContentEncoding::Zstd, false);
+        let mut incoming =
+            incoming_test_file(&path, declared, FileContentEncoding::Zstd, MediaProbe::None);
 
         assert!(pump_test_input(&mut incoming, &encoded, 1024, 16 * 1024).is_err());
         assert!(fs::metadata(path).unwrap().len() <= declared);
@@ -8193,8 +8289,12 @@ mod tests {
         let encoded = encoder.finish().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("window.bin");
-        let mut incoming =
-            incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
+        let mut incoming = incoming_test_file(
+            &path,
+            data.len() as u64,
+            FileContentEncoding::Zstd,
+            MediaProbe::None,
+        );
 
         assert!(pump_test_input(&mut incoming, &encoded, 4096, 64 * 1024).is_err());
     }
@@ -8216,11 +8316,86 @@ mod tests {
             };
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("image.png");
-            let mut incoming = incoming_test_file(&path, png.len() as u64, encoding, true);
+            let mut incoming =
+                incoming_test_file(&path, png.len() as u64, encoding, MediaProbe::Image);
             pump_test_input(&mut incoming, &wire, 191, 4096).unwrap();
             let (_, _, _, dimensions, _) = incoming.finalize().unwrap();
             assert_eq!(dimensions, Some((320, 180)));
         }
+    }
+
+    #[test]
+    fn receive_probes_video_dimensions_from_the_landed_file() {
+        let mp4 = crate::web_server::tests::test_mp4(1920, 1080, 90, None);
+
+        for encoding in [FileContentEncoding::Identity, FileContentEncoding::Zstd] {
+            let wire = match encoding {
+                FileContentEncoding::Identity | FileContentEncoding::Sealed => mp4.clone(),
+                FileContentEncoding::Zstd => encode_test_stream(&mp4, 777, 333),
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("clip.mp4");
+            let mut incoming =
+                incoming_test_file(&path, mp4.len() as u64, encoding, MediaProbe::Video);
+            pump_test_input(&mut incoming, &wire, 191, 4096).unwrap();
+            let (_, _, _, dimensions, _) = incoming.finalize().unwrap();
+            assert_eq!(
+                dimensions,
+                Some((1080, 1920)),
+                "the write-only sink handle forces a reopen, and rotation must survive"
+            );
+
+            let mut incoming = incoming_test_memory_file(
+                "clip.mp4",
+                mp4.len() as u64,
+                encoding,
+                MediaProbe::Video,
+            );
+            pump_test_input(&mut incoming, &wire, 191, 4096).unwrap();
+            let (_, _, _, dimensions, _) = incoming.finalize().unwrap();
+            assert_eq!(dimensions, Some((1080, 1920)));
+        }
+    }
+
+    #[test]
+    fn receive_skips_probing_files_that_are_not_displayable_media() {
+        let mp4 = crate::web_server::tests::test_mp4(640, 360, 0, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let mut incoming = incoming_test_file(
+            &path,
+            mp4.len() as u64,
+            FileContentEncoding::Identity,
+            MediaProbe::None,
+        );
+        pump_test_input(&mut incoming, &mp4, 191, 4096).unwrap();
+        let (_, _, _, dimensions, _) = incoming.finalize().unwrap();
+        assert_eq!(dimensions, None);
+    }
+
+    #[test]
+    fn upload_probes_video_dimensions_from_either_source() {
+        let mp4 = crate::web_server::tests::test_mp4(720, 480, 0, Some((32, 27)));
+        let file = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
+        fs::write(file.path(), &mp4).unwrap();
+
+        assert_eq!(
+            video_source_dimensions("clip.mp4", Some(&mp4), Path::new("unused")),
+            Some((853, 480))
+        );
+        assert_eq!(
+            video_source_dimensions("clip.mp4", None, file.path()),
+            Some((853, 480))
+        );
+        assert_eq!(
+            video_source_dimensions("clip.png", Some(&mp4), file.path()),
+            None,
+            "an image name is probed from its streaming prefix instead"
+        );
+        assert_eq!(
+            video_source_dimensions("clip.mp4", None, Path::new("/nonexistent/clip.mp4")),
+            None
+        );
     }
 
     #[test]
@@ -8229,8 +8404,12 @@ mod tests {
         let encoded = encode_test_stream(&data, 64 * 1024, 64 * 1024);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bounded.bin");
-        let mut incoming =
-            incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
+        let mut incoming = incoming_test_file(
+            &path,
+            data.len() as u64,
+            FileContentEncoding::Zstd,
+            MediaProbe::None,
+        );
         let budget = 32 * 1024;
         let deltas = pump_test_input(&mut incoming, &encoded, encoded.len(), budget).unwrap();
         assert!(deltas.iter().all(|delta| *delta <= budget as u64));
@@ -8246,7 +8425,7 @@ mod tests {
             &path,
             data.len() as u64,
             FileContentEncoding::Identity,
-            false,
+            MediaProbe::None,
         );
         incoming.pending_wire = data;
         incoming.wire_received = incoming.pending_wire.len() as u64;

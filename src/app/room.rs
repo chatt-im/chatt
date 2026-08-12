@@ -7038,6 +7038,35 @@ mod tests {
     }
 
     #[test]
+    fn video_attachment_reaches_the_web_view_with_its_size() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
+        let transfer_id = FileTransferId(8);
+        room.file_received(
+            RoomId(1),
+            transfer_id,
+            11_000,
+            "clip.mp4",
+            456,
+            Some((1080, 1920)),
+        );
+        room.chat_received(
+            file_message(11, UserId(2), "clip.mp4", transfer_id),
+            Some(UserId(1)),
+        )
+        .unwrap();
+
+        let attachment = room
+            .web_attachment_for(rpc::msgref::MessageRef {
+                room_id: RoomId(1),
+                message_id: MessageId(11),
+            })
+            .unwrap();
+        assert_eq!(attachment.kind, "video");
+        assert_eq!((attachment.width, attachment.height), (Some(1080), Some(1920)));
+    }
+
+    #[test]
     fn completed_file_after_announcement_revises_canonical_record() {
         let mut room = test_room();
         enter(

@@ -358,6 +358,7 @@ dependencies = [
  "toml-spanner",
  "unicode-segmentation",
  "unicode-width",
+ "videosize",
  "vt100",
  "zeroize",
  "zstd",

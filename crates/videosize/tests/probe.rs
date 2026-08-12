@@ -412,6 +412,7 @@ fn probes_all_mp4_codec_tags() {
         );
         assert_eq!(info.video_type, VideoType::Mp4);
         assert_eq!(info.codec, Some(codec));
+        assert_eq!(info.display_size, VideoSize { width: 640, height: 360 });
         assert_eq!(info.aspect_ratio(), AspectRatio::new(16, 9));
     }
 }
@@ -442,6 +443,7 @@ fn mp4_clap_tapt_and_composed_transforms_are_applied() {
         }
     );
     assert_eq!(info.aspect_ratio(), AspectRatio::new(1279, 719));
+    assert_eq!(info.display_size, VideoSize { width: 640, height: 360 });
 
     let track = mp4_track_box(
         1,
@@ -454,10 +456,9 @@ fn mp4_clap_tapt_and_composed_transforms_are_applied() {
         Vec::new(),
         Some((1024 << 16, 576 << 16)),
     );
-    assert_eq!(
-        probe_both(&mp4_with_tracks(vec![track], 0)).aspect_ratio(),
-        AspectRatio::new(16, 9)
-    );
+    let info = probe_both(&mp4_with_tracks(vec![track], 0));
+    assert_eq!(info.aspect_ratio(), AspectRatio::new(16, 9));
+    assert_eq!(info.display_size, VideoSize { width: 1024, height: 576 });
 
     let track = mp4_track_box(1, b"avc1", 640, 360, 3, 90, Vec::new(), Vec::new(), None);
     let info = probe_both(&mp4_with_tracks(vec![track], 90));
@@ -573,6 +574,7 @@ fn mov_rotation_and_pixel_aspect_are_applied_to_display_ratio() {
     let info = probe_both(&data);
     assert_eq!(info.rotation, 90);
     assert_eq!(info.pixel_aspect_ratio, AspectRatio::new(4, 3));
+    assert_eq!(info.display_size, VideoSize { width: 360, height: 853 });
     assert_eq!(info.aspect_ratio(), AspectRatio::new(27, 64));
 }
 
@@ -611,6 +613,7 @@ fn probes_matroska_and_webm_codecs_and_display_size() {
         );
         assert_eq!(info.video_type, VideoType::Matroska);
         assert_eq!(info.codec, Some(codec));
+        assert_eq!(info.display_size, VideoSize { width: 1024, height: 576 });
         assert_eq!(info.pixel_aspect_ratio, AspectRatio::new(64, 45));
         assert_eq!(info.aspect_ratio(), AspectRatio::new(16, 9));
     }
@@ -632,6 +635,7 @@ fn probes_avi_tags_aspect_and_global_dimension_fallback() {
     for (tag, codec) in cases {
         let info = probe_both(&avi(tag, true));
         assert_eq!(info.codec, Some(codec));
+        assert_eq!(info.display_size, VideoSize { width: 320, height: 180 });
         assert_eq!(
             info.size,
             VideoSize {
@@ -690,6 +694,7 @@ fn avi_disabled_streams_media_chunks_codec_crop_and_audio_rejection() {
         }
     );
     assert_eq!(info.aspect_ratio(), AspectRatio::new(16, 9));
+    assert_eq!(info.display_size, VideoSize { width: 640, height: 360 });
 
     let avc = vec![
         0, 0, 0, 1, 0x67, 0x64, 0, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x44, 0,
@@ -708,6 +713,7 @@ fn avi_disabled_streams_media_chunks_codec_crop_and_audio_rejection() {
             height: 1088
         }
     );
+    assert_eq!(info.display_size, VideoSize { width: 1920, height: 1080 });
     assert_eq!(info.aspect_ratio(), AspectRatio::new(16, 9));
 
     let audio_only = avi_custom(vec![avi_audio_stream()], (1920, 1080), None);
@@ -929,6 +935,7 @@ fn large_first_sample_is_parsed_from_its_leading_bytes() {
             height: 360
         }
     );
+    assert_eq!(info.display_size, VideoSize { width: 640, height: 360 });
     assert_eq!(info.aspect_ratio(), AspectRatio::new(16, 9));
     assert_eq!(info.codec, Some(Codec::Vp8));
 }
@@ -1006,6 +1013,7 @@ fn matroska_crop_defaults_and_projection_geometry() {
             height: 1088
         }
     );
+    assert_eq!(info.display_size, VideoSize { width: 1920, height: 1080 });
     assert_eq!(info.aspect_ratio(), AspectRatio::new(16, 9));
 
     let only_width = ebml_uint(&[0x54, 0xb0], 1024);
@@ -1032,6 +1040,7 @@ fn matroska_crop_defaults_and_projection_geometry() {
     );
     let info = probe_both(&data);
     assert_eq!(info.rotation, 270);
+    assert_eq!(info.display_size, VideoSize { width: 360, height: 640 });
     assert_eq!(info.aspect_ratio(), AspectRatio::new(9, 16));
 }
 

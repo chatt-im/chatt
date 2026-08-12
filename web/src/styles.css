@@ -25,7 +25,9 @@
   --space: 8px;
   --space-lg: 16px;
   --gutter: 56px;
-  --media-video-height: 240px;
+  /* `--media-video-height` is intentionally not given a shipped value: users
+   * who define it retain an explicit fixed-height override for every video. */
+  --media-video-fallback-height: 240px;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --font-size: 15px;
@@ -704,17 +706,29 @@ body {
   opacity: 1;
 }
 
-/* Video metadata loads async and its intrinsic size is unknown up front, so a
- * fixed height reserves the vertical box that the scroll math depends on. The
- * player controls let the viewer expand to fullscreen. */
+/* All video sizing rules use one-class specificity so a later user rule such
+ * as `.media-video { height: ... }` wins without `!important`. */
 .media-video {
   display: block;
-  height: var(--media-video-height);
   max-width: 100%;
   background: var(--bg);
   /* position: relative, here works around: https://issues.chromium.org/issues/532229489 */
   /* We can remove in 2028. */
   position: relative;
+}
+
+/* Once geometry is known from either our probe or the browser, use the natural
+ * size. A user-defined legacy variable still deliberately fixes the height. */
+.media-video-sized {
+  width: auto;
+  height: var(--media-video-height, auto);
+  max-height: var(--media-video-height, 50vh);
+}
+
+/* Unknown geometry reserves a small, consistent player only while metadata
+ * loads. VideoPlayer removes this class on loadedmetadata. */
+.media-video-unsized {
+  height: var(--media-video-height, var(--media-video-fallback-height));
 }
 
 .media-audio {
@@ -1025,8 +1039,8 @@ body {
   border: 1px solid var(--border);
   overflow-x: auto;
   font-family: var(--font-mono);
-  font-size: 0.88em;
-  line-height: 1.4;
+  font-size: 1rem;
+  line-height: normal;
 }
 
 .code-block code {

@@ -235,10 +235,11 @@ pub struct WebAttachment {
     pub name: String,
     /// One of `image`, `video`, `audio`, or `file`.
     pub kind: String,
-    /// Intrinsic pixel width, set for `image` attachments whose header parsed.
+    /// Intrinsic pixel width, set for `image` and `video` attachments whose
+    /// metadata parsed.
     ///
-    /// The frontend reserves the box from `width`/`height` so a decoding image
-    /// never grows the layout. `None` for non-images or an unreadable header.
+    /// The frontend reserves the box from `width`/`height` so decoding media
+    /// never grows the layout. `None` for other kinds or unreadable metadata.
     pub width: Option<u32>,
     /// Intrinsic pixel height, paired with [`width`](WebAttachment::width).
     pub height: Option<u32>,
@@ -253,7 +254,7 @@ impl WebAttachment {
     ) -> Self {
         let kind = classify(served_name);
         let (width, height) = match (kind, dimensions) {
-            ("image", Some((w, h))) => (Some(w), Some(h)),
+            ("image" | "video", Some((w, h))) => (Some(w), Some(h)),
             _ => (None, None),
         };
         Self {
@@ -417,6 +418,34 @@ fn format_size(bytes: u64) -> String {
 pub fn image_dimensions(header: &[u8]) -> Option<(u32, u32)> {
     let size = imagesize::blob_size(header).ok()?;
     Some((size.width as u32, size.height as u32))
+}
+
+/// Reads the display pixel size of a complete video held in memory.
+///
+/// Unlike [`image_dimensions`] a prefix is not enough: container metadata can
+/// sit anywhere in the file, so callers must pass the whole thing. Returns
+/// `None` for an unsupported container or one whose geometry cannot be trusted.
+pub fn video_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    video_display_dimensions(videosize::blob_probe(data).ok()?)
+}
+
+/// Reads the display pixel size of a complete video file.
+///
+/// Probing seeks around the file rather than reading it whole. Parser work,
+/// cache-refill bytes, and cache misses are all bounded; the file's initial
+/// cursor is ignored.
+pub fn video_dimensions_of_file(file: std::fs::File) -> Option<(u32, u32)> {
+    video_display_dimensions(videosize::probe(file).ok()?)
+}
+
+/// The integral square-pixel canvas a player presents, after container and
+/// codec crop/render geometry, pixel aspect, and rotation have been applied.
+fn video_display_dimensions(info: videosize::VideoInfo) -> Option<(u32, u32)> {
+    let size = info.display_size;
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+    Some((size.width, size.height))
 }
 
 /// Classifies a file name into a media kind by its extension.
@@ -2686,8 +2715,70 @@ fn sanitize_upload_name(name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Builds a complete, minimal MP4 with one video track: `ftyp` plus a
+    /// `moov` holding the track header (which carries the display matrix) and a
+    /// single `avc1` sample entry. `rotation` is a quarter turn written into the
+    /// track matrix and `pixel_aspect` an optional non-square `pasp`.
+    ///
+    /// Shared with the transfer tests in [`crate::client_net`], which need a
+    /// probe-able video to drive the receive path.
+    pub(crate) fn test_mp4(
+        width: u16,
+        height: u16,
+        rotation: u16,
+        pixel_aspect: Option<(u32, u32)>,
+    ) -> Vec<u8> {
+        fn mp4_box(kind: &[u8; 4], payload: Vec<u8>) -> Vec<u8> {
+            let mut output = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+            output.extend_from_slice(kind);
+            output.extend(payload);
+            output
+        }
+
+        let mut ftyp = b"isom".to_vec();
+        ftyp.extend_from_slice(&0u32.to_be_bytes());
+        ftyp.extend_from_slice(b"isom");
+
+        let mut tkhd = vec![0; 84];
+        let (a, b, c, d): (i32, i32, i32, i32) = match rotation {
+            90 => (0, 1 << 16, -(1 << 16), 0),
+            180 => (-(1 << 16), 0, 0, -(1 << 16)),
+            270 => (0, -(1 << 16), 1 << 16, 0),
+            _ => (1 << 16, 0, 0, 1 << 16),
+        };
+        tkhd[40..44].copy_from_slice(&a.to_be_bytes());
+        tkhd[44..48].copy_from_slice(&b.to_be_bytes());
+        tkhd[52..56].copy_from_slice(&c.to_be_bytes());
+        tkhd[56..60].copy_from_slice(&d.to_be_bytes());
+        tkhd[76..80].copy_from_slice(&(u32::from(width) << 16).to_be_bytes());
+        tkhd[80..84].copy_from_slice(&(u32::from(height) << 16).to_be_bytes());
+
+        let mut sample = vec![0; 78];
+        sample[24..26].copy_from_slice(&width.to_be_bytes());
+        sample[26..28].copy_from_slice(&height.to_be_bytes());
+        if let Some((horizontal, vertical)) = pixel_aspect {
+            let mut value = horizontal.to_be_bytes().to_vec();
+            value.extend_from_slice(&vertical.to_be_bytes());
+            sample.extend(mp4_box(b"pasp", value));
+        }
+        let mut stsd = vec![0; 4];
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        stsd.extend(mp4_box(b"avc1", sample));
+
+        let mut hdlr = vec![0; 12];
+        hdlr[8..12].copy_from_slice(b"vide");
+        let mut mdia = mp4_box(b"hdlr", hdlr);
+        mdia.extend(mp4_box(b"minf", mp4_box(b"stbl", mp4_box(b"stsd", stsd))));
+        let mut trak = mp4_box(b"tkhd", tkhd);
+        trak.extend(mp4_box(b"mdia", mdia));
+
+        let mut output = mp4_box(b"ftyp", ftyp);
+        output.extend(mp4_box(b"moov", mp4_box(b"trak", trak)));
+        output
+    }
 
     #[test]
     fn websocket_origins_derive_from_bind() {
@@ -3029,6 +3120,67 @@ mod tests {
     fn image_dimensions_rejects_non_image_bytes() {
         assert_eq!(image_dimensions(b"not an image"), None);
         assert_eq!(image_dimensions(&[]), None);
+    }
+
+    #[test]
+    fn video_dimensions_reads_encoded_size() {
+        assert_eq!(
+            video_dimensions(&test_mp4(1920, 1080, 0, None)),
+            Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn video_dimensions_report_the_presented_geometry() {
+        assert_eq!(
+            video_dimensions(&test_mp4(1920, 1080, 90, None)),
+            Some((1080, 1920)),
+            "a quarter-turned clip presents portrait"
+        );
+        assert_eq!(
+            video_dimensions(&test_mp4(720, 480, 0, Some((32, 27)))),
+            Some((853, 480)),
+            "an anamorphic clip presents at its display aspect"
+        );
+    }
+
+    #[test]
+    fn video_dimensions_of_file_matches_the_in_memory_probe() {
+        let mp4 = test_mp4(640, 360, 0, None);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &mp4).unwrap();
+        assert_eq!(
+            video_dimensions_of_file(std::fs::File::open(file.path()).unwrap()),
+            video_dimensions(&mp4)
+        );
+    }
+
+    #[test]
+    fn video_dimensions_reject_non_video_bytes() {
+        assert_eq!(video_dimensions(b"not a video"), None);
+        assert_eq!(video_dimensions(&[]), None);
+        assert_eq!(
+            video_dimensions(&test_mp4(1920, 1080, 0, None)[..40]),
+            None,
+            "a truncated container is not probe-able"
+        );
+    }
+
+    #[test]
+    fn served_file_keeps_dimensions_for_playable_media_only() {
+        let dimensions = Some((1280, 720));
+        for (name, expected) in [
+            ("clip.mp4", dimensions),
+            ("photo.png", dimensions),
+            ("notes.txt", None),
+        ] {
+            let attachment = WebAttachment::from_served_file(1, 2, name, dimensions);
+            assert_eq!(
+                (attachment.width, attachment.height),
+                (expected.map(|(w, _)| w), expected.map(|(_, h)| h)),
+                "{name}"
+            );
+        }
     }
 
     #[test]

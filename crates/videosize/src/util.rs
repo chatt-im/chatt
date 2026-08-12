@@ -10,6 +10,14 @@ pub(crate) const MAX_STRUCTURAL_ELEMENTS: usize = 65_536;
 /// exhaust the stack.
 pub(crate) const MAX_NESTING: u32 = 32;
 pub(crate) const MAX_INSPECTED_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum cache data a file-backed probe may ask the operating system to read.
+///
+/// This is distinct from [`MAX_INSPECTED_BYTES`]: a tiny parser view can refill
+/// a much larger read-ahead cache, so charging only the returned slice leaves
+/// physical I/O effectively unbounded on adversarial sparse layouts.
+pub(crate) const MAX_FILE_READ_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum cache misses (and therefore seeks/read sequences) for one file probe.
+pub(crate) const MAX_FILE_REFILLS: usize = 256;
 /// How much of a codec buffer is materialized. Sequence and frame headers sit at
 /// the front of one, so an arbitrarily large keyframe costs a bounded read.
 pub(crate) const MAX_CODEC_SCAN: usize = 16 * 1024;
@@ -56,6 +64,18 @@ pub(crate) fn ratio_from_u128(mut a: u128, mut b: u128) -> AspectRatio {
 
 pub(crate) fn ratio4(a: u64, b: u64, c: u64, d: u64) -> AspectRatio {
     ratio_from_u128(a as u128 * d as u128, b as u128 * c as u128)
+}
+
+/// Multiplies `value` by `numerator / denominator`, rounding to the nearest
+/// integer. Presentation geometry is allowed to be fractional in containers,
+/// while the public display canvas is integral pixels.
+pub(crate) fn scale_round(value: u64, numerator: u64, denominator: u64) -> Option<u64> {
+    if denominator == 0 {
+        return None;
+    }
+    let numerator = (value as u128).checked_mul(numerator as u128)?;
+    let rounded = numerator.checked_add((denominator / 2) as u128)? / denominator as u128;
+    u64::try_from(rounded).ok()
 }
 
 /// Reads a big-endian integer of at most eight bytes.

@@ -21,8 +21,9 @@ export interface WebAttachment {
   // Served file name. The URL is `/files/${name}`.
   name: string;
   kind: MediaKind;
-  // Intrinsic pixel size, present for images with a readable header. The view
-  // reserves the box from these so a decoding image never grows the layout.
+  // Intrinsic display size, present for images with a readable header and for
+  // videos whose completed local container could be bounded-probed. The view
+  // reserves the box from these so decoding media never grows the layout.
   width: number | null;
   height: number | null;
 }

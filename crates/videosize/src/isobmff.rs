@@ -1,6 +1,6 @@
 use crate::codecs::{self, CodecGeometry};
 use crate::source::{Source, Span};
-use crate::util::{MAX_NESTING, be, invalid, ratio_from_u128};
+use crate::util::{MAX_NESTING, be, invalid, ratio_from_u128, scale_round};
 use crate::{AspectRatio, Codec, VideoError, VideoInfo, VideoResult, VideoType, make_info};
 
 #[derive(Clone, Copy)]
@@ -62,6 +62,50 @@ impl Matrix {
         };
         (ratio, if self.a < 0 && self.d < 0 { 180 } else { 0 })
     }
+
+    /// Applies the same supported axis transform as [`Self::presentation`] to
+    /// an integral display canvas. `self` is the product of two 16.16 matrices,
+    /// so its coefficients carry 32 fractional bits.
+    fn presentation_size(self, size: (u64, u64)) -> Option<(u64, u64)> {
+        const SCALE: u64 = 1u64 << 32;
+        let scaled = |value, coefficient: i128| {
+            if coefficient == 0 {
+                Some(value)
+            } else {
+                scale_round(value, u64::try_from(coefficient.unsigned_abs()).ok()?, SCALE)
+            }
+        };
+        if self.b.abs() + self.c.abs() > self.a.abs() + self.d.abs() {
+            Some((scaled(size.1, self.c)?, scaled(size.0, self.b)?))
+        } else {
+            Some((scaled(size.0, self.a)?, scaled(size.1, self.d)?))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CleanAperture {
+    width_numerator: u64,
+    width_denominator: u64,
+    height_numerator: u64,
+    height_denominator: u64,
+}
+
+impl CleanAperture {
+    fn aspect_ratio(self) -> AspectRatio {
+        ratio_from_u128(
+            self.width_numerator as u128 * self.height_denominator as u128,
+            self.width_denominator as u128 * self.height_numerator as u128,
+        )
+    }
+
+    fn display_size(self, pixel: AspectRatio) -> Option<(u64, u64)> {
+        let width = AspectRatio::new(self.width_numerator, self.width_denominator)
+            .multiply_ratio(pixel);
+        let width = scale_round(1, width.numerator, width.denominator)?;
+        let height = scale_round(1, self.height_numerator, self.height_denominator)?;
+        Some((width, height))
+    }
 }
 
 #[derive(Default)]
@@ -76,8 +120,9 @@ struct Track {
     track_width: u32,
     track_height: u32,
     pasp: Option<AspectRatio>,
-    clap: Option<AspectRatio>,
-    clef: Option<AspectRatio>,
+    clap: Option<CleanAperture>,
+    /// Raw 16.16 clean-aperture dimensions from `tapt/clef`.
+    clef: Option<(u32, u32)>,
     matrix: Matrix,
     private: Option<Span>,
     chunk: Option<u64>,
@@ -260,10 +305,12 @@ fn parse_visual_extensions(
                 let hn = be(bytes, 8, 4).unwrap_or(0);
                 let hd = be(bytes, 12, 4).unwrap_or(0);
                 if wn != 0 && wd != 0 && hn != 0 && hd != 0 {
-                    track.clap = Some(ratio_from_u128(
-                        wn as u128 * hd as u128,
-                        wd as u128 * hn as u128,
-                    ));
+                    track.clap = Some(CleanAperture {
+                        width_numerator: wn,
+                        width_denominator: wd,
+                        height_numerator: hn,
+                        height_denominator: hd,
+                    });
                 }
             }
             b"avcC" | b"hvcC" | b"av1C" | b"vpcC" => {
@@ -309,7 +356,7 @@ fn parse_tapt(source: &mut Source<'_>, tapt: Atom, track: &mut Track) -> VideoRe
             let width = be(bytes, 0, 4).unwrap_or(0);
             let height = be(bytes, 4, 4).unwrap_or(0);
             if width != 0 && height != 0 {
-                track.clef = Some(AspectRatio::new(width, height));
+                track.clef = Some((width as u32, height as u32));
             }
         }
         source.seek(atom.end);
@@ -526,19 +573,47 @@ fn finish(
         .pasp
         .or_else(|| geometry.and_then(|value| value.pixel_aspect_ratio))
         .unwrap_or_else(AspectRatio::square);
-    let ratio = if let Some(clef) = track.clef {
-        clef
+    let (ratio, display_size) = if let Some((clef_width, clef_height)) = track.clef {
+        (
+            AspectRatio::new(clef_width as u64, clef_height as u64),
+            (fixed(clef_width), fixed(clef_height)),
+        )
     } else if let Some(clap) = track.clap {
-        clap.multiply_ratio(pixel)
+        let ratio = clap.aspect_ratio().multiply_ratio(pixel);
+        let display_size = clap.display_size(pixel).ok_or(VideoError::CorruptedVideo)?;
+        (ratio, display_size)
     } else if track.pasp.is_some() {
-        AspectRatio::new(display.0, display.1).multiply_ratio(pixel)
+        let ratio = AspectRatio::new(display.0, display.1).multiply_ratio(pixel);
+        let display_width = scale_round(display.1, ratio.numerator, ratio.denominator)
+            .ok_or(VideoError::CorruptedVideo)?;
+        (ratio, (display_width, display.1))
     } else if track.track_width != 0 && track.track_height != 0 {
-        AspectRatio::new(track.track_width as u64, track.track_height as u64)
+        (
+            AspectRatio::new(track.track_width as u64, track.track_height as u64),
+            (fixed(track.track_width), fixed(track.track_height)),
+        )
     } else {
-        AspectRatio::new(display.0, display.1).multiply_ratio(pixel)
+        let ratio = AspectRatio::new(display.0, display.1).multiply_ratio(pixel);
+        let display_width = scale_round(display.1, ratio.numerator, ratio.denominator)
+            .ok_or(VideoError::CorruptedVideo)?;
+        (ratio, (display_width, display.1))
     };
-    let (ratio, rotation) = movie.compose(track.matrix).presentation(ratio);
-    make_info(kind, track.codec, width, height, pixel, ratio, rotation)
+    let matrix = movie.compose(track.matrix);
+    let (ratio, rotation) = matrix.presentation(ratio);
+    let display_size = matrix
+        .presentation_size(display_size)
+        .ok_or(VideoError::CorruptedVideo)?;
+    make_info(
+        kind,
+        track.codec,
+        width,
+        height,
+        display_size.0,
+        display_size.1,
+        pixel,
+        ratio,
+        rotation,
+    )
 }
 
 fn matrix_at(source: &mut Source<'_>, atom: Atom, movie: bool) -> VideoResult<Matrix> {

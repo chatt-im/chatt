@@ -159,6 +159,10 @@ impl fmt::Display for AspectRatio {
 pub struct VideoInfo {
     /// Encoded/container pixel dimensions.
     pub size: VideoSize,
+    /// Best-known integral square-pixel presentation canvas after visible
+    /// cropping, render geometry, pixel aspect, and supported transforms.
+    /// Fractional axes are rounded to the nearest pixel.
+    pub display_size: VideoSize,
     /// Authoritative display aspect after aperture, cropping, pixel aspect,
     /// render size, and supported transforms are applied.
     pub display_aspect_ratio: AspectRatio,
@@ -330,17 +334,31 @@ pub(crate) fn make_info(
     codec: Option<Codec>,
     width: u64,
     height: u64,
+    display_width: u64,
+    display_height: u64,
     pixel_aspect_ratio: AspectRatio,
     display_aspect_ratio: AspectRatio,
     rotation: u16,
 ) -> VideoResult<VideoInfo> {
-    if width == 0 || height == 0 || width > util::MAX_DIMENSION || height > util::MAX_DIMENSION {
+    if width == 0
+        || height == 0
+        || display_width == 0
+        || display_height == 0
+        || width > util::MAX_DIMENSION
+        || height > util::MAX_DIMENSION
+        || display_width > util::MAX_DIMENSION
+        || display_height > util::MAX_DIMENSION
+    {
         return Err(VideoError::CorruptedVideo);
     }
     Ok(VideoInfo {
         size: VideoSize {
             width: width as u32,
             height: height as u32,
+        },
+        display_size: VideoSize {
+            width: display_width as u32,
+            height: display_height as u32,
         },
         display_aspect_ratio,
         video_type,

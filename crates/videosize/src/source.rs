@@ -3,8 +3,8 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::codecs::{self, CodecGeometry};
 use crate::util::{
-    MAX_CODEC_SCAN, MAX_INSPECTED_BYTES, MAX_SAMPLE_DESCRIPTIONS, MAX_STRUCTURAL_ELEMENTS,
-    MAX_TRACKS,
+    MAX_CODEC_SCAN, MAX_FILE_READ_BYTES, MAX_FILE_REFILLS, MAX_INSPECTED_BYTES,
+    MAX_SAMPLE_DESCRIPTIONS, MAX_STRUCTURAL_ELEMENTS, MAX_TRACKS,
 };
 use crate::{Codec, VideoError, VideoResult};
 
@@ -14,6 +14,8 @@ const FIRST_READ: usize = 8 * 1024;
 #[derive(Default)]
 struct Budget {
     inspected: u64,
+    file_read: u64,
+    file_refills: usize,
     elements: usize,
     tracks: usize,
     descriptions: usize,
@@ -34,6 +36,18 @@ impl Budget {
             .checked_add(amount as u64)
             .ok_or(VideoError::LimitExceeded)?;
         if self.inspected > MAX_INSPECTED_BYTES {
+            return Err(VideoError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn file_refill(&mut self, amount: usize) -> VideoResult<()> {
+        Self::increment(&mut self.file_refills, 1, MAX_FILE_REFILLS)?;
+        self.file_read = self
+            .file_read
+            .checked_add(amount as u64)
+            .ok_or(VideoError::LimitExceeded)?;
+        if self.file_read > MAX_FILE_READ_BYTES {
             return Err(VideoError::LimitExceeded);
         }
         Ok(())
@@ -75,8 +89,6 @@ pub(crate) struct Source<'a> {
     length: u64,
     position: u64,
     budget: Budget,
-    #[cfg(test)]
-    refills: usize,
 }
 
 impl<'a> Source<'a> {
@@ -91,8 +103,6 @@ impl<'a> Source<'a> {
             length: data.len() as u64,
             position: 0,
             budget: Budget::default(),
-            #[cfg(test)]
-            refills: 0,
         }
     }
 
@@ -152,6 +162,7 @@ impl<'a> Source<'a> {
             return Ok(());
         }
         let want = size.max(self.read_size).min(CACHE_SIZE);
+        self.budget.file_refill(want)?;
         if self.cache.len() < want {
             self.cache.resize(want, 0);
         }
@@ -170,10 +181,6 @@ impl<'a> Source<'a> {
         }
         self.cache_start = position;
         self.cached = filled;
-        #[cfg(test)]
-        {
-            self.refills += 1;
-        }
         Ok(())
     }
 
@@ -262,7 +269,7 @@ impl<'a> Source<'a> {
 
     #[cfg(test)]
     fn refill_count(&self) -> usize {
-        self.refills
+        self.budget.file_refills
     }
 }
 
@@ -271,9 +278,9 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::{Seek, SeekFrom};
 
-    use super::Source;
+    use super::{Budget, CACHE_SIZE, Source};
     use crate::VideoError;
-    use crate::util::MAX_INSPECTED_BYTES;
+    use crate::util::{MAX_FILE_READ_BYTES, MAX_FILE_REFILLS, MAX_INSPECTED_BYTES};
 
     #[test]
     fn nearby_primitives_share_one_refill_and_initial_cursor_is_ignored() {
@@ -303,6 +310,49 @@ mod tests {
         let file = OpenOptions::new().read(true).open(&path).unwrap();
         assert!(matches!(
             Source::file(file).unwrap().bytes(0, data.len()),
+            Err(VideoError::LimitExceeded)
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn file_cache_refills_have_physical_io_and_seek_budgets() {
+        let path =
+            std::env::temp_dir().join(format!("videosize-source-refills-{}", std::process::id()));
+        let length = (MAX_FILE_REFILLS as u64 + 2) * (CACHE_SIZE as u64 + 1);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(length).unwrap();
+        let mut source = Source::file(file).unwrap();
+        let mut stopped = false;
+        for index in 0..MAX_FILE_REFILLS + 2 {
+            let position = index as u64 * (CACHE_SIZE as u64 + 1);
+            if matches!(source.view(position, 1), Err(VideoError::LimitExceeded)) {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "sparse cache misses must hit a file I/O budget");
+        assert!(source.refill_count() <= MAX_FILE_REFILLS);
+
+        let mut budget = Budget::default();
+        for _ in 0..MAX_FILE_REFILLS {
+            budget.file_refill(0).unwrap();
+        }
+        assert!(matches!(
+            budget.file_refill(0),
+            Err(VideoError::LimitExceeded)
+        ));
+
+        let mut budget = Budget::default();
+        budget.file_refill(MAX_FILE_READ_BYTES as usize).unwrap();
+        assert!(matches!(
+            budget.file_refill(1),
             Err(VideoError::LimitExceeded)
         ));
         fs::remove_file(path).unwrap();

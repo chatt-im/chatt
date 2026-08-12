@@ -89,6 +89,7 @@ import {
   type PreviewItem,
 } from "./preview";
 import VideoPlayer from "./VideoPlayer";
+import { estimateMediaBoxHeight } from "./media-layout";
 
 // Pixel tolerance when deciding the view is "at the bottom". Scroll positions
 // are fractional, so an exact comparison would intermittently read as
@@ -570,8 +571,8 @@ const ESTIMATE_CHAT_CONTENT_WIDTH = 720;
 const ESTIMATE_TEXT_CHARS_PER_LINE = 86;
 const ESTIMATE_TEXT_AVG_CHAR_WIDTH =
   ESTIMATE_CHAT_CONTENT_WIDTH / ESTIMATE_TEXT_CHARS_PER_LINE;
-const ESTIMATE_IMAGE_MAX_HEIGHT = 460;
-const ESTIMATE_IMAGE_VIEWPORT_RATIO = 0.5;
+const ESTIMATE_MEDIA_MAX_HEIGHT = 460;
+const ESTIMATE_MEDIA_VIEWPORT_RATIO = 0.5;
 const ESTIMATE_MESSAGE_HORIZONTAL_PADDING = 72;
 const ESTIMATE_MIN_CONTENT_WIDTH = 240;
 const ESTIMATE_MEDIA_MARGIN_Y = 10;
@@ -579,12 +580,12 @@ const ESTIMATE_VIDEO_HEIGHT = 240;
 
 type MessageEstimateLayout = {
   contentWidth: number;
-  imageMaxHeight: number;
+  mediaMaxHeight: number;
 };
 
 const DEFAULT_MESSAGE_ESTIMATE_LAYOUT: MessageEstimateLayout = {
   contentWidth: ESTIMATE_CHAT_CONTENT_WIDTH,
-  imageMaxHeight: ESTIMATE_IMAGE_MAX_HEIGHT,
+  mediaMaxHeight: ESTIMATE_MEDIA_MAX_HEIGHT,
 };
 
 function countMatches(text: string, pattern: RegExp): number {
@@ -681,21 +682,22 @@ function estimateAttachmentHeight(
   layout: MessageEstimateLayout
 ): number {
   switch (attachment.kind) {
-    case "image": {
-      const width = attachment.width ?? 0;
-      const height = attachment.height ?? 0;
-      if (width > 0 && height > 0) {
-        const scaledHeight =
-          height * Math.min(1, layout.contentWidth / width) + 12;
-        const imageHeight = Math.min(scaledHeight, layout.imageMaxHeight);
-        return (
-          ESTIMATE_MEDIA_MARGIN_Y + Math.max(72, Math.ceil(imageHeight))
-        );
-      }
-      return ESTIMATE_MEDIA_MARGIN_Y + 160;
-    }
+    case "image":
+      return (
+        ESTIMATE_MEDIA_MARGIN_Y +
+        (estimateMediaBoxHeight(attachment.width, attachment.height, {
+          contentWidth: layout.contentWidth,
+          mediaMaxHeight: layout.mediaMaxHeight,
+        }) ?? 160)
+      );
     case "video":
-      return ESTIMATE_MEDIA_MARGIN_Y + ESTIMATE_VIDEO_HEIGHT;
+      return (
+        ESTIMATE_MEDIA_MARGIN_Y +
+        (estimateMediaBoxHeight(attachment.width, attachment.height, {
+          contentWidth: layout.contentWidth,
+          mediaMaxHeight: layout.mediaMaxHeight,
+        }) ?? ESTIMATE_VIDEO_HEIGHT)
+      );
     case "audio":
       return ESTIMATE_MEDIA_MARGIN_Y + 40;
     case "file":
@@ -903,7 +905,7 @@ function Attachment(props: {
   const cachedImage = () =>
     att().kind === "image" ? cachedImageState(url()) : undefined;
   const imageUnavailable = () => cachedImage()?.status === "error";
-  const hasIntrinsicImageSize = () =>
+  const hasIntrinsicSize = () =>
     (att().width ?? 0) > 0 && (att().height ?? 0) > 0;
   const missingImageStyle = () => {
     const width = att().width ?? 0;
@@ -987,7 +989,7 @@ function Attachment(props: {
           >
             <div
               class="media-image media-image-missing"
-              classList={{ "has-intrinsic-size": hasIntrinsicImageSize() }}
+              classList={{ "has-intrinsic-size": hasIntrinsicSize() }}
               style={missingImageStyle()}
               role="img"
               aria-label={`${att().name} failed to load`}
@@ -998,10 +1000,16 @@ function Attachment(props: {
           </Show>
         </a>
       </Show>
+      {/* A locally probed display size reserves the final ratio immediately.
+       * Otherwise the player uses a small fallback only until the browser
+       * loads metadata for the current source. */}
       <Show when={att().kind === "video"}>
         <VideoPlayer
           class="media-video"
+          responsiveSizing
           src={url()}
+          width={att().width}
+          height={att().height}
           autoplay={props.autoplay}
         />
       </Show>
@@ -2013,11 +2021,11 @@ export default function App() {
           logEl.clientWidth - ESTIMATE_MESSAGE_HORIZONTAL_PADDING
         )
       : ESTIMATE_CHAT_CONTENT_WIDTH;
-    const imageMaxHeight =
+    const mediaMaxHeight =
       typeof window === "undefined" || window.innerHeight <= 0
-        ? ESTIMATE_IMAGE_MAX_HEIGHT
-        : Math.max(72, window.innerHeight * ESTIMATE_IMAGE_VIEWPORT_RATIO);
-    return { contentWidth, imageMaxHeight };
+        ? ESTIMATE_MEDIA_MAX_HEIGHT
+        : Math.max(72, window.innerHeight * ESTIMATE_MEDIA_VIEWPORT_RATIO);
+    return { contentWidth, mediaMaxHeight };
   }
 
   function topRequestThreshold(): number {
@@ -2071,7 +2079,7 @@ export default function App() {
       topRequestThreshold: topRequestThreshold(),
       topRearmThreshold: topRearmThreshold(),
       estimateContentWidth: estimateLayout.contentWidth,
-      estimateImageMaxHeight: estimateLayout.imageMaxHeight,
+      estimateMediaMaxHeight: estimateLayout.mediaMaxHeight,
       prepend: prepend(),
       userDriving,
       suppress,

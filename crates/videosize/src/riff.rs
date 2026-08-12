@@ -1,6 +1,6 @@
 use crate::codecs::{self, CodecGeometry};
 use crate::source::{Source, Span};
-use crate::util::{MAX_NESTING, invalid, le, ratio4};
+use crate::util::{MAX_NESTING, invalid, le, ratio4, scale_round};
 use crate::{AspectRatio, Codec, VideoError, VideoInfo, VideoResult, VideoType, make_info};
 
 const MAX_MOVI: usize = 4;
@@ -25,6 +25,7 @@ struct Stream {
     frame_width: u64,
     frame_height: u64,
     display_aspect: Option<AspectRatio>,
+    active_height: u64,
     private: Option<Span>,
 }
 
@@ -182,6 +183,7 @@ fn parse_vprp(source: &mut Source<'_>, chunk: Chunk, stream: &mut Stream) -> Vid
     let denominator = packed & 0xffff;
     if numerator != 0 && denominator != 0 && active_width != 0 && active_height != 0 {
         stream.display_aspect = Some(AspectRatio::new(numerator, denominator));
+        stream.active_height = active_height;
     }
     Ok(())
 }
@@ -291,11 +293,20 @@ fn finish(
             AspectRatio::new(visible.0, visible.1).multiply_ratio(codec_pixel),
         )
     };
+    let display_height = if stream.active_height != 0 {
+        stream.active_height
+    } else {
+        visible.1
+    };
+    let display_width = scale_round(display_height, display.numerator, display.denominator)
+        .ok_or(VideoError::CorruptedVideo)?;
     make_info(
         VideoType::Avi,
         codec(stream),
         width,
         height,
+        display_width,
+        display_height,
         pixel,
         display,
         0,
