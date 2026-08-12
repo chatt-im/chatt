@@ -379,13 +379,13 @@ body {
   cursor: pointer;
 }
 
-/* Flat, Discord-style rows: no card, no border. A fixed left gutter is reserved
- * for the hover timestamp so revealing it never shifts layout. Spacing is
- * padding, not margin: child margins are excluded from the contentRect virtua
- * measures, which would desync item sizes. */
+/* Flat rows: no card, no border. Timestamps and actions float at the right, so
+ * message content uses the full inset width. Spacing is padding, not margin:
+ * child margins are excluded from the contentRect virtua measures, which would
+ * desync item sizes. */
 .message {
   position: relative;
-  padding: 1px var(--space-lg) 1px var(--gutter);
+  padding: 1px var(--space-lg);
 }
 
 /* The first message of a group gets extra headroom to separate it from the one
@@ -402,10 +402,6 @@ body {
   display: flex;
   align-items: baseline;
   gap: var(--space);
-}
-
-.message:not(.is-continuation) .message-meta {
-  padding-right: 40px;
 }
 
 .message-sender {
@@ -425,29 +421,41 @@ body {
   font-weight: 600;
 }
 
-/* Every message has a persistent, full-size group control at the far right.
- * Inward/outward list icons describe the action without relying on a small
- * rotating disclosure arrow. */
-.message-group-toggle {
+/* One row-local strip holds every message action and ends in the timestamp.
+ * The buttons grow leftward without moving the shared time column. The strip
+ * normally aligns with the message's right inset. */
+.message-controls {
   position: absolute;
   top: calc(var(--space) - 3px);
   right: var(--space-lg);
   z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.message.is-continuation .message-controls {
+  top: 2px;
+}
+
+.message.is-group-collapsed .message-controls {
+  top: calc(var(--space) - 3px);
+}
+
+/* Every message has a persistent, full-size group control. Inward/outward list
+ * icons describe the action without relying on a small rotating arrow. */
+.message-group-toggle {
   display: inline-grid;
   place-items: center;
   width: 32px;
   height: 28px;
   padding: 0;
   color: var(--text-dim);
-  background: var(--bg-elevated);
+  background: color-mix(in srgb, var(--bg-elevated) 72%, transparent);
   border: 0;
   cursor: pointer;
   opacity: 0;
   pointer-events: none;
-}
-
-.message.is-continuation .message-group-toggle {
-  top: 2px;
 }
 
 .message-group-toggle .icon {
@@ -498,52 +506,29 @@ body {
   cursor: pointer;
 }
 
-.message.is-group-collapsed .message-time-gutter {
-  top: var(--space);
-}
-
-.message.is-group-collapsed .message-group-toggle {
-  top: calc(var(--space) - 3px);
-}
-
-/* The timestamp always occupies the reserved gutter as a single flush-right
- * column. Absolute, so revealing it never affects layout or virtua's measure. */
+/* The timestamp is the rightmost control and sizes to its formatted contents.
+ * Every row uses the same two-digit format and tabular numerals, so no guessed
+ * width or clipping is needed when users override its font. */
 .message-time-gutter {
-  position: absolute;
-  left: 0;
-  top: 1px;
-  width: var(--gutter);
-  /* Flush right by flex alignment rather than `text-align`, and clipped to the
-   * gutter. A browser minimum-font-size setting clamps the 11px below upward
-   * with nothing in CSS able to observe it, so the gutter cannot be sized to
-   * fit; what a time too wide for it must not do is reach the message. A line
-   * is never laid out before its box's start edge, so a right-aligned one
-   * overflows rightward, over the sender name; flex alignment overflows the
-   * start edge instead, and the time runs off the left of the log. The gap to
-   * the message grows with the text so the two never appear to touch. */
-  display: flex;
-  justify-content: flex-end;
-  overflow: hidden;
+  flex: none;
+  align-self: center;
+  margin-left: 0.5rem;
   white-space: nowrap;
-  padding-right: max(var(--space), 0.5em);
   color: var(--text-dim);
   font-size: 11px;
-  /* Match the content's line-box height so the smaller time sits centered on
-   * the same line as the sender/body text it labels, rather than riding high.
-   * The em floor keeps a clamped-up time inside the box `overflow` clips to,
-   * so its ascenders and descenders are not shaved off. */
-  line-height: max(calc(var(--font-size) * var(--line-height)), 1.3em);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
   opacity: 0;
 }
 
-/* On a group's first row the time is always shown and aligns with the sender
- * line; on continuations it is revealed only on hover. */
+/* On a group's first row the time is always shown; on continuations it is
+ * revealed with the rest of that row's controls. */
 .message:not(.is-continuation) .message-time-gutter {
-  top: var(--space);
   opacity: 1;
 }
 
-.message:hover .message-time-gutter {
+.message:hover .message-time-gutter,
+.message:focus-within .message-time-gutter {
   opacity: 1;
 }
 
@@ -668,12 +653,12 @@ body {
 
 .media-image,
 .media-video {
-  border: 6px solid var(--border);
-  border-radius: 2px;
+  border: 4px solid var(--border);
+  border-radius: 1px;
 }
 
 .media-image:hover {
-  border: 6px solid var(--accent);
+  border: 4px solid var(--accent);
 }
 
 .media-image {
@@ -1045,7 +1030,8 @@ body {
 
 .code-block code {
   font-family: inherit;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   color: var(--hl-fg);
 }
 
@@ -1060,7 +1046,7 @@ body {
   height: 28px;
   padding: 0;
   color: var(--text-dim);
-  background: var(--bg-elevated);
+  background: color-mix(in srgb, var(--bg-elevated) 72%, transparent);
   border: 0;
   cursor: pointer;
   opacity: 0;
@@ -1086,21 +1072,8 @@ body {
   outline-offset: 1px;
 }
 
-/* Per-message hover actions: quote a reference into the composer or copy the
- * message's `@@` reference code. Mirrors the code-block copy button. */
-.message-actions {
-  position: absolute;
-  top: 2px;
-  right: calc(var(--space-lg) + 34px);
-  z-index: 1;
-  display: flex;
-  gap: 2px;
-}
-
-.message:not(.is-continuation) .message-actions {
-  top: calc(var(--space) - 3px);
-}
-
+/* Per-message hover actions sit left of the group control and timestamp.
+ * Shift-clicking Quote copies the message's `@@` reference. */
 .message-action {
   display: inline-grid;
   place-items: center;
@@ -1108,7 +1081,7 @@ body {
   height: 28px;
   padding: 0;
   color: var(--text-dim);
-  background: var(--bg-elevated);
+  background: color-mix(in srgb, var(--bg-elevated) 72%, transparent);
   border: 0;
   cursor: pointer;
   opacity: 0;
@@ -1141,7 +1114,6 @@ body {
 
 @media (hover: none),
 (pointer: coarse) {
-
   .message-group-toggle,
   .message-action,
   .code-block-copy {

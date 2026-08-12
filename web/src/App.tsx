@@ -124,8 +124,9 @@ const IMAGE_PRELOAD_SCAN_LIMIT = 24;
 const IMAGE_PRELOAD_CACHE_LIMIT = 32;
 const PREVIEW_HISTORY_LIMIT = 16;
 
-// Consecutive messages from one sender within this window form a group:
-// only the first carries the sender/time header (Discord-style).
+// Consecutive messages from one sender within this window form a group, except
+// that a message starting with code opens a new group so its copy button sits
+// below a sender/time header instead of competing with row controls.
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
 // Mirror the client's conservative edit window and the protocol's hard
@@ -170,6 +171,7 @@ function isMessageContinuation(
     !!previous &&
     !message.system &&
     !previous.system &&
+    message.fragments[0]?.kind !== "code" &&
     !message.edited &&
     !previous.edited &&
     message.unverified === previous.unverified &&
@@ -573,7 +575,7 @@ const ESTIMATE_TEXT_AVG_CHAR_WIDTH =
   ESTIMATE_CHAT_CONTENT_WIDTH / ESTIMATE_TEXT_CHARS_PER_LINE;
 const ESTIMATE_MEDIA_MAX_HEIGHT = 460;
 const ESTIMATE_MEDIA_VIEWPORT_RATIO = 0.5;
-const ESTIMATE_MESSAGE_HORIZONTAL_PADDING = 72;
+const ESTIMATE_MESSAGE_HORIZONTAL_PADDING = 32;
 const ESTIMATE_MIN_CONTENT_WIDTH = 240;
 const ESTIMATE_MEDIA_MARGIN_Y = 10;
 const ESTIMATE_VIDEO_HEIGHT = 240;
@@ -1141,9 +1143,9 @@ function MessageRow(props: {
   onDelete?: (message: WebMessage, opener: HTMLButtonElement) => void;
   autoplay: AutoplayMode;
 }) {
-  // A continuation hides the header and shows its time only on hover, in the
-  // reserved left gutter. Group metadata is projected reactively from the full
-  // feed so prepended history can still change the boundary row's grouping.
+  // A continuation hides the header and shows its time only on hover in the
+  // right-side control strip. Group metadata is projected reactively from the
+  // full feed so prepended history can still change the boundary row's grouping.
   const continuation = () => props.group.continuation;
   const canEdit = () =>
     props.message.local &&
@@ -1166,7 +1168,17 @@ function MessageRow(props: {
   onCleanup(() => {
     if (refCopyResetTimer !== undefined) clearTimeout(refCopyResetTimer);
   });
-  async function copyRef() {
+  async function quoteOrCopyRef(event: MouseEvent) {
+    if (!event.shiftKey) {
+      if (refCopyResetTimer !== undefined) {
+        clearTimeout(refCopyResetTimer);
+        refCopyResetTimer = undefined;
+      }
+      setRefCopied(false);
+      props.onQuoteRef!(props.message.ref_code);
+      return;
+    }
+
     try {
       await copyTextToClipboard(`@@${props.message.ref_code}`);
       setRefCopied(true);
@@ -1205,16 +1217,6 @@ function MessageRow(props: {
         props.onToggleGroup(props.group.key);
       }}
     >
-      {/* The time always lives in the left gutter so it sits in one consistent
-       * column: shown on a group's first row, revealed on hover for the rest. */}
-      <span
-        class="message-time-gutter"
-        title={formatExactTime(props.message.timestamp_ms)}
-        aria-label={formatExactTime(props.message.timestamp_ms)}
-        tabIndex={0}
-      >
-        {formatTime(props.message.timestamp_ms)}
-      </span>
       <Show when={!continuation()}>
         <div class="message-meta">
           <span class="message-sender">{props.message.sender}</span>
@@ -1232,30 +1234,87 @@ function MessageRow(props: {
           </Show>
         </div>
       </Show>
-      <button
-        class="message-group-toggle"
-        type="button"
-        aria-expanded={!props.group.collapsed}
-        aria-label={groupLabel()}
-        title={
-          props.group.collapsed
-            ? "Expand collapsed messages"
-            : "Collapse this message and those below"
-        }
-        onClick={(event) => {
-          event.stopPropagation();
-          if (event.detail > 0) event.currentTarget.blur();
-          props.onToggleGroup(props.group.key);
-        }}
-      >
-        <Icon
-          name={
+      <div class="message-controls">
+        <Show when={!props.group.collapsed}>
+          <Show when={canEdit()}>
+            <button
+              class="message-action"
+              type="button"
+              aria-label="Edit message"
+              title="Edit"
+              onClick={() => props.onEdit!(props.message)}
+            >
+              <Icon name="pencil" />
+            </button>
+          </Show>
+          <Show when={canDelete()}>
+            <button
+              class="message-action is-destructive"
+              type="button"
+              aria-label="Delete message"
+              title="Delete"
+              onClick={(event) =>
+                props.onDelete!(props.message, event.currentTarget)
+              }
+            >
+              <Icon name="trash-2" />
+            </button>
+          </Show>
+          <Show when={props.onQuoteRef && props.message.ref_code}>
+            <button
+              class="message-action"
+              type="button"
+              aria-label={
+                refCopied()
+                  ? "Copied message reference"
+                  : "Quote message; Shift-click to copy reference"
+              }
+              title={
+                refCopied()
+                  ? "Copied reference"
+                  : "Quote (Shift-click to copy reference)"
+              }
+              onClick={quoteOrCopyRef}
+            >
+              <Icon name={refCopied() ? "check" : "corner-up-left"} />
+            </button>
+          </Show>
+        </Show>
+        <button
+          class="message-group-toggle"
+          type="button"
+          aria-expanded={!props.group.collapsed}
+          aria-label={groupLabel()}
+          title={
             props.group.collapsed
-              ? "list-chevrons-up-down"
-              : "list-chevrons-down-up"
+              ? "Expand collapsed messages"
+              : "Collapse this message and those below"
           }
-        />
-      </button>
+          onClick={(event) => {
+            event.stopPropagation();
+            if (event.detail > 0) event.currentTarget.blur();
+            props.onToggleGroup(props.group.key);
+          }}
+        >
+          <Icon
+            name={
+              props.group.collapsed
+                ? "list-chevrons-up-down"
+                : "list-chevrons-down-up"
+            }
+          />
+        </button>
+        {/* The time is the strip's rightmost item so rows with different sets
+         * of actions still share one timestamp column. */}
+        <span
+          class="message-time-gutter"
+          title={formatExactTime(props.message.timestamp_ms)}
+          aria-label={formatExactTime(props.message.timestamp_ms)}
+          tabIndex={0}
+        >
+          {formatTime(props.message.timestamp_ms)}
+        </span>
+      </div>
       <Show when={!props.group.collapsed}>
         <Show
           when={!props.message.system}
@@ -1285,62 +1344,6 @@ function MessageRow(props: {
             {props.message.terminal!.reason
               ? `${props.message.terminal!.verb}: ${props.message.terminal!.reason}`
               : props.message.terminal!.verb}
-          </div>
-        </Show>
-        <Show
-          when={
-            props.message.ref_code ||
-            canEdit() ||
-            canDelete()
-          }
-        >
-          <div class="message-actions">
-            <Show when={canEdit()}>
-              <button
-                class="message-action"
-                type="button"
-                aria-label="Edit message"
-                title="Edit"
-                onClick={() => props.onEdit!(props.message)}
-              >
-                <Icon name="pencil" />
-              </button>
-            </Show>
-            <Show when={canDelete()}>
-              <button
-                class="message-action is-destructive"
-                type="button"
-                aria-label="Delete message"
-                title="Delete"
-                onClick={(event) =>
-                  props.onDelete!(props.message, event.currentTarget)
-                }
-              >
-                <Icon name="trash-2" />
-              </button>
-            </Show>
-            <Show when={props.onQuoteRef}>
-              <button
-                class="message-action"
-                type="button"
-                aria-label="Quote message"
-                title="Quote"
-                onClick={() => props.onQuoteRef!(props.message.ref_code)}
-              >
-                <Icon name="corner-up-left" />
-              </button>
-            </Show>
-            <Show when={props.message.ref_code}>
-              <button
-                class="message-action"
-                type="button"
-                aria-label={refCopied() ? "Copied reference" : "Copy reference"}
-                title={refCopied() ? "Copied" : "Copy reference"}
-                onClick={copyRef}
-              >
-                <Icon name={refCopied() ? "check" : "at-sign"} />
-              </button>
-            </Show>
           </div>
         </Show>
       </Show>
