@@ -107,6 +107,7 @@ members = [
     "crates/darkhttp",
     "crates/libspa-sys",
     "crates/pipewire-sys",
+    "crates/videosize",
 ]
 exclude = [
     "crates/cpal",
