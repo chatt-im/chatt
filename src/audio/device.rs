@@ -1403,7 +1403,8 @@ where
                 callback_core.process(mono, callback_at, timing);
             },
             move |error| {
-                if error.kind() == ErrorKind::RealtimeDenied {
+                let kind = AudioErrorKind::from_cpal(error.kind());
+                if kind == AudioErrorKind::RealtimeDenied {
                     let error_message = error.to_string();
                     kvlog::warn!(
                         "audio realtime priority denied",
@@ -1411,11 +1412,16 @@ where
                         error = error_message.as_str(),
                         hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems"
                     );
+                } else if kind != AudioErrorKind::Xrun {
+                    let error_message = error.to_string();
+                    kvlog::warn!(
+                        "capture backend error",
+                        kind = kind.label(),
+                        recovers = kind.triggers_recovery(),
+                        error = error_message.as_str()
+                    );
                 }
-                error_stats.record_stream_error(
-                    AudioErrorKind::from_cpal(error.kind()),
-                    format!("stream error: {error}"),
-                );
+                error_stats.record_stream_error(kind, format!("stream error: {error}"));
             },
             None,
         )
@@ -1768,6 +1774,15 @@ fn record_live_playback_stream_error(
             direction = "live playback",
             error = error.as_str(),
             hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems"
+        );
+    } else if kind != AudioErrorKind::Xrun {
+        // Kinds that do not trigger recovery are dropped by the supervisor, so
+        // without this a host reroute or device change leaves no trace at all.
+        kvlog::warn!(
+            "live playback backend error",
+            kind = kind.label(),
+            recovers = kind.triggers_recovery(),
+            error = error.as_str()
         );
     }
     shared_snapshot.record_backend_stream_error(error, kind, Instant::now());

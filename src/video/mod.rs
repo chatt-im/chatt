@@ -26,7 +26,13 @@ use rpc::{
     video::{self, VideoAck, VideoHello, VideoRole},
 };
 
-pub use fanout::{NativeViewerHandle, VideoFrameFanout};
+/// Handle to a native renderer viewing a share over the local RPC socket, which
+/// is Unix-only; see the note in `runtime.rs`.
+#[cfg(unix)]
+pub use fanout::NativeViewerHandle;
+pub use fanout::VideoFrameFanout;
+/// The NUT muxer exists for `chatt video-stream`, which is Unix-only.
+#[cfg(unix)]
 pub(crate) use nut::NutPipeMuxer;
 pub use publisher::{ScreencastHandle, start as start_screencast};
 pub use subscriber::{SubscriberHandle, start as start_subscriber};

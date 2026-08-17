@@ -89,12 +89,11 @@ impl UsernameRegistry {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)
-            .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+        let file = chatt_platform::open_private(
+            OpenOptions::new().create(true).append(true).read(true),
+            &path,
+        )
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
         registry.log = Some((path, file));
         Ok(registry)
     }
@@ -291,12 +290,11 @@ pub(crate) fn persist_dynamic_claim(
     if user_id.0 < FIRST_DYNAMIC_USER_ID {
         return Err(format!("user {user_id} is not a dynamic user"));
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(path)
-        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    let mut file = chatt_platform::open_private(
+        OpenOptions::new().create(true).append(true).read(true),
+        path,
+    )
+    .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
     write_record(&mut file, user_id, name)
         .map_err(|error| format!("failed to append {}: {error}", path.display()))
 }

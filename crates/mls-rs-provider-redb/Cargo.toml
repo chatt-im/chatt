@@ -13,6 +13,7 @@ license = "Apache-2.0 OR MIT"
 workspace = true
 
 [dependencies]
+chatt-platform = { path = "../platform" }
 mls-rs-core = { path = "../mls-rs-core", default-features = false, features = ["std"] }
 redb = "4.1"
 thiserror = "2"

@@ -351,6 +351,33 @@ fn enumerator_to_interface_type(enumerator: &str) -> Option<InterfaceType> {
     Some(typ)
 }
 
+/// Activates the current default endpoint for `interface`.
+///
+/// The activation itself runs on an MMDevAPI worker thread, so a failure here can say
+/// nothing about the endpoint: `RPC_E_CHANGED_MODE` (`0x80010106`) means some code in
+/// this process called `CoInitializeEx` on a thread MMDevAPI owns, usually from an
+/// `IMMNotificationClient` callback, and left it in an apartment
+/// the activation cannot use. The message carries the `HRESULT` and this thread's
+/// apartment so that reads as a diagnosis instead of a bare negative number.
+unsafe fn activate_default_endpoint(
+    interface: &GUID,
+    activation_timeout: Option<Duration>,
+) -> Result<Audio::IAudioClient, Error> {
+    let path = Com::StringFromIID(interface).map_err(Error::from)?;
+    let _guard = ComString(path);
+    activate_audio_interface_sync(path, activation_timeout).map_err(|error| {
+        let code = error.code().0 as u32;
+        let error = Error::from(error);
+        Error::with_message(
+            error.kind(),
+            format!(
+                "ActivateAudioInterfaceAsync failed (hr {code:#010x}, caller apartment: {}): {error}",
+                com::Apartment::current().label()
+            ),
+        )
+    })
+}
+
 /// Activates an `IAudioClient` via `ActivateAudioInterfaceAsync` synchronously.
 ///
 /// Used for virtual default-device GUIDs (`DEVINTERFACE_AUDIO_RENDER`/`DEVINTERFACE_AUDIO_CAPTURE`)
@@ -579,17 +606,12 @@ impl Device {
         let audio_client: Audio::IAudioClient = unsafe {
             match &self.device {
                 DeviceHandle::DefaultOutput => {
-                    let path = Com::StringFromIID(&Audio::DEVINTERFACE_AUDIO_RENDER)
-                        .map_err(Error::from)?;
-                    let _guard = ComString(path);
-                    activate_audio_interface_sync(path, activation_timeout).map_err(Error::from)?
+                    activate_default_endpoint(&Audio::DEVINTERFACE_AUDIO_RENDER, activation_timeout)?
                 }
-                DeviceHandle::DefaultInput => {
-                    let path = Com::StringFromIID(&Audio::DEVINTERFACE_AUDIO_CAPTURE)
-                        .map_err(Error::from)?;
-                    let _guard = ComString(path);
-                    activate_audio_interface_sync(path, activation_timeout).map_err(Error::from)?
-                }
+                DeviceHandle::DefaultInput => activate_default_endpoint(
+                    &Audio::DEVINTERFACE_AUDIO_CAPTURE,
+                    activation_timeout,
+                )?,
                 DeviceHandle::Specific(device) => {
                     // can fail if the device has been disconnected since we enumerated it, or if
                     // the device doesn't support playback for some reason
@@ -1177,8 +1199,18 @@ static ENUMERATOR: OnceLock<Enumerator> = OnceLock::new();
 /// Shared by [`Device::immdevice`] and the stream-side `get_current_default` helper to
 /// avoid duplicating the `GetDefaultAudioEndpoint` call.
 pub(super) fn current_default_endpoint(flow: Audio::EDataFlow) -> Option<Audio::IMMDevice> {
-    // Ensure COM is initialised on this thread — callers include notification callbacks on
-    // threads that may not have called CoInitialize themselves.
+    // Only ever called on threads this process owns: the run thread, and the
+    // stream-side helper it drives. A notification callback must *not* reach
+    // here: `CoInitializeEx` on an MMDevAPI worker is never undone until that
+    // thread exits, and the apartment it imposes breaks every later
+    // `ActivateAudioInterfaceAsync` in the process with 0x80010106. The
+    // callbacks record and wake instead, and resolution happens here.
+    //
+    // Not assertable from the apartment: a thread of ours that has not reached
+    // `com_initialized` yet reports `Uninitialized`, which is the ordinary
+    // first-call state, while an MMDevAPI worker reports the apartment the
+    // system already gave it. The two are indistinguishable here, and the check
+    // that looks right rejects the correct callers and admits the wrong one.
     com::com_initialized();
     // SAFETY: `get_enumerator()` is a thread-safe singleton initialised at first use.
     unsafe {

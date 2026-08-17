@@ -1,0 +1,224 @@
+#!/bin/sh
+# Drive the Windows development machine from this checkout.
+#
+# The Linux tree is the only source of truth. This script mirrors it to
+# E:\dev\chatt with rsync and runs cargo there over ssh, so the edit/build/test
+# loop stays in one terminal on this side.
+#
+# Prefer `devsm win ...`, which forwards everything below and works from any
+# directory in the workspace. `scripts/win` is the same thing from the root.
+#
+#   scripts/win sync                 mirror the tree, nothing else
+#   scripts/win check [cargo args]   cargo check
+#   scripts/win build [cargo args]   cargo build
+#   scripts/win test  [filters]      cargo test
+#   scripts/win run   [chatt args]   cargo run -p chatt
+#   scripts/win server[server args]  cargo run -p server
+#   scripts/win exec  <pwsh ...>     arbitrary PowerShell in the repo directory
+#   scripts/win script [file.ps1]    run PowerShell in the repo; reads stdin
+#                                    when no file is given, for here-docs
+#   scripts/win shell                interactive PowerShell in the repo
+#   scripts/win pull <remote> [dst]  copy a file back (remote is E:-relative)
+#
+# Pass -n / --no-sync as the first argument to reuse what is already there.
+#
+# Deliberately no git on the far side. rsync copies bytes verbatim, so the
+# CRLF hazard in docs/windows.md 5.4 (Git for Windows rewriting checked-out
+# text that Rust then include_str!s into the binary) cannot arise.
+
+set -eu
+
+HOST=${CHATT_WIN_HOST:-windows}
+# msys2 rsync speaks /e/... ; PowerShell needs the native path.
+REMOTE_ROOT=/e/dev/chatt
+REMOTE_WIN_ROOT='E:\dev\chatt'
+REMOTE_RSYNC=${CHATT_WIN_RSYNC:-C:/msys64/usr/bin/rsync.exe}
+
+# Three workspace members cannot build on Windows, for reasons that are not
+# going to change:
+#
+#   pipewire-sys, libspa-sys  build.rs bindgens against `pkg-config
+#                             libpipewire-0.3`. PipeWire is the opt-in
+#                             `--features pipewire` Linux audio backend.
+#   benchmark                 depends on jsony_bench -> perf-event2, i.e.
+#                             perf_event_open(2). A Linux profiling harness.
+#
+# Everything else is expected to compile and test here; if one of these
+# excludes starts covering for an ordinary portability bug, that is a
+# regression, not a fact of the platform.
+WORKSPACE='--workspace --exclude pipewire-sys --exclude libspa-sys --exclude benchmark'
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+usage() {
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-1}"
+}
+
+# Mirror the working tree. Full-tree with --delete rather than a git-derived
+# --files-from list, so files deleted or renamed here also disappear there;
+# a stale .rs left behind on the far side otherwise keeps compiling.
+#
+# -L resolves the few symlinks (crates/pipewire-sys/LICENSE) into real files,
+# which Windows would otherwise need privilege to create.
+sync() {
+    printf 'sync -> %s:%s\n' "$HOST" "$REMOTE_WIN_ROOT" >&2
+    {
+        cat <<'EXCLUDES'
+/.git/
+/target/
+/analysis/.venv/
+/analysis/__pycache__/
+/recordings/
+/web/node_modules/
+/web/dist/
+/tools/neteq-oracle/build/
+/tools/neteq-oracle/oracle
+.claude/
+.codex/
+*.kvlog
+EXCLUDES
+        # Dangling symlinks have no referent for -L to copy, and one of them
+        # aborts the entire run -- including the deletion pass, so the mirror
+        # silently stops pruning. Drop them instead. The vendored
+        # crates/pipewire-sys/LICENSE -> ../LICENSE is the current example.
+        find . -xtype l \
+            -not -path './.git/*' \
+            -not -path './target/*' \
+            -not -path './analysis/.venv/*' \
+            -not -path '*/node_modules/*' \
+            -printf '/%P\n' 2>/dev/null
+    } | rsync -rtzL --delete --info=stats1 \
+        --no-perms --no-owner --no-group \
+        --rsync-path="$REMOTE_RSYNC" \
+        --exclude-from=- \
+        ./ "$HOST:$REMOTE_ROOT/"
+}
+
+# Run a PowerShell snippet in the repo directory.
+#
+# The snippet is base64'd UTF-16LE and decoded on the far side. Sending it as
+# text instead would put it through the login shell's own parser, and sending
+# it on stdin to `pwsh -Command -` reads it a line at a time, so anything with
+# a block in it -- foreach, function, if -- silently loses its body and appears
+# to run while producing nothing.
+#
+# The login shell is already PowerShell, so it decodes and runs the snippet
+# itself rather than spawning `pwsh -EncodedCommand`. A second pwsh costs
+# ~130ms on every invocation, and buys nothing: sshd's own session setup
+# (~140ms) is the floor either way.
+remote() {
+    encoded=$(
+        {
+            printf '%s\n' '$ErrorActionPreference = "Continue"'
+            printf "Set-Location -LiteralPath '%s'\n" "$REMOTE_WIN_ROOT"
+            printf '%s\n' "$1"
+        } | iconv -f UTF-8 -t UTF-16LE | base64 -w0
+    )
+    # Base64 is [A-Za-z0-9+/=] only, so it needs no quoting on the way through.
+    ssh "$HOST" "Invoke-Expression ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$encoded'))); exit \$LASTEXITCODE"
+}
+
+# Quote a shell word for literal use inside a single-quoted PowerShell string.
+psquote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+
+# Build "cargo <sub> <fixed args> <user args>" with every user argument quoted.
+cargo_line() {
+    line="cargo $1"
+    shift
+    for arg in "$@"; do
+        line="$line $(psquote "$arg")"
+    done
+    printf '%s' "$line"
+}
+
+# The Windows target set, unless the caller named packages themselves --
+# `--workspace` and `-p` together are contradictory, and a targeted run is the
+# common case when chasing one failure.
+workspace_unless_package_given() {
+    for arg in "$@"; do
+        case "$arg" in
+            -p | --package | -p=* | --package=*)
+                return
+                ;;
+        esac
+    done
+    printf '%s' "$WORKSPACE"
+}
+
+do_sync=1
+maybe_sync() {
+    if [ "$do_sync" = 1 ]; then
+        sync
+    fi
+}
+
+case "${1:-}" in
+    -n | --no-sync)
+        do_sync=0
+        shift
+        ;;
+esac
+
+cmd=${1:-}
+[ -n "$cmd" ] || usage 1
+shift || true
+
+case "$cmd" in
+    sync) sync ;;
+    check)
+        maybe_sync
+        remote "$(cargo_line "check $(workspace_unless_package_given "$@") --all-targets" "$@")"
+        ;;
+    build)
+        maybe_sync
+        remote "$(cargo_line "build -p chatt -p server" "$@")"
+        ;;
+    test)
+        maybe_sync
+        remote "$(cargo_line "test $(workspace_unless_package_given "$@")" "$@")"
+        ;;
+    run)
+        maybe_sync
+        remote "$(cargo_line "run -p chatt --" "$@")"
+        ;;
+    server)
+        maybe_sync
+        remote "$(cargo_line "run -p server --" "$@")"
+        ;;
+    exec)
+        maybe_sync
+        [ "$#" -gt 0 ] || usage 1
+        remote "$*"
+        ;;
+    script)
+        maybe_sync
+        # stdin is fully consumed before `remote` runs, so the ssh child never
+        # competes for the here-doc.
+        if [ "$#" -ge 1 ]; then
+            [ -r "$1" ] || {
+                printf 'cannot read %s\n' "$1" >&2
+                exit 1
+            }
+            remote "$(cat "$1")"
+        else
+            remote "$(cat)"
+        fi
+        ;;
+    shell)
+        maybe_sync
+        exec ssh -t "$HOST" "pwsh -NoExit -Command \"Set-Location '$REMOTE_WIN_ROOT'\""
+        ;;
+    pull)
+        [ "$#" -ge 1 ] || usage 1
+        rsync -tz --info=stats1 --rsync-path="$REMOTE_RSYNC" \
+            "$HOST:/e/$1" "${2:-.}"
+        ;;
+    -h | --help | help) usage 0 ;;
+    *)
+        printf 'unknown command: %s\n\n' "$cmd" >&2
+        usage 1
+        ;;
+esac

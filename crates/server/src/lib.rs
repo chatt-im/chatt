@@ -1458,11 +1458,11 @@ impl Server {
         }
         let mut udp = Vec::with_capacity(config.network.bind.udp.len());
         for (index, addr) in config.network.bind.udp.iter().enumerate() {
-            udp.push(bind_transport("udp", index, addr, UdpSocket::bind)?);
+            udp.push(bind_transport("udp", index, addr, bind_media_udp)?);
         }
         let udp_probe = if p2p_enabled {
             udp_probe_addr
-                .map(|addr| bind_transport("udp probe", 0, addr, UdpSocket::bind))
+                .map(|addr| bind_transport("udp probe", 0, addr, bind_media_udp))
                 .transpose()?
         } else {
             None
@@ -6209,15 +6209,42 @@ impl Server {
                             *next_chunk += 1;
                             payload
                         }
+                        // The retention window was trimmed out from under the
+                        // plan. The messages it named are on disk, since being
+                        // durable is what allowed the trim, so the rest of
+                        // the page is re-read from there. Answering with a
+                        // terminal empty chunk instead would tell the client
+                        // it had reached the start of history when it had not,
+                        // stranding everything older.
                         Err(error) => {
-                            kvlog::warn!(
-                                "history chunk encode failed",
+                            let (before, limit) = plan.resume_after(*next_chunk);
+                            kvlog::info!(
+                                "history page trimmed mid-delivery; refetching from disk",
                                 session_id = delivery.session_id.0,
                                 room_id = delivery.room_id.0,
+                                limit,
                                 error = error.as_str()
                             );
-                            *next_chunk = plan.chunk_count();
-                            history_reader::empty_chunk(delivery.room_id, plan.before())
+                            let session_id = delivery.session_id;
+                            let room_id = delivery.room_id;
+                            let token = delivery.token;
+                            self.finish_history_delivery(session_id);
+                            match self.store.disk_fetch_request(
+                                session_id,
+                                room_id,
+                                before,
+                                limit,
+                                HISTORY_CHUNK_TARGET_BYTES,
+                            ) {
+                                Some(request) => self.enqueue_disk_history_fetch(
+                                    session_id, token, room_id, request,
+                                ),
+                                // Nothing durable to read back: the room's log
+                                // is disabled, so the trim discarded the
+                                // messages outright.
+                                None => self.send_empty_history_chunk(token, room_id, before),
+                            }
+                            continue;
                         }
                     }
                 }
@@ -9731,13 +9758,46 @@ fn io_context(error: io::Error, context: impl std::fmt::Display) -> io::Error {
     io::Error::new(error.kind(), format!("{context}: {error}"))
 }
 
+/// Whether an accept failed because the process or system ran out of
+/// descriptors, which is transient and should not tear the listener down.
 fn is_fd_pressure_accept_error(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+    }
+    #[cfg(windows)]
+    {
+        // Winsock reports descriptor exhaustion as WSAEMFILE; there is no
+        // system-wide counterpart to ENFILE.
+        use windows_sys::Win32::Networking::WinSock::WSAEMFILE;
+        error.raw_os_error() == Some(WSAEMFILE)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 /// Binds one socket, naming the transport and list position in the error. With
 /// several binds per transport a bare `EADDRINUSE` does not say which address
 /// the operator has to fix.
+/// Binds a media or probe socket.
+///
+/// These carry datagrams to addresses that may have nothing listening, and the
+/// ICMP port-unreachable that comes back would otherwise be reported as an
+/// error on the *next* receive. Turning that off is not cosmetic on Windows:
+/// `mio` re-arms a socket's interest only when an I/O call returns
+/// `WouldBlock`, so an error the drain loop stops on would silence the socket
+/// for good.
+fn bind_media_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
+    use chatt_platform::AsRawSock;
+
+    let socket = UdpSocket::bind(addr)?;
+    chatt_platform::ignore_udp_icmp_errors(socket.as_raw_sock())?;
+    Ok(socket)
+}
+
 fn bind_transport<T>(
     transport: &str,
     index: usize,
@@ -10074,7 +10134,28 @@ mod tests {
     use super::*;
     use rpc::crypto::{SessionSecrets, TAG_LEN, TRANSPORT_HEADER_LEN, TransportCipher};
     use std::io::{Read, Write};
+
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
+
+    /// A connected pair of byte streams for the frame-plumbing tests.
+    ///
+    /// These only need two ends of a stream; Unix has `socketpair`, Windows gets
+    /// an equivalent loopback TCP connection.
+    #[cfg(unix)]
+    fn stream_pair() -> (UnixStream, UnixStream) {
+        UnixStream::pair().expect("socket pair")
+    }
+
+    /// A connected pair of byte streams for the frame-plumbing tests.
+    #[cfg(not(unix))]
+    fn stream_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("loopback addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect loopback");
+        let (server, _) = listener.accept().expect("accept loopback");
+        (client, server)
+    }
 
     fn finish_test_roster(server: &mut Server) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -11868,6 +11949,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Everything the server writes under its data directory must be reachable
+    /// only by the account running it.
+    ///
+    /// A sweep rather than an assertion per store: the guarantee belongs to the
+    /// directory as a whole, and the way it gets lost is a new store opening a
+    /// file with plain `OpenOptions`. That is invisible on Unix, where the
+    /// process umask usually hides it, and shows up on Windows as an inherited
+    /// `BUILTIN\Users: (RX)` on whatever the operator chose as the data
+    /// directory.
+    #[test]
+    fn every_file_in_the_data_directory_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-server-private-data-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ServerConfig::default();
+        config.network.bind.tcp = "127.0.0.1:0".parse().unwrap();
+        config.network.bind.udp = "127.0.0.1:0".parse().unwrap();
+        config.network.p2p = false;
+        config.rooms[0].persistence = config::RoomPersistenceConfig::Durable;
+        config.storage.data_dir = Some(dir.display().to_string());
+        let mut server = Server::bind(config).expect("test server");
+        let session = SessionId(1);
+        let _peer = live_user(&mut server, Token(11), session, UserId(1));
+        server
+            .send_chat(session, RoomId(1), "durable".to_string())
+            .unwrap();
+        drive_scheduled_pass(&mut server);
+
+        let mut checked = 0usize;
+        let mut pending = vec![dir.clone()];
+        while let Some(current) = pending.pop() {
+            for entry in std::fs::read_dir(&current).expect("read data dir") {
+                let path = entry.expect("data dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                assert!(
+                    chatt_platform::is_owner_only(&path).expect("inspect access control"),
+                    "{} is reachable by other local users",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the run must have written something to sweep");
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn voice_in_room_a_persists_while_chatting_in_b() {
         let mut server = test_server();
@@ -13019,7 +13154,7 @@ mod tests {
 
     #[test]
     fn read_budget_stop_keeps_readiness_for_retry() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let (mut writer, reader) = stream_pair();
         reader.set_nonblocking(true).expect("set nonblocking");
         writer.write_all(b"x").expect("write payload");
         let mut read_buf = RecvBuffer::new();
@@ -13043,7 +13178,7 @@ mod tests {
 
     #[test]
     fn would_block_clears_retained_readiness_after_buffer_consumed() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let (mut writer, reader) = stream_pair();
         reader.set_nonblocking(true).expect("set nonblocking");
         writer.write_all(b"x").expect("write payload");
         let mut read_buf = RecvBuffer::new();
@@ -13164,7 +13299,7 @@ mod tests {
         let received = recv_datagram_with(&mut buf, |_| {
             calls += 1;
             match calls {
-                1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
                 2 => Ok((3, src)),
                 _ => unreachable!("receive loop should return after one datagram"),
             }
@@ -15540,12 +15675,25 @@ mod tests {
 
     #[test]
     fn accept_error_classification_matches_fd_pressure_only() {
-        assert!(is_fd_pressure_accept_error(&io::Error::from_raw_os_error(
-            libc::EMFILE
-        )));
-        assert!(is_fd_pressure_accept_error(&io::Error::from_raw_os_error(
-            libc::ENFILE
-        )));
+        // The codes differ per platform: Unix distinguishes per-process
+        // (`EMFILE`) from system-wide (`ENFILE`) exhaustion, Winsock reports
+        // only `WSAEMFILE`.
+        #[cfg(unix)]
+        {
+            assert!(is_fd_pressure_accept_error(&io::Error::from_raw_os_error(
+                libc::EMFILE
+            )));
+            assert!(is_fd_pressure_accept_error(&io::Error::from_raw_os_error(
+                libc::ENFILE
+            )));
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Networking::WinSock::WSAEMFILE;
+            assert!(is_fd_pressure_accept_error(&io::Error::from_raw_os_error(
+                WSAEMFILE
+            )));
+        }
         assert!(!is_fd_pressure_accept_error(&io::Error::from(
             io::ErrorKind::Interrupted
         )));

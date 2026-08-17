@@ -21,12 +21,12 @@ impl Default for UdpSocketOptions {
     }
 }
 
-#[cfg(unix)]
+/// Binds a UDP socket at `addr` with `options` applied before the bind.
 pub fn bind_udp_socket(addr: SocketAddr, options: UdpSocketOptions) -> io::Result<UdpSocket> {
     bind_udp_socket_inner(addr, options, None)
 }
 
-#[cfg(unix)]
+/// As [`bind_udp_socket`], additionally scoping the socket to `interface`.
 pub fn bind_udp_socket_on_interface(
     addr: SocketAddr,
     interface: &LocalInterface,
@@ -35,92 +35,60 @@ pub fn bind_udp_socket_on_interface(
     bind_udp_socket_inner(addr, options, Some(interface))
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn socket_cloexec(domain: libc::c_int) -> libc::c_int {
-    unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn socket_cloexec(domain: libc::c_int) -> libc::c_int {
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
-    if fd >= 0 {
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            unsafe {
-                libc::close(fd);
-            }
-            return -1;
-        }
-    }
-    fd
-}
-
-#[cfg(unix)]
 fn bind_udp_socket_inner(
     addr: SocketAddr,
     options: UdpSocketOptions,
     interface: Option<&LocalInterface>,
 ) -> io::Result<UdpSocket> {
-    use std::os::fd::FromRawFd;
-
-    let domain = if addr.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
-    let fd = socket_cloexec(domain);
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let result = (|| {
+    let socket = chatt_platform::bind_udp_socket_with(addr, |socket| {
         if options.reuse_addr {
-            set_bool_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, true)?;
+            chatt_platform::set_reuse_addr(socket, true)?;
         }
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd"
-        ))]
         if options.reuse_port {
-            set_bool_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, true)?;
+            set_reuse_port(socket)?;
         }
         if options.ignore_icmp_errors {
-            ignore_icmp_errors(fd);
+            chatt_platform::ignore_udp_icmp_errors(socket)?;
         }
         if let Some(interface) = interface {
-            bind_to_interface(fd, interface)?;
+            bind_to_interface(socket, interface)?;
         }
-        bind_fd(fd, addr)?;
-        let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-        socket.set_nonblocking(options.nonblocking)?;
-        Ok(socket)
-    })();
-
-    if result.is_err() {
-        unsafe {
-            libc::close(fd);
-        }
-    }
-    result
-}
-
-#[cfg(not(unix))]
-pub fn bind_udp_socket(addr: SocketAddr, options: UdpSocketOptions) -> io::Result<UdpSocket> {
-    let socket = UdpSocket::bind(addr)?;
+        Ok(())
+    })?;
     socket.set_nonblocking(options.nonblocking)?;
-    let _ = options;
     Ok(socket)
 }
 
-#[cfg(not(unix))]
-pub fn bind_udp_socket_on_interface(
-    addr: SocketAddr,
-    _interface: &LocalInterface,
-    options: UdpSocketOptions,
-) -> io::Result<UdpSocket> {
-    bind_udp_socket(addr, options)
+/// Requests that several sockets share `addr`, where the platform has a
+/// separate option for it.
+///
+/// Windows has no `SO_REUSEPORT`: there `SO_REUSEADDR` alone is what lets a
+/// second socket bind a port already in use, so this is a successful no-op.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+))]
+fn set_reuse_port(socket: chatt_platform::RawSock) -> io::Result<()> {
+    chatt_platform::setsockopt_int(
+        socket,
+        chatt_platform::SockLevel::Socket,
+        libc::SO_REUSEPORT,
+        1,
+    )
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+)))]
+fn set_reuse_port(_socket: chatt_platform::RawSock) -> io::Result<()> {
+    Ok(())
 }
 
 pub fn is_ignorable_udp_error(error: &io::Error) -> bool {
@@ -130,124 +98,38 @@ pub fn is_ignorable_udp_error(error: &io::Error) -> bool {
     )
 }
 
-#[cfg(unix)]
-fn set_bool_opt(
-    fd: libc::c_int,
-    level: libc::c_int,
-    opt: libc::c_int,
-    value: bool,
-) -> io::Result<()> {
-    let value: libc::c_int = i32::from(value);
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            opt,
-            &value as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&value) as libc::socklen_t,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
-fn bind_fd(fd: libc::c_int, addr: SocketAddr) -> io::Result<()> {
-    match addr {
-        SocketAddr::V4(addr) => {
-            let raw = libc::sockaddr_in {
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: addr.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from(*addr.ip()).to_be(),
-                },
-                sin_zero: [0; 8],
-            };
-            bind_sockaddr(
-                fd,
-                &raw as *const _ as *const libc::sockaddr,
-                std::mem::size_of_val(&raw),
-            )
-        }
-        SocketAddr::V6(addr) => {
-            let raw = libc::sockaddr_in6 {
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: addr.port().to_be(),
-                sin6_flowinfo: addr.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: addr.ip().octets(),
-                },
-                sin6_scope_id: addr.scope_id(),
-            };
-            bind_sockaddr(
-                fd,
-                &raw as *const _ as *const libc::sockaddr,
-                std::mem::size_of_val(&raw),
-            )
-        }
-    }
-}
-
-#[cfg(unix)]
-fn bind_sockaddr(fd: libc::c_int, addr: *const libc::sockaddr, len: usize) -> io::Result<()> {
-    let rc = unsafe { libc::bind(fd, addr, len as libc::socklen_t) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
-fn ignore_icmp_errors(_fd: libc::c_int) {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        #[allow(clippy::unnecessary_cast)]
-        let _ = set_bool_opt(
-            _fd,
-            libc::IPPROTO_IP,
-            libc::IP_RECVERR as libc::c_int,
-            false,
-        );
-        #[allow(clippy::unnecessary_cast)]
-        let _ = set_bool_opt(
-            _fd,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_RECVERR as libc::c_int,
-            false,
-        );
-    }
-}
-
+/// Pins outbound traffic to one interface, where the platform can.
+///
+/// Only Linux has `SO_BINDTODEVICE`; elsewhere binding to the interface's own
+/// address is the closest equivalent, and the caller has already done that.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn bind_to_interface(fd: libc::c_int, interface: &LocalInterface) -> io::Result<()> {
+fn bind_to_interface(
+    socket: chatt_platform::RawSock,
+    interface: &LocalInterface,
+) -> io::Result<()> {
     let mut name = interface.name.as_bytes().to_vec();
     name.push(0);
-    let rc = unsafe {
+    // SAFETY: the name outlives the call and its length is passed explicitly.
+    let result = unsafe {
         libc::setsockopt(
-            fd,
+            socket,
             libc::SOL_SOCKET,
             libc::SO_BINDTODEVICE,
-            name.as_ptr() as *const libc::c_void,
+            name.as_ptr().cast(),
             name.len() as libc::socklen_t,
         )
     };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    if result != 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn bind_to_interface(_fd: libc::c_int, _interface: &LocalInterface) -> io::Result<()> {
+fn bind_to_interface(
+    _socket: chatt_platform::RawSock,
+    _interface: &LocalInterface,
+) -> io::Result<()> {
     Ok(())
 }
 

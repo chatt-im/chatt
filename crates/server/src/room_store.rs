@@ -469,6 +469,27 @@ impl HistoryFetchPlan {
     pub fn before(&self) -> Option<MessageId> {
         self.before
     }
+
+    /// The bound and limit that re-request the part of this page still owed,
+    /// for when a resident trim lands between planning and encoding.
+    ///
+    /// Chunks go out newest first, so everything already sent is newer than
+    /// everything left: the bound is the oldest id delivered so far, and the
+    /// limit is what the remaining chunks were going to carry. A trim only
+    /// happens once the messages are durable, so the remainder is on disk and
+    /// the page can be finished from there rather than reported as the end of
+    /// history.
+    pub fn resume_after(&self, next_chunk: usize) -> (Option<MessageId>, usize) {
+        let before = next_chunk
+            .checked_sub(1)
+            .and_then(|delivered| self.chunks[delivered].first_id)
+            .or(self.before);
+        let remaining = self.chunks[next_chunk..]
+            .iter()
+            .map(|spec| spec.count)
+            .sum();
+        (before, remaining)
+    }
 }
 
 /// One planned wire chunk, anchored to the id of its oldest message so an
@@ -1931,11 +1952,10 @@ fn rotate_log(
 }
 
 fn open_active_log(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(path)
+    chatt_platform::open_private(
+        OpenOptions::new().create(true).append(true).read(true),
+        path,
+    )
 }
 
 fn segment_path(path: &Path, first_id: MessageId) -> PathBuf {

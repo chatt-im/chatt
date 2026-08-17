@@ -23,10 +23,10 @@
 //! [`MAX_FRAME_LEN`]: crate::frame::MAX_FRAME_LEN
 
 use std::io;
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use chatt_platform::{SocketSource, is_interrupted};
 use jsony::Jsony;
 
 use crate::crypto::{self, AUTH_PROOF_LEN, TAG_LEN, TRANSPORT_HEADER_LEN, TransportMode};
@@ -324,7 +324,11 @@ impl VideoRecordReader {
     /// surfaces as [`io::ErrorKind::WouldBlock`], and an over-length prefix
     /// as [`io::ErrorKind::InvalidData`]. Must not be called while a
     /// completed record is waiting in the reader.
-    pub fn fill(&mut self, socket: &impl AsRawFd, max_read: usize) -> io::Result<usize> {
+    pub fn fill(
+        &mut self,
+        socket: &(impl SocketSource + ?Sized),
+        max_read: usize,
+    ) -> io::Result<usize> {
         debug_assert!(max_read > 0);
         debug_assert!(!self.record_ready());
         if self.prefix_len < VIDEO_LENGTH_PREFIX_LEN {
@@ -363,15 +367,18 @@ impl Default for VideoRecordReader {
     }
 }
 
-fn read_fd(socket: &impl AsRawFd, ptr: *mut u8, want: usize) -> io::Result<usize> {
+/// Reads into `ptr`, retrying an interrupted call.
+///
+/// # Safety
+///
+/// `ptr` must be valid for writes of `want` bytes.
+fn read_fd(socket: &(impl SocketSource + ?Sized), ptr: *mut u8, want: usize) -> io::Result<usize> {
     loop {
-        let read = unsafe { libc::read(socket.as_raw_fd(), ptr.cast(), want) };
-        if read >= 0 {
-            return Ok(read as usize);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+        // SAFETY: callers pass a pointer valid for `want` bytes.
+        match unsafe { socket.recv_into(ptr, want) } {
+            Ok(read) => return Ok(read),
+            Err(error) if is_interrupted(&error) => continue,
+            Err(error) => return Err(error),
         }
     }
 }
@@ -383,7 +390,7 @@ fn read_fd(socket: &impl AsRawFd, ptr: *mut u8, want: usize) -> io::Result<usize
 /// would-block or end-of-stream, and `hit_limit` reports a budget stop that
 /// must be requeued rather than waiting for a new edge.
 pub fn read_video_record(
-    socket: &impl AsRawFd,
+    socket: &(impl SocketSource + ?Sized),
     reader: &mut VideoRecordReader,
     readiness: &mut Readiness,
     byte_budget: usize,
@@ -466,6 +473,27 @@ pub fn decode_video_ack(bytes: &[u8]) -> Result<VideoAck, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connected pair of byte streams.
+    ///
+    /// The record reader only needs two ends of a stream; Unix has
+    /// `socketpair`, Windows gets an equivalent loopback TCP connection.
+    #[cfg(unix)]
+    fn stream_pair() -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        std::os::unix::net::UnixStream::pair().expect("socket pair")
+    }
+
+    #[cfg(not(unix))]
+    fn stream_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("loopback addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect loopback");
+        let (server, _) = listener.accept().expect("accept loopback");
+        (client, server)
+    }
 
     #[test]
     fn video_auth_proof_binds_identity_and_role() {
@@ -612,12 +640,11 @@ mod tests {
     #[test]
     fn record_reader_assembles_record_across_partial_reads() {
         use std::io::Write;
-        use std::os::unix::net::UnixStream;
 
         let mut record = Vec::new();
         write_record(&mut record, b"sealed-record-body").unwrap();
 
-        let (mut writer, reader_sock) = UnixStream::pair().unwrap();
+        let (mut writer, reader_sock) = stream_pair();
         writer.write_all(&record).unwrap();
         let mut reader = VideoRecordReader::new();
 
@@ -636,13 +663,12 @@ mod tests {
     #[test]
     fn record_reader_never_reads_past_the_current_record() {
         use std::io::Write;
-        use std::os::unix::net::UnixStream;
 
         let mut records = Vec::new();
         write_record(&mut records, b"first-record").unwrap();
         write_record(&mut records, b"second").unwrap();
 
-        let (mut writer, reader_sock) = UnixStream::pair().unwrap();
+        let (mut writer, reader_sock) = stream_pair();
         writer.write_all(&records).unwrap();
         let mut reader = VideoRecordReader::new();
 
@@ -665,9 +691,8 @@ mod tests {
     #[test]
     fn record_reader_rejects_oversized_record_length() {
         use std::io::Write;
-        use std::os::unix::net::UnixStream;
 
-        let (mut writer, reader_sock) = UnixStream::pair().unwrap();
+        let (mut writer, reader_sock) = stream_pair();
         let len = (MAX_VIDEO_RECORD_LEN + 1) as u32;
         writer.write_all(&len.to_le_bytes()).unwrap();
         let mut reader = VideoRecordReader::new();
@@ -709,12 +734,11 @@ mod tests {
     fn record_reader_pump_stops_at_budget_and_keeps_readiness() {
         use crate::evented::Readiness;
         use std::io::Write;
-        use std::os::unix::net::UnixStream;
 
         let mut record = Vec::new();
         write_record(&mut record, &[7u8; 32]).unwrap();
 
-        let (mut writer, reader_sock) = UnixStream::pair().unwrap();
+        let (mut writer, reader_sock) = stream_pair();
         reader_sock.set_nonblocking(true).unwrap();
         writer.write_all(&record).unwrap();
         let mut reader = VideoRecordReader::new();

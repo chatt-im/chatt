@@ -104,8 +104,15 @@ fn unusable_logfile_is_reported_on_stdout_before_exit() {
         stdout.contains("server logfile unavailable"),
         "missing logfile error:\n{stdout}"
     );
+    // kvlog escapes backslashes in string values, so a Windows path is doubled
+    // in the emitted record. The replacement is a no-op for POSIX paths.
+    let requested_path = server_dir
+        .path()
+        .display()
+        .to_string()
+        .replace('\\', "\\\\");
     assert!(
-        stdout.contains(&server_dir.path().display().to_string()),
+        stdout.contains(&requested_path),
         "logfile error omitted the requested path:\n{stdout}"
     );
 }

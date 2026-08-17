@@ -1,8 +1,5 @@
 use chatt_mls::LocalInstallation;
 use hashbrown::{HashMap, HashSet};
-#[cfg(test)]
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
@@ -3404,7 +3401,7 @@ impl WorkerState<'_> {
         let request = match intent.source_bytes.clone() {
             Some(bytes) => UploadFileRequest::from_bytes(announcement.name.clone(), bytes),
             None => UploadFileRequest {
-                path: PathBuf::from(std::ffi::OsString::from_vec(intent.source_path.clone())),
+                path: PathBuf::from(chatt_platform::os_string_from_bytes(&intent.source_path)),
                 name_override: Some(announcement.name.clone()),
                 delete_after_open: false,
                 inline_bytes: None,
@@ -4256,7 +4253,7 @@ impl WorkerState<'_> {
             event_id: seal.event_id,
             timestamp_ms: unix_now_ms(),
             announcement,
-            source_path: upload.source_path.as_os_str().as_bytes().to_vec(),
+            source_path: chatt_platform::os_str_to_bytes(upload.source_path.as_os_str()),
             delete_after_upload: upload.delete_source_when_done,
             source_bytes: upload.source_bytes.clone(),
         }))
@@ -7050,20 +7047,37 @@ fn connection_id_from_p2p_username(username: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use chatt_p2p::interfaces::LocalInterface;
+    use chatt_platform::AsRawSock;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn voice_udp_bind_applies_ef_qos() {
         let socket = voice::bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let local = socket.local_addr().unwrap();
+        let (level, option) = chatt_platform::dscp_option(local);
+
+        // Windows accepts `IP_TOS` and then discards it unless the machine opts
+        // back in through policy, so the value cannot be read back there; that
+        // the bind succeeded is all this can assert.
+        #[cfg(not(windows))]
         assert_eq!(
-            socket_int_option(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS) & !0b11,
+            chatt_platform::getsockopt_int(socket.as_raw_sock(), level, option).unwrap() & !0b11,
             (rpc::qos::VOICE_DSCP as i32) << 2
         );
+        #[cfg(windows)]
+        let _ = chatt_platform::getsockopt_int(socket.as_raw_sock(), level, option);
+
         #[cfg(target_os = "linux")]
         assert_eq!(
-            socket_int_option(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PRIORITY),
+            chatt_platform::getsockopt_int(
+                socket.as_raw_sock(),
+                chatt_platform::SockLevel::Socket,
+                libc::SO_PRIORITY
+            )
+            .unwrap(),
             6
         );
     }
@@ -7087,20 +7101,23 @@ mod tests {
         ));
     }
 
-    fn socket_int_option(fd: libc::c_int, level: libc::c_int, option: libc::c_int) -> i32 {
-        let mut value = 0;
-        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
-        let result = unsafe {
-            libc::getsockopt(
-                fd,
-                level,
-                option,
-                &mut value as *mut _ as *mut libc::c_void,
-                &mut len,
-            )
-        };
-        assert_eq!(result, 0, "{}", io::Error::last_os_error());
-        value
+    /// A connected pair of byte streams for the readiness tests.
+    ///
+    /// These tests exercise TCP receive bookkeeping and only need two ends of a
+    /// stream that can be put in non-blocking mode. Unix has `socketpair`;
+    /// Windows gets an equivalent loopback TCP connection.
+    #[cfg(unix)]
+    fn stream_pair() -> (UnixStream, UnixStream) {
+        UnixStream::pair().expect("socket pair")
+    }
+
+    #[cfg(not(unix))]
+    fn stream_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("loopback addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect loopback");
+        let (server, _) = listener.accept().expect("accept loopback");
+        (client, server)
     }
 
     fn user(id: u64) -> UserId {
@@ -7746,6 +7763,10 @@ mod tests {
         assert!(rpc::evented::is_interrupted_io_error(&io::Error::from(
             io::ErrorKind::Interrupted
         )));
+        // A raw `EINTR` only reaches this on Unix; the same numeric code means
+        // something unrelated on Windows, where Winsock reports no interruption
+        // for these calls.
+        #[cfg(unix)]
         assert!(rpc::evented::is_interrupted_io_error(
             &io::Error::from_raw_os_error(libc::EINTR)
         ));
@@ -7826,7 +7847,7 @@ mod tests {
         let received = rpc::evented::recv_datagram_with(&mut buf, |_| {
             calls += 1;
             match calls {
-                1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
                 2 => Ok((3, src)),
                 _ => unreachable!("receive loop should return after one datagram"),
             }
@@ -7854,7 +7875,7 @@ mod tests {
 
     #[test]
     fn tcp_buffer_cap_keeps_readiness_for_retry() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let (mut writer, reader) = stream_pair();
         reader.set_nonblocking(true).expect("set nonblocking");
         writer.write_all(b"x").expect("write payload");
         let mut read_buf = RecvBuffer::new();
@@ -7879,7 +7900,7 @@ mod tests {
 
     #[test]
     fn tcp_would_block_clears_retained_readiness_after_buffer_consumed() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let (mut writer, reader) = stream_pair();
         reader.set_nonblocking(true).expect("set nonblocking");
         writer.write_all(b"x").expect("write payload");
         let mut read_buf = RecvBuffer::new();
@@ -7913,7 +7934,7 @@ mod tests {
 
     #[test]
     fn complete_buffered_frame_is_immediate_tcp_work() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let (mut writer, reader) = stream_pair();
         reader.set_nonblocking(true).expect("set nonblocking");
         let mut encoded = Vec::new();
         frame::encode_frame(b"payload", &mut encoded).expect("encode frame");
@@ -8127,7 +8148,13 @@ mod tests {
         probe: MediaProbe,
     ) -> IncomingFile {
         let sink = ReceiveSink::new(SinkTarget::Memory(Vec::new()), original_size, probe, false);
-        incoming_from_sink(sink, file_name, original_size, encoding, ReceiveDest::Memory)
+        incoming_from_sink(
+            sink,
+            file_name,
+            original_size,
+            encoding,
+            ReceiveDest::Memory,
+        )
     }
 
     fn incoming_from_sink(

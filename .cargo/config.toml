@@ -12,6 +12,14 @@
 # The rustflags are scoped to x86-64 targets so host build scripts are
 # unaffected when cross-compiling. Note env `RUSTFLAGS`, if set, overrides these.
 #
+# Careful adding a [target.*] table below: `rustflags` there *replaces* these
+# rather than merging with them, so a per-target table that sets rustflags
+# silently drops `force-frame-pointers`.
+#
+# Nothing here selects a linker. `lld-link.exe` is worth about 8% on a Windows
+# link step already under a second, which does not justify making every Windows
+# build in the world fail without LLVM on PATH; a developer who wants it puts it
+# in their own `%USERPROFILE%\.cargo\config.toml`. See docs/windows.md 5.6.
 [build]
 rustflags = ["-C", "force-frame-pointers=yes"]
 

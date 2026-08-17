@@ -13,6 +13,7 @@
 //! session's media keys. A bound lane takes precedence over the session's UDP
 //! address for downstream media until it closes.
 
+use chatt_platform::AsRawSock;
 use hashbrown::HashMap;
 use mio::{
     Events, Interest, Poll, Token, Waker,
@@ -32,7 +33,6 @@ use rpc::{
 use std::{
     io,
     net::SocketAddr,
-    os::fd::AsRawFd,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -383,7 +383,7 @@ impl VoiceRelayHandle {
             udp_local_addrs.push(socket.local_addr()?);
         }
         for (socket, local_addr) in udp.iter().zip(&udp_local_addrs) {
-            if let Err(error) = rpc::qos::apply_voice_qos(socket.as_raw_fd(), *local_addr) {
+            if let Err(error) = rpc::qos::apply_voice_qos(socket.as_raw_sock(), *local_addr) {
                 kvlog::warn!(
                     "voice udp qos unavailable",
                     addr = %local_addr,
@@ -1096,7 +1096,7 @@ impl VoiceRelay {
             return;
         }
         if let Ok(local_addr) = socket.local_addr()
-            && let Err(_error) = rpc::qos::apply_voice_qos(socket.as_raw_fd(), local_addr)
+            && let Err(_error) = rpc::qos::apply_voice_qos(socket.as_raw_sock(), local_addr)
         {
             kvlog::debug!("voice tcp qos unavailable", addr = %addr, error = %_error);
         }
@@ -1277,6 +1277,12 @@ impl VoiceRelay {
     /// Drains one ready socket: media bind `bit`, or the probe at
     /// [`PROBE_BIT`]. Re-arms `bit` and returns once the drain budget is spent
     /// so no single socket can hold the loop.
+    ///
+    /// The loop only ever leaves on `WouldBlock` or with work retained. That is
+    /// load-bearing on Windows, where `mio` simulates edge triggering by
+    /// clearing a socket's interest after each readiness event and re-arming it
+    /// only when an I/O call returns `WouldBlock`; exiting on anything else
+    /// would silence the socket for the life of the process.
     fn receive(&mut self, bit: u32) {
         let probe = bit == PROBE_BIT;
         if probe && self.udp_probe.is_none() {
@@ -1288,6 +1294,8 @@ impl VoiceRelay {
         let bind_index = if probe { 0 } else { bit as usize };
         let mut buf = std::mem::take(&mut self.recv_buf);
         let mut datagrams = 0;
+        let mut skipped = 0;
+        let mut last_error = None;
         loop {
             if datagrams >= UDP_DRAIN_BUDGET {
                 self.udp_work |= 1 << bit;
@@ -1298,20 +1306,22 @@ impl VoiceRelay {
             } else {
                 recv_udp_datagram(&self.udp[bind_index], &mut buf)
             };
+            datagrams += 1;
             let (len, src) = match received {
                 Ok(Some(received)) => received,
                 Ok(None) => break,
                 Err(error) => {
-                    kvlog::warn!(
-                        "udp receive failed",
-                        bind_index,
-                        probe = server_probe_id,
-                        error = %error
-                    );
-                    break;
+                    // A receive error describes a datagram, not the socket: an
+                    // ICMP port-unreachable from an earlier send, or a datagram
+                    // too large for the buffer, is reported by the receive that
+                    // follows it and says nothing about what comes next. Both
+                    // are remotely triggerable, so they are skipped and charged
+                    // to the drain budget rather than ending the burst.
+                    skipped += 1;
+                    last_error = Some(error);
+                    continue;
                 }
             };
-            datagrams += 1;
             if let Err(error) =
                 self.handle_packet(server_probe_id, bind_index, src, &mut buf[..len])
             {
@@ -1322,6 +1332,17 @@ impl VoiceRelay {
                     error = %error
                 );
             }
+        }
+        // Summarised once per burst: a socket erroring on every receive would
+        // otherwise log at the drain budget's rate.
+        if let Some(error) = last_error {
+            kvlog::warn!(
+                "udp datagrams skipped",
+                bind_index,
+                probe = server_probe_id,
+                skipped,
+                error = %error
+            );
         }
         self.recv_buf = buf;
     }
@@ -2108,6 +2129,43 @@ mod tests {
 
         let mut bind = media::seal_media(&client, 2, &MediaPayload::Bind).unwrap();
         direct.relay.handle_packet(0, 0, src, &mut bind).unwrap();
+        assert_eq!(
+            direct.relay.event_buf.udp_bound.get(&session_id),
+            Some(&src)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_datagram_does_not_end_the_receive_burst() {
+        let mut direct = DirectRelay::new(false);
+        let server_addr = direct.relay.udp[0].local_addr().unwrap();
+        let session_id = SessionId(1);
+        let client = protection(77);
+        direct
+            .relay
+            .register_session(session_id, UserId(9), client.clone());
+
+        let sender = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let src = sender.local_addr().unwrap();
+        // Larger than the receive buffer: truncated on Unix, reported as
+        // WSAEMSGSIZE on Windows. Either way it is a fact about one datagram,
+        // and stopping the drain on it would leave the socket un-armed for
+        // good under mio's simulated edge triggering.
+        sender
+            .send_to(&vec![0u8; MAX_UDP_DATAGRAM_BYTES + 64], server_addr)
+            .unwrap();
+        let bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
+        sender.send_to(&bind, server_addr).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while direct.relay.event_buf.udp_bound.is_empty() {
+            direct.relay.receive(0);
+            assert!(
+                Instant::now() < deadline,
+                "the bind after an unreadable datagram must still be drained"
+            );
+        }
+
         assert_eq!(
             direct.relay.event_buf.udp_bound.get(&session_id),
             Some(&src)

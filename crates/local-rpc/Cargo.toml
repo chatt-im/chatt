@@ -13,6 +13,10 @@ name = "local_rpc"
 chatt-ids = { path = "../ids" }
 chatt-video = { path = "../video" }
 jsony = "0.1.10"
-kvlog = { git = "https://github.com/exrok/kvlog", rev = "139b426d2050b5f9ad646ab8097d86e8ab0728e9", default-features = false }
-libc = "0.2"
+kvlog = { git = "https://github.com/exrok/kvlog", rev = "2182d43ba7a20d2aa16e37b8c3ba6d8502cf7787", default-features = false }
 uuid = { version = "1.7.0", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+# Descriptor passing and readiness polling on the local socket; the Windows
+# half of this crate is compiled out.
+libc = "0.2"

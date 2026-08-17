@@ -3,7 +3,7 @@ use std::{
     ops::ControlFlow,
     ptr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{channel, Receiver, SendError, Sender},
         Arc,
     },
@@ -19,7 +19,7 @@ use windows::Win32::{
 
 use crate::{
     host::{
-        emit_error, equilibrium::fill_equilibrium, frames_to_duration, latch::Latch,
+        com::Apartment, emit_error, equilibrium::fill_equilibrium, frames_to_duration, latch::Latch,
         ErrorCallbackArc,
     },
     traits::StreamTrait,
@@ -28,15 +28,80 @@ use crate::{
     StreamInstant,
 };
 
-/// Returns the current default audio endpoint for `flow`, or `None` if none exists.
+/// What an endpoint notification observed, handed to the run thread.
 ///
-/// Used by `OnDeviceStateChanged` and `OnDeviceRemoved` to cover the edge case where the
-/// default device becomes unavailable with no replacement: in that situation Windows does
-/// not fire `OnDefaultDeviceChanged`, so these callbacks must signal the run loop instead.
-/// When a replacement *does* exist this returns `Some` and we skip signalling, letting
-/// `OnDefaultDeviceChanged` fire as the sole notifier and avoiding a double wakeup.
-fn get_current_default(flow: Audio::EDataFlow) -> Option<Audio::IMMDevice> {
-    super::device::current_default_endpoint(flow)
+/// `IMMNotificationClient` callbacks arrive on a thread MMDevAPI owns, and this
+/// process must not touch COM there: `CoInitializeEx` on a foreign thread sticks
+/// until that thread exits, and `ActivateAudioInterfaceAsync`, which activates
+/// the default endpoint on those same MMDevAPI workers, then fails with
+/// `RPC_E_CHANGED_MODE` for every default-device stream the process opens
+/// afterwards. So the callbacks only record what fired and wake the run thread,
+/// which owns its apartment and resolves the current default endpoint itself.
+struct DeviceChangeSignal {
+    flow: Audio::EDataFlow,
+    /// The default endpoint for `flow` was replaced.
+    default_changed: AtomicBool,
+    /// An endpoint became unavailable or was removed. Whether that leaves `flow`
+    /// with no default at all is for the run thread to decide.
+    endpoint_lost: AtomicBool,
+    /// [`Apartment`] of the most recent notification thread, reported alongside
+    /// the device-change error so a foreign-thread `CoInitializeEx` regression is
+    /// visible in a log rather than only in its downstream damage.
+    callback_apartment: AtomicU8,
+}
+
+impl DeviceChangeSignal {
+    fn new(flow: Audio::EDataFlow) -> Self {
+        Self {
+            flow,
+            default_changed: AtomicBool::new(false),
+            endpoint_lost: AtomicBool::new(false),
+            callback_apartment: AtomicU8::new(Apartment::Unobserved.code()),
+        }
+    }
+
+    /// Records the notification thread's apartment and wakes the run thread.
+    fn wake(&self, event: Foundation::HANDLE) {
+        self.callback_apartment
+            .store(Apartment::current().code(), Ordering::Relaxed);
+        // A failed SetEvent only costs latency: the flags are the source of
+        // truth and the run thread rechecks them on its next wakeup.
+        unsafe {
+            let _ = Threading::SetEvent(event);
+        }
+    }
+
+    /// Takes the pending notification, if it warrants a `DeviceChanged` error.
+    ///
+    /// Must run on a thread this process owns: it resolves the current default
+    /// endpoint, which needs COM initialized on the calling thread.
+    fn take_device_change(&self) -> Option<Error> {
+        let apartment = Apartment::from_code(self.callback_apartment.load(Ordering::Relaxed));
+        if self.default_changed.swap(false, Ordering::Relaxed) {
+            self.endpoint_lost.store(false, Ordering::Relaxed);
+            return Some(Error::with_message(
+                ErrorKind::DeviceChanged,
+                format!("Default audio device changed (notify apartment: {})", apartment.label()),
+            ));
+        }
+        if !self.endpoint_lost.swap(false, Ordering::Relaxed) {
+            return None;
+        }
+        // Windows does not fire OnDefaultDeviceChanged when the default goes away
+        // with no replacement, so that case is reported from here; when a
+        // replacement exists this wakeup is redundant and OnDefaultDeviceChanged
+        // is the sole notifier.
+        if super::device::current_default_endpoint(self.flow).is_some() {
+            return None;
+        }
+        Some(Error::with_message(
+            ErrorKind::DeviceChanged,
+            format!(
+                "Default audio device removed with no replacement (notify apartment: {})",
+                apartment.label()
+            ),
+        ))
+    }
 }
 
 /// Fires a Windows auto-reset event when the system default audio device changes, allowing
@@ -45,7 +110,7 @@ pub(crate) struct DefaultDeviceMonitor {
     enumerator: Audio::IMMDeviceEnumerator,
     client: Audio::IMMNotificationClient,
     event: Foundation::HANDLE,
-    pub(crate) pending_device_changed: Arc<AtomicBool>,
+    signal: Arc<DeviceChangeSignal>,
 }
 
 // SAFETY: `IMMDeviceEnumerator` and `IMMNotificationClient` are COM objects used only for
@@ -62,11 +127,11 @@ impl DefaultDeviceMonitor {
         let event =
             unsafe { Threading::CreateEventW(None, false, false, None).map_err(Error::from)? };
 
-        let pending_device_changed = Arc::new(AtomicBool::new(false));
+        let signal = Arc::new(DeviceChangeSignal::new(flow));
         let client: Audio::IMMNotificationClient = DefaultDeviceNotificationImpl {
             flow,
             event,
-            pending_device_changed: pending_device_changed.clone(),
+            signal: signal.clone(),
         }
         .into();
 
@@ -80,7 +145,7 @@ impl DefaultDeviceMonitor {
             enumerator,
             client,
             event,
-            pending_device_changed,
+            signal,
         })
     }
 }
@@ -94,7 +159,7 @@ impl Drop for DefaultDeviceMonitor {
             // Synchronous: waits for any in-progress IMMNotificationClient callback to finish
             // before returning. Notification callbacks must not invoke the user error callback:
             // if the user dropped the Stream in response, this call would deadlock waiting for
-            // the in-progress callback. Instead, callbacks set `pending_device_changed` and
+            // the in-progress callback. Instead, callbacks record in `DeviceChangeSignal` and
             // the audio thread delivers the error on its next iteration.
             //
             // Only close the event handle on success; if unregister fails the callback may
@@ -110,11 +175,15 @@ impl Drop for DefaultDeviceMonitor {
     }
 }
 
+/// Endpoint notification sink.
+///
+/// Every method here runs on an MMDevAPI thread: record and wake, nothing more.
+/// No COM call, and above all no `CoInitializeEx`. See [`DeviceChangeSignal`].
 #[windows::core::implement(Audio::IMMNotificationClient)]
 struct DefaultDeviceNotificationImpl {
     flow: Audio::EDataFlow,
     event: Foundation::HANDLE,
-    pending_device_changed: Arc<AtomicBool>,
+    signal: Arc<DeviceChangeSignal>,
 }
 
 impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
@@ -125,13 +194,10 @@ impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
         _pwstrdefaultdeviceid: &windows::core::PCWSTR,
     ) -> windows::core::Result<()> {
         if flow == self.flow && role == Audio::eConsole {
+            self.signal.default_changed.store(true, Ordering::Relaxed);
             // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor, which
             // outlives all uses of this HANDLE copy.
-            unsafe {
-                if Threading::SetEvent(self.event).is_err() {
-                    self.pending_device_changed.store(true, Ordering::Relaxed);
-                }
-            }
+            self.signal.wake(self.event);
         }
         Ok(())
     }
@@ -145,19 +211,13 @@ impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
         // collection but produces no audio. `OnDeviceRemoved` does *not* fire for this state.
         // `DEVICE_STATE_NOTPRESENT`: hardware absent; endpoint may persist as a ghost record.
         // `DEVICE_STATE_DISABLED`: device was manually disabled by the user.
-        //
-        // Only signal when there is no replacement default; if one exists `OnDefaultDeviceChanged`
-        // will fire instead, avoiding a double wakeup.
         let is_unavailable = dwnewstate == Audio::DEVICE_STATE_DISABLED
             || dwnewstate == Audio::DEVICE_STATE_NOTPRESENT
             || dwnewstate == Audio::DEVICE_STATE_UNPLUGGED;
-        if is_unavailable && get_current_default(self.flow).is_none() {
+        if is_unavailable {
+            self.signal.endpoint_lost.store(true, Ordering::Relaxed);
             // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor.
-            unsafe {
-                if Threading::SetEvent(self.event).is_err() {
-                    self.pending_device_changed.store(true, Ordering::Relaxed);
-                }
-            }
+            self.signal.wake(self.event);
         }
         Ok(())
     }
@@ -167,16 +227,9 @@ impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
     }
 
     fn OnDeviceRemoved(&self, _pwstrdeviceid: &windows::core::PCWSTR) -> windows::core::Result<()> {
-        // Only signal when there is no replacement default; if one exists `OnDefaultDeviceChanged`
-        // will fire instead, avoiding a double wakeup.
-        if get_current_default(self.flow).is_none() {
-            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor.
-            unsafe {
-                if Threading::SetEvent(self.event).is_err() {
-                    self.pending_device_changed.store(true, Ordering::Relaxed);
-                }
-            }
-        }
+        self.signal.endpoint_lost.store(true, Ordering::Relaxed);
+        // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor.
+        self.signal.wake(self.event);
         Ok(())
     }
 
@@ -253,9 +306,9 @@ struct RunContext {
 
     commands: Receiver<Command>,
 
-    // Set by a device-change notification callback when SetEvent fails. The audio loop delivers
-    // DeviceChanged on its next iteration.
-    pending_device_changed: Option<Arc<AtomicBool>>,
+    // Present for default-device streams. Written by the notification callbacks, drained by the
+    // audio loop, which is where the DeviceChanged decision is actually made.
+    device_change: Option<Arc<DeviceChangeSignal>>,
 
     // Owned here so the worker thread closes it on exit in a self-join case.
     pending_scheduled_event: Foundation::HANDLE,
@@ -338,14 +391,14 @@ impl Stream {
             handles.push(monitor.event);
         }
 
-        let pending_device_changed = default_device_monitor
+        let device_change = default_device_monitor
             .as_ref()
-            .map(|m| m.pending_device_changed.clone());
+            .map(|monitor| monitor.signal.clone());
         let run_context = RunContext {
             handles,
             stream: stream_inner,
             commands: rx,
-            pending_device_changed,
+            device_change,
             pending_scheduled_event,
         };
 
@@ -408,14 +461,14 @@ impl Stream {
             handles.push(monitor.event);
         }
 
-        let pending_device_changed = default_device_monitor
+        let device_change = default_device_monitor
             .as_ref()
-            .map(|m| m.pending_device_changed.clone());
+            .map(|monitor| monitor.signal.clone());
         let run_context = RunContext {
             handles,
             stream: stream_inner,
             commands: rx,
-            pending_device_changed,
+            device_change,
             pending_scheduled_event,
         };
 
@@ -698,12 +751,10 @@ fn process_commands_and_await_signal(
         }
     };
 
-    if let Some(ref flag) = run_context.pending_device_changed {
-        if flag.swap(false, Ordering::Relaxed) {
-            emit_error(
-                error_callback,
-                Error::with_message(ErrorKind::DeviceChanged, "Default audio device changed"),
-            );
+    // Covers a notification whose SetEvent failed, which the wait below never sees.
+    if let Some(ref signal) = run_context.device_change {
+        if let Some(error) = signal.take_device_change() {
+            emit_error(error_callback, error);
         }
     }
 
@@ -721,10 +772,13 @@ fn process_commands_and_await_signal(
     // Continue(true)  = audio event fired, proceed to process audio this iteration.
     // Continue(false) = command or device-change event, loop around and wait again.
     if handle_idx >= 2 {
-        emit_error(
-            error_callback,
-            Error::with_message(ErrorKind::DeviceChanged, "Default audio device changed"),
-        );
+        // A wakeup without an error means an endpoint elsewhere in the system went
+        // away while this stream's default is still there: nothing to report.
+        if let Some(ref signal) = run_context.device_change {
+            if let Some(error) = signal.take_device_change() {
+                emit_error(error_callback, error);
+            }
+        }
         return ControlFlow::Continue(false);
     }
     ControlFlow::Continue(handle_idx != 0)

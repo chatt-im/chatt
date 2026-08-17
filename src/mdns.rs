@@ -694,6 +694,10 @@ mod tests {
         assert!(rpc::evented::is_interrupted_io_error(&io::Error::from(
             io::ErrorKind::Interrupted
         )));
+        // A raw `EINTR` only reaches this on Unix; the same numeric code means
+        // something unrelated on Windows, where Winsock reports no interruption
+        // for these calls.
+        #[cfg(unix)]
         assert!(rpc::evented::is_interrupted_io_error(
             &io::Error::from_raw_os_error(libc::EINTR)
         ));

@@ -196,6 +196,9 @@ fn classify_semantic(semantic: Option<SemanticKind>) -> Option<HlClass> {
         SemanticKind::MetaVariable => HlClass::MetaVariable,
         SemanticKind::PathComponent => HlClass::Namespace,
         SemanticKind::Lifetime => HlClass::Lifetime,
+        // A constant is a value, so it takes the literal color rather than one
+        // of the binding colors, the same choice tinyhl's own theme makes.
+        SemanticKind::Constant => HlClass::Number,
     };
     Some(class)
 }

@@ -1,8 +1,10 @@
 use std::convert::TryInto;
 use std::ffi::c_void;
 use std::os::raw::{c_float, c_int};
-use std::ptr::{self, NonNull};
-use std::slice;
+use std::ptr::NonNull;
+// Only the linker-symbol path walks raw pointers to find the blob.
+#[cfg(not(rnnoise_weights_in_rust))]
+use std::{ptr, slice};
 
 use crate::{SuppressionParams, FRAME_SIZE};
 
@@ -16,10 +18,18 @@ struct RawRnnModel {
     _private: [u8; 0],
 }
 
+// Embedded by the assembler on targets whose toolchain can `.incbin`; see
+// `model_bytes` for the alternative used on MSVC.
+#[cfg(not(rnnoise_weights_in_rust))]
 unsafe extern "C" {
     static rnnoise_v2_weights: u8;
     static rnnoise_v2_weights_end: u8;
+}
 
+#[cfg(rnnoise_weights_in_rust)]
+include!(concat!(env!("OUT_DIR"), "/rnnoise_v2_weights.rs"));
+
+unsafe extern "C" {
     fn rnnoise_model_from_buffer(ptr: *const c_void, len: c_int) -> *mut RawRnnModel;
     fn rnnoise_model_free(model: *mut RawRnnModel);
     fn rnnoise_create(model: *mut RawRnnModel) -> *mut RawDenoiseState;
@@ -108,6 +118,7 @@ fn create_model() -> NonNull<RawRnnModel> {
     NonNull::new(model).expect("failed to load RNNoise V2 model blob")
 }
 
+#[cfg(not(rnnoise_weights_in_rust))]
 fn model_bytes() -> &'static [u8] {
     unsafe {
         let start = ptr::addr_of!(rnnoise_v2_weights);
@@ -115,6 +126,11 @@ fn model_bytes() -> &'static [u8] {
         let len = end as usize - start as usize;
         slice::from_raw_parts(start, len)
     }
+}
+
+#[cfg(rnnoise_weights_in_rust)]
+fn model_bytes() -> &'static [u8] {
+    &RNNOISE_V2_WEIGHTS.0
 }
 
 #[cfg(test)]

@@ -1,5 +1,9 @@
 # chatt server configuration
 
+# Loopback by default. To reach this server from another machine — the Windows
+# box, say — override at the command line rather than editing this file:
+#   export CHATT_SERVER_ARGS='--network.bind 0.0.0.0:42000 --network.public-addr <lan-ip>:42000'
+#   devsm server --profile public
 [network]
 bind = "127.0.0.1:42000"
 p2p = false

@@ -8,6 +8,9 @@
 mod command;
 mod help;
 mod term;
+/// `chatt video-stream` drives the daemon over the local RPC socket, which is
+/// Unix-only; see the note in `runtime.rs`.
+#[cfg(unix)]
 mod video_stream;
 
 use std::{
@@ -684,7 +687,13 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = matches.value_of("config");
 
     match matches.subcommand() {
+        #[cfg(unix)]
         Some(("daemon", _)) => run_daemon_app(config_path),
+        // Nothing can attach to a headless core where there is no control
+        // socket to attach over, so the daemon would connect to the server,
+        // join rooms and hold the local stores open with no way to reach it.
+        #[cfg(not(unix))]
+        Some(("daemon", _)) => Err("chatt daemon is only supported on Unix".into()),
         Some(("pair", sub)) => {
             let target = sub.value_of("join_string").unwrap_or_default().trim();
             let intent = if target.is_empty() {
@@ -773,12 +782,15 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             println!("{response}");
             Ok(())
         }
+        #[cfg(unix)]
         Some(("video-stream", sub)) => match sub.subcommand() {
             Some(("list", _)) => video_stream::list(),
             Some(("play", play)) => video_stream::play(play.value_of("selector")),
             Some(("pipe", pipe)) => video_stream::pipe(pipe.value_of("selector")),
             _ => Err("usage: chatt video-stream <list | play [SELECTOR] | pipe [SELECTOR]>".into()),
         },
+        #[cfg(not(unix))]
+        Some(("video-stream", _)) => Err("chatt video-stream is only supported on Unix".into()),
         Some(("test-audio-playback", sub)) => {
             let path = PathBuf::from(sub.value_of("path").unwrap_or_default());
             let packet_loss = match sub.value_of("loss") {
@@ -871,6 +883,7 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+#[cfg(unix)]
 fn run_daemon_app(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     match Config::load_for_app(config_path)? {
         AppConfigLoad::Existing(config) => runtime::run_daemon(config),
@@ -888,6 +901,37 @@ fn run_daemon_app(config_path: Option<&str>) -> Result<(), Box<dyn std::error::E
     }
 }
 
+/// The name the client claims for single-instance exclusion.
+///
+/// Scoped by config path rather than by user, because two configs are two
+/// independent sets of local state and may legitimately run side by side,
+/// which is exactly what the dev loop's `alice` and `bob` do. The path is made
+/// absolute first so the same config reached from two working directories is
+/// one instance.
+///
+/// The digest is SHA-256 rather than a `Hash` implementation because the two
+/// processes that must agree on this name are separate program runs, possibly
+/// of binaries built by different Rust versions, and `DefaultHasher`'s output
+/// is explicitly not stable across releases.
+fn client_instance_name(config_path: Option<&str>) -> String {
+    use aws_lc_rs::digest;
+
+    let path = match config_path {
+        Some(path) => PathBuf::from(path),
+        None => crate::paths::client_config_path().unwrap_or_default(),
+    };
+    let path = std::path::absolute(&path).unwrap_or(path);
+    let digest = digest::digest(
+        &digest::SHA256,
+        &chatt_platform::os_str_to_bytes(path.as_os_str()),
+    );
+    let mut name = String::from("chatt-client-");
+    for byte in &digest.as_ref()[..8] {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    name
+}
+
 /// Runs `intent` against the chatt session, whether that means attaching to a
 /// master already running one or becoming that master.
 fn run_interactive_app(
@@ -899,6 +943,16 @@ fn run_interactive_app(
     let pending_join = match &intent {
         Some(intent) => Some(crate::app::PendingJoin::from_intent(intent)?),
         None => None,
+    };
+    // On Unix the control socket below is itself the mutual exclusion: a second
+    // `chatt` attaches instead of starting. Where there is no control socket,
+    // nothing else stops two clients writing the same config, room catalog,
+    // room history and receive store, none of which are locked.
+    let _instance = match chatt_platform::instance::claim(&client_instance_name(config_path))? {
+        chatt_platform::instance::Claim::Held(lock) => lock,
+        chatt_platform::instance::Claim::Taken => {
+            return Err("chatt is already running in this session".into());
+        }
     };
     let mut retaking = false;
     loop {
@@ -1458,6 +1512,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_requires_an_existing_config() {
         let unique = std::time::SystemTime::now()

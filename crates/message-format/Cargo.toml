@@ -12,4 +12,4 @@ syntax-highlighting = ["dep:tinyhl"]
 
 [dependencies]
 chatt-ids = { path = "../ids" }
-tinyhl = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui", optional = true }
+tinyhl = { rev = "32d81254788085d4cb2dc0361a473a637dc5895c", git = "https://github.com/exrok/extui", optional = true }

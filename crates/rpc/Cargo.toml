@@ -14,8 +14,16 @@ toml = ["chatt-ids/toml"]
 chatt-ids = { path = "../ids" }
 chatt-video = { path = "../video" }
 chatt-message-format = { path = "../message-format", default-features = false }
+chatt-platform = { path = "../platform" }
 jsony = "0.1.10"
-libc = "0.2"
 mio = { version = "1.2.1", features = ["os-poll"] }
 aws-lc-rs = { version = "1.18.0", default-features = false, features = ["alloc", "non-fips"] }
 unicode-width = { version = "0.2", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only for SO_PRIORITY, which has no counterpart on other platforms.
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+# WSAENOPROTOOPT, the one refusal the IPv6 QoS test tolerates.
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }

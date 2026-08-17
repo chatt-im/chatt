@@ -8,7 +8,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
 };
@@ -1691,24 +1691,25 @@ impl Persistence {
     ) -> Result<Self, String> {
         let sealed_wal_path = wal_path.with_extension("wal.sealed");
         let lock_path = checkpoint_path.with_extension("lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| format!("failed to open {}: {error}", lock_path.display()))?;
+        let lock = chatt_platform::open_private(
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false),
+            &lock_path,
+        )
+        .map_err(|error| format!("failed to open {}: {error}", lock_path.display()))?;
         lock_store(&lock, &lock_path)?;
         let (_, sealed_records) = replay_wal(&sealed_wal_path, state)?;
         let (valid_bytes, active_records) = replay_wal(&wal_path, state)?;
         let records_since_checkpoint = sealed_records.saturating_add(active_records);
         validate_memory(state)?;
-        let mut wal = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&wal_path)
-            .map_err(|error| format!("failed to open {}: {error}", wal_path.display()))?;
+        let mut wal = chatt_platform::open_private(
+            OpenOptions::new().create(true).append(true).read(true),
+            &wal_path,
+        )
+        .map_err(|error| format!("failed to open {}: {error}", wal_path.display()))?;
         let wal_bytes = if valid_bytes == 0 {
             wal.write_all(WAL_MAGIC)
                 .and_then(|()| wal.write_all(&WAL_VERSION.to_le_bytes()))
@@ -1772,18 +1773,47 @@ impl Persistence {
         Ok(())
     }
 
+    /// Truncates the write-ahead log back to a bare header.
+    ///
+    /// The log is held open in append mode. Windows grants an append handle
+    /// `FILE_APPEND_DATA` but deliberately withholds `FILE_WRITE_DATA`, so
+    /// `set_len` on it fails with "access is denied"; the truncation therefore
+    /// goes through a separate write handle, after which the append handle is
+    /// reopened onto the fresh file. The same path runs on Unix so there is
+    /// only one behaviour to reason about.
+    fn reset_wal(&mut self) -> Result<(), String> {
+        let reset = (|| -> std::io::Result<()> {
+            let mut truncating = chatt_platform::open_private(
+                OpenOptions::new().create(true).write(true).truncate(true),
+                &self.wal_path,
+            )?;
+            truncating.write_all(WAL_MAGIC)?;
+            truncating.write_all(&WAL_VERSION.to_le_bytes())?;
+            truncating.sync_data()?;
+            drop(truncating);
+            // The file is a bare header from here, whatever happens next. The
+            // accounting has to say so before the reopen, which is the step
+            // that can fail: leaving it at its pre-checkpoint values would
+            // misdate every later checkpoint decision for the life of the
+            // process, and appends would still land correctly, so nothing
+            // would surface the discrepancy.
+            self.wal_bytes = WAL_HEADER_BYTES;
+            self.records_since_checkpoint = 0;
+
+            self.wal = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&self.wal_path)?;
+            Ok(())
+        })();
+        reset.map_err(|error| format!("failed to reset {}: {error}", self.wal_path.display()))
+    }
+
     fn checkpoint(&mut self, state: &MemoryState) -> Result<(), String> {
         let bytes = serialize_checkpoint(state);
         write_checkpoint(&self.checkpoint_path, &bytes)?;
-        self.wal
-            .set_len(0)
-            .and_then(|()| self.wal.seek(SeekFrom::Start(0)).map(|_| ()))
-            .and_then(|()| self.wal.write_all(WAL_MAGIC))
-            .and_then(|()| self.wal.write_all(&WAL_VERSION.to_le_bytes()))
-            .and_then(|()| self.wal.sync_data())
-            .map_err(|error| format!("failed to reset {}: {error}", self.wal_path.display()))?;
-        self.wal_bytes = WAL_HEADER_BYTES;
-        self.records_since_checkpoint = 0;
+        self.reset_wal()?;
         self.poisoned = false;
         match fs::remove_file(&self.sealed_wal_path) {
             Ok(()) => sync_parent(&self.sealed_wal_path)?,
@@ -1813,11 +1843,10 @@ impl Persistence {
             )
         })?;
         let replacement = (|| {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .append(true)
-                .read(true)
-                .open(&self.wal_path)?;
+            let mut file = chatt_platform::open_private(
+                OpenOptions::new().create_new(true).append(true).read(true),
+                &self.wal_path,
+            )?;
             file.write_all(WAL_MAGIC)?;
             file.write_all(&WAL_VERSION.to_le_bytes())?;
             file.sync_data()?;
@@ -1946,7 +1975,45 @@ fn lock_store(file: &File, path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(unix))]
+/// Takes an exclusive, non-blocking lock on the store file.
+///
+/// `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` is
+/// the counterpart of `flock(LOCK_EX | LOCK_NB)`: it fails rather than waiting
+/// when another process holds the file, and the lock is dropped when the handle
+/// closes. The whole 64-bit range is locked so it covers the file however it
+/// grows.
+#[cfg(windows)]
+fn lock_store(file: &File, path: &Path) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    // SAFETY: the handle is owned by `file`, and `overlapped` is a valid
+    // zeroed structure for a synchronous, immediate lock request.
+    let locked = unsafe {
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to lock {}; another server may be using this MLS store",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn lock_store(_file: &File, _path: &Path) -> Result<(), String> {
     Ok(())
 }
@@ -2047,12 +2114,13 @@ fn write_checkpoint(path: &Path, bytes: &[u8]) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("failed to remove {}: {error}", tmp.display())),
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp)
-        .map_err(|error| format!("failed to create {}: {error}", tmp.display()))?;
+    // The rename below carries this file's access with it, so creating the
+    // temporary privately is what makes the checkpoint private.
+    let mut file = chatt_platform::open_private(
+        OpenOptions::new().create(true).truncate(true).write(true),
+        &tmp,
+    )
+    .map_err(|error| format!("failed to create {}: {error}", tmp.display()))?;
     file.write_all(bytes)
         .map_err(|error| format!("failed to write {}: {error}", tmp.display()))?;
     file.sync_data()
@@ -2067,8 +2135,7 @@ fn sync_parent(path: &Path) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    chatt_platform::sync_dir(parent)
         .map_err(|error| format!("failed to sync MLS directory {}: {error}", parent.display()))
 }
 

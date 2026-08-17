@@ -7,5 +7,9 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-libc = "0.2"
+chatt-platform = { path = "../platform" }
 rpc.path = "../rpc"
+
+[target.'cfg(unix)'.dependencies]
+# SO_REUSEPORT and SO_BINDTODEVICE, neither of which has a Windows counterpart.
+libc = "0.2"

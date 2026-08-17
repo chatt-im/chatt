@@ -1,5 +1,18 @@
+#[cfg(unix)]
 use std::{os::fd::AsRawFd, sync::Mutex};
 
+/// Runs `f` with the audio backend's own stderr output discarded.
+///
+/// ALSA writes configuration warnings straight to stderr while a device is
+/// opened, which would scribble over the terminal UI. WASAPI reports through
+/// `HRESULT` return values and writes nothing to stderr, so on Windows there is
+/// nothing to suppress and this is a plain call.
+#[cfg(not(unix))]
+pub(crate) fn with_audio_backend_stderr_suppressed<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[cfg(unix)]
 pub(crate) fn with_audio_backend_stderr_suppressed<T>(f: impl FnOnce() -> T) -> T {
     static STDERR_REDIRECT_LOCK: Mutex<()> = Mutex::new(());
     let _guard = STDERR_REDIRECT_LOCK.lock().ok();

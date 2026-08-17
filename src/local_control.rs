@@ -2857,15 +2857,18 @@ mod imp {
 
 #[cfg(all(unix, test))]
 pub(crate) use imp::connect_attach_to_path;
-pub(crate) use imp::{
-    AttachConnectError, connect_attach, is_live_socket_error, read_last_server_hint,
-    write_last_server_hint,
-};
+// Attaching needs a control socket to reach and a hello to send, so these three
+// have no namer where nothing can attach.
+#[cfg(unix)]
+pub use imp::ClientHello;
+#[cfg(unix)]
+pub(crate) use imp::{AttachConnectError, connect_attach};
+
 pub use imp::{
-    ClientHello, ControlSocket, OutputVolumeCommand, ScreencastCommand, VoiceCommand,
-    send_audio_report, send_client_logs, send_config_path, send_message, send_output_volume,
-    send_reload_theme, send_reload_web_css, send_report_bug, send_screencast, send_upload,
-    send_voice,
+    ControlSocket, OutputVolumeCommand, ScreencastCommand, VoiceCommand, send_audio_report,
+    send_client_logs, send_config_path, send_message, send_output_volume, send_reload_theme,
+    send_reload_web_css, send_report_bug, send_screencast, send_upload, send_voice,
 };
 #[cfg(unix)]
 pub(crate) use imp::{RpcPeer, write_attach_ack, write_rpc_ack};
+pub(crate) use imp::{is_live_socket_error, read_last_server_hint, write_last_server_hint};

@@ -7,7 +7,15 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+# Readiness polling and the raw-socket naming the event loop is written against.
+chatt-platform = { path = "../platform" }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
+
+[target.'cfg(windows)'.dependencies]
+# The winsock bits the loop uses directly, beyond what chatt-platform names.
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 ureq = { version = "3.3.0", default-features = false }

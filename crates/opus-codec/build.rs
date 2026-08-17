@@ -12,6 +12,9 @@ struct BuildOptions {
     presume_avx: bool,
     target_arch: String,
     avx_allowed: bool,
+    /// MSVC needs a different C dialect and a different way to spell the SIMD
+    /// levels than the GCC-compatible compilers, so it is decided once here.
+    is_msvc: bool,
 }
 
 impl BuildOptions {
@@ -21,6 +24,7 @@ impl BuildOptions {
         let presume_avx = env::var("CARGO_FEATURE_PRESUME_AVX2").is_ok();
         let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
         let avx_allowed = presume_avx && matches!(target_arch.as_str(), "x86" | "x86_64");
+        let is_msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
 
         Self {
             use_system_lib,
@@ -28,8 +32,47 @@ impl BuildOptions {
             presume_avx,
             target_arch,
             avx_allowed,
+            is_msvc,
         }
     }
+}
+
+/// Flags that raise the SIMD level a translation unit may compile for.
+///
+/// Opus dispatches per SIMD level by compiling the same intrinsics-bearing
+/// sources several times, each at a different level. GCC and Clang take one
+/// `-m<feature>` flag per feature. MSVC has no per-feature switches: on x86-64
+/// SSE through SSE4.1 intrinsics are always available, and `/arch:AVX2` is the
+/// only knob above them. 32-bit MSVC still needs `/arch:SSE2` because its
+/// baseline predates SSE.
+fn simd_flags(level: SimdLevel, opts: &BuildOptions) -> Vec<&'static str> {
+    if opts.is_msvc {
+        return match level {
+            SimdLevel::Sse | SimdLevel::Sse2 => {
+                if opts.target_arch == "x86" {
+                    vec!["/arch:SSE2"]
+                } else {
+                    vec![]
+                }
+            }
+            SimdLevel::Sse41 => vec![],
+            SimdLevel::Avx2 => vec!["/arch:AVX2"],
+        };
+    }
+    match level {
+        SimdLevel::Sse => vec!["-msse"],
+        SimdLevel::Sse2 => vec!["-msse2"],
+        SimdLevel::Sse41 => vec!["-msse4.1"],
+        SimdLevel::Avx2 => AVX2_FLAGS.to_vec(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SimdLevel {
+    Sse,
+    Sse2,
+    Sse41,
+    Avx2,
 }
 
 #[derive(Clone, Copy)]
@@ -96,12 +139,6 @@ fn handle_system_lib(opts: &BuildOptions) {
 }
 
 fn build_bundled_and_link(opts: &BuildOptions) {
-    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        panic!(
-            "opus-codec no longer builds the bundled libopus for MSVC targets; \
-             enable the system-lib feature and provide libopus via pkg-config"
-        );
-    }
     if opts.presume_avx && !opts.avx_allowed {
         println!(
             "cargo:warning=presume-avx2 feature only applies to x86/x86_64 targets; ignoring for {}",
@@ -131,12 +168,21 @@ fn build_bundled_and_link(opts: &BuildOptions) {
         .include("opus/silk/float")
         .include("opus")
         .define("OPUS_BUILD", None)
-        .define("VAR_ARRAYS", None)
         .define("HAVE_LRINTF", None)
         .define("HAVE_LRINT", None)
         .define("ENABLE_HARDENING", None)
         .define("DISABLE_DEBUG_FLOAT", None)
         .flag_if_supported("-fstack-protector-strong");
+
+    // Opus needs one of its stack-allocation strategies chosen at compile time.
+    // `VAR_ARRAYS` uses C99 variable-length arrays, which MSVC does not
+    // implement at any language level; upstream's own Windows builds use
+    // `alloca` instead, so follow them there.
+    if opts.is_msvc {
+        template.define("USE_ALLOCA", None);
+    } else {
+        template.define("VAR_ARRAYS", None);
+    }
 
     if opts.dred_enabled {
         template
@@ -152,9 +198,15 @@ fn build_bundled_and_link(opts: &BuildOptions) {
             .define("OPUS_X86_MAY_HAVE_SSE4_1", None)
             .define("OPUS_X86_MAY_HAVE_AVX2", None);
         if rtcd_needed {
-            template
-                .define("OPUS_HAVE_RTCD", None)
-                .define("CPU_INFO_BY_ASM", None);
+            template.define("OPUS_HAVE_RTCD", None);
+            // Runtime CPU detection reads CPUID. Opus's `CPU_INFO_BY_ASM` path
+            // is GCC inline assembly, which MSVC cannot parse; `CPU_INFO_BY_C`
+            // is the same query written against the `__cpuid` intrinsic.
+            if opts.is_msvc {
+                template.define("CPU_INFO_BY_C", None);
+            } else {
+                template.define("CPU_INFO_BY_ASM", None);
+            }
         }
         if opts.target_arch == "x86_64" {
             template
@@ -177,7 +229,7 @@ fn build_bundled_and_link(opts: &BuildOptions) {
 
     let mut lib = template.clone();
     if opts.avx_allowed {
-        for flag in AVX2_FLAGS {
+        for flag in simd_flags(SimdLevel::Avx2, opts) {
             lib.flag(flag);
         }
     }
@@ -209,22 +261,22 @@ fn build_bundled_and_link(opts: &BuildOptions) {
 
         let mut simd_groups = vec![
             (
-                vec!["-msse"],
+                simd_flags(SimdLevel::Sse, opts),
                 vec![mk_sources("opus/celt_sources.mk", "CELT_SOURCES_SSE")],
             ),
             (
-                vec!["-msse2"],
+                simd_flags(SimdLevel::Sse2, opts),
                 vec![mk_sources("opus/celt_sources.mk", "CELT_SOURCES_SSE2")],
             ),
             (
-                vec!["-msse4.1"],
+                simd_flags(SimdLevel::Sse41, opts),
                 vec![
                     mk_sources("opus/celt_sources.mk", "CELT_SOURCES_SSE4_1"),
                     mk_sources("opus/silk_sources.mk", "SILK_SOURCES_SSE4_1"),
                 ],
             ),
             (
-                AVX2_FLAGS.to_vec(),
+                simd_flags(SimdLevel::Avx2, opts),
                 vec![
                     mk_sources("opus/celt_sources.mk", "CELT_SOURCES_AVX2"),
                     mk_sources("opus/silk_sources.mk", "SILK_SOURCES_AVX2"),

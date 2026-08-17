@@ -1535,9 +1535,13 @@ enum JoinResolution {
 impl App {
     pub(crate) fn new(config: Config, pending_join: Option<PendingJoin>) -> Result<Self, String> {
         let events = AppEvents::new();
-        #[cfg(not(test))]
+        // The control socket is how *other* processes reach this one: a
+        // terminal attaching, a native renderer, or a `chatt send`. Windows runs
+        // the terminal UI in this process only, so there is nothing to publish
+        // and its absence is the normal state rather than a startup failure.
+        #[cfg(all(not(test), unix))]
         let control_socket = Some(local_control::ControlSocket::spawn(events.sender())?);
-        #[cfg(test)]
+        #[cfg(any(test, not(unix)))]
         let control_socket = None;
         let soundboard_enabled = config.soundboard.enabled;
         let room = RoomSession::new(&config);
@@ -6580,7 +6584,7 @@ impl App {
     /// `/audio-reset` and the lobby-bar reset button.
     pub(crate) fn audio_manual_reset(&mut self) {
         let now = Instant::now();
-        self.audio_events.push(
+        self.note_audio_event(
             now,
             AudioDeviceEventKind::ManualReset,
             "user requested audio reset",
@@ -6688,7 +6692,7 @@ impl App {
             && let (Some(old), Some(new)) = (&previous.default_input, &probe.default_input)
             && old.stable_id != new.stable_id
         {
-            self.audio_events.push(
+            self.note_audio_event(
                 now,
                 AudioDeviceEventKind::DefaultInputChanged,
                 format!("{} → {}", old.name, new.name),
@@ -6710,7 +6714,7 @@ impl App {
             && let (Some(old), Some(new)) = (&previous.default_output, &probe.default_output)
             && old.stable_id != new.stable_id
         {
-            self.audio_events.push(
+            self.note_audio_event(
                 now,
                 AudioDeviceEventKind::DefaultOutputChanged,
                 format!("{} → {}", old.name, new.name),
@@ -6739,11 +6743,8 @@ impl App {
                 && !probe.inputs_contain(&info.stable_id)
             {
                 let message = format!("device `{}` no longer present", info.device_name);
-                self.audio_events.push(
-                    now,
-                    AudioDeviceEventKind::DeviceLost,
-                    format!("mic: {}", info.device_name),
-                );
+                let detail = format!("mic: {}", info.device_name);
+                self.note_audio_event(now, AudioDeviceEventKind::DeviceLost, detail);
                 self.supervisor
                     .capture
                     .on_error(now, AudioErrorKind::DeviceGone, message);
@@ -6758,11 +6759,8 @@ impl App {
                 && !probe.outputs_contain(&info.stable_id)
             {
                 let message = format!("device `{}` no longer present", info.device_name);
-                self.audio_events.push(
-                    now,
-                    AudioDeviceEventKind::DeviceLost,
-                    format!("spk: {}", info.device_name),
-                );
+                let detail = format!("spk: {}", info.device_name);
+                self.note_audio_event(now, AudioDeviceEventKind::DeviceLost, detail);
                 self.supervisor
                     .playback
                     .on_error(now, AudioErrorKind::DeviceGone, message);
@@ -6778,7 +6776,7 @@ impl App {
             None => probe.default_input.is_some(),
         };
         if capture_target_present && self.supervisor.capture.on_target_device_seen(now) {
-            self.audio_events.push(
+            self.note_audio_event(
                 now,
                 AudioDeviceEventKind::DeviceReturned,
                 "mic device available again",
@@ -6789,7 +6787,7 @@ impl App {
             None => probe.default_output.is_some(),
         };
         if playback_target_present && self.supervisor.playback.on_target_device_seen(now) {
-            self.audio_events.push(
+            self.note_audio_event(
                 now,
                 AudioDeviceEventKind::DeviceReturned,
                 "speaker device available again",
@@ -6957,9 +6955,34 @@ impl App {
         dirty
     }
 
+    /// Records an audio device event for the `/audio` timeline and mirrors it to
+    /// the log. The device state machine is otherwise invisible there: only its
+    /// consequences (a rebuild, a failed start) get logged, never the transition
+    /// that caused them.
+    fn note_audio_event(
+        &mut self,
+        now: Instant,
+        kind: AudioDeviceEventKind,
+        detail: impl Into<String>,
+    ) {
+        let detail = detail.into();
+        match kind {
+            AudioDeviceEventKind::StreamError | AudioDeviceEventKind::DeviceLost => kvlog::warn!(
+                "audio device event",
+                kind = kind.label(),
+                detail = detail.as_str()
+            ),
+            _ => kvlog::info!(
+                "audio device event",
+                kind = kind.label(),
+                detail = detail.as_str()
+            ),
+        }
+        self.audio_events.push(now, kind, detail);
+    }
+
     fn note_capture_failure(&mut self, now: Instant, kind: AudioErrorKind, message: String) {
-        kvlog::warn!("capture stream failure", reason = message.as_str());
-        self.audio_events.push(
+        self.note_audio_event(
             now,
             AudioDeviceEventKind::StreamError,
             format!("mic: {message}"),
@@ -6969,8 +6992,7 @@ impl App {
     }
 
     fn note_playback_failure(&mut self, now: Instant, kind: AudioErrorKind, message: String) {
-        kvlog::warn!("playback stream failure", reason = message.as_str());
-        self.audio_events.push(
+        self.note_audio_event(
             now,
             AudioDeviceEventKind::StreamError,
             format!("spk: {message}"),
@@ -7084,7 +7106,7 @@ impl App {
 
     fn recover_capture_stream(&mut self, now: Instant, cause: RebuildCause) {
         kvlog::warn!("recovering capture stream", cause = cause.label());
-        self.audio_events.push(
+        self.note_audio_event(
             now,
             AudioDeviceEventKind::RebuildStarted,
             format!("mic rebuild ({})", cause.label()),
@@ -7095,7 +7117,7 @@ impl App {
                 self.supervisor.capture_watch = CaptureWatch::default();
                 self.mic_error = None;
                 if restarted {
-                    self.audio_events.push(
+                    self.note_audio_event(
                         now,
                         AudioDeviceEventKind::Recovered,
                         "microphone recovered",
@@ -7111,7 +7133,7 @@ impl App {
                     error = error.message.as_str()
                 );
                 self.mic_error = Some(error.message.clone());
-                self.audio_events.push(
+                self.note_audio_event(
                     now,
                     AudioDeviceEventKind::StreamError,
                     format!("mic rebuild failed: {}", error.message),
@@ -7131,7 +7153,7 @@ impl App {
 
     fn recover_playback_stream(&mut self, now: Instant, cause: RebuildCause) {
         kvlog::warn!("recovering playback stream", cause = cause.label());
-        self.audio_events.push(
+        self.note_audio_event(
             now,
             AudioDeviceEventKind::RebuildStarted,
             format!("spk rebuild ({})", cause.label()),
@@ -8856,7 +8878,7 @@ impl App {
                 ) {
                     Ok(capture) => {
                         self.supervisor.capture.set_wants_configured_device(true);
-                        self.audio_events.push(
+                        self.note_audio_event(
                             Instant::now(),
                             AudioDeviceEventKind::FallbackToDefault,
                             format!("mic: {error}"),
@@ -9014,7 +9036,7 @@ impl App {
                 {
                     Ok(playback) => {
                         self.supervisor.playback.set_wants_configured_device(true);
-                        self.audio_events.push(
+                        self.note_audio_event(
                             Instant::now(),
                             AudioDeviceEventKind::FallbackToDefault,
                             format!("spk: {error}"),
@@ -9075,7 +9097,7 @@ impl App {
                 self.playback_error = Some(error.message.clone());
                 self.set_error(format!("voice playback unavailable: {error}"));
                 let now = Instant::now();
-                self.audio_events.push(
+                self.note_audio_event(
                     now,
                     AudioDeviceEventKind::StreamError,
                     format!("spk start failed: {}", error.message),

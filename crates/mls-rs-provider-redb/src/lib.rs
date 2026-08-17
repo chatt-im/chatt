@@ -11,11 +11,7 @@
 //! encrypted storage or authenticated record encryption with externally managed
 //! keys in production.
 
-use std::{
-    fs::{self, OpenOptions},
-    path::Path,
-    sync::Arc,
-};
+use std::{fs::OpenOptions, path::Path, sync::Arc};
 
 use redb::{CompactionError, Database, MultimapTableDefinition, ReadableTable, TableDefinition};
 use thiserror::Error;
@@ -214,15 +210,16 @@ impl RedbDataStorageEngine {
     }
 }
 
+/// Creates the database file before `redb` opens it, so it exists with
+/// owner-only access rather than whatever its directory grants.
+///
+/// This file holds MLS secrets, and the directory holding it is chosen by the
+/// user, so the access has to be stated rather than inherited on both
+/// platforms.
 fn ensure_private_file(path: &Path) -> Result<(), RedbDataStorageError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(path).map_err(|error| {
+    let file = chatt_platform::open_private(&mut options, path).map_err(|error| {
         RedbDataStorageError::DatabaseFile(format!(
             "failed to create or open {}: {error}",
             path.display()
@@ -230,27 +227,11 @@ fn ensure_private_file(path: &Path) -> Result<(), RedbDataStorageError> {
     })?;
     drop(file);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let metadata = fs::metadata(path).map_err(|error| {
-            RedbDataStorageError::DatabaseFile(format!(
-                "failed to inspect {}: {error}",
-                path.display()
-            ))
-        })?;
-        let mode = metadata.mode() & 0o777;
-        if mode != 0o600 {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-                RedbDataStorageError::DatabaseFile(format!(
-                    "failed to secure {}: {error}",
-                    path.display()
-                ))
-            })?;
-        }
-    }
-    Ok(())
+    // Creation-time access does not apply to a file that already existed, and
+    // this one outlives many runs.
+    chatt_platform::security::restrict_to_owner(path).map_err(|error| {
+        RedbDataStorageError::DatabaseFile(format!("failed to secure {}: {error}", path.display()))
+    })
 }
 
 #[cfg(test)]
@@ -269,5 +250,39 @@ mod tests {
         RedbDataStorageEngine::compact_file(&path).unwrap();
         let reopened = RedbDataStorageEngine::open(&path).unwrap();
         assert!(reopened.storage_stats().is_ok());
+    }
+
+    #[test]
+    fn the_database_file_is_owner_only_on_create_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mls.redb");
+        let engine = RedbDataStorageEngine::open(&path).unwrap();
+        assert!(chatt_platform::is_owner_only(&path).unwrap());
+        drop(engine);
+
+        grant_everyone(&path);
+        let reopened = RedbDataStorageEngine::open(&path).unwrap();
+        assert!(
+            chatt_platform::is_owner_only(&path).unwrap(),
+            "reopening must reassert owner-only access, not assume it"
+        );
+        drop(reopened);
+    }
+
+    /// Grants every local user access, so the reopen has something to undo.
+    #[cfg(unix)]
+    fn grant_everyone(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn grant_everyone(path: &Path) {
+        let path = path.display().to_string();
+        let status = std::process::Command::new("icacls")
+            .args([path.as_str(), "/grant", "*S-1-1-0:(F)"])
+            .status()
+            .expect("run icacls");
+        assert!(status.success(), "icacls must grant Everyone access");
     }
 }

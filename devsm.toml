@@ -3,9 +3,12 @@ profiles = ["private", "pop", "public", "plaintext"]
 require = [
   { if.profile = "public", then = { resource = "public-server-data" }, or_else = { if.profile = "plaintext", then = { resource = "plaintext-server-data" }, or_else = { resource = "private-server-data" } } },
 ]
+# CHATT_SERVER_ARGS is deliberately not declared under env. below: it comes from
+# the developer's own shell, so machine-specific overrides (a LAN bind address
+# for reaching this server from the Windows box) stay out of the repo.
 sh = '''
 rm -f /tmp/chatt-server.kvlog
-cargo run $CARGO_FLAGS -p server -- --logfile /tmp/chatt-server.kvlog serve $CHATT_SERVER_CONFIG
+cargo run $CARGO_FLAGS -p server -- --logfile /tmp/chatt-server.kvlog serve $CHATT_SERVER_CONFIG ${CHATT_SERVER_ARGS:-}
 '''
 env.RUST_BACKTRACE = "1"
 env.CHATT_RUN_DIR = { if.profile = "public", then = "/tmp/public-dev-chatt-server/", or_else = { if.profile = "plaintext", then = "/tmp/plaintext-dev-chatt-server/", or_else = "/tmp/private-dev-chatt-server/" } }
@@ -181,6 +184,13 @@ info = "Reset all generated server and client development data"
 cmd = ["cargo", "nextest", "run", "--workspace", { var = "args" }]
 cli.forward_arguments = true
 env.CARGO_TERM_COLOR = "never"
+
+[action.win]
+cmd = ["scripts/win", { var = "args" }]
+cli.forward_arguments = true
+managed = false
+allow_multiple = true
+info = "Drive the Windows dev machine; subcommands and flags pass through to scripts/win"
 
 [action.test-mls-scenarios]
 cmd = ["cargo", "+nightly", "nextest", "run", "-p", "chatt", "--features", "nightly-test-spans", "--run-ignored", "ignored-only", "mls_live_stateful_scenario_campaign"]

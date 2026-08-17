@@ -1,4 +1,13 @@
 #![cfg_attr(all(test, feature = "nightly-test-spans"), feature(thread_spawn_hook))]
+// Windows compiles out the daemon/attach half (see `runtime.rs`), and that
+// leaves the whole local-RPC projection surface without a caller: the settings,
+// identity and appearance hubs, and the `App` methods that feed them. None of
+// it is dead in the ordinary sense, and none of it sits behind a single
+// boundary that could be gated instead: the projections are fields and methods
+// of the renderer-independent core, deliberately carrying no `cfg` so the core
+// reads the same on both platforms. Linux builds every one of them and is
+// warning-free, so code that is genuinely unreachable still gets caught.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 mod app;
 mod attach;

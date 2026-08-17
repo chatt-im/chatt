@@ -1,11 +1,11 @@
 //! Best-effort socket quality-of-service settings for real-time voice media.
 
-use std::{error::Error, fmt, io, net::SocketAddr, os::fd::RawFd};
+use std::{error::Error, fmt, io, net::SocketAddr};
+
+use chatt_platform::{RawSock, apply_dscp};
 
 /// Expedited Forwarding DSCP, recommended for low-delay voice bearer traffic.
 pub const VOICE_DSCP: u8 = 46;
-
-const VOICE_TRAFFIC_CLASS: libc::c_int = (VOICE_DSCP as libc::c_int) << 2;
 
 #[derive(Debug)]
 pub enum VoiceQosError {
@@ -48,16 +48,18 @@ impl Error for VoiceQosError {
 /// Every applicable setting is attempted even if an earlier one fails. The
 /// caller decides whether the combined failure is fatal; media sockets use
 /// this as a best-effort hint and continue after logging it.
-pub fn apply_voice_qos(fd: RawFd, local_addr: SocketAddr) -> Result<(), VoiceQosError> {
-    let (level, option) = if local_addr.is_ipv4() {
-        (libc::IPPROTO_IP, libc::IP_TOS)
-    } else {
-        (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
-    };
-    let traffic_class = set_int_option(fd, level, option, VOICE_TRAFFIC_CLASS);
+pub fn apply_voice_qos(socket: RawSock, local_addr: SocketAddr) -> Result<(), VoiceQosError> {
+    let traffic_class = apply_dscp(socket, local_addr, VOICE_DSCP);
 
+    // `SO_PRIORITY` sets the kernel's local queueing priority and exists only
+    // on Linux; elsewhere the DSCP marking is the whole story.
     #[cfg(target_os = "linux")]
-    let socket_priority = set_int_option(fd, libc::SOL_SOCKET, libc::SO_PRIORITY, 6);
+    let socket_priority = chatt_platform::sock::setsockopt_int(
+        socket,
+        chatt_platform::SockLevel::Socket,
+        libc::SO_PRIORITY,
+        6,
+    );
     #[cfg(not(target_os = "linux"))]
     let socket_priority = Ok(());
 
@@ -74,45 +76,44 @@ pub fn apply_voice_qos(fd: RawFd, local_addr: SocketAddr) -> Result<(), VoiceQos
     }
 }
 
-fn set_int_option(
-    fd: RawFd,
-    level: libc::c_int,
-    option: libc::c_int,
-    value: libc::c_int,
-) -> io::Result<()> {
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            option,
-            &value as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&value) as libc::socklen_t,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::UdpSocket, os::fd::AsRawFd};
+    use chatt_platform::{AsRawSock, getsockopt_int, sock::dscp_option};
+    use std::net::UdpSocket;
+
+    /// [`VOICE_DSCP`] as it appears in the traffic-class byte, which is what
+    /// reads back from the socket. Only the platforms that read it back
+    /// compare against it; see the note in the assertions below.
+    #[cfg(not(windows))]
+    const VOICE_TRAFFIC_CLASS: i32 = (VOICE_DSCP as i32) << 2;
 
     #[test]
     fn applies_voice_qos_to_ipv4_socket() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        apply_voice_qos(socket.as_raw_fd(), socket.local_addr().unwrap()).unwrap();
+        let local = socket.local_addr().unwrap();
+        apply_voice_qos(socket.as_raw_sock(), local).unwrap();
 
+        let (level, option) = dscp_option(local);
+        // Windows accepts IP_TOS and then ignores it unless the machine opts
+        // back in through policy, so the value read back is not required to
+        // match there; the call succeeding is all this can assert.
+        #[cfg(not(windows))]
         assert_eq!(
-            get_int_option(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS).unwrap() & !0b11,
+            getsockopt_int(socket.as_raw_sock(), level, option).unwrap() & !0b11,
             VOICE_TRAFFIC_CLASS
         );
+        #[cfg(windows)]
+        let _ = getsockopt_int(socket.as_raw_sock(), level, option);
+
         #[cfg(target_os = "linux")]
         assert_eq!(
-            get_int_option(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PRIORITY).unwrap(),
+            getsockopt_int(
+                socket.as_raw_sock(),
+                chatt_platform::SockLevel::Socket,
+                libc::SO_PRIORITY
+            )
+            .unwrap(),
             6
         );
     }
@@ -122,36 +123,45 @@ mod tests {
         let Ok(socket) = UdpSocket::bind("[::1]:0") else {
             return;
         };
-        apply_voice_qos(socket.as_raw_fd(), socket.local_addr().unwrap()).unwrap();
+        let local = socket.local_addr().unwrap();
+        let applied = apply_voice_qos(socket.as_raw_sock(), local);
+        #[cfg(not(windows))]
+        applied.unwrap();
 
+        // Unlike IP_TOS, which Windows accepts and then ignores, IPV6_TCLASS
+        // has no setsockopt route there at all: marking v6 traffic goes
+        // through the qWAVE QoS2 API, so the call comes back WSAENOPROTOOPT.
+        // Voice QoS is best-effort and the media sockets log and carry on, so
+        // that specific refusal is the expected outcome -- but only that one.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Networking::WinSock::WSAENOPROTOOPT;
+            match &applied {
+                Ok(()) => {}
+                Err(VoiceQosError::TrafficClass(error))
+                    if error.raw_os_error() == Some(WSAENOPROTOOPT) => {}
+                Err(error) => panic!("unexpected IPv6 voice QoS failure: {error}"),
+            }
+        }
+
+        let (level, option) = dscp_option(local);
+        #[cfg(not(windows))]
         assert_eq!(
-            get_int_option(socket.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_TCLASS,).unwrap()
-                & !0b11,
+            getsockopt_int(socket.as_raw_sock(), level, option).unwrap() & !0b11,
             VOICE_TRAFFIC_CLASS
         );
+        #[cfg(windows)]
+        let _ = getsockopt_int(socket.as_raw_sock(), level, option);
+
         #[cfg(target_os = "linux")]
         assert_eq!(
-            get_int_option(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PRIORITY).unwrap(),
+            getsockopt_int(
+                socket.as_raw_sock(),
+                chatt_platform::SockLevel::Socket,
+                libc::SO_PRIORITY
+            )
+            .unwrap(),
             6
         );
-    }
-
-    fn get_int_option(fd: RawFd, level: libc::c_int, option: libc::c_int) -> io::Result<i32> {
-        let mut value = 0;
-        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
-        let result = unsafe {
-            libc::getsockopt(
-                fd,
-                level,
-                option,
-                &mut value as *mut _ as *mut libc::c_void,
-                &mut len,
-            )
-        };
-        if result == 0 {
-            Ok(value)
-        } else {
-            Err(io::Error::last_os_error())
-        }
     }
 }

@@ -1,3 +1,8 @@
+// Only `LENGTH_PREFIX_LEN` is reachable without the Unix transport, but the
+// rest cannot be gated per item: the `frame` tests exercise them on every
+// platform, so a `cfg(unix)` here would break the Windows test build.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 pub const MAX_FRAME_LEN: usize = crate::MAX_FRAME_BYTES;
 pub const LENGTH_PREFIX_LEN: usize = 4;
 

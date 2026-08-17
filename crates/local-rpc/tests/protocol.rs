@@ -1,3 +1,8 @@
+// The local RPC transport is Unix-domain sockets and descriptor passing, and
+// this test drives `local_rpc::unix` directly. Windows compiles the whole
+// daemon-to-renderer half out, so there is nothing here to exercise there.
+#![cfg(unix)]
+
 use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
 
 use local_rpc::{

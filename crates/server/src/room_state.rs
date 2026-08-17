@@ -7,7 +7,7 @@
 
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs::OpenOptions,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
@@ -54,33 +54,18 @@ pub(super) fn open(path: &Path) -> Result<(LoadedState, StateWriter), String> {
     Ok((state, StateWriter::spawn(database, path.to_path_buf())?))
 }
 
+/// Creates the state database file before `redb` opens it, so it exists with
+/// owner-only access rather than whatever its directory grants. An existing
+/// file has that access reasserted rather than assumed.
 fn ensure_private_file(path: &Path) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(path)
+    chatt_platform::open_private(&mut options, path)
         .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
-    drop(file);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let metadata = fs::metadata(path)
-            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
-        let mode = metadata.mode() & 0o777;
-        let private_mode = mode & 0o700;
-        if mode != private_mode {
-            fs::set_permissions(path, fs::Permissions::from_mode(private_mode))
-                .map_err(|error| format!("failed to secure {}: {error}", path.display()))?;
-        }
-    }
-    Ok(())
+    // The creation-time restriction does not apply to a file that already
+    // existed, and this one outlives many runs.
+    chatt_platform::security::restrict_to_owner(path)
+        .map_err(|error| format!("failed to secure {}: {error}", path.display()))
 }
 
 fn initialize_schema(database: &Database) -> Result<(), String> {
@@ -714,26 +699,37 @@ mod tests {
         assert_eq!(state.dm_rooms[0], room);
     }
 
-    #[cfg(unix)]
     #[test]
     fn database_file_is_owner_only_on_create_and_reopen() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
         let (_, writer) = open(&path).unwrap();
         drop(writer);
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert!(chatt_platform::is_owner_only(&path).unwrap());
 
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        loosen_access(&path);
         let (_, writer) = open(&path).unwrap();
         drop(writer);
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
+        assert!(
+            chatt_platform::is_owner_only(&path).unwrap(),
+            "reopening must reassert owner-only access, not assume it"
         );
+    }
+
+    /// Grants every local user access, so the reopen has something to undo.
+    #[cfg(unix)]
+    fn loosen_access(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn loosen_access(path: &Path) {
+        let path = path.display().to_string();
+        let status = std::process::Command::new("icacls")
+            .args([path.as_str(), "/grant", "*S-1-1-0:(F)"])
+            .status()
+            .expect("run icacls");
+        assert!(status.success(), "icacls must grant Everyone access");
     }
 }

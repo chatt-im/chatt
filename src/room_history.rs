@@ -9,8 +9,6 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -437,14 +435,12 @@ fn open_append(path: &Path) -> Option<RoomHistoryStore> {
     })
 }
 
-/// Opens (creating it private) a room file for append. Files are mode `0600` so
-/// chat contents are not exposed to other local users.
+/// Opens (creating it private) a room file for append, so chat contents are not
+/// exposed to other local users.
 fn open_append_file(path: &Path) -> Option<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    match options.open(path) {
+    match chatt_platform::open_private(&mut options, path) {
         Ok(file) => Some(file),
         Err(error) => {
             kvlog::warn!(
@@ -457,15 +453,11 @@ fn open_append_file(path: &Path) -> Option<File> {
     }
 }
 
-/// Creates `dir` and any missing parents with mode `0700` so the history tree is
-/// readable only by its owner. Required for user-configured locations under
-/// world-writable roots like `/tmp`.
+/// Creates `dir` and any missing parents readable only by their owner, so the
+/// history tree stays private. Required for user-configured locations under
+/// world-readable roots like `/tmp` or a Windows data drive.
 pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    builder.mode(0o700);
-    builder.create(dir)
+    chatt_platform::create_private_dir(dir)
 }
 
 /// The single rotation backup beside `path`, named by appending `.1`.
@@ -1042,9 +1034,7 @@ fn create_unique_sibling(path: &Path, kind: &str) -> Option<(PathBuf, File)> {
         let candidate = parent.join(format!("{stem}.{kind}-{timestamp}-{counter}.kvlog"));
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        match options.open(&candidate) {
+        match chatt_platform::open_private(&mut options, &candidate) {
             Ok(file) => return Some((candidate, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {

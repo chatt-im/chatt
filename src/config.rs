@@ -2356,13 +2356,7 @@ fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), String> {
     let write_temp = || -> Result<(), String> {
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temp_path)
+        let mut file = chatt_platform::open_private(&mut options, &temp_path)
             .map_err(|err| format!("failed to create {}: {err}", temp_path.display()))?;
         file.write_all(contents)
             .map_err(|err| format!("failed to write {}: {err}", temp_path.display()))?;
@@ -2385,15 +2379,11 @@ fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), String> {
         let _ = fs::remove_file(&temp_path);
         format!("failed to replace {}: {err}", path.display())
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|err| format!("failed to secure {}: {err}", path.display()))?;
-    }
-    #[cfg(unix)]
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    // The temp file was created private, but the rename lands on a path that
+    // may already have existed with looser access; restate the guarantee.
+    chatt_platform::security::restrict_to_owner(path)
+        .map_err(|err| format!("failed to secure {}: {err}", path.display()))?;
+    chatt_platform::sync_dir(parent)
         .map_err(|err| format!("failed to sync {}: {err}", parent.display()))?;
     Ok(())
 }

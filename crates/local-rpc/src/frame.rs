@@ -746,6 +746,8 @@ fn encode_bulk_wire_into(chunk: &BulkChunk, output: &mut Vec<u8>) -> Result<(), 
     Ok(())
 }
 
+/// Only the Unix transport sends bulk chunks, so only it builds their headers.
+#[cfg(unix)]
 pub(crate) fn bulk_framed_header(
     transfer_id: BulkTransferId,
     bytes_len: usize,

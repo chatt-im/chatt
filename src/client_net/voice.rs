@@ -13,6 +13,7 @@ use chatt_p2p::{
     ReflexiveObservation, StunAuth, TraversalAgent, interfaces::InterfaceSnapshot,
     stun::StunMessage,
 };
+use chatt_platform::AsRawSock;
 use hashbrown::{HashMap, HashSet};
 use mio::{
     Events, Interest, Poll, Registry, Token, Waker,
@@ -31,7 +32,6 @@ use std::{
     collections::VecDeque,
     io,
     net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket},
-    os::fd::AsRawFd,
     panic::{self, AssertUnwindSafe},
     sync::{
         Arc, Mutex,
@@ -611,7 +611,7 @@ fn stream_owner_matches(
 pub(super) fn bind_voice_udp_socket(addr: SocketAddr) -> io::Result<StdUdpSocket> {
     let socket =
         chatt_p2p::socket::bind_udp_socket(addr, chatt_p2p::socket::UdpSocketOptions::default())?;
-    if let Err(error) = rpc::qos::apply_voice_qos(socket.as_raw_fd(), addr) {
+    if let Err(error) = rpc::qos::apply_voice_qos(socket.as_raw_sock(), addr) {
         kvlog::warn!(
             "voice udp qos unavailable",
             addr = %addr,
@@ -3156,6 +3156,10 @@ impl VoiceSession {
 
     /// Drains a bounded receive burst. `true` retains local work so an
     /// edge-triggered readable socket cannot strand datagrams after the budget.
+    ///
+    /// The loop only ever leaves on `WouldBlock` or with work retained, which
+    /// is what re-arms `mio`'s simulated edge triggering on Windows; see
+    /// [`super::super::client_net`].
     fn read_udp(&mut self) -> bool {
         let Some(udp) = self.udp.as_ref() else {
             return false;
@@ -3163,24 +3167,28 @@ impl VoiceSession {
         let server_addr = udp.server_addr;
         let mut buf = [0u8; 2048];
         let mut datagrams_this_wake = 0usize;
-        loop {
+        let mut skipped = 0usize;
+        let mut last_error = None;
+        let retain = loop {
             let Some(udp) = self.udp.as_ref() else {
-                return false;
+                break false;
             };
+            if datagrams_this_wake + skipped >= UDP_DRAIN_BUDGET {
+                break true;
+            }
             let (len, src) = match recv_udp_datagram(&udp.socket, &mut buf) {
                 Ok(Some(value)) => value,
-                Ok(None) => {
-                    if datagrams_this_wake > 1 {
-                        kvlog::info!("udp read coalesced", datagrams = datagrams_this_wake);
-                    }
-                    return false;
-                }
+                Ok(None) => break false,
                 Err(error) => {
-                    kvlog::warn!("udp receive failed", error = %error);
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::Error(format!("UDP receive failed: {error}")));
-                    return false;
+                    // A receive error describes a datagram, not the socket: an
+                    // ICMP port-unreachable drawn by an earlier P2P probe, or a
+                    // datagram too large for `buf`, is reported by the receive
+                    // that follows it. Skipping keeps the drain going, and the
+                    // budget bounds it. Not surfaced to the user, because a
+                    // probe to a closed port is routine, not a fault.
+                    skipped += 1;
+                    last_error = Some(error);
+                    continue;
                 }
             };
             datagrams_this_wake += 1;
@@ -3214,10 +3222,16 @@ impl VoiceSession {
                     }
                 }
             }
-            if datagrams_this_wake >= UDP_DRAIN_BUDGET {
-                return true;
-            }
+        };
+        if datagrams_this_wake > 1 {
+            kvlog::info!("udp read coalesced", datagrams = datagrams_this_wake);
         }
+        // Summarised once per burst: a socket erroring on every receive would
+        // otherwise log at the drain budget's rate.
+        if let Some(error) = last_error {
+            kvlog::warn!("udp datagrams skipped", skipped, error = %error);
+        }
+        retain
     }
 
     /// Dispatches an authenticated server media payload, shared by the UDP
@@ -3755,7 +3769,7 @@ impl VoiceSession {
             kvlog::warn!("voice tcp lane nodelay failed", error = %error);
         }
         if let Ok(local_addr) = lane.stream.local_addr()
-            && let Err(_error) = rpc::qos::apply_voice_qos(lane.stream.as_raw_fd(), local_addr)
+            && let Err(_error) = rpc::qos::apply_voice_qos(lane.stream.as_raw_sock(), local_addr)
         {
             kvlog::debug!("voice tcp lane qos unavailable", error = %_error);
         }

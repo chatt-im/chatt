@@ -1,25 +1,41 @@
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io,
-    os::fd::{AsRawFd, IntoRawFd, OwnedFd},
-    os::unix::net::UnixStream,
     panic::{self, AssertUnwindSafe},
     sync::{Arc, Once},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use extui::event::polling::{self, GlobalWakerConfig};
-use local_rpc::{
-    frame::{DaemonFrame, NegotiatedLimits, StateDelta, StateEvent, Welcome},
-    model::DaemonInstanceId,
+// Serving other processes, meaning terminal clients that attach and native
+// renderers speaking the local RPC protocol, rides on Unix-domain sockets and
+// descriptor passing. Windows runs the terminal UI in this process only, so the whole
+// remote-serving half is compiled out there and the maps it feeds stay empty.
+// `AppEvent`'s corresponding variants are gated the same way.
+#[cfg(unix)]
+use std::os::{
+    fd::{AsRawFd, IntoRawFd, OwnedFd},
+    unix::net::UnixStream,
 };
+
+use extui::event::polling::{self, GlobalWakerConfig};
+use local_rpc::model::DaemonInstanceId;
+
+// Everything below serves attached clients and RPC renderers, so it is used
+// only where that half is compiled in.
+#[cfg(unix)]
+use std::collections::HashSet;
+
+#[cfg(unix)]
+use local_rpc::frame::{DaemonFrame, NegotiatedLimits, StateDelta, StateEvent, Welcome};
+#[cfg(unix)]
 use parking_lot::Mutex;
 
+#[cfg(unix)]
+use crate::attach;
 use crate::{
     app::{App, AppEvent, EventSender, PendingJoin, command::CoreCommand},
-    attach,
     client_channel::{ClientChannel, ClientId, DirtySections},
     client_net::NetworkEvent,
     config::Config,
@@ -34,6 +50,125 @@ const CORE_BATCH_BUDGET: usize = 256;
 const RPC_CONTROL_BURST: usize = 8;
 static PANIC_HOOK: Once = Once::new();
 
+/// Windows stand-ins for the remote-serving half of the runtime.
+///
+/// Nothing can attach on Windows: no control socket is published, so the client
+/// and RPC-client maps the shared event loop carries are always empty. Making
+/// their value types uninhabited says exactly that to the compiler: the maps
+/// provably hold nothing, and every operation over them is a no-op the
+/// optimiser can see through.
+///
+/// The point of the stand-ins is that the loop body itself carries no `cfg`, so
+/// each of these has a `cfg(unix)` twin with the same signature. Adding an
+/// operation on either map means adding it here too; that is the cost of the
+/// arrangement and it is cheaper than the alternative, which is `cfg` on every
+/// function signature that threads the maps through.
+///
+/// The `AppEvent` match arms that stay gated are a different thing: those
+/// variants are themselves `cfg(unix)` on `AppEvent`, so on Windows there is no
+/// pattern to write. They are not stand-in candidates.
+#[cfg(not(unix))]
+mod no_remote {
+    use super::*;
+
+    /// A terminal client attached over the local control socket.
+    pub(super) enum RemoteClient {}
+    /// A native renderer speaking the local RPC protocol.
+    pub(super) enum RemoteRpcClient {}
+
+    pub(super) fn broadcast_rpc_snapshots(
+        _app: &mut App,
+        _clients: &mut HashMap<ClientId, RemoteRpcClient>,
+        _instance_id: DaemonInstanceId,
+    ) {
+    }
+
+    pub(super) fn broadcast_rpc_voice_roster(
+        _app: &mut App,
+        _clients: &mut HashMap<ClientId, RemoteRpcClient>,
+        _instance_id: DaemonInstanceId,
+    ) {
+    }
+
+    pub(super) fn broadcast_rpc_settings_events(
+        _app: &App,
+        _clients: &mut HashMap<ClientId, RemoteRpcClient>,
+        _now: Instant,
+    ) {
+    }
+
+    pub(super) fn broadcast_rpc_appearance_events(
+        _app: &App,
+        _clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    ) {
+    }
+
+    pub(super) fn broadcast_rpc_identity_events(
+        _app: &mut App,
+        _clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    ) {
+    }
+
+    /// No renderer can be staging an upload when no renderer can connect.
+    pub(super) fn rpc_upload_staging_active(_clients: &HashMap<ClientId, RemoteRpcClient>) -> bool {
+        false
+    }
+
+    pub(super) fn shutdown_rpc(client: &mut RemoteRpcClient) {
+        // Uninhabited: the compiler discharges this arm-less match.
+        match *client {}
+    }
+
+    pub(super) fn shutdown_remote(client: RemoteClient, _shutdown: RemoteShutdown) {
+        match client {}
+    }
+
+    pub(super) fn wake_remote(client: &RemoteClient, _dirty: DirtySections) {
+        match *client {}
+    }
+
+    pub(super) fn terminate_remote(client: &RemoteClient) {
+        match *client {}
+    }
+
+    pub(super) fn ack_terminate_remote(client: &RemoteClient) {
+        match *client {}
+    }
+
+    pub(super) fn notify_rpc_shutdown(
+        client: &mut RemoteRpcClient,
+        _instance_id: DaemonInstanceId,
+    ) {
+        match *client {}
+    }
+
+    pub(super) fn project_rpc_history_change(
+        _app: &App,
+        _clients: &mut HashMap<ClientId, RemoteRpcClient>,
+        _instance_id: DaemonInstanceId,
+        _change: &crate::app::HistoryChange,
+    ) {
+    }
+
+    pub(super) fn broadcast_rpc_live_share_status(
+        _clients: &mut HashMap<ClientId, RemoteRpcClient>,
+        _stream_id: rpc::ids::StreamId,
+        _generation: u64,
+        _state: crate::app::ShareViewState,
+    ) {
+    }
+}
+
+#[cfg(not(unix))]
+use no_remote::{
+    RemoteClient, RemoteRpcClient, ack_terminate_remote, broadcast_rpc_appearance_events,
+    broadcast_rpc_identity_events, broadcast_rpc_live_share_status, broadcast_rpc_settings_events,
+    broadcast_rpc_snapshots, broadcast_rpc_voice_roster, notify_rpc_shutdown,
+    project_rpc_history_change, rpc_upload_staging_active, shutdown_remote, shutdown_rpc,
+    terminate_remote, wake_remote,
+};
+
+#[cfg(unix)]
 struct RemoteClient {
     channel: Arc<ClientChannel>,
     control: Arc<Mutex<UnixStream>>,
@@ -41,6 +176,7 @@ struct RemoteClient {
     control_thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 struct RemoteRpcClient {
     sender: RpcClientSender,
     control: Arc<UnixStream>,
@@ -60,17 +196,20 @@ struct RemoteRpcClient {
     identity_generation: u64,
 }
 
+#[cfg(unix)]
 struct RpcLiveViewer {
     generation: u64,
     _handle: crate::video::NativeViewerHandle,
 }
 
+#[cfg(unix)]
 struct AttachmentStreamControl {
     shutdown: UnixStream,
     worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
+#[cfg(unix)]
 struct RpcHistoryRequest {
     room_id: rpc::ids::RoomId,
     room_generation: u64,
@@ -78,6 +217,7 @@ struct RpcHistoryRequest {
     limit: u16,
 }
 
+#[cfg(unix)]
 struct RpcUpload {
     upload: local_rpc::bulk::BeginUpload,
     file: tempfile::NamedTempFile,
@@ -86,6 +226,7 @@ struct RpcUpload {
 
 /// Something the writer thread has to do at a byte position in [`RpcOutbound`],
 /// rather than just putting more bytes on the socket.
+#[cfg(unix)]
 enum RpcOutboundControl {
     /// A frame handing over descriptors, which needs a `sendmsg` of its own and
     /// so bounds the write in front of it.
@@ -109,6 +250,7 @@ enum RpcOutboundControl {
 /// emptied one rather than draining it, so the two ping-pong and neither
 /// reallocates.
 #[derive(Default)]
+#[cfg(unix)]
 struct RpcOutbound {
     bytes: Vec<u8>,
     /// Ordered by the offset in `bytes` each one happens at, so descriptors and
@@ -118,11 +260,13 @@ struct RpcOutbound {
 }
 
 #[derive(Default)]
+#[cfg(unix)]
 struct RpcOutboundQueue {
     state: Mutex<RpcOutbound>,
     ready: parking_lot::Condvar,
 }
 
+#[cfg(unix)]
 impl RpcOutboundQueue {
     /// Swaps everything queued into the writer's own buffers, blocking while
     /// `idle` until there is something to do.
@@ -141,11 +285,13 @@ impl RpcOutboundQueue {
     }
 }
 
+#[cfg(unix)]
 enum RpcAttachmentReader {
     Memory { bytes: Arc<Vec<u8>>, offset: usize },
     Disk(std::fs::File),
 }
 
+#[cfg(unix)]
 struct RpcAttachmentStream {
     transfer_id: local_rpc::model::BulkTransferId,
     file_name: String,
@@ -155,6 +301,7 @@ struct RpcAttachmentStream {
     buffer: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl RpcAttachmentStream {
     fn new(
         transfer_id: local_rpc::model::BulkTransferId,
@@ -246,6 +393,7 @@ impl RpcAttachmentStream {
 }
 
 #[derive(Clone)]
+#[cfg(unix)]
 struct RpcClientSender {
     outbound: Arc<RpcOutboundQueue>,
     control: Arc<UnixStream>,
@@ -253,6 +401,7 @@ struct RpcClientSender {
     outstanding: Arc<Mutex<HashSet<local_rpc::model::RequestId>>>,
 }
 
+#[cfg(unix)]
 impl RpcClientSender {
     fn send(&self, frame: &DaemonFrame) -> Result<(), String> {
         self.send_with_fds(frame, Vec::new())
@@ -406,6 +555,7 @@ impl RpcClientSender {
     }
 }
 
+#[cfg(unix)]
 fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
     match frame {
         DaemonFrame::Welcome(_) => "welcome",
@@ -451,6 +601,10 @@ pub(crate) fn run_app_with_welcome(
     run_app_inner(config, pending_join, true, false)
 }
 
+/// Runs the core with no terminal, serving whatever attaches over the local
+/// control socket. Unix only, because that socket is where the attachers come
+/// from.
+#[cfg(unix)]
 pub(crate) fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     run_app_inner(config, None, false, true)
 }
@@ -500,8 +654,8 @@ fn run_app_inner(
                 .spawn(move || {
                     let client = ClientThread {
                         id: ClientId::PRIMARY,
-                        stdin_fd: 0,
-                        stdout_fd: 1,
+                        stdin_fd: extui::stdin_raw(),
+                        stdout_fd: extui::stdout_raw(),
                         channel: render_channel,
                         session,
                         view,
@@ -600,7 +754,7 @@ fn run_app_inner(
             channel.wake_sections(dirty);
         }
         for client in clients.values() {
-            client.channel.wake_sections(dirty);
+            wake_remote(client, dirty);
         }
         if quit {
             break;
@@ -622,14 +776,7 @@ fn run_app_inner(
         shutdown_remote(client, shutdown);
     }
     for (_, mut client) in rpc_clients.drain() {
-        let seq = client.next_event_seq;
-        if let Err(error) = client.sender.send(&DaemonFrame::Event(StateEvent {
-            instance_id: daemon_instance,
-            event_seq: seq,
-            delta: StateDelta::DaemonStopping,
-        })) {
-            kvlog::error!("could not notify RPC client of daemon shutdown", error = %error);
-        }
+        notify_rpc_shutdown(&mut client, daemon_instance);
         shutdown_rpc(&mut client);
     }
     let render_result = render_thread.map(JoinHandle::join);
@@ -660,10 +807,12 @@ fn handle_runtime_command(
     let Some(client) = clients.get(&client_id) else {
         return;
     };
-    let _ = attach::write_frame(&mut client.control.lock(), attach::TERMINATE_ACK, &[]);
-    client.channel.terminate();
+    ack_terminate_remote(client);
 }
 
+// The parameters the remote-serving arms consume are still passed on Windows,
+// where those arms do not exist, so the signature stays identical on both.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn handle_runtime_event(
     app: &mut App,
     event: AppEvent,
@@ -683,6 +832,10 @@ fn handle_runtime_event(
             }
             handle_runtime_command(app, clients, client_id, *command);
         }
+        // Everything below serves other processes over the local control
+        // socket. `AppEvent` gates these variants on Unix too, so on Windows
+        // they cannot be constructed and the arms do not exist.
+        #[cfg(unix)]
         AppEvent::ClientAttach {
             mut stream,
             stdin,
@@ -733,6 +886,7 @@ fn handle_runtime_event(
                 app.start_attach_intent(id, &intent);
             }
         }
+        #[cfg(unix)]
         AppEvent::RpcClientAttach {
             mut stream,
             hello,
@@ -774,6 +928,7 @@ fn handle_runtime_event(
                 Err(error) => kvlog::warn!("daemon RPC client attach failed", error = %error),
             }
         }
+        #[cfg(unix)]
         AppEvent::RpcClientFrame { client_id, frame } => {
             if let local_rpc::frame::ClientFrame::SelectServer { request_id, label } = &frame
                 && !(app.network.is_some()
@@ -800,6 +955,7 @@ fn handle_runtime_event(
                 broadcast_rpc_snapshots(app, rpc_clients, daemon_instance);
             }
         }
+        #[cfg(unix)]
         AppEvent::RpcClientExited(id) => {
             app.retire_client(id);
             if let Some(mut client) = rpc_clients.remove(&id) {
@@ -812,6 +968,7 @@ fn handle_runtime_event(
                 kvlog::info!("daemon RPC client detached", client_id = id.0);
             }
         }
+        #[cfg(unix)]
         AppEvent::AttachmentStreamWorkerExited {
             client_id,
             request_id,
@@ -831,7 +988,7 @@ fn handle_runtime_event(
         AppEvent::ClientDetached(id) => {
             app.retire_client(id);
             if let Some(client) = clients.get(&id) {
-                client.channel.terminate();
+                terminate_remote(client);
             }
         }
         AppEvent::ClientExited(id) => {
@@ -901,6 +1058,7 @@ fn daemon_instance_id() -> DaemonInstanceId {
     DaemonInstanceId(id)
 }
 
+#[cfg(unix)]
 fn spawn_rpc_client(
     app: &mut App,
     id: ClientId,
@@ -1014,6 +1172,7 @@ fn spawn_rpc_client(
     })
 }
 
+#[cfg(unix)]
 fn rpc_reader_loop(
     id: ClientId,
     stream: UnixStream,
@@ -1059,6 +1218,7 @@ fn rpc_reader_loop(
     let _ = events.send(AppEvent::RpcClientExited(id));
 }
 
+#[cfg(unix)]
 fn rpc_writer_loop(
     stream: UnixStream,
     outbound: Arc<RpcOutboundQueue>,
@@ -1160,6 +1320,7 @@ fn rpc_writer_loop(
     outbound.close();
 }
 
+#[cfg(unix)]
 fn send_rpc_snapshot(
     app: &mut App,
     id: ClientId,
@@ -1180,6 +1341,7 @@ fn send_rpc_snapshot(
     Ok(())
 }
 
+#[cfg(unix)]
 fn broadcast_rpc_snapshots(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -1213,6 +1375,7 @@ fn broadcast_rpc_snapshots(
 /// is the point: a speaking edge is sampled every 50 ms and moves one bit of
 /// one row, so rebuilding and diffing every client's whole snapshot for it is
 /// pure waste.
+#[cfg(unix)]
 fn broadcast_rpc_voice_roster(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -1240,6 +1403,7 @@ fn broadcast_rpc_voice_roster(
     }
 }
 
+#[cfg(unix)]
 fn broadcast_rpc_live_share_status(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     stream_id: rpc::ids::StreamId,
@@ -1262,6 +1426,7 @@ fn broadcast_rpc_live_share_status(
     }
 }
 
+#[cfg(unix)]
 fn send_rpc_event(
     client: &mut RemoteRpcClient,
     instance_id: DaemonInstanceId,
@@ -1277,6 +1442,7 @@ fn send_rpc_event(
     Ok(())
 }
 
+#[cfg(unix)]
 fn project_rpc_history_change(
     app: &App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -1357,6 +1523,7 @@ fn project_rpc_history_change(
     }
 }
 
+#[cfg(unix)]
 fn sync_rpc_state(
     app: &App,
     id: ClientId,
@@ -1428,6 +1595,7 @@ fn sync_rpc_state(
     Ok(())
 }
 
+#[cfg(unix)]
 fn complete_pending_rpc_history(
     app: &App,
     id: ClientId,
@@ -1479,6 +1647,7 @@ fn complete_pending_rpc_history(
     Ok(())
 }
 
+#[cfg(unix)]
 fn send_rpc_history_page(
     client: &mut RemoteRpcClient,
     instance_id: DaemonInstanceId,
@@ -1508,6 +1677,7 @@ fn send_rpc_history_page(
     Ok(())
 }
 
+#[cfg(unix)]
 fn projection_deltas(
     old: &local_rpc::model::StateSnapshot,
     next: &local_rpc::model::StateSnapshot,
@@ -1607,6 +1777,7 @@ fn projection_deltas(
     deltas
 }
 
+#[cfg(unix)]
 fn handle_rpc_command(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -1990,6 +2161,7 @@ fn handle_rpc_command(
     }
 }
 
+#[cfg(unix)]
 fn broadcast_rpc_appearance_events(app: &App, clients: &mut HashMap<ClientId, RemoteRpcClient>) {
     let generation = app.rpc_appearance_generation();
     for client in clients.values_mut() {
@@ -2006,6 +2178,7 @@ fn broadcast_rpc_appearance_events(app: &App, clients: &mut HashMap<ClientId, Re
 /// Hands each renderer the identity review it has not seen yet. Opening a
 /// review needs a server round trip, so the document always arrives this way
 /// rather than as the reply to `Open`.
+#[cfg(unix)]
 fn broadcast_rpc_identity_events(app: &mut App, clients: &mut HashMap<ClientId, RemoteRpcClient>) {
     for (id, client) in clients.iter_mut() {
         let Some((generation, event)) = app.rpc_identity_event(*id, client.identity_generation)
@@ -2021,6 +2194,7 @@ fn broadcast_rpc_identity_events(app: &mut App, clients: &mut HashMap<ClientId, 
     }
 }
 
+#[cfg(unix)]
 fn broadcast_rpc_settings_events(
     app: &App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -2065,6 +2239,7 @@ fn broadcast_rpc_settings_events(
     }
 }
 
+#[cfg(unix)]
 fn send_live_share_rejection(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     id: ClientId,
@@ -2076,6 +2251,7 @@ fn send_live_share_rejection(
     send_rpc_rejection(clients, id, request_id, operation, code, message);
 }
 
+#[cfg(unix)]
 fn send_rpc_rejection(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     id: ClientId,
@@ -2099,10 +2275,12 @@ fn send_rpc_rejection(
     ));
 }
 
+#[cfg(unix)]
 fn rpc_upload_staging_active(clients: &HashMap<ClientId, RemoteRpcClient>) -> bool {
     upload_staging_active(clients.values().map(|client| client.uploads.as_ref()))
 }
 
+#[cfg(unix)]
 fn upload_staging_active<'a, T: 'a>(
     uploads: impl IntoIterator<Item = &'a Mutex<HashMap<local_rpc::model::BulkTransferId, T>>>,
 ) -> bool {
@@ -2111,6 +2289,7 @@ fn upload_staging_active<'a, T: 'a>(
         .any(|uploads| !uploads.lock().is_empty())
 }
 
+#[cfg(unix)]
 fn open_rpc_attachment_source(
     client: &mut RemoteRpcClient,
     client_id: ClientId,
@@ -2264,6 +2443,7 @@ fn open_rpc_attachment_source(
     }
 }
 
+#[cfg(unix)]
 fn open_direct_attachment_source(
     path: &std::path::Path,
     byte_len: u64,
@@ -2290,6 +2470,7 @@ fn open_direct_attachment_source(
     Ok(file.into())
 }
 
+#[cfg(unix)]
 struct AttachmentStreamWorkerGuard {
     events: EventSender,
     client_id: ClientId,
@@ -2301,6 +2482,7 @@ struct AttachmentStreamWorkerGuard {
     reason: String,
 }
 
+#[cfg(unix)]
 impl Drop for AttachmentStreamWorkerGuard {
     fn drop(&mut self) {
         kvlog::info!(
@@ -2323,6 +2505,7 @@ impl Drop for AttachmentStreamWorkerGuard {
     }
 }
 
+#[cfg(unix)]
 fn run_attachment_stream_worker(
     mut stream: UnixStream,
     bytes: Arc<Vec<u8>>,
@@ -2392,6 +2575,7 @@ fn run_attachment_stream_worker(
     }
 }
 
+#[cfg(unix)]
 fn handle_rpc_effect(
     app: &mut App,
     client: &mut RemoteRpcClient,
@@ -2585,6 +2769,7 @@ fn handle_rpc_effect(
     }
 }
 
+#[cfg(unix)]
 fn handle_rpc_upload_chunk(
     uploads: &Mutex<HashMap<local_rpc::model::BulkTransferId, RpcUpload>>,
     sender: &RpcClientSender,
@@ -2618,6 +2803,7 @@ fn handle_rpc_upload_chunk(
     }
 }
 
+#[cfg(unix)]
 fn finish_rpc_upload(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -2670,6 +2856,7 @@ fn finish_rpc_upload(
         .send_or_abort(&DaemonFrame::RequestResult(result));
 }
 
+#[cfg(unix)]
 fn shutdown_rpc(client: &mut RemoteRpcClient) {
     client.live_viewers.clear();
     for stream in client.attachment_streams.values() {
@@ -2690,6 +2877,40 @@ fn shutdown_rpc(client: &mut RemoteRpcClient) {
     }
 }
 
+/// Repaints the sections `dirty` names on an attached terminal.
+#[cfg(unix)]
+fn wake_remote(client: &RemoteClient, dirty: DirtySections) {
+    client.channel.wake_sections(dirty);
+}
+
+/// Tells an attached terminal to exit.
+#[cfg(unix)]
+fn terminate_remote(client: &RemoteClient) {
+    client.channel.terminate();
+}
+
+/// Acknowledges a terminal's own terminate request, then tells it to exit.
+#[cfg(unix)]
+fn ack_terminate_remote(client: &RemoteClient) {
+    let _ = attach::write_frame(&mut client.control.lock(), attach::TERMINATE_ACK, &[]);
+    terminate_remote(client);
+}
+
+/// Tells a renderer the daemon is going away, before its connection is torn
+/// down under it.
+#[cfg(unix)]
+fn notify_rpc_shutdown(client: &mut RemoteRpcClient, instance_id: DaemonInstanceId) {
+    let seq = client.next_event_seq;
+    if let Err(error) = client.sender.send(&DaemonFrame::Event(StateEvent {
+        instance_id,
+        event_seq: seq,
+        delta: StateDelta::DaemonStopping,
+    })) {
+        kvlog::error!("could not notify RPC client of daemon shutdown", error = %error);
+    }
+}
+
+#[cfg(unix)]
 fn spawn_remote_client(
     app: &mut App,
     id: ClientId,
@@ -2789,6 +3010,7 @@ fn spawn_remote_client(
     })
 }
 
+#[cfg(unix)]
 fn remote_control_loop(
     id: ClientId,
     mut reader: UnixStream,
@@ -2815,6 +3037,7 @@ fn remote_control_loop(
     }
 }
 
+#[cfg(unix)]
 fn shutdown_remote(mut client: RemoteClient, shutdown: RemoteShutdown) {
     let _ = client
         .control
@@ -2883,7 +3106,9 @@ fn install_panic_hook() {
     });
 }
 
-#[cfg(test)]
+// These cover the remote-serving half of the runtime, attaching terminals and
+// RPC renderers over the local control socket, which only exists on Unix.
+#[cfg(all(test, unix))]
 mod tests {
     use std::{os::unix::net::UnixStream, sync::Arc, thread};
 

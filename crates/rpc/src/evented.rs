@@ -4,10 +4,9 @@
 //! bounded read/write pumps, retrying interrupted syscalls, and cursor-based
 //! queued writes. Loop scheduling policy stays in the caller.
 
-use std::{
-    io::{self, Write},
-    os::fd::AsRawFd,
-};
+use std::io::{self, Write};
+
+use chatt_platform::SocketSource;
 
 use crate::recv::RecvBuffer;
 
@@ -57,7 +56,7 @@ pub struct ReadPumpOutcome {
 
 #[inline]
 pub fn read_into_buffer(
-    socket: &impl AsRawFd,
+    socket: &(impl SocketSource + ?Sized),
     read_buf: &mut RecvBuffer,
     readiness: &mut Readiness,
     max_read_bytes_per_syscall: usize,
@@ -264,7 +263,7 @@ impl MioReady {
 
 #[inline]
 pub fn is_interrupted_io_error(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::EINTR)
+    chatt_platform::is_interrupted(error)
 }
 
 #[inline]
@@ -286,7 +285,27 @@ pub fn recv_datagram_with<A>(
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
+
+    /// A connected pair of byte streams.
+    ///
+    /// These tests exercise read-budget and readiness bookkeeping and only need
+    /// two ends of a stream that can be put in non-blocking mode. Unix has
+    /// `socketpair`; Windows gets an equivalent loopback TCP connection.
+    #[cfg(unix)]
+    fn stream_pair() -> (UnixStream, UnixStream) {
+        UnixStream::pair().expect("socket pair")
+    }
+
+    #[cfg(not(unix))]
+    fn stream_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("loopback addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect loopback");
+        let (server, _) = listener.accept().expect("accept loopback");
+        (client, server)
+    }
 
     struct PartialWriter {
         per_write: usize,
@@ -334,7 +353,7 @@ mod tests {
 
     #[test]
     fn read_byte_budget_stop_keeps_readiness_for_retry() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let (mut writer, reader) = stream_pair();
         reader.set_nonblocking(true).expect("set nonblocking");
         writer.write_all(b"x").expect("write payload");
         let mut read_buf = RecvBuffer::new();
@@ -358,7 +377,7 @@ mod tests {
 
     #[test]
     fn read_byte_budget_caps_single_large_syscall() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let (mut writer, reader) = stream_pair();
         reader.set_nonblocking(true).expect("set nonblocking");
         writer.write_all(b"abcdef").expect("write payload");
         let mut read_buf = RecvBuffer::new();
@@ -381,7 +400,7 @@ mod tests {
 
     #[test]
     fn read_max_buffer_stop_keeps_readiness_for_retry() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let (mut writer, reader) = stream_pair();
         reader.set_nonblocking(true).expect("set nonblocking");
         writer.write_all(b"x").expect("write payload");
         let mut read_buf = RecvBuffer::new();
@@ -404,7 +423,7 @@ mod tests {
 
     #[test]
     fn read_would_block_clears_retained_readiness_after_buffer_consumed() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let (mut writer, reader) = stream_pair();
         reader.set_nonblocking(true).expect("set nonblocking");
         writer.write_all(b"x").expect("write payload");
         let mut read_buf = RecvBuffer::new();
@@ -500,9 +519,12 @@ mod tests {
         assert!(is_interrupted_io_error(&io::Error::from(
             io::ErrorKind::Interrupted
         )));
-        assert!(is_interrupted_io_error(&io::Error::from_raw_os_error(
-            libc::EINTR
-        )));
+        // A raw `EINTR` reaches this only on Unix; Winsock has no equivalent
+        // code for the calls in this module. Spelled numerically because
+        // `EINTR` is 4 on every Unix and this crate otherwise needs `libc` on
+        // Linux alone.
+        #[cfg(unix)]
+        assert!(is_interrupted_io_error(&io::Error::from_raw_os_error(4)));
         assert!(!is_interrupted_io_error(&io::Error::from(
             io::ErrorKind::WouldBlock
         )));
@@ -517,7 +539,7 @@ mod tests {
         let received = recv_datagram_with(&mut buf, |_| {
             calls += 1;
             match calls {
-                1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
                 2 => Ok((3, src)),
                 _ => unreachable!("receive loop should return after one datagram"),
             }

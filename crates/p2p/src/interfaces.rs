@@ -1,7 +1,12 @@
 use std::{
-    ffi::CStr,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
+};
+
+#[cfg(unix)]
+use std::{
+    ffi::CStr,
+    net::{Ipv4Addr, Ipv6Addr},
 };
 
 use crate::candidate::{Candidate, CandidateKind};

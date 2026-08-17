@@ -11,23 +11,38 @@ name = "chatt-server"
 path = "src/main.rs"
 
 [dependencies]
+chatt-platform = { path = "../platform" }
 jsony = "0.1.10"
 rpc.path = "../rpc"
 chatt-mls.path = "../mls"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
 aws-lc-rs = { version = "1.18.0", default-features = false, features = ["alloc", "non-fips"] }
-kvlog = { git = "https://github.com/exrok/kvlog", rev = "139b426d2050b5f9ad646ab8097d86e8ab0728e9" }
+kvlog = { git = "https://github.com/exrok/kvlog", rev = "2182d43ba7a20d2aa16e37b8c3ba6d8502cf7787" }
 annotate-snippets = "0.12.10"
 toml-spanner = { version = "1.0.3", features = [
     "to-toml",
     "from-toml",
     "derive",
 ] }
-libc = "0.2"
 foldhash = "0.2.0"
 hashbrown = "0.17.1"
 mimalloc = { version = "0.1.52", features = ["override"] }
 redb = "4.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Named-pipe control channel; see src/local_admin_windows.rs.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    # WSAEMFILE, for classifying accept failures.
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

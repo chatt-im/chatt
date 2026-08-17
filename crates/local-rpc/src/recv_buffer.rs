@@ -9,7 +9,7 @@
 //! receive.
 
 use std::io;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::os::fd::AsRawFd;
 
 pub struct RecvBuffer {
@@ -54,7 +54,7 @@ impl RecvBuffer {
     ///
     /// Any partial frame left from the previous read is moved to the front of
     /// the buffer first — the only copy this buffer ever makes.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn fill(&mut self, socket: &impl AsRawFd, max_read: usize) -> io::Result<usize> {
         self.fill_with(max_read, |destination, len| {
             loop {
@@ -122,7 +122,11 @@ impl Default for RecvBuffer {
     }
 }
 
-#[cfg(test)]
+// Every test here drives `fill`, which reads through a raw descriptor, over a
+// `UnixStream` pair. Gated rather than ported, matching the rest of the Windows
+// port; `fill_with`, the part that is not Unix-specific, is covered through the
+// transports in `frame.rs`.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;

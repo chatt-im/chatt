@@ -408,6 +408,10 @@ pub enum BufferSize {
 impl BufferSize {
     /// Frame count corresponding to `target` at `sample_rate`, rounded to the
     /// nearest frame and clamped to at least one frame.
+    ///
+    /// Every backend but WASAPI sizes its buffer through this, and WASAPI is
+    /// the only host on Windows, so there it is exercised by the tests alone.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn frames_for_latency(
         target: std::time::Duration,
         sample_rate: SampleRate,
@@ -422,6 +426,10 @@ impl BufferSize {
 /// Real audio hardware runs its DMA period on a power of two, so aligning a
 /// requested period to one lets the driver/server drive the device directly
 /// instead of inserting an adaptive re-blocker.
+///
+/// Unused by WASAPI, which is the only host on Windows; see
+/// [`BufferSize::frames_for_latency`].
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn nearest_power_of_two(n: FrameCount) -> FrameCount {
     if n <= 1 {
         return 1;

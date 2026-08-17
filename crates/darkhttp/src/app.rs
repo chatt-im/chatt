@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -21,6 +20,8 @@ use crate::server::{
     WebSocketId, WebSocketMessage,
 };
 use crate::websocket::{frame, handshake};
+use chatt_platform::AsRawSock;
+use chatt_platform::poll::{self, POLLERR, POLLHUP, POLLIN, POLLOUT, PollFd};
 
 const READ_BUF_SIZE: usize = 32 * 1024;
 const SENDFILE_CHUNK: u64 = 1 << 20;
@@ -45,7 +46,7 @@ pub(crate) struct App {
     /// not allocate. `pollfds`/`poll_keys` are cleared and refilled each poll;
     /// `read_buf` is the destination for socket reads (overwritten before use,
     /// so it never needs re-zeroing).
-    pollfds: Vec<libc::pollfd>,
+    pollfds: Vec<PollFd>,
     poll_keys: Vec<PollKey>,
     read_buf: Box<[u8; READ_BUF_SIZE]>,
 }
@@ -92,51 +93,36 @@ impl App {
         let mut keys = std::mem::take(&mut self.poll_keys);
         pollfds.clear();
         keys.clear();
-        pollfds.push(libc::pollfd {
-            fd: self.listener.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
+        pollfds.push(poll::pollfd(self.listener.as_raw_sock(), POLLIN));
         keys.push(PollKey::Listener);
 
         // The waker's read end lets an I/O-pool worker interrupt `poll` the
         // moment a file response is ready, instead of waiting for the timeout.
-        pollfds.push(libc::pollfd {
-            fd: self.waker.read_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
+        pollfds.push(poll::pollfd(self.waker.read_sock(), POLLIN));
         keys.push(PollKey::Waker);
 
         for (idx, conn) in self.conns.iter().enumerate() {
             let events = match conn.state {
-                ConnState::RecvRequest => libc::POLLIN,
+                ConnState::RecvRequest => POLLIN,
                 ConnState::AwaitFile => 0,
-                ConnState::SendResponse => libc::POLLOUT,
+                ConnState::SendResponse => POLLOUT,
                 ConnState::WebSocket => {
                     if conn.websocket_out.is_empty() {
-                        libc::POLLIN
+                        POLLIN
                     } else {
-                        libc::POLLIN | libc::POLLOUT
+                        POLLIN | POLLOUT
                     }
                 }
                 ConnState::Done => 0,
             };
             if events != 0 {
-                pollfds.push(libc::pollfd {
-                    fd: conn.stream.as_raw_fd(),
-                    events,
-                    revents: 0,
-                });
+                pollfds.push(poll::pollfd(conn.stream.as_raw_sock(), events));
                 keys.push(PollKey::Connection(idx));
             }
         }
 
         let timeout = self.poll_timeout(max_wait);
-        let ret =
-            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
-        if ret == -1 {
-            let err = io::Error::last_os_error();
+        if let Err(err) = poll::poll(&mut pollfds, timeout) {
             if err.kind() == io::ErrorKind::Interrupted {
                 return Ok(());
             }
@@ -147,12 +133,12 @@ impl App {
             let revents = pollfds[i].revents;
             match keys[i] {
                 PollKey::Listener => {
-                    if revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+                    if revents & (POLLIN | POLLERR | POLLHUP) != 0 {
                         self.accept_connections()?;
                     }
                 }
                 PollKey::Waker => {
-                    if revents & libc::POLLIN != 0 {
+                    if revents & POLLIN != 0 {
                         self.waker.drain();
                     }
                 }
@@ -162,23 +148,23 @@ impl App {
                     }
                     match self.conns[idx].state {
                         ConnState::RecvRequest => {
-                            if revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+                            if revents & (POLLIN | POLLERR | POLLHUP) != 0 {
                                 self.recv_request(idx);
                             }
                         }
                         ConnState::AwaitFile => {}
                         ConnState::SendResponse => {
-                            if revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0 {
+                            if revents & (POLLOUT | POLLERR | POLLHUP) != 0 {
                                 self.send_response(idx);
                             }
                         }
                         ConnState::WebSocket => {
-                            if revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+                            if revents & (POLLIN | POLLERR | POLLHUP) != 0 {
                                 self.recv_websocket(idx);
                             }
                             if idx < self.conns.len()
                                 && matches!(self.conns[idx].state, ConnState::WebSocket)
-                                && revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0
+                                && revents & (POLLOUT | POLLERR | POLLHUP) != 0
                             {
                                 self.send_websocket(idx);
                             }
@@ -723,8 +709,8 @@ impl App {
                     }
                     while file_body.remaining > 0 {
                         match send_file(
-                            conn.stream.as_raw_fd(),
-                            file_body.file.as_raw_fd(),
+                            &conn.stream,
+                            &file_body.file,
                             file_body.offset,
                             file_body.remaining,
                         ) {
@@ -1090,12 +1076,28 @@ struct FileResult {
     response: PreparedResponse,
 }
 
-fn send_file(socket: RawFd, file: RawFd, offset: u64, remaining: u64) -> io::Result<u64> {
+/// Sends one chunk of `file` starting at `offset` over `socket`.
+///
+/// Linux gets `sendfile(2)`, which keeps the copy in the kernel and sends up to
+/// [`SENDFILE_CHUNK`]. Everywhere else this is a positional read followed by an
+/// ordinary socket write, capped by the stack buffer at [`READ_BUF_SIZE`].
+/// That cap is smaller, so it takes more calls per response, but the
+/// observable behaviour is the same: it never seeks the shared file cursor, it sends at most one chunk
+/// per call, and it surfaces `WouldBlock` so the caller can wait for `POLLOUT`
+/// and resume from the updated offset.
+fn send_file(
+    socket: &std::net::TcpStream,
+    file: &std::fs::File,
+    offset: u64,
+    remaining: u64,
+) -> io::Result<u64> {
     let to_send = remaining.min(SENDFILE_CHUNK) as usize;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
+        use std::os::fd::AsRawFd;
         let mut off = offset as libc::off_t;
-        let sent = unsafe { libc::sendfile(socket, file, &mut off, to_send) };
+        let sent =
+            unsafe { libc::sendfile(socket.as_raw_fd(), file.as_raw_fd(), &mut off, to_send) };
         if sent == -1 {
             Err(io::Error::last_os_error())
         } else {
@@ -1104,29 +1106,20 @@ fn send_file(socket: RawFd, file: RawFd, offset: u64, remaining: u64) -> io::Res
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
+        // Positional read: the offset is passed explicitly, so concurrent
+        // responses sharing this file handle cannot disturb each other's
+        // position.
         let mut buf = [0u8; READ_BUF_SIZE];
         let amount = to_send.min(buf.len());
-        let got = unsafe {
-            libc::pread(
-                file,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                amount,
-                offset as libc::off_t,
-            )
-        };
-        if got == -1 {
-            return Err(io::Error::last_os_error());
-        }
+        let got = chatt_platform::read_at(file, &mut buf[..amount], offset)?;
+
         if got == 0 {
             return Ok(0);
         }
-        let sent =
-            unsafe { libc::send(socket, buf.as_ptr() as *const libc::c_void, got as usize, 0) };
-        if sent == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(sent as u64)
-        }
+        // `&TcpStream` implements `Write`, so this is a plain non-blocking send
+        // that reports `WouldBlock` rather than blocking the event loop.
+        let sent = Write::write(&mut &*socket, &buf[..got])?;
+        Ok(sent as u64)
     }
 }
 

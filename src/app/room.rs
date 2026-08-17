@@ -7063,7 +7063,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(attachment.kind, "video");
-        assert_eq!((attachment.width, attachment.height), (Some(1080), Some(1920)));
+        assert_eq!(
+            (attachment.width, attachment.height),
+            (Some(1080), Some(1920))
+        );
     }
 
     #[test]

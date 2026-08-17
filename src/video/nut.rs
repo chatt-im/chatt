@@ -14,6 +14,12 @@
 //! Checksums are skipped, not verified: the pipe is a local subprocess, and a
 //! malformed stream fails the capture with a visible reason instead.
 
+// The demuxing half serves capture on every platform; the muxing half below it
+// serves `chatt video-stream`, which needs the local RPC socket and so exists
+// only on Unix. Scoped here rather than spelled as nine `cfg(unix)` attributes
+// on one contiguous run of items.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use rpc::bitstream::{self, Codec};
 
 use super::capture::{CapturedFrame, start_code_offsets};

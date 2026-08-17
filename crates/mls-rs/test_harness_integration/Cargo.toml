@@ -1,7 +1,7 @@
 [package]
 name = "harness_client"
 version = "0.1.0"
-authors = ["Marta Mularczyk <mulmarta@amazon.ch>"]
+# authors = ["Marta Mularczyk <mulmarta@amazon.ch>"]
 edition = "2021"
 publish = false
 

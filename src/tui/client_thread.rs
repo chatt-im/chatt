@@ -1,7 +1,5 @@
 use std::{
-    fs::File,
     io::{self, Write},
-    os::fd::{FromRawFd, RawFd},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -56,8 +54,8 @@ pub(crate) enum InitialMode {
 
 pub(crate) struct ClientThread {
     pub(crate) id: ClientId,
-    pub(crate) stdin_fd: RawFd,
-    pub(crate) stdout_fd: RawFd,
+    pub(crate) stdin_fd: extui::RawTerminal,
+    pub(crate) stdout_fd: extui::RawTerminal,
     pub(crate) channel: Arc<ClientChannel>,
     pub(crate) session: Arc<RwLock<RoomSession>>,
     pub(crate) view: ClientView,
@@ -83,10 +81,10 @@ impl ClientThread {
         // SAFETY: this render thread owns the descriptors for its lifetime. For
         // internal client #0 they are the process stdio descriptors; closing
         // them happens only after terminal restoration during process shutdown.
-        let stdin = unsafe { File::from_raw_fd(stdin_fd) };
+        let stdin = unsafe { extui::file_from_raw(stdin_fd) };
         // Keep an owner for the output descriptor. extui deliberately never
         // closes descriptors passed to Terminal::new.
-        let _stdout = unsafe { File::from_raw_fd(stdout_fd) };
+        let _stdout = unsafe { extui::file_from_raw(stdout_fd) };
 
         let flags = TerminalFlags::RAW_MODE
             | TerminalFlags::ALT_SCREEN

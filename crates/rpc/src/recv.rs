@@ -14,7 +14,8 @@
 //! the buffer before the next read.
 
 use std::io;
-use std::os::fd::AsRawFd;
+
+use chatt_platform::{SocketSource, is_interrupted};
 
 pub struct RecvBuffer {
     buf: Vec<u8>,
@@ -67,16 +68,19 @@ impl RecvBuffer {
     ///
     /// Any partial frame left from the previous read is moved to the front of
     /// the buffer first — the only copy this buffer ever makes.
-    pub fn fill(&mut self, socket: &impl AsRawFd, max_read: usize) -> io::Result<usize> {
+    pub fn fill(
+        &mut self,
+        socket: &(impl SocketSource + ?Sized),
+        max_read: usize,
+    ) -> io::Result<usize> {
         self.fill_with(max_read, |destination, len| {
             loop {
-                let read = unsafe { libc::read(socket.as_raw_fd(), destination.cast(), len) };
-                if read >= 0 {
-                    return Ok(read as usize);
-                }
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
+                // SAFETY: `fill_with` hands out spare capacity valid for `len`
+                // writes.
+                match unsafe { socket.recv_into(destination, len) } {
+                    Ok(read) => return Ok(read),
+                    Err(error) if is_interrupted(&error) => continue,
+                    Err(error) => return Err(error),
                 }
             }
         })
@@ -137,11 +141,32 @@ impl Default for RecvBuffer {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
+
+    /// A connected pair of byte streams.
+    ///
+    /// These tests only need two ends of a stream; the receive path under test
+    /// takes any [`SocketSource`]. Keeping them running on Windows matters more
+    /// than most: the raw-read-versus-`mio` interaction this buffer sits on is
+    /// what broke the port.
+    #[cfg(unix)]
+    fn stream_pair() -> (UnixStream, UnixStream) {
+        UnixStream::pair().expect("socket pair")
+    }
+
+    #[cfg(not(unix))]
+    fn stream_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("loopback addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect loopback");
+        let (server, _) = listener.accept().expect("accept loopback");
+        (client, server)
+    }
 
     #[test]
     fn fill_reads_into_spare_capacity_and_cursor_consumes_in_place() {
-        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let (mut writer, reader) = stream_pair();
         writer.write_all(b"abcdef").unwrap();
         let mut recv = RecvBuffer::new();
 
@@ -160,7 +185,7 @@ mod tests {
 
     #[test]
     fn fill_moves_partial_tail_to_front_before_reading() {
-        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let (mut writer, reader) = stream_pair();
         writer.write_all(b"onetwo").unwrap();
         let mut recv = RecvBuffer::new();
         recv.fill(&reader, 16).unwrap();
@@ -173,7 +198,7 @@ mod tests {
 
     #[test]
     fn fill_reads_at_most_requested_bytes() {
-        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let (mut writer, reader) = stream_pair();
         writer.write_all(b"abcdef").unwrap();
         let mut recv = RecvBuffer::new();
 
@@ -185,7 +210,7 @@ mod tests {
 
     #[test]
     fn fill_reports_eof_and_would_block() {
-        let (writer, reader) = UnixStream::pair().unwrap();
+        let (writer, reader) = stream_pair();
         reader.set_nonblocking(true).unwrap();
         let mut recv = RecvBuffer::new();
         assert_eq!(
@@ -198,7 +223,7 @@ mod tests {
 
     #[test]
     fn ship_hands_off_backing_buffer_trimmed_to_range() {
-        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let (mut writer, reader) = stream_pair();
         writer.write_all(b"hdrpayloadtag").unwrap();
         let mut recv = RecvBuffer::new();
         recv.fill(&reader, 16).unwrap();

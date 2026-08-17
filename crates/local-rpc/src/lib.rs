@@ -22,6 +22,8 @@ pub mod unix;
 pub use chatt_video::{bitstream, video};
 
 mod framing;
+/// Reads for the Unix transport, which is the only thing that fills it.
+#[cfg(unix)]
 mod recv_buffer;
 
 /// This protocol is private to a daemon and the renderers it ships with, and

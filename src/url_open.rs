@@ -145,13 +145,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nonzero_exit_reports_status_and_stderr() {
-        let mut opener = UrlOpener::new(vec![
+    /// Runs a shell that writes to stderr and exits non-zero, spelled for the
+    /// platform's own shell.
+    #[cfg(unix)]
+    fn failing_opener_command() -> Vec<String> {
+        vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             "printf 'browser unavailable' >&2; exit 7".to_string(),
-        ]);
+        ]
+    }
+
+    #[cfg(windows)]
+    fn failing_opener_command() -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            // `echo` would append a newline; `set /p` writes the text bare, and
+            // redirecting it to stderr matches what the Unix shell does.
+            "<nul set /p=browser unavailable 1>&2 & exit 7".to_string(),
+        ]
+    }
+
+    #[test]
+    fn nonzero_exit_reports_status_and_stderr() {
+        let mut opener = UrlOpener::new(failing_opener_command());
         opener.open("https://example.com").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -162,7 +180,12 @@ mod tests {
             assert!(Instant::now() < deadline, "opener child did not exit");
             std::thread::yield_now();
         };
+        // `ExitStatus`'s Display spells the same thing differently per platform:
+        // "exit status: 7" on Unix, "exit code: 7" on Windows.
+        #[cfg(unix)]
         assert!(error.contains("exited with exit status: 7"), "{error}");
+        #[cfg(windows)]
+        assert!(error.contains("exited with exit code: 7"), "{error}");
         assert!(error.contains("browser unavailable"), "{error}");
     }
 }

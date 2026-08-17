@@ -7,14 +7,15 @@ edition = "2024"
 cpal = { path = "crates/cpal", default-features = false }
 libc = "0.2"
 nnnoiseless = { path = "crates/nnnoiseless" }
-extui = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui", features = [
+extui = { rev = "32d81254788085d4cb2dc0361a473a637dc5895c", git = "https://github.com/exrok/extui", features = [
     "bracketed-paste",
 ] }
-extui-editor = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui" }
-extui-bindings = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui" }
+extui-editor = { rev = "32d81254788085d4cb2dc0361a473a637dc5895c", git = "https://github.com/exrok/extui" }
+extui-bindings = { rev = "32d81254788085d4cb2dc0361a473a637dc5895c", git = "https://github.com/exrok/extui" }
 bwrap.path = "crates/bwrap"
-tinyhl = { rev = "a768420e1b1e2f918deb29f5f9c095acbd9cdd74", git = "https://github.com/exrok/extui" }
+tinyhl = { rev = "32d81254788085d4cb2dc0361a473a637dc5895c", git = "https://github.com/exrok/extui" }
 chatt-message-format.path = "crates/message-format"
+chatt-platform.path = "crates/platform"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 opus-codec = { path = "crates/opus-codec", features = ["dred"] }
@@ -29,9 +30,8 @@ chatt-p2p.path = "crates/p2p"
 chatt-mls.path = "crates/mls"
 darkhttp.path = "crates/darkhttp"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
-sendfd = "0.4.4"
 parking_lot = { version = "0.12.5", features = ["arc_lock"] }
-kvlog = { git = "https://github.com/exrok/kvlog", rev = "139b426d2050b5f9ad646ab8097d86e8ab0728e9" }
+kvlog = { git = "https://github.com/exrok/kvlog", rev = "2182d43ba7a20d2aa16e37b8c3ba6d8502cf7787" }
 #kvlog = { path = "/code/logging/kvlog" }
 annotate-snippets = "0.12.10"
 toml-spanner = { version = "1.0.3", features = [
@@ -54,6 +54,12 @@ dhat = { version = "0.3", optional = true }
 memchr = "2.8.3"
 zeroize = { version = "1.9", features = ["derive"] }
 
+[target.'cfg(unix)'.dependencies]
+# Descriptor passing over the local control socket (SCM_RIGHTS). It has no
+# Windows counterpart, and the code that uses it lives in the `cfg(unix)`
+# half of `src/local_control.rs`.
+sendfd = "0.4.4"
+
 [features]
 default = ["audio-realtime", "mimalloc-allocator", "embed-web"]
 pipewire = ["cpal/pipewire"]
@@ -75,9 +81,9 @@ dhat-heap = ["dep:dhat"]
 # both. The default build leaves this off and stays portable.
 avx2 = ["opus-codec/presume-avx2", "nnnoiseless/presume-avx2"]
 # Bundle the built web frontend into the binary (served gzipped) instead of
-# reading it from `web/dist` at runtime. Off by default. Requires building the
-# committed `web/embedded` bundle and its asset resolver. Refresh them
-# deliberately with `cd web && bun run build:embedded` when shipping web changes.
+# reading it from `web/dist` at runtime. On by default. Requires the committed
+# `web/embedded` bundle and its asset resolver. Refresh them deliberately with
+# `cd web && bun run build:embedded` when shipping web changes.
 embed-web = []
 # Propagate kvlog spans through all threads spawned by the exhaustive MLS
 # matrix. This is test-only because `std::thread::add_spawn_hook` is nightly.
@@ -109,6 +115,7 @@ members = [
     "crates/libspa-sys",
     "crates/pipewire-sys",
     "crates/videosize",
+    "crates/platform",
 ]
 exclude = [
     "crates/cpal",

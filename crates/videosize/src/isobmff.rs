@@ -72,7 +72,11 @@ impl Matrix {
             if coefficient == 0 {
                 Some(value)
             } else {
-                scale_round(value, u64::try_from(coefficient.unsigned_abs()).ok()?, SCALE)
+                scale_round(
+                    value,
+                    u64::try_from(coefficient.unsigned_abs()).ok()?,
+                    SCALE,
+                )
             }
         };
         if self.b.abs() + self.c.abs() > self.a.abs() + self.d.abs() {
@@ -100,8 +104,8 @@ impl CleanAperture {
     }
 
     fn display_size(self, pixel: AspectRatio) -> Option<(u64, u64)> {
-        let width = AspectRatio::new(self.width_numerator, self.width_denominator)
-            .multiply_ratio(pixel);
+        let width =
+            AspectRatio::new(self.width_numerator, self.width_denominator).multiply_ratio(pixel);
         let width = scale_round(1, width.numerator, width.denominator)?;
         let height = scale_round(1, self.height_numerator, self.height_denominator)?;
         Some((width, height))

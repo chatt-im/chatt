@@ -432,6 +432,8 @@ mod imp {
 #[cfg(unix)]
 pub(crate) use imp::*;
 
+/// Only `NoMaster` is reachable without a control socket, but the callers'
+/// match arms are shared with Unix, so the other two still have to exist.
 #[cfg(not(unix))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttachOutcome {

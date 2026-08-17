@@ -73,9 +73,11 @@ fn main() {
         let mut sse = base_build(src, include);
         sse.define("RNN_ENABLE_X86_RTCD", None)
             .define("OPUS_X86_MAY_HAVE_SSE4_1", None)
-            .flag_if_supported("-msse4.1")
             .file(format!("{src}/x86/nnet_sse4_1.c"));
+        // MSVC has no per-feature SSE switch: SSE through SSE4.1 intrinsics are
+        // always available on x86-64, and `-msse4.1` would be rejected.
         if !target.contains("msvc") {
+            sse.flag_if_supported("-msse4.1");
             sse.flag_if_supported("-std=c99");
         }
         sse.compile("rnnoise_v2_sse4_1");
@@ -83,10 +85,11 @@ fn main() {
         let mut avx = base_build(src, include);
         avx.define("RNN_ENABLE_X86_RTCD", None)
             .define("OPUS_X86_MAY_HAVE_AVX2", None)
-            .flag_if_supported("-mavx")
-            .flag_if_supported("-mfma")
-            .flag_if_supported("-mavx2")
             .file(format!("{src}/x86/nnet_avx2.c"));
+        // This translation unit hard-errors unless the compiler is actually in
+        // AVX2 mode, so it needs the flag its own compiler spells: `/arch:AVX2`
+        // for MSVC, the three `-m` flags for everyone else.
+        add_avx2_flags(&mut avx, &target);
         if !target.contains("msvc") {
             avx.flag_if_supported("-std=c99");
         }
@@ -95,8 +98,16 @@ fn main() {
 }
 
 fn build_weight_blob(weights: &Path, out_dir: &Path, target: &str) {
+    println!("cargo:rustc-check-cfg=cfg(rnnoise_weights_in_rust)");
+
+    // The GNU assembler's `.incbin` is what embeds the blob everywhere else.
+    // MSVC's assembler has no equivalent directive, so on that target the blob
+    // is embedded from Rust instead and the crate reads it through a generated
+    // static rather than a pair of linker symbols.
     if target.contains("msvc") {
-        panic!("RNNoise weight embedding is not implemented for MSVC targets");
+        emit_rust_weight_blob(weights, out_dir);
+        println!("cargo:rustc-cfg=rnnoise_weights_in_rust");
+        return;
     }
 
     let symbol_prefix = if target.contains("apple") { "_" } else { "" };
@@ -117,7 +128,7 @@ fn build_weight_blob(weights: &Path, out_dir: &Path, target: &str) {
          .incbin \"{}\"\n\
          {symbol_prefix}rnnoise_v2_weights_end:\n\
          .byte 0\n",
-        asm_string_literal(weights),
+        escaped_path_literal(weights),
     );
     fs::write(&asm, source).expect("write RNNoise V2 weight assembly");
 
@@ -126,15 +137,35 @@ fn build_weight_blob(weights: &Path, out_dir: &Path, target: &str) {
     build.compile("rnnoise_v2_weights");
 }
 
-fn asm_string_literal(path: &Path) -> String {
+/// Writes a Rust source file that embeds the weight blob as an over-aligned
+/// static, for targets whose assembler cannot `.incbin`.
+///
+/// The alignment matters: the DNN kernels load the weights with 256-bit AVX
+/// instructions, so the blob is aligned to 32 bytes exactly as the assembly
+/// path's `.balign 32` does.
+fn emit_rust_weight_blob(weights: &Path, out_dir: &Path) {
+    let len = fs::metadata(weights)
+        .expect("stat RNNoise weight blob")
+        .len();
+    let source = format!(
+        "#[repr(C, align(32))]\n\
+         pub(crate) struct AlignedWeights(pub(crate) [u8; {len}]);\n\
+         pub(crate) static RNNOISE_V2_WEIGHTS: AlignedWeights =\n\
+         \x20   AlignedWeights(*include_bytes!(\"{}\"));\n",
+        escaped_path_literal(weights),
+    );
+    fs::write(out_dir.join("rnnoise_v2_weights.rs"), source)
+        .expect("write RNNoise V2 weight module");
+}
+
+/// Escapes `path` for a double-quoted string literal.
+///
+/// Rust source and GNU-as `.incbin` want the same two escapes, which matters on
+/// Windows, where every generated path is full of backslashes.
+fn escaped_path_literal(path: &Path) -> String {
     path.to_string_lossy()
-        .chars()
-        .flat_map(|ch| match ch {
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '"' => "\\\"".chars().collect(),
-            _ => vec![ch],
-        })
-        .collect()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 fn base_build(src: &str, include: &str) -> cc::Build {

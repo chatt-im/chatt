@@ -1,0 +1,23 @@
+[package]
+name = "chatt-platform"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    # WSAIoctl, for SIO_UDP_CONNRESET.
+    "Win32_System_IO",
+    # Owner-only DACLs on files and directories; see src/security.rs.
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    # OpenProcessToken for the token user's SID, and the single-instance mutex.
+    "Win32_System_Threading",
+] }

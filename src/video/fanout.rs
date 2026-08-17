@@ -26,12 +26,22 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, Condvar, Mutex},
+};
+
+// The renderer-facing half of the fanout is Unix-only; see the note below.
+#[cfg(unix)]
+use std::{
     io::Write,
     net::Shutdown,
-    os::unix::net::UnixStream,
-    sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
 };
+
+// Native renderers reach the fanout over the local RPC socket, which is
+// Unix-only; see the note in `runtime.rs`. Frame fanout itself is portable, so
+// only the viewer-facing half below is gated.
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 use rpc::{ids::StreamId, video::SharedVideoFrame};
 
@@ -119,6 +129,7 @@ struct QueueState {
     overflows: u64,
 }
 
+#[cfg(unix)]
 pub struct NativeViewerHandle {
     fanout: VideoFrameFanout,
     viewer_id: u64,
@@ -267,6 +278,7 @@ impl VideoFrameFanout {
         }
     }
 
+    #[cfg(unix)]
     pub fn add_native(
         &self,
         viewer_id: u64,
@@ -643,6 +655,7 @@ fn is_bootstrap_boundary(frame: &SharedVideoFrame) -> bool {
         .is_some_and(|header| header.bootstrap_end)
 }
 
+#[cfg(unix)]
 fn native_writer_loop(mut stream: UnixStream, queue: Arc<NativeQueue>) {
     let mut written = 0u64;
     let mut write_error = None;
@@ -700,6 +713,7 @@ fn native_writer_loop(mut stream: UnixStream, queue: Arc<NativeQueue>) {
     queue.close();
 }
 
+#[cfg(unix)]
 impl Drop for NativeViewerHandle {
     fn drop(&mut self) {
         self.fanout
@@ -717,7 +731,9 @@ impl Drop for NativeViewerHandle {
     }
 }
 
-#[cfg(test)]
+// The fanout tests drive native viewers through a `UnixStream` pair, so they
+// exercise the Unix-only half of this module.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Read;

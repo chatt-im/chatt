@@ -11,7 +11,6 @@
 use std::{
     fs::{self, File},
     io,
-    os::unix::fs::FileExt,
     path::PathBuf,
     sync::{Arc, mpsc},
     thread::{self, JoinHandle},
@@ -194,7 +193,7 @@ fn read_source(source: &Source) -> std::io::Result<Vec<u8>> {
         Source::Segment { path } => fs::read(path),
         Source::ActiveTail { file, valid_bytes } => {
             let mut bytes = vec![0u8; *valid_bytes as usize];
-            file.read_exact_at(&mut bytes, 0)?;
+            chatt_platform::read_exact_at(file, &mut bytes, 0)?;
             Ok(bytes)
         }
     }

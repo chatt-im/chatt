@@ -1407,12 +1407,7 @@ pub(crate) fn atomic_write_toml(path: &Path, content: &str) -> Result<(), String
 fn create_temp_file(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+    chatt_platform::open_private(&mut options, path)
 }
 
 fn open_new_config_file(path: &Path) -> Result<File, String> {
@@ -1438,8 +1433,7 @@ fn sync_parent_dir(path: &Path) -> Result<(), String> {
     else {
         return Ok(());
     };
-    File::open(parent)
-        .and_then(|dir| dir.sync_all())
+    chatt_platform::sync_dir(parent)
         .map_err(|error| format!("failed to sync directory {}: {error}", parent.display()))
 }
 
@@ -2413,8 +2407,6 @@ mod tests {
 
     #[test]
     fn atomic_write_toml_keeps_secrets_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = std::env::temp_dir().join(format!(
             "chatt-atomic-mode-{}-{:?}.toml",
             std::process::id(),
@@ -2424,19 +2416,16 @@ mod tests {
 
         atomic_write_toml(&path, "key = 1\n").unwrap();
 
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o077,
-            0,
-            "state rewrite must stay owner-only, got {mode:o}"
-        );
+        let owner_only = chatt_platform::is_owner_only(&path).unwrap();
         let _ = fs::remove_file(&path);
+        assert!(
+            owner_only,
+            "pairing secrets and the server identity must not be readable by other local users"
+        );
     }
 
     #[test]
     fn atomic_write_toml_replaces_a_planted_temp_file() {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = std::env::temp_dir().join(format!(
             "chatt-atomic-planted-{}-{:?}.toml",
             std::process::id(),
@@ -2445,21 +2434,36 @@ mod tests {
         let tmp = temp_config_path(&path);
         let _ = fs::remove_file(&path);
         fs::write(&tmp, "planted").unwrap();
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        // Plant permissive access so the rewrite has something to override.
+        grant_everyone(&tmp);
 
         atomic_write_toml(&path, "key = 1\n").unwrap();
 
         let content = fs::read_to_string(&path).unwrap();
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        let owner_only = chatt_platform::is_owner_only(&path).unwrap();
         let tmp_exists = tmp.exists();
         let _ = fs::remove_file(&path);
 
         assert_eq!(content, "key = 1\n");
-        assert_eq!(
-            mode & 0o077,
-            0,
-            "planted mode must not survive, got {mode:o}"
-        );
+        assert!(owner_only, "planted access must not survive the rewrite");
         assert!(!tmp_exists);
+    }
+
+    /// Makes a path readable by every local user, whichever way the platform
+    /// spells that.
+    #[cfg(unix)]
+    fn grant_everyone(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn grant_everyone(path: &Path) {
+        let path = path.display().to_string();
+        let status = std::process::Command::new("icacls")
+            .args([path.as_str(), "/grant", "*S-1-1-0:(F)"])
+            .status()
+            .expect("run icacls");
+        assert!(status.success(), "icacls must grant Everyone access");
     }
 }
